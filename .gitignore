@@ -1,0 +1,5 @@
+# Rust build artifacts
+/target
+
+# Local audit/report artifacts
+/.lavish
