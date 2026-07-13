@@ -72,7 +72,8 @@ struct ShellState {
     active_text: Option<usize>,
     active_reasoning: Option<usize>,
     scroll_from_bottom: usize,
-    usage: Option<(u64, u64)>,
+    context_estimate: Option<(u64, u64)>,
+    last_turn_usage: Option<Usage>,
     run_label: String,
     size: (u16, u16),
 }
@@ -239,11 +240,20 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
         }
         status.push_str(&state.run_label);
     }
-    if let Some((estimate, budget)) = state.usage {
+    if let Some((estimate, budget)) = state.context_estimate {
         if !status.is_empty() {
             status.push_str("  ·  ");
         }
         status.push_str(&format!("context ~{estimate}/{budget}"));
+    }
+    if let Some(usage) = state.last_turn_usage {
+        if !status.is_empty() {
+            status.push_str("  ·  ");
+        }
+        status.push_str(&format!(
+            "last turn {} in / {} out",
+            usage.input_tokens, usage.output_tokens
+        ));
     }
     if status.is_empty() {
         status = "ygg".to_owned();
@@ -270,12 +280,13 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
             .saturating_sub(lines.len())
             .saturating_sub(editor_lines)
             .max(1);
-        let end = transcript_lines
-            .len()
-            .saturating_sub(state.scroll_from_bottom);
+        let scroll_from_bottom = state
+            .scroll_from_bottom
+            .min(transcript_lines.len().saturating_sub(available));
+        let end = transcript_lines.len().saturating_sub(scroll_from_bottom);
         let start = end.saturating_sub(available);
         lines.extend(transcript_lines[start..end].iter().cloned());
-        if state.scroll_from_bottom > 0 {
+        if scroll_from_bottom > 0 {
             lines.push(
                 state
                     .theme
@@ -417,10 +428,7 @@ impl InteractiveShell {
             }
             AgentEvent::TurnFinished { usage, .. } => {
                 state.close_streaming_blocks();
-                state.usage = Some((
-                    usage.total_tokens.saturating_sub(usage.output_tokens),
-                    usage.total_tokens,
-                ));
+                state.last_turn_usage = Some(*usage);
                 state.run_label = "turn complete".to_owned();
             }
             AgentEvent::RunFinished { reason, .. } => {
@@ -433,10 +441,24 @@ impl InteractiveShell {
     pub fn on_turn_finished(&mut self, usage: &Usage) {
         let mut state = self.state.borrow_mut();
         state.close_streaming_blocks();
-        state.usage = Some((
-            usage.total_tokens.saturating_sub(usage.output_tokens),
-            usage.total_tokens,
-        ));
+        state.last_turn_usage = Some(*usage);
+    }
+
+    /// Update the request-context estimate at an idle boundary, where App is
+    /// available to reconstruct the actual next request safely.
+    pub fn set_context_estimate(&mut self, estimate: u64, budget: u64) {
+        self.state.borrow_mut().context_estimate = Some((estimate, budget));
+    }
+
+    /// Add a locally submitted prompt immediately; Agent persistence follows
+    /// only after `Agent::prompt` succeeds.
+    pub fn on_prompt_submitted(&mut self, prompt: &str) {
+        let mut state = self.state.borrow_mut();
+        state.close_streaming_blocks();
+        state
+            .transcript
+            .push(TranscriptBlock::User(prompt.to_owned()));
+        state.scroll_from_bottom = 0;
     }
 
     pub fn apply_edit(&mut self, action: EditAction) {
@@ -506,7 +528,9 @@ impl InteractiveShell {
         if direction < 0 {
             state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(page);
         } else {
-            state.scroll_from_bottom = state.scroll_from_bottom.saturating_sub(page);
+            // PageDown is the explicit return-to-live control; reset rather
+            // than decrementing an overshot viewport a page at a time.
+            state.scroll_from_bottom = 0;
         }
     }
 
@@ -689,6 +713,31 @@ mod tests {
     #[test]
     fn plain_wrapping_is_nonempty_for_empty_text() {
         assert_eq!(wrap_plain("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn submitted_prompts_render_immediately_with_real_context_budget() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.on_prompt_submitted("second prompt");
+        shell.set_status("deepseek-v4-pro");
+        shell.set_context_estimate(4_096, 967_232);
+        let snapshot = shell.debug_snapshot();
+        assert!(snapshot.contains("second prompt"));
+        let rendered = render_shell(&shell.state.borrow(), 120);
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("context ~4096/967232")));
+    }
+
+    #[test]
+    fn overscrolled_viewport_clamps_to_available_transcript() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.on_prompt_submitted("visible prompt");
+        shell.state.borrow_mut().scroll_from_bottom = 9_999;
+        let rendered = render_shell(&shell.state.borrow(), 120);
+        assert!(rendered.iter().any(|line| line.contains("visible prompt")));
+        shell.scroll(1);
+        assert_eq!(shell.state.borrow().scroll_from_bottom, 0);
     }
 
     #[test]

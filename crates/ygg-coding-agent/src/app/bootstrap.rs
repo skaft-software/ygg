@@ -44,6 +44,9 @@ pub struct LaunchSelection {
 const DEEPSEEK_ENDPOINT_ID: &str = "deepseek";
 const DEEPSEEK_MODEL_ID: &str = "deepseek-v4-pro";
 const DEEPSEEK_DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1/";
+const DEEPSEEK_DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
+// Only a local capacity reserve; it never sends a provider max-output value.
+const DEEPSEEK_DEFAULT_MAX_OUTPUT_TOKENS: u64 = 32_768;
 
 fn deepseek_base_url() -> anyhow::Result<url::Url> {
     let configured = std::env::var("YGG_DEEPSEEK_BASE_URL")
@@ -57,6 +60,16 @@ fn deepseek_base_url() -> anyhow::Result<url::Url> {
         .map_err(|error| anyhow::anyhow!("invalid YGG_DEEPSEEK_BASE_URL: {error}"))
 }
 
+fn deepseek_limit(name: &str, default: u64) -> anyhow::Result<u64> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid {name}={value:?}: {error}")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(anyhow::anyhow!("could not read {name}: {error}")),
+    }
+}
+
 fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
     let endpoint = Endpoint {
         id: EndpointId(DEEPSEEK_ENDPOINT_ID.into()),
@@ -68,6 +81,17 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
     catalog.register_endpoint(endpoint)?;
     let api_name =
         std::env::var("YGG_DEEPSEEK_MODEL").unwrap_or_else(|_| DEEPSEEK_MODEL_ID.to_owned());
+    let context_window = deepseek_limit(
+        "YGG_DEEPSEEK_CONTEXT_WINDOW",
+        DEEPSEEK_DEFAULT_CONTEXT_WINDOW,
+    )?;
+    let max_output_tokens = deepseek_limit(
+        "YGG_DEEPSEEK_MAX_OUTPUT_TOKENS",
+        DEEPSEEK_DEFAULT_MAX_OUTPUT_TOKENS,
+    )?;
+    if max_output_tokens > context_window {
+        anyhow::bail!("YGG_DEEPSEEK_MAX_OUTPUT_TOKENS must not exceed YGG_DEEPSEEK_CONTEXT_WINDOW");
+    }
     catalog.register_model(ModelSpec {
         id: ModelId(DEEPSEEK_MODEL_ID.into()),
         endpoint: EndpointId(DEEPSEEK_ENDPOINT_ID.into()),
@@ -81,11 +105,11 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
             reasoning: None,
             structured_output: false,
         },
-        // Conservative limits used solely for the local capacity gate. They
-        // can be revised when DeepSeek publishes v4-pro's final limits.
+        // DeepSeek v4 Pro advertises a 1M-token context window. These values
+        // drive only Ygg's local capacity gate and are configurable by env.
         limits: ModelLimits {
-            context_window: 128_000,
-            max_output_tokens: 8_192,
+            context_window,
+            max_output_tokens,
         },
         pricing: None,
     })?;
@@ -371,6 +395,13 @@ mod tests {
             std::env::var("YGG_DEEPSEEK_MODEL").unwrap_or_else(|_| DEEPSEEK_MODEL_ID.into())
         );
         assert!(model.spec.capabilities.tools);
+        assert_eq!(
+            model.spec.limits.context_window,
+            std::env::var("YGG_DEEPSEEK_CONTEXT_WINDOW")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEEPSEEK_DEFAULT_CONTEXT_WINDOW)
+        );
     }
 
     #[test]

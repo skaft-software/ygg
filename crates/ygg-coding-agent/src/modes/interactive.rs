@@ -17,7 +17,8 @@ use crate::app::bootstrap::{build_app, resolve_launch_interactive, Bootstrap};
 use crate::app::{apply_reconfig, supported_levels, thinking_to_reasoning, App, Reconfig};
 use crate::commands::{self, Command};
 use crate::compaction::{
-    attempt_compaction, ensure_capacity_before_prompt, CapacityDecision, CompactionOutcome,
+    attempt_compaction, ensure_capacity_before_prompt, estimate_next_request_tokens,
+    hard_input_budget, CapacityDecision, CompactionOutcome,
 };
 use crate::config::ThinkingLevel;
 use crate::modes::RunEnded;
@@ -289,6 +290,7 @@ where
                     InputAction::Steer(_) => {
                         let text = shell.drain_editor();
                         if !text.is_empty() {
+                            shell.on_prompt_submitted(&text);
                             intents.push_back(ControlIntent::Steer(text));
                         }
                         shell.render();
@@ -296,6 +298,7 @@ where
                     InputAction::FollowUp(_) => {
                         let text = shell.drain_editor();
                         if !text.is_empty() {
+                            shell.on_prompt_submitted(&text);
                             intents.push_back(ControlIntent::FollowUp(text));
                         }
                         shell.render();
@@ -364,6 +367,10 @@ fn update_status(shell: &mut InteractiveShell, app: &App) {
         app.config.workspace.display()
     ));
     shell.set_status_detail(commands::status_text(app, None));
+    shell.set_context_estimate(
+        estimate_next_request_tokens(app, ""),
+        hard_input_budget(&app.model),
+    );
 }
 
 fn report_compaction(shell: &mut InteractiveShell, outcome: &CompactionOutcome) {
@@ -426,6 +433,7 @@ async fn apply_pending_actions(
                 shell.render();
                 let outcome = attempt_compaction(&mut app).await?;
                 report_compaction(shell, &outcome);
+                update_status(shell, &app);
             }
             PendingIdleAction::PickModel => {
                 let model = model_picker(shell, input, &app.catalog).await?;
@@ -516,6 +524,7 @@ async fn run_idle_command(
             shell.render();
             let outcome = attempt_compaction(&mut app).await?;
             report_compaction(shell, &outcome);
+            update_status(shell, &app);
         }
         Command::Unknown(text) => shell.error(format!("unknown command: {text}")),
     }
@@ -561,7 +570,13 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 shell.set_run_label("checking context…");
                 shell.render();
                 match ensure_capacity_before_prompt(&mut app, &prompt).await? {
-                    CapacityDecision::Proceed(outcome) => report_compaction(&mut shell, &outcome),
+                    CapacityDecision::Proceed(outcome) => {
+                        report_compaction(&mut shell, &outcome);
+                        shell.set_context_estimate(
+                            estimate_next_request_tokens(&app, &prompt),
+                            hard_input_budget(&app.model),
+                        );
+                    }
                     CapacityDecision::Exceeded { estimate, budget } => {
                         shell.error(format!(
                             "prompt too large: ~{estimate} tokens exceeds the {budget}-token budget even after compaction — shorten it or start a new session"
@@ -571,7 +586,9 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         continue;
                     }
                 }
-                let mut run = app.agent.prompt(prompt).await?;
+                let mut run = app.agent.prompt(prompt.clone()).await?;
+                shell.on_prompt_submitted(&prompt);
+                shell.render();
                 let control = run.control();
                 let mut quit_requested = false;
                 let ended = drive_active_run(
@@ -585,6 +602,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 )
                 .await?;
                 drop(run);
+                update_status(&mut shell, &app);
                 shell.set_run_label(&format!("run: {ended:?}"));
                 if quit_requested {
                     break;
