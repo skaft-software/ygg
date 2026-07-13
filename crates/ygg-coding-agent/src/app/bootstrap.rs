@@ -3,10 +3,10 @@
 use std::path::PathBuf;
 
 use ygg_agent::{
-    Agent, AgentConfig, CoreTools, EditTool, ExecTool, ExtensionHost, ReadTool, SearchTool,
-    Session, Tool,
+    Agent, AgentConfig, CoreTools, EditTool, EntryValue, ExecTool, ExtensionHost, ReadTool,
+    SearchTool, Session, Tool,
 };
-use ygg_ai::{AiClient, ModelCatalog, ModelId, ReasoningConfig, ToolDef};
+use ygg_ai::{AiClient, Model, ModelCatalog, ModelId, ReasoningConfig, ToolDef};
 
 use crate::app::App;
 use crate::config::{Config, ResumeSelector};
@@ -148,6 +148,75 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     })
 }
 
+/// Recreate the Agent at an idle boundary. Taking `App` by value guarantees the
+/// old Agent and its session file are dropped before a session is reopened.
+pub fn rebuild_app(
+    app: App,
+    new_model: Option<Model>,
+    new_reasoning: Option<ReasoningConfig>,
+    selection: Option<SessionSelection>,
+) -> anyhow::Result<App> {
+    let App {
+        agent,
+        model,
+        client,
+        mut config,
+        catalog,
+        sessions,
+        reasoning,
+        system,
+        system_tokens,
+        tool_schema_tokens,
+    } = app;
+    let current_path = agent.session().path().to_owned();
+    drop(agent);
+
+    let model = new_model.unwrap_or(model);
+    let reasoning = new_reasoning.unwrap_or(reasoning);
+    let mut session = match selection {
+        Some(SessionSelection::CreateNew(path)) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Session::create(path)?
+        }
+        Some(SessionSelection::OpenExisting(path)) => Session::open(path)?,
+        None => Session::open(current_path)?,
+    };
+    session.append(EntryValue::Config {
+        model: Some(model.spec.id.0.clone()),
+        reasoning: Some(crate::app::reasoning_label(&reasoning)),
+    })?;
+
+    config.model = Some(model.spec.id.clone());
+    config.reasoning = reasoning.clone();
+    let mut extensions = ExtensionHost::new();
+    extensions.load(&CoreTools);
+    let agent = Agent::new(AgentConfig {
+        client: client.clone(),
+        model: model.clone(),
+        session,
+        system: system.clone(),
+        sandbox: config.sandbox.to_sandbox_config(&config.workspace),
+        extensions,
+        max_turns: config.max_turns,
+        reasoning: reasoning.clone(),
+    })?;
+
+    Ok(App {
+        agent,
+        model,
+        client,
+        config,
+        catalog,
+        sessions,
+        reasoning,
+        system,
+        system_tokens,
+        tool_schema_tokens,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +263,51 @@ mod tests {
     fn tool_schema_reserve_is_positive_and_deterministic() {
         assert!(tool_schema_reserve() > 0);
         assert_eq!(tool_schema_reserve(), tool_schema_reserve());
+    }
+
+    fn fresh_app(directory: &std::path::Path) -> App {
+        let boot = bootstrap(config(directory, Some("gpt-4o-mini"))).unwrap();
+        let launch = resolve_launch_print(&boot, "test-session").unwrap();
+        build_app(boot, launch, "system".into()).unwrap()
+    }
+
+    #[test]
+    fn rebuild_same_session_preserves_history_and_records_provenance() {
+        use ygg_ai::{Message, UserMessage, UserPart};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = fresh_app(directory.path());
+        let entry = app
+            .agent
+            .session_mut()
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("keep me".into())],
+            })))
+            .unwrap();
+        let app = rebuild_app(app, None, None, None).unwrap();
+        assert!(app.agent.session().entry(&entry).is_some());
+        assert!(matches!(
+            app.agent
+                .session()
+                .entries()
+                .last()
+                .map(|entry| &entry.value),
+            Some(EntryValue::Config { .. })
+        ));
+    }
+
+    #[test]
+    fn rebuild_new_session_has_empty_context_and_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = fresh_app(directory.path());
+        let new_path = directory.path().join("new.jsonl");
+        let app =
+            rebuild_app(app, None, None, Some(SessionSelection::CreateNew(new_path))).unwrap();
+        assert!(app.agent.session().context().unwrap().is_empty());
+        assert_eq!(app.agent.session().entries().len(), 1);
+        assert!(matches!(
+            app.agent.session().entries()[0].value,
+            EntryValue::Config { .. }
+        ));
     }
 }

@@ -14,11 +14,12 @@ use ygg_agent::{AgentError, AgentEvent, Run, RunControl};
 use ygg_ai::{ModelId, ReasoningConfig};
 
 use crate::app::bootstrap::{build_app, Bootstrap, LaunchSelection, SessionSelection};
-use crate::app::App;
+use crate::app::{apply_reconfig, App, Reconfig};
 use crate::commands::{self, Command};
 use crate::config::{parse_reasoning, ResumeSelector};
 use crate::modes::{timestamp, RunEnded};
 use crate::tui::keymap::{self, InputAction};
+use crate::tui::pickers::session_picker;
 use crate::tui::theme::load_theme;
 use crate::tui::view::InteractiveShell;
 
@@ -316,40 +317,127 @@ where
     }
 }
 
-async fn apply_pending_actions_stub(
+fn update_status(shell: &mut InteractiveShell, app: &App) {
+    shell.set_status(&format!(
+        "{} · {} · {}",
+        app.model.spec.id.0,
+        crate::app::reasoning_label(&app.reasoning),
+        app.config.workspace.display()
+    ));
+}
+
+fn transition(app: App, shell: &mut InteractiveShell, reconfig: Reconfig) -> anyhow::Result<App> {
+    let app = apply_reconfig(app, reconfig)?;
+    shell.hydrate(app.agent.session())?;
+    update_status(shell, &app);
+    Ok(app)
+}
+
+async fn apply_pending_actions(
+    mut app: App,
     shell: &mut InteractiveShell,
+    input: &mut EventStream,
     pending_actions: &mut VecDeque<PendingIdleAction>,
-) {
+) -> anyhow::Result<App> {
     while let Some(action) = pending_actions.pop_front() {
-        shell.notice(format!("pending action reached idle boundary: {action:?}"));
+        match action {
+            PendingIdleAction::ChangeModel(id) => {
+                app = transition(app, shell, Reconfig::Model(id))?;
+                shell.notice("queued model change applied");
+            }
+            PendingIdleAction::ChangeThinking(reasoning) => {
+                app = transition(app, shell, Reconfig::Thinking(reasoning))?;
+                shell.notice("queued thinking change applied");
+            }
+            PendingIdleAction::NewSession => {
+                app = transition(app, shell, Reconfig::NewSession)?;
+                shell.notice("queued new session created");
+            }
+            PendingIdleAction::ResumeSession(Some(id)) => {
+                let path = app.sessions.by_id(&id)?.path;
+                app = transition(app, shell, Reconfig::Resume(path))?;
+                shell.notice("queued session resumed");
+            }
+            PendingIdleAction::ResumeSession(None) => {
+                if let Some(path) = session_picker(shell, input, &app.sessions).await? {
+                    app = transition(app, shell, Reconfig::Resume(path))?;
+                    shell.notice("queued session resumed");
+                }
+            }
+            PendingIdleAction::Compact => {
+                shell.notice("queued compaction will run when compaction support is initialized");
+            }
+            PendingIdleAction::PickModel => {
+                shell.notice("queued model picker will open when model selection is initialized");
+            }
+            PendingIdleAction::PickThinking => {
+                shell.notice(
+                    "queued thinking picker will open when thinking selection is initialized",
+                );
+            }
+        }
+        shell.render();
     }
-    shell.render();
+    Ok(app)
+}
+
+enum IdleCommandOutcome {
+    Continue(App),
+    Quit,
 }
 
 async fn run_idle_command(
-    app: &mut App,
+    mut app: App,
     shell: &mut InteractiveShell,
+    input: &mut EventStream,
     command: Command,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<IdleCommandOutcome> {
     match command {
         Command::Status => {
             shell.show_overlay_text(format!(
-                "model: {}\nthinking: {:?}\nworkspace: {}\nsession: {}",
+                "model: {}\nthinking: {}\nworkspace: {}\nsession: {}",
                 app.model.spec.id.0,
-                app.reasoning,
+                crate::app::reasoning_label(&app.reasoning),
                 app.config.workspace.display(),
                 app.agent.session().path().display(),
             ));
         }
         Command::Help => shell.show_overlay_text(commands::help_text()),
-        Command::Quit => return Ok(true),
+        Command::Quit => return Ok(IdleCommandOutcome::Quit),
+        Command::New => {
+            app = transition(app, shell, Reconfig::NewSession)?;
+            shell.notice("created a new session");
+        }
+        Command::Resume(Some(id)) => {
+            let path = app.sessions.by_id(&id)?.path;
+            app = transition(app, shell, Reconfig::Resume(path))?;
+            shell.notice("resumed session");
+        }
+        Command::Resume(None) => {
+            if let Some(path) = session_picker(shell, input, &app.sessions).await? {
+                app = transition(app, shell, Reconfig::Resume(path))?;
+                shell.notice("resumed session");
+            }
+        }
+        Command::Model(Some(id)) => {
+            app = transition(app, shell, Reconfig::Model(ModelId(id)))?;
+            shell.notice("model changed");
+        }
+        Command::Thinking(Some(level)) => {
+            app = transition(app, shell, Reconfig::Thinking(parse_reasoning(&level)?))?;
+            shell.notice("thinking changed");
+        }
+        Command::Model(None) => shell.notice("model picker is not available yet"),
+        Command::Thinking(None) => shell.notice("thinking picker is not available yet"),
+        Command::Theme(name) => shell.notice(match name {
+            Some(name) => format!("theme {name:?} will be available after theme discovery"),
+            None => "theme picker is not available yet".to_owned(),
+        }),
+        Command::Compact => shell.notice("compaction is not available yet"),
         Command::Unknown(text) => shell.error(format!("unknown command: {text}")),
-        command => shell.notice(format!(
-            "{command:?} is available once runtime reconfiguration is initialized"
-        )),
     }
     shell.render();
-    Ok(false)
+    Ok(IdleCommandOutcome::Continue(app))
 }
 
 /// Run the interactive frontend with explicit idle and active borrow phases.
@@ -364,12 +452,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let launch = launch_for_interactive(&boot, &timestamp())?;
     let mut app = build_app(boot, launch, BASE_SYSTEM.to_owned())?;
     shell.hydrate(app.agent.session())?;
-    shell.set_status(&format!(
-        "{} · {:?} · {}",
-        app.model.spec.id.0,
-        app.reasoning,
-        app.config.workspace.display()
-    ));
+    update_status(&mut shell, &app);
     shell.render();
 
     let mut pending_actions = VecDeque::new();
@@ -381,9 +464,12 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
         };
         match idle {
             Idle::Quit => break,
-            Idle::Command(input) => {
-                if run_idle_command(&mut app, &mut shell, commands::parse(&input)).await? {
-                    break;
+            Idle::Command(command_input) => {
+                match run_idle_command(app, &mut shell, &mut input, commands::parse(&command_input))
+                    .await?
+                {
+                    IdleCommandOutcome::Continue(next) => app = next,
+                    IdleCommandOutcome::Quit => break,
                 }
             }
             Idle::Submit(prompt) => {
@@ -402,7 +488,8 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 .await?;
                 drop(run);
                 shell.set_run_label(&format!("run: {ended:?}"));
-                apply_pending_actions_stub(&mut shell, &mut pending_actions).await;
+                app = apply_pending_actions(app, &mut shell, &mut input, &mut pending_actions)
+                    .await?;
                 if quit_requested {
                     break;
                 }

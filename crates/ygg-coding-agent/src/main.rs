@@ -4,6 +4,7 @@ mod app;
 mod cli;
 mod commands;
 mod config;
+mod hydrate;
 mod modes;
 mod session_store;
 mod tui;

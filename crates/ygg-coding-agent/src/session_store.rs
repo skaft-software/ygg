@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use ygg_agent::{EntryValue, Session};
+use ygg_ai::{Message, UserPart};
+
 static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 /// Filesystem-backed sessions scoped to one canonical workspace.
@@ -19,6 +22,38 @@ pub struct SessionMeta {
     pub path: PathBuf,
     pub modified: SystemTime,
     pub title: String,
+}
+
+/// Derive a compact title from the oldest user text on the active branch.
+pub fn active_branch_title(session: &Session) -> String {
+    let mut oldest = None;
+    let mut cursor = session.head();
+    while let Some(id) = cursor {
+        let Some(entry) = session.entry(&id) else {
+            break;
+        };
+        if let EntryValue::Message(Message::User(user)) = &entry.value {
+            if let Some(UserPart::Text(text)) = user
+                .content
+                .iter()
+                .find(|part| matches!(part, UserPart::Text(_)))
+            {
+                oldest = Some(text.clone());
+            }
+        }
+        cursor = entry.parent.clone();
+    }
+    oldest.map_or_else(|| "(empty session)".to_owned(), |title| trim_title(&title))
+}
+
+fn trim_title(title: &str) -> String {
+    const LIMIT: usize = 60;
+    let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= LIMIT {
+        return normalized;
+    }
+    let clipped = normalized.chars().take(LIMIT).collect::<String>();
+    format!("{clipped}…")
 }
 
 fn workspace_key(workspace: &Path) -> String {
@@ -66,11 +101,14 @@ impl SessionStore {
                 }
                 let id = path.file_stem()?.to_string_lossy().into_owned();
                 let modified = entry.metadata().ok()?.modified().ok()?;
+                let title = Session::open(&path)
+                    .map(|session| active_branch_title(&session))
+                    .unwrap_or_else(|_| "(unreadable session)".to_owned());
                 Some(SessionMeta {
                     id,
                     path,
                     modified,
-                    title: String::new(),
+                    title,
                 })
             })
             .collect::<Vec<_>>();
@@ -136,6 +174,38 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(15));
         std::fs::write(store.dir().join("2026-02-02T00-00-00Z-bbbb.jsonl"), b"").unwrap();
         assert_eq!(store.latest().unwrap().id, "2026-02-02T00-00-00Z-bbbb");
+    }
+
+    #[test]
+    fn active_branch_title_uses_oldest_active_user_text() {
+        use ygg_agent::{EntryValue, Session};
+        use ygg_ai::{
+            AssistantMessage, AssistantPart, Message, ModelId, Protocol, UserMessage, UserPart,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        let root = session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("active title".into())],
+            })))
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("abandoned".into())],
+                model: ModelId("m".into()),
+                protocol: Protocol::OpenAiChat,
+            })))
+            .unwrap();
+        session.checkout(root).unwrap();
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("active".into())],
+                model: ModelId("m".into()),
+                protocol: Protocol::OpenAiChat,
+            })))
+            .unwrap();
+        assert_eq!(active_branch_title(&session), "active title");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use sexy_tui_rs::{Component, TUI};
 use ygg_agent::{AgentEvent, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ToolCallId, Usage};
 
+use crate::hydrate::{hydrate_transcript, TranscriptItem};
 use crate::tui::keymap::EditAction;
 use crate::tui::terminal::{force_restore, YggTerminal};
 use crate::tui::theme::markdown_theme;
@@ -171,7 +172,8 @@ fn render_block(
             } else {
                 theme.fg("accent", "running")
             };
-            let mut lines = vec![theme.bold(&format!("Tool {} [{state}]", panel.name))];
+            let mut lines =
+                vec![theme.bold(&format!("Tool {} ({}) [{state}]", panel.name, panel.id.0))];
             if !panel.args.is_empty() && panel.args != "null" {
                 lines.push(theme.dim(&format!("  args: {}", panel.args)));
             }
@@ -429,6 +431,14 @@ impl InteractiveShell {
         self.state.borrow_mut().size = (columns, rows);
     }
 
+    pub fn columns(&self) -> u16 {
+        self.size.get().0
+    }
+
+    pub fn theme(&self) -> sexy_tui_rs::theme::Theme {
+        self.state.borrow().theme.clone()
+    }
+
     pub fn pending_is_empty(&self) -> bool {
         self.state.borrow().editor.is_empty()
     }
@@ -490,8 +500,59 @@ impl InteractiveShell {
         self.state.borrow_mut().theme = theme;
     }
 
-    /// M6 replaces this minimal hook with active-branch transcript hydration.
-    pub fn hydrate(&mut self, _session: &Session) -> Result<()> {
+    /// Rebuild the visible transcript from the session's active branch.
+    pub fn hydrate(&mut self, session: &Session) -> Result<()> {
+        let items = hydrate_transcript(session)?;
+        let mut state = self.state.borrow_mut();
+        state.transcript.clear();
+        state.tool_panels.clear();
+        state.close_streaming_blocks();
+        for item in items {
+            match item {
+                TranscriptItem::User(text) => state.transcript.push(TranscriptBlock::User(text)),
+                TranscriptItem::Assistant(text) => {
+                    state.transcript.push(TranscriptBlock::Assistant(text))
+                }
+                TranscriptItem::Reasoning(text) => {
+                    state.transcript.push(TranscriptBlock::Reasoning(text))
+                }
+                TranscriptItem::ToolCall { id, name, args } => {
+                    let index = state.transcript.len();
+                    state.transcript.push(TranscriptBlock::Tool(ToolPanel {
+                        id: id.clone(),
+                        name,
+                        args: args.to_string(),
+                        output: String::new(),
+                        finished: false,
+                        is_error: false,
+                    }));
+                    state.tool_panels.insert(id, index);
+                }
+                TranscriptItem::ToolResult { id, text, is_error } => {
+                    if let Some(panel) = state.tool_output_mut(&id) {
+                        panel.finished = true;
+                        panel.is_error = is_error;
+                        bounded_append(&mut panel.output, &text);
+                    } else {
+                        let index = state.transcript.len();
+                        state.transcript.push(TranscriptBlock::Tool(ToolPanel {
+                            id: id.clone(),
+                            name: "tool result".into(),
+                            args: String::new(),
+                            output: text,
+                            finished: true,
+                            is_error,
+                        }));
+                        state.tool_panels.insert(id, index);
+                    }
+                }
+                TranscriptItem::CompactionMarker { summary_preview } => {
+                    state
+                        .transcript
+                        .push(TranscriptBlock::Compaction(summary_preview));
+                }
+            }
+        }
         Ok(())
     }
 
