@@ -1,5 +1,9 @@
 #![allow(missing_docs)]
 
+use crate::app::{reasoning_label, App, Reconfig};
+use crate::compaction::{estimate_next_request_tokens, hard_input_budget};
+use crate::session_store::active_branch_title;
+
 /// Parsed in-TUI command. Commands are deliberately separate from shell CLI
 /// options: only editor text beginning with `/` enters this grammar.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +47,33 @@ pub fn parse(input: &str) -> Command {
     }
 }
 
+/// Detailed status text suitable for the `/status` overlay.
+pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
+    let session = app.agent.session();
+    let session_id = session
+        .path()
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("(unknown)");
+    let queue = queued
+        .map(|item| format!("{item:?}"))
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "Model: {}\nThinking: {}\nWorkspace: {}\nSession: {} — {}\nContext estimate: ~{} / {} tokens\nSandbox: edit={} process={} shell={}\nQueued reconfiguration: {}",
+        app.model.spec.id.0,
+        reasoning_label(&app.reasoning),
+        app.config.workspace.display(),
+        session_id,
+        active_branch_title(session),
+        estimate_next_request_tokens(app, ""),
+        hard_input_budget(&app.model),
+        app.config.sandbox.allow_edit,
+        app.config.sandbox.allow_process,
+        app.config.sandbox.allow_shell,
+        queue,
+    )
+}
+
 /// Concrete interaction reference shown by `/help`.
 pub fn help_text() -> String {
     [
@@ -79,5 +110,72 @@ mod tests {
         assert!(matches!(parse("hello"), Command::Unknown(_)));
         assert!(matches!(parse("/new extra"), Command::Unknown(_)));
         assert!(matches!(parse("/checkout"), Command::Unknown(_)));
+    }
+
+    fn app_for_status() -> (tempfile::TempDir, App) {
+        use crate::app::bootstrap::{bootstrap, build_app, LaunchSelection, SessionSelection};
+        use crate::config::{CompactionPolicy, Config, Mode, ResumeSelector, SandboxPolicy};
+        use ygg_ai::{ModelId, ReasoningConfig};
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            workspace: directory.path().to_owned(),
+            invocation_cwd: directory.path().to_owned(),
+            model: Some(ModelId("gpt-4o-mini".into())),
+            reasoning: ReasoningConfig::Off,
+            sandbox: SandboxPolicy::default(),
+            theme: None,
+            session_dir: directory.path().join("sessions"),
+            compaction: CompactionPolicy::default(),
+            max_turns: 40,
+            show_reasoning_in_print: false,
+            initial_prompt: None,
+            mode: Mode::Interactive,
+            resume: ResumeSelector::New,
+        };
+        let boot = bootstrap(config).unwrap();
+        let app = build_app(
+            boot,
+            LaunchSelection {
+                model: ModelId("gpt-4o-mini".into()),
+                session: SessionSelection::CreateNew(directory.path().join("session.jsonl")),
+            },
+            "system".into(),
+        )
+        .unwrap();
+        (directory, app)
+    }
+
+    #[test]
+    fn status_and_help_reference_real_runtime_features() {
+        let (_directory, app) = app_for_status();
+        let queued = Reconfig::NewSession;
+        let status = status_text(&app, Some(&queued));
+        for expected in [
+            "gpt-4o-mini",
+            "Thinking:",
+            "Workspace:",
+            "Session:",
+            "Context estimate:",
+            "edit=true process=true shell=false",
+            "NewSession",
+        ] {
+            assert!(
+                status.contains(expected),
+                "missing {expected:?} in {status}"
+            );
+        }
+        let help = help_text();
+        for expected in [
+            "Enter submits",
+            "Enter queues a follow-up",
+            "Ctrl+S steers",
+            "Ctrl+C aborts",
+            "PageUp/PageDown",
+            "Esc closes",
+            "Alt+Enter",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?}");
+        }
     }
 }

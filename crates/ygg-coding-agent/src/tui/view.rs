@@ -65,6 +65,7 @@ struct ShellState {
     transcript: Vec<TranscriptBlock>,
     editor: String,
     status: String,
+    status_detail: String,
     error: Option<String>,
     overlay: Option<String>,
     tool_panels: HashMap<ToolCallId, usize>,
@@ -427,6 +428,14 @@ impl InteractiveShell {
 
     pub fn set_status(&mut self, status: &str) {
         self.state.borrow_mut().status = status.to_owned();
+    }
+
+    pub fn set_status_detail(&mut self, detail: String) {
+        self.state.borrow_mut().status_detail = detail;
+    }
+
+    pub fn status_detail(&self) -> String {
+        self.state.borrow().status_detail.clone()
     }
 
     pub fn set_run_label(&mut self, label: &str) {

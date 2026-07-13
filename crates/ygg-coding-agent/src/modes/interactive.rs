@@ -191,9 +191,11 @@ fn handle_active_command(
 ) {
     match command {
         Command::Status => {
-            shell.show_overlay_text(
-                "Run active. Model and session status remains visible in the status bar.".into(),
-            );
+            let mut status = shell.status_detail();
+            if !queue.is_empty() {
+                status.push_str(&format!("\nQueued idle actions: {}", queue.len()));
+            }
+            shell.show_overlay_text(status);
         }
         Command::Help => shell.show_overlay_text(commands::help_text()),
         Command::Theme(Some(name)) => {
@@ -345,6 +347,7 @@ fn update_status(shell: &mut InteractiveShell, app: &App) {
         crate::app::reasoning_label(&app.reasoning),
         app.config.workspace.display()
     ));
+    shell.set_status_detail(commands::status_text(app, None));
 }
 
 fn report_compaction(shell: &mut InteractiveShell, outcome: &CompactionOutcome) {
@@ -437,15 +440,7 @@ async fn run_idle_command(
     command: Command,
 ) -> anyhow::Result<IdleCommandOutcome> {
     match command {
-        Command::Status => {
-            shell.show_overlay_text(format!(
-                "model: {}\nthinking: {}\nworkspace: {}\nsession: {}",
-                app.model.spec.id.0,
-                crate::app::reasoning_label(&app.reasoning),
-                app.config.workspace.display(),
-                app.agent.session().path().display(),
-            ));
-        }
+        Command::Status => shell.show_overlay_text(commands::status_text(&app, None)),
         Command::Help => shell.show_overlay_text(commands::help_text()),
         Command::Quit => return Ok(IdleCommandOutcome::Quit),
         Command::New => {
