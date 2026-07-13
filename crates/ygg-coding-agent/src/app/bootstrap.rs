@@ -1,13 +1,17 @@
 #![allow(missing_docs)]
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crossterm::event::EventStream;
 use ygg_agent::{
     Agent, AgentConfig, CoreTools, EditTool, EntryValue, ExecTool, ExtensionHost, ReadTool,
     SearchTool, Session, Tool,
 };
-use ygg_ai::{AiClient, Model, ModelCatalog, ModelId, ReasoningConfig, ToolDef};
+use ygg_ai::{
+    AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model, ModelCatalog, ModelId,
+    ModelLimits, ModelSpec, Protocol, ReasoningConfig, ToolDef,
+};
 
 use crate::app::{level_from_reasoning, normalize_reasoning_for_model, thinking_to_reasoning, App};
 use crate::config::{Config, ResumeSelector};
@@ -37,9 +41,61 @@ pub struct LaunchSelection {
     pub session: SessionSelection,
 }
 
+const DEEPSEEK_ENDPOINT_ID: &str = "deepseek";
+const DEEPSEEK_MODEL_ID: &str = "deepseek-v4-pro";
+const DEEPSEEK_DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1/";
+
+fn deepseek_base_url() -> anyhow::Result<url::Url> {
+    let configured = std::env::var("YGG_DEEPSEEK_BASE_URL")
+        .unwrap_or_else(|_| DEEPSEEK_DEFAULT_BASE_URL.to_owned());
+    let normalized = if configured.ends_with('/') {
+        configured
+    } else {
+        format!("{configured}/")
+    };
+    url::Url::parse(&normalized)
+        .map_err(|error| anyhow::anyhow!("invalid YGG_DEEPSEEK_BASE_URL: {error}"))
+}
+
+fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
+    let endpoint = Endpoint {
+        id: EndpointId(DEEPSEEK_ENDPOINT_ID.into()),
+        base_url: deepseek_base_url()?,
+        auth: Auth::bearer_env("DEEPSEEK_API_KEY"),
+        default_headers: http::HeaderMap::new(),
+        timeout: Duration::from_secs(120),
+    };
+    catalog.register_endpoint(endpoint)?;
+    let api_name =
+        std::env::var("YGG_DEEPSEEK_MODEL").unwrap_or_else(|_| DEEPSEEK_MODEL_ID.to_owned());
+    catalog.register_model(ModelSpec {
+        id: ModelId(DEEPSEEK_MODEL_ID.into()),
+        endpoint: EndpointId(DEEPSEEK_ENDPOINT_ID.into()),
+        api_name,
+        protocol: Protocol::OpenAiChat,
+        capabilities: Capabilities {
+            input_modalities: ModalitySet::none(),
+            output_modalities: ModalitySet::none(),
+            tools: true,
+            parallel_tool_calls: false,
+            reasoning: None,
+            structured_output: false,
+        },
+        // Conservative limits used solely for the local capacity gate. They
+        // can be revised when DeepSeek publishes v4-pro's final limits.
+        limits: ModelLimits {
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+        },
+        pricing: None,
+    })?;
+    Ok(())
+}
+
 /// Build bootstrap state from resolved configuration.
 pub fn bootstrap(config: Config) -> anyhow::Result<Bootstrap> {
-    let catalog = ModelCatalog::builtin()?;
+    let mut catalog = ModelCatalog::builtin()?;
+    register_deepseek_v4_pro(&mut catalog)?;
     let sessions = SessionStore::new(&config.session_dir, &config.workspace);
     let client = AiClient::new();
     Ok(Bootstrap {
@@ -298,6 +354,23 @@ mod tests {
         );
         assert_eq!(resolve_model_id(None, None, id("global")), id("global"));
         assert_eq!(resolve_model_id(None, None, None), None);
+    }
+
+    #[test]
+    fn deepseek_v4_pro_is_registered_as_openai_chat_with_env_auth() {
+        let directory = tempfile::tempdir().unwrap();
+        let boot = bootstrap(config(directory.path(), Some(DEEPSEEK_MODEL_ID))).unwrap();
+        let model = boot
+            .catalog
+            .resolve(&ModelId(DEEPSEEK_MODEL_ID.into()))
+            .unwrap();
+        assert_eq!(model.spec.protocol, Protocol::OpenAiChat);
+        assert_eq!(model.endpoint.id.0, DEEPSEEK_ENDPOINT_ID);
+        assert_eq!(
+            model.spec.api_name,
+            std::env::var("YGG_DEEPSEEK_MODEL").unwrap_or_else(|_| DEEPSEEK_MODEL_ID.into())
+        );
+        assert!(model.spec.capabilities.tools);
     }
 
     #[test]
