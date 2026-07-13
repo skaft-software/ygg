@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use sexy_tui_rs::theme::{capability::CapabilityTier, Theme};
-use sexy_tui_rs::widgets::{MarkdownTheme, SelectListTheme};
+use sexy_tui_rs::widgets::SelectListTheme;
 
 use crate::config::Config;
 
@@ -106,16 +106,6 @@ pub fn available_themes(config: &Config) -> Vec<String> {
     available_themes_from_dirs(&global_theme_dir(), &project_theme_dir(config))
 }
 
-/// Build sexy-tui's markdown closures from a resolved theme.
-pub fn markdown_theme(theme: &Theme) -> MarkdownTheme {
-    MarkdownTheme {
-        heading: bold_foreground(theme, "accent"),
-        bold: bold_foreground(theme, "accent"),
-        code: foreground(theme, "muted"),
-        code_block_border: foreground(theme, "accent"),
-    }
-}
-
 /// Build sexy-tui's select-list closures from a resolved theme.
 pub fn select_list_theme(theme: &Theme) -> SelectListTheme {
     SelectListTheme {
@@ -148,12 +138,6 @@ mod tests {
             mode: Mode::Interactive,
             resume: ResumeSelector::New,
         }
-    }
-
-    #[test]
-    fn markdown_theme_builds_and_preserves_text() {
-        let theme = markdown_theme(&Theme::load(None, CapabilityTier::Baseline));
-        assert!((theme.bold)("x").contains('x'));
     }
 
     #[test]

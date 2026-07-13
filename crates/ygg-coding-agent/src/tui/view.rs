@@ -5,8 +5,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use anyhow::Result;
-use sexy_tui_rs::widgets::Markdown;
-use sexy_tui_rs::{visible_width, Component, TUI};
+use sexy_tui_rs::{visible_width, wrap_text_with_ansi, Component, TUI};
 use unicode_width::UnicodeWidthChar;
 use ygg_agent::{AgentEvent, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ToolCallId, Usage};
@@ -15,7 +14,6 @@ use crate::config::Config;
 use crate::hydrate::{hydrate_transcript, TranscriptItem};
 use crate::tui::keymap::EditAction;
 use crate::tui::terminal::{force_restore, YggTerminal};
-use crate::tui::theme::markdown_theme;
 
 const MAX_PANEL_BYTES: usize = 64 * 1024;
 const ELISION_MARKER: &str = "\n… older tool output elided …\n";
@@ -202,8 +200,148 @@ fn render_block(
 }
 
 fn markdown_lines(text: &str, theme: &sexy_tui_rs::theme::Theme, width: u16) -> Vec<String> {
-    let markdown = Markdown::new(text, 1, 0, Some(markdown_theme(theme)));
-    markdown.render(width.max(1))
+    let inner_width = usize::from(width.saturating_sub(2).max(1));
+    let mut lines = Vec::new();
+    let mut in_code_block = false;
+    let mut previous_was_blank = false;
+
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_block = !in_code_block;
+            lines.push(format!(" {}", theme.fg("muted", &"─".repeat(inner_width))));
+            previous_was_blank = false;
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            // Consecutive source blank lines should not turn a compact transcript
+            // into a sparse document.
+            if !previous_was_blank {
+                lines.push(String::new());
+            }
+            previous_was_blank = true;
+            continue;
+        }
+        previous_was_blank = false;
+
+        let rendered = if in_code_block {
+            theme.fg("muted", &format!("  {raw}"))
+        } else if is_horizontal_rule(trimmed) {
+            theme.fg("muted", &"─".repeat(inner_width))
+        } else if let Some((level, heading)) = markdown_heading(trimmed) {
+            let heading = render_inline_markdown(heading, theme);
+            if level <= 2 {
+                theme.bold(&theme.fg("accent", &heading))
+            } else {
+                theme.bold(&heading)
+            }
+        } else if let Some((prefix, item)) = markdown_list_item(raw) {
+            format!(
+                "{}{}",
+                theme.fg("accent", &prefix),
+                render_inline_markdown(item, theme)
+            )
+        } else if let Some(quote) = trimmed.strip_prefix("> ") {
+            theme.dim(&format!("│ {}", render_inline_markdown(quote, theme)))
+        } else {
+            render_inline_markdown(raw, theme)
+        };
+
+        for wrapped in wrap_text_with_ansi(&rendered, inner_width) {
+            lines.push(format!(" {wrapped}"));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn is_horizontal_rule(line: &str) -> bool {
+    let compact: String = line
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    compact.len() >= 3
+        && compact
+            .chars()
+            .next()
+            .is_some_and(|marker| matches!(marker, '-' | '*' | '_'))
+        && compact
+            .chars()
+            .all(|character| character == compact.chars().next().unwrap_or_default())
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let level = line
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    if (1..=6).contains(&level) {
+        line.get(level..)
+            .and_then(|remaining| remaining.strip_prefix(' '))
+            .map(|heading| (level, heading))
+    } else {
+        None
+    }
+}
+
+fn markdown_list_item(line: &str) -> Option<(String, &str)> {
+    let indent = line.len().saturating_sub(line.trim_start().len());
+    let trimmed = line.trim_start();
+    let prefix = " ".repeat(indent);
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(item) = trimmed.strip_prefix(marker) {
+            return Some((format!("{prefix}• "), item));
+        }
+    }
+
+    let dot = trimmed.find('.')?;
+    let (number, remainder) = trimmed.split_at(dot);
+    if !number.is_empty() && number.chars().all(|character| character.is_ascii_digit()) {
+        remainder
+            .strip_prefix(". ")
+            .map(|item| (format!("{prefix}{number}. "), item))
+    } else {
+        None
+    }
+}
+
+fn render_inline_markdown(text: &str, theme: &sexy_tui_rs::theme::Theme) -> String {
+    let mut rendered = String::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        if let Some((content, rest)) =
+            delimited_markdown(remaining, "**").or_else(|| delimited_markdown(remaining, "__"))
+        {
+            rendered.push_str(&theme.bold(&render_inline_markdown(content, theme)));
+            remaining = rest;
+            continue;
+        }
+        if let Some((content, rest)) = delimited_markdown(remaining, "`") {
+            rendered.push_str(&theme.fg("muted", content));
+            remaining = rest;
+            continue;
+        }
+
+        let character = remaining
+            .chars()
+            .next()
+            .expect("remaining is checked non-empty");
+        rendered.push(character);
+        remaining = &remaining[character.len_utf8()..];
+    }
+
+    rendered
+}
+
+fn delimited_markdown<'a>(text: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> {
+    let body = text.strip_prefix(delimiter)?;
+    let end = body.find(delimiter)?;
+    Some((&body[..end], &body[end + delimiter.len()..]))
 }
 
 fn wrap_plain(text: &str, width: usize) -> Vec<String> {
@@ -987,6 +1125,27 @@ mod tests {
     #[test]
     fn plain_wrapping_is_nonempty_for_empty_text() {
         assert_eq!(wrap_plain("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn markdown_transcript_renders_common_headings_lists_code_and_rules() {
+        let theme = sexy_tui_rs::theme::Theme::load(
+            None,
+            sexy_tui_rs::theme::capability::CapabilityTier::Baseline,
+        );
+        let rendered = markdown_lines(
+            "### 🔍 **Read & Search**\n- **`read`** — inspect a file\n\n---",
+            &theme,
+            80,
+        )
+        .join("\n");
+        for marker in ["###", "**", "`", "---"] {
+            assert!(!rendered.contains(marker), "marker {marker:?} leaked");
+        }
+        assert!(rendered.contains("Read & Search"));
+        assert!(rendered.contains("read"));
+        assert!(rendered.contains('•'));
+        assert!(rendered.contains('─'));
     }
 
     #[test]
