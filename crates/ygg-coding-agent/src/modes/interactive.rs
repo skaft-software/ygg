@@ -23,8 +23,8 @@ use crate::config::ThinkingLevel;
 use crate::modes::RunEnded;
 use crate::resources::compose_instructions;
 use crate::tui::keymap::{self, InputAction};
-use crate::tui::pickers::{model_picker, session_picker, thinking_picker};
-use crate::tui::theme::load_theme;
+use crate::tui::pickers::{model_picker, session_picker, theme_picker, thinking_picker};
+use crate::tui::theme::{available_themes, load_named_theme, load_theme};
 use crate::tui::view::InteractiveShell;
 
 /// Ordered controls sent to the frozen Agent during an active run.
@@ -155,6 +155,34 @@ fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> a
     Ok(())
 }
 
+fn apply_theme(shell: &mut InteractiveShell, name: &str) -> anyhow::Result<()> {
+    let config = shell
+        .theme_config()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("theme configuration is unavailable"))?;
+    let theme = load_named_theme(name, &config)?;
+    shell.set_theme(theme);
+    shell.notice(format!("theme changed to {name}"));
+    Ok(())
+}
+
+fn active_theme_choices(shell: &mut InteractiveShell) {
+    match shell.theme_config() {
+        Some(config) => {
+            let names = available_themes(config);
+            if names.is_empty() {
+                shell.notice("no themes found under .ygg/themes or ~/.ygg/themes");
+            } else {
+                shell.show_overlay_text(format!(
+                    "Available themes:\n{}\n\nUse /theme <name> while a run is active.",
+                    names.join("\n")
+                ));
+            }
+        }
+        None => shell.error("theme configuration is unavailable".into()),
+    }
+}
+
 fn handle_active_command(
     shell: &mut InteractiveShell,
     command: Command,
@@ -168,12 +196,12 @@ fn handle_active_command(
             );
         }
         Command::Help => shell.show_overlay_text(commands::help_text()),
-        Command::Theme(name) => match name {
-            Some(name) => shell.notice(format!(
-                "theme change requested: {name} (applied when theme support is configured)"
-            )),
-            None => shell.notice("theme picker requested (available after theme discovery)"),
-        },
+        Command::Theme(Some(name)) => {
+            if let Err(error) = apply_theme(shell, &name) {
+                shell.error(error.to_string());
+            }
+        }
+        Command::Theme(None) => active_theme_choices(shell),
         Command::Quit => *quit_requested = true,
         Command::Unknown(text) => shell.error(format!("unknown command: {text}")),
         command => match queue_command(command, queue) {
@@ -456,10 +484,22 @@ async fn run_idle_command(
             app = transition(app, shell, Reconfig::Thinking(reasoning))?;
             shell.notice("thinking changed");
         }
-        Command::Theme(name) => shell.notice(match name {
-            Some(name) => format!("theme {name:?} will be available after theme discovery"),
-            None => "theme picker is not available yet".to_owned(),
-        }),
+        Command::Theme(Some(name)) => {
+            if let Err(error) = apply_theme(shell, &name) {
+                shell.error(error.to_string());
+            }
+        }
+        Command::Theme(None) => {
+            let config = shell
+                .theme_config()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("theme configuration is unavailable"))?;
+            let names = available_themes(&config);
+            let name = theme_picker(shell, input, &names).await?;
+            if let Err(error) = apply_theme(shell, &name) {
+                shell.error(error.to_string());
+            }
+        }
         Command::Compact => {
             shell.set_run_label("compacting…");
             shell.render();
@@ -478,6 +518,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let theme = load_theme(&boot.config);
     let size = Rc::new(Cell::new(crossterm::terminal::size().unwrap_or((80, 24))));
     let mut shell = InteractiveShell::enter(theme, size)?;
+    shell.set_theme_config(boot.config.clone());
     let mut input = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(80));
 

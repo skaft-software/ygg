@@ -130,6 +130,26 @@ fn session_select_item(session: &SessionMeta) -> SelectItem {
     }
 }
 
+/// Ask the user to select an installed theme name.
+pub async fn theme_picker(
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    names: &[String],
+) -> anyhow::Result<String> {
+    let items = names
+        .iter()
+        .map(|name| SelectItem {
+            value: name.clone(),
+            label: name.clone(),
+            description: None,
+        })
+        .collect::<Vec<_>>();
+    let index = pick_from(shell, input, items)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("theme selection cancelled"))?;
+    Ok(names[index].clone())
+}
+
 /// Ask the user to select a capability-supported thinking level.
 pub async fn thinking_picker(
     shell: &mut InteractiveShell,

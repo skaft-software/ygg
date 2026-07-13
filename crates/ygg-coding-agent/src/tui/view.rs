@@ -10,6 +10,7 @@ use sexy_tui_rs::{Component, TUI};
 use ygg_agent::{AgentEvent, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ToolCallId, Usage};
 
+use crate::config::Config;
 use crate::hydrate::{hydrate_transcript, TranscriptItem};
 use crate::tui::keymap::EditAction;
 use crate::tui::terminal::{force_restore, YggTerminal};
@@ -299,6 +300,7 @@ pub struct InteractiveShell {
     tui: TUI<'static>,
     state: Rc<RefCell<ShellState>>,
     size: Rc<Cell<(u16, u16)>>,
+    theme_config: Option<Config>,
 }
 
 impl InteractiveShell {
@@ -315,7 +317,12 @@ impl InteractiveShell {
             state: state.clone(),
         }));
         tui.start();
-        Ok(Self { tui, state, size })
+        Ok(Self {
+            tui,
+            state,
+            size,
+            theme_config: None,
+        })
     }
 
     /// Stop rendering and restore the process terminal.
@@ -437,6 +444,14 @@ impl InteractiveShell {
 
     pub fn theme(&self) -> sexy_tui_rs::theme::Theme {
         self.state.borrow().theme.clone()
+    }
+
+    pub fn set_theme_config(&mut self, config: Config) {
+        self.theme_config = Some(config);
+    }
+
+    pub fn theme_config(&self) -> Option<&Config> {
+        self.theme_config.as_ref()
     }
 
     pub fn pending_is_empty(&self) -> bool {
