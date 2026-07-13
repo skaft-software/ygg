@@ -13,6 +13,18 @@ pub type TerminalSize = Rc<Cell<(u16, u16)>>;
 
 static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+fn normalize_line_endings(data: &str, last_was_cr: &mut bool) -> String {
+    let mut normalized = String::with_capacity(data.len().saturating_add(8));
+    for character in data.chars() {
+        if character == '\n' && !*last_was_cr {
+            normalized.push('\r');
+        }
+        normalized.push(character);
+        *last_was_cr = character == '\r';
+    }
+    normalized
+}
+
 /// Restore the process terminal state. Repeated calls are harmless.
 pub fn force_restore() {
     if RAW_ACTIVE.swap(false, Ordering::SeqCst) {
@@ -40,6 +52,7 @@ pub fn install_panic_hook() {
 pub struct YggTerminal {
     out: Stdout,
     size: TerminalSize,
+    last_was_cr: bool,
 }
 
 impl YggTerminal {
@@ -68,7 +81,11 @@ impl YggTerminal {
         let mut out = std::io::stdout();
         execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
         size.set(terminal::size().unwrap_or(size.get()));
-        Ok(Self { out, size })
+        Ok(Self {
+            out,
+            size,
+            last_was_cr: false,
+        })
     }
 }
 
@@ -88,7 +105,12 @@ impl sexy_tui_rs::Terminal for YggTerminal {
     }
 
     fn write(&mut self, data: &str) {
-        let _ = self.out.write_all(data.as_bytes());
+        // sexy-tui writes each rendered line and its `\n` separately. In raw
+        // mode LF alone advances vertically but does not reliably return to
+        // column zero, which corrupts differential frames. Normalize to CRLF
+        // at this terminal boundary while preserving existing CRLF sequences.
+        let normalized = normalize_line_endings(data, &mut self.last_was_cr);
+        let _ = self.out.write_all(normalized.as_bytes());
         let _ = self.out.flush();
     }
 
@@ -145,6 +167,18 @@ mod tests {
         force_restore();
         force_restore();
         assert!(!RAW_ACTIVE.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn output_newlines_return_to_column_zero_across_write_calls() {
+        let mut last_was_cr = false;
+        assert_eq!(normalize_line_endings("line", &mut last_was_cr), "line");
+        assert_eq!(
+            normalize_line_endings("\nnext", &mut last_was_cr),
+            "\r\nnext"
+        );
+        assert_eq!(normalize_line_endings("\r", &mut last_was_cr), "\r");
+        assert_eq!(normalize_line_endings("\n", &mut last_was_cr), "\n");
     }
 
     #[test]
