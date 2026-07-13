@@ -24,8 +24,8 @@ ygg-agent = { path = "../ygg-agent" }
 # [patch.'https://github.com/achuthanmukundan00/sexy-tui-rs']
 # sexy-tui-rs = { path = "../../../../achuthanmukundan00/sexy-tui-rs-rust-port" }
 sexy-tui-rs = { git = "https://github.com/achuthanmukundan00/sexy-tui-rs", rev = "cc228b0f3b9032d86e16e0a3a7cb3ed1db194b4d" }
-tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "process", "sync"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "process", "sync", "net"] }
+crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
 clap = { version = "4", features = ["derive"] }
@@ -37,6 +37,13 @@ anyhow = "1"
 url = "2"
 http = "1"
 unicode-width = "0.2"
+# Codex OAuth (Sign in with ChatGPT): token exchange/refresh, PKCE, and JWT
+# claim decoding. reqwest is pinned to match ygg-ai's rustls-only stack.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

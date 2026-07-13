@@ -65,6 +65,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                Some(Ok(Event::Paste(text))) => {
+                    key_log.push(format!("paste event: {text:?}"));
+                }
                 Some(Ok(Event::Resize(columns, rows))) => {
                     key_log.push(format!("resize event: {columns}x{rows}"));
                     tui.request_render();

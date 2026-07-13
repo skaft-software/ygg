@@ -1,8 +1,11 @@
 #![allow(missing_docs)]
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use sexy_tui_rs::{visible_width, wrap_text_with_ansi, Component, TUI};
@@ -14,9 +17,10 @@ use crate::commands;
 use crate::config::Config;
 use crate::hydrate::{hydrate_transcript, TranscriptItem};
 use crate::tui::keymap::EditAction;
-use crate::tui::terminal::{force_restore, YggTerminal};
+use crate::tui::terminal::{force_restore, TerminalSize, YggTerminal};
 
 const MAX_PANEL_BYTES: usize = 64 * 1024;
+const RENDER_INTERVAL: Duration = Duration::from_millis(16);
 const ELISION_MARKER: &str = "\n… older tool output elided …\n";
 const PROMPT_CURSOR: &str = "▎";
 
@@ -60,10 +64,43 @@ struct ToolPanel {
     is_error: bool,
 }
 
+#[derive(Clone, Debug)]
+struct TranscriptCache {
+    width: Option<u16>,
+    lines: Vec<String>,
+    block_starts: Vec<usize>,
+    block_lengths: Vec<usize>,
+    block_revisions: Vec<u64>,
+    dirty: bool,
+    generation: u64,
+}
+
+impl Default for TranscriptCache {
+    fn default() -> Self {
+        Self {
+            width: None,
+            lines: Vec::new(),
+            block_starts: Vec::new(),
+            block_lengths: Vec::new(),
+            block_revisions: Vec::new(),
+            dirty: true,
+            generation: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct ShellState {
     theme: sexy_tui_rs::theme::Theme,
     transcript: Vec<TranscriptBlock>,
+    /// Monotonic revisions let the renderer update only blocks whose text or
+    /// tool output changed.
+    block_revisions: Vec<u64>,
+    /// Steering messages accepted while a run is active but not yet injected.
+    steering_queue: Vec<String>,
+    /// Cached wrapped transcript lines. Scrolling only slices this cache rather
+    /// than markdown-rendering the complete history for every wheel event.
+    transcript_cache: RefCell<TranscriptCache>,
     editor: String,
     /// Byte offset into `editor`; always kept at a UTF-8 character boundary.
     editor_cursor: usize,
@@ -82,33 +119,135 @@ struct ShellState {
 }
 
 impl ShellState {
+    fn invalidate_transcript(&mut self) {
+        self.transcript_cache.get_mut().dirty = true;
+    }
+
+    fn invalidate_transcript_layout(&mut self) {
+        let cache = self.transcript_cache.get_mut();
+        cache.width = None;
+        cache.dirty = true;
+    }
+
+    fn push_block(&mut self, block: TranscriptBlock) {
+        self.transcript.push(block);
+        self.block_revisions.push(0);
+        self.invalidate_transcript();
+    }
+
+    fn touch_block(&mut self, index: usize) {
+        if let Some(revision) = self.block_revisions.get_mut(index) {
+            *revision = revision.saturating_add(1);
+        }
+        self.invalidate_transcript();
+    }
+
+    fn rendered_transcript(&self, width: u16) -> Ref<'_, Vec<String>> {
+        let stale = self.transcript_cache.borrow().dirty;
+        if stale {
+            let mut cache = self.transcript_cache.borrow_mut();
+            let rebuild =
+                cache.width != Some(width) || cache.block_revisions.len() > self.transcript.len();
+
+            if rebuild {
+                cache.lines.clear();
+                cache.block_starts.clear();
+                cache.block_lengths.clear();
+                cache.block_revisions.clear();
+                cache.width = Some(width);
+
+                for (index, block) in self.transcript.iter().enumerate() {
+                    let rendered = render_block(block, &self.theme, width);
+                    let start = cache.lines.len();
+                    let length = rendered.len();
+                    cache.lines.extend(rendered);
+                    cache.block_starts.push(start);
+                    cache.block_lengths.push(length);
+                    cache.block_revisions.push(self.block_revisions[index]);
+                }
+            } else {
+                // New blocks are appended in normal operation. Render them
+                // once and leave every existing block's layout untouched.
+                while cache.block_revisions.len() < self.transcript.len() {
+                    let index = cache.block_revisions.len();
+                    let rendered = render_block(&self.transcript[index], &self.theme, width);
+                    let start = cache.lines.len();
+                    let length = rendered.len();
+                    cache.lines.extend(rendered);
+                    cache.block_starts.push(start);
+                    cache.block_lengths.push(length);
+                    cache.block_revisions.push(self.block_revisions[index]);
+                }
+
+                for index in 0..self.transcript.len() {
+                    if cache.block_revisions[index] == self.block_revisions[index] {
+                        continue;
+                    }
+                    let start = cache.block_starts[index];
+                    let old_length = cache.block_lengths[index];
+                    let rendered = render_block(&self.transcript[index], &self.theme, width);
+                    let new_length = rendered.len();
+                    cache.lines.splice(start..start + old_length, rendered);
+                    cache.block_lengths[index] = new_length;
+                    cache.block_revisions[index] = self.block_revisions[index];
+
+                    let delta = new_length as isize - old_length as isize;
+                    if delta != 0 {
+                        for following in cache.block_starts.iter_mut().skip(index + 1) {
+                            if delta > 0 {
+                                *following += delta as usize;
+                            } else {
+                                *following = following.saturating_sub((-delta) as usize);
+                            }
+                        }
+                    }
+                }
+            }
+
+            cache.dirty = false;
+            cache.generation = cache.generation.saturating_add(1);
+        }
+        Ref::map(self.transcript_cache.borrow(), |cache| &cache.lines)
+    }
+
     fn append_text_block(&mut self, channel: OutputChannel, text: &str) {
-        let active = match channel {
-            OutputChannel::Text => &mut self.active_text,
-            OutputChannel::Reasoning => &mut self.active_reasoning,
+        let active_index = match channel {
+            OutputChannel::Text => self.active_text,
+            OutputChannel::Reasoning => self.active_reasoning,
         };
-        if let Some(index) = *active {
-            match self.transcript.get_mut(index) {
+        if let Some(index) = active_index {
+            let updated = match self.transcript.get_mut(index) {
                 Some(TranscriptBlock::Assistant(existing)) if channel == OutputChannel::Text => {
                     existing.push_str(text);
-                    return;
+                    true
                 }
                 Some(TranscriptBlock::Reasoning(existing))
                     if channel == OutputChannel::Reasoning =>
                 {
                     existing.push_str(text);
-                    return;
+                    true
                 }
-                _ => *active = None,
+                _ => false,
+            };
+            if updated {
+                self.touch_block(index);
+                return;
+            }
+            match channel {
+                OutputChannel::Text => self.active_text = None,
+                OutputChannel::Reasoning => self.active_reasoning = None,
             }
         }
 
         let index = self.transcript.len();
-        self.transcript.push(match channel {
+        self.push_block(match channel {
             OutputChannel::Text => TranscriptBlock::Assistant(text.to_owned()),
             OutputChannel::Reasoning => TranscriptBlock::Reasoning(text.to_owned()),
         });
-        *active = Some(index);
+        match channel {
+            OutputChannel::Text => self.active_text = Some(index),
+            OutputChannel::Reasoning => self.active_reasoning = Some(index),
+        }
     }
 
     fn close_streaming_blocks(&mut self) {
@@ -118,6 +257,7 @@ impl ShellState {
 
     fn tool_output_mut(&mut self, id: &ToolCallId) -> Option<&mut ToolPanel> {
         let index = *self.tool_panels.get(id)?;
+        self.touch_block(index);
         match self.transcript.get_mut(index) {
             Some(TranscriptBlock::Tool(panel)) => Some(panel),
             _ => None,
@@ -125,10 +265,76 @@ impl ShellState {
     }
 }
 
+/// Thread-safe handle to the mutable shell model. The TUI renderer owns a
+/// clone of this handle and performs all expensive layout work away from the
+/// async agent/input loop.
+#[derive(Clone)]
+struct SharedState(Arc<Mutex<ShellState>>);
+
+impl SharedState {
+    fn new(state: ShellState) -> Self {
+        Self(Arc::new(Mutex::new(state)))
+    }
+
+    fn borrow(&self) -> MutexGuard<'_, ShellState> {
+        self.0.lock().expect("shell state mutex poisoned")
+    }
+
+    fn borrow_mut(&self) -> MutexGuard<'_, ShellState> {
+        self.0.lock().expect("shell state mutex poisoned")
+    }
+}
+
+enum RenderCommand {
+    Render,
+    Stop,
+}
+
+fn render_loop(terminal: YggTerminal, state: SharedState, rx: Receiver<RenderCommand>) {
+    let mut tui = TUI::new(Box::new(terminal));
+    tui.add_child(Box::new(ShellComponent { state }));
+    tui.start();
+
+    let mut last_render: Option<Instant> = None;
+    while let Ok(command) = rx.recv() {
+        if matches!(command, RenderCommand::Stop) {
+            break;
+        }
+
+        // Keep rendering bounded to one frame per 16 ms. The channel is
+        // bounded too, so a burst of model deltas coalesces into the latest
+        // state instead of queueing unbounded full-frame work.
+        if let Some(last) = last_render {
+            let elapsed = last.elapsed();
+            if elapsed < RENDER_INTERVAL {
+                thread::sleep(RENDER_INTERVAL - elapsed);
+            }
+        }
+
+        // Discard redundant render requests. The shared state already holds
+        // the newest transcript, so only the final request matters.
+        let mut stop = false;
+        while let Ok(next) = rx.try_recv() {
+            if matches!(next, RenderCommand::Stop) {
+                stop = true;
+                break;
+            }
+        }
+        if stop {
+            break;
+        }
+
+        tui.request_render();
+        last_render = Some(Instant::now());
+    }
+
+    tui.stop();
+}
+
 /// The retained root component. It reads the shell state at render time, while
 /// `InteractiveShell` mutates that same state in response to events.
 struct ShellComponent {
-    state: Rc<RefCell<ShellState>>,
+    state: SharedState,
 }
 
 impl Component for ShellComponent {
@@ -395,6 +601,13 @@ fn editor_wrap_width(width: u16) -> usize {
     prompt_content_width(width).saturating_sub(1).max(1)
 }
 
+/// Normalize terminal paste line endings before placing them in the editor.
+/// Bracketed paste must never submit the prompt or turn CRLF into visual `\r`
+/// characters in a multi-line editor.
+fn normalize_paste(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn editor_layout(text: &str, cursor: usize, width: u16) -> EditorLayout {
     let mut cursor = cursor.min(text.len());
     while cursor > 0 && !text.is_char_boundary(cursor) {
@@ -578,20 +791,56 @@ fn render_slash_suggestions(state: &ShellState, width: u16, max_rows: usize) -> 
     lines
 }
 
-fn transcript_lines(state: &ShellState, width: u16) -> Vec<String> {
-    let mut lines = Vec::new();
-    for block in &state.transcript {
-        lines.extend(render_block(block, &state.theme, width));
+fn render_pending_steering(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
+    if state.steering_queue.is_empty() || max_rows == 0 {
+        return Vec::new();
     }
+
+    let mut lines = vec![state.theme.dim(&format!(
+        "  Queued steering ({})",
+        state.steering_queue.len()
+    ))];
+    let item_rows = max_rows.saturating_sub(1);
+    if item_rows == 0 {
+        return lines;
+    }
+
+    let available_width = usize::from(width).saturating_sub(1);
+    let visible = state.steering_queue.len().min(item_rows);
+    for message in state.steering_queue.iter().take(visible) {
+        // Keep each queued message on one predictable row so a burst of
+        // steering prompts cannot consume the whole transcript viewport.
+        let compact = message.replace(['\r', '\n'], " ↵ ");
+        let line = sexy_tui_rs::truncate_to_width(
+            &format!("  Steering: {compact}"),
+            available_width,
+            None,
+        );
+        lines.push(state.theme.dim(&line));
+    }
+    let hidden = state.steering_queue.len().saturating_sub(visible);
+    if hidden > 0 {
+        lines.push(
+            state
+                .theme
+                .dim(&format!("  … {hidden} more steering messages")),
+        );
+    }
+    lines.truncate(max_rows);
     lines
 }
 
+fn transcript_lines(state: &ShellState, width: u16) -> Ref<'_, Vec<String>> {
+    state.rendered_transcript(width)
+}
+
 fn max_scroll_for_available(transcript_len: usize, available: usize) -> usize {
-    // A scrolled viewport reserves one line for its return-to-live indicator.
-    if available <= 1 {
+    // A scrolled viewport reserves one line for its return-to-live indicator,
+    // but an exactly-full transcript still has no hidden content to scroll.
+    if available <= 1 || transcript_len <= available {
         0
     } else {
-        transcript_len.saturating_sub(available - 1)
+        transcript_len - (available - 1)
     }
 }
 
@@ -600,17 +849,25 @@ fn max_scroll_from_bottom(state: &ShellState, width: u16) -> usize {
         return 0;
     }
     let rows = usize::from(state.size.1.max(5));
-    let header_lines = 1 + usize::from(state.error.is_some());
-    let suggestion_budget = rows.saturating_sub(header_lines).saturating_sub(4);
+    // Status bar + optional error line are fixed rows below the prompt box.
+    let fixed_bottom = 1 + usize::from(state.error.is_some());
+    let pending_budget = rows.saturating_sub(fixed_bottom).saturating_sub(4);
+    let pending = render_pending_steering(state, width, pending_budget);
+    let suggestion_budget = rows
+        .saturating_sub(fixed_bottom)
+        .saturating_sub(pending.len())
+        .saturating_sub(4);
     let suggestions = render_slash_suggestions(state, width, suggestion_budget);
     let prompt_max_rows = rows
-        .saturating_sub(header_lines)
+        .saturating_sub(fixed_bottom)
+        .saturating_sub(pending.len())
         .saturating_sub(suggestions.len())
         .saturating_sub(3)
         .max(1);
     let prompt_height = render_prompt_box(state, width, prompt_max_rows).len();
     let available = rows
-        .saturating_sub(header_lines)
+        .saturating_sub(fixed_bottom)
+        .saturating_sub(pending.len())
         .saturating_sub(suggestions.len())
         .saturating_sub(prompt_height);
     max_scroll_for_available(transcript_lines(state, width).len(), available)
@@ -620,6 +877,7 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
     let rows = usize::from(state.size.1.max(5));
     let mut lines = Vec::new();
 
+    // Build the status bar line (rendered below the prompt box).
     let mut status = state.status.clone();
     if !state.run_label.is_empty() {
         if !status.is_empty() {
@@ -645,11 +903,14 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
     if status.is_empty() {
         status = "ygg".to_owned();
     }
-    lines.push(state.theme.bold(&state.theme.fg("accent", &status)));
+    let status_line = state.theme.bold(&state.theme.fg("accent", &status));
+    let error_line = state
+        .error
+        .as_ref()
+        .map(|e| state.theme.fg("error", &format!("Error: {e}")));
 
-    if let Some(error) = &state.error {
-        lines.push(state.theme.fg("error", &format!("Error: {error}")));
-    }
+    // Fixed rows consumed below the prompt box.
+    let fixed_bottom = 1 + usize::from(error_line.is_some());
 
     if let Some(overlay) = &state.overlay {
         lines.push(state.theme.bold(&state.theme.fg("accent", "─ overlay ─")));
@@ -657,21 +918,41 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
             lines.push(format!(" {line}"));
         }
         lines.push(state.theme.dim("Press Esc or any printable key to close."));
-        let prompt_max_rows = rows.saturating_sub(lines.len()).saturating_sub(2).max(1);
+        let pending_budget = rows
+            .saturating_sub(lines.len() + fixed_bottom)
+            .saturating_sub(2);
+        let pending = render_pending_steering(state, width, pending_budget);
+        let prompt_max_rows = rows
+            .saturating_sub(lines.len() + fixed_bottom)
+            .saturating_sub(pending.len())
+            .saturating_sub(2)
+            .max(1);
+        lines.extend(pending);
         lines.extend(render_prompt_box(state, width, prompt_max_rows));
+        lines.push(status_line);
+        if let Some(err) = error_line {
+            lines.push(err);
+        }
         return lines;
     }
 
-    let suggestion_budget = rows.saturating_sub(lines.len()).saturating_sub(4);
+    let pending_budget = rows.saturating_sub(fixed_bottom).saturating_sub(4);
+    let pending = render_pending_steering(state, width, pending_budget);
+    let suggestion_budget = rows
+        .saturating_sub(fixed_bottom)
+        .saturating_sub(pending.len())
+        .saturating_sub(4);
     let suggestions = render_slash_suggestions(state, width, suggestion_budget);
     let prompt_max_rows = rows
-        .saturating_sub(lines.len())
+        .saturating_sub(fixed_bottom)
+        .saturating_sub(pending.len())
         .saturating_sub(suggestions.len())
         .saturating_sub(3)
         .max(1);
     let prompt = render_prompt_box(state, width, prompt_max_rows);
     let available = rows
-        .saturating_sub(lines.len())
+        .saturating_sub(fixed_bottom)
+        .saturating_sub(pending.len())
         .saturating_sub(suggestions.len())
         .saturating_sub(prompt.len());
     let transcript = transcript_lines(state, width);
@@ -689,84 +970,132 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
                 .dim("↑ scrolled transcript (mouse/trackpad or PageDown returns to live)"),
         );
     }
+    lines.extend(pending);
     lines.extend(suggestions);
     lines.extend(prompt);
+    lines.push(status_line);
+    if let Some(err) = error_line {
+        lines.push(err);
+    }
     lines
 }
 
 /// Full-screen terminal shell. It owns all terminal I/O and no Agent state.
 pub struct InteractiveShell {
-    tui: TUI<'static>,
-    state: Rc<RefCell<ShellState>>,
-    size: Rc<Cell<(u16, u16)>>,
+    // Production rendering runs on a dedicated OS thread. Tests keep an
+    // inline TUI so they can inspect rendering deterministically without a
+    // background thread.
+    tui: Option<TUI<'static>>,
+    state: SharedState,
+    size: TerminalSize,
+    render_tx: Option<SyncSender<RenderCommand>>,
+    render_thread: Option<JoinHandle<()>>,
     theme_config: Option<Config>,
 }
 
 impl InteractiveShell {
-    /// Enter alternate-screen raw mode and start the retained TUI.
-    pub fn enter(theme: sexy_tui_rs::theme::Theme, size: Rc<Cell<(u16, u16)>>) -> Result<Self> {
+    /// Enter alternate-screen raw mode and start the retained TUI renderer.
+    pub fn enter(theme: sexy_tui_rs::theme::Theme, size: TerminalSize) -> Result<Self> {
         let terminal = YggTerminal::enter_with_size(size.clone())?;
-        let state = Rc::new(RefCell::new(ShellState {
+        let initial_size = *size.lock().expect("terminal size mutex poisoned");
+        let state = SharedState::new(ShellState {
             theme,
-            size: size.get(),
+            size: initial_size,
             ..ShellState::default()
-        }));
-        let mut tui = TUI::new(Box::new(terminal));
-        tui.add_child(Box::new(ShellComponent {
-            state: state.clone(),
-        }));
-        tui.start();
+        });
+        let (render_tx, render_rx) = mpsc::sync_channel(1);
+        let render_state = state.clone();
+        let render_thread = thread::Builder::new()
+            .name("ygg-tui-render".to_owned())
+            .spawn(move || render_loop(terminal, render_state, render_rx))?;
+
         Ok(Self {
-            tui,
+            tui: None,
             state,
             size,
+            render_tx: Some(render_tx),
+            render_thread: Some(render_thread),
             theme_config: None,
         })
     }
 
     #[cfg(test)]
     pub fn test_shell() -> Self {
-        let size = Rc::new(Cell::new((120, 40)));
-        let state = Rc::new(RefCell::new(ShellState {
+        let size = Arc::new(Mutex::new((120, 40)));
+        let initial_size = *size.lock().expect("terminal size mutex poisoned");
+        let state = SharedState::new(ShellState {
             theme: sexy_tui_rs::theme::Theme::load(
                 None,
                 sexy_tui_rs::theme::capability::CapabilityTier::Baseline,
             ),
-            size: size.get(),
+            size: initial_size,
             ..ShellState::default()
-        }));
+        });
         let mut tui = TUI::new(Box::new(TestTerminal { size: size.clone() }));
         tui.add_child(Box::new(ShellComponent {
             state: state.clone(),
         }));
         tui.start();
         Self {
-            tui,
+            tui: Some(tui),
             state,
             size,
+            render_tx: None,
+            render_thread: None,
             theme_config: None,
+        }
+    }
+
+    fn stop_renderer(&mut self) {
+        if let Some(render_tx) = self.render_tx.take() {
+            let _ = render_tx.send(RenderCommand::Stop);
+        }
+        if let Some(render_thread) = self.render_thread.take() {
+            let _ = render_thread.join();
+        }
+        if let Some(mut tui) = self.tui.take() {
+            tui.stop();
         }
     }
 
     /// Stop rendering and restore the process terminal.
     pub fn leave(mut self) {
-        self.tui.stop();
+        self.stop_renderer();
         force_restore();
     }
 
-    /// Render the updated retained view.
+    /// Queue a retained-frame render without doing layout on the async loop.
+    /// The bounded renderer queue coalesces bursts of model/tool events.
     pub fn render(&mut self) {
-        self.tui.request_render();
+        if let Some(render_tx) = &self.render_tx {
+            let _ = render_tx.try_send(RenderCommand::Render);
+        } else if let Some(tui) = self.tui.as_mut() {
+            tui.request_render();
+        }
     }
 
     pub fn on_agent_event(&mut self, event: &AgentEvent) {
         let mut state = self.state.borrow_mut();
         match event {
             AgentEvent::OutputDelta { channel, text } => state.append_text_block(*channel, text),
+            AgentEvent::SteeringDelivered { messages } => {
+                state.close_streaming_blocks();
+                for message in messages {
+                    if let Some(index) = state
+                        .steering_queue
+                        .iter()
+                        .position(|queued| queued == message)
+                    {
+                        state.steering_queue.remove(index);
+                        state.push_block(TranscriptBlock::User(message.clone()));
+                    }
+                }
+                state.scroll_from_bottom = 0;
+            }
             AgentEvent::ToolStarted { id, name, args } => {
                 state.close_streaming_blocks();
                 let index = state.transcript.len();
-                state.transcript.push(TranscriptBlock::Tool(ToolPanel {
+                state.push_block(TranscriptBlock::Tool(ToolPanel {
                     id: id.clone(),
                     name: name.clone(),
                     args: args.to_string(),
@@ -842,10 +1171,38 @@ impl InteractiveShell {
     pub fn on_prompt_submitted(&mut self, prompt: &str) {
         let mut state = self.state.borrow_mut();
         state.close_streaming_blocks();
-        state
-            .transcript
-            .push(TranscriptBlock::User(prompt.to_owned()));
+        state.push_block(TranscriptBlock::User(prompt.to_owned()));
         state.scroll_from_bottom = 0;
+    }
+
+    /// Keep a steering message in the pending area until the Agent reports
+    /// that it has appended the message at the next model-turn boundary.
+    pub fn queue_steering(&mut self, message: &str) {
+        if message.is_empty() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        state.steering_queue.push(message.to_owned());
+        state.scroll_from_bottom = 0;
+    }
+
+    /// Move undelivered steering messages back into the editor. This is used
+    /// when an active run is aborted before the Agent can consume its queue.
+    pub fn restore_queued_steering(&mut self) {
+        let mut state = self.state.borrow_mut();
+        if state.steering_queue.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut state.steering_queue).join("\n\n");
+        let current = std::mem::take(&mut state.editor);
+        state.editor = if current.trim().is_empty() {
+            queued
+        } else if queued.is_empty() {
+            current
+        } else {
+            format!("{queued}\\n\\n{current}")
+        };
+        state.editor_cursor = state.editor.len();
     }
 
     pub fn apply_edit(&mut self, action: EditAction) {
@@ -856,6 +1213,12 @@ impl InteractiveShell {
                 let cursor = state.editor_cursor;
                 state.editor.insert(cursor, character);
                 state.editor_cursor = cursor + character.len_utf8();
+            }
+            EditAction::Paste(text) => {
+                let pasted = normalize_paste(&text);
+                let cursor = state.editor_cursor;
+                state.editor.insert_str(cursor, &pasted);
+                state.editor_cursor = cursor + pasted.len();
             }
             EditAction::Backspace => {
                 if state.editor_cursor > 0 {
@@ -946,7 +1309,7 @@ impl InteractiveShell {
     }
 
     pub fn set_size(&mut self, columns: u16, rows: u16) {
-        self.size.set((columns, rows));
+        *self.size.lock().expect("terminal size mutex poisoned") = (columns, rows);
         let mut state = self.state.borrow_mut();
         state.size = (columns, rows);
         let maximum = max_scroll_from_bottom(&state, columns);
@@ -954,7 +1317,7 @@ impl InteractiveShell {
     }
 
     pub fn columns(&self) -> u16 {
-        self.size.get().0
+        self.size.lock().expect("terminal size mutex poisoned").0
     }
 
     pub fn theme(&self) -> sexy_tui_rs::theme::Theme {
@@ -1032,21 +1395,19 @@ impl InteractiveShell {
     }
 
     pub fn notice(&mut self, message: impl Into<String>) {
-        self.state
-            .borrow_mut()
-            .transcript
-            .push(TranscriptBlock::Notice(message.into()));
+        let mut state = self.state.borrow_mut();
+        state.push_block(TranscriptBlock::Notice(message.into()));
     }
 
     pub fn compaction_marker(&mut self, summary: impl Into<String>) {
-        self.state
-            .borrow_mut()
-            .transcript
-            .push(TranscriptBlock::Compaction(summary.into()));
+        let mut state = self.state.borrow_mut();
+        state.push_block(TranscriptBlock::Compaction(summary.into()));
     }
 
     pub fn set_theme(&mut self, theme: sexy_tui_rs::theme::Theme) {
-        self.state.borrow_mut().theme = theme;
+        let mut state = self.state.borrow_mut();
+        state.theme = theme;
+        state.invalidate_transcript_layout();
     }
 
     /// Rebuild the visible transcript from the session's active branch.
@@ -1054,20 +1415,26 @@ impl InteractiveShell {
         let items = hydrate_transcript(session)?;
         let mut state = self.state.borrow_mut();
         state.transcript.clear();
+        state.block_revisions.clear();
+        state.invalidate_transcript_layout();
+        state.steering_queue.clear();
         state.tool_panels.clear();
         state.close_streaming_blocks();
+        state.scroll_from_bottom = 0;
+        state.last_turn_usage = None;
+        state.error = None;
         for item in items {
             match item {
-                TranscriptItem::User(text) => state.transcript.push(TranscriptBlock::User(text)),
+                TranscriptItem::User(text) => state.push_block(TranscriptBlock::User(text)),
                 TranscriptItem::Assistant(text) => {
-                    state.transcript.push(TranscriptBlock::Assistant(text))
+                    state.push_block(TranscriptBlock::Assistant(text))
                 }
                 TranscriptItem::Reasoning(text) => {
-                    state.transcript.push(TranscriptBlock::Reasoning(text))
+                    state.push_block(TranscriptBlock::Reasoning(text))
                 }
                 TranscriptItem::ToolCall { id, name, args } => {
                     let index = state.transcript.len();
-                    state.transcript.push(TranscriptBlock::Tool(ToolPanel {
+                    state.push_block(TranscriptBlock::Tool(ToolPanel {
                         id: id.clone(),
                         name,
                         args: args.to_string(),
@@ -1084,7 +1451,7 @@ impl InteractiveShell {
                         bounded_append(&mut panel.output, &text);
                     } else {
                         let index = state.transcript.len();
-                        state.transcript.push(TranscriptBlock::Tool(ToolPanel {
+                        state.push_block(TranscriptBlock::Tool(ToolPanel {
                             id: id.clone(),
                             name: "tool result".into(),
                             args: String::new(),
@@ -1096,12 +1463,11 @@ impl InteractiveShell {
                     }
                 }
                 TranscriptItem::CompactionMarker { summary_preview } => {
-                    state
-                        .transcript
-                        .push(TranscriptBlock::Compaction(summary_preview));
+                    state.push_block(TranscriptBlock::Compaction(summary_preview));
                 }
             }
         }
+        state.invalidate_transcript();
         Ok(())
     }
 
@@ -1128,6 +1494,11 @@ impl InteractiveShell {
                 }
             }
         }
+        for message in &state.steering_queue {
+            result.push('\n');
+            result.push_str("Steering: ");
+            result.push_str(message);
+        }
         result
     }
 
@@ -1142,9 +1513,16 @@ impl InteractiveShell {
     }
 }
 
+impl Drop for InteractiveShell {
+    fn drop(&mut self) {
+        self.stop_renderer();
+        force_restore();
+    }
+}
+
 #[cfg(test)]
 struct TestTerminal {
-    size: Rc<Cell<(u16, u16)>>,
+    size: TerminalSize,
 }
 
 #[cfg(test)]
@@ -1153,10 +1531,10 @@ impl sexy_tui_rs::Terminal for TestTerminal {
     fn stop(&mut self) {}
     fn write(&mut self, _data: &str) {}
     fn columns(&self) -> u16 {
-        self.size.get().0
+        self.size.lock().expect("terminal size mutex poisoned").0
     }
     fn rows(&self) -> u16 {
-        self.size.get().1
+        self.size.lock().expect("terminal size mutex poisoned").1
     }
     fn move_by(&mut self, _lines: i16) {}
     fn hide_cursor(&mut self) {}
@@ -1244,6 +1622,38 @@ mod tests {
         assert!(rendered
             .iter()
             .any(|line| line.contains("context ~4096/967232")));
+    }
+
+    #[test]
+    fn steering_messages_are_queued_above_prompt_and_delivered_as_a_batch() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.queue_steering("check the docs");
+        shell.queue_steering("then run the tests");
+
+        let rendered = render_shell(&shell.state.borrow(), 120);
+        let prompt = rendered
+            .iter()
+            .position(|line| line.contains("prompt"))
+            .expect("prompt box");
+        let queue = rendered
+            .iter()
+            .position(|line| line.contains("Queued steering (2)"))
+            .expect("steering queue");
+        assert!(queue < prompt);
+        assert!(rendered.iter().any(|line| line.contains("check the docs")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("then run the tests")));
+
+        shell.on_agent_event(&AgentEvent::SteeringDelivered {
+            messages: vec!["check the docs".into(), "then run the tests".into()],
+        });
+        let snapshot = shell.debug_snapshot();
+        assert!(snapshot.contains("check the docs"));
+        assert!(snapshot.contains("then run the tests"));
+        assert!(!render_shell(&shell.state.borrow(), 120)
+            .iter()
+            .any(|line| line.contains("Queued steering")));
     }
 
     #[test]
@@ -1338,6 +1748,18 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_paste_preserves_multiline_editor_text_without_submitting() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.apply_edit(EditAction::Char('a'));
+        shell.apply_edit(EditAction::Paste("b\r\nc\rd".into()));
+        assert_eq!(shell.pending(), "ab\nc\nd");
+        assert_eq!(shell.state.borrow().editor_cursor, "ab\nc\nd".len());
+        let rendered = render_shell(&shell.state.borrow(), 120);
+        assert!(rendered.iter().any(|line| line.contains("ab")));
+        assert!(rendered.iter().any(|line| line.contains("c")));
+    }
+
+    #[test]
     fn prompt_bar_cursor_tracks_insertions_and_cursor_motion() {
         let mut shell = InteractiveShell::test_shell();
         for character in "abcdef".chars() {
@@ -1355,6 +1777,37 @@ mod tests {
             .unwrap();
         assert!(line.find("abcdX").unwrap() < line.find(PROMPT_CURSOR).unwrap());
         assert!(line.find(PROMPT_CURSOR).unwrap() < line.find("ef").unwrap());
+    }
+
+    #[test]
+    fn scrolling_reuses_the_cached_transcript_layout() {
+        let mut shell = InteractiveShell::test_shell();
+        for number in 0..200 {
+            shell.notice(format!("notice {number}"));
+        }
+        let _ = render_shell(&shell.state.borrow(), 120);
+        let first_generation = shell.state.borrow().transcript_cache.borrow().generation;
+
+        shell.scroll_lines(-3);
+        let _ = render_shell(&shell.state.borrow(), 120);
+        assert_eq!(
+            shell.state.borrow().transcript_cache.borrow().generation,
+            first_generation,
+            "scrolling must only slice the existing layout"
+        );
+
+        shell.notice("new transcript block");
+        let _ = render_shell(&shell.state.borrow(), 120);
+        assert_eq!(
+            shell.state.borrow().transcript_cache.borrow().generation,
+            first_generation + 1
+        );
+    }
+
+    #[test]
+    fn exact_viewport_has_no_hidden_scroll_range() {
+        assert_eq!(max_scroll_for_available(10, 10), 0);
+        assert_eq!(max_scroll_for_available(11, 10), 2);
     }
 
     #[test]

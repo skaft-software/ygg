@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 
 /// Stable base instruction applied before all user/project instructions.
-pub const BASE_PERSONA: &str = "You are ygg, a careful coding agent. Work directly in the workspace, explain important changes concisely, and use tools when they improve accuracy.";
+pub const BASE_PERSONA: &str = "You are ygg, a careful coding agent. Work directly on local files, explain important changes concisely, and use tools when they improve accuracy. Relative tool paths use the workspace; absolute and ~/ paths are available when needed.";
 
 fn global_agents_path() -> PathBuf {
     dirs::home_dir()

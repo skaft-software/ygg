@@ -201,6 +201,7 @@ mod tests {
             exposes_text: true,
             preserves_state: false,
             effort_budgets: None,
+            openai_chat_mode: ygg_ai::OpenAiChatReasoningMode::Standard,
         }));
         assert_eq!(
             thinking_to_reasoning(ThinkingLevel::High, &effort).unwrap(),
@@ -217,6 +218,7 @@ mod tests {
                 medium: 4096,
                 high: 8192,
             }),
+            openai_chat_mode: ygg_ai::OpenAiChatReasoningMode::Standard,
         }));
         assert_eq!(
             thinking_to_reasoning(ThinkingLevel::High, &budget).unwrap(),

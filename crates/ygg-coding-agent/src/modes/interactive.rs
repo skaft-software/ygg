@@ -1,15 +1,14 @@
 #![allow(missing_docs)]
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream};
 use futures_util::{Stream, StreamExt};
-use tokio::time::Interval;
+use tokio::time::{Interval, MissedTickBehavior};
 use ygg_agent::{AgentError, AgentEvent, Run, RunControl};
 use ygg_ai::{ModelId, ReasoningConfig};
 
@@ -90,11 +89,12 @@ enum Idle {
 async fn wait_for_prompt<S>(
     shell: &mut InteractiveShell,
     input: &mut S,
-    ticker: &mut Interval,
+    scroll_tick: &mut Interval,
 ) -> anyhow::Result<Idle>
 where
     S: Stream<Item = std::io::Result<Event>> + Unpin,
 {
+    let mut scroll_dirty = false;
     loop {
         tokio::select! {
             maybe = input.next() => {
@@ -143,7 +143,7 @@ where
                     }
                     InputAction::ScrollLines(direction) => {
                         shell.scroll_lines(direction);
-                        shell.render();
+                        scroll_dirty = true;
                     }
                     InputAction::Close => {
                         shell.clear_error();
@@ -158,7 +158,13 @@ where
                     | InputAction::FollowUp(_) => {}
                 }
             }
-            _ = ticker.tick() => shell.render(),
+            // Mouse/trackpad events arrive in bursts. Apply every delta to
+            // state, but draw at most once per frame so a large transcript
+            // cannot leave a backlog that appears as post-scroll inertia.
+            _ = scroll_tick.tick(), if scroll_dirty => {
+                shell.render();
+                scroll_dirty = false;
+            },
         }
     }
 }
@@ -240,14 +246,15 @@ fn handle_active_command(
     shell.render();
 }
 
-/// Drive one active frozen-Agent run. The input arm only queues sends, so a
-/// full control channel can never stop the run stream from making progress.
+/// Drive one active frozen-Agent run. Control sends are queued locally, and
+/// input polling pauses while a bounded send waits so a full control channel
+/// can never starve the run stream that drains it.
 pub async fn drive_active_run<S>(
     run: &mut Run<'_>,
     control: &RunControl,
     shell: &mut InteractiveShell,
     input: &mut S,
-    ticker: &mut Interval,
+    scroll_tick: &mut Interval,
     pending_actions: &mut VecDeque<PendingIdleAction>,
     quit_requested: &mut bool,
 ) -> anyhow::Result<RunEnded>
@@ -256,6 +263,7 @@ where
 {
     let mut intents = VecDeque::<ControlIntent>::new();
     let mut in_flight: Option<ControlFuture> = None;
+    let mut scroll_dirty = false;
 
     loop {
         if in_flight.is_none() {
@@ -278,7 +286,11 @@ where
                 let _ = result;
                 in_flight = None;
             }
-            maybe = input.next() => {
+            _ = scroll_tick.tick(), if scroll_dirty => {
+                shell.render();
+                scroll_dirty = false;
+            }
+            maybe = input.next(), if in_flight.is_none() => {
                 let event = match maybe {
                     Some(Ok(event)) => event,
                     Some(Err(error)) => return Err(error.into()),
@@ -312,13 +324,14 @@ where
                 match keymap::translate(Some(event), true, &pending) {
                     InputAction::Abort => {
                         control.abort();
+                        shell.restore_queued_steering();
                         shell.set_run_label("aborting…");
                         shell.render();
                     }
                     InputAction::Steer(_) => {
                         let text = shell.drain_editor();
                         if !text.is_empty() {
-                            shell.on_prompt_submitted(&text);
+                            shell.queue_steering(&text);
                             intents.push_back(ControlIntent::Steer(text));
                         }
                         shell.render();
@@ -359,7 +372,7 @@ where
                     }
                     InputAction::ScrollLines(direction) => {
                         shell.scroll_lines(direction);
-                        shell.render();
+                        scroll_dirty = true;
                     }
                     InputAction::Close => {
                         shell.clear_error();
@@ -367,6 +380,7 @@ where
                     }
                     InputAction::Closed => {
                         control.abort();
+                        shell.restore_queued_steering();
                         *quit_requested = true;
                     }
                     InputAction::Ignore | InputAction::Submit(_) => {}
@@ -375,6 +389,10 @@ where
             event = run.next() => match event {
                 Some(AgentEvent::RunFinished { reason, .. }) => {
                     let ended = RunEnded::from(reason);
+                    // A control send can race the final stream event. Do not
+                    // leave an undelivered steering message stranded above an
+                    // idle prompt; put it back where the user can edit/resend.
+                    shell.restore_queued_steering();
                     shell.set_run_label(&format!("run: {ended:?}"));
                     shell.render();
                     return Ok(ended);
@@ -388,9 +406,11 @@ where
                     shell.on_agent_event(&event);
                     shell.render();
                 }
-                None => return Ok(RunEnded::Aborted),
+                None => {
+                    shell.restore_queued_steering();
+                    return Ok(RunEnded::Aborted);
+                }
             },
-            _ = ticker.tick() => shell.render(),
         }
     }
 }
@@ -572,11 +592,15 @@ async fn run_idle_command(
 pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let initial_prompt = boot.config.initial_prompt.clone();
     let theme = load_theme(&boot.config);
-    let size = Rc::new(Cell::new(crossterm::terminal::size().unwrap_or((80, 24))));
+    let size = Arc::new(Mutex::new(crossterm::terminal::size().unwrap_or((80, 24))));
     let mut shell = InteractiveShell::enter(theme, size)?;
     shell.set_theme_config(boot.config.clone());
     let mut input = EventStream::new();
-    let mut ticker = tokio::time::interval(Duration::from_millis(80));
+    // sexy-tui renders synchronously on `request_render`; it does not own an
+    // async render loop. Only use this clock to coalesce high-rate wheel input,
+    // never to repaint an unchanged transcript in the background.
+    let mut scroll_tick = tokio::time::interval(Duration::from_millis(16));
+    scroll_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let launch = resolve_launch_interactive(&boot, &mut shell, &mut input).await?;
     let system = compose_instructions(&boot.config)?;
@@ -590,7 +614,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     loop {
         let idle = match startup_prompt.take() {
             Some(prompt) if !prompt.is_empty() => Idle::Submit(prompt),
-            _ => wait_for_prompt(&mut shell, &mut input, &mut ticker).await?,
+            _ => wait_for_prompt(&mut shell, &mut input, &mut scroll_tick).await?,
         };
         match idle {
             Idle::Quit => break,
@@ -632,7 +656,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     &control,
                     &mut shell,
                     &mut input,
-                    &mut ticker,
+                    &mut scroll_tick,
                     &mut pending_actions,
                     &mut quit_requested,
                 )

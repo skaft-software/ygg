@@ -26,6 +26,9 @@ pub enum InputAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditAction {
     Char(char),
+    /// A bracketed-paste payload. It is inserted verbatim by the editor rather
+    /// than being interpreted as key presses or command submission.
+    Paste(String),
     Backspace,
     Delete,
     Newline,
@@ -55,6 +58,7 @@ pub fn translate(event: Option<Event>, active: bool, editor_text: &str) -> Input
             MouseEventKind::ScrollDown => InputAction::ScrollLines(3),
             _ => InputAction::Ignore,
         },
+        Event::Paste(text) => InputAction::Edit(EditAction::Paste(text)),
         Event::Key(key) => {
             if key.kind != KeyEventKind::Press {
                 return InputAction::Ignore;
@@ -62,7 +66,9 @@ pub fn translate(event: Option<Event>, active: bool, editor_text: &str) -> Input
 
             let control_c =
                 key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-            if control_c {
+            let control_d =
+                key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL);
+            if control_c || control_d {
                 return if active {
                     InputAction::Abort
                 } else {
@@ -70,7 +76,10 @@ pub fn translate(event: Option<Event>, active: bool, editor_text: &str) -> Input
                 };
             }
 
-            if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::ALT {
+            if key.code == KeyCode::Enter
+                && (key.modifiers == KeyModifiers::ALT
+                    || key.modifiers.contains(KeyModifiers::CONTROL))
+            {
                 return InputAction::Edit(EditAction::Newline);
             }
 
@@ -81,7 +90,11 @@ pub fn translate(event: Option<Event>, active: bool, editor_text: &str) -> Input
                 return InputAction::Scroll(1);
             }
             if key.code == KeyCode::Esc && key.modifiers.is_empty() {
-                return InputAction::Close;
+                return if active {
+                    InputAction::Abort
+                } else {
+                    InputAction::Close
+                };
             }
 
             if is_command_submission(&key) && editor_text.starts_with('/') {
@@ -241,6 +254,13 @@ mod tests {
     }
 
     #[test]
+    fn control_d_aborts_active_and_closes_idle() {
+        let event = Some(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(translate(event.clone(), true, ""), InputAction::Abort);
+        assert_eq!(translate(event, false, ""), InputAction::Closed);
+    }
+
+    #[test]
     fn submit_and_active_controls_use_editor_text() {
         assert_eq!(
             translate(
@@ -325,6 +345,14 @@ mod tests {
             InputAction::Edit(EditAction::Newline)
         );
         assert_eq!(
+            translate(Some(key(KeyCode::Enter, KeyModifiers::CONTROL)), false, "x"),
+            InputAction::Edit(EditAction::Newline)
+        );
+        assert_eq!(
+            translate(Some(Event::Paste("first\nsecond".into())), false, ""),
+            InputAction::Edit(EditAction::Paste("first\nsecond".into()))
+        );
+        assert_eq!(
             translate(Some(key(KeyCode::Enter, KeyModifiers::NONE)), false, ""),
             InputAction::Ignore
         );
@@ -369,6 +397,10 @@ mod tests {
         assert_eq!(
             translate(Some(key(KeyCode::Esc, KeyModifiers::NONE)), false, ""),
             InputAction::Close
+        );
+        assert_eq!(
+            translate(Some(key(KeyCode::Esc, KeyModifiers::NONE)), true, ""),
+            InputAction::Abort
         );
     }
 

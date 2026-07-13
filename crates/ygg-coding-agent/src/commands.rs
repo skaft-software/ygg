@@ -151,12 +151,20 @@ fn gate(enabled: bool) -> &'static str {
     }
 }
 
+fn path_access(allow_external_paths: bool) -> &'static str {
+    if allow_external_paths {
+        "current-user paths (absolute, ~/ and relative)"
+    } else {
+        "workspace-only guard"
+    }
+}
+
 /// Detailed status text suitable for the `/status` overlay.
 ///
 /// The security block states Ygg's model plainly: it is a trusted local agent,
-/// not an OS sandbox. The workspace path guard only validates explicit path
-/// arguments to built-in tools — it never confines a spawned process — so the
-/// block never implies that enabled process/shell execution is contained.
+/// not an OS sandbox. Built-in tools default to the current user's local files;
+/// a host can opt into a workspace-only accidental-path guard, but neither mode
+/// confines spawned processes.
 pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
     let session = app.agent.session();
     let session_id = session
@@ -170,7 +178,7 @@ pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
     let sandbox = &app.config.sandbox;
     format!(
         "Model: {}\nThinking: {}\nWorkspace: {}\nSession: {} — {}\nContext estimate: ~{} / {} tokens\n\
-         Security model: trusted local agent\nWorkspace path guard (built-in tools): enabled\nFile edits: {}\n\
+         Security model: trusted local agent\nBuilt-in file paths: {}\nFile edits: {}\n\
          Process execution: {}\nShell execution: {}\nOS isolation: none\n\
          Process privileges: current user\nRepository trust: user-managed\nQueued reconfiguration: {}",
         app.model.spec.id.0,
@@ -180,6 +188,7 @@ pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
         active_branch_title(session),
         estimate_next_request_tokens(app, ""),
         hard_input_budget(&app.model),
+        path_access(sandbox.allow_external_paths),
         gate(sandbox.allow_edit),
         gate(sandbox.allow_process),
         gate(sandbox.allow_shell),
@@ -191,9 +200,9 @@ pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
 pub fn help_text() -> String {
     [
         "Commands: /model [id], /thinking [level], /theme [name], /compact, /new, /resume [id], /status, /help, /quit",
-        "Idle: Enter submits; Alt+Enter inserts a newline; Ctrl+C quits. Type / for commands; Tab completes a unique match.",
-        "Active: Enter queues a follow-up; Ctrl+S steers; Ctrl+C aborts.",
-        "PageUp/PageDown scroll the transcript. Esc closes overlays.",
+        "Idle: Enter submits; Ctrl+Enter or Alt+Enter inserts a newline; bracketed paste preserves newlines; Ctrl+C quits. Type / for commands; Tab completes a unique match.",
+        "Active: Enter queues a follow-up; Ctrl+S steers; Ctrl+C aborts; Esc aborts too.",
+        "PageUp/PageDown scroll the transcript. Esc closes overlays when idle.",
     ]
     .join("\n")
 }
@@ -284,14 +293,13 @@ mod tests {
             "Workspace:",
             "Session:",
             "Context estimate:",
-            // The security block reports the trusted-local-agent model with each
-            // capability gate as an explicit enabled/disabled word, and never
-            // claims OS isolation (defaults: edit + process on, shell off).
+            // The default product policy is trusted local access: every built-in
+            // tool can use current-user paths and capability gates are enabled.
             "Security model: trusted local agent",
-            "Workspace path guard (built-in tools): enabled",
+            "Built-in file paths: current-user paths (absolute, ~/ and relative)",
             "File edits: enabled",
             "Process execution: enabled",
-            "Shell execution: disabled",
+            "Shell execution: enabled",
             "OS isolation: none",
             "Process privileges: current user",
             "Repository trust: user-managed",
@@ -311,6 +319,8 @@ mod tests {
             "PageUp/PageDown",
             "Esc closes",
             "Alt+Enter",
+            "Ctrl+Enter",
+            "bracketed paste",
             "Tab completes",
         ] {
             assert!(help.contains(expected), "missing {expected:?}");

@@ -41,6 +41,7 @@ pub enum ResumeSelector {
 /// Product-level sandbox settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxPolicy {
+    pub allow_external_paths: bool,
     pub allow_edit: bool,
     pub allow_process: bool,
     pub allow_shell: bool,
@@ -51,9 +52,13 @@ pub struct SandboxPolicy {
 impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
+            // Ygg is a trusted local agent: built-in tools should be able to
+            // operate on any path available to the current user. Relative
+            // paths still resolve from the workspace.
+            allow_external_paths: true,
             allow_edit: true,
             allow_process: true,
-            allow_shell: false,
+            allow_shell: true,
             exec_timeout_secs: 120,
             max_output_bytes: 64 * 1024,
         }
@@ -64,6 +69,7 @@ impl SandboxPolicy {
     /// Translate product settings to the frozen agent sandbox configuration.
     pub fn to_sandbox_config(&self, workspace: &Path) -> SandboxConfig {
         let mut sandbox = SandboxConfig::new(workspace);
+        sandbox.allow_external_paths = self.allow_external_paths;
         sandbox.allow_edit = self.allow_edit;
         sandbox.allow_process = self.allow_process;
         sandbox.allow_shell = self.allow_shell;
@@ -218,6 +224,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let workspace = resolve_workspace(None, directory.path()).unwrap();
         assert_eq!(workspace, directory.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn trusted_local_tool_access_is_the_product_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::default();
+        assert!(policy.allow_external_paths);
+        assert!(policy.allow_edit);
+        assert!(policy.allow_process);
+        assert!(policy.allow_shell);
+        let sandbox = policy.to_sandbox_config(directory.path());
+        assert!(sandbox.allow_external_paths);
     }
 
     #[test]

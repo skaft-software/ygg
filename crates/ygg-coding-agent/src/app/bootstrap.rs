@@ -10,7 +10,8 @@ use ygg_agent::{
 };
 use ygg_ai::{
     AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model, ModelCatalog, ModelId,
-    ModelLimits, ModelSpec, Protocol, ReasoningConfig, ToolDef,
+    ModelLimits, ModelSpec, OpenAiChatReasoningMode, Protocol, ReasoningCapability,
+    ReasoningConfig, ReasoningControl, ToolDef,
 };
 
 use crate::app::{level_from_reasoning, normalize_reasoning_for_model, thinking_to_reasoning, App};
@@ -102,7 +103,16 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
             output_modalities: ModalitySet::none(),
             tools: true,
             parallel_tool_calls: false,
-            reasoning: None,
+            // DeepSeek v4 Pro's OpenAI-compatible API supports an explicit
+            // `thinking` toggle plus `reasoning_effort`; the mode also tells the
+            // Chat codec to replay `reasoning_content` after tool calls.
+            reasoning: Some(ReasoningCapability {
+                control: ReasoningControl::Effort,
+                exposes_text: true,
+                preserves_state: false,
+                effort_budgets: None,
+                openai_chat_mode: OpenAiChatReasoningMode::DeepSeekThinking,
+            }),
             structured_output: false,
         },
         // DeepSeek v4 Pro advertises a 1M-token context window. These values
@@ -116,12 +126,91 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Codex models advertise a 272k context window with 128k max output (per the
+// GPT-5.4/5.5 family). These bound only Ygg's local capacity gate.
+const CODEX_CONTEXT_WINDOW: u64 = 272_000;
+const CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
+
+fn codex_user_agent() -> String {
+    format!("ygg/{} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS)
+}
+
+/// Register the OpenAI Codex (Sign in with ChatGPT) endpoint and models, but
+/// only when a credential exists — otherwise the models are simply not offered
+/// and `ygg --login codex` is the guided path. Uses the frozen
+/// `Protocol::OpenAiResponses` codec; the Codex-specific headers are injected
+/// via static endpoint headers plus the resolver's dynamic `extra_headers`.
+fn register_openai_codex(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
+    use crate::auth::codex;
+
+    let store = codex::CredentialStore::new(codex::default_path());
+    if !store.exists() {
+        return Ok(());
+    }
+    let resolver = std::sync::Arc::new(codex::CodexResolver::new(store));
+
+    let mut default_headers = http::HeaderMap::new();
+    default_headers.insert(
+        http::HeaderName::from_static("openai-beta"),
+        http::HeaderValue::from_static("responses=experimental"),
+    );
+    default_headers.insert(
+        http::HeaderName::from_static("originator"),
+        http::HeaderValue::from_static(codex::ORIGINATOR),
+    );
+    default_headers.insert(
+        http::header::USER_AGENT,
+        http::HeaderValue::from_str(&codex_user_agent())?,
+    );
+
+    catalog.register_endpoint(Endpoint {
+        id: EndpointId(codex::ENDPOINT_ID.into()),
+        base_url: url::Url::parse(codex::BACKEND_BASE_URL)?,
+        auth: Auth::dynamic(resolver),
+        default_headers,
+        timeout: Duration::from_secs(120),
+    })?;
+
+    for &model_id in codex::MODELS {
+        catalog.register_model(ModelSpec {
+            id: ModelId(model_id.into()),
+            endpoint: EndpointId(codex::ENDPOINT_ID.into()),
+            api_name: model_id.into(),
+            protocol: Protocol::OpenAiResponses,
+            capabilities: Capabilities {
+                input_modalities: ModalitySet::none(),
+                output_modalities: ModalitySet::none(),
+                tools: true,
+                parallel_tool_calls: true,
+                reasoning: Some(ReasoningCapability {
+                    control: ReasoningControl::Effort,
+                    exposes_text: true,
+                    preserves_state: true,
+                    effort_budgets: None,
+                    openai_chat_mode: OpenAiChatReasoningMode::Standard,
+                }),
+                structured_output: false,
+            },
+            limits: ModelLimits {
+                context_window: CODEX_CONTEXT_WINDOW,
+                max_output_tokens: CODEX_MAX_OUTPUT_TOKENS,
+            },
+            pricing: None,
+        })?;
+    }
+    Ok(())
+}
+
 /// Build bootstrap state from resolved configuration.
 pub fn bootstrap(config: Config) -> anyhow::Result<Bootstrap> {
     let mut catalog = ModelCatalog::builtin()?;
     register_deepseek_v4_pro(&mut catalog)?;
+    // Non-fatal: a Codex registration problem must never block ygg from starting.
+    if let Err(error) = register_openai_codex(&mut catalog) {
+        eprintln!("warning: OpenAI Codex models unavailable: {error}");
+    }
     let sessions = SessionStore::new(&config.session_dir, &config.workspace);
-    let client = AiClient::new();
+    let client = AiClient::try_new()?;
     Ok(Bootstrap {
         config,
         catalog,
@@ -395,12 +484,35 @@ mod tests {
             std::env::var("YGG_DEEPSEEK_MODEL").unwrap_or_else(|_| DEEPSEEK_MODEL_ID.into())
         );
         assert!(model.spec.capabilities.tools);
+        assert!(matches!(
+            model.spec.capabilities.reasoning.as_ref(),
+            Some(ReasoningCapability {
+                control: ReasoningControl::Effort,
+                exposes_text: true,
+                openai_chat_mode: OpenAiChatReasoningMode::DeepSeekThinking,
+                ..
+            })
+        ));
         assert_eq!(
             model.spec.limits.context_window,
             std::env::var("YGG_DEEPSEEK_CONTEXT_WINDOW")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(DEEPSEEK_DEFAULT_CONTEXT_WINDOW)
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_pro_accepts_high_reasoning_at_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config(directory.path(), Some(DEEPSEEK_MODEL_ID));
+        config.reasoning = ReasoningConfig::Effort(ygg_ai::ReasoningEffort::High);
+        let boot = bootstrap(config).unwrap();
+        let launch = resolve_launch_print(&boot, "test-session").unwrap();
+        let app = build_app(boot, launch, "system".into()).unwrap();
+        assert_eq!(
+            app.reasoning,
+            ReasoningConfig::Effort(ygg_ai::ReasoningEffort::High)
         );
     }
 

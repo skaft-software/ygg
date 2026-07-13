@@ -14,6 +14,15 @@ use crate::config::{self, CompactionPolicy, Config, Mode, ResumeSelector, Sandbo
 pub struct Cli {
     /// An initial prompt. In interactive mode it is submitted after startup.
     pub prompt: Option<String>,
+    /// Sign in to a subscription provider (e.g. `codex`) and exit.
+    #[arg(long, value_name = "PROVIDER")]
+    pub login: Option<String>,
+    /// Sign out of a subscription provider (e.g. `codex`) and exit.
+    #[arg(long, value_name = "PROVIDER")]
+    pub logout: Option<String>,
+    /// With `--login`, use the headless (paste-a-code) flow instead of a browser.
+    #[arg(long)]
+    pub headless: bool,
     /// Use headless print mode instead of the full-screen TUI.
     #[arg(long, short = 'p')]
     pub print: bool,
@@ -56,7 +65,7 @@ pub struct Cli {
     /// Disable structured process execution.
     #[arg(long)]
     pub no_process: bool,
-    /// Enable shell execution (structured process mode remains enabled unless disabled).
+    /// Enable shell execution (overrides a disabling configuration setting).
     #[arg(long)]
     pub allow_shell: bool,
     /// Maximum execution time in seconds.
@@ -78,6 +87,7 @@ struct ConfigLayer {
     model: Option<String>,
     reasoning: Option<String>,
     theme: Option<String>,
+    allow_external_paths: Option<bool>,
     allow_edit: Option<bool>,
     allow_process: Option<bool>,
     allow_shell: Option<bool>,
@@ -100,6 +110,7 @@ impl ConfigLayer {
         override_some!(model);
         override_some!(reasoning);
         override_some!(theme);
+        override_some!(allow_external_paths);
         override_some!(allow_edit);
         override_some!(allow_process);
         override_some!(allow_shell);
@@ -167,6 +178,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         model: env_value("YGG_MODEL"),
         reasoning: env_value("YGG_REASONING"),
         theme: env_value("YGG_THEME"),
+        allow_external_paths: env_parse("YGG_ALLOW_EXTERNAL_PATHS")?,
         allow_edit: env_parse("YGG_ALLOW_EDIT")?,
         allow_process: env_parse("YGG_ALLOW_PROCESS")?,
         allow_shell: env_parse("YGG_ALLOW_SHELL")?,
@@ -216,6 +228,9 @@ fn build_config_with_global_path(
     };
 
     let mut sandbox = SandboxPolicy::default();
+    if let Some(value) = values.allow_external_paths {
+        sandbox.allow_external_paths = value;
+    }
     if let Some(value) = values.allow_edit {
         sandbox.allow_edit = value;
     }
@@ -315,6 +330,9 @@ mod tests {
     fn base() -> Cli {
         Cli {
             prompt: None,
+            login: None,
+            logout: None,
+            headless: false,
             print: false,
             continue_: false,
             resume: None,
@@ -417,7 +435,7 @@ mod tests {
         std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
         std::fs::write(
             directory.path().join(".ygg/config.toml"),
-            "model = 'project'\ntheme = 'project-theme'\nmax_turns = 9\n",
+            "model = 'project'\ntheme = 'project-theme'\nmax_turns = 9\nallow_external_paths = false\n",
         )
         .unwrap();
         let mut cli = base();
@@ -428,5 +446,6 @@ mod tests {
         assert_eq!(config.model.unwrap().0, "cli");
         assert_eq!(config.theme.as_deref(), Some("project-theme"));
         assert_eq!(config.max_turns, 11);
+        assert!(!config.sandbox.allow_external_paths);
     }
 }
