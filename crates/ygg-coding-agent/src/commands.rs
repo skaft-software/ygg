@@ -20,6 +20,100 @@ pub enum Command {
     Unknown(String),
 }
 
+/// One command shown in the prompt's live slash-command suggestions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlashCommandSuggestion {
+    pub name: &'static str,
+    pub usage: &'static str,
+    pub description: &'static str,
+    accepts_argument: bool,
+}
+
+const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
+    SlashCommandSuggestion {
+        name: "model",
+        usage: "/model [id]",
+        description: "select or change the model",
+        accepts_argument: true,
+    },
+    SlashCommandSuggestion {
+        name: "thinking",
+        usage: "/thinking [level]",
+        description: "set thinking level",
+        accepts_argument: true,
+    },
+    SlashCommandSuggestion {
+        name: "theme",
+        usage: "/theme [name]",
+        description: "select or change theme",
+        accepts_argument: true,
+    },
+    SlashCommandSuggestion {
+        name: "compact",
+        usage: "/compact",
+        description: "compact conversation context",
+        accepts_argument: false,
+    },
+    SlashCommandSuggestion {
+        name: "new",
+        usage: "/new",
+        description: "start a new session",
+        accepts_argument: false,
+    },
+    SlashCommandSuggestion {
+        name: "resume",
+        usage: "/resume [id]",
+        description: "resume a saved session",
+        accepts_argument: true,
+    },
+    SlashCommandSuggestion {
+        name: "status",
+        usage: "/status",
+        description: "show session and capability status",
+        accepts_argument: false,
+    },
+    SlashCommandSuggestion {
+        name: "help",
+        usage: "/help",
+        description: "show commands and key bindings",
+        accepts_argument: false,
+    },
+    SlashCommandSuggestion {
+        name: "quit",
+        usage: "/quit",
+        description: "quit Ygg",
+        accepts_argument: false,
+    },
+];
+
+/// Suggestions for an editor value while its first token is a slash command.
+pub fn slash_suggestions(input: &str) -> Vec<&'static SlashCommandSuggestion> {
+    let Some(query) = input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if query.contains(char::is_whitespace) || query.contains('\n') {
+        return Vec::new();
+    }
+    SLASH_COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(query))
+        .collect()
+}
+
+/// Complete a unique command-name prefix. Argument-taking commands receive a
+/// trailing space so the next keystroke naturally begins their argument.
+pub fn complete_slash_command(input: &str) -> Option<String> {
+    let suggestions = slash_suggestions(input);
+    let [command] = suggestions.as_slice() else {
+        return None;
+    };
+    Some(format!(
+        "/{}{}",
+        command.name,
+        if command.accepts_argument { " " } else { "" }
+    ))
+}
+
 /// Parse a slash command without interpreting models, paths, or capabilities.
 pub fn parse(input: &str) -> Command {
     let input = input.trim();
@@ -47,7 +141,22 @@ pub fn parse(input: &str) -> Command {
     }
 }
 
+/// Render a capability gate as an explicit enabled/disabled word rather than a
+/// bare boolean, so `/status` reads as a security report.
+fn gate(enabled: bool) -> &'static str {
+    if enabled {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
 /// Detailed status text suitable for the `/status` overlay.
+///
+/// The security block states Ygg's model plainly: it is a trusted local agent,
+/// not an OS sandbox. The workspace path guard only validates explicit path
+/// arguments to built-in tools — it never confines a spawned process — so the
+/// block never implies that enabled process/shell execution is contained.
 pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
     let session = app.agent.session();
     let session_id = session
@@ -58,8 +167,12 @@ pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
     let queue = queued
         .map(|item| format!("{item:?}"))
         .unwrap_or_else(|| "none".to_owned());
+    let sandbox = &app.config.sandbox;
     format!(
-        "Model: {}\nThinking: {}\nWorkspace: {}\nSession: {} — {}\nContext estimate: ~{} / {} tokens\nSandbox: edit={} process={} shell={}\nQueued reconfiguration: {}",
+        "Model: {}\nThinking: {}\nWorkspace: {}\nSession: {} — {}\nContext estimate: ~{} / {} tokens\n\
+         Security model: trusted local agent\nWorkspace path guard (built-in tools): enabled\nFile edits: {}\n\
+         Process execution: {}\nShell execution: {}\nOS isolation: none\n\
+         Process privileges: current user\nRepository trust: user-managed\nQueued reconfiguration: {}",
         app.model.spec.id.0,
         reasoning_label(&app.reasoning),
         app.config.workspace.display(),
@@ -67,9 +180,9 @@ pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
         active_branch_title(session),
         estimate_next_request_tokens(app, ""),
         hard_input_budget(&app.model),
-        app.config.sandbox.allow_edit,
-        app.config.sandbox.allow_process,
-        app.config.sandbox.allow_shell,
+        gate(sandbox.allow_edit),
+        gate(sandbox.allow_process),
+        gate(sandbox.allow_shell),
         queue,
     )
 }
@@ -78,7 +191,7 @@ pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
 pub fn help_text() -> String {
     [
         "Commands: /model [id], /thinking [level], /theme [name], /compact, /new, /resume [id], /status, /help, /quit",
-        "Idle: Enter submits; Alt+Enter inserts a newline; Ctrl+C quits.",
+        "Idle: Enter submits; Alt+Enter inserts a newline; Ctrl+C quits. Type / for commands; Tab completes a unique match.",
         "Active: Enter queues a follow-up; Ctrl+S steers; Ctrl+C aborts.",
         "PageUp/PageDown scroll the transcript. Esc closes overlays.",
     ]
@@ -103,6 +216,20 @@ mod tests {
         assert_eq!(parse("/status"), Command::Status);
         assert_eq!(parse("/help"), Command::Help);
         assert_eq!(parse("/quit"), Command::Quit);
+    }
+
+    #[test]
+    fn slash_suggestions_filter_and_tab_complete_unique_prefixes() {
+        assert_eq!(slash_suggestions("/").len(), 9);
+        assert_eq!(slash_suggestions("/mod")[0].usage, "/model [id]");
+        assert_eq!(slash_suggestions("/th").len(), 2);
+        assert!(slash_suggestions("/model ").is_empty());
+        assert_eq!(complete_slash_command("/mod"), Some("/model ".to_owned()));
+        assert_eq!(complete_slash_command("/th"), None);
+        assert_eq!(
+            complete_slash_command("/status"),
+            Some("/status".to_owned())
+        );
     }
 
     #[test]
@@ -157,7 +284,17 @@ mod tests {
             "Workspace:",
             "Session:",
             "Context estimate:",
-            "edit=true process=true shell=false",
+            // The security block reports the trusted-local-agent model with each
+            // capability gate as an explicit enabled/disabled word, and never
+            // claims OS isolation (defaults: edit + process on, shell off).
+            "Security model: trusted local agent",
+            "Workspace path guard (built-in tools): enabled",
+            "File edits: enabled",
+            "Process execution: enabled",
+            "Shell execution: disabled",
+            "OS isolation: none",
+            "Process privileges: current user",
+            "Repository trust: user-managed",
             "NewSession",
         ] {
             assert!(
@@ -174,6 +311,7 @@ mod tests {
             "PageUp/PageDown",
             "Esc closes",
             "Alt+Enter",
+            "Tab completes",
         ] {
             assert!(help.contains(expected), "missing {expected:?}");
         }
