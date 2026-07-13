@@ -31,17 +31,31 @@ pub fn bounded_append(existing: &mut String, additional: &str) {
         return;
     }
 
-    let mut combined = String::with_capacity(existing.len().saturating_add(additional.len()));
-    combined.push_str(existing);
-    combined.push_str(additional);
+    // Retain the newest bytes in place. The old implementation allocated a
+    // second combined String on every overflow event, which is a hot path for
+    // noisy tools; reserve once and shift only the retained tail.
     let tail_budget = MAX_PANEL_BYTES.saturating_sub(ELISION_MARKER.len());
-    let mut start = combined.len().saturating_sub(tail_budget);
-    while start < combined.len() && !combined.is_char_boundary(start) {
-        start += 1;
+    let mut additional_start = if additional.len() >= tail_budget {
+        additional.len() - tail_budget
+    } else {
+        0
+    };
+    while additional_start < additional.len() && !additional.is_char_boundary(additional_start) {
+        additional_start += 1;
     }
-    existing.clear();
-    existing.push_str(ELISION_MARKER);
-    existing.push_str(&combined[start..]);
+    let existing_budget = tail_budget.saturating_sub(additional.len() - additional_start);
+    let mut existing_start = existing.len().saturating_sub(existing_budget);
+    while existing_start < existing.len() && !existing.is_char_boundary(existing_start) {
+        existing_start += 1;
+    }
+
+    let final_len = ELISION_MARKER.len()
+        + existing.len().saturating_sub(existing_start)
+        + additional.len().saturating_sub(additional_start);
+    existing.replace_range(..existing_start, "");
+    existing.reserve(final_len.saturating_sub(existing.len()));
+    existing.insert_str(0, ELISION_MARKER);
+    existing.push_str(&additional[additional_start..]);
 }
 
 #[derive(Clone, Debug)]
@@ -98,8 +112,8 @@ struct ShellState {
     block_revisions: Vec<u64>,
     /// Steering messages accepted while a run is active but not yet injected.
     steering_queue: Vec<String>,
-    /// Cached wrapped transcript lines. Scrolling only slices this cache rather
-    /// than markdown-rendering the complete history for every wheel event.
+    /// Cached wrapped transcript lines. Scrolling only slices this cache, and
+    /// streaming updates re-render only the changed block.
     transcript_cache: RefCell<TranscriptCache>,
     editor: String,
     /// Byte offset into `editor`; always kept at a UTF-8 character boundary.
@@ -352,24 +366,35 @@ fn render_block(
 ) -> Vec<String> {
     match block {
         TranscriptBlock::User(text) => {
-            let heading = theme.bold(&theme.fg("accent", "You"));
+            let heading = theme.bold(&theme.fg("user_msg_text", "You"));
             let mut lines = vec![heading];
             lines.extend(markdown_lines(text, theme, width));
             lines.push(String::new());
             lines
         }
         TranscriptBlock::Assistant(text) => {
-            let heading = theme.bold(&theme.fg("accent", "Assistant"));
+            let heading = theme.bold(&theme.fg("assistant_msg_text", "Assistant"));
             let mut lines = vec![heading];
             lines.extend(markdown_lines(text, theme, width));
             lines.push(String::new());
             lines
         }
         TranscriptBlock::Reasoning(text) => {
-            let heading = theme.dim("Thinking");
+            let heading_style = if theme.capability_tier() > sexy_tui_rs::theme::capability::CapabilityTier::Baseline {
+                format!("\x1b[3mThinking\x1b[23m")
+            } else {
+                "Thinking".to_string()
+            };
+            let heading = theme.fg("md_quote", &theme.dim(&heading_style));
             let mut lines = vec![heading];
-            for line in wrap_plain(text, width.saturating_sub(2) as usize) {
-                lines.push(theme.dim(&format!("  {line}")));
+            let border = theme.fg("md_quote_border", "│");
+            for line in wrap_plain(text, width.saturating_sub(4) as usize) {
+                let italicized = if theme.capability_tier() > sexy_tui_rs::theme::capability::CapabilityTier::Baseline {
+                    format!("\x1b[3m{line}\x1b[23m")
+                } else {
+                    line
+                };
+                lines.push(format!("  {} {}", border, theme.fg("md_quote", &italicized)));
             }
             lines.push(String::new());
             lines
@@ -385,7 +410,7 @@ fn render_block(
                 theme.fg("accent", "running")
             };
             let mut lines =
-                vec![theme.bold(&format!("Tool {} ({}) [{state}]", panel.name, panel.id.0))];
+                vec![theme.bold(&theme.fg("tool_title", &format!("Tool {} ({}) [{state}]", panel.name, panel.id.0)))];
             if !panel.args.is_empty() && panel.args != "null" {
                 lines.push(theme.dim(&format!("  args: {}", panel.args)));
             }
@@ -410,13 +435,19 @@ fn markdown_lines(text: &str, theme: &sexy_tui_rs::theme::Theme, width: u16) -> 
     let inner_width = usize::from(width.saturating_sub(2).max(1));
     let mut lines = Vec::new();
     let mut in_code_block = false;
+    let mut current_lang = String::new();
     let mut previous_was_blank = false;
 
     for raw in text.lines() {
         let trimmed = raw.trim();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_code_block = !in_code_block;
-            lines.push(format!(" {}", theme.fg("muted", &"─".repeat(inner_width))));
+            if in_code_block {
+                current_lang = trimmed[3..].trim().to_lowercase();
+            } else {
+                current_lang.clear();
+            }
+            lines.push(format!(" {}", theme.fg("md_code_border", &"─".repeat(inner_width))));
             previous_was_blank = false;
             continue;
         }
@@ -433,13 +464,13 @@ fn markdown_lines(text: &str, theme: &sexy_tui_rs::theme::Theme, width: u16) -> 
         previous_was_blank = false;
 
         let rendered = if in_code_block {
-            theme.fg("muted", &format!("  {raw}"))
+            format!("  {}", crate::tui::highlight::highlight_line(raw, &current_lang, theme))
         } else if is_horizontal_rule(trimmed) {
-            theme.fg("muted", &"─".repeat(inner_width))
+            theme.fg("md_hr", &"─".repeat(inner_width))
         } else if let Some((level, heading)) = markdown_heading(trimmed) {
             let heading = render_inline_markdown(heading, theme);
             if level <= 2 {
-                theme.bold(&theme.fg("accent", &heading))
+                theme.bold(&theme.fg("md_heading", &heading))
             } else {
                 theme.bold(&heading)
             }
@@ -450,7 +481,9 @@ fn markdown_lines(text: &str, theme: &sexy_tui_rs::theme::Theme, width: u16) -> 
                 render_inline_markdown(item, theme)
             )
         } else if let Some(quote) = trimmed.strip_prefix("> ") {
-            theme.dim(&format!("│ {}", render_inline_markdown(quote, theme)))
+            let border = theme.fg("md_quote_border", "│");
+            let quote_text = theme.fg("md_quote", &render_inline_markdown(quote, theme));
+            format!("{border} {quote_text}")
         } else {
             render_inline_markdown(raw, theme)
         };
@@ -521,6 +554,18 @@ fn render_inline_markdown(text: &str, theme: &sexy_tui_rs::theme::Theme) -> Stri
     let mut remaining = text;
 
     while !remaining.is_empty() {
+        if let Some((content, rest)) = delimited_markdown(remaining, "***") {
+            let inner = render_inline_markdown(content, theme);
+            let bold = theme.bold(&inner);
+            let bold_italic = if theme.capability_tier() > sexy_tui_rs::theme::capability::CapabilityTier::Baseline {
+                format!("\x1b[3m{bold}\x1b[23m")
+            } else {
+                bold
+            };
+            rendered.push_str(&bold_italic);
+            remaining = rest;
+            continue;
+        }
         if let Some((content, rest)) =
             delimited_markdown(remaining, "**").or_else(|| delimited_markdown(remaining, "__"))
         {
@@ -528,8 +573,21 @@ fn render_inline_markdown(text: &str, theme: &sexy_tui_rs::theme::Theme) -> Stri
             remaining = rest;
             continue;
         }
+        if let Some((content, rest)) =
+            delimited_markdown(remaining, "*").or_else(|| delimited_markdown(remaining, "_"))
+        {
+            let inner = render_inline_markdown(content, theme);
+            let italic = if theme.capability_tier() > sexy_tui_rs::theme::capability::CapabilityTier::Baseline {
+                format!("\x1b[3m{inner}\x1b[23m")
+            } else {
+                format!("\x1b[4m{inner}\x1b[24m")
+            };
+            rendered.push_str(&italic);
+            remaining = rest;
+            continue;
+        }
         if let Some((content, rest)) = delimited_markdown(remaining, "`") {
-            rendered.push_str(&theme.fg("muted", content));
+            rendered.push_str(&theme.fg("md_code", content));
             remaining = rest;
             continue;
         }
@@ -544,6 +602,7 @@ fn render_inline_markdown(text: &str, theme: &sexy_tui_rs::theme::Theme) -> Stri
 
     rendered
 }
+
 
 fn delimited_markdown<'a>(text: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> {
     let body = text.strip_prefix(delimiter)?;
@@ -1056,6 +1115,31 @@ impl InteractiveShell {
         if let Some(mut tui) = self.tui.take() {
             tui.stop();
         }
+    }
+
+    /// Temporarily leave the alternate screen while preserving shell state.
+    /// OAuth uses this so the hosted verification code and browser fallback are
+    /// visible in an ordinary terminal.
+    pub fn suspend(&mut self) {
+        self.stop_renderer();
+        force_restore();
+    }
+
+    /// Re-enter the alternate screen after a suspended operation.
+    pub fn resume(&mut self) -> Result<()> {
+        if self.render_thread.is_some() || self.tui.is_some() {
+            return Ok(());
+        }
+        let terminal = YggTerminal::enter_with_size(self.size.clone())?;
+        let (render_tx, render_rx) = mpsc::sync_channel(1);
+        let render_state = self.state.clone();
+        let render_thread = thread::Builder::new()
+            .name("ygg-tui-render".to_owned())
+            .spawn(move || render_loop(terminal, render_state, render_rx))?;
+        self.render_tx = Some(render_tx);
+        self.render_thread = Some(render_thread);
+        self.render();
+        Ok(())
     }
 
     /// Stop rendering and restore the process terminal.

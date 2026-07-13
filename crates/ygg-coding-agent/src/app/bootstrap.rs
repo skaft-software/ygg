@@ -122,6 +122,7 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
             max_output_tokens,
         },
         pricing: None,
+        cache: ygg_ai::CacheCompatibility::default(),
     })?;
     Ok(())
 }
@@ -132,19 +133,24 @@ const CODEX_CONTEXT_WINDOW: u64 = 272_000;
 const CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
 
 fn codex_user_agent() -> String {
-    format!("ygg/{} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS)
+    format!(
+        "ygg/{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    )
 }
 
-/// Register the OpenAI Codex (Sign in with ChatGPT) endpoint and models, but
-/// only when a credential exists — otherwise the models are simply not offered
-/// and `ygg --login codex` is the guided path. Uses the frozen
-/// `Protocol::OpenAiResponses` codec; the Codex-specific headers are injected
-/// via static endpoint headers plus the resolver's dynamic `extra_headers`.
-fn register_openai_codex(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
+/// Register the OpenAI Codex (Sign in with ChatGPT) endpoint and the models
+/// supported by Ygg's SSE transport, but only for a validated subscription
+/// credential. The Codex-specific headers are injected via static endpoint
+/// headers plus the resolver's dynamic `extra_headers`.
+fn register_openai_codex(
+    catalog: &mut ModelCatalog,
+    store: crate::auth::codex::CredentialStore,
+) -> anyhow::Result<()> {
     use crate::auth::codex;
 
-    let store = codex::CredentialStore::new(codex::default_path());
-    if !store.exists() {
+    if !codex::has_usable_credential(&store)? {
         return Ok(());
     }
     let resolver = std::sync::Arc::new(codex::CodexResolver::new(store));
@@ -196,19 +202,39 @@ fn register_openai_codex(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
                 max_output_tokens: CODEX_MAX_OUTPUT_TOKENS,
             },
             pricing: None,
+            cache: ygg_ai::CacheCompatibility::default(),
         })?;
     }
     Ok(())
 }
 
-/// Build bootstrap state from resolved configuration.
-pub fn bootstrap(config: Config) -> anyhow::Result<Bootstrap> {
+fn base_model_catalog() -> anyhow::Result<ModelCatalog> {
     let mut catalog = ModelCatalog::builtin()?;
     register_deepseek_v4_pro(&mut catalog)?;
-    // Non-fatal: a Codex registration problem must never block ygg from starting.
-    if let Err(error) = register_openai_codex(&mut catalog) {
+    Ok(catalog)
+}
+
+/// Build the runtime model catalog, exposing ChatGPT subscription models only
+/// when Ygg owns a usable OAuth credential.
+pub fn model_catalog() -> anyhow::Result<ModelCatalog> {
+    let mut catalog = base_model_catalog()?;
+    let store = crate::auth::codex::CredentialStore::new(crate::auth::codex::default_path());
+    // Non-fatal: a stale or malformed OAuth file must never block Ygg startup.
+    if let Err(error) = register_openai_codex(&mut catalog, store) {
         eprintln!("warning: OpenAI Codex models unavailable: {error}");
     }
+    Ok(catalog)
+}
+
+/// Build the catalog without subscription models, used to make `/logout`
+/// atomic when the active model itself belongs to ChatGPT.
+pub fn model_catalog_without_codex() -> anyhow::Result<ModelCatalog> {
+    base_model_catalog()
+}
+
+/// Build bootstrap state from resolved configuration.
+pub fn bootstrap(config: Config) -> anyhow::Result<Bootstrap> {
+    let catalog = model_catalog()?;
     let sessions = SessionStore::new(&config.session_dir, &config.workspace);
     let client = AiClient::try_new()?;
     Ok(Bootstrap {
@@ -335,6 +361,8 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         extensions,
         max_turns: config.max_turns,
         reasoning: reasoning.clone(),
+        cache_retention: ygg_ai::CacheRetention::default(),
+        session_id: None,
     })?;
 
     Ok(App {
@@ -413,6 +441,8 @@ pub fn rebuild_app(
         extensions,
         max_turns: config.max_turns,
         reasoning: reasoning.clone(),
+        cache_retention: ygg_ai::CacheRetention::default(),
+        session_id: None,
     })?;
 
     Ok(App {
@@ -467,6 +497,68 @@ mod tests {
         );
         assert_eq!(resolve_model_id(None, None, id("global")), id("global"));
         assert_eq!(resolve_model_id(None, None, None), None);
+    }
+
+    fn write_codex_credential(path: &std::path::Path, localhost: bool) {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_test",
+                "localhost": localhost
+            }
+        });
+        let access = format!(
+            "h.{}.s",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+        );
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": {
+                    "access_token": access,
+                    "refresh_token": "refresh",
+                    "account_id": "acct_test"
+                },
+                "expires_at": u64::MAX
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex_models_require_a_usable_credential_and_match_sse_support() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("codex.json");
+        let store = crate::auth::codex::CredentialStore::new(&path);
+
+        let mut catalog = base_model_catalog().unwrap();
+        register_openai_codex(&mut catalog, store.clone()).unwrap();
+        assert!(catalog.resolve(&ModelId("gpt-5.6-sol".into())).is_err());
+
+        write_codex_credential(&path, true);
+        let mut catalog = base_model_catalog().unwrap();
+        let error = register_openai_codex(&mut catalog, store.clone()).unwrap_err();
+        assert!(error.to_string().contains("localhost-only"));
+        assert!(catalog.resolve(&ModelId("gpt-5.6-sol".into())).is_err());
+
+        write_codex_credential(&path, false);
+        let mut catalog = base_model_catalog().unwrap();
+        register_openai_codex(&mut catalog, store).unwrap();
+        for model_id in crate::auth::codex::MODELS {
+            let model = catalog.resolve(&ModelId((*model_id).into())).unwrap();
+            assert_eq!(model.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
+            assert_eq!(model.spec.protocol, Protocol::OpenAiResponses);
+        }
+        // These were the two misleading entries in the original integration:
+        // Pro is not in the subscription catalog and Luna currently needs WS.
+        assert!(catalog.resolve(&ModelId("gpt-5.5-pro".into())).is_err());
+        assert!(catalog.resolve(&ModelId("gpt-5.6-luna".into())).is_err());
     }
 
     #[test]

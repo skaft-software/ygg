@@ -230,6 +230,8 @@ pub async fn summarize(
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: ygg_ai::CompatibilityMode::Strict,
+        cache_retention: ygg_ai::CacheRetention::default(),
+        session_id: None,
     };
     let response = client.complete(model, request).await?;
     let summary = response
