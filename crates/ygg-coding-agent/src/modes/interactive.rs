@@ -21,12 +21,11 @@ use crate::compaction::{
 };
 use crate::config::ThinkingLevel;
 use crate::modes::RunEnded;
+use crate::resources::compose_instructions;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{model_picker, session_picker, thinking_picker};
 use crate::tui::theme::load_theme;
 use crate::tui::view::InteractiveShell;
-
-const BASE_SYSTEM: &str = "You are ygg, a careful coding agent. Work directly in the workspace, explain important changes concisely, and use tools when they improve accuracy.";
 
 /// Ordered controls sent to the frozen Agent during an active run.
 #[derive(Debug)]
@@ -483,7 +482,8 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_millis(80));
 
     let launch = resolve_launch_interactive(&boot, &mut shell, &mut input).await?;
-    let mut app = build_app(boot, launch, BASE_SYSTEM.to_owned())?;
+    let system = compose_instructions(&boot.config)?;
+    let mut app = build_app(boot, launch, system)?;
     shell.hydrate(app.agent.session())?;
     update_status(&mut shell, &app);
     shell.render();

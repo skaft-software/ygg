@@ -3,8 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use serde::Deserialize;
 
-use crate::config::{self, Config, Mode, ResumeSelector, SandboxPolicy};
+use crate::app::bootstrap::resolve_model_id;
+use crate::config::{self, CompactionPolicy, Config, Mode, ResumeSelector, SandboxPolicy};
 
 /// Command-line launcher for `ygg`.
 #[derive(Debug, Parser)]
@@ -43,8 +45,8 @@ pub struct Cli {
     #[arg(long)]
     pub show_reasoning: bool,
     /// Maximum model turns in one run.
-    #[arg(long, default_value_t = 40)]
-    pub max_turns: u64,
+    #[arg(long)]
+    pub max_turns: Option<u64>,
     /// Persistent session directory override.
     #[arg(long)]
     pub session_dir: Option<PathBuf>,
@@ -58,15 +60,134 @@ pub struct Cli {
     #[arg(long)]
     pub allow_shell: bool,
     /// Maximum execution time in seconds.
-    #[arg(long, default_value_t = 120)]
-    pub exec_timeout_secs: u64,
+    #[arg(long)]
+    pub exec_timeout_secs: Option<u64>,
     /// Maximum persisted tool output size in bytes.
-    #[arg(long, default_value_t = 64 * 1024)]
-    pub max_output_bytes: usize,
+    #[arg(long)]
+    pub max_output_bytes: Option<usize>,
 }
 
-/// Convert parsed CLI arguments into the process configuration.
-pub fn build_config(cli: Cli, cwd: &Path) -> anyhow::Result<Config> {
+#[derive(Clone, Debug, Default, Deserialize)]
+struct CompactionLayer {
+    threshold_fraction: Option<f64>,
+    keep_recent_turns: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ConfigLayer {
+    model: Option<String>,
+    reasoning: Option<String>,
+    theme: Option<String>,
+    allow_edit: Option<bool>,
+    allow_process: Option<bool>,
+    allow_shell: Option<bool>,
+    exec_timeout_secs: Option<u64>,
+    max_output_bytes: Option<usize>,
+    session_dir: Option<PathBuf>,
+    max_turns: Option<u64>,
+    compaction: Option<CompactionLayer>,
+}
+
+impl ConfigLayer {
+    fn merge(&mut self, newer: Self) {
+        macro_rules! override_some {
+            ($field:ident) => {
+                if newer.$field.is_some() {
+                    self.$field = newer.$field;
+                }
+            };
+        }
+        override_some!(model);
+        override_some!(reasoning);
+        override_some!(theme);
+        override_some!(allow_edit);
+        override_some!(allow_process);
+        override_some!(allow_shell);
+        override_some!(exec_timeout_secs);
+        override_some!(max_output_bytes);
+        override_some!(session_dir);
+        override_some!(max_turns);
+        match (self.compaction.as_mut(), newer.compaction) {
+            (Some(current), Some(newer)) => {
+                if newer.threshold_fraction.is_some() {
+                    current.threshold_fraction = newer.threshold_fraction;
+                }
+                if newer.keep_recent_turns.is_some() {
+                    current.keep_recent_turns = newer.keep_recent_turns;
+                }
+            }
+            (None, Some(newer)) => self.compaction = Some(newer),
+            _ => {}
+        }
+    }
+}
+
+fn global_config_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ygg")
+        .join("config.toml")
+}
+
+fn project_config_path(workspace: &Path) -> PathBuf {
+    workspace.join(".ygg").join("config.toml")
+}
+
+fn read_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
+    if !path.exists() {
+        return Ok(ConfigLayer::default());
+    }
+    let source = std::fs::read_to_string(path)?;
+    toml::from_str(&source)
+        .map_err(|error| anyhow::anyhow!("invalid config {}: {error}", path.display()))
+}
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn env_parse<T>(name: &str) -> anyhow::Result<Option<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    env_value(name)
+        .map(|value| {
+            value
+                .parse::<T>()
+                .map_err(|error| anyhow::anyhow!("invalid {name}={value:?}: {error}"))
+        })
+        .transpose()
+}
+
+fn environment_layer() -> anyhow::Result<ConfigLayer> {
+    let threshold_fraction = env_parse("YGG_COMPACTION_THRESHOLD_FRACTION")?;
+    let keep_recent_turns = env_parse("YGG_COMPACTION_KEEP_RECENT_TURNS")?;
+    Ok(ConfigLayer {
+        model: env_value("YGG_MODEL"),
+        reasoning: env_value("YGG_REASONING"),
+        theme: env_value("YGG_THEME"),
+        allow_edit: env_parse("YGG_ALLOW_EDIT")?,
+        allow_process: env_parse("YGG_ALLOW_PROCESS")?,
+        allow_shell: env_parse("YGG_ALLOW_SHELL")?,
+        exec_timeout_secs: env_parse("YGG_EXEC_TIMEOUT_SECS")?,
+        max_output_bytes: env_parse("YGG_MAX_OUTPUT_BYTES")?,
+        session_dir: env_value("YGG_SESSION_DIR").map(PathBuf::from),
+        max_turns: env_parse("YGG_MAX_TURNS")?,
+        compaction: (threshold_fraction.is_some() || keep_recent_turns.is_some()).then_some(
+            CompactionLayer {
+                threshold_fraction,
+                keep_recent_turns,
+            },
+        ),
+    })
+}
+
+fn build_config_with_global_path(
+    cli: Cli,
+    cwd: &Path,
+    global_path: &Path,
+) -> anyhow::Result<Config> {
     let invocation_cwd = cwd.canonicalize()?;
     let workspace = config::resolve_workspace(cli.workspace.as_deref(), &invocation_cwd)?;
     if !invocation_cwd.starts_with(&workspace) {
@@ -77,12 +198,67 @@ pub fn build_config(cli: Cli, cwd: &Path) -> anyhow::Result<Config> {
         );
     }
 
-    let reasoning = cli
-        .reasoning
-        .as_deref()
-        .map(config::parse_reasoning)
-        .transpose()?
-        .unwrap_or_default();
+    let global = read_layer(global_path)?;
+    let project = read_layer(&project_config_path(&workspace))?;
+    let environment = environment_layer()?;
+    let mut values = global.clone();
+    values.merge(project.clone());
+    values.merge(environment);
+
+    let model = resolve_model_id(
+        cli.model.clone().map(ygg_ai::ModelId),
+        values.model.clone().map(ygg_ai::ModelId),
+        None,
+    );
+    let reasoning = match cli.reasoning.as_deref().or(values.reasoning.as_deref()) {
+        Some(value) => config::parse_reasoning(value)?,
+        None => ygg_ai::ReasoningConfig::Off,
+    };
+
+    let mut sandbox = SandboxPolicy::default();
+    if let Some(value) = values.allow_edit {
+        sandbox.allow_edit = value;
+    }
+    if let Some(value) = values.allow_process {
+        sandbox.allow_process = value;
+    }
+    if let Some(value) = values.allow_shell {
+        sandbox.allow_shell = value;
+    }
+    if let Some(value) = values.exec_timeout_secs {
+        sandbox.exec_timeout_secs = value;
+    }
+    if let Some(value) = values.max_output_bytes {
+        sandbox.max_output_bytes = value;
+    }
+    if cli.no_edit {
+        sandbox.allow_edit = false;
+    }
+    if cli.no_process {
+        sandbox.allow_process = false;
+    }
+    if cli.allow_shell {
+        sandbox.allow_shell = true;
+    }
+    if let Some(value) = cli.exec_timeout_secs {
+        sandbox.exec_timeout_secs = value;
+    }
+    if let Some(value) = cli.max_output_bytes {
+        sandbox.max_output_bytes = value;
+    }
+
+    let mut compaction = CompactionPolicy::default();
+    if let Some(layer) = values.compaction {
+        if let Some(value) = layer.threshold_fraction {
+            if !(0.0..=1.0).contains(&value) {
+                anyhow::bail!("compaction.threshold_fraction must be between 0 and 1");
+            }
+            compaction.threshold_fraction = value;
+        }
+        if let Some(value) = layer.keep_recent_turns {
+            compaction.keep_recent_turns = value.max(1);
+        }
+    }
 
     let mode = if cli.print {
         let prompt = cli.prompt.clone().ok_or_else(|| {
@@ -92,41 +268,40 @@ pub fn build_config(cli: Cli, cwd: &Path) -> anyhow::Result<Config> {
     } else {
         Mode::Interactive
     };
-
     let resume = if cli.continue_ {
         ResumeSelector::Continue
     } else if let Some(id) = cli.resume {
         ResumeSelector::Resume(id.and_then(|id| {
-            let id = id.trim().to_string();
+            let id = id.trim().to_owned();
             (!id.is_empty()).then_some(id)
         }))
     } else {
         ResumeSelector::New
     };
 
-    let sandbox = SandboxPolicy {
-        allow_edit: !cli.no_edit,
-        allow_process: !cli.no_process,
-        allow_shell: cli.allow_shell,
-        exec_timeout_secs: cli.exec_timeout_secs,
-        max_output_bytes: cli.max_output_bytes,
-    };
-
     Ok(Config {
         workspace,
         invocation_cwd,
-        model: cli.model.map(ygg_ai::ModelId),
+        model,
         reasoning,
         sandbox,
-        theme: cli.theme,
-        session_dir: cli.session_dir.unwrap_or_else(config::default_session_dir),
-        compaction: config::CompactionPolicy::default(),
-        max_turns: cli.max_turns.max(1),
+        theme: cli.theme.or(values.theme),
+        session_dir: cli
+            .session_dir
+            .or(values.session_dir)
+            .unwrap_or_else(config::default_session_dir),
+        compaction,
+        max_turns: cli.max_turns.or(values.max_turns).unwrap_or(40).max(1),
         show_reasoning_in_print: cli.show_reasoning,
         initial_prompt: (!cli.print).then_some(cli.prompt).flatten(),
         mode,
         resume,
     })
+}
+
+/// Convert parsed CLI arguments into layered process configuration.
+pub fn build_config(cli: Cli, cwd: &Path) -> anyhow::Result<Config> {
+    build_config_with_global_path(cli, cwd, &global_config_path())
 }
 
 #[cfg(test)]
@@ -148,14 +323,18 @@ mod tests {
             workspace: None,
             theme: None,
             show_reasoning: false,
-            max_turns: 40,
+            max_turns: None,
             session_dir: None,
             no_edit: false,
             no_process: false,
             allow_shell: false,
-            exec_timeout_secs: 120,
-            max_output_bytes: 64 * 1024,
+            exec_timeout_secs: None,
+            max_output_bytes: None,
         }
+    }
+
+    fn config_with_empty_global(cli: Cli, directory: &Path) -> anyhow::Result<Config> {
+        build_config_with_global_path(cli, directory, &directory.join("missing-global.toml"))
     }
 
     #[test]
@@ -165,7 +344,7 @@ mod tests {
         cli.print = true;
         cli.model = Some("m".into());
         cli.workspace = Some(directory.path().into());
-        assert!(build_config(cli, directory.path()).is_err());
+        assert!(config_with_empty_global(cli, directory.path()).is_err());
     }
 
     #[test]
@@ -177,7 +356,7 @@ mod tests {
         cli.model = Some("m".into());
         cli.workspace = Some(directory.path().into());
         cli.show_reasoning = true;
-        let config = build_config(cli, directory.path()).unwrap();
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
         assert!(matches!(config.mode, Mode::Print { prompt } if prompt == "hi"));
         assert!(config.show_reasoning_in_print);
     }
@@ -188,7 +367,7 @@ mod tests {
         let mut cli = base();
         cli.continue_ = true;
         cli.workspace = Some(directory.path().into());
-        let config = build_config(cli, directory.path()).unwrap();
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
         assert!(matches!(config.resume, ResumeSelector::Continue));
         assert!(matches!(config.mode, Mode::Interactive));
     }
@@ -199,17 +378,17 @@ mod tests {
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
         cli.reasoning = Some("off".into());
-        assert!(build_config(cli, directory.path()).is_ok());
+        assert!(config_with_empty_global(cli, directory.path()).is_ok());
 
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
         cli.reasoning = Some("budget=2048".into());
-        assert!(build_config(cli, directory.path()).is_ok());
+        assert!(config_with_empty_global(cli, directory.path()).is_ok());
 
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
         cli.reasoning = Some("nonsense".into());
-        assert!(build_config(cli, directory.path()).is_err());
+        assert!(config_with_empty_global(cli, directory.path()).is_err());
     }
 
     #[test]
@@ -219,8 +398,35 @@ mod tests {
         cli.workspace = Some(directory.path().into());
         cli.resume = Some(None);
         assert!(matches!(
-            build_config(cli, directory.path()).unwrap().resume,
+            config_with_empty_global(cli, directory.path())
+                .unwrap()
+                .resume,
             ResumeSelector::Resume(None)
         ));
+    }
+
+    #[test]
+    fn cli_overrides_project_which_overrides_global() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(
+            &global,
+            "model = 'global'\ntheme = 'global-theme'\nmax_turns = 7\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
+        std::fs::write(
+            directory.path().join(".ygg/config.toml"),
+            "model = 'project'\ntheme = 'project-theme'\nmax_turns = 9\n",
+        )
+        .unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.model = Some("cli".into());
+        cli.max_turns = Some(11);
+        let config = build_config_with_global_path(cli, directory.path(), &global).unwrap();
+        assert_eq!(config.model.unwrap().0, "cli");
+        assert_eq!(config.theme.as_deref(), Some("project-theme"));
+        assert_eq!(config.max_turns, 11);
     }
 }

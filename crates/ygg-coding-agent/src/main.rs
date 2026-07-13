@@ -7,6 +7,7 @@ mod compaction;
 mod config;
 mod hydrate;
 mod modes;
+mod resources;
 mod session_store;
 mod tui;
 

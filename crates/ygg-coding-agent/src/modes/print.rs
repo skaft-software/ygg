@@ -7,8 +7,7 @@ use ygg_agent::{AgentEvent, OutputChannel};
 use crate::app::bootstrap::{build_app, resolve_launch_print, Bootstrap};
 use crate::compaction::{ensure_capacity_before_prompt, CapacityDecision};
 use crate::modes::{timestamp, RunEnded};
-
-const BASE_SYSTEM: &str = "You are ygg, a careful coding agent. Work directly in the workspace, explain important changes concisely, and use tools when they improve accuracy.";
+use crate::resources::compose_instructions;
 
 /// Convert an explicit terminal run result to process success or an actionable
 /// nonzero error. A started run must always yield `RunFinished`.
@@ -26,7 +25,8 @@ pub fn classify_finish(finished: Option<RunEnded>) -> anyhow::Result<()> {
 /// terminal UI.
 pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
     let launch = resolve_launch_print(&boot, &timestamp())?;
-    let mut app = build_app(boot, launch, BASE_SYSTEM.to_owned())?;
+    let system = compose_instructions(&boot.config)?;
+    let mut app = build_app(boot, launch, system)?;
 
     if let CapacityDecision::Exceeded { estimate, budget } =
         ensure_capacity_before_prompt(&mut app, &prompt).await?
