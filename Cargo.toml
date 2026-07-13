@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/ygg-ai", "crates/ygg-agent", "crates/ygg-coding-agent"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# Money must be exact integers; no floating-point arithmetic in pricing.
+# (Enforced per-module where relevant; kept off the workspace default to avoid
+# false positives on legitimate f32 sampling knobs like `temperature`.)

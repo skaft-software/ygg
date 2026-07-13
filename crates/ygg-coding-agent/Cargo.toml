@@ -1,0 +1,41 @@
+[package]
+name = "ygg-coding-agent"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Full-screen interactive coding agent over ygg-agent."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ygg"
+path = "src/main.rs"
+
+[[bin]]
+name = "ygg-tui-spike"
+path = "src/spike/bin_spike.rs"
+
+[dependencies]
+ygg-ai = { path = "../ygg-ai" }
+ygg-agent = { path = "../ygg-agent" }
+# Pinned to the verified rust-port commit. Developer override:
+# [patch.'https://github.com/achuthanmukundan00/sexy-tui-rs']
+# sexy-tui-rs = { path = "../../../../achuthanmukundan00/sexy-tui-rs-rust-port" }
+sexy-tui-rs = { git = "https://github.com/achuthanmukundan00/sexy-tui-rs", rev = "05a151533fb5be6cb908a1becd420e50a1754164" }
+tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "process", "sync"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+dirs = "5"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+wiremock = "0.6"
