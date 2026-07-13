@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+mod app;
 mod cli;
 mod config;
 mod session_store;
