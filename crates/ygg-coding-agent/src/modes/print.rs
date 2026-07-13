@@ -5,6 +5,7 @@ use std::io::Write;
 use ygg_agent::{AgentEvent, OutputChannel};
 
 use crate::app::bootstrap::{build_app, resolve_launch_print, Bootstrap};
+use crate::compaction::{ensure_capacity_before_prompt, CapacityDecision};
 use crate::modes::{timestamp, RunEnded};
 
 const BASE_SYSTEM: &str = "You are ygg, a careful coding agent. Work directly in the workspace, explain important changes concisely, and use tools when they improve accuracy.";
@@ -27,7 +28,13 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
     let launch = resolve_launch_print(&boot, &timestamp())?;
     let mut app = build_app(boot, launch, BASE_SYSTEM.to_owned())?;
 
-    // M9 inserts the shared pre-request compaction gate here.
+    if let CapacityDecision::Exceeded { estimate, budget } =
+        ensure_capacity_before_prompt(&mut app, &prompt).await?
+    {
+        anyhow::bail!(
+            "prompt too large: ~{estimate} tokens exceeds the {budget}-token budget even after compaction"
+        );
+    }
     let show_reasoning = app.config.show_reasoning_in_print;
     let mut run = app.agent.prompt(prompt).await?;
     let mut output = std::io::stdout().lock();

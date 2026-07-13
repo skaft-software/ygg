@@ -3,6 +3,7 @@
 mod app;
 mod cli;
 mod commands;
+mod compaction;
 mod config;
 mod hydrate;
 mod modes;

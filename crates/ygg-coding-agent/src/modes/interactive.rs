@@ -16,6 +16,9 @@ use ygg_ai::{ModelId, ReasoningConfig};
 use crate::app::bootstrap::{build_app, resolve_launch_interactive, Bootstrap};
 use crate::app::{apply_reconfig, supported_levels, thinking_to_reasoning, App, Reconfig};
 use crate::commands::{self, Command};
+use crate::compaction::{
+    attempt_compaction, ensure_capacity_before_prompt, CapacityDecision, CompactionOutcome,
+};
 use crate::config::ThinkingLevel;
 use crate::modes::RunEnded;
 use crate::tui::keymap::{self, InputAction};
@@ -317,6 +320,18 @@ fn update_status(shell: &mut InteractiveShell, app: &App) {
     ));
 }
 
+fn report_compaction(shell: &mut InteractiveShell, outcome: &CompactionOutcome) {
+    match outcome {
+        CompactionOutcome::NotNeeded => {}
+        CompactionOutcome::Compacted { elided } => {
+            shell.compaction_marker(format!("summarized {elided} earlier messages"));
+        }
+        CompactionOutcome::Skipped { reason } => {
+            shell.notice(format!("compaction skipped: {reason}"))
+        }
+    }
+}
+
 fn transition(app: App, shell: &mut InteractiveShell, reconfig: Reconfig) -> anyhow::Result<App> {
     let app = apply_reconfig(app, reconfig)?;
     shell.hydrate(app.agent.session())?;
@@ -361,7 +376,10 @@ async fn apply_pending_actions(
                 }
             }
             PendingIdleAction::Compact => {
-                shell.notice("queued compaction will run when compaction support is initialized");
+                shell.set_run_label("compacting…");
+                shell.render();
+                let outcome = attempt_compaction(&mut app).await?;
+                report_compaction(shell, &outcome);
             }
             PendingIdleAction::PickModel => {
                 let model = model_picker(shell, input, &app.catalog).await?;
@@ -443,7 +461,12 @@ async fn run_idle_command(
             Some(name) => format!("theme {name:?} will be available after theme discovery"),
             None => "theme picker is not available yet".to_owned(),
         }),
-        Command::Compact => shell.notice("compaction is not available yet"),
+        Command::Compact => {
+            shell.set_run_label("compacting…");
+            shell.render();
+            let outcome = attempt_compaction(&mut app).await?;
+            report_compaction(shell, &outcome);
+        }
         Command::Unknown(text) => shell.error(format!("unknown command: {text}")),
     }
     shell.render();
@@ -483,6 +506,19 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 }
             }
             Idle::Submit(prompt) => {
+                shell.set_run_label("checking context…");
+                shell.render();
+                match ensure_capacity_before_prompt(&mut app, &prompt).await? {
+                    CapacityDecision::Proceed(outcome) => report_compaction(&mut shell, &outcome),
+                    CapacityDecision::Exceeded { estimate, budget } => {
+                        shell.error(format!(
+                            "prompt too large: ~{estimate} tokens exceeds the {budget}-token budget even after compaction — shorten it or start a new session"
+                        ));
+                        shell.set_run_label("idle");
+                        shell.render();
+                        continue;
+                    }
+                }
                 let mut run = app.agent.prompt(prompt).await?;
                 let control = run.control();
                 let mut quit_requested = false;
