@@ -26,26 +26,24 @@ access is **not itself a Ygg vulnerability**. A valid report must demonstrate
 that Ygg *granted* access the user did not already have, *bypassed a documented
 Ygg boundary*, or *crossed an operating-system privilege boundary*.
 
-## Workspace path guard
+## Local file access
 
-Ygg's workspace path guard validates explicit path arguments supplied to the
-built-in `read`, `search`, and `edit` operations and to the `exec` working
-directory. It reduces accidental path mistakes but is **not** an
-operating-system security boundary.
+Ygg defaults to **trusted-local** file access. Its built-in `read`, `search`,
+and `edit` tools accept paths available to the current OS user, including
+absolute paths and `~/…`; relative paths are based at the selected workspace.
+`exec` likewise accepts local working directories, and spawned processes run
+with the current user's filesystem, network, environment, and subprocess
+access.
 
-Specifically:
+A host may set `allow_external_paths = false` (or
+`YGG_ALLOW_EXTERNAL_PATHS=false`) to opt into a workspace-only accidental-path
+guard for explicit built-in tool paths and `exec` working directories. That
+optional guard rejects absolute paths, `..` components, and external symlink
+targets. It is **not** an operating-system security boundary: spawned processes
+remain unconfined regardless of this setting.
 
-- `read`, `search`, and `edit` path arguments remain workspace-checked
-  (absolute paths, `..` components, and symlink escapes are rejected);
-- `exec` working directories remain workspace-checked;
-- **spawned processes are not confined to the workspace**;
-- spawned processes may access anything available to the current user;
-- the path guard does not restrict a spawned process's filesystem calls,
-  networking, environment access, subprocesses, or shell behavior.
-
-Enabling `process` or `shell` execution is a capability grant equivalent to
-"run any program this user can run." Ygg is **not** sandboxed merely because
-built-in tool path arguments are checked.
+Process and shell execution are capability settings, not containment. Enabling
+either is equivalent to "run any program this user can run."
 
 ## Trusted inputs
 
@@ -90,8 +88,8 @@ vulnerabilities:
 Examples of reports that **may** be valid:
 
 - crossing an operating-system user or privilege boundary;
-- bypassing an explicitly documented Ygg security boundary (for example,
-  defeating the workspace path guard on a built-in tool's path argument);
+- bypassing an explicitly configured Ygg boundary (for example, defeating a
+  workspace-only path guard on a built-in tool's path argument);
 - Ygg itself granting unauthorized local read or write access;
 - unauthorized remote access through a service or interface shipped by Ygg;
 - exposure of infrastructure credentials controlled by the Ygg project;
