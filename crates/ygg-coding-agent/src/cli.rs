@@ -123,6 +123,7 @@ pub fn build_config(cli: Cli, cwd: &Path) -> anyhow::Result<Config> {
         compaction: config::CompactionPolicy::default(),
         max_turns: cli.max_turns.max(1),
         show_reasoning_in_print: cli.show_reasoning,
+        initial_prompt: (!cli.print).then_some(cli.prompt).flatten(),
         mode,
         resume,
     })

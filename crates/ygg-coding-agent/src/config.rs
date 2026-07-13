@@ -102,6 +102,8 @@ pub struct Config {
     pub compaction: CompactionPolicy,
     pub max_turns: u64,
     pub show_reasoning_in_print: bool,
+    /// Prompt passed positionally for interactive startup, if any.
+    pub initial_prompt: Option<String>,
     pub mode: Mode,
     pub resume: ResumeSelector,
 }

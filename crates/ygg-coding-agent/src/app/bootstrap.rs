@@ -165,6 +165,7 @@ mod tests {
             compaction: CompactionPolicy::default(),
             max_turns: 40,
             show_reasoning_in_print: false,
+            initial_prompt: None,
             mode: Mode::Print {
                 prompt: "hi".to_owned(),
             },

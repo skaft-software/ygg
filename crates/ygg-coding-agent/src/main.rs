@@ -2,7 +2,9 @@
 
 mod app;
 mod cli;
+mod commands;
 mod config;
+mod modes;
 mod session_store;
 mod tui;
 
@@ -12,7 +14,12 @@ use clap::Parser;
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     let cwd = std::env::current_dir()?;
-    let _config = cli::build_config(cli, &cwd)?;
-    println!("ygg configuration loaded");
-    Ok(())
+    tui::terminal::install_panic_hook();
+    let config = cli::build_config(cli, &cwd)?;
+    let mode = config.mode.clone();
+    let boot = app::bootstrap::bootstrap(config)?;
+    match mode {
+        config::Mode::Interactive => modes::interactive::run_interactive(boot).await,
+        config::Mode::Print { prompt } => modes::print::run_print(boot, prompt).await,
+    }
 }
