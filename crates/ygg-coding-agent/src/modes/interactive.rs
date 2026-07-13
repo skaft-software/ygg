@@ -13,13 +13,13 @@ use tokio::time::Interval;
 use ygg_agent::{AgentError, AgentEvent, Run, RunControl};
 use ygg_ai::{ModelId, ReasoningConfig};
 
-use crate::app::bootstrap::{build_app, Bootstrap, LaunchSelection, SessionSelection};
+use crate::app::bootstrap::{build_app, resolve_launch_interactive, Bootstrap};
 use crate::app::{apply_reconfig, App, Reconfig};
 use crate::commands::{self, Command};
-use crate::config::{parse_reasoning, ResumeSelector};
-use crate::modes::{timestamp, RunEnded};
+use crate::config::parse_reasoning;
+use crate::modes::RunEnded;
 use crate::tui::keymap::{self, InputAction};
-use crate::tui::pickers::session_picker;
+use crate::tui::pickers::{model_picker, session_picker};
 use crate::tui::theme::load_theme;
 use crate::tui::view::InteractiveShell;
 
@@ -70,25 +70,6 @@ enum Idle {
     Submit(String),
     Command(String),
     Quit,
-}
-
-fn launch_for_interactive(boot: &Bootstrap, stamp: &str) -> anyhow::Result<LaunchSelection> {
-    let model = boot.config.model.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "no model configured: pass --model <id>; interactive model selection arrives after startup"
-        )
-    })?;
-    let session = match &boot.config.resume {
-        ResumeSelector::New => SessionSelection::CreateNew(boot.sessions.new_path(stamp)),
-        ResumeSelector::Continue => SessionSelection::OpenExisting(boot.sessions.latest()?.path),
-        ResumeSelector::Resume(Some(id)) => {
-            SessionSelection::OpenExisting(boot.sessions.by_id(id)?.path)
-        }
-        ResumeSelector::Resume(None) => {
-            anyhow::bail!("--resume without an id requires the session picker")
-        }
-    };
-    Ok(LaunchSelection { model, session })
 }
 
 async fn wait_for_prompt<S>(
@@ -368,7 +349,9 @@ async fn apply_pending_actions(
                 shell.notice("queued compaction will run when compaction support is initialized");
             }
             PendingIdleAction::PickModel => {
-                shell.notice("queued model picker will open when model selection is initialized");
+                let model = model_picker(shell, input, &app.catalog).await?;
+                app = transition(app, shell, Reconfig::Model(model))?;
+                shell.notice("queued model change applied");
             }
             PendingIdleAction::PickThinking => {
                 shell.notice(
@@ -427,7 +410,11 @@ async fn run_idle_command(
             app = transition(app, shell, Reconfig::Thinking(parse_reasoning(&level)?))?;
             shell.notice("thinking changed");
         }
-        Command::Model(None) => shell.notice("model picker is not available yet"),
+        Command::Model(None) => {
+            let model = model_picker(shell, input, &app.catalog).await?;
+            app = transition(app, shell, Reconfig::Model(model))?;
+            shell.notice("model changed");
+        }
         Command::Thinking(None) => shell.notice("thinking picker is not available yet"),
         Command::Theme(name) => shell.notice(match name {
             Some(name) => format!("theme {name:?} will be available after theme discovery"),
@@ -449,7 +436,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let mut input = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(80));
 
-    let launch = launch_for_interactive(&boot, &timestamp())?;
+    let launch = resolve_launch_interactive(&boot, &mut shell, &mut input).await?;
     let mut app = build_app(boot, launch, BASE_SYSTEM.to_owned())?;
     shell.hydrate(app.agent.session())?;
     update_status(&mut shell, &app);

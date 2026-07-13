@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use crossterm::event::EventStream;
 use ygg_agent::{
     Agent, AgentConfig, CoreTools, EditTool, EntryValue, ExecTool, ExtensionHost, ReadTool,
     SearchTool, Session, Tool,
@@ -11,6 +12,8 @@ use ygg_ai::{AiClient, Model, ModelCatalog, ModelId, ReasoningConfig, ToolDef};
 use crate::app::App;
 use crate::config::{Config, ResumeSelector};
 use crate::session_store::SessionStore;
+use crate::tui::pickers::{model_picker, session_picker};
+use crate::tui::view::InteractiveShell;
 
 /// Inputs needed to resolve a launch without constructing an Agent or a TUI.
 pub struct Bootstrap {
@@ -45,6 +48,42 @@ pub fn bootstrap(config: Config) -> anyhow::Result<Bootstrap> {
         sessions,
         client,
     })
+}
+
+/// Resolve model configuration precedence. The caller supplies values from
+/// distinct configuration layers; explicit CLI selection always wins.
+pub fn resolve_model_id(
+    cli: Option<ModelId>,
+    project: Option<ModelId>,
+    global: Option<ModelId>,
+) -> Option<ModelId> {
+    cli.or(project).or(global)
+}
+
+/// Resolve an interactive launch and open pickers only while no Agent exists.
+pub async fn resolve_launch_interactive(
+    boot: &Bootstrap,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<LaunchSelection> {
+    let model = match boot.config.model.clone() {
+        Some(model) => model,
+        None => model_picker(shell, input, &boot.catalog).await?,
+    };
+    let session = match &boot.config.resume {
+        ResumeSelector::New => {
+            SessionSelection::CreateNew(boot.sessions.new_path(&crate::modes::timestamp()))
+        }
+        ResumeSelector::Continue => SessionSelection::OpenExisting(boot.sessions.latest()?.path),
+        ResumeSelector::Resume(Some(id)) => {
+            SessionSelection::OpenExisting(boot.sessions.by_id(id)?.path)
+        }
+        ResumeSelector::Resume(None) => session_picker(shell, input, &boot.sessions)
+            .await?
+            .map(SessionSelection::OpenExisting)
+            .ok_or_else(|| anyhow::anyhow!("session selection cancelled"))?,
+    };
+    Ok(LaunchSelection { model, session })
 }
 
 /// Resolve a print launch without opening an interactive picker.
@@ -240,6 +279,21 @@ mod tests {
             },
             resume: ResumeSelector::New,
         }
+    }
+
+    #[test]
+    fn model_resolution_has_cli_project_global_precedence() {
+        let id = |value: &str| Some(ModelId(value.into()));
+        assert_eq!(
+            resolve_model_id(id("cli"), id("project"), id("global")),
+            id("cli")
+        );
+        assert_eq!(
+            resolve_model_id(None, id("project"), id("global")),
+            id("project")
+        );
+        assert_eq!(resolve_model_id(None, None, id("global")), id("global"));
+        assert_eq!(resolve_model_id(None, None, None), None);
     }
 
     #[test]
