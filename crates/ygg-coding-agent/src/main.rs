@@ -1,9 +1,17 @@
 #![allow(missing_docs)]
 
+mod cli;
+mod config;
+mod session_store;
 mod tui;
+
+use clap::Parser;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    println!("ygg scaffold");
+    let cli = cli::Cli::parse();
+    let cwd = std::env::current_dir()?;
+    let _config = cli::build_config(cli, &cwd)?;
+    println!("ygg configuration loaded");
     Ok(())
 }
