@@ -6,7 +6,8 @@ use std::rc::Rc;
 
 use anyhow::Result;
 use sexy_tui_rs::widgets::Markdown;
-use sexy_tui_rs::{Component, TUI};
+use sexy_tui_rs::{visible_width, Component, TUI};
+use unicode_width::UnicodeWidthChar;
 use ygg_agent::{AgentEvent, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ToolCallId, Usage};
 
@@ -18,6 +19,7 @@ use crate::tui::theme::markdown_theme;
 
 const MAX_PANEL_BYTES: usize = 64 * 1024;
 const ELISION_MARKER: &str = "\n… older tool output elided …\n";
+const PROMPT_CURSOR: &str = "▎";
 
 /// Append display output while retaining only the newest 64 KiB.
 pub fn bounded_append(existing: &mut String, additional: &str) {
@@ -64,6 +66,8 @@ struct ShellState {
     theme: sexy_tui_rs::theme::Theme,
     transcript: Vec<TranscriptBlock>,
     editor: String,
+    /// Byte offset into `editor`; always kept at a UTF-8 character boundary.
+    editor_cursor: usize,
     status: String,
     status_detail: String,
     error: Option<String>,
@@ -229,6 +233,206 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+#[derive(Clone, Debug)]
+struct EditorVisualLine {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Debug)]
+struct EditorLayout {
+    lines: Vec<EditorVisualLine>,
+    cursor_row: usize,
+}
+
+fn prompt_content_width(width: u16) -> usize {
+    // left border + left padding + content + right padding + right border
+    usize::from(width).saturating_sub(4)
+}
+
+fn editor_wrap_width(width: u16) -> usize {
+    // Reserve one cell for the rendered bar cursor so it never pushes a line
+    // past the prompt border.
+    prompt_content_width(width).saturating_sub(1).max(1)
+}
+
+fn editor_layout(text: &str, cursor: usize, width: u16) -> EditorLayout {
+    let mut cursor = cursor.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+
+    let wrap_width = editor_wrap_width(width);
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut columns: usize = 0;
+
+    for (offset, character) in text.char_indices() {
+        if character == '\n' {
+            lines.push(EditorVisualLine { start, end: offset });
+            start = offset + character.len_utf8();
+            columns = 0;
+            continue;
+        }
+
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if columns > 0 && columns.saturating_add(character_width) > wrap_width {
+            lines.push(EditorVisualLine { start, end: offset });
+            start = offset;
+            columns = 0;
+        }
+        columns = columns.saturating_add(character_width);
+    }
+    // Keep a visible editable row for empty text and after a trailing newline.
+    lines.push(EditorVisualLine {
+        start,
+        end: text.len(),
+    });
+
+    let cursor_row = lines
+        .iter()
+        .position(|line| {
+            (line.start == line.end && cursor == line.start)
+                || (cursor >= line.start && cursor < line.end)
+        })
+        .or_else(|| lines.iter().rposition(|line| cursor == line.end))
+        .unwrap_or(0);
+
+    EditorLayout { lines, cursor_row }
+}
+
+fn editor_column(text: &str, line: &EditorVisualLine, cursor: usize) -> usize {
+    visible_width(&text[line.start..cursor.clamp(line.start, line.end)])
+}
+
+fn editor_offset_at_column(text: &str, line: &EditorVisualLine, target: usize) -> usize {
+    let mut offset = line.start;
+    let mut column: usize = 0;
+    for (relative, character) in text[line.start..line.end].char_indices() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if column.saturating_add(width) > target {
+            break;
+        }
+        column = column.saturating_add(width);
+        offset = line.start + relative + character.len_utf8();
+    }
+    offset
+}
+
+fn prompt_border(theme: &sexy_tui_rs::theme::Theme, width: u16, top: bool) -> String {
+    let width = usize::from(width);
+    let border = match (width, top) {
+        (0, _) => String::new(),
+        (1, true) => "┏".to_owned(),
+        (1, false) => "┗".to_owned(),
+        (2, true) => "┏┓".to_owned(),
+        (2, false) => "┗┛".to_owned(),
+        (_, true) if width >= 11 => format!("┏━ prompt {}┓", "━".repeat(width - 11)),
+        (_, true) => format!("┏{}┓", "━".repeat(width - 2)),
+        (_, false) => format!("┗{}┛", "━".repeat(width - 2)),
+    };
+    theme.fg("accent", &border)
+}
+
+fn prompt_content_line(theme: &sexy_tui_rs::theme::Theme, content: String, width: u16) -> String {
+    let width = usize::from(width);
+    let border = |text| theme.fg("accent", text);
+    match width {
+        0 => return String::new(),
+        1 => return border("┃"),
+        2 => return border("┃┃"),
+        3 => return border("┃ ┃"),
+        _ => {}
+    }
+
+    let content_width = width.saturating_sub(4);
+    let content = if content_width == 0 {
+        String::new()
+    } else if visible_width(&content) > content_width {
+        sexy_tui_rs::truncate_to_width(&content, content_width, None)
+    } else {
+        content
+    };
+    let padding = " ".repeat(content_width.saturating_sub(visible_width(&content)));
+    let border = border("┃");
+    format!("{border} {content}{padding} {border}")
+}
+
+fn render_prompt_box(state: &ShellState, width: u16, max_content_rows: usize) -> Vec<String> {
+    let mut lines = vec![prompt_border(&state.theme, width, true)];
+
+    if state.editor.is_empty() {
+        let cursor = state.theme.fg("accent", PROMPT_CURSOR);
+        let placeholder = state.theme.dim(" Type a prompt or /help");
+        lines.push(prompt_content_line(
+            &state.theme,
+            format!("{cursor}{placeholder}"),
+            width,
+        ));
+    } else {
+        let layout = editor_layout(&state.editor, state.editor_cursor, width);
+        let visible_rows = max_content_rows.max(1).min(layout.lines.len());
+        let mut start = layout
+            .cursor_row
+            .saturating_add(1)
+            .saturating_sub(visible_rows);
+        let mut end = (start + visible_rows).min(layout.lines.len());
+        if end.saturating_sub(start) < visible_rows {
+            start = end.saturating_sub(visible_rows);
+        }
+        // Keep this assignment explicit: it makes the viewport invariant clear
+        // if the selection policy above changes later.
+        end = (start + visible_rows).min(layout.lines.len());
+
+        for (index, line) in layout.lines[start..end].iter().enumerate() {
+            let index = start + index;
+            let content = if index == layout.cursor_row {
+                let cursor = state.editor_cursor.clamp(line.start, line.end);
+                let before = &state.editor[line.start..cursor];
+                let after = &state.editor[cursor..line.end];
+                format!("{before}{}{after}", state.theme.fg("accent", PROMPT_CURSOR))
+            } else {
+                state.editor[line.start..line.end].to_owned()
+            };
+            lines.push(prompt_content_line(&state.theme, content, width));
+        }
+    }
+
+    lines.push(prompt_border(&state.theme, width, false));
+    lines
+}
+
+fn transcript_lines(state: &ShellState, width: u16) -> Vec<String> {
+    let mut lines = Vec::new();
+    for block in &state.transcript {
+        lines.extend(render_block(block, &state.theme, width));
+    }
+    lines
+}
+
+fn max_scroll_for_available(transcript_len: usize, available: usize) -> usize {
+    // A scrolled viewport reserves one line for its return-to-live indicator.
+    if available <= 1 {
+        0
+    } else {
+        transcript_len.saturating_sub(available - 1)
+    }
+}
+
+fn max_scroll_from_bottom(state: &ShellState, width: u16) -> usize {
+    if state.overlay.is_some() {
+        return 0;
+    }
+    let rows = usize::from(state.size.1.max(5));
+    let header_lines = 1 + usize::from(state.error.is_some());
+    let prompt_max_rows = rows.saturating_sub(header_lines).saturating_sub(3).max(1);
+    let prompt_height = render_prompt_box(state, width, prompt_max_rows).len();
+    let available = rows
+        .saturating_sub(header_lines)
+        .saturating_sub(prompt_height);
+    max_scroll_for_available(transcript_lines(state, width).len(), available)
+}
+
 fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
     let rows = usize::from(state.size.1.max(5));
     let mut lines = Vec::new();
@@ -270,40 +474,32 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
             lines.push(format!(" {line}"));
         }
         lines.push(state.theme.dim("Press Esc or any printable key to close."));
-    } else {
-        let mut transcript_lines = Vec::new();
-        for block in &state.transcript {
-            transcript_lines.extend(render_block(block, &state.theme, width));
-        }
-        let editor_lines = state.editor.lines().count().max(1) + 2;
-        let available = rows
-            .saturating_sub(lines.len())
-            .saturating_sub(editor_lines)
-            .max(1);
-        let scroll_from_bottom = state
-            .scroll_from_bottom
-            .min(transcript_lines.len().saturating_sub(available));
-        let end = transcript_lines.len().saturating_sub(scroll_from_bottom);
-        let start = end.saturating_sub(available);
-        lines.extend(transcript_lines[start..end].iter().cloned());
-        if scroll_from_bottom > 0 {
-            lines.push(
-                state
-                    .theme
-                    .dim("↑ scrolled transcript (PageDown returns to live)"),
-            );
-        }
+        let prompt_max_rows = rows.saturating_sub(lines.len()).saturating_sub(2).max(1);
+        lines.extend(render_prompt_box(state, width, prompt_max_rows));
+        return lines;
     }
 
-    lines.push(state.theme.fg("accent", "┌─ prompt ─"));
-    if state.editor.is_empty() {
-        lines.push(state.theme.dim("│ Type a prompt or /help"));
-    } else {
-        for line in state.editor.lines() {
-            lines.push(format!("│ {line}"));
-        }
+    let prompt_max_rows = rows.saturating_sub(lines.len()).saturating_sub(3).max(1);
+    let prompt = render_prompt_box(state, width, prompt_max_rows);
+    let available = rows
+        .saturating_sub(lines.len())
+        .saturating_sub(prompt.len());
+    let transcript = transcript_lines(state, width);
+    let max_scroll = max_scroll_for_available(transcript.len(), available);
+    let scroll_from_bottom = state.scroll_from_bottom.min(max_scroll);
+    let show_scroll_indicator = scroll_from_bottom > 0 && available > 1;
+    let transcript_capacity = available.saturating_sub(usize::from(show_scroll_indicator));
+    let end = transcript.len().saturating_sub(scroll_from_bottom);
+    let start = end.saturating_sub(transcript_capacity);
+    lines.extend(transcript[start..end].iter().cloned());
+    if show_scroll_indicator {
+        lines.push(
+            state
+                .theme
+                .dim("↑ scrolled transcript (mouse/trackpad or PageDown returns to live)"),
+        );
     }
-    lines.push(state.theme.fg("accent", "└──────────"));
+    lines.extend(prompt);
     lines
 }
 
@@ -463,12 +659,70 @@ impl InteractiveShell {
 
     pub fn apply_edit(&mut self, action: EditAction) {
         let mut state = self.state.borrow_mut();
+        state.editor_cursor = state.editor_cursor.min(state.editor.len());
         match action {
-            EditAction::Char(character) => state.editor.push(character),
-            EditAction::Backspace => {
-                state.editor.pop();
+            EditAction::Char(character) => {
+                let cursor = state.editor_cursor;
+                state.editor.insert(cursor, character);
+                state.editor_cursor = cursor + character.len_utf8();
             }
-            EditAction::Newline => state.editor.push('\n'),
+            EditAction::Backspace => {
+                if state.editor_cursor > 0 {
+                    let previous = state.editor[..state.editor_cursor]
+                        .char_indices()
+                        .last()
+                        .map_or(0, |(offset, _)| offset);
+                    let cursor = state.editor_cursor;
+                    state.editor.replace_range(previous..cursor, "");
+                    state.editor_cursor = previous;
+                }
+            }
+            EditAction::Delete => {
+                if let Some(character) = state.editor[state.editor_cursor..].chars().next() {
+                    let end = state.editor_cursor + character.len_utf8();
+                    let cursor = state.editor_cursor;
+                    state.editor.replace_range(cursor..end, "");
+                }
+            }
+            EditAction::Newline => {
+                let cursor = state.editor_cursor;
+                state.editor.insert(cursor, '\n');
+                state.editor_cursor = cursor + 1;
+            }
+            EditAction::Left => {
+                if state.editor_cursor > 0 {
+                    state.editor_cursor = state.editor[..state.editor_cursor]
+                        .char_indices()
+                        .last()
+                        .map_or(0, |(offset, _)| offset);
+                }
+            }
+            EditAction::Right => {
+                if let Some(character) = state.editor[state.editor_cursor..].chars().next() {
+                    state.editor_cursor += character.len_utf8();
+                }
+            }
+            EditAction::Up | EditAction::Down => {
+                let layout = editor_layout(&state.editor, state.editor_cursor, state.size.0);
+                let current = &layout.lines[layout.cursor_row];
+                let target_row = if matches!(action, EditAction::Up) {
+                    layout.cursor_row.saturating_sub(1)
+                } else {
+                    (layout.cursor_row + 1).min(layout.lines.len().saturating_sub(1))
+                };
+                let column = editor_column(&state.editor, current, state.editor_cursor);
+                state.editor_cursor =
+                    editor_offset_at_column(&state.editor, &layout.lines[target_row], column);
+            }
+            EditAction::Home | EditAction::End => {
+                let layout = editor_layout(&state.editor, state.editor_cursor, state.size.0);
+                let line = &layout.lines[layout.cursor_row];
+                state.editor_cursor = if matches!(action, EditAction::Home) {
+                    line.start
+                } else {
+                    line.end
+                };
+            }
         }
     }
 
@@ -490,7 +744,10 @@ impl InteractiveShell {
 
     pub fn set_size(&mut self, columns: u16, rows: u16) {
         self.size.set((columns, rows));
-        self.state.borrow_mut().size = (columns, rows);
+        let mut state = self.state.borrow_mut();
+        state.size = (columns, rows);
+        let maximum = max_scroll_from_bottom(&state, columns);
+        state.scroll_from_bottom = state.scroll_from_bottom.min(maximum);
     }
 
     pub fn columns(&self) -> u16 {
@@ -519,7 +776,8 @@ impl InteractiveShell {
 
     pub fn drain_editor(&mut self) -> String {
         let mut state = self.state.borrow_mut();
-        state.editor.drain(..).collect()
+        state.editor_cursor = 0;
+        std::mem::take(&mut state.editor)
     }
 
     pub fn scroll(&mut self, direction: i16) {
@@ -527,10 +785,26 @@ impl InteractiveShell {
         let page = usize::from(state.size.1.max(4) / 2);
         if direction < 0 {
             state.scroll_from_bottom = state.scroll_from_bottom.saturating_add(page);
+            let maximum = max_scroll_from_bottom(&state, state.size.0);
+            state.scroll_from_bottom = state.scroll_from_bottom.min(maximum);
         } else {
             // PageDown is the explicit return-to-live control; reset rather
             // than decrementing an overshot viewport a page at a time.
             state.scroll_from_bottom = 0;
+        }
+    }
+
+    /// Scroll the transcript in small, trackpad-friendly increments.
+    pub fn scroll_lines(&mut self, direction: i16) {
+        let mut state = self.state.borrow_mut();
+        if direction < 0 {
+            state.scroll_from_bottom = state
+                .scroll_from_bottom
+                .saturating_add(direction.unsigned_abs() as usize);
+            let maximum = max_scroll_from_bottom(&state, state.size.0);
+            state.scroll_from_bottom = state.scroll_from_bottom.min(maximum);
+        } else {
+            state.scroll_from_bottom = state.scroll_from_bottom.saturating_sub(direction as usize);
         }
     }
 
@@ -727,6 +1001,131 @@ mod tests {
         assert!(rendered
             .iter()
             .any(|line| line.contains("context ~4096/967232")));
+    }
+
+    #[test]
+    fn prompt_box_wraps_to_terminal_width_and_grows_then_shrinks() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(24, 10);
+        for character in "abcdefghijklmnopqrstuvwxyz0123456789".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+
+        let rendered = render_shell(&shell.state.borrow(), 24);
+        let top = rendered
+            .iter()
+            .position(|line| line.contains("prompt"))
+            .unwrap();
+        let bottom = rendered
+            .iter()
+            .skip(top + 1)
+            .position(|line| line.contains('┗'))
+            .map(|index| top + index + 1)
+            .unwrap();
+        assert!(bottom - top + 1 > 3, "long input should grow the editor");
+        assert!(
+            rendered.len() <= 10,
+            "the editor must not exceed the viewport"
+        );
+        for line in &rendered[top..=bottom] {
+            assert_eq!(
+                visible_width(line),
+                24,
+                "prompt border must fit terminal: {line:?}"
+            );
+        }
+        assert!(rendered.iter().any(|line| line.contains(PROMPT_CURSOR)));
+
+        shell.drain_editor();
+        let rendered = render_shell(&shell.state.borrow(), 24);
+        let top = rendered
+            .iter()
+            .position(|line| line.contains("prompt"))
+            .unwrap();
+        let bottom = rendered
+            .iter()
+            .skip(top + 1)
+            .position(|line| line.contains('┗'))
+            .map(|index| top + index + 1)
+            .unwrap();
+        assert_eq!(bottom - top + 1, 3, "empty editor should shrink to one row");
+    }
+
+    #[test]
+    fn prompt_box_keeps_perfect_geometry_across_viewport_sizes() {
+        for (width, height) in [
+            (1, 5),
+            (2, 5),
+            (3, 5),
+            (4, 5),
+            (8, 5),
+            (12, 7),
+            (24, 10),
+            (80, 24),
+            (173, 61),
+        ] {
+            let mut shell = InteractiveShell::test_shell();
+            shell.set_size(width, height);
+            for character in "a long prompt that must wrap cleanly at every width".chars() {
+                shell.apply_edit(EditAction::Char(character));
+            }
+
+            let rendered = render_shell(&shell.state.borrow(), width);
+            let top = rendered
+                .iter()
+                .position(|line| line.contains('┏'))
+                .expect("prompt top border");
+            let bottom = rendered
+                .iter()
+                .skip(top + 1)
+                .position(|line| line.contains('┗'))
+                .map(|index| top + index + 1)
+                .expect("prompt bottom border");
+            assert!(rendered.len() <= usize::from(height));
+            for line in &rendered[top..=bottom] {
+                assert_eq!(visible_width(line), usize::from(width), "{width}x{height}");
+            }
+            assert!(rendered[top].contains('┏'));
+            assert!(rendered[bottom].contains('┗'));
+            if width >= 2 {
+                assert!(rendered[top].contains('┓'));
+                assert!(rendered[bottom].contains('┛'));
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_bar_cursor_tracks_insertions_and_cursor_motion() {
+        let mut shell = InteractiveShell::test_shell();
+        for character in "abcdef".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+        shell.apply_edit(EditAction::Left);
+        shell.apply_edit(EditAction::Left);
+        shell.apply_edit(EditAction::Char('X'));
+        assert_eq!(shell.state.borrow().editor, "abcdXef");
+
+        let rendered = render_shell(&shell.state.borrow(), 120);
+        let line = rendered
+            .iter()
+            .find(|line| line.contains(PROMPT_CURSOR))
+            .unwrap();
+        assert!(line.find("abcdX").unwrap() < line.find(PROMPT_CURSOR).unwrap());
+        assert!(line.find(PROMPT_CURSOR).unwrap() < line.find("ef").unwrap());
+    }
+
+    #[test]
+    fn trackpad_scroll_moves_the_transcript_in_small_clamped_steps() {
+        let mut shell = InteractiveShell::test_shell();
+        for number in 0..30 {
+            shell.notice(format!("notice {number}"));
+        }
+        shell.scroll_lines(-3);
+        assert!(shell.state.borrow().scroll_from_bottom > 0);
+        let rendered = render_shell(&shell.state.borrow(), 120);
+        assert!(rendered.iter().any(|line| line.contains("notice")));
+        shell.scroll_lines(3);
+        assert_eq!(shell.state.borrow().scroll_from_bottom, 0);
     }
 
     #[test]

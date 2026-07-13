@@ -104,10 +104,20 @@ where
                     None => return Ok(Idle::Quit),
                 };
                 if shell.has_overlay() {
-                    shell.close_overlay();
-                    shell.clear_error();
-                    shell.render();
-                    continue;
+                    match event {
+                        Event::Mouse(_) => continue,
+                        Event::Resize(columns, rows) => {
+                            shell.set_size(columns, rows);
+                            shell.render();
+                            continue;
+                        }
+                        _ => {
+                            shell.close_overlay();
+                            shell.clear_error();
+                            shell.render();
+                            continue;
+                        }
+                    }
                 }
                 let pending = if shell.pending_is_empty() {
                     String::new()
@@ -125,6 +135,10 @@ where
                     }
                     InputAction::Scroll(direction) => {
                         shell.scroll(direction);
+                        shell.render();
+                    }
+                    InputAction::ScrollLines(direction) => {
+                        shell.scroll_lines(direction);
                         shell.render();
                     }
                     InputAction::Close => {
@@ -271,10 +285,20 @@ where
                     }
                 };
                 if shell.has_overlay() {
-                    shell.close_overlay();
-                    shell.clear_error();
-                    shell.render();
-                    continue;
+                    match event {
+                        Event::Mouse(_) => continue,
+                        Event::Resize(columns, rows) => {
+                            shell.set_size(columns, rows);
+                            shell.render();
+                            continue;
+                        }
+                        _ => {
+                            shell.close_overlay();
+                            shell.clear_error();
+                            shell.render();
+                            continue;
+                        }
+                    }
                 }
                 let pending = if shell.pending_is_empty() {
                     String::new()
@@ -323,6 +347,10 @@ where
                     }
                     InputAction::Scroll(direction) => {
                         shell.scroll(direction);
+                        shell.render();
+                    }
+                    InputAction::ScrollLines(direction) => {
+                        shell.scroll_lines(direction);
                         shell.render();
                     }
                     InputAction::Close => {

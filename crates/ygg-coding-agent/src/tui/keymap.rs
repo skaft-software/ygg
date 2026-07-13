@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 
 /// Actions produced by the pure terminal-event translator.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,7 +12,10 @@ pub enum InputAction {
     Command(String),
     Edit(EditAction),
     Resize(u16, u16),
+    /// Page-based transcript navigation from PageUp/PageDown.
     Scroll(i16),
+    /// Small incremental movement from a mouse wheel or trackpad.
+    ScrollLines(i16),
     Close,
     Closed,
     Ignore,
@@ -23,7 +26,14 @@ pub enum InputAction {
 pub enum EditAction {
     Char(char),
     Backspace,
+    Delete,
     Newline,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
 }
 
 fn is_command_submission(key: &KeyEvent) -> bool {
@@ -39,6 +49,11 @@ pub fn translate(event: Option<Event>, active: bool, editor_text: &str) -> Input
 
     match event {
         Event::Resize(columns, rows) => InputAction::Resize(columns, rows),
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => InputAction::ScrollLines(-3),
+            MouseEventKind::ScrollDown => InputAction::ScrollLines(3),
+            _ => InputAction::Ignore,
+        },
         Event::Key(key) => {
             if key.kind != KeyEventKind::Press {
                 return InputAction::Ignore;
@@ -100,6 +115,27 @@ pub fn translate(event: Option<Event>, active: bool, editor_text: &str) -> Input
                     ) =>
                 {
                     InputAction::Edit(EditAction::Backspace)
+                }
+                (_, KeyCode::Delete, modifiers) if modifiers.is_empty() => {
+                    InputAction::Edit(EditAction::Delete)
+                }
+                (_, KeyCode::Left, modifiers) if modifiers.is_empty() => {
+                    InputAction::Edit(EditAction::Left)
+                }
+                (_, KeyCode::Right, modifiers) if modifiers.is_empty() => {
+                    InputAction::Edit(EditAction::Right)
+                }
+                (_, KeyCode::Up, modifiers) if modifiers.is_empty() => {
+                    InputAction::Edit(EditAction::Up)
+                }
+                (_, KeyCode::Down, modifiers) if modifiers.is_empty() => {
+                    InputAction::Edit(EditAction::Down)
+                }
+                (_, KeyCode::Home, modifiers) if modifiers.is_empty() => {
+                    InputAction::Edit(EditAction::Home)
+                }
+                (_, KeyCode::End, modifiers) if modifiers.is_empty() => {
+                    InputAction::Edit(EditAction::End)
                 }
                 (_, KeyCode::Char(character), modifiers)
                     if !modifiers.intersects(
@@ -276,6 +312,31 @@ mod tests {
             InputAction::Ignore
         );
         assert_eq!(translate(None, false, ""), InputAction::Closed);
+    }
+
+    #[test]
+    fn editor_navigation_and_mouse_scroll_are_available_to_the_shell() {
+        assert_eq!(
+            translate(Some(key(KeyCode::Left, KeyModifiers::NONE)), false, "x"),
+            InputAction::Edit(EditAction::Left)
+        );
+        assert_eq!(
+            translate(Some(key(KeyCode::Delete, KeyModifiers::NONE)), false, "x"),
+            InputAction::Edit(EditAction::Delete)
+        );
+        assert_eq!(
+            translate(
+                Some(Event::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                })),
+                false,
+                ""
+            ),
+            InputAction::ScrollLines(-3)
+        );
     }
 
     #[test]

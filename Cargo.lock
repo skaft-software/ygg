@@ -1405,7 +1405,7 @@ dependencies = [
 [[package]]
 name = "sexy-tui-rs"
 version = "0.1.0"
-source = "git+https://github.com/achuthanmukundan00/sexy-tui-rs?rev=05a151533fb5be6cb908a1becd420e50a1754164#05a151533fb5be6cb908a1becd420e50a1754164"
+source = "git+https://github.com/achuthanmukundan00/sexy-tui-rs?rev=aa4592a3d46faf4995f2fe73c3276224290dc370#aa4592a3d46faf4995f2fe73c3276224290dc370"
 dependencies = [
  "crossterm",
  "notify",
@@ -2246,6 +2246,7 @@ dependencies = [
  "tokio-stream",
  "tokio-test",
  "toml",
+ "unicode-width",
  "url",
  "wiremock",
  "ygg-agent",

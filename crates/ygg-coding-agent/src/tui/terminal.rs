@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use crossterm::{cursor, execute, terminal};
+use crossterm::{cursor, event, execute, terminal};
 
 /// Shared dimensions reachable by both the boxed terminal and the shell.
 pub type TerminalSize = Rc<Cell<(u16, u16)>>;
@@ -30,7 +30,12 @@ pub fn force_restore() {
     if RAW_ACTIVE.swap(false, Ordering::SeqCst) {
         let _ = terminal::disable_raw_mode();
         let mut out = std::io::stdout();
-        let _ = execute!(out, terminal::LeaveAlternateScreen, cursor::Show);
+        let _ = execute!(
+            out,
+            event::DisableMouseCapture,
+            terminal::LeaveAlternateScreen,
+            cursor::Show
+        );
         let _ = out.flush();
     }
 }
@@ -79,7 +84,12 @@ impl YggTerminal {
 
     fn enter_inner(size: TerminalSize) -> Result<Self> {
         let mut out = std::io::stdout();
-        execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
+        execute!(
+            out,
+            terminal::EnterAlternateScreen,
+            event::EnableMouseCapture,
+            cursor::Hide
+        )?;
         size.set(terminal::size().unwrap_or(size.get()));
         Ok(Self {
             out,
