@@ -3,3 +3,4 @@
 pub mod keymap;
 pub mod terminal;
 pub mod theme;
+pub mod view;

@@ -42,27 +42,29 @@ pub struct YggTerminal {
 impl YggTerminal {
     /// Enter raw mode and the alternate screen, returning the shared size cell.
     pub fn enter() -> Result<(Self, Rc<Cell<(u16, u16)>>)> {
+        let size = Rc::new(Cell::new(terminal::size().unwrap_or((80, 24))));
+        let terminal = Self::enter_with_size(size.clone())?;
+        Ok((terminal, size))
+    }
+
+    /// Enter using a caller-owned shared dimensions cell. This lets the shell
+    /// update dimensions after resize while the terminal is boxed in the TUI.
+    pub fn enter_with_size(size: Rc<Cell<(u16, u16)>>) -> Result<Self> {
         terminal::enable_raw_mode()?;
         RAW_ACTIVE.store(true, Ordering::SeqCst);
 
-        let result = Self::enter_inner();
+        let result = Self::enter_inner(size);
         if result.is_err() {
             force_restore();
         }
         result
     }
 
-    fn enter_inner() -> Result<(Self, Rc<Cell<(u16, u16)>>)> {
+    fn enter_inner(size: Rc<Cell<(u16, u16)>>) -> Result<Self> {
         let mut out = std::io::stdout();
         execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
-        let size = Rc::new(Cell::new(terminal::size().unwrap_or((80, 24))));
-        Ok((
-            Self {
-                out,
-                size: size.clone(),
-            },
-            size,
-        ))
+        size.set(terminal::size().unwrap_or(size.get()));
+        Ok(Self { out, size })
     }
 }
 
