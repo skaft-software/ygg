@@ -326,6 +326,30 @@ impl InteractiveShell {
         })
     }
 
+    #[cfg(test)]
+    pub fn test_shell() -> Self {
+        let size = Rc::new(Cell::new((120, 40)));
+        let state = Rc::new(RefCell::new(ShellState {
+            theme: sexy_tui_rs::theme::Theme::load(
+                None,
+                sexy_tui_rs::theme::capability::CapabilityTier::Baseline,
+            ),
+            size: size.get(),
+            ..ShellState::default()
+        }));
+        let mut tui = TUI::new(Box::new(TestTerminal { size: size.clone() }));
+        tui.add_child(Box::new(ShellComponent {
+            state: state.clone(),
+        }));
+        tui.start();
+        Self {
+            tui,
+            state,
+            size,
+            theme_config: None,
+        }
+    }
+
     /// Stop rendering and restore the process terminal.
     pub fn leave(mut self) {
         self.tui.stop();
@@ -581,6 +605,7 @@ impl InteractiveShell {
     }
 
     /// Human-readable state used by headless unit tests and regression checks.
+    #[cfg(test)]
     pub fn debug_snapshot(&self) -> String {
         let state = self.state.borrow();
         let mut result = state.status.clone();
@@ -605,6 +630,7 @@ impl InteractiveShell {
         result
     }
 
+    #[cfg(test)]
     pub fn debug_tool_output(&self, id: &ToolCallId) -> Option<String> {
         let state = self.state.borrow();
         let index = *state.tool_panels.get(id)?;
@@ -613,6 +639,30 @@ impl InteractiveShell {
             _ => None,
         }
     }
+}
+
+#[cfg(test)]
+struct TestTerminal {
+    size: Rc<Cell<(u16, u16)>>,
+}
+
+#[cfg(test)]
+impl sexy_tui_rs::Terminal for TestTerminal {
+    fn start(&mut self, _on_input: Box<dyn FnMut(&str)>, _on_resize: Box<dyn FnMut()>) {}
+    fn stop(&mut self) {}
+    fn write(&mut self, _data: &str) {}
+    fn columns(&self) -> u16 {
+        self.size.get().0
+    }
+    fn rows(&self) -> u16 {
+        self.size.get().1
+    }
+    fn move_by(&mut self, _lines: i16) {}
+    fn hide_cursor(&mut self) {}
+    fn show_cursor(&mut self) {}
+    fn clear_line(&mut self) {}
+    fn clear_from_cursor(&mut self) {}
+    fn clear_screen(&mut self) {}
 }
 
 #[cfg(test)]
@@ -639,5 +689,62 @@ mod tests {
     #[test]
     fn plain_wrapping_is_nonempty_for_empty_text() {
         assert_eq!(wrap_plain("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn scripted_agent_events_map_to_distinct_transcript_and_tool_state() {
+        use ygg_agent::{EntryId, FinishReason, ToolOutput};
+        use ygg_ai::{AssistantMessage, AssistantPart, ModelId, Protocol};
+
+        let mut shell = InteractiveShell::test_shell();
+        let id = ToolCallId("call-1".into());
+        let events = vec![
+            AgentEvent::OutputDelta {
+                channel: OutputChannel::Reasoning,
+                text: "considering".into(),
+            },
+            AgentEvent::OutputDelta {
+                channel: OutputChannel::Text,
+                text: "answer".into(),
+            },
+            AgentEvent::ToolStarted {
+                id: id.clone(),
+                name: "read".into(),
+                args: serde_json::json!({"path": "src/lib.rs"}),
+            },
+            AgentEvent::ToolProgress {
+                id: id.clone(),
+                progress: ToolProgress::Status("reading".into()),
+            },
+            AgentEvent::ToolFinished {
+                id: id.clone(),
+                result: Ok(ToolOutput::new("contents")),
+            },
+            AgentEvent::TurnFinished {
+                message: AssistantMessage {
+                    content: vec![AssistantPart::Text("answer".into())],
+                    model: ModelId("m".into()),
+                    protocol: Protocol::OpenAiChat,
+                },
+                usage: Usage {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                    total_tokens: 15,
+                    ..Usage::default()
+                },
+            },
+            AgentEvent::RunFinished {
+                head: EntryId("003".into()),
+                reason: FinishReason::Completed,
+            },
+        ];
+        for event in &events {
+            shell.on_agent_event(event);
+        }
+        let snapshot = shell.debug_snapshot();
+        assert!(snapshot.contains("considering"));
+        assert!(snapshot.contains("answer"));
+        assert!(snapshot.contains("read"));
+        assert!(shell.debug_tool_output(&id).unwrap().contains("reading"));
     }
 }

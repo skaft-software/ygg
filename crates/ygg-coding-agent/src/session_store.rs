@@ -112,7 +112,7 @@ impl SessionStore {
                 })
             })
             .collect::<Vec<_>>();
-        sessions.sort_by(|left, right| right.modified.cmp(&left.modified));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.modified));
         sessions
     }
 

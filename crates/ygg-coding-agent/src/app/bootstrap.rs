@@ -117,13 +117,7 @@ pub fn resolve_launch_print(boot: &Bootstrap, stamp: &str) -> anyhow::Result<Lau
 
 /// Conservative character-based token estimate used for capacity reserves.
 pub fn estimate_text_tokens(text: &str) -> u64 {
-    (text.len() as u64 + 3) / 4
-}
-
-fn estimate_tool_definition(definition: &ToolDef) -> u64 {
-    serde_json::to_string(definition)
-        .map(|json| estimate_text_tokens(&json))
-        .unwrap_or_default()
+    (text.len() as u64).div_ceil(4)
 }
 
 /// Estimate the reserved serialized size of the four frozen core tool schemas.

@@ -7,7 +7,7 @@ use sexy_tui_rs::Component;
 use ygg_ai::{ModelCatalog, ModelId};
 
 use crate::config::ThinkingLevel;
-use crate::session_store::{SessionMeta, SessionStore};
+use crate::session_store::SessionStore;
 use crate::tui::keymap::encode;
 use crate::tui::theme::select_list_theme;
 use crate::tui::view::InteractiveShell;
@@ -116,17 +116,16 @@ pub async fn session_picker(
     input: &mut EventStream,
     store: &SessionStore,
 ) -> anyhow::Result<Option<std::path::PathBuf>> {
-    let sessions = store.list();
-    let items = sessions.iter().map(session_select_item).collect::<Vec<_>>();
-    let selected = pick_from(shell, input, items).await?;
-    Ok(selected.and_then(|index| sessions.get(index).map(|session| session.path.clone())))
-}
-
-fn session_select_item(session: &SessionMeta) -> SelectItem {
-    SelectItem {
-        value: session.id.clone(),
-        label: session.title.clone(),
-        description: Some(session.id.clone()),
+    let items = session_items(store);
+    if items.is_empty() {
+        shell.error(format!("no sessions in {}", store.dir().display()));
+        shell.render();
+        return Ok(None);
+    }
+    let selected = pick_from(shell, input, items.clone()).await?;
+    match selected {
+        Some(index) => Ok(Some(store.by_id(&items[index].value)?.path)),
+        None => Ok(None),
     }
 }
 

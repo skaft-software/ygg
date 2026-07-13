@@ -34,6 +34,8 @@ enum ControlIntent {
     FollowUp(String),
 }
 
+type ControlFuture = Pin<Box<dyn Future<Output = Result<(), AgentError>>>>;
+
 /// Reconfiguration work requested while the Agent is active. It is applied
 /// only after `Run` is dropped at the next idle boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,7 +108,11 @@ where
                     shell.render();
                     continue;
                 }
-                let pending = shell.pending();
+                let pending = if shell.pending_is_empty() {
+                    String::new()
+                } else {
+                    shell.pending()
+                };
                 match keymap::translate(Some(event), false, &pending) {
                     InputAction::Edit(action) => {
                         shell.apply_edit(action);
@@ -142,9 +148,10 @@ fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> a
     let action = match command {
         Command::Model(Some(id)) => PendingIdleAction::ChangeModel(ModelId(id)),
         Command::Model(None) => PendingIdleAction::PickModel,
-        Command::Thinking(Some(level)) => {
-            PendingIdleAction::ChangeThinkingLevel(ThinkingLevel::parse(&level)?)
-        }
+        Command::Thinking(Some(level)) => match ThinkingLevel::parse(&level)? {
+            ThinkingLevel::Off => PendingIdleAction::ChangeThinking(ReasoningConfig::Off),
+            level => PendingIdleAction::ChangeThinkingLevel(level),
+        },
         Command::Thinking(None) => PendingIdleAction::PickThinking,
         Command::New => PendingIdleAction::NewSession,
         Command::Resume(id) => PendingIdleAction::ResumeSession(id),
@@ -229,7 +236,7 @@ where
     S: Stream<Item = std::io::Result<Event>> + Unpin,
 {
     let mut intents = VecDeque::<ControlIntent>::new();
-    let mut in_flight: Option<Pin<Box<dyn Future<Output = Result<(), AgentError>>>>> = None;
+    let mut in_flight: Option<ControlFuture> = None;
 
     loop {
         if in_flight.is_none() {
@@ -268,7 +275,11 @@ where
                     shell.render();
                     continue;
                 }
-                let pending = shell.pending();
+                let pending = if shell.pending_is_empty() {
+                    String::new()
+                } else {
+                    shell.pending()
+                };
                 match keymap::translate(Some(event), true, &pending) {
                     InputAction::Abort => {
                         control.abort();
@@ -328,6 +339,11 @@ where
                     shell.set_run_label(&format!("run: {ended:?}"));
                     shell.render();
                     return Ok(ended);
+                }
+                Some(AgentEvent::TurnFinished { usage, .. }) => {
+                    shell.on_turn_finished(&usage);
+                    shell.set_run_label("turn complete");
+                    shell.render();
                 }
                 Some(event) => {
                     shell.on_agent_event(&event);
@@ -429,7 +445,7 @@ async fn apply_pending_actions(
 }
 
 enum IdleCommandOutcome {
-    Continue(App),
+    Continue(Box<App>),
     Quit,
 }
 
@@ -504,7 +520,7 @@ async fn run_idle_command(
         Command::Unknown(text) => shell.error(format!("unknown command: {text}")),
     }
     shell.render();
-    Ok(IdleCommandOutcome::Continue(app))
+    Ok(IdleCommandOutcome::Continue(Box::new(app)))
 }
 
 /// Run the interactive frontend with explicit idle and active borrow phases.
@@ -537,7 +553,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 match run_idle_command(app, &mut shell, &mut input, commands::parse(&command_input))
                     .await?
                 {
-                    IdleCommandOutcome::Continue(next) => app = next,
+                    IdleCommandOutcome::Continue(next) => app = *next,
                     IdleCommandOutcome::Quit => break,
                 }
             }
@@ -570,11 +586,11 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 .await?;
                 drop(run);
                 shell.set_run_label(&format!("run: {ended:?}"));
-                app = apply_pending_actions(app, &mut shell, &mut input, &mut pending_actions)
-                    .await?;
                 if quit_requested {
                     break;
                 }
+                app = apply_pending_actions(app, &mut shell, &mut input, &mut pending_actions)
+                    .await?;
             }
         }
     }
@@ -625,5 +641,172 @@ mod tests {
             queue.pop_front(),
             Some(PendingIdleAction::ResumeSession(Some("id".into())))
         );
+    }
+
+    fn text_turn() -> String {
+        concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        )
+        .to_owned()
+    }
+
+    fn scripted_model(uri: &str) -> ygg_ai::Model {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use ygg_ai::{
+            Auth, Capabilities, Endpoint, EndpointId, ModalitySet, ModelLimits, ModelSpec, Protocol,
+        };
+
+        ygg_ai::Model {
+            spec: Arc::new(ModelSpec {
+                id: ModelId("scripted".into()),
+                endpoint: EndpointId("test".into()),
+                api_name: "scripted".into(),
+                protocol: Protocol::AnthropicMessages,
+                capabilities: Capabilities {
+                    input_modalities: ModalitySet::none(),
+                    output_modalities: ModalitySet::none(),
+                    tools: true,
+                    parallel_tool_calls: false,
+                    reasoning: None,
+                    structured_output: false,
+                },
+                limits: ModelLimits {
+                    context_window: 16_000,
+                    max_output_tokens: 1024,
+                },
+                pricing: None,
+            }),
+            endpoint: Arc::new(Endpoint {
+                id: EndpointId("test".into()),
+                base_url: url::Url::parse(&format!("{uri}/v1/")).unwrap(),
+                auth: Auth::None,
+                default_headers: http::HeaderMap::new(),
+                timeout: Duration::from_secs(5),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn scripted_active_loop_queues_controls_and_never_forwards_active_model_command() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use tokio_stream::wrappers::ReceiverStream;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use ygg_agent::{Agent, AgentConfig, CoreTools, ExtensionHost, SandboxConfig, Session};
+        use ygg_ai::AiClient;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(text_turn()),
+            )
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let session_path = workspace.path().join("session.jsonl");
+        let mut extensions = ExtensionHost::new();
+        extensions.load(&CoreTools);
+        let mut sandbox = SandboxConfig::new(workspace.path());
+        sandbox.allow_edit = true;
+        sandbox.allow_process = true;
+        let mut agent = Agent::new(AgentConfig {
+            client: AiClient::new(),
+            model: scripted_model(&server.uri()),
+            session: Session::create(&session_path).unwrap(),
+            system: "test".into(),
+            sandbox,
+            extensions,
+            max_turns: 4,
+            reasoning: ReasoningConfig::Off,
+        })
+        .unwrap();
+
+        let mut shell = InteractiveShell::test_shell();
+        for character in "steer first".chars() {
+            shell.apply_edit(crate::tui::keymap::EditAction::Char(character));
+        }
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL,
+            ))))
+            .await
+            .unwrap();
+        for character in "/model gpt-4o-mini".chars() {
+            sender
+                .send(Ok(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))))
+                .await
+                .unwrap();
+        }
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))))
+            .await
+            .unwrap();
+        // Keep the sender alive so the receiver remains pending rather than
+        // signalling an input close that would abort the real run.
+        let _sender = sender;
+        let mut input = ReceiverStream::new(receiver);
+        let mut ticker = tokio::time::interval(Duration::from_millis(1));
+        let mut pending = VecDeque::new();
+        let mut quit = false;
+        let mut run = agent.prompt("initial").await.unwrap();
+        let control = run.control();
+        let ended = drive_active_run(
+            &mut run,
+            &control,
+            &mut shell,
+            &mut input,
+            &mut ticker,
+            &mut pending,
+            &mut quit,
+        )
+        .await
+        .unwrap();
+        drop(run);
+
+        assert_eq!(ended, RunEnded::Completed);
+        assert!(!quit);
+        assert_eq!(
+            pending.pop_front(),
+            Some(PendingIdleAction::ChangeModel(ModelId(
+                "gpt-4o-mini".into()
+            )))
+        );
+        let context = agent.session().context().unwrap();
+        let user_text = context
+            .iter()
+            .filter_map(|message| match message {
+                ygg_ai::Message::User(user) => user.content.iter().find_map(|part| match part {
+                    ygg_ai::UserPart::Text(text) => Some(text.as_str()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(user_text.contains(&"steer first"));
+        assert!(!user_text.iter().any(|text| text.contains("/model")));
     }
 }

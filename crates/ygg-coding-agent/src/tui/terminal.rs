@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use crossterm::{cursor, execute, terminal};
 
+/// Shared dimensions reachable by both the boxed terminal and the shell.
+pub type TerminalSize = Rc<Cell<(u16, u16)>>;
+
 static RAW_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Restore the process terminal state. Repeated calls are harmless.
@@ -36,12 +39,13 @@ pub fn install_panic_hook() {
 /// sexy-tui's blocking `Terminal::start` is never called.
 pub struct YggTerminal {
     out: Stdout,
-    size: Rc<Cell<(u16, u16)>>,
+    size: TerminalSize,
 }
 
 impl YggTerminal {
     /// Enter raw mode and the alternate screen, returning the shared size cell.
-    pub fn enter() -> Result<(Self, Rc<Cell<(u16, u16)>>)> {
+    #[allow(dead_code)] // Used by the separately compiled Gate-0 spike target.
+    pub fn enter() -> Result<(Self, TerminalSize)> {
         let size = Rc::new(Cell::new(terminal::size().unwrap_or((80, 24))));
         let terminal = Self::enter_with_size(size.clone())?;
         Ok((terminal, size))
@@ -49,7 +53,7 @@ impl YggTerminal {
 
     /// Enter using a caller-owned shared dimensions cell. This lets the shell
     /// update dimensions after resize while the terminal is boxed in the TUI.
-    pub fn enter_with_size(size: Rc<Cell<(u16, u16)>>) -> Result<Self> {
+    pub fn enter_with_size(size: TerminalSize) -> Result<Self> {
         terminal::enable_raw_mode()?;
         RAW_ACTIVE.store(true, Ordering::SeqCst);
 
@@ -60,7 +64,7 @@ impl YggTerminal {
         result
     }
 
-    fn enter_inner(size: Rc<Cell<(u16, u16)>>) -> Result<Self> {
+    fn enter_inner(size: TerminalSize) -> Result<Self> {
         let mut out = std::io::stdout();
         execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
         size.set(terminal::size().unwrap_or(size.get()));

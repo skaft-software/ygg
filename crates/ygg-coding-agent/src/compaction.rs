@@ -30,7 +30,7 @@ pub enum CapacityDecision {
 /// Conservative character-based estimate retained alongside App's precomputed
 /// system and tool-schema reserves.
 pub fn estimate_text_tokens(text: &str) -> u64 {
-    (text.len() as u64 + 3) / 4
+    (text.len() as u64).div_ceil(4)
 }
 
 fn message_byte_len(message: &Message) -> usize {
@@ -44,7 +44,7 @@ fn message_byte_len(message: &Message) -> usize {
 pub fn estimate_messages_tokens(messages: &[Message]) -> u64 {
     messages.iter().fold(0u64, |total, message| {
         total
-            .saturating_add((message_byte_len(message) as u64 + 3) / 4)
+            .saturating_add((message_byte_len(message) as u64).div_ceil(4))
             .saturating_add(PER_MESSAGE_OVERHEAD_TOKENS)
     })
 }
