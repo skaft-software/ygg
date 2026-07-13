@@ -10,6 +10,7 @@ pub enum InputAction {
     FollowUp(String),
     Submit(String),
     Command(String),
+    CompleteSlashCommand,
     Edit(EditAction),
     Resize(u16, u16),
     /// Page-based transcript navigation from PageUp/PageDown.
@@ -85,6 +86,10 @@ pub fn translate(event: Option<Event>, active: bool, editor_text: &str) -> Input
 
             if is_command_submission(&key) && editor_text.starts_with('/') {
                 return InputAction::Command(editor_text.to_owned());
+            }
+            if key.code == KeyCode::Tab && key.modifiers.is_empty() && editor_text.starts_with('/')
+            {
+                return InputAction::CompleteSlashCommand;
             }
 
             match (active, key.code, key.modifiers) {
@@ -287,6 +292,18 @@ mod tests {
                 InputAction::Command("/model".into())
             );
         }
+    }
+
+    #[test]
+    fn slash_tab_requests_completion() {
+        assert_eq!(
+            translate(Some(key(KeyCode::Tab, KeyModifiers::NONE)), false, "/mod"),
+            InputAction::CompleteSlashCommand
+        );
+        assert_eq!(
+            translate(Some(key(KeyCode::Tab, KeyModifiers::NONE)), false, "hello"),
+            InputAction::Ignore
+        );
     }
 
     #[test]

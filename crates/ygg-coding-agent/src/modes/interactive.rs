@@ -125,6 +125,10 @@ where
                     shell.pending()
                 };
                 match keymap::translate(Some(event), false, &pending) {
+                    InputAction::CompleteSlashCommand => {
+                        shell.complete_slash_command();
+                        shell.render();
+                    }
                     InputAction::Edit(action) => {
                         shell.apply_edit(action);
                         shell.render();
@@ -336,6 +340,10 @@ where
                             shell.set_run_label("quitting…");
                             shell.render();
                         }
+                    }
+                    InputAction::CompleteSlashCommand => {
+                        shell.complete_slash_command();
+                        shell.render();
                     }
                     InputAction::Edit(action) => {
                         shell.apply_edit(action);

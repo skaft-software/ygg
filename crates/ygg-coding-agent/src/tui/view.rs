@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthChar;
 use ygg_agent::{AgentEvent, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ToolCallId, Usage};
 
+use crate::commands;
 use crate::config::Config;
 use crate::hydrate::{hydrate_transcript, TranscriptItem};
 use crate::tui::keymap::EditAction;
@@ -540,6 +541,43 @@ fn render_prompt_box(state: &ShellState, width: u16, max_content_rows: usize) ->
     lines
 }
 
+fn render_slash_suggestions(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
+    let suggestions = commands::slash_suggestions(&state.editor);
+    if suggestions.is_empty() || max_rows == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = vec![state.theme.dim("  Slash commands · Tab completes")];
+    let item_rows = max_rows.saturating_sub(1);
+    if item_rows == 0 {
+        return lines;
+    }
+
+    let hidden = suggestions.len().saturating_sub(item_rows);
+    let visible = if hidden == 0 {
+        suggestions.len()
+    } else {
+        item_rows.saturating_sub(1)
+    };
+    for command in suggestions.into_iter().take(visible) {
+        let usage = format!("  {:<20}", command.usage);
+        let description_width = usize::from(width)
+            .saturating_sub(visible_width(&usage))
+            .saturating_sub(1);
+        let description =
+            sexy_tui_rs::truncate_to_width(command.description, description_width, None);
+        lines.push(format!(
+            "{}{}",
+            state.theme.fg("accent", &usage),
+            state.theme.dim(&description)
+        ));
+    }
+    if hidden > 0 {
+        lines.push(state.theme.dim(&format!("  … {hidden} more commands")));
+    }
+    lines
+}
+
 fn transcript_lines(state: &ShellState, width: u16) -> Vec<String> {
     let mut lines = Vec::new();
     for block in &state.transcript {
@@ -563,10 +601,17 @@ fn max_scroll_from_bottom(state: &ShellState, width: u16) -> usize {
     }
     let rows = usize::from(state.size.1.max(5));
     let header_lines = 1 + usize::from(state.error.is_some());
-    let prompt_max_rows = rows.saturating_sub(header_lines).saturating_sub(3).max(1);
+    let suggestion_budget = rows.saturating_sub(header_lines).saturating_sub(4);
+    let suggestions = render_slash_suggestions(state, width, suggestion_budget);
+    let prompt_max_rows = rows
+        .saturating_sub(header_lines)
+        .saturating_sub(suggestions.len())
+        .saturating_sub(3)
+        .max(1);
     let prompt_height = render_prompt_box(state, width, prompt_max_rows).len();
     let available = rows
         .saturating_sub(header_lines)
+        .saturating_sub(suggestions.len())
         .saturating_sub(prompt_height);
     max_scroll_for_available(transcript_lines(state, width).len(), available)
 }
@@ -617,10 +662,17 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
         return lines;
     }
 
-    let prompt_max_rows = rows.saturating_sub(lines.len()).saturating_sub(3).max(1);
+    let suggestion_budget = rows.saturating_sub(lines.len()).saturating_sub(4);
+    let suggestions = render_slash_suggestions(state, width, suggestion_budget);
+    let prompt_max_rows = rows
+        .saturating_sub(lines.len())
+        .saturating_sub(suggestions.len())
+        .saturating_sub(3)
+        .max(1);
     let prompt = render_prompt_box(state, width, prompt_max_rows);
     let available = rows
         .saturating_sub(lines.len())
+        .saturating_sub(suggestions.len())
         .saturating_sub(prompt.len());
     let transcript = transcript_lines(state, width);
     let max_scroll = max_scroll_for_available(transcript.len(), available);
@@ -637,6 +689,7 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
                 .dim("↑ scrolled transcript (mouse/trackpad or PageDown returns to live)"),
         );
     }
+    lines.extend(suggestions);
     lines.extend(prompt);
     lines
 }
@@ -861,6 +914,18 @@ impl InteractiveShell {
                     line.end
                 };
             }
+        }
+    }
+
+    /// Complete a unique slash-command prefix at the end of the prompt.
+    pub fn complete_slash_command(&mut self) {
+        let mut state = self.state.borrow_mut();
+        if state.editor_cursor != state.editor.len() {
+            return;
+        }
+        if let Some(completed) = commands::complete_slash_command(&state.editor) {
+            state.editor = completed;
+            state.editor_cursor = state.editor.len();
         }
     }
 
@@ -1146,6 +1211,25 @@ mod tests {
         assert!(rendered.contains("read"));
         assert!(rendered.contains('•'));
         assert!(rendered.contains('─'));
+    }
+
+    #[test]
+    fn slash_command_menu_lists_commands_and_tab_completes_a_unique_prefix() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.apply_edit(EditAction::Char('/'));
+        let rendered = render_shell(&shell.state.borrow(), 120);
+        for command in ["/model [id]", "/thinking [level]", "/theme [name]", "/quit"] {
+            assert!(rendered.iter().any(|line| line.contains(command)));
+        }
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("Slash commands · Tab completes")));
+
+        for character in "mod".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+        shell.complete_slash_command();
+        assert_eq!(shell.pending(), "/model ");
     }
 
     #[test]
