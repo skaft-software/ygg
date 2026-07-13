@@ -5,7 +5,9 @@ pub mod bootstrap;
 use std::path::PathBuf;
 
 use ygg_agent::Agent;
-use ygg_ai::{AiClient, Model, ModelCatalog, ModelId, ReasoningConfig, ReasoningControl};
+use ygg_ai::{
+    AiClient, Model, ModelCatalog, ModelId, ReasoningConfig, ReasoningControl, ReasoningEffort,
+};
 
 use crate::config::Config;
 use crate::config::ThinkingLevel;
@@ -45,6 +47,65 @@ pub fn thinking_to_reasoning(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("{} has no reasoning budgets", model.spec.id.0))?;
             Ok(ReasoningConfig::Budget(level.pick_budget(budgets)))
+        }
+    }
+}
+
+fn effort_level(effort: ReasoningEffort) -> ThinkingLevel {
+    match effort {
+        ReasoningEffort::Minimal => ThinkingLevel::Minimal,
+        ReasoningEffort::Low => ThinkingLevel::Low,
+        ReasoningEffort::Medium => ThinkingLevel::Medium,
+        ReasoningEffort::High => ThinkingLevel::High,
+    }
+}
+
+/// Normalize a CLI/config reasoning selection against the resolved model.
+pub fn normalize_reasoning_for_model(
+    reasoning: &ReasoningConfig,
+    model: &Model,
+) -> anyhow::Result<ReasoningConfig> {
+    match reasoning {
+        ReasoningConfig::Off => Ok(ReasoningConfig::Off),
+        ReasoningConfig::Effort(effort) => thinking_to_reasoning(effort_level(*effort), model),
+        ReasoningConfig::Budget(budget) => match &model.spec.capabilities.reasoning {
+            Some(capability) if capability.control == ReasoningControl::TokenBudget => {
+                Ok(ReasoningConfig::Budget(*budget))
+            }
+            Some(_) => anyhow::bail!(
+                "{} uses effort-based thinking; use --reasoning high/medium/low/minimal instead of budget={budget}",
+                model.spec.id.0
+            ),
+            None => anyhow::bail!("{} has no thinking support", model.spec.id.0),
+        },
+    }
+}
+
+/// Convert a current model-specific reasoning setting back to a portable level
+/// before switching models. Custom token budgets cannot be safely translated.
+pub fn level_from_reasoning(
+    reasoning: &ReasoningConfig,
+    model: &Model,
+) -> anyhow::Result<ThinkingLevel> {
+    match reasoning {
+        ReasoningConfig::Off => Ok(ThinkingLevel::Off),
+        ReasoningConfig::Effort(effort) => Ok(effort_level(*effort)),
+        ReasoningConfig::Budget(budget) => {
+            let Some(capability) = &model.spec.capabilities.reasoning else {
+                anyhow::bail!("{} has no thinking support", model.spec.id.0);
+            };
+            let Some(budgets) = capability.effort_budgets else {
+                anyhow::bail!("{} has no portable thinking budgets", model.spec.id.0);
+            };
+            match *budget {
+                value if value == budgets.minimal => Ok(ThinkingLevel::Minimal),
+                value if value == budgets.low => Ok(ThinkingLevel::Low),
+                value if value == budgets.medium => Ok(ThinkingLevel::Medium),
+                value if value == budgets.high => Ok(ThinkingLevel::High),
+                _ => anyhow::bail!(
+                    "budget={budget} cannot be translated while switching models; choose /thinking explicitly"
+                ),
+            }
         }
     }
 }
@@ -161,6 +222,12 @@ mod tests {
             thinking_to_reasoning(ThinkingLevel::High, &budget).unwrap(),
             ReasoningConfig::Budget(8192)
         );
+        assert_eq!(
+            normalize_reasoning_for_model(&ReasoningConfig::Effort(ReasoningEffort::High), &budget)
+                .unwrap(),
+            ReasoningConfig::Budget(8192)
+        );
+        assert!(normalize_reasoning_for_model(&ReasoningConfig::Budget(2048), &effort).is_err());
     }
 
     #[test]

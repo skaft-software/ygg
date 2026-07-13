@@ -29,9 +29,13 @@ impl From<FinishReason> for RunEnded {
 
 /// Filesystem-safe timestamp seed for new session filenames.
 pub fn timestamp() -> String {
-    let seconds = SystemTime::now()
+    let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("{seconds}")
+        .unwrap_or_default();
+    format!(
+        "{}-{:09}-{}",
+        elapsed.as_secs(),
+        elapsed.subsec_nanos(),
+        std::process::id()
+    )
 }

@@ -9,7 +9,7 @@ use ygg_agent::{
 };
 use ygg_ai::{AiClient, Model, ModelCatalog, ModelId, ReasoningConfig, ToolDef};
 
-use crate::app::App;
+use crate::app::{level_from_reasoning, normalize_reasoning_for_model, thinking_to_reasoning, App};
 use crate::config::{Config, ResumeSelector};
 use crate::session_store::SessionStore;
 use crate::tui::pickers::{model_picker, session_picker};
@@ -135,7 +135,7 @@ pub fn tool_schema_reserve() -> u64 {
 /// Construct the owning Agent only after model and session selection complete.
 pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> anyhow::Result<App> {
     let Bootstrap {
-        config,
+        mut config,
         catalog,
         sessions,
         client,
@@ -153,7 +153,8 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
 
     let mut extensions = ExtensionHost::new();
     extensions.load(&CoreTools);
-    let reasoning = config.reasoning.clone();
+    let reasoning = normalize_reasoning_for_model(&config.reasoning, &model)?;
+    config.reasoning = reasoning.clone();
     let system_tokens = estimate_text_tokens(&system);
     let tool_schema_tokens = tool_schema_reserve();
     let agent = Agent::new(AgentConfig {
@@ -204,8 +205,17 @@ pub fn rebuild_app(
     let current_path = agent.session().path().to_owned();
     drop(agent);
 
-    let model = new_model.unwrap_or(model);
-    let reasoning = new_reasoning.unwrap_or(reasoning);
+    let changing_model = new_model.is_some();
+    let old_model = model;
+    let model = new_model.unwrap_or_else(|| old_model.clone());
+    let reasoning = match new_reasoning {
+        Some(reasoning) => normalize_reasoning_for_model(&reasoning, &model)?,
+        None if changing_model => {
+            let level = level_from_reasoning(&reasoning, &old_model)?;
+            thinking_to_reasoning(level, &model)?
+        }
+        None => normalize_reasoning_for_model(&reasoning, &model)?,
+    };
     let mut session = match selection {
         Some(SessionSelection::CreateNew(path)) => {
             if let Some(parent) = path.parent() {
