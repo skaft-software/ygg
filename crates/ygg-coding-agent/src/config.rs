@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ygg_agent::SandboxConfig;
-use ygg_ai::{ModelId, ReasoningConfig, ReasoningEffort};
+use ygg_ai::{ModelId, ReasoningConfig, ReasoningEffort, ReasoningEffortBudgets};
 
 /// Resolve the workspace root: an explicit path, the nearest `.git` ancestor,
 /// or the current directory. The returned path is canonicalized.
@@ -70,6 +70,61 @@ impl SandboxPolicy {
         sandbox.exec_timeout = Duration::from_secs(self.exec_timeout_secs);
         sandbox.max_output_bytes = self.max_output_bytes;
         sandbox
+    }
+}
+
+/// Portable user-facing thinking levels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThinkingLevel {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ThinkingLevel {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "minimal" | "min" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" | "med" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            _ => anyhow::bail!(
+                "invalid thinking level {value:?}; use off, minimal, low, medium, or high"
+            ),
+        }
+    }
+
+    pub fn to_effort(self) -> ReasoningEffort {
+        match self {
+            Self::Minimal => ReasoningEffort::Minimal,
+            Self::Low => ReasoningEffort::Low,
+            Self::Medium => ReasoningEffort::Medium,
+            Self::High => ReasoningEffort::High,
+            Self::Off => unreachable!("off is represented by ReasoningConfig::Off"),
+        }
+    }
+
+    pub fn pick_budget(self, budgets: &ReasoningEffortBudgets) -> u64 {
+        match self {
+            Self::Minimal => budgets.minimal,
+            Self::Low => budgets.low,
+            Self::Medium => budgets.medium,
+            Self::High => budgets.high,
+            Self::Off => 0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
     }
 }
 
@@ -163,6 +218,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let workspace = resolve_workspace(None, directory.path()).unwrap();
         assert_eq!(workspace, directory.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn thinking_levels_parse_short_and_full_names() {
+        assert_eq!(ThinkingLevel::parse("off").unwrap(), ThinkingLevel::Off);
+        assert_eq!(ThinkingLevel::parse("min").unwrap(), ThinkingLevel::Minimal);
+        assert_eq!(ThinkingLevel::parse("high").unwrap(), ThinkingLevel::High);
+        assert!(ThinkingLevel::parse("budget=2048").is_err());
     }
 
     #[test]

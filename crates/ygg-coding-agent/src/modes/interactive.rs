@@ -14,12 +14,12 @@ use ygg_agent::{AgentError, AgentEvent, Run, RunControl};
 use ygg_ai::{ModelId, ReasoningConfig};
 
 use crate::app::bootstrap::{build_app, resolve_launch_interactive, Bootstrap};
-use crate::app::{apply_reconfig, App, Reconfig};
+use crate::app::{apply_reconfig, supported_levels, thinking_to_reasoning, App, Reconfig};
 use crate::commands::{self, Command};
-use crate::config::parse_reasoning;
+use crate::config::ThinkingLevel;
 use crate::modes::RunEnded;
 use crate::tui::keymap::{self, InputAction};
-use crate::tui::pickers::{model_picker, session_picker};
+use crate::tui::pickers::{model_picker, session_picker, thinking_picker};
 use crate::tui::theme::load_theme;
 use crate::tui::view::InteractiveShell;
 
@@ -38,6 +38,7 @@ enum ControlIntent {
 pub enum PendingIdleAction {
     ChangeModel(ModelId),
     ChangeThinking(ReasoningConfig),
+    ChangeThinkingLevel(ThinkingLevel),
     PickModel,
     PickThinking,
     NewSession,
@@ -57,6 +58,15 @@ pub fn push_pending_action(queue: &mut VecDeque<PendingIdleAction>, action: Pend
         ) | (
             Some(PendingIdleAction::ChangeThinking(_)),
             PendingIdleAction::ChangeThinking(_)
+        ) | (
+            Some(PendingIdleAction::ChangeThinking(_)),
+            PendingIdleAction::ChangeThinkingLevel(_)
+        ) | (
+            Some(PendingIdleAction::ChangeThinkingLevel(_)),
+            PendingIdleAction::ChangeThinking(_)
+        ) | (
+            Some(PendingIdleAction::ChangeThinkingLevel(_)),
+            PendingIdleAction::ChangeThinkingLevel(_)
         )
     );
     if same_kind {
@@ -131,7 +141,7 @@ fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> a
         Command::Model(Some(id)) => PendingIdleAction::ChangeModel(ModelId(id)),
         Command::Model(None) => PendingIdleAction::PickModel,
         Command::Thinking(Some(level)) => {
-            PendingIdleAction::ChangeThinking(parse_reasoning(&level)?)
+            PendingIdleAction::ChangeThinkingLevel(ThinkingLevel::parse(&level)?)
         }
         Command::Thinking(None) => PendingIdleAction::PickThinking,
         Command::New => PendingIdleAction::NewSession,
@@ -330,6 +340,11 @@ async fn apply_pending_actions(
                 app = transition(app, shell, Reconfig::Thinking(reasoning))?;
                 shell.notice("queued thinking change applied");
             }
+            PendingIdleAction::ChangeThinkingLevel(level) => {
+                let reasoning = thinking_to_reasoning(level, &app.model)?;
+                app = transition(app, shell, Reconfig::Thinking(reasoning))?;
+                shell.notice("queued thinking change applied");
+            }
             PendingIdleAction::NewSession => {
                 app = transition(app, shell, Reconfig::NewSession)?;
                 shell.notice("queued new session created");
@@ -354,9 +369,10 @@ async fn apply_pending_actions(
                 shell.notice("queued model change applied");
             }
             PendingIdleAction::PickThinking => {
-                shell.notice(
-                    "queued thinking picker will open when thinking selection is initialized",
-                );
+                let level = thinking_picker(shell, input, &supported_levels(&app.model)).await?;
+                let reasoning = thinking_to_reasoning(level, &app.model)?;
+                app = transition(app, shell, Reconfig::Thinking(reasoning))?;
+                shell.notice("queued thinking change applied");
             }
         }
         shell.render();
@@ -407,7 +423,9 @@ async fn run_idle_command(
             shell.notice("model changed");
         }
         Command::Thinking(Some(level)) => {
-            app = transition(app, shell, Reconfig::Thinking(parse_reasoning(&level)?))?;
+            let level = ThinkingLevel::parse(&level)?;
+            let reasoning = thinking_to_reasoning(level, &app.model)?;
+            app = transition(app, shell, Reconfig::Thinking(reasoning))?;
             shell.notice("thinking changed");
         }
         Command::Model(None) => {
@@ -415,7 +433,12 @@ async fn run_idle_command(
             app = transition(app, shell, Reconfig::Model(model))?;
             shell.notice("model changed");
         }
-        Command::Thinking(None) => shell.notice("thinking picker is not available yet"),
+        Command::Thinking(None) => {
+            let level = thinking_picker(shell, input, &supported_levels(&app.model)).await?;
+            let reasoning = thinking_to_reasoning(level, &app.model)?;
+            app = transition(app, shell, Reconfig::Thinking(reasoning))?;
+            shell.notice("thinking changed");
+        }
         Command::Theme(name) => shell.notice(match name {
             Some(name) => format!("theme {name:?} will be available after theme discovery"),
             None => "theme picker is not available yet".to_owned(),
@@ -524,7 +547,7 @@ mod tests {
         queue_command(Command::Resume(Some("id".into())), &mut queue).unwrap();
         assert!(matches!(
             queue.pop_front(),
-            Some(PendingIdleAction::ChangeThinking(_))
+            Some(PendingIdleAction::ChangeThinkingLevel(ThinkingLevel::High))
         ));
         assert_eq!(
             queue.pop_front(),

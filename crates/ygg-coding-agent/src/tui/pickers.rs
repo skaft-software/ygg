@@ -6,6 +6,7 @@ use sexy_tui_rs::widgets::{SelectItem, SelectList};
 use sexy_tui_rs::Component;
 use ygg_ai::{ModelCatalog, ModelId};
 
+use crate::config::ThinkingLevel;
 use crate::session_store::{SessionMeta, SessionStore};
 use crate::tui::keymap::encode;
 use crate::tui::theme::select_list_theme;
@@ -127,6 +128,26 @@ fn session_select_item(session: &SessionMeta) -> SelectItem {
         label: session.title.clone(),
         description: Some(session.id.clone()),
     }
+}
+
+/// Ask the user to select a capability-supported thinking level.
+pub async fn thinking_picker(
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    levels: &[ThinkingLevel],
+) -> anyhow::Result<ThinkingLevel> {
+    let items = levels
+        .iter()
+        .map(|level| SelectItem {
+            value: level.label().into(),
+            label: level.label().into(),
+            description: None,
+        })
+        .collect::<Vec<_>>();
+    let index = pick_from(shell, input, items)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("thinking selection cancelled"))?;
+    Ok(levels[index])
 }
 
 /// Ask the user to select one model from the embedded catalog.
