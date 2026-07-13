@@ -1,0 +1,14 @@
+: cite: docs/research/apidocs/openai-responses/07-streaming-events.md (function_call output_item.added with call_id; function_call_arguments.delta/done)
+: cite: docs/design/ygg-ai.md §12.2/§13/§15 (tool args by output_index; completed+function_call -> ToolUse)
+data: {"type":"response.created","response":{"id":"resp_tool"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"grep"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"pattern\":"}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"foo\"}"}
+
+data: {"type":"response.function_call_arguments.done","output_index":0}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":30,"output_tokens":10,"total_tokens":40}}}
+

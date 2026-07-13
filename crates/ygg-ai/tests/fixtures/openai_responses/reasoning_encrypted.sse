@@ -1,0 +1,18 @@
+: cite: docs/research/apidocs/openai-responses/07-streaming-events.md (reasoning_text.delta; output_item.done reasoning carries encrypted_content,id)
+: cite: docs/design/ygg-ai.md §12.2/§14 (OpenAiReasoning opaque state; usage reasoning_tokens)
+data: {"type":"response.created","response":{"id":"resp_reason"}}
+
+data: {"type":"response.reasoning_text.delta","output_index":0,"delta":"Let me reason"}
+
+data: {"type":"response.reasoning_text.delta","output_index":0,"delta":" carefully."}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","encrypted_content":"RU5DUllQVEVE"}}
+
+data: {"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message"}}
+
+data: {"type":"response.output_text.delta","output_index":1,"delta":"Answer: 42"}
+
+data: {"type":"response.output_text.done","output_index":1}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":20,"output_tokens":30,"total_tokens":50,"output_tokens_details":{"reasoning_tokens":18}}}}
+

@@ -1,0 +1,13 @@
+: cite: docs/design/ygg-ai.md §12.2 (out-of-scope event families skipped without error: web_search_call.*)
+data: {"type":"response.created","response":{"id":"resp_ign"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message"}}
+
+data: {"type":"response.web_search_call.searching","output_index":9,"item":{"id":"ws_1"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"ok"}
+
+data: {"type":"response.output_text.done","output_index":0}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}
+

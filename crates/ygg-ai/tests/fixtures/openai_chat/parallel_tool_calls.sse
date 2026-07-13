@@ -1,0 +1,14 @@
+: cite: docs/research/apidocs/compatibility/openAI-chat-completions/15-streaming-events.md (parallel tool_calls interleaved by index)
+: cite: docs/design/ygg-ai.md §13 (one buffer per open key; ToolCallEnd per key)
+data: {"id":"chatcmpl-par","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"alpha","arguments":""}}]}}]}
+
+data: {"id":"chatcmpl-par","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_y","type":"function","function":{"name":"beta","arguments":""}}]}}]}
+
+data: {"id":"chatcmpl-par","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"a\":1}"}}]}}]}
+
+data: {"id":"chatcmpl-par","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"b\":2}"}}]}}]}
+
+data: {"id":"chatcmpl-par","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+

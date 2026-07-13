@@ -1,0 +1,12 @@
+: cite: docs/research/apidocs/compatibility/openAI-chat-completions/15-streaming-events.md (chat.completion.chunk deltas)
+: cite: docs/design/ygg-ai.md §12.1 (Chat streaming decode: delta.content -> Text*, usage -> Usage, [DONE] terminal)
+data: {"id":"chatcmpl-plain","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Hello"}}]}
+
+data: {"id":"chatcmpl-plain","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":", world"}}]}
+
+data: {"id":"chatcmpl-plain","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-plain","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12}}
+
+data: [DONE]
+

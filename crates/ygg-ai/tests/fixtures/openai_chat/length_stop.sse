@@ -1,0 +1,9 @@
+: cite: docs/design/ygg-ai.md §15 (finish_reason "length" -> StopReason::MaxTokens)
+data: {"id":"chatcmpl-len","choices":[{"index":0,"delta":{"content":"partial"}}]}
+
+data: {"id":"chatcmpl-len","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: {"id":"chatcmpl-len","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":16,"total_tokens":21}}
+
+data: [DONE]
+

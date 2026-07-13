@@ -1,0 +1,11 @@
+: cite: docs/design/ygg-ai.md §8/§13 (bad tool-arg JSON at assembly -> Decode)
+data: {"type":"response.created","response":{"id":"resp_bad"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_bad","type":"function_call","call_id":"call_bad","name":"foo"}}
+
+data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{broken"}
+
+data: {"type":"response.function_call_arguments.done","output_index":0}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}
+

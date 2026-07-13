@@ -1,0 +1,124 @@
+{
+  "endpoints": [
+    {
+      "id": "openai",
+      "base_url": "https://api.openai.com/v1/",
+      "auth": {
+        "kind": "bearer_env",
+        "var": "OPENAI_API_KEY"
+      },
+      "default_headers": {},
+      "timeout_secs": 30
+    },
+    {
+      "id": "anthropic",
+      "base_url": "https://api.anthropic.com/v1/",
+      "auth": {
+        "kind": "header_env",
+        "name": "x-api-key",
+        "var": "ANTHROPIC_API_KEY"
+      },
+      "default_headers": {},
+      "timeout_secs": 30
+    }
+  ],
+  "models": [
+    {
+      "id": "gpt-4o-mini",
+      "endpoint": "openai",
+      "api_name": "gpt-4o-mini",
+      "protocol": "open_ai_chat",
+      "capabilities": {
+        "input_modalities": {"bits": 1},
+        "output_modalities": {"bits": 0},
+        "tools": true,
+        "parallel_tool_calls": true,
+        "reasoning": null,
+        "structured_output": true
+      },
+      "limits": {
+        "context_window": 128000,
+        "max_output_tokens": 16384
+      },
+      "pricing": {
+        "input": 150000,
+        "output": 600000,
+        "cache_read": 75000,
+        "cache_write_5m": 150000,
+        "cache_write_1h": null,
+        "reasoning": null,
+        "tiers": []
+      }
+    },
+    {
+      "id": "gpt-audio-1.5",
+      "endpoint": "openai",
+      "api_name": "gpt-audio-1.5",
+      "protocol": "open_ai_chat",
+      "capabilities": {
+        "input_modalities": {"bits": 3},
+        "output_modalities": {"bits": 2},
+        "tools": true,
+        "parallel_tool_calls": true,
+        "reasoning": null,
+        "structured_output": true
+      },
+      "limits": {
+        "context_window": 128000,
+        "max_output_tokens": 16384
+      },
+      "pricing": null
+    },
+    {
+      "id": "gpt-5.4-mini-responses",
+      "endpoint": "openai",
+      "api_name": "gpt-5.4-mini",
+      "protocol": "open_ai_responses",
+      "capabilities": {
+        "input_modalities": {"bits": 1},
+        "output_modalities": {"bits": 0},
+        "tools": true,
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "control": "effort",
+          "exposes_text": true,
+          "preserves_state": true,
+          "effort_budgets": null
+        },
+        "structured_output": true
+      },
+      "limits": {
+        "context_window": 128000,
+        "max_output_tokens": 16384
+      },
+      "pricing": null
+    },
+    {
+      "id": "claude-sonnet-4-5",
+      "endpoint": "anthropic",
+      "api_name": "claude-sonnet-4-5-20250929",
+      "protocol": "anthropic_messages",
+      "capabilities": {
+        "input_modalities": {"bits": 1},
+        "output_modalities": {"bits": 0},
+        "tools": true,
+        "parallel_tool_calls": true,
+        "reasoning": null,
+        "structured_output": true
+      },
+      "limits": {
+        "context_window": 200000,
+        "max_output_tokens": 8192
+      },
+      "pricing": {
+        "input": 3000000,
+        "output": 15000000,
+        "cache_read": 300000,
+        "cache_write_5m": 3750000,
+        "cache_write_1h": null,
+        "reasoning": null,
+        "tiers": []
+      }
+    }
+  ]
+}

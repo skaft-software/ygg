@@ -1,0 +1,12 @@
+: cite: docs/design/ygg-ai.md §15 (response.incomplete{max_output_tokens} -> MaxTokens)
+: cite: docs/research/apidocs/openai-responses/01-responses.md:15394 (incomplete_details{reason})
+data: {"type":"response.created","response":{"id":"resp_inc"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"partial"}
+
+data: {"type":"response.output_text.done","output_index":0}
+
+data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":5,"output_tokens":16,"total_tokens":21}}}
+
