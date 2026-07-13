@@ -1405,7 +1405,7 @@ dependencies = [
 [[package]]
 name = "sexy-tui-rs"
 version = "0.1.0"
-source = "git+https://github.com/achuthanmukundan00/sexy-tui-rs?rev=aa4592a3d46faf4995f2fe73c3276224290dc370#aa4592a3d46faf4995f2fe73c3276224290dc370"
+source = "git+https://github.com/achuthanmukundan00/sexy-tui-rs?rev=cc228b0f3b9032d86e16e0a3a7cb3ed1db194b4d#cc228b0f3b9032d86e16e0a3a7cb3ed1db194b4d"
 dependencies = [
  "crossterm",
  "notify",

@@ -23,7 +23,7 @@ ygg-agent = { path = "../ygg-agent" }
 # Pinned to the verified rust-port commit. Developer override:
 # [patch.'https://github.com/achuthanmukundan00/sexy-tui-rs']
 # sexy-tui-rs = { path = "../../../../achuthanmukundan00/sexy-tui-rs-rust-port" }
-sexy-tui-rs = { git = "https://github.com/achuthanmukundan00/sexy-tui-rs", rev = "aa4592a3d46faf4995f2fe73c3276224290dc370" }
+sexy-tui-rs = { git = "https://github.com/achuthanmukundan00/sexy-tui-rs", rev = "cc228b0f3b9032d86e16e0a3a7cb3ed1db194b4d" }
 tokio = { version = "1", features = ["rt", "macros", "time", "io-util", "process", "sync"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures-util = "0.3"
