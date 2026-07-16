@@ -95,6 +95,61 @@ pub fn classify_paste(text: &str) -> PasteKind {
     PasteKind::Verbatim
 }
 
+/// List workspace files (relative, sorted, gitignore-aware), capped.
+pub fn workspace_files(root: &Path, cap: usize) -> Vec<String> {
+    let mut files = Vec::new();
+    // `require_git(false)` honors .gitignore files even when the workspace is
+    // not (yet) a git repository, which is also useful for new projects.
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .require_git(false)
+        .build();
+    for entry in walker.flatten() {
+        if files.len() >= cap {
+            break;
+        }
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            if let Ok(relative) = entry.path().strip_prefix(root) {
+                files.push(relative.to_string_lossy().into_owned());
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The mention query when the text ends in an `@`-prefixed token.
+pub fn active_mention(text: &str) -> Option<&str> {
+    if text.starts_with('/') || text.chars().last().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let token = text.split_whitespace().next_back()?;
+    token.strip_prefix('@')
+}
+
+/// Case-insensitive substring match on relative paths; earlier and shorter
+/// matches rank first.
+pub fn mention_matches<'a>(files: &'a [String], query: &str, limit: usize) -> Vec<&'a str> {
+    let needle = query.to_lowercase();
+    let mut scored: Vec<(usize, usize, &str)> = files
+        .iter()
+        .filter_map(|file| {
+            file.to_lowercase()
+                .find(&needle)
+                .map(|at| (at, file.len(), file.as_str()))
+        })
+        .collect();
+    scored.sort();
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, file)| file)
+        .collect()
+}
+
 /// What a chip stands for.
 #[derive(Clone, Debug)]
 pub enum AttachmentPayload {
@@ -283,7 +338,12 @@ pub fn compose(display_text: String, ledger: &mut AttachmentLedger) -> ComposedI
         text_run.push_str(&display_text[cursor..*at]);
         match &entry.payload {
             AttachmentPayload::PastedText(pasted) => text_run.push_str(pasted),
-            AttachmentPayload::Media { media, .. } => {
+            AttachmentPayload::Media { media, byte_len } => {
+                let limit = match media {
+                    Media::Image(_) => MAX_IMAGE_BYTES,
+                    Media::Audio(_) => MAX_AUDIO_BYTES,
+                };
+                debug_assert!(*byte_len <= limit, "attached media exceeded its size cap");
                 if !text_run.is_empty() {
                     parts.push(InputPart::Text(std::mem::take(&mut text_run)));
                 }
@@ -381,6 +441,43 @@ mod tests {
         assert_eq!(classify_paste(&"x".repeat(2049)), PasteKind::LargeText);
         // Exactly at the bounds stays verbatim.
         assert_eq!(classify_paste(&"x".repeat(2048)), PasteKind::Verbatim);
+    }
+
+    #[test]
+    fn workspace_files_lists_relative_paths_and_respects_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), b"x").unwrap();
+        fs::write(dir.path().join("shot.png"), b"x").unwrap();
+        fs::write(dir.path().join(".gitignore"), b"ignored.txt\n").unwrap();
+        fs::write(dir.path().join("ignored.txt"), b"x").unwrap();
+
+        let files = workspace_files(dir.path(), 100);
+        assert!(files.contains(&"src/main.rs".to_owned()));
+        assert!(files.contains(&"shot.png".to_owned()));
+        assert!(!files.iter().any(|file| file.contains("ignored")));
+    }
+
+    #[test]
+    fn active_mention_is_the_trailing_at_token() {
+        assert_eq!(active_mention("look at @sr"), Some("sr"));
+        assert_eq!(active_mention("@"), Some(""));
+        assert_eq!(active_mention("email a@b.com"), None);
+        assert_eq!(active_mention("no mention"), None);
+        assert_eq!(active_mention("ends with space @x "), None);
+    }
+
+    #[test]
+    fn mention_matches_rank_by_position_then_length() {
+        let files = vec![
+            "src/main.rs".to_owned(),
+            "docs/main-notes.md".to_owned(),
+            "main.rs".to_owned(),
+        ];
+        let matches = mention_matches(&files, "main", 10);
+        assert_eq!(matches[0], "main.rs");
+        assert!(matches.contains(&"src/main.rs"));
+        assert!(mention_matches(&files, "zzz", 10).is_empty());
     }
 
     #[test]

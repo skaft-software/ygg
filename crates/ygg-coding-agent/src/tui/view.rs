@@ -2,6 +2,7 @@
 
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -178,6 +179,9 @@ struct ShellState {
     ledger: composer::AttachmentLedger,
     /// Input modalities of the active model; gates attach attempts.
     input_modalities: ModalitySet,
+    /// Workspace root and its lazily built mention-completion index.
+    workspace: Option<PathBuf>,
+    file_index: Option<Vec<String>>,
     /// Cached wrapped transcript lines. Scrolling only slices this cache, and
     /// streaming updates re-render only the changed block.
     transcript_cache: RefCell<TranscriptCache>,
@@ -936,6 +940,45 @@ fn render_slash_suggestions(state: &ShellState, width: u16, max_rows: usize) -> 
     lines
 }
 
+fn render_mention_suggestions(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
+    if max_rows == 0 || state.editor_cursor != state.editor.len() {
+        return Vec::new();
+    }
+    let Some(query) = composer::active_mention(&state.editor) else {
+        return Vec::new();
+    };
+    let Some(files) = state.file_index.as_ref() else {
+        return Vec::new();
+    };
+    let matches = composer::mention_matches(files, query, 5);
+    if matches.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec![state.theme.dim("  Project files · Tab completes")];
+    let item_rows = max_rows.saturating_sub(1).min(5);
+    let available_width = usize::from(width).saturating_sub(2);
+    for (index, path) in matches.into_iter().take(item_rows).enumerate() {
+        let line = sexy_tui_rs::truncate_to_width(path, available_width, None);
+        let line = format!("  {line}");
+        lines.push(if index == 0 {
+            state.theme.fg("accent", &line)
+        } else {
+            state.theme.dim(&line)
+        });
+    }
+    lines
+}
+
+fn render_input_suggestions(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
+    let slash = render_slash_suggestions(state, width, max_rows);
+    if slash.is_empty() {
+        render_mention_suggestions(state, width, max_rows)
+    } else {
+        slash
+    }
+}
+
 fn render_pending_steering(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
     if state.steering_queue.is_empty() || max_rows == 0 {
         return Vec::new();
@@ -1002,7 +1045,7 @@ fn max_scroll_from_bottom(state: &ShellState, width: u16) -> usize {
         .saturating_sub(fixed_bottom)
         .saturating_sub(pending.len())
         .saturating_sub(4);
-    let suggestions = render_slash_suggestions(state, width, suggestion_budget);
+    let suggestions = render_input_suggestions(state, width, suggestion_budget);
     let prompt_max_rows = rows
         .saturating_sub(fixed_bottom)
         .saturating_sub(pending.len())
@@ -1091,7 +1134,7 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
         .saturating_sub(fixed_bottom)
         .saturating_sub(pending.len())
         .saturating_sub(4);
-    let suggestions = render_slash_suggestions(state, width, suggestion_budget);
+    let suggestions = render_input_suggestions(state, width, suggestion_budget);
     let prompt_max_rows = rows
         .saturating_sub(fixed_bottom)
         .saturating_sub(pending.len())
@@ -1492,6 +1535,15 @@ impl InteractiveShell {
                 };
             }
         }
+
+        if state.editor_cursor == state.editor.len()
+            && composer::active_mention(&state.editor).is_some()
+            && state.file_index.is_none()
+        {
+            if let Some(root) = state.workspace.clone() {
+                state.file_index = Some(composer::workspace_files(&root, 10_000));
+            }
+        }
     }
 
     /// Complete a unique slash-command prefix at the end of the prompt.
@@ -1504,6 +1556,57 @@ impl InteractiveShell {
             state.editor = completed;
             state.editor_cursor = state.editor.len();
         }
+    }
+
+    pub fn set_workspace(&mut self, root: PathBuf) {
+        let mut state = self.state.borrow_mut();
+        state.workspace = Some(root);
+        state.file_index = None;
+    }
+
+    /// Complete the trailing `@token`: media files attach, others insert a
+    /// plain `@relative/path` reference.
+    pub fn complete_mention(&mut self) {
+        let mut state = self.state.borrow_mut();
+        if state.editor_cursor != state.editor.len() {
+            return;
+        }
+        let Some(query) = composer::active_mention(&state.editor).map(str::to_owned) else {
+            return;
+        };
+        let Some(root) = state.workspace.clone() else {
+            return;
+        };
+        if state.file_index.is_none() {
+            state.file_index = Some(composer::workspace_files(&root, 10_000));
+        }
+        let files = state.file_index.as_ref().expect("file index just built");
+        let Some(top) = composer::mention_matches(files, &query, 1)
+            .first()
+            .copied()
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let token_start = state.editor.len() - (query.len() + 1);
+        let absolute = root.join(&top);
+        if composer::media_kind_for_path(&absolute).is_some() {
+            let modalities = state.input_modalities;
+            match state.ledger.attach_media(&absolute, modalities) {
+                Ok(chip) => state.editor.replace_range(token_start.., &chip),
+                Err(error) => {
+                    state.push_block(TranscriptBlock::Notice(error.to_string()));
+                    state
+                        .editor
+                        .replace_range(token_start.., &format!("@{top} "));
+                }
+            }
+        } else {
+            state
+                .editor
+                .replace_range(token_start.., &format!("@{top} "));
+        }
+        state.editor_cursor = state.editor.len();
     }
 
     pub fn set_status(&mut self, status: &str) {
@@ -1563,7 +1666,11 @@ impl InteractiveShell {
         let mut state = self.state.borrow_mut();
         state.editor_cursor = 0;
         let text = std::mem::take(&mut state.editor);
-        composer::compose(text, &mut state.ledger)
+        if state.ledger.is_empty() {
+            ComposedInput::from_text(text)
+        } else {
+            composer::compose(text, &mut state.ledger)
+        }
     }
 
     pub fn drain_editor(&mut self) -> String {
@@ -1885,6 +1992,64 @@ mod tests {
         }
         shell.complete_slash_command();
         assert_eq!(shell.pending(), "/model ");
+    }
+
+    #[test]
+    fn mention_completion_inserts_path_reference_for_text_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), b"x").unwrap();
+
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_workspace(dir.path().to_path_buf());
+        for character in "see @main".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+        let rendered = render_shell(&shell.state.borrow(), 120);
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("Project files · Tab completes")));
+        assert!(rendered.iter().any(|line| line.contains("src/main.rs")));
+        shell.complete_mention();
+        assert_eq!(shell.pending(), "see @src/main.rs ");
+    }
+
+    #[test]
+    fn mention_completion_attaches_media_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), b"png").unwrap();
+
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_workspace(dir.path().to_path_buf());
+        shell.set_input_modalities(ygg_ai::ModalitySet::none().with(ygg_ai::Modality::Image));
+        for character in "@shot".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+        shell.complete_mention();
+        assert_eq!(shell.pending(), "[Image #1: shot.png]");
+        let composed = shell.drain_composed();
+        assert!(composed
+            .parts
+            .iter()
+            .any(|part| matches!(part, ygg_agent::InputPart::Media(_))));
+    }
+
+    #[test]
+    fn unsupported_media_mention_falls_back_to_a_path_and_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), b"png").unwrap();
+
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_workspace(dir.path().to_path_buf());
+        for character in "@shot".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+        shell.complete_mention();
+
+        assert_eq!(shell.pending(), "@shot.png ");
+        assert!(shell
+            .debug_snapshot()
+            .contains("does not accept image input"));
     }
 
     #[test]

@@ -134,6 +134,10 @@ where
                         shell.complete_slash_command();
                         shell.render();
                     }
+                    InputAction::CompleteMention => {
+                        shell.complete_mention();
+                        shell.render();
+                    }
                     InputAction::Edit(action) => {
                         shell.apply_edit(action);
                         shell.render();
@@ -433,6 +437,10 @@ where
                     shell.pending()
                 };
                 match keymap::translate(Some(event), true, &pending) {
+                    InputAction::CompleteMention => {
+                        shell.complete_mention();
+                        shell.render();
+                    }
                     InputAction::Abort => {
                         control.abort();
                         shell.restore_queued_steering();
@@ -543,6 +551,7 @@ fn update_status(shell: &mut InteractiveShell, app: &App) {
     ));
     shell.set_status_detail(commands::status_text(app, None));
     shell.set_input_modalities(app.model.spec.capabilities.input_modalities);
+    shell.set_workspace(app.config.workspace.clone());
     shell.set_context_estimate(
         estimate_next_request_tokens(app, ""),
         hard_input_budget(&app.model),

@@ -11,6 +11,7 @@ pub enum InputAction {
     Submit(String),
     Command(String),
     CompleteSlashCommand,
+    CompleteMention,
     Edit(EditAction),
     Resize(u16, u16),
     /// Page-based transcript navigation from PageUp/PageDown.
@@ -103,6 +104,12 @@ pub fn translate(event: Option<Event>, active: bool, editor_text: &str) -> Input
             if key.code == KeyCode::Tab && key.modifiers.is_empty() && editor_text.starts_with('/')
             {
                 return InputAction::CompleteSlashCommand;
+            }
+            if key.code == KeyCode::Tab
+                && key.modifiers.is_empty()
+                && crate::tui::composer::active_mention(editor_text).is_some()
+            {
+                return InputAction::CompleteMention;
             }
 
             match (active, key.code, key.modifiers) {
@@ -323,6 +330,26 @@ mod tests {
         assert_eq!(
             translate(Some(key(KeyCode::Tab, KeyModifiers::NONE)), false, "hello"),
             InputAction::Ignore
+        );
+    }
+
+    #[test]
+    fn tab_on_trailing_at_token_requests_mention_completion() {
+        assert_eq!(
+            translate(
+                Some(key(KeyCode::Tab, KeyModifiers::NONE)),
+                false,
+                "see @sr"
+            ),
+            InputAction::CompleteMention
+        );
+        assert_eq!(
+            translate(Some(key(KeyCode::Tab, KeyModifiers::NONE)), false, "plain"),
+            InputAction::Ignore
+        );
+        assert_eq!(
+            translate(Some(key(KeyCode::Tab, KeyModifiers::NONE)), false, "/mod"),
+            InputAction::CompleteSlashCommand
         );
     }
 
