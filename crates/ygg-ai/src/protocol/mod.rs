@@ -1,5 +1,45 @@
 //! Private wire protocol codecs. Nothing here is part of the public API.
 
+use serde::Serialize;
+
+use crate::types::{CacheCompatibility, CacheRetention, Request};
+
+/// Wire cache-control marker shared by Anthropic and compatible endpoints.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct CacheControl {
+    #[serde(rename = "type")]
+    pub(crate) kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ttl: Option<&'static str>,
+}
+
+pub(crate) fn cache_session_id(req: &Request) -> Option<&str> {
+    (req.cache_retention != CacheRetention::None)
+        .then_some(req.session_id.as_deref())
+        .flatten()
+        .filter(|id| !id.is_empty())
+}
+
+pub(crate) fn prompt_cache_key(req: &Request) -> Option<String> {
+    let id = cache_session_id(req)?;
+    let key: String = id.chars().take(64).collect();
+    (!key.is_empty()).then_some(key)
+}
+
+pub(crate) fn cache_control(
+    req: &Request,
+    compatibility: &CacheCompatibility,
+) -> Option<CacheControl> {
+    if req.cache_retention == CacheRetention::None {
+        return None;
+    }
+    Some(CacheControl {
+        kind: "ephemeral",
+        ttl: (req.cache_retention == CacheRetention::Long && compatibility.supports_long_retention)
+            .then_some("1h"),
+    })
+}
+
 pub(crate) mod anthropic;
 pub(crate) mod openai_chat;
 pub(crate) mod openai_responses;
@@ -173,6 +213,7 @@ pub(crate) mod harness {
                 max_output_tokens: 8192,
             },
             pricing,
+            cache: crate::types::CacheCompatibility::default(),
         };
         let endpoint = Endpoint {
             id: EndpointId("fixture-ep".to_string()),

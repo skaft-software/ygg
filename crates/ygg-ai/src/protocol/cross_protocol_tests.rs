@@ -71,6 +71,7 @@ fn make_model(
             max_output_tokens: 8192,
         },
         pricing: None,
+        cache: crate::types::CacheCompatibility::default(),
     };
 
     let ep = Endpoint {
@@ -138,6 +139,8 @@ fn test_cross_protocol_canonical_immutability() {
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: Strict,
+        cache_retention: crate::types::CacheRetention::Short,
+        session_id: None,
     };
 
     // Serialize to Chat Completions
@@ -174,6 +177,8 @@ fn test_cross_protocol_anthropic_message_merging() {
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: Strict,
+        cache_retention: crate::types::CacheRetention::Short,
+        session_id: None,
     };
 
     let parts = crate::protocol::anthropic::build_request(&model, &req).unwrap();
@@ -216,6 +221,8 @@ fn test_lossy_inserts_missing_tool_result_before_next_assistant() {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: Lossy,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
         let body: serde_json::Value = match protocol {
             Protocol::OpenAiResponses => serde_json::from_slice(
@@ -279,6 +286,8 @@ fn test_cross_protocol_reasoning_state_rejection() {
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: Strict,
+        cache_retention: crate::types::CacheRetention::Short,
+        session_id: None,
     };
 
     // In Strict mode, it should be rejected

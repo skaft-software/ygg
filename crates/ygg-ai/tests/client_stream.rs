@@ -36,6 +36,7 @@ fn make_test_model(base_url_str: &str, protocol: Protocol, is_audio: bool) -> Mo
             max_output_tokens: 2000,
         },
         pricing: None,
+        cache: ygg_ai::CacheCompatibility::default(),
     };
 
     let ep = Endpoint {
@@ -89,6 +90,8 @@ async fn test_client_stream_sse_openai_chat() {
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: Strict,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
     };
 
     let mut stream = client.stream(&model, req).await.unwrap();
@@ -216,6 +219,8 @@ async fn test_client_stream_non_streaming_chat_audio() {
             voice: ygg_ai::AudioVoice::Named("alloy".to_string()),
         }),
         compatibility: Strict,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
     };
 
     let mut stream = client.stream(&model, req).await.unwrap();
@@ -309,6 +314,8 @@ fn text_request() -> Request {
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: Strict,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
     }
 }
 
@@ -343,6 +350,8 @@ async fn test_client_stream_http_error_handling() {
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: Strict,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
     };
 
     let res = client.stream(&model, req).await;

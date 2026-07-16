@@ -111,6 +111,12 @@ pub struct AgentConfig {
     /// `FinishReason::MaxTurns`. Required for the MaxTurns guard to be real
     /// rather than an unreachable variant.
     pub max_turns: u64,
+    /// Prompt-cache retention (`Short` by default in the coding-agent app;
+    /// `None` omits provider cache controls).
+    pub cache_retention: CacheRetention,
+    /// Optional explicit provider cache-affinity identifier. The agent derives
+    /// a stable session-path key when this is `None`.
+    pub session_id: Option<String>,
 }
 ```
 

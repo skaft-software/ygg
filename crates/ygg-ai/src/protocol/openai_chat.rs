@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, ConfigError, DecodeError};
 use crate::protocol::sse::SseEvent;
-use crate::protocol::HttpRequestParts;
+use crate::protocol::{
+    cache_control, cache_session_id, prompt_cache_key, CacheControl, HttpRequestParts,
+};
 use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{
     AssistantMessage, AssistantPart, AudioFormat, AudioMedia, AudioPayload, AudioVoice,
@@ -41,6 +43,10 @@ struct ChatCompletionsRequest {
     modalities: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audio: Option<ChatAudioOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_retention: Option<&'static str>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<ChatStreamOptions>,
@@ -63,15 +69,15 @@ struct ChatThinkingConfig {
 #[serde(tag = "role")]
 enum ChatCompletionsMessage {
     #[serde(rename = "developer")]
-    Developer { content: String },
+    Developer { content: ChatInstructionContent },
     #[serde(rename = "system")]
-    System { content: String },
+    System { content: ChatInstructionContent },
     #[serde(rename = "user")]
     User { content: Vec<ChatContentPart> },
     #[serde(rename = "assistant")]
     Assistant {
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        content: Option<ChatInstructionContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,11 +93,26 @@ enum ChatCompletionsMessage {
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+enum ChatInstructionContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+#[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ChatContentPart {
-    Text { text: String },
-    ImageUrl { image_url: ChatImageUrl },
-    InputAudio { input_audio: ChatInputAudio },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+    ImageUrl {
+        image_url: ChatImageUrl,
+    },
+    InputAudio {
+        input_audio: ChatInputAudio,
+    },
 }
 
 #[derive(Serialize)]
@@ -129,6 +150,8 @@ struct ChatFunctionCall {
 struct ChatTool {
     r#type: String,
     function: ChatFunctionDef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Serialize)]
@@ -298,17 +321,30 @@ pub(crate) fn build_request(
         Some(OpenAiChatReasoningMode::DeepSeekThinking)
     );
     let mut messages = Vec::new();
+    let cache_marker = if matches!(
+        model.spec.cache.cache_control_format,
+        Some(crate::types::CacheControlFormat::Anthropic)
+    ) {
+        cache_control(req, &model.spec.cache)
+    } else {
+        None
+    };
     if let Some(ref sys) = req.system {
         // DeepSeek's documented Chat Completions examples use `system`; its
         // reasoning extension is not OpenAI's developer-message convention.
+        let content = cache_marker.map_or_else(
+            || ChatInstructionContent::Text(sys.clone()),
+            |marker| {
+                ChatInstructionContent::Parts(vec![ChatContentPart::Text {
+                    text: sys.clone(),
+                    cache_control: Some(marker),
+                }])
+            },
+        );
         if has_reasoning && !deepseek_thinking {
-            messages.push(ChatCompletionsMessage::Developer {
-                content: sys.clone(),
-            });
+            messages.push(ChatCompletionsMessage::Developer { content });
         } else {
-            messages.push(ChatCompletionsMessage::System {
-                content: sys.clone(),
-            });
+            messages.push(ChatCompletionsMessage::System { content });
         }
     }
 
@@ -320,7 +356,10 @@ pub(crate) fn build_request(
                 for part in &user.content {
                     match part {
                         UserPart::Text(ref text) => {
-                            parts.push(ChatContentPart::Text { text: text.clone() });
+                            parts.push(ChatContentPart::Text {
+                                text: text.clone(),
+                                cache_control: None,
+                            });
                         }
                         UserPart::Media(Media::Image(ref image)) => {
                             if !model
@@ -488,7 +527,7 @@ pub(crate) fn build_request(
                 let content_str = if text_parts.is_empty() {
                     None
                 } else {
-                    Some(text_parts.join("\n"))
+                    Some(ChatInstructionContent::Text(text_parts.join("\n")))
                 };
                 let reasoning_content =
                     (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("\n"));
@@ -508,6 +547,10 @@ pub(crate) fn build_request(
         }
     }
 
+    if let Some(marker) = cache_marker {
+        add_cache_control_to_last_conversation_message(&mut messages, marker);
+    }
+
     // 4. Map tools and tool_choice
     let tools_opt = if req.tools.is_empty() || !model.spec.capabilities.tools {
         None
@@ -515,13 +558,18 @@ pub(crate) fn build_request(
         Some(
             req.tools
                 .iter()
-                .map(|t| ChatTool {
+                .enumerate()
+                .map(|(index, t)| ChatTool {
                     r#type: "function".to_string(),
                     function: ChatFunctionDef {
                         name: t.name.clone(),
                         description: t.description.clone(),
                         parameters: t.parameters.clone(),
                     },
+                    cache_control: (index + 1 == req.tools.len()
+                        && model.spec.cache.supports_cache_control_on_tools)
+                        .then_some(cache_marker)
+                        .flatten(),
                 })
                 .collect(),
         )
@@ -650,6 +698,21 @@ pub(crate) fn build_request(
         response_format: response_format_opt,
         modalities: modalities_opt,
         audio: audio_opt,
+        prompt_cache_key: {
+            let direct_openai = model
+                .endpoint
+                .base_url
+                .to_string()
+                .contains("api.openai.com");
+            ((direct_openai && req.cache_retention != crate::types::CacheRetention::None)
+                || (req.cache_retention == crate::types::CacheRetention::Long
+                    && model.spec.cache.supports_long_retention))
+                .then(|| prompt_cache_key(req))
+                .flatten()
+        },
+        prompt_cache_retention: (req.cache_retention == crate::types::CacheRetention::Long
+            && model.spec.cache.supports_long_retention)
+            .then_some("24h"),
         stream: streaming,
         stream_options,
     };
@@ -663,13 +726,81 @@ pub(crate) fn build_request(
         .join("chat/completions")
         .map_err(|e| ConfigError::Parse(e.to_string()))?;
 
+    let mut headers = http::HeaderMap::new();
+    if model.spec.cache.send_session_affinity_headers {
+        if let Some(session_id) = cache_session_id(req) {
+            let value = http::HeaderValue::from_str(session_id)
+                .map_err(|_| ConfigError::InvalidHeader("x-session-affinity".into()))?;
+            headers.insert(http::HeaderName::from_static("session_id"), value.clone());
+            headers.insert(
+                http::HeaderName::from_static("x-client-request-id"),
+                value.clone(),
+            );
+            headers.insert(http::HeaderName::from_static("x-session-affinity"), value);
+        }
+    }
+
     Ok(HttpRequestParts {
         url,
-        headers: http::HeaderMap::new(),
+        headers,
         body: bytes::Bytes::from(body_bytes),
         streaming,
         diagnostics,
     })
+}
+
+fn add_cache_control_to_last_conversation_message(
+    messages: &mut [ChatCompletionsMessage],
+    marker: CacheControl,
+) {
+    for message in messages.iter_mut().rev() {
+        let applied = match message {
+            ChatCompletionsMessage::User { content } => {
+                content.iter_mut().rev().find_map(|part| match part {
+                    ChatContentPart::Text { cache_control, .. } => {
+                        *cache_control = Some(marker);
+                        Some(())
+                    }
+                    ChatContentPart::ImageUrl { .. } | ChatContentPart::InputAudio { .. } => None,
+                })
+            }
+            ChatCompletionsMessage::Assistant { content, .. } => content
+                .as_mut()
+                .and_then(|content| add_cache_control_to_instruction(content, marker)),
+            ChatCompletionsMessage::Developer { .. }
+            | ChatCompletionsMessage::System { .. }
+            | ChatCompletionsMessage::Tool { .. } => None,
+        };
+        if applied.is_some() {
+            return;
+        }
+    }
+}
+
+fn add_cache_control_to_instruction(
+    content: &mut ChatInstructionContent,
+    marker: CacheControl,
+) -> Option<()> {
+    match content {
+        ChatInstructionContent::Text(text) if !text.is_empty() => {
+            let text = std::mem::take(text);
+            *content = ChatInstructionContent::Parts(vec![ChatContentPart::Text {
+                text,
+                cache_control: Some(marker),
+            }]);
+            Some(())
+        }
+        ChatInstructionContent::Parts(parts) => {
+            parts.iter_mut().rev().find_map(|part| match part {
+                ChatContentPart::Text { cache_control, .. } => {
+                    *cache_control = Some(marker);
+                    Some(())
+                }
+                ChatContentPart::ImageUrl { .. } | ChatContentPart::InputAudio { .. } => None,
+            })
+        }
+        ChatInstructionContent::Text(_) => None,
+    }
 }
 
 /// Decodes the non-streaming JSON response body from OpenAI Chat Completions.
@@ -1098,6 +1229,7 @@ mod tests {
                 max_output_tokens: 2000,
             },
             pricing: None,
+            cache: crate::types::CacheCompatibility::default(),
         };
 
         let ep = Endpoint {
@@ -1131,6 +1263,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
 
         let parts = build_request(&model, &req).unwrap();
@@ -1188,6 +1322,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
 
         let parts = build_request(&model, &req).unwrap();
@@ -1229,6 +1365,8 @@ mod tests {
                 voice: AudioVoice::Named("alloy".to_string()),
             }),
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
 
         let parts = build_request(&model, &req).unwrap();
@@ -1296,6 +1434,47 @@ mod tests {
     }
 
     #[test]
+    fn cache_retention_controls_openai_chat_key() {
+        let model = make_test_model(false, false, false, false, false, false);
+        let mut req = Request {
+            system: Some("system".to_string()),
+            messages: vec![Message::User(UserMessage {
+                content: vec![UserPart::Text("hello".to_string())],
+            })],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: None,
+            temperature: None,
+            stop: vec![],
+            reasoning: ReasoningConfig::Off,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: Some("b".repeat(70)),
+        };
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(
+            body["prompt_cache_key"].as_str().unwrap().chars().count(),
+            64
+        );
+        assert!(body.get("prompt_cache_retention").is_none());
+
+        req.cache_retention = crate::types::CacheRetention::Long;
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["prompt_cache_retention"], "24h");
+
+        req.cache_retention = crate::types::CacheRetention::None;
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
     fn test_build_request_audio_input() {
         let model = make_test_model(false, true, false, false, false, false);
         let audio_payload = bytes::Bytes::from(vec![0x00, 0x01, 0x02, 0x03]);
@@ -1318,6 +1497,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
 
         let parts = build_request(&model, &req).unwrap();
@@ -1363,6 +1544,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
 
         let parts = build_request(&model, &req).unwrap();

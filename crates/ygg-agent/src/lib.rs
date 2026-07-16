@@ -16,7 +16,7 @@
 //!
 //! ```no_run
 //! use ygg_agent::{Agent, AgentConfig, CoreTools, ExtensionHost, SandboxConfig, Session};
-//! use ygg_ai::{AiClient, ModelCatalog, ModelId, ReasoningConfig};
+//! use ygg_ai::{AiClient, CacheRetention, ModelCatalog, ModelId, ReasoningConfig};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let catalog = ModelCatalog::builtin()?;
@@ -32,6 +32,8 @@
 //!     extensions,
 //!     max_turns: 40,
 //!     reasoning: ReasoningConfig::Off,
+//!     cache_retention: CacheRetention::Short,
+//!     session_id: None,
 //! })?;
 //!
 //! // Streaming: drive events and control concurrently.

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, ConfigError, DecodeError, ProviderError};
 use crate::protocol::sse::SseEvent;
-use crate::protocol::HttpRequestParts;
+use crate::protocol::{cache_control, CacheControl, HttpRequestParts};
 use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{
     AssistantPart, ImageSource, Media, Message, Protocol, ReasoningConfig, ReasoningState,
@@ -35,7 +35,7 @@ struct AnthropicRequest {
     model: String,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<AnthropicSystem>,
     max_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -53,6 +53,20 @@ struct AnthropicRequest {
 }
 
 #[derive(Serialize)]
+#[serde(untagged)]
+enum AnthropicSystem {
+    Blocks(Vec<AnthropicSystemBlock>),
+}
+
+#[derive(Serialize)]
+struct AnthropicSystemBlock {
+    r#type: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+#[derive(Serialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 enum AnthropicMessage {
     User { content: Vec<AnthropicContentBlock> },
@@ -64,9 +78,13 @@ enum AnthropicMessage {
 enum AnthropicContentBlock {
     Text {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     Image {
         source: AnthropicImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: String,
@@ -77,6 +95,8 @@ enum AnthropicContentBlock {
         tool_use_id: String,
         content: Vec<AnthropicToolResultBlock>,
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     Thinking {
         thinking: String,
@@ -106,6 +126,8 @@ struct AnthropicTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Serialize)]
@@ -263,8 +285,15 @@ pub(crate) fn build_request(
         req.compatibility,
     )?;
 
-    // 2. Map system prompt
-    let system = req.system.clone();
+    // 2. Map system prompt and allocate one provider-compatible breakpoint.
+    let cache_marker = cache_control(req, &model.spec.cache);
+    let system = req.system.as_ref().map(|system| {
+        AnthropicSystem::Blocks(vec![AnthropicSystemBlock {
+            r#type: "text",
+            text: system.clone(),
+            cache_control: cache_marker,
+        }])
+    });
 
     // 3. Map messages with alternation merging
     let mut messages = Vec::new();
@@ -277,7 +306,10 @@ pub(crate) fn build_request(
                 for part in &user.content {
                     match part {
                         UserPart::Text(ref text) => {
-                            blocks.push(AnthropicContentBlock::Text { text: text.clone() });
+                            blocks.push(AnthropicContentBlock::Text {
+                                text: text.clone(),
+                                cache_control: None,
+                            });
                         }
                         UserPart::Media(Media::Image(ref image)) => {
                             if !model
@@ -304,7 +336,10 @@ pub(crate) fn build_request(
                                 },
                                 ImageSource::ProviderRef(_) => continue,
                             };
-                            blocks.push(AnthropicContentBlock::Image { source });
+                            blocks.push(AnthropicContentBlock::Image {
+                                source,
+                                cache_control: None,
+                            });
                         }
                         UserPart::Media(Media::Audio(_)) => {}
                         UserPart::ToolResult(ref tr) => {
@@ -351,6 +386,7 @@ pub(crate) fn build_request(
                                 ),
                                 content: tool_blocks,
                                 is_error: tr.is_error,
+                                cache_control: None,
                             });
                         }
                     }
@@ -376,7 +412,10 @@ pub(crate) fn build_request(
                 for part in &assistant.content {
                     match part {
                         AssistantPart::Text(ref text) => {
-                            blocks.push(AnthropicContentBlock::Text { text: text.clone() });
+                            blocks.push(AnthropicContentBlock::Text {
+                                text: text.clone(),
+                                cache_control: None,
+                            });
                         }
                         AssistantPart::ToolCall(ref tc) => {
                             pending_tool_calls.insert(tc.id.0.clone());
@@ -439,6 +478,17 @@ pub(crate) fn build_request(
         );
     }
 
+    // Anthropic caches the prefix ending at the final user block. Keep the
+    // marker on the final user turn so every subsequent request can reuse the
+    // preceding conversation prefix without changing the canonical history.
+    if let Some(marker) = cache_marker {
+        if let Some(AnthropicMessage::User { content }) = messages.last_mut() {
+            if let Some(block) = content.last_mut() {
+                set_content_cache_control(block, marker);
+            }
+        }
+    }
+
     // 4. Map tools & tool_choice
     let tools_opt = if req.tools.is_empty()
         || !model.spec.capabilities.tools
@@ -449,10 +499,15 @@ pub(crate) fn build_request(
         Some(
             req.tools
                 .iter()
-                .map(|t| AnthropicTool {
+                .enumerate()
+                .map(|(index, t)| AnthropicTool {
                     name: t.name.clone(),
                     description: t.description.clone(),
                     input_schema: t.parameters.clone(),
+                    cache_control: (index + 1 == req.tools.len()
+                        && model.spec.cache.supports_cache_control_on_tools)
+                        .then_some(cache_marker)
+                        .flatten(),
                 })
                 .collect(),
         )
@@ -555,6 +610,13 @@ pub(crate) fn build_request(
         http::HeaderName::from_static("anthropic-version"),
         http::HeaderValue::from_static("2023-06-01"),
     );
+    if model.spec.cache.send_session_affinity_headers {
+        if let Some(session_id) = crate::protocol::cache_session_id(req) {
+            let value = http::HeaderValue::from_str(session_id)
+                .map_err(|_| ConfigError::InvalidHeader("x-session-affinity".into()))?;
+            headers.insert(http::HeaderName::from_static("x-session-affinity"), value);
+        }
+    }
 
     Ok(HttpRequestParts {
         url,
@@ -563,6 +625,19 @@ pub(crate) fn build_request(
         streaming: true,
         diagnostics,
     })
+}
+
+fn set_content_cache_control(block: &mut AnthropicContentBlock, marker: CacheControl) {
+    match block {
+        AnthropicContentBlock::Text { cache_control, .. }
+        | AnthropicContentBlock::Image { cache_control, .. }
+        | AnthropicContentBlock::ToolResult { cache_control, .. } => {
+            *cache_control = Some(marker);
+        }
+        AnthropicContentBlock::ToolUse { .. }
+        | AnthropicContentBlock::Thinking { .. }
+        | AnthropicContentBlock::RedactedThinking { .. } => {}
+    }
 }
 
 fn push_synthetic_tool_results(
@@ -581,6 +656,7 @@ fn push_synthetic_tool_results(
                     text: "Tool execution result was not supplied by the caller.".to_string(),
                 }],
                 is_error: true,
+                cache_control: None,
             }
         })
         .collect();
@@ -977,6 +1053,7 @@ mod tests {
                 max_output_tokens: 8192,
             },
             pricing: None,
+            cache: crate::types::CacheCompatibility::default(),
         };
 
         let ep = Endpoint {
@@ -1010,6 +1087,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::None,
+            session_id: None,
         };
 
         let parts = build_request(&model, &req).unwrap();
@@ -1031,10 +1110,62 @@ mod tests {
         assert_eq!(body["model"], "claude-3-5-sonnet");
         assert_eq!(body["max_tokens"], 1000);
         assert_eq!(body["temperature"], 0.5);
-        assert_eq!(body["system"], "System instructions");
+        assert_eq!(body["system"][0]["text"], "System instructions");
+        assert!(body["system"][0].get("cache_control").is_none());
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         assert_eq!(body["messages"][0]["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn cache_retention_controls_anthropic_wire_markers() {
+        let model = make_test_model(false);
+        let mut req = Request {
+            system: Some("stable system".to_string()),
+            messages: vec![Message::User(UserMessage {
+                content: vec![UserPart::Text("stable user".to_string())],
+            })],
+            tools: vec![crate::types::ToolDef {
+                name: "lookup".to_string(),
+                description: "lookup".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            }],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: None,
+            temperature: None,
+            stop: vec![],
+            reasoning: ReasoningConfig::Off,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: Some("session-123".to_string()),
+        };
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+
+        req.cache_retention = crate::types::CacheRetention::Long;
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
+
+        req.cache_retention = crate::types::CacheRetention::None;
+        let parts = build_request(&model, &req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
+        assert_eq!(body["system"][0]["text"], "stable system");
+        assert!(body["system"][0].get("cache_control").is_none());
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert!(parts.headers.get("x-session-affinity").is_none());
     }
 
     #[test]
@@ -1062,6 +1193,8 @@ mod tests {
             }),
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
         let body: serde_json::Value =
             serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
@@ -1108,6 +1241,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
 
         let parts = build_request(&model, &req).unwrap();
@@ -1170,6 +1305,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
 
         let parts = build_request(&model, &req).unwrap();

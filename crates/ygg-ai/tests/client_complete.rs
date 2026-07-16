@@ -30,6 +30,7 @@ fn make_test_model(base_url_str: &str, protocol: Protocol) -> Model {
             max_output_tokens: 2000,
         },
         pricing: None,
+        cache: ygg_ai::CacheCompatibility::default(),
     };
 
     let ep = Endpoint {
@@ -79,6 +80,8 @@ async fn test_client_complete_happy_path() {
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: Strict,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
     };
 
     let response = client.complete(&model, req).await.unwrap();

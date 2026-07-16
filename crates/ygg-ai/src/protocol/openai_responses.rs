@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, ConfigError, DecodeError, ProviderError};
 use crate::protocol::sse::SseEvent;
-use crate::protocol::HttpRequestParts;
+use crate::protocol::{cache_session_id, prompt_cache_key, HttpRequestParts};
 use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{
     AssistantPart, ImageSource, Media, Message, Protocol, ReasoningConfig, ReasoningState,
@@ -32,6 +32,10 @@ struct ResponsesRequest {
     reasoning: Option<ResponsesReasoningConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<ResponsesTextConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_retention: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     include: Vec<String>,
     store: bool,
@@ -62,7 +66,9 @@ enum ResponsesInputItem {
     Reasoning {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        // The Responses API requires `summary` on replayed reasoning items even
+        // when the model returned no visible summary (`[]`). Omitting it makes
+        // newer Codex models reject the post-tool continuation request.
         summary: Vec<ResponsesReasoningSummary>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
@@ -74,6 +80,12 @@ enum ResponsesInputItem {
 enum ResponsesContentPart {
     InputText {
         text: String,
+    },
+    // Replayed assistant messages are output items, not new user input. Newer
+    // Responses/Codex models reject `input_text` under role `assistant`.
+    OutputText {
+        text: String,
+        annotations: Vec<serde_json::Value>,
     },
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,6 +128,9 @@ struct ResponsesTool {
 #[derive(Serialize)]
 struct ResponsesReasoningConfig {
     effort: String,
+    // Request visible summary deltas in addition to encrypted continuation
+    // state. Without this, reasoning-capable Codex models think silently.
+    summary: &'static str,
 }
 
 #[derive(Serialize)]
@@ -427,7 +442,10 @@ pub(crate) fn build_request(
                     crate::types::ReasoningEffort::Medium => "medium".to_string(),
                     crate::types::ReasoningEffort::High => "high".to_string(),
                 };
-                Some(ResponsesReasoningConfig { effort: effort_str })
+                Some(ResponsesReasoningConfig {
+                    effort: effort_str,
+                    summary: "auto",
+                })
             }
             ReasoningConfig::Budget(_) => None,
         }
@@ -481,6 +499,10 @@ pub(crate) fn build_request(
         temperature: req.temperature,
         reasoning: reasoning_opt,
         text: text_opt,
+        prompt_cache_key: prompt_cache_key(req),
+        prompt_cache_retention: (req.cache_retention == crate::types::CacheRetention::Long
+            && model.spec.cache.supports_long_retention)
+            .then_some("24h"),
         include,
         store: false,
         stream: true,
@@ -495,9 +517,22 @@ pub(crate) fn build_request(
         .join("responses")
         .map_err(|e| ConfigError::Parse(e.to_string()))?;
 
+    let mut headers = http::HeaderMap::new();
+    if let Some(session_id) = cache_session_id(req) {
+        let value = http::HeaderValue::from_str(session_id)
+            .map_err(|_| ConfigError::InvalidHeader("x-client-request-id".into()))?;
+        headers.insert(
+            http::HeaderName::from_static("x-client-request-id"),
+            value.clone(),
+        );
+        if model.spec.cache.send_session_id_header {
+            headers.insert(http::HeaderName::from_static("session_id"), value);
+        }
+    }
+
     Ok(HttpRequestParts {
         url,
-        headers: http::HeaderMap::new(),
+        headers,
         body: bytes::Bytes::from(body_bytes),
         streaming: true,
         diagnostics,
@@ -526,8 +561,9 @@ fn flush_assistant_text(input: &mut Vec<ResponsesInputItem>, text_parts: &mut Ve
     if !text_parts.is_empty() {
         input.push(ResponsesInputItem::Message {
             role: "assistant".to_string(),
-            content: vec![ResponsesContentPart::InputText {
+            content: vec![ResponsesContentPart::OutputText {
                 text: std::mem::take(text_parts).join("\n"),
+                annotations: vec![],
             }],
         });
     }
@@ -1125,6 +1161,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         }
     }
 
@@ -1157,6 +1195,7 @@ mod tests {
                 max_output_tokens: 16384,
             },
             pricing: None,
+            cache: crate::types::CacheCompatibility::default(),
         };
 
         let ep = Endpoint {
@@ -1190,6 +1229,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
 
         let parts = build_request(&model, &req).unwrap();
@@ -1215,6 +1256,143 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_request_streams_summaries_and_replay_keeps_empty_summary() {
+        let model = make_test_model(true);
+        let mut req = user_req(
+            vec![UserPart::Text("follow up".to_string())],
+            CompatibilityMode::Strict,
+        );
+        req.reasoning = ReasoningConfig::Effort(crate::types::ReasoningEffort::High);
+        req.messages = vec![
+            Message::User(UserMessage {
+                content: vec![UserPart::Text("initial".to_string())],
+            }),
+            Message::Assistant(crate::types::AssistantMessage {
+                content: vec![AssistantPart::Reasoning(crate::types::ReasoningPart {
+                    text: None,
+                    state: Some(ReasoningState {
+                        protocol: Protocol::OpenAiResponses,
+                        model: model.spec.id.clone(),
+                        kind: ReasoningStateKind::OpenAiReasoning {
+                            item_id: Some("rs_terra".to_string()),
+                            encrypted_content: Some("encrypted".to_string()),
+                        },
+                    }),
+                })],
+                model: model.spec.id.clone(),
+                protocol: Protocol::OpenAiResponses,
+            }),
+            Message::User(UserMessage {
+                content: vec![UserPart::Text("follow up".to_string())],
+            }),
+        ];
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["input"][1]["type"], "reasoning");
+        assert_eq!(body["input"][1]["id"], "rs_terra");
+        assert_eq!(body["input"][1]["summary"], serde_json::json!([]));
+        assert_eq!(body["input"][1]["encrypted_content"], "encrypted");
+    }
+
+    #[test]
+    fn completed_assistant_history_uses_output_text_for_the_next_turn() {
+        let model = make_test_model(false);
+        let mut req = user_req(
+            vec![UserPart::Text("second prompt".to_string())],
+            CompatibilityMode::Strict,
+        );
+        req.messages = vec![
+            Message::User(UserMessage {
+                content: vec![UserPart::Text("first prompt".to_string())],
+            }),
+            Message::Assistant(crate::types::AssistantMessage {
+                content: vec![AssistantPart::Text("first response".to_string())],
+                model: model.spec.id.clone(),
+                protocol: Protocol::OpenAiResponses,
+            }),
+            Message::User(UserMessage {
+                content: vec![UserPart::Text("second prompt".to_string())],
+            }),
+        ];
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["input"][1]["role"], "assistant");
+        assert_eq!(body["input"][1]["content"][0]["type"], "output_text");
+        assert_eq!(body["input"][1]["content"][0]["text"], "first response");
+        assert_eq!(
+            body["input"][1]["content"][0]["annotations"],
+            serde_json::json!([])
+        );
+        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(body["input"][2]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn cache_retention_controls_responses_key_and_headers() {
+        let model = make_test_model(false);
+        let mut req = user_req(
+            vec![UserPart::Text("hello".to_string())],
+            CompatibilityMode::Strict,
+        );
+        req.session_id = Some("a".repeat(70));
+
+        let parts = build_request(&model, &req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
+        assert_eq!(
+            body["prompt_cache_key"].as_str().unwrap().chars().count(),
+            64
+        );
+        assert!(body.get("prompt_cache_retention").is_none());
+        assert_eq!(
+            parts.headers["session_id"],
+            req.session_id.as_deref().unwrap()
+        );
+        assert_eq!(
+            parts.headers["x-client-request-id"],
+            req.session_id.as_deref().unwrap()
+        );
+
+        req.cache_retention = crate::types::CacheRetention::Long;
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["prompt_cache_retention"], "24h");
+
+        req.cache_retention = crate::types::CacheRetention::None;
+        let parts = build_request(&model, &req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+        assert!(parts.headers.get("session_id").is_none());
+        assert!(parts.headers.get("x-client-request-id").is_none());
+    }
+
+    #[test]
+    fn responses_compat_can_disable_standard_session_and_long_retention() {
+        let mut model = make_test_model(false);
+        let cache = &mut Arc::make_mut(&mut model.spec).cache;
+        cache.send_session_id_header = false;
+        cache.supports_long_retention = false;
+
+        let mut req = user_req(
+            vec![UserPart::Text("hello".to_string())],
+            CompatibilityMode::Strict,
+        );
+        req.cache_retention = crate::types::CacheRetention::Long;
+        req.session_id = Some("codex-session".to_string());
+
+        let parts = build_request(&model, &req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
+        assert_eq!(body["prompt_cache_key"], "codex-session");
+        assert!(body.get("prompt_cache_retention").is_none());
+        assert!(parts.headers.get("session_id").is_none());
+        assert_eq!(parts.headers["x-client-request-id"], "codex-session");
+    }
+
+    #[test]
     fn test_build_request_responses_tool_shape() {
         let model = make_test_model(false);
         let mut req = Request {
@@ -1235,6 +1413,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
         let mut capable = (*model.spec).clone();
         capable.capabilities.tools = true;
@@ -1304,6 +1484,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
 
         let parts = build_request(&model, &req).unwrap();
@@ -1503,6 +1685,36 @@ mod fixture_tests {
         }
         assert_eq!(text_of(&events), "Answer: 42");
         assert_eq!(resp.usage.reasoning_tokens, 18);
+    }
+
+    #[tokio::test]
+    async fn reasoning_summary_deltas_stream_and_preserve_state() {
+        let events = run(fx!("reasoning_summary.sse"), 0).await.unwrap();
+        let resp = harness::finished(&events);
+        let reasoning = resp
+            .message
+            .content
+            .iter()
+            .find_map(|part| match part {
+                AssistantPart::Reasoning(reasoning) => Some(reasoning),
+                _ => None,
+            })
+            .expect("reasoning summary must be surfaced");
+        assert_eq!(reasoning.text.as_deref(), Some("Planning briefly."));
+        match &reasoning.state.as_ref().unwrap().kind {
+            ReasoningStateKind::OpenAiReasoning {
+                item_id,
+                encrypted_content,
+            } => {
+                assert_eq!(item_id.as_deref(), Some("rs_summary"));
+                assert_eq!(
+                    encrypted_content.as_deref(),
+                    Some("RU5DUllQVEVEX1NVTU1BUlk=")
+                );
+            }
+            other => panic!("expected OpenAiReasoning, got {other:?}"),
+        }
+        assert_eq!(text_of(&events), "DONE");
     }
 
     #[tokio::test]

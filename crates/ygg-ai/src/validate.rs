@@ -706,6 +706,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
         let caps = dummy_caps(false, false, false, true, false, false);
         let limits = dummy_limits();
@@ -753,6 +755,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
         let caps = dummy_caps(false, false, false, true, false, false);
         let limits = dummy_limits();
@@ -803,6 +807,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
         let caps_no_image = dummy_caps(false, false, false, false, false, false);
         let limits = dummy_limits();
@@ -851,6 +857,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
         // Anthropic has no audio capability
         let caps_anthropic = dummy_caps(true, false, false, false, false, false);
@@ -958,6 +966,8 @@ mod matrix_tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         }
     }
 

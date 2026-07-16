@@ -316,7 +316,7 @@ where
     let mut inner = Box::pin(inner);
     let mut started = false;
     let mut finished = false;
-    let mut part_states = HashMap::new();
+    let mut part_states = HashMap::with_capacity(4);
     let mut usage_seen = false;
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]

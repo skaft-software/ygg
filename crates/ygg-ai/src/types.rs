@@ -17,6 +17,66 @@ pub struct ModelId(pub String);
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct ToolCallId(pub String);
 
+/// Supported prompt-cache retention policies.
+///
+/// `Short` is the default and matches pi's provider defaults. `None` disables
+/// all explicit cache controls and cache-affinity identifiers for a request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheRetention {
+    /// Disable prompt caching controls for this request.
+    None,
+    /// Provider default short-lived cache retention.
+    #[default]
+    Short,
+    /// Request the provider's long-lived retention where supported.
+    Long,
+}
+
+/// Cache compatibility knobs for provider/model variants.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheCompatibility {
+    /// Whether long retention is supported by this model/endpoint.
+    #[serde(default = "default_true")]
+    pub supports_long_retention: bool,
+    /// Whether Responses-style `session_id` cache affinity is supported.
+    #[serde(default = "default_true")]
+    pub send_session_id_header: bool,
+    /// Whether Chat/Anthropic-compatible session-affinity headers are supported.
+    #[serde(default)]
+    pub send_session_affinity_headers: bool,
+    /// Optional Anthropic-style cache-control convention on Chat payloads.
+    #[serde(default)]
+    pub cache_control_format: Option<CacheControlFormat>,
+    /// Whether Anthropic-style cache markers are accepted on tool definitions.
+    #[serde(default = "default_true")]
+    pub supports_cache_control_on_tools: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+impl Default for CacheCompatibility {
+    fn default() -> Self {
+        Self {
+            supports_long_retention: true,
+            send_session_id_header: true,
+            send_session_affinity_headers: false,
+            cache_control_format: None,
+            supports_cache_control_on_tools: true,
+        }
+    }
+}
+
+/// Cache-control wire convention used by an OpenAI-compatible endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheControlFormat {
+    /// Anthropic `cache_control: { type: "ephemeral", ttl?: "1h" }`.
+    Anthropic,
+}
+
 /// Supported wire protocols.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -196,6 +256,9 @@ pub struct ModelSpec {
     pub limits: ModelLimits,
     /// Pricing rates for this model.
     pub pricing: Option<Pricing>,
+    /// Prompt-cache compatibility settings for this model/endpoint.
+    #[serde(default)]
+    pub cache: CacheCompatibility,
 }
 
 /// Multimodal data structure.
@@ -528,6 +591,12 @@ pub struct Request {
     /// Compatibility mode for handling unsupported features.
     #[serde(default)]
     pub compatibility: CompatibilityMode,
+    /// Prompt-cache retention preference; defaults to pi-compatible short retention.
+    #[serde(default)]
+    pub cache_retention: CacheRetention,
+    /// Stable session identifier used for provider cache affinity.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Tool definition.
@@ -785,6 +854,7 @@ mod tests {
                 reasoning: None,
                 tiers: vec![],
             }),
+            cache: CacheCompatibility::default(),
         };
 
         let serialized = serde_json::to_string(&spec).unwrap();
@@ -926,6 +996,8 @@ mod tests {
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
         };
         let serialized = serde_json::to_string(&req).unwrap();
         let deserialized: Request = serde_json::from_str(&serialized).unwrap();

@@ -85,6 +85,9 @@ pub struct ModelConfig {
     /// Pricing rates for this model.
     #[serde(default)]
     pub pricing: Option<Pricing>,
+    /// Prompt-cache compatibility settings for this model/endpoint.
+    #[serde(default)]
+    pub cache: crate::types::CacheCompatibility,
 }
 
 /// Resolved binding of a model specification and its destination endpoint.
@@ -149,6 +152,7 @@ impl ModelCatalog {
                 capabilities: m_cfg.capabilities,
                 limits: m_cfg.limits,
                 pricing: m_cfg.pricing,
+                cache: m_cfg.cache,
             };
             catalog.register_model(spec)?;
         }

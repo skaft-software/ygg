@@ -58,13 +58,13 @@ pub use pricing::{Cost, Pricing, PricingTier, TokenRate};
 pub use stream::{ResponseStream, StreamEvent};
 pub use types::{
     AssistantMessage, AssistantPart, AudioFormat, AudioMedia, AudioOutputOptions, AudioPayload,
-    AudioVoice, Capabilities, Endpoint, EndpointId, ImageDetail, ImageMedia, ImageSource,
-    JsonSchemaFormat, Media, Message, Modality, ModalitySet, ModelId, ModelLimits, ModelSpec,
-    OpenAiChatReasoningMode, OutputFormat, OutputModalities, Protocol, ProviderMediaRef,
-    ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningEffort,
-    ReasoningEffortBudgets, ReasoningPart, ReasoningState, ReasoningStateKind, Request, Response,
-    StopReason, ToolCall, ToolCallId, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage,
-    UserMessage, UserPart,
+    AudioVoice, CacheCompatibility, CacheControlFormat, CacheRetention, Capabilities, Endpoint,
+    EndpointId, ImageDetail, ImageMedia, ImageSource, JsonSchemaFormat, Media, Message, Modality,
+    ModalitySet, ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode, OutputFormat,
+    OutputModalities, Protocol, ProviderMediaRef, ReasoningCapability, ReasoningConfig,
+    ReasoningControl, ReasoningEffort, ReasoningEffortBudgets, ReasoningPart, ReasoningState,
+    ReasoningStateKind, Request, Response, StopReason, ToolCall, ToolCallId, ToolChoice, ToolDef,
+    ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
 };
 
 /// Strictness for cross-protocol / capability degradation.

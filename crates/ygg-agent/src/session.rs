@@ -285,6 +285,22 @@ impl Session {
         &self.path
     }
 
+    /// Returns a stable, provider-safe cache-affinity key for this session.
+    ///
+    /// The key is derived from the full session path, so two sessions with the
+    /// same filename in different workspaces cannot share a provider cache.
+    /// Reopening the same file preserves the key across process restarts.
+    pub fn cache_key(&self) -> String {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        for byte in self.path.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        format!("ygg-{hash:016x}")
+    }
+
     /// Appends an entry (parented on the current head) and records the new
     /// head. Writes two JSONL records — the entry, then a head record — in a
     /// single write to the append-only file. The write is process-crash safe
@@ -378,7 +394,9 @@ impl Session {
     /// [`Message`]; the request-level system prompt belongs to the agent).
     /// Config entries are skipped. Consecutive tool-result messages are
     /// coalesced into a single user message, matching the provider-required
-    /// shape.
+    /// shape. Once materialized, the result is incrementally updated for
+    /// ordinary appends and reused until checkout or compaction changes the
+    /// active branch semantics.
     pub fn context(&self) -> Result<Vec<Message>, SessionError> {
         if let Some(cached) = self.context_cache.borrow().as_ref() {
             return Ok(cached.clone());
@@ -564,6 +582,22 @@ mod tests {
         assert_eq!(ctx.len(), 2);
         assert_eq!(text_of(&ctx[0]), "hello");
         assert_eq!(text_of(&ctx[1]), "hi there");
+    }
+
+    #[test]
+    fn cache_key_is_stable_and_path_scoped() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let first_path = first_dir.path().join("session.jsonl");
+        let second_path = second_dir.path().join("session.jsonl");
+        let first = Session::create(&first_path).unwrap();
+        let first_key = first.cache_key();
+        assert_eq!(first_key, first.cache_key());
+        drop(first);
+        let reopened = Session::open(&first_path).unwrap();
+        assert_eq!(first_key, reopened.cache_key());
+        let other = Session::create(&second_path).unwrap();
+        assert_ne!(first_key, other.cache_key());
     }
 
     #[test]

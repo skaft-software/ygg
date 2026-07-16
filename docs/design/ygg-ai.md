@@ -243,6 +243,7 @@ pub use types::{
     ProviderMediaRef, AudioFormat,
     ReasoningPart, ReasoningState, Request, Response, Usage, StopReason,
     ReasoningConfig, ReasoningEffort, ReasoningEffortBudgets,
+    CacheRetention, CacheCompatibility, CacheControlFormat,
     OutputFormat, JsonSchemaFormat, OutputModalities, AudioOutputOptions, AudioVoice,
 };
 // `mime::Mime` (from the `mime` crate) is re-exported for open media types.
@@ -339,6 +340,7 @@ pub struct ModelSpec {
     pub capabilities: Capabilities,
     pub limits: ModelLimits,
     pub pricing: Option<Pricing>,
+    pub cache: CacheCompatibility, // provider/model cache compatibility
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,6 +618,10 @@ pub struct Request {
     pub output_modalities: OutputModalities,
     #[serde(default)]
     pub compatibility: CompatibilityMode,  // default Strict
+    #[serde(default)]
+    pub cache_retention: CacheRetention,   // default Short; None disables controls
+    #[serde(default)]
+    pub session_id: Option<String>,        // stable provider cache-affinity key
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1128,6 +1134,9 @@ DTO field names are the private structs each codec owns.
 | `ReasoningConfig::Effort` | standard Chat: `reasoning_effort: "minimal"\|"low"\|"medium"\|"high"`; DeepSeek-thinking Chat: `thinking:{type:"enabled"}` plus `reasoning_effort` (portable `minimal` → `low`, because DeepSeek rejects `minimal`) |
 | `ReasoningConfig::Off` (DeepSeek-thinking Chat) | `thinking:{type:"disabled"}`; DeepSeek otherwise defaults thinking to enabled |
 | `OutputModalities::TextAndAudio(AudioOutputOptions)` | `modalities:["text","audio"]`, `audio:{voice, format}` where `voice` = `AudioVoice::Named(s)` → the string `s`, or `AudioVoice::ProviderRef(id)` → `{id}`. Forces a **non-streaming** request (see below) |
+| `cache_retention: Short/Long` on direct OpenAI or compatible endpoints | `prompt_cache_key` from the session ID; `Long` adds `prompt_cache_retention:"24h"` when supported |
+| Anthropic-compatible cache format | `cache_control` markers on the system prompt, final conversation text, and final tool where supported |
+| `cache_retention: None` | Omits all explicit prompt-cache fields and affinity headers |
 | streaming usage | `stream_options:{include_usage:true}` (text/tool path only) |
 
 **Two request shapes, one event surface.** When `output_modalities` is `Text`,
@@ -1192,6 +1201,8 @@ in later turns. The unified stream emits `Started`, any `Text*` events for
 | `OutputFormat::JsonObject` | `text:{format:{type:"json_object"}}` |
 | `OutputFormat::JsonSchema(s)` | `text:{format:{type:"json_schema",name,description?,schema,strict}}` |
 | request encrypted reasoning | `include:["reasoning.encrypted_content"]`, `store:false` |
+| `cache_retention: Short/Long` | `prompt_cache_key` from the session ID (clamped to 64 characters); `Long` also sends `prompt_cache_retention:"24h"` when compatible |
+| `cache_retention: None` | Omits prompt-cache body fields and cache-affinity headers |
 | `OutputModalities::TextAndAudio` | **UNSUPPORTED in v0.1.** Strict → `Unsupported(AudioOutput)`; Lossy → downgrade to `Text` + `Diagnostic`. No `response.audio.*` handling exists. |
 
 **Stream decode (`←`):**
@@ -1224,7 +1235,7 @@ families are skipped without error unless they are terminal: `response.audio.*`,
 
 | Canonical | Wire |
 |-----------|------|
-| `system` | top-level `system` string parameter |
+| `system` | top-level `system:[{type:"text",text,cache_control?}]` text-block array |
 | user text | `{role:"user", content:[{type:"text",text}]}` |
 | `Media(Image)` inline | `{type:"image", source:{type:"base64", media_type:<mime>, data:<b64(bytes)>}}` |
 | `Media(Image)` url | `{type:"image", source:{type:"url", url}}` |
@@ -1233,16 +1244,20 @@ families are skipped without error unless they are terminal: `response.audio.*`,
 | `AssistantPart::ToolCall` | `{type:"tool_use", id, name, input:<parsed args>}` |
 | `ReasoningPart` w/ `AnthropicSignature` (same model) | `{type:"thinking", thinking:<text>, signature}` |
 | `ReasoningPart` w/ `AnthropicRedacted` (same model) | `{type:"redacted_thinking", data}` |
-| `ToolDef` | `tools:[{name, description, input_schema}]` |
+| `ToolDef` | `tools:[{name, description, input_schema}]`; the final tool receives `cache_control` when enabled and supported |
 | `ToolChoice` | `tool_choice`: `{type:"auto"\|"any"\|"tool", name?}` |
 | `ReasoningConfig::Budget`/`Effort` | `thinking:{type:"enabled", budget_tokens}`; effort uses `ReasoningCapability.effort_budgets`, while explicit budget passes through after limit validation |
 | effective output limit | `max_tokens` (request value or model maximum) |
 | `OutputFormat::JsonSchema(s)` | `output_config:{format:{type:"json_schema",schema}}`; Anthropic has no name/description/strict wire fields, so non-default metadata is accepted without loss because it only labels/strengthens the same schema locally |
 | `OutputFormat::JsonObject` | unsupported (Strict error / Lossy downgrade+diagnostic); Anthropic documents schema output, not unconstrained JSON mode |
+| `cache_retention: Short` | `cache_control:{type:"ephemeral"}` on the system prompt, final user block, and final tool (where supported) |
+| `cache_retention: Long` | Same markers with `ttl:"1h"` when the model compatibility allows long retention |
+| `cache_retention: None` | Emits no `cache_control` fields or session-affinity header |
 
-No canonical cache-write policy exists in v0.1, so codecs emit no
-`cache_control` request fields. Cache usage returned by providers is still
-normalized and priced.
+Cache usage returned by providers is normalized and priced. OpenAI prompt-cache
+keys are derived from the stable session ID and clamped to the provider's
+64-character limit; `None` is the explicit opt-out for requests that must not
+send Ygg's cache controls.
 
 **Stream decode (`←`), SSE with `event:` names:**
 
@@ -1733,8 +1748,10 @@ These are decisions, not questions:
     request, so `builtin()` never requires credentials and key rotation works.
 12. **Base URLs are versioned directories.** They end in `/`; codec paths are
     relative and preserve custom gateway prefixes (§10).
-13. **Request cache controls are deferred.** Usage decoding/pricing remains, but
-    v0.1 emits no provider cache-control fields.
+13. **Request cache controls are explicit and provider-specific.** Requests default
+    to short retention, support `none` as an opt-out and `long` where compatible,
+    and codecs map the policy to Anthropic cache markers or OpenAI prompt-cache
+    fields/affinity headers. Usage decoding/pricing remains normalized.
 14. **Transport failures are distinct from HTTP failures.** A failure without an
     HTTP status is `AiError::Transport`; non-2xx is always `AiError::Http`, and
     provider error frames within a 2xx stream are `AiError::Provider`.

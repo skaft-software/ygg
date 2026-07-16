@@ -175,6 +175,7 @@ fn scripted_model(uri: &str) -> Model {
                 max_output_tokens: 8192,
             },
             pricing: None,
+            cache: ygg_ai::CacheCompatibility::default(),
         }),
         endpoint: Arc::new(Endpoint {
             id: EndpointId("test".to_string()),
@@ -210,6 +211,8 @@ fn build_agent(uri: &str, workspace: &Path, session_path: &Path, max_turns: u64)
         extensions,
         max_turns,
         reasoning: ReasoningConfig::Off,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
     })
     .unwrap()
 }
@@ -262,6 +265,8 @@ fn build_agent_with_reasoning(
         extensions,
         max_turns,
         reasoning,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
     })
     .unwrap()
 }
@@ -818,6 +823,8 @@ async fn duplicate_tool_registration_is_rejected() {
         extensions,
         max_turns: 8,
         reasoning: ReasoningConfig::Off,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
     });
     match result {
         Err(ygg_agent::AgentError::DuplicateTool(name)) => assert_eq!(name, "read"),
@@ -979,6 +986,8 @@ fn build_agent_with_extra_tool(
         extensions,
         max_turns,
         reasoning: ReasoningConfig::Off,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
     })
     .unwrap()
 }

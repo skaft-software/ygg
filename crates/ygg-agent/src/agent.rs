@@ -9,9 +9,9 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use ygg_ai::{
-    AiClient, AiError, CompatibilityMode, Message, Model, OutputFormat, OutputModalities,
-    ReasoningConfig, Request, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolResult,
-    ToolResultPart, Usage, UserMessage, UserPart,
+    AiClient, AiError, CacheRetention, CompatibilityMode, Message, Model, OutputFormat,
+    OutputModalities, ReasoningConfig, Request, StreamEvent, ToolCall, ToolChoice, ToolDef,
+    ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
 };
 
 use crate::events::{AgentEvent, Control, FinishReason, OutputChannel};
@@ -73,6 +73,12 @@ pub struct AgentConfig {
     /// validation when the run opens its stream, surfacing as
     /// [`FinishReason::Failed`].
     pub reasoning: ReasoningConfig,
+    /// Prompt-cache retention policy for model turns. Defaults to short in
+    /// application configuration, matching pi.
+    pub cache_retention: CacheRetention,
+    /// Optional explicit cache-affinity ID. When absent, the stable session
+    /// path-derived key is used.
+    pub session_id: Option<String>,
 }
 
 /// A stateful agent: one session, one model, one authoritative head.
@@ -89,6 +95,8 @@ pub struct Agent {
     system: String,
     max_turns: u64,
     reasoning: ReasoningConfig,
+    cache_retention: CacheRetention,
+    session_id: String,
 }
 
 /// Aggregate result of [`Agent::complete`].
@@ -252,6 +260,9 @@ impl Agent {
             )));
         }
         config.sandbox.workspace = workspace;
+        let session_id = config
+            .session_id
+            .unwrap_or_else(|| config.session.cache_key());
         Ok(Self {
             client: config.client,
             model: config.model,
@@ -261,6 +272,8 @@ impl Agent {
             system: config.system,
             max_turns: config.max_turns,
             reasoning: config.reasoning,
+            cache_retention: config.cache_retention,
+            session_id,
         })
     }
 
@@ -303,6 +316,8 @@ impl Agent {
         let observers = self.extensions.observers.clone();
         let max_turns = self.max_turns;
         let reasoning = self.reasoning.clone();
+        let cache_retention = self.cache_retention;
+        let session_id = self.session_id.clone();
         let session = &mut self.session;
 
         let stream = async_stream::stream! {
@@ -389,6 +404,8 @@ impl Agent {
                     output_format: OutputFormat::Text,
                     output_modalities: OutputModalities::Text,
                     compatibility: CompatibilityMode::Strict,
+                    cache_retention,
+                    session_id: Some(session_id.clone()),
                 };
 
                 // ── Open the provider stream (abortable) ───────────────────
