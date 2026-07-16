@@ -65,6 +65,7 @@
 pub mod agent;
 pub mod events;
 pub mod extension;
+pub mod input;
 pub mod sandbox;
 pub mod session;
 pub mod tool;
@@ -73,6 +74,7 @@ pub mod tools;
 pub use agent::{Agent, AgentConfig, AgentError, Run, RunControl, RunOutput};
 pub use events::{AgentEvent, Control, FinishReason, OutputChannel};
 pub use extension::{EventObserver, Extension, ExtensionHost};
+pub use input::{InputPart, UserInput};
 pub use sandbox::SandboxConfig;
 pub use session::{Entry, EntryId, EntryValue, Session, SessionError, SessionRecord};
 pub use tool::{
