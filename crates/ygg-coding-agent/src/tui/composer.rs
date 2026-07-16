@@ -4,6 +4,7 @@
 //! ledger with placeholder chips, and submit-time composition into parts.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ygg_agent::{InputPart, UserInput};
@@ -56,9 +57,11 @@ pub fn parse_dropped_path(text: &str) -> Option<PathBuf> {
         .unwrap_or(trimmed);
     let unescaped = unquoted.replace("\\ ", " ");
     let expanded = if let Some(rest) = unescaped.strip_prefix("file://") {
-        // file://localhost/... and percent-encoding are out of scope; plain
-        // file:///path is the shape macOS terminals produce.
-        rest.trim_start_matches("localhost").to_owned()
+        if let Some(path) = rest.strip_prefix("localhost") {
+            path.to_owned()
+        } else {
+            rest.to_owned()
+        }
     } else if let Some(rest) = unescaped.strip_prefix("~/") {
         let home = dirs::home_dir()?;
         return existing_file(home.join(rest));
@@ -242,7 +245,12 @@ impl AttachmentLedger {
         if metadata.len() > limit {
             return Err(AttachError::TooLarge { limit_bytes: limit });
         }
-        let data = fs::read(path).map_err(|e| AttachError::Unreadable(e.to_string()))?;
+        let file = std::fs::File::open(path).map_err(|e| AttachError::Unreadable(e.to_string()))?;
+        let mut limited = file.take(limit + 1);
+        let mut data = Vec::new();
+        limited
+            .read_to_end(&mut data)
+            .map_err(|e| AttachError::Unreadable(e.to_string()))?;
         if data.len() as u64 > limit {
             return Err(AttachError::TooLarge { limit_bytes: limit });
         }
@@ -578,5 +586,50 @@ mod tests {
         let composed = compose(chip, &mut ledger);
         assert_eq!(composed.text_for_estimate(), "body");
         assert!(!composed.is_empty());
+    }
+
+    #[test]
+    fn file_url_localhost_strips_only_the_hostname_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("images").join("file.png");
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        fs::write(&plain, b"x").unwrap();
+
+        let url = format!("file://localhost{}", plain.display());
+        let parsed = parse_dropped_path(&url);
+        assert_eq!(parsed, Some(plain.clone()));
+    }
+
+    #[test]
+    fn file_url_triple_slash_localhostimages_remains_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("localhostimages").join("file.png");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"x").unwrap();
+
+        let url = format!("file://{}", file.display());
+        let parsed = parse_dropped_path(&url);
+        assert_eq!(parsed, Some(file.clone()));
+    }
+
+    #[test]
+    fn attach_media_bounds_read_to_limit_plus_one_to_prevent_toctou_alloc() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("shot.png");
+        let honest_data = vec![0u8; MAX_IMAGE_BYTES as usize];
+        fs::write(&image, &honest_data).unwrap();
+
+        let mut ledger = AttachmentLedger::default();
+        let result = ledger.attach_media(&image, all_modalities());
+        assert!(result.is_ok(), "file at exact limit should succeed");
+
+        let oversized = dir.path().join("big.png");
+        fs::write(&oversized, vec![0u8; (MAX_IMAGE_BYTES + 1) as usize]).unwrap();
+        let mut ledger2 = AttachmentLedger::default();
+        let result2 = ledger2.attach_media(&oversized, all_modalities());
+        assert!(
+            matches!(result2, Err(AttachError::TooLarge { .. })),
+            "file over limit must be rejected without allocating the full file"
+        );
     }
 }

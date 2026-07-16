@@ -105,12 +105,13 @@ fn parent_is_user_text(session: &Session, entry: &ygg_agent::Entry) -> bool {
     let Some(parent) = session.entry(parent) else {
         return false;
     };
-    matches!(
-        &parent.value,
-        EntryValue::Message(Message::User(user))
-            if !user.content.is_empty()
-                && user.content.iter().all(|part| matches!(part, UserPart::Text(_)))
-    )
+    match &parent.value {
+        EntryValue::Message(message) => {
+            matches!(message, Message::User(user) if !user.content.is_empty())
+                && !is_tool_results(message)
+        }
+        _ => false,
+    }
 }
 
 /// Select the assistant entry beginning the oldest of the requested recent
@@ -320,7 +321,8 @@ pub async fn ensure_capacity_before_prompt(
 mod tests {
     use super::*;
     use ygg_ai::{
-        AssistantMessage, ModelId, Protocol, ToolCall, ToolCallId, ToolResult, ToolResultPart,
+        AssistantMessage, Media, ModelId, Protocol, ToolCall, ToolCallId, ToolResult,
+        ToolResultPart,
     };
 
     use crate::app::bootstrap::{bootstrap, build_app, LaunchSelection, SessionSelection};
@@ -480,6 +482,69 @@ mod tests {
         )
         .unwrap();
         (directory, app)
+    }
+
+    fn user_media(text: &str) -> EntryValue {
+        EntryValue::Message(Message::User(UserMessage {
+            content: vec![
+                UserPart::Text(text.into()),
+                UserPart::Media(Media::image_url(
+                    "https://example.com/test.png".parse().unwrap(),
+                    Some(mime::IMAGE_PNG),
+                )),
+            ],
+        }))
+    }
+
+    #[test]
+    fn multimodal_user_prompts_count_as_real_turns_for_compaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        for index in 0..5 {
+            session
+                .append(user_media(&format!("look at this screenshot {index}")))
+                .unwrap();
+            session
+                .append(assistant(&format!("I see it {index}")))
+                .unwrap();
+        }
+        let first_kept = choose_first_kept(&session, 2).unwrap();
+        session.compact("summary", first_kept).unwrap();
+        let context = session.context().unwrap();
+        assert!(matches!(context.first(), Some(Message::User(_))));
+        assert_eq!(context.len(), 4);
+    }
+
+    #[test]
+    fn tool_result_user_messages_are_excluded_from_turn_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        for index in 0..4 {
+            session.append(user(&format!("turn {index}"))).unwrap();
+            session
+                .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                    content: vec![AssistantPart::ToolCall(ToolCall {
+                        id: ToolCallId(format!("call-{index}")),
+                        name: "read".into(),
+                        arguments_json: "{}".into(),
+                    })],
+                    model: ModelId("m".into()),
+                    protocol: Protocol::OpenAiChat,
+                })))
+                .unwrap();
+            session
+                .append(EntryValue::Message(Message::User(UserMessage {
+                    content: vec![UserPart::ToolResult(ToolResult {
+                        tool_call_id: ToolCallId(format!("call-{index}")),
+                        content: vec![ToolResultPart::Text("ok".into())],
+                        is_error: false,
+                    })],
+                })))
+                .unwrap();
+            session.append(assistant(&format!("done {index}"))).unwrap();
+        }
+        let starts = choose_first_kept(&session, 1);
+        assert!(starts.is_some());
     }
 
     #[test]
