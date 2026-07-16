@@ -11,11 +11,12 @@ use anyhow::Result;
 use sexy_tui_rs::{visible_width, wrap_text_with_ansi, Component, TUI};
 use unicode_width::UnicodeWidthChar;
 use ygg_agent::{AgentEvent, OutputChannel, Session, ToolProgress};
-use ygg_ai::{ToolCallId, Usage};
+use ygg_ai::{ModalitySet, ToolCallId, Usage};
 
 use crate::commands;
 use crate::config::Config;
 use crate::hydrate::{hydrate_transcript, TranscriptItem};
+use crate::tui::composer::{self, ComposedInput};
 use crate::tui::keymap::EditAction;
 use crate::tui::terminal::{force_restore, TerminalSize, YggTerminal};
 
@@ -158,6 +159,12 @@ impl Default for TranscriptCache {
     }
 }
 
+#[derive(Clone, Debug)]
+struct QueuedSteering {
+    display: String,
+    attachments: Vec<composer::Attachment>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct ShellState {
     theme: sexy_tui_rs::theme::Theme,
@@ -166,7 +173,11 @@ struct ShellState {
     /// tool output changed.
     block_revisions: Vec<u64>,
     /// Steering messages accepted while a run is active but not yet injected.
-    steering_queue: Vec<String>,
+    steering_queue: Vec<QueuedSteering>,
+    /// Chip-backed attachments awaiting submit.
+    ledger: composer::AttachmentLedger,
+    /// Input modalities of the active model; gates attach attempts.
+    input_modalities: ModalitySet,
     /// Cached wrapped transcript lines. Scrolling only slices this cache, and
     /// streaming updates re-render only the changed block.
     transcript_cache: RefCell<TranscriptCache>,
@@ -944,7 +955,7 @@ fn render_pending_steering(state: &ShellState, width: u16, max_rows: usize) -> V
     for message in state.steering_queue.iter().take(visible) {
         // Keep each queued message on one predictable row so a burst of
         // steering prompts cannot consume the whole transcript viewport.
-        let compact = message.replace(['\r', '\n'], " ↵ ");
+        let compact = message.display.replace(['\r', '\n'], " ↵ ");
         let line = sexy_tui_rs::truncate_to_width(
             &format!("  Steering: {compact}"),
             available_width,
@@ -1244,14 +1255,12 @@ impl InteractiveShell {
             AgentEvent::SteeringDelivered { messages } => {
                 state.close_streaming_blocks();
                 for message in messages {
-                    if let Some(index) = state
-                        .steering_queue
-                        .iter()
-                        .position(|queued| queued == message)
-                    {
-                        state.steering_queue.remove(index);
-                        state.push_block(TranscriptBlock::User(message.clone()));
-                    }
+                    let display = if state.steering_queue.is_empty() {
+                        message.clone()
+                    } else {
+                        state.steering_queue.remove(0).display
+                    };
+                    state.push_block(TranscriptBlock::User(display));
                 }
                 state.scroll_from_bottom = 0;
             }
@@ -1340,12 +1349,15 @@ impl InteractiveShell {
 
     /// Keep a steering message in the pending area until the Agent reports
     /// that it has appended the message at the next model-turn boundary.
-    pub fn queue_steering(&mut self, message: &str) {
-        if message.is_empty() {
+    pub fn queue_steering(&mut self, composed: &ComposedInput) {
+        if composed.is_empty() {
             return;
         }
         let mut state = self.state.borrow_mut();
-        state.steering_queue.push(message.to_owned());
+        state.steering_queue.push(QueuedSteering {
+            display: composed.display_text.clone(),
+            attachments: composed.attachments.clone(),
+        });
         state.scroll_from_bottom = 0;
     }
 
@@ -1356,14 +1368,22 @@ impl InteractiveShell {
         if state.steering_queue.is_empty() {
             return;
         }
-        let queued = std::mem::take(&mut state.steering_queue).join("\n\n");
+        let queued = std::mem::take(&mut state.steering_queue);
+        let mut attachments = Vec::new();
+        let mut displays = Vec::with_capacity(queued.len());
+        for entry in queued {
+            displays.push(entry.display);
+            attachments.extend(entry.attachments);
+        }
+        state.ledger.restore(attachments);
+        let restored = displays.join("\n\n");
         let current = std::mem::take(&mut state.editor);
         state.editor = if current.trim().is_empty() {
-            queued
-        } else if queued.is_empty() {
+            restored
+        } else if restored.is_empty() {
             current
         } else {
-            format!("{queued}\\n\\n{current}")
+            format!("{restored}\n\n{current}")
         };
         state.editor_cursor = state.editor.len();
     }
@@ -1379,9 +1399,40 @@ impl InteractiveShell {
             }
             EditAction::Paste(text) => {
                 let pasted = normalize_paste(&text);
-                let cursor = state.editor_cursor;
-                state.editor.insert_str(cursor, &pasted);
-                state.editor_cursor = cursor + pasted.len();
+                match composer::classify_paste(&pasted) {
+                    composer::PasteKind::Verbatim => {
+                        let cursor = state.editor_cursor;
+                        state.editor.insert_str(cursor, &pasted);
+                        state.editor_cursor = cursor + pasted.len();
+                    }
+                    composer::PasteKind::LargeText => {
+                        let chip = state.ledger.attach_pasted_text(pasted);
+                        let cursor = state.editor_cursor;
+                        state.editor.insert_str(cursor, &chip);
+                        state.editor_cursor = cursor + chip.len();
+                    }
+                    composer::PasteKind::MediaFile(path) => {
+                        let modalities = state.input_modalities;
+                        match state.ledger.attach_media(&path, modalities) {
+                            Ok(chip) => {
+                                let cursor = state.editor_cursor;
+                                state.editor.insert_str(cursor, &chip);
+                                state.editor_cursor = cursor + chip.len();
+                            }
+                            Err(error) => {
+                                state.push_block(TranscriptBlock::Notice(error.to_string()));
+                                let cursor = state.editor_cursor;
+                                state.editor.insert_str(cursor, &pasted);
+                                state.editor_cursor = cursor + pasted.len();
+                            }
+                        }
+                    }
+                    composer::PasteKind::NonMediaFile(_) => {
+                        let cursor = state.editor_cursor;
+                        state.editor.insert_str(cursor, &pasted);
+                        state.editor_cursor = cursor + pasted.len();
+                    }
+                }
             }
             EditAction::Backspace => {
                 if state.editor_cursor > 0 {
@@ -1501,6 +1552,18 @@ impl InteractiveShell {
 
     pub fn pending(&self) -> String {
         self.state.borrow().editor.clone()
+    }
+
+    pub fn set_input_modalities(&mut self, modalities: ModalitySet) {
+        self.state.borrow_mut().input_modalities = modalities;
+    }
+
+    /// Drain the editor and resolve chips into ordered parts.
+    pub fn drain_composed(&mut self) -> ComposedInput {
+        let mut state = self.state.borrow_mut();
+        state.editor_cursor = 0;
+        let text = std::mem::take(&mut state.editor);
+        composer::compose(text, &mut state.ledger)
     }
 
     pub fn drain_editor(&mut self) -> String {
@@ -1660,7 +1723,7 @@ impl InteractiveShell {
         for message in &state.steering_queue {
             result.push('\n');
             result.push_str("Steering: ");
-            result.push_str(message);
+            result.push_str(&message.display);
         }
         result
     }
@@ -1841,8 +1904,8 @@ mod tests {
     #[test]
     fn steering_messages_are_queued_above_prompt_and_delivered_as_a_batch() {
         let mut shell = InteractiveShell::test_shell();
-        shell.queue_steering("check the docs");
-        shell.queue_steering("then run the tests");
+        shell.queue_steering(&ComposedInput::from_text("check the docs".into()));
+        shell.queue_steering(&ComposedInput::from_text("then run the tests".into()));
 
         let rendered = render_shell(&shell.state.borrow(), 120);
         let prompt = rendered
@@ -1971,6 +2034,109 @@ mod tests {
         let rendered = render_shell(&shell.state.borrow(), 120);
         assert!(rendered.iter().any(|line| line.contains("ab")));
         assert!(rendered.iter().any(|line| line.contains("c")));
+    }
+
+    #[test]
+    fn media_path_paste_attaches_a_chip_and_composes_media_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("shot.png");
+        std::fs::write(&image, b"png").unwrap();
+
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_input_modalities(
+            ygg_ai::ModalitySet::none()
+                .with(ygg_ai::Modality::Image)
+                .with(ygg_ai::Modality::Audio),
+        );
+        for character in "see ".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+        shell.apply_edit(EditAction::Paste(image.display().to_string()));
+
+        let composed = shell.drain_composed();
+        assert_eq!(composed.display_text, "see [Image #1: shot.png]");
+        assert!(composed
+            .parts
+            .iter()
+            .any(|part| matches!(part, ygg_agent::InputPart::Media(_))));
+    }
+
+    #[test]
+    fn media_paste_without_capability_inserts_plain_path_and_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("shot.png");
+        std::fs::write(&image, b"png").unwrap();
+
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_input_modalities(ygg_ai::ModalitySet::none());
+        shell.apply_edit(EditAction::Paste(image.display().to_string()));
+
+        let composed = shell.drain_composed();
+        assert_eq!(composed.display_text, image.display().to_string());
+        assert!(composed
+            .parts
+            .iter()
+            .all(|part| matches!(part, ygg_agent::InputPart::Text(_))));
+        assert!(shell
+            .debug_snapshot()
+            .contains("does not accept image input"));
+    }
+
+    #[test]
+    fn large_paste_collapses_to_chip_and_splices_back_on_drain() {
+        let mut shell = InteractiveShell::test_shell();
+        let large = "line\n".repeat(20);
+        shell.apply_edit(EditAction::Paste(large.clone()));
+
+        let state_text = shell.pending();
+        assert!(state_text.starts_with("[Pasted text #1: 20 lines]"));
+
+        let composed = shell.drain_composed();
+        let text = composed.text_for_estimate();
+        assert_eq!(text.matches("line").count(), 20);
+    }
+
+    #[test]
+    fn small_paste_still_inserts_verbatim() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.apply_edit(EditAction::Paste("first\nsecond".into()));
+        assert_eq!(shell.pending(), "first\nsecond");
+    }
+
+    #[test]
+    fn steering_restore_returns_chips_and_attachments() {
+        let mut shell = InteractiveShell::test_shell();
+        let large = "line\n".repeat(20);
+        shell.apply_edit(EditAction::Paste(large));
+        let composed = shell.drain_composed();
+        shell.queue_steering(&composed);
+
+        shell.restore_queued_steering();
+        assert!(shell.pending().contains("[Pasted text #1: 20 lines]"));
+        // The ledger got its entry back: draining resolves the chip again.
+        let recomposed = shell.drain_composed();
+        assert_eq!(recomposed.text_for_estimate().matches("line").count(), 20);
+    }
+
+    #[test]
+    fn steering_delivery_is_positional_fifo() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.apply_edit(EditAction::Paste("go left".into()));
+        let first = shell.drain_composed();
+        shell.queue_steering(&first);
+        shell.apply_edit(EditAction::Paste("go right".into()));
+        let second = shell.drain_composed();
+        shell.queue_steering(&second);
+
+        shell.on_agent_event(&AgentEvent::SteeringDelivered {
+            messages: vec!["go left".into()],
+        });
+        let snapshot = shell.debug_snapshot();
+        assert!(snapshot.contains("go left"));
+        // Second message still pending.
+        assert!(render_shell(&shell.state.borrow(), 120)
+            .iter()
+            .any(|line| line.contains("go right")));
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::compaction::{
 use crate::config::ThinkingLevel;
 use crate::modes::RunEnded;
 use crate::resources::compose_instructions;
+use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
     model_picker, optional_model_picker, session_picker, theme_picker, thinking_picker,
@@ -441,7 +442,7 @@ where
                     InputAction::Steer(_) => {
                         let text = shell.drain_editor();
                         if !text.is_empty() {
-                            shell.queue_steering(&text);
+                            shell.queue_steering(&ComposedInput::from_text(text.clone()));
                             intents.push_back(ControlIntent::Steer(text));
                         }
                         shell.render();
