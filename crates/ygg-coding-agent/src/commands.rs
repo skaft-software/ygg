@@ -232,7 +232,10 @@ pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
 pub fn help_text() -> String {
     [
         "Commands: /login [codex], /logout [codex], /model [id], /thinking [level], /theme [name], /compact, /new, /resume [id], /status, /help, /quit",
-        "Idle: Enter submits; Ctrl+Enter or Alt+Enter inserts a newline; bracketed paste preserves newlines; Ctrl+C quits. Type / for commands; Tab completes a unique match.",
+        "Idle: Enter submits; Ctrl+Enter or Alt+Enter inserts a newline; small bracketed pastes preserve newlines; Ctrl+C quits. Type / for commands; Tab completes a unique match.",
+        "Attachments: paste or drop a supported image/audio file path to attach it natively.",
+        "Large pastes: more than 10 lines or 2,048 characters collapse to [Pasted text #N] chips and expand on submit.",
+        "Project files: type @ and press Tab to complete a path; media attaches, while other files remain @path references.",
         "Active: Enter queues a follow-up; Ctrl+S steers; Ctrl+C aborts; Esc aborts too.",
         "PageUp/PageDown scroll the transcript. Esc closes overlays when idle.",
     ]
@@ -371,6 +374,9 @@ mod tests {
             "Alt+Enter",
             "Ctrl+Enter",
             "bracketed paste",
+            "paste or drop",
+            "[Pasted text #N]",
+            "type @ and press Tab",
             "Tab completes",
         ] {
             assert!(help.contains(expected), "missing {expected:?}");

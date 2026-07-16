@@ -85,6 +85,34 @@ The agent crate uses `ygg-ai`'s public types (`Message`, `Request`, `StreamEvent
 
 ## 3. Public API
 
+### `UserInput` + `InputPart`
+
+```rust
+/// Ordered user-authored content crossing the agent boundary.
+pub struct UserInput {
+    pub parts: Vec<InputPart>,
+}
+
+pub enum InputPart {
+    Text(String),
+    Media(ygg_ai::Media),
+}
+
+impl From<String> for UserInput; // one Text part
+impl From<&str> for UserInput;   // one Text part
+impl From<Vec<InputPart>> for UserInput;
+```
+
+`UserInput` preserves text/media ordering and maps one-to-one onto
+`ygg_ai::UserPart` when persisted. `text_summary()` joins text parts and renders
+media as `[image]` / `[audio]` for steering-delivery events and logs. Existing
+text-only callers remain source-compatible through the `From<String>` and
+`From<&str>` implementations.
+
+This is the second sanctioned widening of the frozen v1 agent boundary. The
+text-only signature was an omission: `ygg-ai` already supported media. The
+change was approved in the 2026-07-15 native multimodal-input design spec.
+
 ### `Agent`
 
 ```rust
@@ -127,10 +155,10 @@ impl Agent {
 
     /// Begin a run. Streams events; caller drives the returned `Run`.
     /// Returns `Err` for pre-flight failures (bad session, invalid config).
-    pub async fn prompt(&mut self, input: impl Into<String>) -> Result<Run<'_>, AgentError>;
+    pub async fn prompt(&mut self, input: impl Into<UserInput>) -> Result<Run<'_>, AgentError>;
 
     /// Run to completion, returning the final output.
-    pub async fn complete(&mut self, input: impl Into<String>) -> Result<RunOutput, AgentError>;
+    pub async fn complete(&mut self, input: impl Into<UserInput>) -> Result<RunOutput, AgentError>;
 }
 ```
 
@@ -155,10 +183,10 @@ pub struct RunControl {
 }
 
 pub enum Control {
-    /// Inject text into the conversation before the next model turn.
-    Steer(String),
-    /// Queue text for after the current run settles.
-    FollowUp(String),
+    /// Inject ordered text/media input before the next model turn.
+    Steer(UserInput),
+    /// Queue ordered text/media input for after the current run settles.
+    FollowUp(UserInput),
     /// Abort the run at the next safe boundary.
     Abort,
 }
@@ -179,8 +207,8 @@ impl Stream for Run<'_> {
 }
 
 impl RunControl {
-    pub async fn steer(&self, text: impl Into<String>) -> Result<(), AgentError>;
-    pub async fn follow_up(&self, text: impl Into<String>) -> Result<(), AgentError>;
+    pub async fn steer(&self, input: impl Into<UserInput>) -> Result<(), AgentError>;
+    pub async fn follow_up(&self, input: impl Into<UserInput>) -> Result<(), AgentError>;
     pub fn abort(&self);
 }
 ```
@@ -197,8 +225,9 @@ pub enum AgentEvent {
         text: String,
     },
 
-    /// All queued steering messages injected before the next model turn.
-    /// The batch is emitted after the preceding turn's tools complete.
+    /// All queued steering inputs injected before the next model turn.
+    /// Strings are single-line summaries in FIFO delivery order. The batch is
+    /// emitted after the preceding turn's tools complete.
     SteeringDelivered {
         messages: Vec<String>,
     },
@@ -708,9 +737,10 @@ pub enum NetworkPolicy {
 The loop lives in `Agent::prompt()`. Pseudocode:
 
 ```rust
-async fn prompt(&mut self, input: impl Into<String>) -> Result<Run<'_>, AgentError> {
-    // 1. Append user message to session
-    let user_msg = Message::User(UserMessage { content: vec![UserPart::Text(input.into())] });
+async fn prompt(&mut self, input: impl Into<UserInput>) -> Result<Run<'_>, AgentError> {
+    // 1. Append ordered text/media parts as a user message.
+    let input = input.into();
+    let user_msg = Message::User(UserMessage { content: input.into_user_parts() });
     let entry_id = self.session.append(EntryValue::Message(user_msg.clone()))?;
 
     // 2. Build tool definitions from extensions
@@ -761,8 +791,8 @@ async fn run_loop(
         turn += 1;
 
         // ── Drain steer into messages ──────────────────
-        while let Ok(Control::Steer(text)) = control.try_recv() {
-            let msg = user_msg(vec![UserPart::Text(text)]);
+        while let Ok(Control::Steer(input)) = control.try_recv() {
+            let msg = user_msg(input.into_user_parts());
             session.append(EntryValue::Message(msg.clone())).ok();
             messages.push(msg);
         }
@@ -945,6 +975,7 @@ crates/ygg-agent/
 └── src/
     ├── lib.rs           # Agent, Run, RunControl, RunOutput, AgentConfig, AgentError
     ├── agent.rs          # Agent::new(), Agent::prompt(), Agent::complete(), run_loop()
+    ├── input.rs          # UserInput and ordered text/media InputPart values
     ├── session.rs        # Session, Entry, EntryId, EntryValue, SessionRecord
     ├── extension.rs      # Extension trait, ExtensionHost, EventObserver
     ├── tool.rs           # Tool trait, ToolContext, ToolOutput, ToolError
@@ -967,7 +998,8 @@ crates/ygg-agent/
 - Session: create, open, append, checkout, context reconstruction
 - Extensions: tool registration + event observers
 - Trusted-local built-in paths with optional workspace-only accidental-path guard; capability gates (not an OS sandbox)
-- Steering and abort via `RunControl`
+- Multimodal `UserInput` for prompt, steering, and follow-up controls
+- Steering, follow-up, and abort via `RunControl`
 - Persistence at completed-message boundaries
 
 **Deferred to v0.2+:**
@@ -975,6 +1007,5 @@ crates/ygg-agent/
 - PTY mode for exec
 - Optional OS-containment deployment mode (container, seccomp, namespaces, Landlock, Seatbelt) and network policy — a stronger *optional* deployment, not required for the trusted-local-agent model
 - Context injection via extensions
-- Follow-up queue (structure exists in `Control` enum)
 - File-system extension loading
 - Parallel tool execution for read/search
