@@ -12,6 +12,10 @@ never streaming deltas), and emits a streaming event surface including
 
 Included:
 
+- Typed `UserInput` / `InputPart` boundary for `prompt`, `steer`, and
+  `follow_up`: ordered text and media parts (`ygg_ai::Media`) pass through
+  the agent to the model unchanged; text-only callers remain compatible via
+  `From<String>` / `From<&str>`.
 - Four built-in tools — `read`, `search`, `edit`, `exec` — registered through
   the same `Extension` boundary available to third-party tools.
 - A concrete `SandboxConfig`: relative paths use the workspace and hosts may

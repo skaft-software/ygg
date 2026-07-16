@@ -124,6 +124,9 @@ pub struct Agent {
     sandbox: SandboxConfig,
     system: String,
     max_turns: u64,
+    reasoning: ReasoningConfig,
+    cache_retention: CacheRetention,
+    session_id: String,
 }
 
 pub struct AgentConfig {
@@ -139,6 +142,12 @@ pub struct AgentConfig {
     /// `FinishReason::MaxTurns`. Required for the MaxTurns guard to be real
     /// rather than an unreachable variant.
     pub max_turns: u64,
+    /// Reasoning configuration applied to every model request in this agent's
+    /// runs. Use `ReasoningConfig::Off` to disable reasoning (the historical
+    /// default). Unsupported configurations are rejected by `ygg-ai`'s
+    /// validation when the run opens its stream, surfacing as
+    /// `FinishReason::Failed`.
+    pub reasoning: ReasoningConfig,
     /// Prompt-cache retention (`Short` by default in the coding-agent app;
     /// `None` omits provider cache controls).
     pub cache_retention: CacheRetention,
@@ -237,6 +246,15 @@ pub enum AgentEvent {
         id: ToolCallId,
         name: String,
         args: serde_json::Value,
+    },
+
+    /// Live progress from a running tool.
+    ///
+    /// Emitted zero or more times between `ToolStarted` and the matching
+    /// `ToolFinished`. Never persisted in the session.
+    ToolProgress {
+        id: ToolCallId,
+        progress: ToolProgress,
     },
 
     /// A tool call completed execution.
@@ -450,6 +468,7 @@ pub trait Extension: Send + Sync {
 pub struct ExtensionHost {
     tools: Vec<Arc<dyn Tool>>,
     observers: Vec<Arc<dyn EventObserver>>,
+    duplicate_tools: Vec<String>,
 }
 ```
 

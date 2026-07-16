@@ -55,19 +55,37 @@ ygg --print "explain repo"   → secondary noninteractive/headless mode
 > with the boxed `YggTerminal` via `Rc<Cell<(u16,u16)>>` for resize (§5.4/§7).
 > Verified frozen test count: **222**. The full v1 implementation plan is
 > `docs/superpowers/plans/2026-07-12-ygg-coding-agent-v1.md`.
+>
+> Revision 4 (native multimodal input, 2026-07-15): the ygg-agent boundary was
+> widened — `prompt`, `steer`, `follow_up` now accept `impl Into<UserInput>`
+> (was `impl Into<String>`) with ordered `InputPart::Text`/`InputPart::Media`
+> parts; text-only callers remain source-compatible. The TUI composer gained
+> an attachment ledger with chips for media-path pastes/drops, large-paste
+> collapsing, gitignore-aware `@` file-mention completion, and capability-gated
+> attach-time validation. `ygg-ai` is unchanged — its `UserPart::Media` already
+> supported both modalities. Full design: `docs/superpowers/specs/2026-07-15-multimodal-input-design.md`;
+> implementation plan: `docs/superpowers/plans/2026-07-15-multimodal-input.md`.
 
 ---
 
 ## Preconditions and scope guards
 
-This design assumes one already-merged, narrowly-scoped change to `ygg-agent`:
-`AgentConfig` carries `pub reasoning: ReasoningConfig`, and `Agent::prompt`
-threads it into every `ygg_ai::Request` instead of hardcoding
-`ReasoningConfig::Off` (former `agent.rs:353`). Streaming reasoning is therefore
-configurable through the frozen public API. **`ygg-coding-agent` must not
-re-implement or work around reasoning configuration**; it only *sets*
-`AgentConfig.reasoning` at construction. With that field in place `ygg-agent`
-is refrozen.
+This design assumes two already-merged, narrowly-scoped changes to `ygg-agent`:
+1. `AgentConfig` carries `pub reasoning: ReasoningConfig`, and `Agent::prompt`
+   threads it into every `ygg_ai::Request` instead of hardcoding
+   `ReasoningConfig::Off`. Streaming reasoning is therefore configurable
+   through the frozen public API.
+2. The agent boundary accepts `impl Into<UserInput>` (ordered `InputPart::Text` /
+   `InputPart::Media` parts) on `prompt`, `steer`, and `follow_up`. Text-only
+   callers remain source-compatible via `From<String>` / `From<&str>`.
+   `ygg-ai` is unchanged — its `UserPart::Media` already supports both
+   modalities. Full design:
+   `docs/superpowers/specs/2026-07-15-multimodal-input-design.md`.
+
+**`ygg-coding-agent` must not re-implement or work around any of these**;
+it only *sets* `AgentConfig.reasoning` at construction and passes
+`UserInput`/`ComposedInput` at submit, steer, and follow-up. With those
+fields in place `ygg-agent` is refrozen.
 
 Everything else in `ygg-ai` / `ygg-agent` is used exactly as published. This
 crate duplicates none of their responsibilities: the one mutable session head,
