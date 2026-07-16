@@ -48,6 +48,43 @@ fn tool_result_text(parts: &[ToolResultPart]) -> String {
         .join("\n")
 }
 
+fn human_bytes(len: u64) -> String {
+    if len >= 1024 * 1024 {
+        format!("{:.1} MB", len as f64 / (1024.0 * 1024.0))
+    } else if len >= 1024 {
+        format!("{:.1} KB", len as f64 / 1024.0)
+    } else {
+        format!("{len} B")
+    }
+}
+
+fn media_marker(media: &ygg_ai::Media) -> String {
+    match media {
+        ygg_ai::Media::Image(image) => {
+            let mime = image
+                .media_type
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "image".into());
+            match &image.source {
+                ygg_ai::ImageSource::Inline(data) => {
+                    format!("[image {mime} · {}]", human_bytes(data.len() as u64))
+                }
+                _ => format!("[image {mime}]"),
+            }
+        }
+        ygg_ai::Media::Audio(audio) => {
+            let format = format!("{:?}", audio.format).to_lowercase();
+            match &audio.payload {
+                ygg_ai::AudioPayload::Inline(data) => {
+                    format!("[audio {format} · {}]", human_bytes(data.len() as u64))
+                }
+                _ => format!("[audio {format}]"),
+            }
+        }
+    }
+}
+
 fn push_message(items: &mut Vec<TranscriptItem>, message: &Message) {
     match message {
         Message::User(user) => {
@@ -60,7 +97,7 @@ fn push_message(items: &mut Vec<TranscriptItem>, message: &Message) {
                         text: tool_result_text(&result.content),
                         is_error: result.is_error,
                     }),
-                    UserPart::Media(_) => {}
+                    UserPart::Media(media) => text.push_str(&media_marker(media)),
                 }
             }
             if !text.is_empty() {
@@ -160,6 +197,28 @@ mod tests {
                 TranscriptItem::User("active question".into()),
                 TranscriptItem::Assistant("active answer".into()),
             ]
+        );
+    }
+
+    #[test]
+    fn user_media_parts_render_as_markers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![
+                    UserPart::Text("look: ".into()),
+                    UserPart::Media(ygg_ai::Media::image_bytes(
+                        bytes::Bytes::from(vec![0u8; 1024]),
+                        "image/png".parse().unwrap(),
+                    )),
+                ],
+            })))
+            .unwrap();
+
+        let items = hydrate_transcript(&session).unwrap();
+        assert!(
+            matches!(&items[0], TranscriptItem::User(text) if text == "look: [image image/png · 1.0 KB]")
         );
     }
 
