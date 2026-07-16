@@ -35,7 +35,7 @@ pub enum AgentEvent {
     /// from its pending-steering display at the same boundary the model sees
     /// them.
     SteeringDelivered {
-        /// The ordered steering messages injected into the conversation.
+        /// Single-line summaries of the delivered inputs, in FIFO order.
         messages: Vec<String>,
     },
 
@@ -115,13 +115,13 @@ pub enum FinishReason {
 /// Control messages accepted by an active run via [`RunControl`](crate::RunControl).
 #[derive(Debug)]
 pub enum Control {
-    /// Inject text into the conversation at the next model-turn boundary of
+    /// Inject input into the conversation at the next model-turn boundary of
     /// the active run.
-    Steer(String),
-    /// Queue text for after the current run settles (the model completes a
+    Steer(crate::input::UserInput),
+    /// Queue input for after the current run settles (the model completes a
     /// turn without tool calls). The run then continues with this input
     /// instead of finishing.
-    FollowUp(String),
+    FollowUp(crate::input::UserInput),
     /// Abort the run at the next safe boundary.
     Abort,
 }

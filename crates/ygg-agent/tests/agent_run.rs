@@ -389,6 +389,45 @@ async fn text_only_completion() {
 }
 
 #[tokio::test]
+async fn prompt_with_media_persists_media_user_part() {
+    use ygg_agent::{InputPart, UserInput};
+    use ygg_ai::{Media, Message, UserPart};
+
+    let mut h = harness(vec![text_turn("seen")], 8).await;
+    let input = UserInput::from(vec![
+        InputPart::Text("what is in this image?".into()),
+        InputPart::Media(Media::image_bytes(
+            bytes::Bytes::from_static(&[0x89, 0x50, 0x4e, 0x47]),
+            "image/png".parse().unwrap(),
+        )),
+    ]);
+    let mut run = h.agent.prompt(input).await.unwrap();
+    let events = collect(&mut run).await;
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    drop(run);
+
+    // The first session entry is the user message with both parts.
+    let session = h.agent.session();
+    let mut entries = Vec::new();
+    let mut cursor = session.head();
+    while let Some(id) = cursor {
+        let entry = session.entry(&id).unwrap();
+        entries.push(entry);
+        cursor = entry.parent.clone();
+    }
+    entries.reverse();
+    let EntryValue::Message(Message::User(user)) = &entries[0].value else {
+        panic!("first entry is not a user message");
+    };
+    assert_eq!(user.content.len(), 2);
+    assert!(matches!(&user.content[0], UserPart::Text(t) if t == "what is in this image?"));
+    assert!(matches!(&user.content[1], UserPart::Media(Media::Image(_))));
+}
+
+#[tokio::test]
 async fn reasoning_and_text_deltas_use_distinct_channels() {
     let body = msg_start()
         + &thinking_block(0, "pondering deeply")

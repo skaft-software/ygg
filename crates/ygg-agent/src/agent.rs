@@ -16,6 +16,7 @@ use ygg_ai::{
 
 use crate::events::{AgentEvent, Control, FinishReason, OutputChannel};
 use crate::extension::{EventObserver, ExtensionHost};
+use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
 use crate::session::{EntryId, EntryValue, Session, SessionError};
 use crate::tool::{
@@ -157,21 +158,21 @@ pub struct RunControl {
 }
 
 impl RunControl {
-    /// Injects text into the conversation at the next model-turn boundary of
+    /// Injects input into the conversation at the next model-turn boundary of
     /// the active run (persisted to the session when applied).
-    pub async fn steer(&self, text: impl Into<String>) -> Result<(), AgentError> {
+    pub async fn steer(&self, input: impl Into<UserInput>) -> Result<(), AgentError> {
         self.tx
-            .send(Control::Steer(text.into()))
+            .send(Control::Steer(input.into()))
             .await
             .map_err(|_| AgentError::RunEnded)
     }
 
-    /// Queues text for after the current run settles: when the model completes
+    /// Queues input for after the current run settles: when the model completes
     /// a turn without tool calls, the run continues with this input instead of
     /// finishing.
-    pub async fn follow_up(&self, text: impl Into<String>) -> Result<(), AgentError> {
+    pub async fn follow_up(&self, input: impl Into<UserInput>) -> Result<(), AgentError> {
         self.tx
-            .send(Control::FollowUp(text.into()))
+            .send(Control::FollowUp(input.into()))
             .await
             .map_err(|_| AgentError::RunEnded)
     }
@@ -215,9 +216,9 @@ impl AbortFlag {
     }
 }
 
-fn user_message(text: String) -> EntryValue {
+fn user_message(input: UserInput) -> EntryValue {
     EntryValue::Message(Message::User(UserMessage {
-        content: vec![UserPart::Text(text)],
+        content: input.into_user_parts(),
     }))
 }
 
@@ -295,7 +296,7 @@ impl Agent {
     /// the run has started every terminal outcome — completed, aborted,
     /// failed, or max-turns — is reported by exactly one
     /// [`AgentEvent::RunFinished`].
-    pub async fn prompt(&mut self, input: impl Into<String>) -> Result<Run<'_>, AgentError> {
+    pub async fn prompt(&mut self, input: impl Into<UserInput>) -> Result<Run<'_>, AgentError> {
         let first_entry = self.session.append(user_message(input.into()))?;
 
         let (control_tx, mut control_rx) = mpsc::channel::<Control>(8);
@@ -329,8 +330,8 @@ impl Agent {
             }
             let tool_defs: Vec<ToolDef> = tools.iter().map(|t| t.definition()).collect();
 
-            let mut pending_steer: Vec<String> = Vec::new();
-            let mut followups: VecDeque<String> = VecDeque::new();
+            let mut pending_steer: Vec<UserInput> = Vec::new();
+            let mut followups: VecDeque<UserInput> = VecDeque::new();
             let mut control_open = true;
             let mut completed_turns: u64 = 0;
             let mut run_usage = Usage::default();
@@ -339,8 +340,8 @@ impl Agent {
                 // ── Drain control at the turn boundary ─────────────────────
                 while control_open {
                     match control_rx.try_recv() {
-                        Ok(Control::Steer(text)) => pending_steer.push(text),
-                        Ok(Control::FollowUp(text)) => followups.push_back(text),
+                        Ok(Control::Steer(input)) => pending_steer.push(input),
+                        Ok(Control::FollowUp(input)) => followups.push_back(input),
                         Ok(Control::Abort) => break 'run FinishReason::Aborted,
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => control_open = false,
@@ -359,8 +360,9 @@ impl Agent {
                 if !pending_steer.is_empty() {
                     let queued = std::mem::take(&mut pending_steer);
                     let mut delivered = Vec::with_capacity(queued.len());
-                    for text in queued {
-                        if let Err(e) = session.append(user_message(text.clone())) {
+                    for input in queued {
+                        let summary = input.text_summary();
+                        if let Err(e) = session.append(user_message(input)) {
                             if !delivered.is_empty() {
                                 let ev = AgentEvent::SteeringDelivered {
                                     messages: delivered,
@@ -370,7 +372,7 @@ impl Agent {
                             }
                             break 'run FinishReason::Failed(e.into());
                         }
-                        delivered.push(text);
+                        delivered.push(summary);
                     }
                     if !delivered.is_empty() {
                         let ev = AgentEvent::SteeringDelivered {
@@ -435,8 +437,8 @@ impl Agent {
                         Next::Abort | Next::Ctl(Some(Control::Abort)) => {
                             break Err(FinishReason::Aborted);
                         }
-                        Next::Ctl(Some(Control::Steer(text))) => pending_steer.push(text),
-                        Next::Ctl(Some(Control::FollowUp(text))) => followups.push_back(text),
+                        Next::Ctl(Some(Control::Steer(input))) => pending_steer.push(input),
+                        Next::Ctl(Some(Control::FollowUp(input))) => followups.push_back(input),
                         Next::Ctl(None) => control_open = false,
                         Next::Event(None) => {
                             break Err(FinishReason::Failed(
@@ -501,8 +503,8 @@ impl Agent {
                 // lost when the run completes without tool calls.
                 while control_open {
                     match control_rx.try_recv() {
-                        Ok(Control::Steer(text)) => pending_steer.push(text),
-                        Ok(Control::FollowUp(text)) => followups.push_back(text),
+                        Ok(Control::Steer(input)) => pending_steer.push(input),
+                        Ok(Control::FollowUp(input)) => followups.push_back(input),
                         Ok(Control::Abort) => break 'run FinishReason::Aborted,
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => control_open = false,
@@ -526,8 +528,8 @@ impl Agent {
                     if !pending_steer.is_empty() {
                         continue;
                     }
-                    if let Some(text) = followups.pop_front() {
-                        if let Err(e) = session.append(user_message(text)) {
+                    if let Some(input) = followups.pop_front() {
+                        if let Err(e) = session.append(user_message(input)) {
                             break 'run FinishReason::Failed(e.into());
                         }
                         continue;
@@ -581,8 +583,8 @@ impl Agent {
                                         _ = abort.wait() => break None,
                                         r = &mut execute => break Some(r),
                                         c = control_rx.recv(), if control_open => match c {
-                                            Some(Control::Steer(text)) => pending_steer.push(text),
-                                            Some(Control::FollowUp(text)) => followups.push_back(text),
+                                            Some(Control::Steer(input)) => pending_steer.push(input),
+                                            Some(Control::FollowUp(input)) => followups.push_back(input),
                                             Some(Control::Abort) => break None,
                                             None => control_open = false,
                                         },
@@ -689,7 +691,7 @@ impl Agent {
     ///
     /// A run that ends with [`FinishReason::Failed`] is returned as `Err`;
     /// aborted and max-turns runs return `Ok` with their reason.
-    pub async fn complete(&mut self, input: impl Into<String>) -> Result<RunOutput, AgentError> {
+    pub async fn complete(&mut self, input: impl Into<UserInput>) -> Result<RunOutput, AgentError> {
         let mut run = self.prompt(input).await?;
         let mut text = String::new();
         let mut usage = Usage::default();
