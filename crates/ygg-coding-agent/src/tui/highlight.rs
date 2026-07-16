@@ -85,9 +85,7 @@ pub fn highlight_line(line: &str, lang: &str, theme: &Theme) -> String {
     }
 
     // Sort matches: first by start index, then reverse by length (longest match first)
-    matches.sort_by(|a, b| {
-        a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1))
-    });
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
 
     let mut result = String::new();
     let mut last_idx = 0;

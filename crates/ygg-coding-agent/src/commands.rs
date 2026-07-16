@@ -8,6 +8,8 @@ use crate::session_store::active_branch_title;
 /// options: only editor text beginning with `/` enters this grammar.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    Login(Option<String>),
+    Logout(Option<String>),
     Model(Option<String>),
     Thinking(Option<String>),
     Theme(Option<String>),
@@ -30,6 +32,18 @@ pub struct SlashCommandSuggestion {
 }
 
 const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
+    SlashCommandSuggestion {
+        name: "login",
+        usage: "/login [codex]",
+        description: "sign in with ChatGPT",
+        accepts_argument: true,
+    },
+    SlashCommandSuggestion {
+        name: "logout",
+        usage: "/logout [codex]",
+        description: "remove ChatGPT credentials",
+        accepts_argument: true,
+    },
     SlashCommandSuggestion {
         name: "model",
         usage: "/model [id]",
@@ -127,7 +141,25 @@ pub fn parse(input: &str) -> Command {
         return Command::Unknown(input.to_owned());
     }
 
-    match name {
+    let full_name = match name {
+        "login" | "logout" | "model" | "thinking" | "theme" | "compact" | "new" | "resume"
+        | "status" | "help" | "quit" => name.to_owned(),
+        _ => {
+            let matches: Vec<_> = SLASH_COMMANDS
+                .iter()
+                .filter(|command| command.name.starts_with(name))
+                .collect();
+            if matches.len() == 1 {
+                matches[0].name.to_owned()
+            } else {
+                name.to_owned()
+            }
+        }
+    };
+
+    match full_name.as_str() {
+        "login" => Command::Login(argument),
+        "logout" => Command::Logout(argument),
         "model" => Command::Model(argument),
         "thinking" => Command::Thinking(argument),
         "theme" => Command::Theme(argument),
@@ -199,7 +231,7 @@ pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
 /// Concrete interaction reference shown by `/help`.
 pub fn help_text() -> String {
     [
-        "Commands: /model [id], /thinking [level], /theme [name], /compact, /new, /resume [id], /status, /help, /quit",
+        "Commands: /login [codex], /logout [codex], /model [id], /thinking [level], /theme [name], /compact, /new, /resume [id], /status, /help, /quit",
         "Idle: Enter submits; Ctrl+Enter or Alt+Enter inserts a newline; bracketed paste preserves newlines; Ctrl+C quits. Type / for commands; Tab completes a unique match.",
         "Active: Enter queues a follow-up; Ctrl+S steers; Ctrl+C aborts; Esc aborts too.",
         "PageUp/PageDown scroll the transcript. Esc closes overlays when idle.",
@@ -213,6 +245,11 @@ mod tests {
 
     #[test]
     fn parses_the_complete_v1_command_grammar() {
+        assert_eq!(parse("/login"), Command::Login(None));
+        assert_eq!(
+            parse("/logout openai-codex"),
+            Command::Logout(Some("openai-codex".into()))
+        );
         assert_eq!(
             parse("/model gpt-4o-mini"),
             Command::Model(Some("gpt-4o-mini".into()))
@@ -229,7 +266,7 @@ mod tests {
 
     #[test]
     fn slash_suggestions_filter_and_tab_complete_unique_prefixes() {
-        assert_eq!(slash_suggestions("/").len(), 9);
+        assert_eq!(slash_suggestions("/").len(), 11);
         assert_eq!(slash_suggestions("/mod")[0].usage, "/model [id]");
         assert_eq!(slash_suggestions("/th").len(), 2);
         assert!(slash_suggestions("/model ").is_empty());
@@ -239,6 +276,18 @@ mod tests {
             complete_slash_command("/status"),
             Some("/status".to_owned())
         );
+    }
+
+    #[test]
+    fn parses_unambiguous_command_prefixes() {
+        assert_eq!(parse("/mod"), Command::Model(None));
+        assert_eq!(
+            parse("/mo gpt-4o-mini"),
+            Command::Model(Some("gpt-4o-mini".into()))
+        );
+        assert_eq!(parse("/c"), Command::Compact);
+        // /t matches both thinking and theme, so it remains unknown
+        assert!(matches!(parse("/t"), Command::Unknown(_)));
     }
 
     #[test]
@@ -259,6 +308,7 @@ mod tests {
             invocation_cwd: directory.path().to_owned(),
             model: Some(ModelId("gpt-4o-mini".into())),
             reasoning: ReasoningConfig::Off,
+            cache_retention: ygg_ai::CacheRetention::Short,
             sandbox: SandboxPolicy::default(),
             theme: None,
             session_dir: directory.path().join("sessions"),

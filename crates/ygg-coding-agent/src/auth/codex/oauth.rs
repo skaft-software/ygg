@@ -1,58 +1,17 @@
 #![allow(missing_docs)]
 
-//! Pure OAuth mechanics: PKCE, the authorize URL, token exchange/refresh, and
-//! JWT claim decoding. Network calls use `reqwest`; everything else is pure and
-//! unit-tested.
+//! OpenAI device authorization, token exchange/refresh, and JWT claim
+//! validation. The flow mirrors Pi's TypeScript OpenAI Codex OAuth provider.
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use super::{
-    now_unix, random_hex, AUTHORIZE_URL, CLIENT_ID, JWT_AUTH_CLAIM, ORIGINATOR, REDIRECT_URI, SCOPE,
-    TOKEN_URL,
+    now_unix, CLIENT_ID, DEVICE_REDIRECT_URI, DEVICE_TOKEN_URL, DEVICE_USER_CODE_URL,
+    JWT_AUTH_CLAIM, TOKEN_URL,
 };
-
-/// A PKCE verifier/challenge pair (S256).
-pub struct Pkce {
-    pub verifier: String,
-    pub challenge: String,
-}
-
-/// Generate a PKCE pair: verifier = base64url(32 random bytes), challenge =
-/// base64url(SHA256(verifier)).
-pub fn generate_pkce() -> Pkce {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let verifier = URL_SAFE_NO_PAD.encode(bytes);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    Pkce { verifier, challenge }
-}
-
-/// A random CSRF `state` value (128 bits, hex).
-pub fn random_state() -> String {
-    random_hex(16)
-}
-
-/// Build the browser authorization URL with PKCE + Codex's extra flow params.
-pub fn authorize_url(challenge: &str, state: &str) -> String {
-    let mut url = url::Url::parse(AUTHORIZE_URL).expect("valid authorize url");
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", CLIENT_ID)
-        .append_pair("redirect_uri", REDIRECT_URI)
-        .append_pair("scope", SCOPE)
-        .append_pair("code_challenge", challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("state", state)
-        .append_pair("id_token_add_organizations", "true")
-        .append_pair("codex_cli_simplified_flow", "true")
-        .append_pair("originator", ORIGINATOR);
-    url.to_string()
-}
 
 /// A token endpoint result with an absolute expiry (Unix seconds).
 pub struct Tokens {
@@ -72,7 +31,6 @@ async fn post_token(
     client: &reqwest::Client,
     token_url: &str,
     form: &[(&str, &str)],
-    fallback_refresh: Option<&str>,
 ) -> Result<Tokens> {
     let resp = client
         .post(token_url)
@@ -87,36 +45,189 @@ async fn post_token(
     }
     let raw: TokenResponseRaw =
         serde_json::from_str(&body).context("token response was not valid JSON")?;
-    let access = raw.access_token.context("token response missing access_token")?;
-    // Refresh responses rotate the refresh token; if one is somehow absent, keep
-    // the token we already had rather than losing the ability to refresh.
+    let access = raw
+        .access_token
+        .filter(|token| !token.is_empty())
+        .context("token response missing access_token")?;
+    // OpenAI rotates refresh tokens; accepting a response without the rotated
+    // value would persist a credential that may no longer be usable.
     let refresh = raw
         .refresh_token
-        .or_else(|| fallback_refresh.map(str::to_owned))
+        .filter(|token| !token.is_empty())
         .context("token response missing refresh_token")?;
-    let expires_in = raw.expires_in.context("token response missing expires_in")?;
+    let expires_in = raw
+        .expires_in
+        .context("token response missing expires_in")?;
     Ok(Tokens {
         access,
         refresh,
-        expires_at: now_unix() + expires_in,
+        expires_at: now_unix().saturating_add(expires_in),
     })
 }
 
-/// Exchange an authorization code for tokens (PKCE).
-pub async fn exchange_code(client: &reqwest::Client, code: &str, verifier: &str) -> Result<Tokens> {
+async fn exchange_code_with_redirect(
+    client: &reqwest::Client,
+    token_url: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<Tokens> {
     post_token(
         client,
-        TOKEN_URL,
+        token_url,
         &[
             ("grant_type", "authorization_code"),
             ("client_id", CLIENT_ID),
             ("code", code),
             ("code_verifier", verifier),
-            ("redirect_uri", REDIRECT_URI),
+            ("redirect_uri", redirect_uri),
         ],
-        None,
     )
     .await
+}
+
+/// Exchange a completed device authorization for tokens.
+pub async fn exchange_device_code(
+    client: &reqwest::Client,
+    code: &str,
+    verifier: &str,
+) -> Result<Tokens> {
+    exchange_code_with_redirect(client, TOKEN_URL, code, verifier, DEVICE_REDIRECT_URI).await
+}
+
+/// Device authorization details returned by OpenAI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceAuth {
+    pub device_auth_id: String,
+    pub user_code: String,
+    pub interval_seconds: u64,
+}
+
+/// Result of one device authorization poll.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DevicePoll {
+    Pending,
+    SlowDown,
+    Complete {
+        authorization_code: String,
+        code_verifier: String,
+    },
+}
+
+pub(crate) async fn start_device_auth_with_url(
+    client: &reqwest::Client,
+    endpoint: &str,
+) -> Result<DeviceAuth> {
+    let response = client
+        .post(endpoint)
+        .json(&serde_json::json!({ "client_id": CLIENT_ID }))
+        .send()
+        .await
+        .context("device authorization request failed")?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        if status == reqwest::StatusCode::NOT_FOUND {
+            bail!("OpenAI Codex device-code login is unavailable; verify the OpenAI auth endpoint");
+        }
+        bail!("device authorization endpoint returned {status}: {body}");
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(&body).context("device authorization response was not valid JSON")?;
+    let device_auth_id = value
+        .get("device_auth_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("device authorization response missing device_auth_id")?;
+    let user_code = value
+        .get("user_code")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("device authorization response missing user_code")?;
+    let interval_seconds = value
+        .get("interval")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
+        })
+        .context("device authorization response missing a valid interval")?;
+
+    Ok(DeviceAuth {
+        device_auth_id: device_auth_id.to_owned(),
+        user_code: user_code.to_owned(),
+        // Avoid a hot polling loop if the service ever returns zero.
+        interval_seconds: interval_seconds.max(1),
+    })
+}
+
+/// Start OpenAI's hosted device-code flow.
+pub async fn start_device_auth(client: &reqwest::Client) -> Result<DeviceAuth> {
+    start_device_auth_with_url(client, DEVICE_USER_CODE_URL).await
+}
+
+pub(crate) async fn poll_device_auth_with_url(
+    client: &reqwest::Client,
+    endpoint: &str,
+    device: &DeviceAuth,
+) -> Result<DevicePoll> {
+    let response = client
+        .post(endpoint)
+        .json(&serde_json::json!({
+            "device_auth_id": device.device_auth_id,
+            "user_code": device.user_code,
+        }))
+        .send()
+        .await
+        .context("device authorization poll failed")?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    // OpenAI uses both statuses for the ordinary not-authorized-yet state.
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(DevicePoll::Pending);
+    }
+    if status.is_success() {
+        let value: serde_json::Value =
+            serde_json::from_str(&body).context("device token response was not valid JSON")?;
+        let authorization_code = value
+            .get("authorization_code")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("device token response missing authorization_code")?;
+        let code_verifier = value
+            .get("code_verifier")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("device token response missing code_verifier")?;
+        return Ok(DevicePoll::Complete {
+            authorization_code: authorization_code.to_owned(),
+            code_verifier: code_verifier.to_owned(),
+        });
+    }
+
+    let error_code = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("error").cloned())
+        .and_then(|error| match error {
+            serde_json::Value::String(code) => Some(code),
+            serde_json::Value::Object(object) => object
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        });
+    match error_code.as_deref() {
+        Some("deviceauth_authorization_pending") => Ok(DevicePoll::Pending),
+        Some("slow_down") => Ok(DevicePoll::SlowDown),
+        _ => bail!("device authorization failed with status {status}: {body}"),
+    }
+}
+
+/// Poll OpenAI once for completion of a device authorization.
+pub async fn poll_device_auth(client: &reqwest::Client, device: &DeviceAuth) -> Result<DevicePoll> {
+    poll_device_auth_with_url(client, DEVICE_TOKEN_URL, device).await
 }
 
 /// Refresh against the token endpoint (overridable for tests/proxies),
@@ -134,7 +245,6 @@ pub async fn refresh_with_url(
             ("client_id", CLIENT_ID),
             ("refresh_token", refresh_token),
         ],
-        Some(refresh_token),
     )
     .await
 }
@@ -142,65 +252,41 @@ pub async fn refresh_with_url(
 /// Decode a JWT payload's claims (no signature verification — we only read
 /// non-authoritative claims like the account id, which the backend re-checks).
 fn decode_jwt_claims(token: &str) -> Option<serde_json::Value> {
-    let payload = token.split('.').nth(1)?;
+    let mut parts = token.split('.');
+    parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Extract the ChatGPT account id from an access token.
-pub fn decode_account_id(access: &str) -> Option<String> {
-    decode_jwt_claims(access)?
-        .get(JWT_AUTH_CLAIM)?
-        .get("chatgpt_account_id")?
-        .as_str()
-        .filter(|s| !s.is_empty())
+/// Validate that an access token represents a real ChatGPT subscription
+/// session rather than the localhost-only token produced by the old Ygg
+/// browser flow. OpenAI routes the latter through a reduced/free model pool,
+/// which is why selecting otherwise valid subscription models yielded 404s.
+pub fn validate_subscription_token(access: &str) -> Result<String> {
+    let claims = decode_jwt_claims(access).context("access token was not a valid JWT")?;
+    let auth = claims
+        .get(JWT_AUTH_CLAIM)
+        .and_then(serde_json::Value::as_object)
+        .context("access token did not contain ChatGPT authorization claims")?;
+    if auth
+        .get("localhost")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!(
+            "stored OpenAI credential is localhost-only and cannot access the ChatGPT model pool; run `ygg --login codex` again"
+        );
+    }
+    auth.get("chatgpt_account_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
         .map(str::to_owned)
-}
-
-/// Parsed authorization input pasted by the user (raw code or a redirect URL).
-pub struct AuthorizationInput {
-    pub code: Option<String>,
-    pub state: Option<String>,
-}
-
-/// Parse a pasted value: a full redirect URL, a bare `code=…&state=…` query, or
-/// a raw code.
-pub fn parse_authorization_input(input: &str) -> AuthorizationInput {
-    let value = input.trim();
-    if value.is_empty() {
-        return AuthorizationInput {
-            code: None,
-            state: None,
-        };
-    }
-    if let Ok(url) = url::Url::parse(value) {
-        let mut code = None;
-        let mut state = None;
-        for (k, v) in url.query_pairs() {
-            match k.as_ref() {
-                "code" => code = Some(v.into_owned()),
-                "state" => state = Some(v.into_owned()),
-                _ => {}
-            }
-        }
-        return AuthorizationInput { code, state };
-    }
-    if value.contains("code=") {
-        let mut code = None;
-        let mut state = None;
-        for pair in value.trim_start_matches('?').split('&') {
-            if let Some(rest) = pair.strip_prefix("code=") {
-                code = Some(rest.to_owned());
-            } else if let Some(rest) = pair.strip_prefix("state=") {
-                state = Some(rest.to_owned());
-            }
-        }
-        return AuthorizationInput { code, state };
-    }
-    AuthorizationInput {
-        code: Some(value.to_owned()),
-        state: None,
-    }
+        .context("access token did not contain a chatgpt_account_id")
 }
 
 #[cfg(test)]
@@ -208,62 +294,178 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pkce_pair_is_well_formed() {
-        let a = generate_pkce();
-        // base64url(32 bytes) -> 43 chars, no padding; challenge is base64url of a
-        // 32-byte SHA-256 digest -> also 43 chars.
-        assert_eq!(a.verifier.len(), 43);
-        assert_eq!(a.challenge.len(), 43);
-        assert!(!a.verifier.contains('=') && !a.verifier.contains('+') && !a.verifier.contains('/'));
-        // Distinct verifier and a deterministic challenge for that verifier.
-        let expect = URL_SAFE_NO_PAD.encode(Sha256::digest(a.verifier.as_bytes()));
-        assert_eq!(a.challenge, expect);
-        let b = generate_pkce();
-        assert_ne!(a.verifier, b.verifier, "verifier must be random");
-    }
-
-    #[test]
-    fn authorize_url_carries_all_required_params() {
-        let url = authorize_url("CHAL", "STATE");
-        let parsed = url::Url::parse(&url).unwrap();
-        let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(q["response_type"], "code");
-        assert_eq!(q["client_id"], CLIENT_ID);
-        assert_eq!(q["redirect_uri"], REDIRECT_URI);
-        assert_eq!(q["scope"], SCOPE);
-        assert_eq!(q["code_challenge"], "CHAL");
-        assert_eq!(q["code_challenge_method"], "S256");
-        assert_eq!(q["state"], "STATE");
-        assert_eq!(q["id_token_add_organizations"], "true");
-        assert_eq!(q["codex_cli_simplified_flow"], "true");
-        assert_eq!(q["originator"], ORIGINATOR);
-    }
-
-    #[test]
-    fn decode_account_id_reads_the_claim() {
+    fn subscription_token_validation_reads_account_and_rejects_localhost_credentials() {
         // A JWT with an unsigned payload carrying the auth claim.
         let payload = serde_json::json!({
             "https://api.openai.com/auth": { "chatgpt_account_id": "acct_123" }
         });
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
         let token = format!("h.{encoded}.s");
-        assert_eq!(decode_account_id(&token).as_deref(), Some("acct_123"));
-        assert_eq!(decode_account_id("not-a-jwt"), None);
+        assert_eq!(validate_subscription_token(&token).unwrap(), "acct_123");
+        assert!(validate_subscription_token("not-a-jwt").is_err());
+        assert!(validate_subscription_token(&format!("h.{encoded}")).is_err());
+
+        let localhost = serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_123",
+                "localhost": true
+            }
+        });
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&localhost).unwrap());
+        let token = format!("h.{encoded}.s");
+        assert!(validate_subscription_token(&token)
+            .unwrap_err()
+            .to_string()
+            .contains("localhost-only"));
     }
 
-    #[test]
-    fn parse_authorization_input_forms() {
-        let from_url =
-            parse_authorization_input("http://localhost:1455/auth/callback?code=abc&state=xyz");
-        assert_eq!(from_url.code.as_deref(), Some("abc"));
-        assert_eq!(from_url.state.as_deref(), Some("xyz"));
+    #[tokio::test]
+    async fn device_flow_parses_start_pending_and_completion_responses() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let from_query = parse_authorization_input("code=abc&state=xyz");
-        assert_eq!(from_query.code.as_deref(), Some("abc"));
-        assert_eq!(from_query.state.as_deref(), Some("xyz"));
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/start"))
+            .and(body_json(serde_json::json!({ "client_id": CLIENT_ID })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_auth_id": "device-1",
+                "user_code": "ABCD-1234",
+                "interval": "5"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/pending"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": { "code": "deviceauth_authorization_pending" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/pending-json"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": { "code": "deviceauth_authorization_pending" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/slow-down"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": "slow_down"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/complete"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorization_code": "oauth-code",
+                "code_verifier": "device-verifier"
+            })))
+            .mount(&server)
+            .await;
 
-        let raw = parse_authorization_input("  just-a-code  ");
-        assert_eq!(raw.code.as_deref(), Some("just-a-code"));
-        assert_eq!(raw.state, None);
+        let client = reqwest::Client::new();
+        let device = start_device_auth_with_url(&client, &format!("{}/start", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(
+            device,
+            DeviceAuth {
+                device_auth_id: "device-1".into(),
+                user_code: "ABCD-1234".into(),
+                interval_seconds: 5,
+            }
+        );
+        assert_eq!(
+            poll_device_auth_with_url(&client, &format!("{}/pending", server.uri()), &device)
+                .await
+                .unwrap(),
+            DevicePoll::Pending
+        );
+        assert_eq!(
+            poll_device_auth_with_url(&client, &format!("{}/pending-json", server.uri()), &device,)
+                .await
+                .unwrap(),
+            DevicePoll::Pending
+        );
+        assert_eq!(
+            poll_device_auth_with_url(&client, &format!("{}/slow-down", server.uri()), &device,)
+                .await
+                .unwrap(),
+            DevicePoll::SlowDown
+        );
+        assert_eq!(
+            poll_device_auth_with_url(&client, &format!("{}/complete", server.uri()), &device)
+                .await
+                .unwrap(),
+            DevicePoll::Complete {
+                authorization_code: "oauth-code".into(),
+                code_verifier: "device-verifier".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn device_code_exchange_uses_the_hosted_redirect() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code=oauth-code"))
+            .and(body_string_contains("code_verifier=device-verifier"))
+            .and(body_string_contains(
+                "redirect_uri=https%3A%2F%2Fauth.openai.com%2Fdeviceauth%2Fcallback",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+
+        let tokens = exchange_code_with_redirect(
+            &reqwest::Client::new(),
+            &format!("{}/token", server.uri()),
+            "oauth-code",
+            "device-verifier",
+            DEVICE_REDIRECT_URI,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokens.access, "access");
+        assert_eq!(tokens.refresh, "refresh");
+    }
+
+    #[tokio::test]
+    async fn token_response_requires_a_rotated_refresh_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+
+        let error = match refresh_with_url(
+            &reqwest::Client::new(),
+            &format!("{}/token", server.uri()),
+            "old-refresh",
+        )
+        .await
+        {
+            Ok(_) => panic!("missing rotated refresh token must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("missing refresh_token"));
     }
 }

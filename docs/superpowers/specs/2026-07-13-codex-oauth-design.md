@@ -1,111 +1,140 @@
 # Codex OAuth (Sign in with ChatGPT) — Design Spec
 
-> **Status:** approved for implementation (2026-07-13). Self-reviewed against Pi's
-> reference implementation in `~/github/earendil-works/pi` (`packages/ai/src/utils/oauth/openai-codex.ts`,
-> `packages/ai/src/api/openai-codex-responses.ts`, `packages/ai/src/providers/openai-codex.*`).
+> **Status:** implemented and verified (2026-07-13), using Pi's current
+> `packages/ai/src/utils/oauth/openai-codex.ts` device-code flow as the reference.
 
 ## Goal
 
-Let a user drive OpenAI subscription models (GPT-5.6 family) through `ygg` using
-their ChatGPT (Codex) subscription — the same "Sign in with ChatGPT" OAuth the
-Codex CLI uses — with a first-class `ygg` login flow (browser + headless), token
-storage, and automatic refresh.
+Let users run supported OpenAI subscription models through `ygg` with their
+ChatGPT subscription. Authentication must work from both the CLI and the TUI,
+refresh safely, hide models when no usable credential exists, and never
+advertise a model that Ygg's transport cannot run.
 
-## Grounded constants (extracted from the live Codex CLI + JWT, cross-checked with Pi)
+## Grounded constants
 
 | Item | Value |
 |---|---|
-| client_id | `app_EMoamEEZ73f0CkXaXp7hrann` |
-| authorize | `https://auth.openai.com/oauth/authorize` |
-| token | `https://auth.openai.com/oauth/token` |
-| redirect | `http://localhost:1455/auth/callback` (server binds `127.0.0.1:1455`) |
-| scope | `openid profile email offline_access` |
-| authorize extra params | `code_challenge_method=S256`, `id_token_add_organizations=true`, `codex_cli_simplified_flow=true`, `originator=ygg`, `state` |
-| backend base | `https://chatgpt.com/backend-api/codex/` (endpoint base_url; **not** api.openai.com) |
-| request | `POST …/codex/responses` (SSE) |
-| account id | JWT access-token claim `["https://api.openai.com/auth"].chatgpt_account_id` |
-| models | `gpt-5.6-sol` (default), `gpt-5.5`, `gpt-5.6-luna`, `gpt-5.6-terra`, `gpt-5.5-pro` — 272k ctx / 128k out, reasoning=Effort |
+| client id | `app_EMoamEEZ73f0CkXaXp7hrann` |
+| device start | `https://auth.openai.com/api/accounts/deviceauth/usercode` |
+| device poll | `https://auth.openai.com/api/accounts/deviceauth/token` |
+| verification page | `https://auth.openai.com/codex/device` |
+| token exchange/refresh | `https://auth.openai.com/oauth/token` |
+| device exchange redirect | `https://auth.openai.com/deviceauth/callback` |
+| timeout | 15 minutes |
+| backend base | `https://chatgpt.com/backend-api/codex/` |
+| request | `POST …/codex/responses` over SSE |
+| account id | JWT claim `['https://api.openai.com/auth'].chatgpt_account_id` |
 
-## Key architectural decision: reuse `Protocol::OpenAiResponses`, no frozen `ygg-ai` changes
+The start request contains the public client id. Ygg displays the returned user
+code, optionally opens the hosted verification page, and polls at the returned
+interval. HTTP 403/404 and `deviceauth_authorization_pending` mean pending;
+`slow_down` increases the interval by five seconds. The completed authorization
+code and server-issued verifier are exchanged using the hosted device redirect.
 
-The subscription-Codex request is wire-compatible with ygg's existing
-`OpenAiResponses` codec:
+This replaces Ygg's old localhost callback flow. Tokens marked
+`['https://api.openai.com/auth'].localhost = true` are rejected because OpenAI
+routes those credentials through a reduced model pool, which caused misleading
+model 404 responses.
 
-- `build_request` does `base_url.join("responses")`; with base `…/codex/` this
-  yields exactly `…/codex/responses`.
-- It already emits `store: false`, `include: ["reasoning.encrypted_content"]`,
-  the `input`/tools/`reasoning:{effort}` shapes, and `developer`-role system.
-- The codec returns an empty header map; `client.rs` composes
-  `endpoint.default_headers` → codec headers → auth headers, so all Codex
-  headers inject without touching the codec.
+## Request protocol and supported models
 
-Header placement:
-- **Static** (endpoint `default_headers`): `OpenAI-Beta: responses=experimental`,
-  `originator: ygg`, `User-Agent: ygg/<ver> (<os>)`.
-- **Dynamic** (resolver `extra_headers`, per credential/session):
-  `chatgpt-account-id: <account_id>`, `session-id: <uuid>` (note the hyphen).
+The subscription backend works with Ygg's existing
+`Protocol::OpenAiResponses` SSE codec. Codex-specific headers are composed around
+that codec:
 
-### Live-test outcome (2026-07-13): two proven blockers, both frozen-codec fixes
+- Static endpoint headers: `OpenAI-Beta: responses=experimental`,
+  `originator: ygg`, and `User-Agent: ygg/<version> (<os>)`.
+- Dynamic resolver headers: `chatgpt-account-id: <account_id>` and one
+  process-stable `session-id`.
+- Request cache affinity: `prompt_cache_key` and `x-client-request-id` use the
+  stable Ygg session key. Standard Responses' underscore `session_id` header and
+  `prompt_cache_retention` are disabled for Codex because Pi's Codex transport
+  does not send them.
 
-A real `gpt-5.6-sol` turn surfaced two backend rejections — each a *proven
-blocker*, and each also a genuine correctness fix for standard OpenAI Responses,
-so both were applied to the frozen `openai_responses` codec (all 116 frozen
-tests remain green):
+The codec includes `stream: true`, does not synthesize
+`max_output_tokens`, emits `store: false`, and requests encrypted reasoning
+continuation data plus `reasoning.summary: "auto"` for visible thinking. Replayed
+reasoning items always include `summary` (including `[]`), which newer Codex
+models require for post-tool continuation. Completed assistant history is replayed
+as `output_text` (never `input_text`), allowing subsequent user turns to start.
+A developer-role input message is accepted for system instructions.
 
-1. `{"detail":"Stream must be set to true"}` — the codec set streaming only as a
-   transport flag, never `"stream": true` in the body. Now emitted
-   unconditionally (the codec is always-streamed by design).
-2. `{"detail":"Unsupported parameter: max_output_tokens"}` — the codec
-   synthesized a default `max_output_tokens` from the local capacity limit. Now
-   only an *explicit* caller cap is forwarded; the default is never synthesized.
+The advertised SSE-compatible model set is:
 
-The predicted **`instructions`** risk did **not** materialize: the ChatGPT Codex
-backend accepts the system prompt as a `developer` message in `input`. After the
-two fixes, the end-to-end turn returned `OK`. No `Protocol::OpenAiCodexResponses`
-variant was needed.
+- `gpt-5.6-sol` (recommended default)
+- `gpt-5.6-terra`
+- `gpt-5.5`
+- `gpt-5.4`
+- `gpt-5.4-mini`
 
-## Components (all in `ygg-coding-agent`; `ygg-ai` stays frozen)
+`gpt-5.6-luna` is deliberately hidden: Ygg's current SSE request semantics
+return `Model not found`, while Codex's WebSocket transport and richer official
+HTTP fallback request both succeed. `gpt-5.5-pro` is absent from the subscription
+catalog and is explicitly rejected for ChatGPT-account Codex requests.
 
-`src/auth/codex/`:
-- **`oauth.rs`** — constants; PKCE (`verifier` = base64url(32 rand bytes),
-  `challenge` = base64url(SHA256(verifier))); `authorize_url`; `exchange_code`
-  and `refresh` (reqwest form POST to the token endpoint); JWT `account_id` +
-  `expires_at` decode. Refresh **rotates** the refresh token — the new one is
-  persisted.
-- **`store.rs`** — JSON credential file at `~/.ygg/credentials/codex.json`, mode
-  `0600`. `{ tokens: { access_token, refresh_token, account_id }, expires_at }`.
-  `load`/`save`/`delete`, plus an async `modify` guarded by a mutex for
-  double-checked-lock refresh.
-- **`resolver.rs`** — `CodexResolver` implements the public
-  `ygg_ai::CredentialResolver`. `resolve()`: load token; if `now + skew >=
-  expires_at`, refresh under lock (re-check inside); return `Bearer(access)` +
-  `{chatgpt-account-id, session-id}`. Fast when unexpired.
-- **`login.rs`** — browser flow: local `127.0.0.1:1455` `TcpListener`, open the
-  system browser, await the `?code=&state=` callback (state-verified), exchange.
-  Headless / fallback: print the URL and read a pasted `code` or redirect URL
-  from stdin. Writes the store.
+## Components
 
-`src/cli.rs` — `--login <provider>` / `--logout <provider>` flags (avoids
-clashing with the positional prompt), plus `--headless`.
+All concrete OAuth code remains in `ygg-coding-agent` and uses the public
+`ygg_ai::CredentialResolver` interface.
 
-`src/main.rs` — dispatch `--login`/`--logout` before building the run config.
+### `src/auth/codex/oauth.rs`
 
-`src/app/bootstrap.rs` — `register_openai_codex`: build the endpoint (backend
-base + static headers + `Auth::dynamic(CodexResolver)`) and register the models,
-**only if** a credential file exists (so unlogged-in users simply don't see the
-models, and `ygg --login codex` is the guided path). Mirrors the DeepSeek
-programmatic-registration pattern.
+- Starts and polls hosted device authorization.
+- Exchanges the completed code and refreshes access tokens.
+- Requires and persists OpenAI's rotated refresh token.
+- Extracts and validates the ChatGPT account claim without treating it as an
+  authorization boundary; the backend still validates the bearer token.
+- Rejects malformed and localhost-only access tokens.
 
-## Testing
+### `src/auth/codex/store.rs`
 
-- Unit: PKCE shape, `authorize_url` params, callback-request parsing, JWT
-  account-id/expiry decode, store round-trip + `0600`, resolver expiry→refresh
-  (mock token endpoint via the existing `wiremock` dev-dep).
-- Manual acceptance gate: `ygg --login codex`, then a real `gpt-5.6-sol` turn —
-  this is the live confirmation of the `instructions` risk above.
+Stores
+`{ tokens: { access_token, refresh_token, account_id }, expires_at }` at
+`~/.ygg/credentials/codex.json`. Writes use owner-only mode `0600` on Unix.
+Ygg never reads or persists Pi's refresh token.
 
-## Out of scope (this pass)
+### `src/auth/codex/resolver.rs`
 
-Device-code headless flow (Pi has one; browser+paste covers headless here),
-Anthropic/Copilot OAuth, keychain storage, `Protocol::OpenAiCodexResponses`
-variant (only if the live test forces it).
+Loads the credential for each request. Near expiry, refresh is serialized with a
+double-checked async lock, the rotated access token is revalidated, and both
+rotated tokens are persisted. Resolution returns a bearer credential plus the
+Codex account and session headers.
+
+### CLI and TUI
+
+- `ygg --login codex` runs device login and opens the verification page.
+- `ygg --login codex --headless` prints the URL/code without opening a browser.
+- `ygg --logout codex` removes Ygg's credential.
+- `/login [codex]` and `/logout [codex]` are first-class slash commands.
+- During TUI login, Ygg temporarily restores the normal terminal so the code is
+  visible, then re-enters the alternate screen and reloads the catalog.
+- Commands submitted during a model run are queued for the next idle boundary.
+- Logging out while a Codex model is active requires selecting a non-Codex
+  replacement first; cancellation leaves the credential and model untouched.
+
+### Catalog visibility
+
+Codex models are registered only when Ygg's own credential file can be parsed,
+has a refresh token, contains a ChatGPT account id, and is not marked localhost.
+An expired access token may still register the models because the resolver can
+refresh it before the next request. Missing, malformed, or legacy credentials do
+not expose Codex models.
+
+## Verification
+
+Automated tests cover device start/pending/completion responses, hosted redirect
+exchange, JWT validation, localhost rejection, secure store round trips, token
+refresh and rotation, catalog visibility, slash-command parsing, and queued TUI
+actions.
+
+A live acceptance replay using Pi's access token in memory only confirmed that
+Ygg's exact SSE request shape streams successfully for all five advertised
+models. It also reproduced Luna's SSE-only 404 and `gpt-5.5-pro`'s explicit
+subscription rejection. Pi credentials were neither copied nor persisted.
+
+## Out of scope
+
+- The richer Codex request/transport semantics needed to expose
+  `gpt-5.6-luna` reliably.
+- Anthropic or GitHub Copilot OAuth.
+- OS keychain-backed token storage.

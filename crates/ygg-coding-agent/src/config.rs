@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ygg_agent::SandboxConfig;
-use ygg_ai::{ModelId, ReasoningConfig, ReasoningEffort, ReasoningEffortBudgets};
+use ygg_ai::{CacheRetention, ModelId, ReasoningConfig, ReasoningEffort, ReasoningEffortBudgets};
 
 /// Resolve the workspace root: an explicit path, the nearest `.git` ancestor,
 /// or the current directory. The returned path is canonicalized.
@@ -157,6 +157,7 @@ pub struct Config {
     pub invocation_cwd: PathBuf,
     pub model: Option<ModelId>,
     pub reasoning: ReasoningConfig,
+    pub cache_retention: CacheRetention,
     pub sandbox: SandboxPolicy,
     pub theme: Option<String>,
     pub session_dir: PathBuf,
@@ -189,6 +190,16 @@ pub fn parse_reasoning(value: &str) -> anyhow::Result<ReasoningConfig> {
     Ok(config)
 }
 
+/// Parse a prompt-cache retention policy.
+pub fn parse_cache_retention(value: &str) -> anyhow::Result<CacheRetention> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" | "disabled" => Ok(CacheRetention::None),
+        "short" => Ok(CacheRetention::Short),
+        "long" => Ok(CacheRetention::Long),
+        _ => anyhow::bail!("invalid cache retention {value:?}; use none, short, or long"),
+    }
+}
+
 /// Default location for persistent sessions.
 pub fn default_session_dir() -> PathBuf {
     dirs::home_dir()
@@ -201,6 +212,17 @@ pub fn default_session_dir() -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn cache_retention_accepts_disable_and_rejects_unknown_values() {
+        assert_eq!(parse_cache_retention("none").unwrap(), CacheRetention::None);
+        assert_eq!(
+            parse_cache_retention("short").unwrap(),
+            CacheRetention::Short
+        );
+        assert_eq!(parse_cache_retention("long").unwrap(), CacheRetention::Long);
+        assert!(parse_cache_retention("sometimes").is_err());
+    }
 
     #[test]
     fn explicit_workspace_wins_and_is_canonicalized() {

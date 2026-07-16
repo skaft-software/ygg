@@ -20,7 +20,7 @@ pub struct Cli {
     /// Sign out of a subscription provider (e.g. `codex`) and exit.
     #[arg(long, value_name = "PROVIDER")]
     pub logout: Option<String>,
-    /// With `--login`, use the headless (paste-a-code) flow instead of a browser.
+    /// With `--login`, print the device URL/code without opening a browser.
     #[arg(long)]
     pub headless: bool,
     /// Use headless print mode instead of the full-screen TUI.
@@ -44,6 +44,9 @@ pub struct Cli {
     /// Reasoning: off, minimal, low, medium, high, or budget=N.
     #[arg(long)]
     pub reasoning: Option<String>,
+    /// Prompt-cache retention: none, short, or long.
+    #[arg(long, value_name = "POLICY")]
+    pub cache_retention: Option<String>,
     /// Workspace root override.
     #[arg(long)]
     pub workspace: Option<PathBuf>,
@@ -86,6 +89,7 @@ struct CompactionLayer {
 struct ConfigLayer {
     model: Option<String>,
     reasoning: Option<String>,
+    cache_retention: Option<String>,
     theme: Option<String>,
     allow_external_paths: Option<bool>,
     allow_edit: Option<bool>,
@@ -109,6 +113,7 @@ impl ConfigLayer {
         }
         override_some!(model);
         override_some!(reasoning);
+        override_some!(cache_retention);
         override_some!(theme);
         override_some!(allow_external_paths);
         override_some!(allow_edit);
@@ -133,11 +138,67 @@ impl ConfigLayer {
     }
 }
 
-fn global_config_path() -> PathBuf {
+pub fn global_config_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".ygg")
         .join("config.toml")
+}
+
+pub fn persist_model(model: &str) -> anyhow::Result<()> {
+    persist_model_to_path(model, &global_config_path())
+}
+
+fn persist_model_to_path(model: &str, path: &std::path::Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let content = if path.exists() {
+        std::fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+
+    // Serialise the model id through toml so special characters are
+    // properly escaped rather than producing invalid config.
+    let escaped = toml::Value::String(model.to_string());
+    let replacement = format!("model = {escaped}");
+
+    let mut found = false;
+    let mut new_lines = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        // Never rewrite a commented-out model line.
+        if trimmed.starts_with('#') {
+            new_lines.push(line.to_string());
+            continue;
+        }
+        if trimmed.starts_with("model") {
+            let after = trimmed.strip_prefix("model").unwrap();
+            if after.trim_start().starts_with('=') {
+                new_lines.push(replacement.clone());
+                found = true;
+                continue;
+            }
+        }
+        new_lines.push(line.to_string());
+    }
+
+    if !found {
+        if !new_lines.is_empty() && !new_lines.last().unwrap().is_empty() {
+            new_lines.push(String::new());
+        }
+        new_lines.push(replacement);
+    }
+
+    let new_content = new_lines.join("\n") + "\n";
+    // Atomic write: write to a sibling temp file then rename over the
+    // real path so a crash mid-write cannot leave a truncated config.
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, &new_content)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 fn project_config_path(workspace: &Path) -> PathBuf {
@@ -177,6 +238,8 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
     Ok(ConfigLayer {
         model: env_value("YGG_MODEL"),
         reasoning: env_value("YGG_REASONING"),
+        cache_retention: env_value("YGG_CACHE_RETENTION")
+            .or_else(|| env_value("PI_CACHE_RETENTION")),
         theme: env_value("YGG_THEME"),
         allow_external_paths: env_parse("YGG_ALLOW_EXTERNAL_PATHS")?,
         allow_edit: env_parse("YGG_ALLOW_EDIT")?,
@@ -225,6 +288,14 @@ fn build_config_with_global_path(
     let reasoning = match cli.reasoning.as_deref().or(values.reasoning.as_deref()) {
         Some(value) => config::parse_reasoning(value)?,
         None => ygg_ai::ReasoningConfig::Off,
+    };
+    let cache_retention = match cli
+        .cache_retention
+        .as_deref()
+        .or(values.cache_retention.as_deref())
+    {
+        Some(value) => config::parse_cache_retention(value)?,
+        None => ygg_ai::CacheRetention::Short,
     };
 
     let mut sandbox = SandboxPolicy::default();
@@ -299,6 +370,7 @@ fn build_config_with_global_path(
         invocation_cwd,
         model,
         reasoning,
+        cache_retention,
         sandbox,
         theme: cli.theme.or(values.theme),
         session_dir: cli
@@ -338,6 +410,7 @@ mod tests {
             resume: None,
             model: None,
             reasoning: None,
+            cache_retention: None,
             workspace: None,
             theme: None,
             show_reasoning: false,
@@ -353,6 +426,16 @@ mod tests {
 
     fn config_with_empty_global(cli: Cli, directory: &Path) -> anyhow::Result<Config> {
         build_config_with_global_path(cli, directory, &directory.join("missing-global.toml"))
+    }
+
+    #[test]
+    fn cache_retention_can_disable_prompt_caching() {
+        let directory = cwd();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.cache_retention = Some("none".into());
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(config.cache_retention, ygg_ai::CacheRetention::None);
     }
 
     #[test]
@@ -447,5 +530,93 @@ mod tests {
         assert_eq!(config.theme.as_deref(), Some("project-theme"));
         assert_eq!(config.max_turns, 11);
         assert!(!config.sandbox.allow_external_paths);
+    }
+
+    // --- persist_model_to_path ---
+
+    fn read_model_from_config(path: &std::path::Path) -> Option<String> {
+        let source = std::fs::read_to_string(path).unwrap();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(after) = trimmed.strip_prefix("model") {
+                let after = after.trim_start();
+                if let Some(val) = after.strip_prefix('=') {
+                    return Some(val.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn persist_model_creates_file_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        persist_model_to_path("gpt-4o-mini", &path).unwrap();
+        assert_eq!(
+            read_model_from_config(&path).as_deref(),
+            Some("gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn persist_model_updates_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "model = \"old-model\"\ntheme = \"dusk\"\n").unwrap();
+        persist_model_to_path("new-model", &path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("model = \"new-model\""), "{content}");
+        assert!(
+            content.contains("theme = \"dusk\""),
+            "theme line preserved: {content}"
+        );
+    }
+
+    #[test]
+    fn persist_model_appends_when_no_model_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "theme = \"dusk\"\n").unwrap();
+        persist_model_to_path("gpt-4o-mini", &path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("model = \"gpt-4o-mini\""), "{content}");
+    }
+
+    #[test]
+    fn persist_model_skips_commented_model_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# model = \"commented-out\"\ntheme = \"dusk\"\n").unwrap();
+        persist_model_to_path("active-model", &path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("# model = \"commented-out\""),
+            "commented line preserved: {content}"
+        );
+        assert!(
+            content.contains("model = \"active-model\""),
+            "new entry appended: {content}"
+        );
+    }
+
+    #[test]
+    fn persist_model_escapes_special_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Backslash and double-quote must be escaped in TOML basic strings.
+        persist_model_to_path("model\\with\"quotes", &path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("model = "), "{content}");
+        // Round-trip: the written TOML must parse back to the original id.
+        let parsed: std::collections::BTreeMap<String, toml::Value> =
+            toml::from_str(&content).unwrap();
+        assert_eq!(
+            parsed.get("model").unwrap().as_str().unwrap(),
+            "model\\with\"quotes"
+        );
     }
 }

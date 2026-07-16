@@ -128,6 +128,7 @@ mod tests {
             invocation_cwd: workspace,
             model: None,
             reasoning: ygg_ai::ReasoningConfig::Off,
+            cache_retention: ygg_ai::CacheRetention::Short,
             sandbox: SandboxPolicy::default(),
             theme: None,
             session_dir: PathBuf::from("sessions"),

@@ -56,11 +56,12 @@ impl CodexResolver {
         }
 
         let tokens =
-            oauth::refresh_with_url(&self.http, &self.token_url, &cred.tokens.refresh_token).await?;
-        // The rotated access token usually re-carries the account id; fall back
-        // to the previously stored one if the claim is absent.
-        let account_id =
-            oauth::decode_account_id(&tokens.access).unwrap_or(cred.tokens.account_id.clone());
+            oauth::refresh_with_url(&self.http, &self.token_url, &cred.tokens.refresh_token)
+                .await?;
+        // Re-validate every rotated token. Keeping the old account id when the
+        // new token lacks subscription claims would silently reintroduce the
+        // localhost/free-routing 404 failure.
+        let account_id = oauth::validate_subscription_token(&tokens.access)?;
         let refreshed = CredentialFile {
             tokens: Tokens {
                 access_token: tokens.access,
@@ -81,10 +82,12 @@ impl CredentialResolver for CodexResolver {
         // the actionable "run `ygg --login codex`" guidance is surfaced at
         // registration time, not here.
         let cred = self.load_valid().await.map_err(|_| AuthError::Resolve)?;
+        let account_id = oauth::validate_subscription_token(&cred.tokens.access_token)
+            .map_err(|_| AuthError::Resolve)?;
 
         let mut extra_headers = http::HeaderMap::new();
-        let account = http::HeaderValue::from_str(&cred.tokens.account_id)
-            .map_err(|_| AuthError::InvalidHeaderValue)?;
+        let account =
+            http::HeaderValue::from_str(&account_id).map_err(|_| AuthError::InvalidHeaderValue)?;
         extra_headers.insert(http::HeaderName::from_static("chatgpt-account-id"), account);
         let session = http::HeaderValue::from_str(&self.session_id)
             .map_err(|_| AuthError::InvalidHeaderValue)?;
@@ -108,7 +111,7 @@ mod tests {
         store
             .save(&CredentialFile {
                 tokens: Tokens {
-                    access_token: "live-access".into(),
+                    access_token: jwt_with_account("acct_9"),
                     refresh_token: "r".into(),
                     account_id: "acct_9".into(),
                 },
@@ -143,7 +146,7 @@ mod tests {
     }
 
     /// A minimal unsigned JWT whose payload carries the ChatGPT account claim,
-    /// so `decode_account_id` can read it after a refresh.
+    /// so refresh validation can derive the account header.
     fn jwt_with_account(account: &str) -> String {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
@@ -156,13 +159,19 @@ mod tests {
 
     #[tokio::test]
     async fn expired_token_refreshes_and_persists_rotation() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let new_access = jwt_with_account("acct_refreshed");
         Mock::given(method("POST"))
             .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains(format!(
+                "client_id={}",
+                super::super::CLIENT_ID
+            )))
+            .and(body_string_contains("refresh_token=old-refresh"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": new_access,
                 "refresh_token": "rotated-refresh",

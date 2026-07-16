@@ -230,7 +230,7 @@ pub async fn summarize(
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: ygg_ai::CompatibilityMode::Strict,
-        cache_retention: ygg_ai::CacheRetention::default(),
+        cache_retention: ygg_ai::CacheRetention::None,
         session_id: None,
     };
     let response = client.complete(model, request).await?;
@@ -458,6 +458,7 @@ mod tests {
             invocation_cwd: directory.path().to_owned(),
             model: Some(ModelId("gpt-4o-mini".into())),
             reasoning: ReasoningConfig::Off,
+            cache_retention: ygg_ai::CacheRetention::Short,
             sandbox: SandboxPolicy::default(),
             theme: None,
             session_dir: directory.path().join("sessions"),

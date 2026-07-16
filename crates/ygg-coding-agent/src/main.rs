@@ -14,6 +14,8 @@ mod tui;
 
 use clap::Parser;
 
+// The control loop stays local; interactive TUI layout and terminal writes run
+// on `ygg-tui-render` so model streaming is not stalled by frame rendering.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
@@ -21,7 +23,13 @@ async fn main() -> anyhow::Result<()> {
     // Subscription auth commands run and exit before any run configuration is
     // built — they need neither a workspace nor a session.
     if let Some(provider) = cli.login.as_deref() {
-        return run_auth_command(provider, AuthCommand::Login { headless: cli.headless }).await;
+        return run_auth_command(
+            provider,
+            AuthCommand::Login {
+                headless: cli.headless,
+            },
+        )
+        .await;
     }
     if let Some(provider) = cli.logout.as_deref() {
         return run_auth_command(provider, AuthCommand::Logout).await;

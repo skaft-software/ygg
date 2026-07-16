@@ -169,12 +169,14 @@ pub async fn thinking_picker(
     Ok(levels[index])
 }
 
-/// Ask the user to select one model from the embedded catalog.
-pub async fn model_picker(
+/// Ask the user to select one model, preserving cancellation for workflows
+/// such as `/logout` that must not mutate credentials until a replacement model
+/// has been chosen.
+pub async fn optional_model_picker(
     shell: &mut InteractiveShell,
     input: &mut EventStream,
     catalog: &ModelCatalog,
-) -> anyhow::Result<ModelId> {
+) -> anyhow::Result<Option<ModelId>> {
     let mut models = catalog.models().collect::<Vec<_>>();
     models.sort_by(|left, right| left.id.0.cmp(&right.id.0));
     let items = models
@@ -185,10 +187,25 @@ pub async fn model_picker(
             description: Some(model.api_name.clone()),
         })
         .collect::<Vec<_>>();
-    let index = pick_from(shell, input, items)
+    let Some(index) = pick_from(shell, input, items).await? else {
+        return Ok(None);
+    };
+    let selected_id = models[index].id.0.clone();
+    if let Err(e) = crate::cli::persist_model(&selected_id) {
+        shell.error(format!("failed to save model preference: {e}"));
+    }
+    Ok(Some(ModelId(selected_id)))
+}
+
+/// Ask the user to select one model from the active catalog.
+pub async fn model_picker(
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    catalog: &ModelCatalog,
+) -> anyhow::Result<ModelId> {
+    optional_model_picker(shell, input, catalog)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("model selection cancelled"))?;
-    Ok(ModelId(models[index].id.0.clone()))
+        .ok_or_else(|| anyhow::anyhow!("model selection cancelled"))
 }
 
 #[cfg(test)]

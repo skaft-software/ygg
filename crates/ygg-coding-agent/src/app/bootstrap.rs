@@ -122,7 +122,10 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
             max_output_tokens,
         },
         pricing: None,
-        cache: ygg_ai::CacheCompatibility::default(),
+        cache: ygg_ai::CacheCompatibility {
+            supports_long_retention: false,
+            ..ygg_ai::CacheCompatibility::default()
+        },
     })?;
     Ok(())
 }
@@ -202,7 +205,13 @@ fn register_openai_codex(
                 max_output_tokens: CODEX_MAX_OUTPUT_TOKENS,
             },
             pricing: None,
-            cache: ygg_ai::CacheCompatibility::default(),
+            // Codex uses `session-id` (hyphenated) from its credential resolver
+            // and does not send standard Responses long-retention controls.
+            cache: ygg_ai::CacheCompatibility {
+                supports_long_retention: false,
+                send_session_id_header: false,
+                ..ygg_ai::CacheCompatibility::default()
+            },
         })?;
     }
     Ok(())
@@ -361,7 +370,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         extensions,
         max_turns: config.max_turns,
         reasoning: reasoning.clone(),
-        cache_retention: ygg_ai::CacheRetention::default(),
+        cache_retention: config.cache_retention,
         session_id: None,
     })?;
 
@@ -441,7 +450,7 @@ pub fn rebuild_app(
         extensions,
         max_turns: config.max_turns,
         reasoning: reasoning.clone(),
-        cache_retention: ygg_ai::CacheRetention::default(),
+        cache_retention: config.cache_retention,
         session_id: None,
     })?;
 
@@ -470,6 +479,7 @@ mod tests {
             invocation_cwd: directory.to_path_buf(),
             model: model.map(|model| ModelId(model.to_owned())),
             reasoning: ReasoningConfig::Off,
+            cache_retention: ygg_ai::CacheRetention::Short,
             sandbox: SandboxPolicy::default(),
             theme: None,
             session_dir: directory.join("sessions"),
@@ -554,9 +564,12 @@ mod tests {
             let model = catalog.resolve(&ModelId((*model_id).into())).unwrap();
             assert_eq!(model.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
             assert_eq!(model.spec.protocol, Protocol::OpenAiResponses);
+            assert!(!model.spec.cache.supports_long_retention);
+            assert!(!model.spec.cache.send_session_id_header);
         }
         // These were the two misleading entries in the original integration:
-        // Pro is not in the subscription catalog and Luna currently needs WS.
+        // Pro is not in the subscription catalog, and Luna needs richer Codex
+        // request/transport semantics than Ygg currently implements.
         assert!(catalog.resolve(&ModelId("gpt-5.5-pro".into())).is_err());
         assert!(catalog.resolve(&ModelId("gpt-5.6-luna".into())).is_err());
     }

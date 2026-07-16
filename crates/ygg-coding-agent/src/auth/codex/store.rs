@@ -42,10 +42,6 @@ impl CredentialStore {
         Self { path: path.into() }
     }
 
-    pub fn exists(&self) -> bool {
-        self.path.exists()
-    }
-
     /// Load the credential, or `None` if the file does not exist.
     pub fn load(&self) -> Result<Option<CredentialFile>> {
         match std::fs::read(&self.path) {
@@ -123,11 +119,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials/codex.json");
         let store = CredentialStore::new(&path);
-        assert!(!store.exists());
+        assert!(!path.exists());
         assert!(store.load().unwrap().is_none());
 
         store.save(&sample()).unwrap();
-        assert!(store.exists());
+        assert!(path.exists());
         let loaded = store.load().unwrap().unwrap();
         assert_eq!(loaded.tokens.access_token, "acc");
         assert_eq!(loaded.tokens.account_id, "acct_1");
@@ -141,7 +137,7 @@ mod tests {
         }
 
         store.delete().unwrap();
-        assert!(!store.exists());
+        assert!(!path.exists());
         // Deleting a missing file is not an error.
         store.delete().unwrap();
     }

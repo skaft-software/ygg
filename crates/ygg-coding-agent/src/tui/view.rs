@@ -24,10 +24,65 @@ const RENDER_INTERVAL: Duration = Duration::from_millis(16);
 const ELISION_MARKER: &str = "\n… older tool output elided …\n";
 const PROMPT_CURSOR: &str = "▎";
 
+/// Replace C0 control characters (except \n, \r, \t) and strip ANSI escape
+/// sequences so raw binary tool output cannot inject terminal commands that
+/// crash or destabilise the emulator (e.g. WezTerm).
+///
+/// NULL becomes `␀`, ESC becomes `␛`, BEL becomes `␇`, other C0 controls
+/// become `·`. Any `\x1b[...` CSI sequence is collapsed to `␛[…` so it
+/// renders as visible text.
+fn sanitize_for_terminal(raw: &str) -> String {
+    // Fast path: most tool output is clean text.
+    if raw
+        .bytes()
+        .all(|b| b >= 0x20 || b == b'\n' || b == b'\r' || b == b'\t')
+    {
+        return raw.to_owned();
+    }
+
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x00' => out.push('␀'),
+            '\x07' => out.push('␇'),
+            '\x1b' => {
+                // If the next char starts a CSI sequence (ESC [), swallow
+                // until the final byte so the terminal never sees a live
+                // escape. Render the whole thing as visible text.
+                out.push('␛');
+                if chars.peek() == Some(&'[') {
+                    out.push('[');
+                    chars.next();
+                    // Consume parameter bytes (0x30-0x3F) and intermediate
+                    // bytes (0x20-0x2F), then the final byte (0x40-0x7E).
+                    while let Some(&next) = chars.peek() {
+                        let b = next as u32;
+                        if (0x30..=0x3F).contains(&b) || (0x20..=0x2F).contains(&b) {
+                            out.push(next);
+                            chars.next();
+                        } else if (0x40..=0x7E).contains(&b) {
+                            out.push(next);
+                            chars.next();
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            c if (c as u32) < 0x20 => out.push('·'),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Append display output while retaining only the newest 64 KiB.
 pub fn bounded_append(existing: &mut String, additional: &str) {
-    if existing.len().saturating_add(additional.len()) <= MAX_PANEL_BYTES {
-        existing.push_str(additional);
+    let safe = sanitize_for_terminal(additional);
+    if existing.len().saturating_add(safe.len()) <= MAX_PANEL_BYTES {
+        existing.push_str(&safe);
         return;
     }
 
@@ -35,15 +90,15 @@ pub fn bounded_append(existing: &mut String, additional: &str) {
     // second combined String on every overflow event, which is a hot path for
     // noisy tools; reserve once and shift only the retained tail.
     let tail_budget = MAX_PANEL_BYTES.saturating_sub(ELISION_MARKER.len());
-    let mut additional_start = if additional.len() >= tail_budget {
-        additional.len() - tail_budget
+    let mut additional_start = if safe.len() >= tail_budget {
+        safe.len() - tail_budget
     } else {
         0
     };
-    while additional_start < additional.len() && !additional.is_char_boundary(additional_start) {
+    while additional_start < safe.len() && !safe.is_char_boundary(additional_start) {
         additional_start += 1;
     }
-    let existing_budget = tail_budget.saturating_sub(additional.len() - additional_start);
+    let existing_budget = tail_budget.saturating_sub(safe.len() - additional_start);
     let mut existing_start = existing.len().saturating_sub(existing_budget);
     while existing_start < existing.len() && !existing.is_char_boundary(existing_start) {
         existing_start += 1;
@@ -51,11 +106,11 @@ pub fn bounded_append(existing: &mut String, additional: &str) {
 
     let final_len = ELISION_MARKER.len()
         + existing.len().saturating_sub(existing_start)
-        + additional.len().saturating_sub(additional_start);
+        + safe.len().saturating_sub(additional_start);
     existing.replace_range(..existing_start, "");
     existing.reserve(final_len.saturating_sub(existing.len()));
     existing.insert_str(0, ELISION_MARKER);
-    existing.push_str(&additional[additional_start..]);
+    existing.push_str(&safe[additional_start..]);
 }
 
 #[derive(Clone, Debug)]
@@ -380,8 +435,10 @@ fn render_block(
             lines
         }
         TranscriptBlock::Reasoning(text) => {
-            let heading_style = if theme.capability_tier() > sexy_tui_rs::theme::capability::CapabilityTier::Baseline {
-                format!("\x1b[3mThinking\x1b[23m")
+            let heading_style = if theme.capability_tier()
+                > sexy_tui_rs::theme::capability::CapabilityTier::Baseline
+            {
+                "\x1b[3mThinking\x1b[23m".to_string()
             } else {
                 "Thinking".to_string()
             };
@@ -389,12 +446,18 @@ fn render_block(
             let mut lines = vec![heading];
             let border = theme.fg("md_quote_border", "│");
             for line in wrap_plain(text, width.saturating_sub(4) as usize) {
-                let italicized = if theme.capability_tier() > sexy_tui_rs::theme::capability::CapabilityTier::Baseline {
+                let italicized = if theme.capability_tier()
+                    > sexy_tui_rs::theme::capability::CapabilityTier::Baseline
+                {
                     format!("\x1b[3m{line}\x1b[23m")
                 } else {
                     line
                 };
-                lines.push(format!("  {} {}", border, theme.fg("md_quote", &italicized)));
+                lines.push(format!(
+                    "  {} {}",
+                    border,
+                    theme.fg("md_quote", &italicized)
+                ));
             }
             lines.push(String::new());
             lines
@@ -409,8 +472,10 @@ fn render_block(
             } else {
                 theme.fg("accent", "running")
             };
-            let mut lines =
-                vec![theme.bold(&theme.fg("tool_title", &format!("Tool {} ({}) [{state}]", panel.name, panel.id.0)))];
+            let mut lines = vec![theme.bold(&theme.fg(
+                "tool_title",
+                &format!("Tool {} ({}) [{state}]", panel.name, panel.id.0),
+            ))];
             if !panel.args.is_empty() && panel.args != "null" {
                 lines.push(theme.dim(&format!("  args: {}", panel.args)));
             }
@@ -418,7 +483,8 @@ fn render_block(
                 lines.push(theme.dim("  (waiting for output)"));
             } else {
                 for line in panel.output.lines() {
-                    lines.push(theme.dim(&format!("  {line}")));
+                    let safe = sanitize_for_terminal(line);
+                    lines.push(theme.dim(&format!("  {safe}")));
                 }
             }
             lines.push(String::new());
@@ -447,7 +513,10 @@ fn markdown_lines(text: &str, theme: &sexy_tui_rs::theme::Theme, width: u16) -> 
             } else {
                 current_lang.clear();
             }
-            lines.push(format!(" {}", theme.fg("md_code_border", &"─".repeat(inner_width))));
+            lines.push(format!(
+                " {}",
+                theme.fg("md_code_border", &"─".repeat(inner_width))
+            ));
             previous_was_blank = false;
             continue;
         }
@@ -464,7 +533,10 @@ fn markdown_lines(text: &str, theme: &sexy_tui_rs::theme::Theme, width: u16) -> 
         previous_was_blank = false;
 
         let rendered = if in_code_block {
-            format!("  {}", crate::tui::highlight::highlight_line(raw, &current_lang, theme))
+            format!(
+                "  {}",
+                crate::tui::highlight::highlight_line(raw, &current_lang, theme)
+            )
         } else if is_horizontal_rule(trimmed) {
             theme.fg("md_hr", &"─".repeat(inner_width))
         } else if let Some((level, heading)) = markdown_heading(trimmed) {
@@ -557,7 +629,9 @@ fn render_inline_markdown(text: &str, theme: &sexy_tui_rs::theme::Theme) -> Stri
         if let Some((content, rest)) = delimited_markdown(remaining, "***") {
             let inner = render_inline_markdown(content, theme);
             let bold = theme.bold(&inner);
-            let bold_italic = if theme.capability_tier() > sexy_tui_rs::theme::capability::CapabilityTier::Baseline {
+            let bold_italic = if theme.capability_tier()
+                > sexy_tui_rs::theme::capability::CapabilityTier::Baseline
+            {
                 format!("\x1b[3m{bold}\x1b[23m")
             } else {
                 bold
@@ -577,7 +651,9 @@ fn render_inline_markdown(text: &str, theme: &sexy_tui_rs::theme::Theme) -> Stri
             delimited_markdown(remaining, "*").or_else(|| delimited_markdown(remaining, "_"))
         {
             let inner = render_inline_markdown(content, theme);
-            let italic = if theme.capability_tier() > sexy_tui_rs::theme::capability::CapabilityTier::Baseline {
+            let italic = if theme.capability_tier()
+                > sexy_tui_rs::theme::capability::CapabilityTier::Baseline
+            {
                 format!("\x1b[3m{inner}\x1b[23m")
             } else {
                 format!("\x1b[4m{inner}\x1b[24m")
@@ -602,7 +678,6 @@ fn render_inline_markdown(text: &str, theme: &sexy_tui_rs::theme::Theme) -> Stri
 
     rendered
 }
-
 
 fn delimited_markdown<'a>(text: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> {
     let body = text.strip_prefix(delimiter)?;
@@ -973,7 +1048,11 @@ fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
 
     if let Some(overlay) = &state.overlay {
         lines.push(state.theme.bold(&state.theme.fg("accent", "─ overlay ─")));
-        for line in wrap_plain(overlay, usize::from(width.saturating_sub(2))) {
+        // Picker overlays already contain theme-generated ANSI sequences.
+        // Wrap by visible terminal cells rather than raw characters: slicing a
+        // color reset (for example, ESC [ 39 m) makes fragments such as
+        // `[39m` appear on screen and causes short model names to wrap.
+        for line in wrap_text_with_ansi(overlay, usize::from(width.saturating_sub(2))) {
             lines.push(format!(" {line}"));
         }
         lines.push(state.theme.dim("Press Esc or any printable key to close."));
@@ -1587,6 +1666,11 @@ impl InteractiveShell {
     }
 
     #[cfg(test)]
+    pub fn debug_error(&self) -> Option<String> {
+        self.state.borrow().error.clone()
+    }
+
+    #[cfg(test)]
     pub fn debug_tool_output(&self, id: &ToolCallId) -> Option<String> {
         let state = self.state.borrow();
         let index = *state.tool_panels.get(id)?;
@@ -1642,6 +1726,20 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_for_terminal_replaces_control_chars_and_strips_csi() {
+        // Clean text passes through unchanged.
+        assert_eq!(sanitize_for_terminal("hello world\n"), "hello world\n");
+        // NULL, BEL, ESC, and other C0 controls are replaced.
+        assert_eq!(sanitize_for_terminal("a\x00b\x07c\x1bd\x01e"), "a␀b␇c␛d·e");
+        // CSI sequences (ESC [ ...) are neutralised to visible characters.
+        assert_eq!(sanitize_for_terminal("\x1b[31mRED\x1b[0m"), "␛[31mRED␛[0m");
+        // Incomplete CSI at end of string is still neutralised.
+        assert_eq!(sanitize_for_terminal("\x1b[38;5"), "␛[38;5");
+        // ESC not followed by '[' renders as lone ␛; BS and US become · .
+        assert_eq!(sanitize_for_terminal("\x1bB\x08\x1f"), "␛B··");
+    }
+
+    #[test]
     fn bounded_append_keeps_valid_utf8_at_the_cut_boundary() {
         let mut output = "é".repeat(40_000);
         bounded_append(&mut output, " tail");
@@ -1652,6 +1750,38 @@ mod tests {
     #[test]
     fn plain_wrapping_is_nonempty_for_empty_text() {
         assert_eq!(wrap_plain("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn styled_overlay_wraps_by_visible_width_without_splitting_ansi() {
+        let theme = sexy_tui_rs::theme::Theme::load(
+            None,
+            sexy_tui_rs::theme::capability::CapabilityTier::Baseline,
+        );
+        let selected = format!(
+            "{} — {}",
+            theme.bold(&theme.fg("accent", "gpt-audio-1.5")),
+            theme.fg("muted", "gpt-audio-1.5")
+        );
+        // This is 29 visible cells but 82 raw characters. At an 80-column
+        // terminal the old raw-character wrapper split off the final reset as
+        // a literal `[39m` line.
+        assert_eq!(visible_width(&selected), 29);
+        let wrapped = wrap_text_with_ansi(&selected, 78);
+        assert_eq!(wrapped, vec![selected.clone()]);
+
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(80, 20);
+        shell.show_overlay_text(selected);
+        let rendered = render_shell(&shell.state.borrow(), 80);
+        let prompt_row = rendered
+            .iter()
+            .position(|line| line.contains("prompt"))
+            .expect("prompt box");
+        assert_eq!(
+            prompt_row, 3,
+            "one styled item must occupy one overlay row at 80 columns"
+        );
     }
 
     #[test]

@@ -23,7 +23,9 @@ use crate::config::ThinkingLevel;
 use crate::modes::RunEnded;
 use crate::resources::compose_instructions;
 use crate::tui::keymap::{self, InputAction};
-use crate::tui::pickers::{model_picker, session_picker, theme_picker, thinking_picker};
+use crate::tui::pickers::{
+    model_picker, optional_model_picker, session_picker, theme_picker, thinking_picker,
+};
 use crate::tui::theme::{available_themes, load_named_theme, load_theme};
 use crate::tui::view::InteractiveShell;
 
@@ -40,6 +42,8 @@ type ControlFuture = Pin<Box<dyn Future<Output = Result<(), AgentError>>>>;
 /// only after `Run` is dropped at the next idle boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingIdleAction {
+    Login(Option<String>),
+    Logout(Option<String>),
     ChangeModel(ModelId),
     ChangeThinking(ReasoningConfig),
     ChangeThinkingLevel(ThinkingLevel),
@@ -171,6 +175,8 @@ where
 
 fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> anyhow::Result<()> {
     let action = match command {
+        Command::Login(provider) => PendingIdleAction::Login(provider),
+        Command::Logout(provider) => PendingIdleAction::Logout(provider),
         Command::Model(Some(id)) => PendingIdleAction::ChangeModel(ModelId(id)),
         Command::Model(None) => PendingIdleAction::PickModel,
         Command::Thinking(Some(level)) => match ThinkingLevel::parse(&level)? {
@@ -185,6 +191,110 @@ fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> a
     };
     push_pending_action(queue, action);
     Ok(())
+}
+
+fn validate_codex_provider(provider: Option<&str>) -> anyhow::Result<()> {
+    match provider.unwrap_or("codex") {
+        "codex" | "openai-codex" | "openai" => Ok(()),
+        other => anyhow::bail!("unknown provider {other:?}; supported: codex"),
+    }
+}
+
+/// Run device-code login outside raw/alternate-screen mode, then make the new
+/// models available immediately without restarting the current Agent.
+async fn login_codex(
+    app: &mut App,
+    shell: &mut InteractiveShell,
+    provider: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Err(error) = validate_codex_provider(provider) {
+        shell.error(error.to_string());
+        return Ok(());
+    }
+
+    shell.set_run_label("signing in to ChatGPT…");
+    shell.render();
+    shell.suspend();
+    let store = crate::auth::codex::CredentialStore::new(crate::auth::codex::default_path());
+    let login_result = crate::auth::codex::login(&store, false).await;
+    // Restoring the terminal is mandatory even when OAuth fails.
+    shell.resume()?;
+    shell.set_run_label("idle");
+
+    if let Err(error) = login_result {
+        shell.error(format!("ChatGPT login failed: {error:#}"));
+        shell.render();
+        return Ok(());
+    }
+
+    let catalog = match crate::app::bootstrap::model_catalog() {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            shell.error(format!(
+                "ChatGPT login succeeded, but reloading models failed: {error:#}"
+            ));
+            shell.render();
+            return Ok(());
+        }
+    };
+    if catalog
+        .resolve(&ModelId(crate::auth::codex::MODELS[0].into()))
+        .is_err()
+    {
+        shell.error("ChatGPT login completed, but no Codex models could be registered".into());
+        shell.render();
+        return Ok(());
+    }
+    app.catalog = catalog;
+    shell.clear_error();
+    shell.notice("signed in to ChatGPT; use /model to select a Codex model");
+    shell.render();
+    Ok(())
+}
+
+/// Remove the Ygg-owned credential and catalog entries together. If the active
+/// model is a Codex model, choose its replacement before deleting anything so
+/// cancellation leaves both the session and credentials untouched.
+async fn logout_codex(
+    mut app: App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    provider: Option<&str>,
+) -> anyhow::Result<App> {
+    if let Err(error) = validate_codex_provider(provider) {
+        shell.error(error.to_string());
+        return Ok(app);
+    }
+
+    let catalog = crate::app::bootstrap::model_catalog_without_codex()?;
+    let replacement = if app.model.endpoint.id.0 == crate::auth::codex::ENDPOINT_ID {
+        shell.notice("select a replacement model before signing out");
+        let Some(model) = optional_model_picker(shell, input, &catalog).await? else {
+            shell.notice("logout cancelled");
+            return Ok(app);
+        };
+        Some(model)
+    } else {
+        None
+    };
+
+    // Transition while authentication and the old catalog are still intact.
+    // If rebuilding the Agent fails, the user remains signed in rather than
+    // being stranded on a model whose credential was already deleted.
+    if let Some(model) = replacement {
+        app = transition(app, shell, Reconfig::Model(model))?;
+    }
+
+    let store = crate::auth::codex::CredentialStore::new(crate::auth::codex::default_path());
+    if let Err(error) = store.delete() {
+        shell.error(format!("ChatGPT logout failed: {error:#}"));
+        return Ok(app);
+    }
+    app.catalog = catalog;
+    shell.clear_error();
+    shell.notice("signed out of ChatGPT");
+    shell.render();
+    Ok(app)
 }
 
 fn apply_theme(shell: &mut InteractiveShell, name: &str) -> anyhow::Result<()> {
@@ -415,6 +525,14 @@ where
     }
 }
 
+fn prepare_prompt(shell: &mut InteractiveShell) {
+    // Errors describe the previous interaction. Once a new prompt is accepted
+    // they are stale and must not remain pinned below the active run.
+    shell.clear_error();
+    shell.set_run_label("checking context…");
+    shell.render();
+}
+
 fn update_status(shell: &mut InteractiveShell, app: &App) {
     shell.set_status(&format!(
         "{} · {} · {}",
@@ -456,6 +574,12 @@ async fn apply_pending_actions(
 ) -> anyhow::Result<App> {
     while let Some(action) = pending_actions.pop_front() {
         match action {
+            PendingIdleAction::Login(provider) => {
+                login_codex(&mut app, shell, provider.as_deref()).await?;
+            }
+            PendingIdleAction::Logout(provider) => {
+                app = logout_codex(app, shell, input, provider.as_deref()).await?;
+            }
             PendingIdleAction::ChangeModel(id) => {
                 app = transition(app, shell, Reconfig::Model(id))?;
                 shell.notice("queued model change applied");
@@ -523,6 +647,12 @@ async fn run_idle_command(
         Command::Status => shell.show_overlay_text(commands::status_text(&app, None)),
         Command::Help => shell.show_overlay_text(commands::help_text()),
         Command::Quit => return Ok(IdleCommandOutcome::Quit),
+        Command::Login(provider) => {
+            login_codex(&mut app, shell, provider.as_deref()).await?;
+        }
+        Command::Logout(provider) => {
+            app = logout_codex(app, shell, input, provider.as_deref()).await?;
+        }
         Command::New => {
             app = transition(app, shell, Reconfig::NewSession)?;
             shell.notice("created a new session");
@@ -596,9 +726,9 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let mut shell = InteractiveShell::enter(theme, size)?;
     shell.set_theme_config(boot.config.clone());
     let mut input = EventStream::new();
-    // sexy-tui renders synchronously on `request_render`; it does not own an
-    // async render loop. Only use this clock to coalesce high-rate wheel input,
-    // never to repaint an unchanged transcript in the background.
+    // The shell owns a dedicated renderer thread, but sexy-tui still renders
+    // synchronously when that thread receives a request. This clock only
+    // coalesces high-rate wheel input on the input loop.
     let mut scroll_tick = tokio::time::interval(Duration::from_millis(16));
     scroll_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -627,8 +757,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 }
             }
             Idle::Submit(prompt) => {
-                shell.set_run_label("checking context…");
-                shell.render();
+                prepare_prompt(&mut shell);
                 match ensure_capacity_before_prompt(&mut app, &prompt).await? {
                     CapacityDecision::Proceed(outcome) => {
                         report_compaction(&mut shell, &outcome);
@@ -709,8 +838,10 @@ mod tests {
     #[test]
     fn command_queue_parses_reconfiguration_values() {
         let mut queue = VecDeque::new();
+        queue_command(Command::Login(None), &mut queue).unwrap();
         queue_command(Command::Thinking(Some("high".into())), &mut queue).unwrap();
         queue_command(Command::Resume(Some("id".into())), &mut queue).unwrap();
+        assert_eq!(queue.pop_front(), Some(PendingIdleAction::Login(None)));
         assert!(matches!(
             queue.pop_front(),
             Some(PendingIdleAction::ChangeThinkingLevel(ThinkingLevel::High))
@@ -719,6 +850,17 @@ mod tests {
             queue.pop_front(),
             Some(PendingIdleAction::ResumeSession(Some("id".into())))
         );
+    }
+
+    #[test]
+    fn starting_a_new_prompt_clears_the_previous_error() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.error("old failure".to_string());
+        assert_eq!(shell.debug_error().as_deref(), Some("old failure"));
+
+        prepare_prompt(&mut shell);
+
+        assert_eq!(shell.debug_error(), None);
     }
 
     fn text_turn() -> String {
@@ -765,6 +907,7 @@ mod tests {
                     max_output_tokens: 1024,
                 },
                 pricing: None,
+                cache: ygg_ai::CacheCompatibility::default(),
             }),
             endpoint: Arc::new(Endpoint {
                 id: EndpointId("test".into()),
@@ -812,6 +955,8 @@ mod tests {
             extensions,
             max_turns: 4,
             reasoning: ReasoningConfig::Off,
+            cache_retention: ygg_ai::CacheRetention::default(),
+            session_id: None,
         })
         .unwrap();
 
