@@ -38,6 +38,8 @@ url = "2"
 http = "1"
 unicode-width = "0.2"
 regex = "1"
+mime = "0.3"
+bytes = "1"
 
 # Codex OAuth (Sign in with ChatGPT): hosted device authorization,
 # token exchange/refresh, and JWT claim decoding. reqwest is pinned to match
