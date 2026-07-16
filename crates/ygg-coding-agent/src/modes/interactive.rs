@@ -33,8 +33,8 @@ use crate::tui::view::InteractiveShell;
 /// Ordered controls sent to the frozen Agent during an active run.
 #[derive(Debug)]
 enum ControlIntent {
-    Steer(String),
-    FollowUp(String),
+    Steer(ygg_agent::UserInput),
+    FollowUp(ygg_agent::UserInput),
 }
 
 type ControlFuture = Pin<Box<dyn Future<Output = Result<(), AgentError>>>>;
@@ -86,7 +86,7 @@ pub fn push_pending_action(queue: &mut VecDeque<PendingIdleAction>, action: Pend
 
 #[derive(Debug)]
 enum Idle {
-    Submit(String),
+    Submit(ComposedInput),
     Command(String),
     Quit,
 }
@@ -154,7 +154,7 @@ where
                         shell.clear_error();
                         shell.render();
                     }
-                    InputAction::Submit(_) => return Ok(Idle::Submit(shell.drain_editor())),
+                    InputAction::Submit(_) => return Ok(Idle::Submit(shell.drain_composed())),
                     InputAction::Command(_) => return Ok(Idle::Command(shell.drain_editor())),
                     InputAction::Closed => return Ok(Idle::Quit),
                     InputAction::Ignore
@@ -440,18 +440,18 @@ where
                         shell.render();
                     }
                     InputAction::Steer(_) => {
-                        let text = shell.drain_editor();
-                        if !text.is_empty() {
-                            shell.queue_steering(&ComposedInput::from_text(text.clone()));
-                            intents.push_back(ControlIntent::Steer(text));
+                        let composed = shell.drain_composed();
+                        if !composed.is_empty() {
+                            shell.queue_steering(&composed);
+                            intents.push_back(ControlIntent::Steer(composed.into_user_input()));
                         }
                         shell.render();
                     }
                     InputAction::FollowUp(_) => {
-                        let text = shell.drain_editor();
-                        if !text.is_empty() {
-                            shell.on_prompt_submitted(&text);
-                            intents.push_back(ControlIntent::FollowUp(text));
+                        let composed = shell.drain_composed();
+                        if !composed.is_empty() {
+                            shell.on_prompt_submitted(&composed.display_text);
+                            intents.push_back(ControlIntent::FollowUp(composed.into_user_input()));
                         }
                         shell.render();
                     }
@@ -542,6 +542,7 @@ fn update_status(shell: &mut InteractiveShell, app: &App) {
         app.config.workspace.display()
     ));
     shell.set_status_detail(commands::status_text(app, None));
+    shell.set_input_modalities(app.model.spec.capabilities.input_modalities);
     shell.set_context_estimate(
         estimate_next_request_tokens(app, ""),
         hard_input_budget(&app.model),
@@ -744,7 +745,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let mut startup_prompt = initial_prompt;
     loop {
         let idle = match startup_prompt.take() {
-            Some(prompt) if !prompt.is_empty() => Idle::Submit(prompt),
+            Some(prompt) if !prompt.is_empty() => Idle::Submit(ComposedInput::from_text(prompt)),
             _ => wait_for_prompt(&mut shell, &mut input, &mut scroll_tick).await?,
         };
         match idle {
@@ -757,13 +758,14 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     IdleCommandOutcome::Quit => break,
                 }
             }
-            Idle::Submit(prompt) => {
+            Idle::Submit(composed) => {
                 prepare_prompt(&mut shell);
-                match ensure_capacity_before_prompt(&mut app, &prompt).await? {
+                let estimate_text = composed.text_for_estimate();
+                match ensure_capacity_before_prompt(&mut app, &estimate_text).await? {
                     CapacityDecision::Proceed(outcome) => {
                         report_compaction(&mut shell, &outcome);
                         shell.set_context_estimate(
-                            estimate_next_request_tokens(&app, &prompt),
+                            estimate_next_request_tokens(&app, &estimate_text),
                             hard_input_budget(&app.model),
                         );
                     }
@@ -776,8 +778,9 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         continue;
                     }
                 }
-                let mut run = app.agent.prompt(prompt.clone()).await?;
-                shell.on_prompt_submitted(&prompt);
+                let display = composed.display_text.clone();
+                let mut run = app.agent.prompt(composed.into_user_input()).await?;
+                shell.on_prompt_submitted(&display);
                 shell.render();
                 let control = run.control();
                 let mut quit_requested = false;
@@ -886,7 +889,8 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
         use ygg_ai::{
-            Auth, Capabilities, Endpoint, EndpointId, ModalitySet, ModelLimits, ModelSpec, Protocol,
+            Auth, Capabilities, Endpoint, EndpointId, Modality, ModalitySet, ModelLimits,
+            ModelSpec, Protocol,
         };
 
         ygg_ai::Model {
@@ -896,7 +900,7 @@ mod tests {
                 api_name: "scripted".into(),
                 protocol: Protocol::AnthropicMessages,
                 capabilities: Capabilities {
-                    input_modalities: ModalitySet::none(),
+                    input_modalities: ModalitySet::none().with(Modality::Image),
                     output_modalities: ModalitySet::none(),
                     tools: true,
                     parallel_tool_calls: false,
@@ -941,6 +945,8 @@ mod tests {
             .await;
 
         let workspace = tempfile::tempdir().unwrap();
+        let image = workspace.path().join("shot.png");
+        std::fs::write(&image, b"png").unwrap();
         let session_path = workspace.path().join("session.jsonl");
         let mut extensions = ExtensionHost::new();
         extensions.load(&CoreTools);
@@ -962,9 +968,13 @@ mod tests {
         .unwrap();
 
         let mut shell = InteractiveShell::test_shell();
+        shell.set_input_modalities(ygg_ai::ModalitySet::none().with(ygg_ai::Modality::Image));
         for character in "steer first".chars() {
             shell.apply_edit(crate::tui::keymap::EditAction::Char(character));
         }
+        shell.apply_edit(crate::tui::keymap::EditAction::Paste(
+            image.display().to_string(),
+        ));
         let (sender, receiver) = tokio::sync::mpsc::channel(32);
         sender
             .send(Ok(Event::Key(KeyEvent::new(
@@ -1032,5 +1042,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(user_text.contains(&"steer first"));
         assert!(!user_text.iter().any(|text| text.contains("/model")));
+        assert!(context.iter().any(|message| matches!(
+            message,
+            ygg_ai::Message::User(user)
+                if user
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, ygg_ai::UserPart::Media(_)))
+        )));
     }
 }
