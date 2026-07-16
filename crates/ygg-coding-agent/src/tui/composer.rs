@@ -57,8 +57,10 @@ pub fn parse_dropped_path(text: &str) -> Option<PathBuf> {
         .unwrap_or(trimmed);
     let unescaped = unquoted.replace("\\ ", " ");
     let expanded = if let Some(rest) = unescaped.strip_prefix("file://") {
-        if let Some(path) = rest.strip_prefix("localhost") {
-            path.to_owned()
+        if rest == "localhost" {
+            String::new()
+        } else if let Some(path) = rest.strip_prefix("localhost/") {
+            format!("/{path}")
         } else {
             rest.to_owned()
         }
@@ -598,6 +600,23 @@ mod tests {
         let url = format!("file://localhost{}", plain.display());
         let parsed = parse_dropped_path(&url);
         assert_eq!(parsed, Some(plain.clone()));
+    }
+
+    #[test]
+    fn file_url_double_slash_localhostimages_is_not_mangled() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("images");
+        fs::create_dir_all(&subdir).unwrap();
+        let wrong_file = subdir.join("file.png");
+        fs::write(&wrong_file, b"x").unwrap();
+
+        // `file://localhostimages/...` — hostname is `localhostimages`, not `localhost`.
+        // The literal relative path won't exist from cwd, so parse_dropped_path
+        // must return None rather than stripping `localhost` and resolving
+        // the (unrelated) `images/file.png` that happens to exist in the tempdir.
+        let url = "file://localhostimages/file.png";
+        let parsed = parse_dropped_path(url);
+        assert_eq!(parsed, None);
     }
 
     #[test]
