@@ -573,7 +573,12 @@ pub(crate) fn validate_request(
         }
         let supported = match (&req.reasoning, &caps.reasoning) {
             (_, None) => false,
-            (ReasoningConfig::Effort(_), Some(_)) => true,
+            (ReasoningConfig::On, Some(capability)) => {
+                capability.control == crate::types::ReasoningControl::Toggle
+            }
+            (ReasoningConfig::Effort(_), Some(capability)) => {
+                capability.control != crate::types::ReasoningControl::Toggle
+            }
             (ReasoningConfig::Budget(budget), Some(capability)) => {
                 capability.control == crate::types::ReasoningControl::TokenBudget
                     && *budget <= limits.max_output_tokens

@@ -4,27 +4,20 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Full-screen local-first coding agent for local and cloud models."
+description = "Local-first terminal coding agent for local and cloud models."
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
 default-run = "ygg"
+keywords = ["ai", "coding-agent", "terminal", "local-first", "llm"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lints]
 workspace = true
 
-[features]
-default = []
-spike = []
-
 [[bin]]
 name = "ygg"
 path = "src/main.rs"
-
-[[bin]]
-name = "ygg-tui-spike"
-path = "src/spike/bin_spike.rs"
-required-features = ["spike"]
 
 [dependencies]
 ygg-ai = { version = "=0.1.0-alpha", path = "../ygg-ai" }

@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="520" viewBox="0 0 1200 520" role="img" aria-labelledby="title description">
+  <title id="title">Ygg — a local-first coding agent</title>
+  <description id="description">A dark Skaft-branded banner with the Ygg wordmark, a branching tree motif, and a terminal session.</description>
+  <defs>
+    <linearGradient id="canvas" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#08090b"/>
+      <stop offset="0.58" stop-color="#0d1118"/>
+      <stop offset="1" stop-color="#111b1b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#536dfe"/>
+      <stop offset="1" stop-color="#58d6a3"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#536dfe" stop-opacity="0.36"/>
+      <stop offset="1" stop-color="#58d6a3" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#b7c7cf" stroke-opacity="0.055" stroke-width="1"/>
+    </pattern>
+    <filter id="soft" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="38"/>
+    </filter>
+    <clipPath id="terminalClip">
+      <rect x="626" y="82" width="500" height="356" rx="18"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1200" height="520" rx="24" fill="url(#canvas)"/>
+  <rect width="1200" height="520" rx="24" fill="url(#grid)"/>
+  <ellipse cx="735" cy="84" rx="275" ry="170" fill="url(#glow)" filter="url(#soft)"/>
+  <rect x="1" y="1" width="1198" height="518" rx="23" fill="none" stroke="#b7c7cf" stroke-opacity="0.16" stroke-width="2"/>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace">
+    <text x="72" y="76" fill="#9fb4bf" font-size="15" font-weight="700" letter-spacing="3">SKAFT / LOCAL-FIRST SYSTEMS</text>
+    <text x="68" y="216" fill="#f4f7f8" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="138" font-weight="900" letter-spacing="-9">ygg</text>
+    <rect x="72" y="241" width="428" height="5" rx="2.5" fill="url(#accent)"/>
+    <text x="72" y="292" fill="#d9e1e5" font-size="22" font-weight="600">a coding agent that is yours</text>
+    <text x="72" y="326" fill="#81939d" font-size="16">local models · cloud models · one durable mind</text>
+
+    <g transform="translate(74 368)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M0 0v62h54m-54-34h36m18 34h28m-46-34h46" stroke="#58d6a3" stroke-width="3"/>
+      <circle cx="0" cy="0" r="5" fill="#536dfe" stroke="none"/>
+      <circle cx="82" cy="28" r="5" fill="#58d6a3" stroke="none"/>
+      <circle cx="82" cy="62" r="5" fill="#58d6a3" stroke="none"/>
+      <text x="104" y="34" fill="#b7c7cf" stroke="none" font-size="14">branchable sessions</text>
+      <text x="104" y="68" fill="#b7c7cf" stroke="none" font-size="14">inspectable state</text>
+    </g>
+
+    <g clip-path="url(#terminalClip)">
+      <rect x="626" y="82" width="500" height="356" rx="18" fill="#101317" stroke="#2c3640" stroke-width="2"/>
+      <rect x="626" y="82" width="500" height="46" fill="#161b21"/>
+      <circle cx="654" cy="105" r="6" fill="#ff6b6b"/>
+      <circle cx="676" cy="105" r="6" fill="#ffd166"/>
+      <circle cx="698" cy="105" r="6" fill="#58d6a3"/>
+      <text x="730" y="111" fill="#81939d" font-size="13">ygg · rust workspace</text>
+
+      <rect x="646" y="149" width="460" height="32" rx="5" fill="#536dfe"/>
+      <text x="660" y="170" fill="#ffffff" font-size="14">› harden the parser and run the focused tests</text>
+
+      <text x="650" y="214" fill="#58d6a3" font-size="14" font-weight="700">read</text>
+      <text x="710" y="214" fill="#a9b7bf" font-size="14">src/parser.rs:1-240</text>
+
+      <text x="650" y="248" fill="#58d6a3" font-size="14" font-weight="700">edit</text>
+      <text x="710" y="248" fill="#dbe3e7" font-size="14">close the malformed-frame edge case</text>
+      <rect x="670" y="264" width="422" height="21" fill="#182b22"/>
+      <text x="682" y="279" fill="#8bd8ae" font-size="12">+ return a bounded protocol error</text>
+      <rect x="670" y="286" width="422" height="21" fill="#2a1d20"/>
+      <text x="682" y="301" fill="#d7a0a7" font-size="12">- continue with partial state</text>
+
+      <text x="650" y="340" fill="#f4f7f8" font-size="14" font-weight="700">$</text>
+      <text x="670" y="340" fill="#f4f7f8" font-size="14" font-weight="700">cargo test -p ygg-ai parser</text>
+      <text x="670" y="366" fill="#81939d" font-size="13">119 passed · 0 failed · 1.4s</text>
+
+      <text x="650" y="407" fill="#58d6a3" font-size="14">✓ bounded, verified, ready</text>
+    </g>
+    <rect x="626" y="82" width="500" height="356" rx="18" fill="none" stroke="url(#accent)" stroke-opacity="0.72" stroke-width="2"/>
+
+    <text x="72" y="482" fill="#536dfe" font-size="13" font-weight="700" letter-spacing="1">RUST</text>
+    <text x="142" y="482" fill="#44525b" font-size="13">/</text>
+    <text x="164" y="482" fill="#9fb4bf" font-size="13" font-weight="700" letter-spacing="1">LOCAL + CLOUD</text>
+    <text x="302" y="482" fill="#44525b" font-size="13">/</text>
+    <text x="324" y="482" fill="#9fb4bf" font-size="13" font-weight="700" letter-spacing="1">MIT</text>
+    <text x="1118" y="482" fill="#58d6a3" font-size="13" font-weight="700" text-anchor="end">skaft.org/ygg ↗</text>
+  </g>
+</svg>

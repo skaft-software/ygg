@@ -17,7 +17,7 @@ pub enum InputAction {
     SlashMenu(SlashMenuAction),
     CompleteMention,
     ShowCompactionSummary,
-    /// Toggle expanded details for the most recent tool (ctrl+o).
+    /// Toggle the most recent reasoning/tool/shell details (ctrl+o).
     ExpandFocusedTool,
     Edit(EditAction),
     Resize(u16, u16),

@@ -921,7 +921,7 @@ mod tests {
             "Tool calls",
             "Skills         0 active / 0 discovered",
             "Security model: local agent with workspace trust gates",
-            "Built-in file paths: workspace-only guard",
+            "Built-in file paths: current-user paths (absolute, ~/ and relative)",
             "File edits: enabled",
             "Process execution: enabled",
             "Shell execution: enabled",

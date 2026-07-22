@@ -22,6 +22,64 @@ use crate::presentation::{
 use crate::resources::compose_instructions;
 use crate::tui::theme::YggTheme;
 
+#[derive(Debug, PartialEq, Eq)]
+enum PromptExit {
+    Finished(RunEnded),
+    Shutdown,
+}
+
+#[derive(Default)]
+struct ProviderAttemptOutput {
+    pending: String,
+}
+
+impl ProviderAttemptOutput {
+    fn observe(&mut self, event: &AgentEvent) -> Option<String> {
+        match event {
+            AgentEvent::OutputDelta {
+                channel: OutputChannel::Text,
+                text,
+            } => self.pending.push_str(text),
+            AgentEvent::ProviderRetry { .. } => self.pending.clear(),
+            AgentEvent::TurnFinished { .. } => return Some(std::mem::take(&mut self.pending)),
+            _ => {}
+        }
+        None
+    }
+}
+
+#[derive(Default)]
+struct InteractiveExitStatus {
+    first_failure: Option<RunEnded>,
+}
+
+impl InteractiveExitStatus {
+    fn observe(&mut self, exit: PromptExit) -> bool {
+        match exit {
+            PromptExit::Shutdown => false,
+            PromptExit::Finished(RunEnded::Completed) => true,
+            PromptExit::Finished(failure) => {
+                self.first_failure.get_or_insert(failure);
+                true
+            }
+        }
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        match self.first_failure {
+            Some(failure) => crate::modes::print::classify_finish(Some(failure)),
+            None => Ok(()),
+        }
+    }
+}
+
+fn finish_one_shot(exit: PromptExit) -> anyhow::Result<()> {
+    match exit {
+        PromptExit::Finished(finished) => crate::modes::print::classify_finish(Some(finished)),
+        PromptExit::Shutdown => Ok(()),
+    }
+}
+
 fn safe_text(raw: &str) -> String {
     let mut safe = String::with_capacity(raw.len());
     let mut characters = raw.chars().peekable();
@@ -120,7 +178,7 @@ async fn run_prompt(
     output: &mut impl Write,
     theme: &YggTheme,
     tracker: &mut RunTracker,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PromptExit> {
     let prompt = match crate::prompts::render_configured(app, &prompt)? {
         Some(rendered) => {
             if app.config.debug_prompt {
@@ -137,36 +195,28 @@ async fn run_prompt(
 
     if let Some(limit) = app.config.max_cost_microdollars {
         if app.agent.session().total_cost_microdollars() >= limit {
-            let outcome = tracker
-                .fail(
-                    run_id,
-                    format!(
-                        "Session cost limit of {} reached.",
-                        crate::commands::format_microdollars_cents(limit)
-                    ),
-                )
-                .expect("active run");
+            let reason = format!(
+                "Session cost limit of {} reached.",
+                crate::commands::format_microdollars_cents(limit)
+            );
+            let outcome = tracker.fail(run_id, reason.clone()).expect("active run");
             writeln!(output, "{}", style_log(theme, &outcome_text(&outcome)))?;
             output.flush()?;
-            return Ok(());
+            return Ok(PromptExit::Finished(RunEnded::Failed(reason)));
         }
     }
 
     // Capacity checks and compaction happen inside the cancellable Agent run.
     if let Some(limit) = app.config.max_cost_microdollars {
         if app.agent.session().total_cost_microdollars() >= limit {
-            let outcome = tracker
-                .fail(
-                    run_id,
-                    format!(
-                        "Session cost limit of {} reached.",
-                        crate::commands::format_microdollars_cents(limit)
-                    ),
-                )
-                .expect("active run");
+            let reason = format!(
+                "Session cost limit of {} reached.",
+                crate::commands::format_microdollars_cents(limit)
+            );
+            let outcome = tracker.fail(run_id, reason.clone()).expect("active run");
             writeln!(output, "{}", style_log(theme, &outcome_text(&outcome)))?;
             output.flush()?;
-            return Ok(());
+            return Ok(PromptExit::Finished(RunEnded::Failed(reason)));
         }
     }
 
@@ -198,7 +248,7 @@ async fn run_prompt(
             let outcome = tracker.fail(run_id, error.to_string()).expect("active run");
             writeln!(output, "{}", style_log(theme, &outcome_text(&outcome)))?;
             output.flush()?;
-            return Ok(());
+            return Ok(PromptExit::Finished(RunEnded::Failed(error.to_string())));
         }
     };
     app.executable_extensions
@@ -223,6 +273,7 @@ async fn run_prompt(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     heartbeat.tick().await;
     let mut response_text = String::new();
+    let mut attempt_output = ProviderAttemptOutput::default();
     let mut shutdown_requested = false;
     let mut finished = None;
 
@@ -240,30 +291,35 @@ async fn run_prompt(
             }
             event = run.next() => {
                 let Some(event) = event else {
+                    let reason = "run stream ended without a final outcome";
                     let outcome = tracker
-                        .fail(run_id, "run stream ended without a final outcome")
+                        .fail(run_id, reason)
                         .expect("active run");
                     write_log(output, &mut response_open, theme, &outcome_text(&outcome))?;
+                    finished = Some(RunEnded::Failed(reason.into()));
                     break;
                 };
+                let accepted_output = attempt_output.observe(&event);
                 let update = tracker.apply_event(run_id, &event);
                 match &event {
-                    AgentEvent::OutputDelta { channel: OutputChannel::Text, text } => {
-                        write!(output, "{}", safe_text(text))?;
-                        response_open = !text.ends_with('\n');
-                    }
+                    AgentEvent::OutputDelta { channel: OutputChannel::Text, .. } => {}
                     AgentEvent::OutputDelta { channel: OutputChannel::Reasoning, .. } => {
                         if !matches!(last_phase, Some(RunPhase::Thinking)) {
                             write_log(output, &mut response_open, theme, "[working] Thinking")?;
                         }
                     }
-                    AgentEvent::ProviderRetry { attempt, max_attempts, .. } => {
+                    AgentEvent::ProviderRetry {
+                        attempt,
+                        max_attempts,
+                        error,
+                        ..
+                    } => {
                         write_log(
                             output,
                             &mut response_open,
                             theme,
                             &format!(
-                                "[retry] provider stream interrupted; discarding partial response and retrying ({attempt}/{max_attempts})"
+                                "[retry] {error}; discarding partial response and retrying ({attempt}/{max_attempts})"
                             ),
                         )?;
                     }
@@ -331,6 +387,12 @@ async fn run_prompt(
                         run_cost_microdollars,
                         ..
                     } => {
+                        if let Some(accepted_output) = accepted_output {
+                            write!(output, "{}", safe_text(&accepted_output))?;
+                            if !accepted_output.is_empty() {
+                                response_open = !accepted_output.ends_with('\n');
+                            }
+                        }
                         response_text.clear();
                         response_text.push_str(&crate::extensions::assistant_text(message));
                         let turn_cost = run_cost_microdollars.saturating_sub(last_run_cost);
@@ -422,7 +484,7 @@ async fn run_prompt(
         .await;
         ygg_agent::extension_process::force_kill_registered_process_groups();
         output.flush()?;
-        return Ok(());
+        return Ok(PromptExit::Shutdown);
     }
     if matches!(finished, Some(RunEnded::Completed)) {
         for notification in app
@@ -440,7 +502,9 @@ async fn run_prompt(
     }
     writeln!(output)?;
     output.flush()?;
-    Ok(())
+    Ok(PromptExit::Finished(finished.unwrap_or_else(|| {
+        RunEnded::Failed("run stream ended without a final outcome".into())
+    })))
 }
 
 /// Run the chronological fallback. A positional prompt is one-shot. Without
@@ -470,11 +534,13 @@ pub async fn run_plain(boot: Bootstrap, initial_prompt: Option<String>) -> anyho
     )?;
 
     if let Some(prompt) = initial_prompt.filter(|prompt| !prompt.trim().is_empty()) {
-        return run_prompt(&mut app, prompt, &mut output, &theme, &mut tracker).await;
+        let exit = run_prompt(&mut app, prompt, &mut output, &theme, &mut tracker).await?;
+        return finish_one_shot(exit);
     }
 
     if app.config.prompt_template.is_some() && std::io::stdin().is_terminal() {
-        return run_prompt(&mut app, String::new(), &mut output, &theme, &mut tracker).await;
+        let exit = run_prompt(&mut app, String::new(), &mut output, &theme, &mut tracker).await?;
+        return finish_one_shot(exit);
     }
 
     if !std::io::stdin().is_terminal() {
@@ -483,7 +549,8 @@ pub async fn run_plain(boot: Bootstrap, initial_prompt: Option<String>) -> anyho
         if prompt.trim().is_empty() {
             anyhow::bail!("plain mode needs a positional prompt or text on stdin");
         }
-        return run_prompt(&mut app, prompt, &mut output, &theme, &mut tracker).await;
+        let exit = run_prompt(&mut app, prompt, &mut output, &theme, &mut tracker).await?;
+        return finish_one_shot(exit);
     }
 
     // A blocking terminal read must not prevent coordinated signal cleanup.
@@ -508,6 +575,7 @@ pub async fn run_plain(boot: Bootstrap, initial_prompt: Option<String>) -> anyho
                 }
             }
         })?;
+    let mut exit_status = InteractiveExitStatus::default();
     loop {
         write!(output, "{} ", theme.fg("model_accent", ">"))?;
         output.flush()?;
@@ -539,15 +607,33 @@ pub async fn run_plain(boot: Bootstrap, initial_prompt: Option<String>) -> anyho
         if prompt.is_empty() {
             continue;
         }
-        run_prompt(&mut app, prompt, &mut output, &theme, &mut tracker).await?;
+        let exit = run_prompt(&mut app, prompt, &mut output, &theme, &mut tracker).await?;
+        if !exit_status.observe(exit) {
+            return exit_status.finish();
+        }
     }
-    Ok(())
+    exit_status.finish()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::presentation::RunSummary;
+    use ygg_ai::{AssistantMessage, ModelId, Protocol, Usage};
+
+    fn completed_turn() -> AgentEvent {
+        AgentEvent::TurnFinished {
+            message: AssistantMessage {
+                content: Vec::new(),
+                model: ModelId("test-model".into()),
+                protocol: Protocol::OpenAiChat,
+            },
+            turn_usage: Usage::default(),
+            usage: Usage::default(),
+            session_cost_microdollars: None,
+            run_cost_microdollars: 0,
+        }
+    }
 
     #[test]
     fn plain_outcomes_are_ascii_and_explicit() {
@@ -573,5 +659,54 @@ mod tests {
     fn plain_text_neutralizes_terminal_controls() {
         assert_eq!(safe_text("a\x1b[31m\x07"), "a·[31m·");
         assert_eq!(safe_text("a\r\nb\rc"), "a\nb·c");
+    }
+
+    #[test]
+    fn one_shot_plain_exit_status_matches_print_mode() {
+        assert!(finish_one_shot(PromptExit::Finished(RunEnded::Completed)).is_ok());
+        assert!(finish_one_shot(PromptExit::Finished(RunEnded::MaxTurns)).is_err());
+        assert!(finish_one_shot(PromptExit::Finished(RunEnded::Aborted)).is_err());
+        assert!(finish_one_shot(PromptExit::Finished(RunEnded::Failed("nope".into()))).is_err());
+    }
+
+    #[test]
+    fn interactive_plain_retains_a_requested_run_failure_until_exit() {
+        let mut status = InteractiveExitStatus::default();
+        assert!(status.observe(PromptExit::Finished(RunEnded::Failed(
+            "first request failed".into(),
+        ))));
+        assert!(status.observe(PromptExit::Finished(RunEnded::Completed)));
+
+        let error = status.finish().unwrap_err().to_string();
+        assert!(error.contains("first request failed"), "{error}");
+    }
+
+    #[test]
+    fn provider_retry_discards_stale_plain_output_before_turn_commit() {
+        let events = [
+            AgentEvent::OutputDelta {
+                channel: OutputChannel::Text,
+                text: "STALE".into(),
+            },
+            AgentEvent::ProviderRetry {
+                attempt: 1,
+                max_attempts: 5,
+                delay: Duration::ZERO,
+                error: "forced disconnect".into(),
+            },
+            AgentEvent::OutputDelta {
+                channel: OutputChannel::Text,
+                text: "FRESH".into(),
+            },
+            completed_turn(),
+        ];
+        let mut output = ProviderAttemptOutput::default();
+        let published = events
+            .iter()
+            .filter_map(|event| output.observe(event))
+            .collect::<String>();
+
+        assert_eq!(published, "FRESH");
+        assert!(!published.contains("STALE"));
     }
 }

@@ -86,9 +86,10 @@ pub struct SandboxPolicy {
 impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
-            // Explicit paths stay inside the selected workspace unless the
-            // user deliberately opts into broader trusted-local access.
-            allow_external_paths: false,
+            // Ygg is a trusted local agent: explicit absolute, `~/`, and
+            // parent-relative paths work by default. Users can opt into the
+            // workspace-only accidental-path guard in configuration.
+            allow_external_paths: true,
             allow_edit: true,
             allow_write: true,
             allow_process: true,
@@ -239,6 +240,7 @@ impl SandboxPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThinkingLevel {
     Off,
+    On,
     Minimal,
     Low,
     Medium,
@@ -251,6 +253,7 @@ impl ThinkingLevel {
     pub fn parse(value: &str) -> anyhow::Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" => Ok(Self::Off),
+            "on" => Ok(Self::On),
             "minimal" | "min" => Ok(Self::Minimal),
             "low" => Ok(Self::Low),
             "medium" | "med" => Ok(Self::Medium),
@@ -258,7 +261,7 @@ impl ThinkingLevel {
             "xhigh" | "x-high" => Ok(Self::Xhigh),
             "max" => Ok(Self::Max),
             _ => anyhow::bail!(
-                "invalid thinking level {value:?}; use off, minimal, low, medium, high, xhigh, or max"
+                "invalid thinking level {value:?}; use off, on, minimal, low, medium, high, xhigh, or max"
             ),
         }
     }
@@ -271,7 +274,9 @@ impl ThinkingLevel {
             Self::High => ReasoningEffort::High,
             Self::Xhigh => ReasoningEffort::Xhigh,
             Self::Max => ReasoningEffort::Max,
-            Self::Off => unreachable!("off is represented by ReasoningConfig::Off"),
+            Self::Off | Self::On => {
+                unreachable!("binary thinking is not represented by ReasoningEffort")
+            }
         }
     }
 
@@ -283,13 +288,14 @@ impl ThinkingLevel {
             Self::High => budgets.high,
             Self::Xhigh => budgets.xhigh,
             Self::Max => budgets.max,
-            Self::Off => 0,
+            Self::Off | Self::On => 0,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::On => "on",
             Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
@@ -404,6 +410,7 @@ impl Config {
 pub fn parse_reasoning(value: &str) -> anyhow::Result<ReasoningConfig> {
     let config = match value.trim().to_ascii_lowercase().as_str() {
         "off" => ReasoningConfig::Off,
+        "on" => ReasoningConfig::On,
         "minimal" | "min" => ReasoningConfig::Effort(ReasoningEffort::Minimal),
         "low" => ReasoningConfig::Effort(ReasoningEffort::Low),
         "medium" | "med" => ReasoningConfig::Effort(ReasoningEffort::Medium),
@@ -501,16 +508,16 @@ mod tests {
     }
 
     #[test]
-    fn workspace_path_confinement_is_the_product_default() {
+    fn trusted_local_paths_are_the_product_default() {
         let directory = tempfile::tempdir().unwrap();
         let policy = SandboxPolicy::default();
-        assert!(!policy.allow_external_paths);
+        assert!(policy.allow_external_paths);
         assert!(policy.allow_edit);
         assert!(policy.allow_write);
         assert!(policy.allow_process);
         assert!(policy.allow_shell);
         let sandbox = policy.to_sandbox_config(directory.path());
-        assert!(!sandbox.allow_external_paths);
+        assert!(sandbox.allow_external_paths);
     }
 
     #[test]
@@ -545,6 +552,7 @@ mod tests {
     #[test]
     fn thinking_levels_parse_short_and_full_names() {
         assert_eq!(ThinkingLevel::parse("off").unwrap(), ThinkingLevel::Off);
+        assert_eq!(ThinkingLevel::parse("on").unwrap(), ThinkingLevel::On);
         assert_eq!(ThinkingLevel::parse("min").unwrap(), ThinkingLevel::Minimal);
         assert_eq!(ThinkingLevel::parse("high").unwrap(), ThinkingLevel::High);
         assert_eq!(ThinkingLevel::parse("xhigh").unwrap(), ThinkingLevel::Xhigh);
@@ -568,6 +576,7 @@ mod tests {
     #[test]
     fn reasoning_parser_accepts_effort_and_budget_values() {
         assert_eq!(parse_reasoning("off").unwrap(), ReasoningConfig::Off);
+        assert_eq!(parse_reasoning("on").unwrap(), ReasoningConfig::On);
         assert_eq!(
             parse_reasoning("high").unwrap(),
             ReasoningConfig::Effort(ReasoningEffort::High)

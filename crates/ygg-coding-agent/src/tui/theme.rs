@@ -1095,8 +1095,8 @@ const VERBATIM_FOREGROUNDS: &[(&str, &str)] = &[
 /// Subtle terminal-background-aware surfaces. These retain their semantic hue
 /// without replacing syntax foregrounds or looking like terminal selection.
 const DEFAULT_BACKGROUNDS: &[(&str, &str)] = &[
-    ("diff_added_bg", "#00b847"),
-    ("diff_removed_bg", "#e03030"),
+    ("diff_added_bg", "#4f8f68"),
+    ("diff_removed_bg", "#ad6868"),
     ("user_msg_bg", DEFAULT_ACCENT),
 ];
 
@@ -1163,8 +1163,8 @@ pub(crate) fn balance_background(source: &str, background: TerminalBackground) -
         return source.to_owned();
     };
     let target_luminance = match background {
-        TerminalBackground::Dark => 0.035,
-        TerminalBackground::Light => 0.93,
+        TerminalBackground::Dark => 0.025,
+        TerminalBackground::Light => 0.95,
         TerminalBackground::Unknown => unreachable!("handled above"),
     };
     let source_luminance = relative_luminance(source);
@@ -2423,8 +2423,8 @@ mod tests {
     fn diff_rows_use_subtle_background_surfaces_and_normal_foregrounds() {
         let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
         for (background, target) in [
-            (TerminalBackground::Dark, 0.035),
-            (TerminalBackground::Light, 0.93),
+            (TerminalBackground::Dark, 0.025),
+            (TerminalBackground::Light, 0.95),
         ] {
             let theme = default_theme_for(background, capabilities);
             assert_eq!(

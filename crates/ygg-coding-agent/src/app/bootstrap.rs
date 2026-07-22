@@ -71,10 +71,14 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 // this phase short and separately bounded; the response body has its own idle
 // and absolute deadlines in ygg-ai.
 const PROVIDER_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+// Local servers may need to load a model before they can return response
+// headers. Match Pi's cold-start-safe five-minute default for custom endpoints
+// without weakening the fail-fast behavior of hosted providers.
+const CUSTOM_ENDPOINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_DISCOVERY_BODY_BYTES: usize = 8 * 1024 * 1024;
 // Version 2 invalidates inventories whose llama.cpp context length was guessed
 // because older discovery ignored hlid's nested `meta.n_ctx` field.
-const CUSTOM_MODEL_CACHE_VERSION: u8 = 2;
+const CUSTOM_MODEL_CACHE_VERSION: u8 = 3;
 const PROVIDER_INVENTORY_CACHE_VERSION: u8 = 1;
 const MAX_PROVIDER_INVENTORY_CACHE_BYTES: usize = MAX_DISCOVERY_BODY_BYTES + 1024 * 1024;
 const PROVIDER_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -504,8 +508,61 @@ struct DiscoveredApiModel {
     id: String,
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
+    tools: bool,
     vision: bool,
     audio: bool,
+}
+
+fn metadata_capability_flag(value: &serde_json::Value) -> Option<bool> {
+    value
+        .as_bool()
+        .or_else(|| value.get("supported").and_then(serde_json::Value::as_bool))
+}
+
+/// Inventory schemas are not standardized, but the common hosted gateways
+/// expose tool support either as a capability flag or as a list of accepted
+/// request parameters. Unknown support must remain disabled: advertising a
+/// tool schema to a text-only route makes an otherwise usable model fail before
+/// it can answer.
+fn model_metadata_supports_tools(entry: &serde_json::Value) -> bool {
+    for metadata in [
+        Some(entry),
+        entry.get("top_provider"),
+        entry.get("provider"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for name in [
+            "supports_tools",
+            "tools",
+            "tool_calling",
+            "function_calling",
+        ] {
+            if let Some(supported) = metadata.get(name).and_then(metadata_capability_flag) {
+                return supported;
+            }
+        }
+        if let Some(capabilities) = metadata.get("capabilities") {
+            for name in ["tools", "tool_calling", "function_calling"] {
+                if let Some(supported) = capabilities.get(name).and_then(metadata_capability_flag) {
+                    return supported;
+                }
+            }
+        }
+        if let Some(parameters) = metadata
+            .get("supported_parameters")
+            .and_then(serde_json::Value::as_array)
+        {
+            return parameters.iter().any(|parameter| {
+                matches!(
+                    parameter.as_str(),
+                    Some("tools" | "tool_choice" | "functions" | "function_call")
+                )
+            });
+        }
+    }
+    false
 }
 
 /// Read provider model-inventory modality metadata without assuming a single
@@ -579,6 +636,7 @@ fn api_models_from_response(body: &serde_json::Value) -> anyhow::Result<Vec<Disc
                         .get("top_provider")
                         .and_then(|provider| positive_u64(provider, &["max_completion_tokens"]))
                 }),
+            tools: model_metadata_supports_tools(entry),
             vision,
             audio,
         });
@@ -746,8 +804,8 @@ fn register_openai_compatible_models(
             capabilities: Capabilities {
                 input_modalities,
                 output_modalities: ModalitySet::none(),
-                tools: true,
-                parallel_tool_calls: protocol != Protocol::OpenAiChat,
+                tools: model.tools,
+                parallel_tool_calls: model.tools && protocol != Protocol::OpenAiChat,
                 reasoning: reasoning.then_some(ReasoningCapability {
                     control: ReasoningControl::Effort,
                     exposes_text: true,
@@ -1160,17 +1218,7 @@ fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<V
         if model_id_implies_vision(api_name) {
             input_modalities = input_modalities.with(ygg_ai::Modality::Image);
         }
-        let supports_tools = entry
-            .get("supported_parameters")
-            .and_then(serde_json::Value::as_array)
-            .map(|parameters| {
-                parameters
-                    .iter()
-                    .any(|parameter| matches!(parameter.as_str(), Some("tools" | "tool_choice")))
-            })
-            // Older OpenRouter responses omitted this field; keep those models
-            // selectable rather than incorrectly declaring them unusable.
-            .unwrap_or(true);
+        let supports_tools = model_metadata_supports_tools(entry);
 
         let supports_reasoning = entry
             .get("supported_parameters")
@@ -1566,6 +1614,146 @@ fn configured_custom_models(
     }
 }
 
+fn resolve_custom_startup_timeout(
+    configured_secs: Option<u64>,
+    environment: Option<&str>,
+) -> anyhow::Result<Duration> {
+    let seconds = match environment.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.parse::<u64>().map_err(|error| {
+            anyhow::anyhow!("invalid YGG_CUSTOM_STARTUP_TIMEOUT_SECS {value:?}: {error}")
+        })?,
+        None => configured_secs.unwrap_or(CUSTOM_ENDPOINT_STARTUP_TIMEOUT.as_secs()),
+    };
+    anyhow::ensure!(
+        seconds > 0,
+        "custom endpoint startup timeout must be greater than zero"
+    );
+    Ok(Duration::from_secs(seconds))
+}
+
+fn custom_reasoning_effort(value: &str) -> Option<ygg_ai::ReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "minimal" | "min" => Some(ygg_ai::ReasoningEffort::Minimal),
+        "low" => Some(ygg_ai::ReasoningEffort::Low),
+        "medium" | "med" => Some(ygg_ai::ReasoningEffort::Medium),
+        "high" => Some(ygg_ai::ReasoningEffort::High),
+        "xhigh" | "x-high" | "extra_high" => Some(ygg_ai::ReasoningEffort::Xhigh),
+        "max" => Some(ygg_ai::ReasoningEffort::Max),
+        _ => None,
+    }
+}
+
+fn custom_reasoning_is_off(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "none" | "off" | "disabled" | "false"
+    )
+}
+
+fn custom_reasoning_is_on(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "default" | "on" | "enabled" | "true"
+    )
+}
+
+fn discovered_custom_reasoning(entry: &serde_json::Value) -> (bool, Vec<String>, String) {
+    let reported = entry
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("reasoning"));
+    let values = reported
+        .and_then(|reasoning| reasoning.get("values"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let default = reported
+        .and_then(|reasoning| reasoning.get("default"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let enabled = match reported {
+        Some(metadata) => {
+            metadata
+                .get("supported")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                && (values.is_empty() || values.iter().any(|value| !custom_reasoning_is_off(value)))
+        }
+        None => entry
+            .get("supported_parameters")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|parameters| {
+                parameters.iter().any(|parameter| {
+                    matches!(parameter.as_str(), Some("reasoning" | "reasoning_effort"))
+                })
+            }),
+    };
+    (enabled, values, default)
+}
+
+fn custom_reasoning_capability(
+    model: &crate::auth::custom::CustomModel,
+) -> Option<ReasoningCapability> {
+    if !model.reasoning {
+        return None;
+    }
+    let efforts = model
+        .reasoning_values
+        .iter()
+        .filter_map(|value| custom_reasoning_effort(value))
+        .collect::<Vec<_>>();
+    let control = if !efforts.is_empty() {
+        ReasoningControl::Effort
+    } else if model
+        .reasoning_values
+        .iter()
+        .any(|value| custom_reasoning_is_on(value))
+    {
+        ReasoningControl::Toggle
+    } else if model.reasoning_values.is_empty() {
+        // Legacy/manual `reasoning = true` configurations predate provider
+        // value discovery and retain the portable effort range.
+        ReasoningControl::Effort
+    } else {
+        return None;
+    };
+    let min_effort = efforts
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(ygg_ai::ReasoningEffort::Minimal);
+    let max_effort = efforts
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(ygg_ai::ReasoningEffort::High);
+    let openai_chat_mode = if model.reasoning_values.is_empty() {
+        if model.reasoning_uses_system_message {
+            OpenAiChatReasoningMode::SystemMessage
+        } else {
+            OpenAiChatReasoningMode::Standard
+        }
+    } else {
+        OpenAiChatReasoningMode::ProviderValues {
+            values: model.reasoning_values.clone(),
+            default: (!model.reasoning_default.is_empty()).then(|| model.reasoning_default.clone()),
+            system_message: model.reasoning_uses_system_message,
+        }
+    };
+    Some(ReasoningCapability {
+        control,
+        exposes_text: true,
+        preserves_state: false,
+        effort_budgets: None,
+        openai_chat_mode,
+        min_effort,
+        max_effort,
+    })
+}
+
 fn register_custom_openai_endpoint(
     catalog: &mut ModelCatalog,
     offline: bool,
@@ -1582,6 +1770,12 @@ fn register_custom_openai_endpoint(
     let cache = store
         .load_cache_compatibility()?
         .unwrap_or_else(ygg_ai::CacheCompatibility::default);
+    let startup_timeout = resolve_custom_startup_timeout(
+        store.load_startup_timeout_secs()?,
+        std::env::var("YGG_CUSTOM_STARTUP_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )?;
 
     let base_url = if cred.base_url.ends_with('/') {
         url::Url::parse(&cred.base_url)
@@ -1626,7 +1820,7 @@ fn register_custom_openai_endpoint(
         auth,
         default_headers,
         transport: ygg_ai::EndpointTransport::Http,
-        timeout: PROVIDER_RESPONSE_HEADER_TIMEOUT,
+        timeout: startup_timeout,
     };
     catalog.register_endpoint(endpoint)?;
 
@@ -1737,24 +1931,8 @@ fn register_custom_openai_endpoint(
                 input_modalities: input_mods,
                 output_modalities: ModalitySet::none(),
                 tools: m.tools,
-                parallel_tool_calls: m.parallel_tool_calls,
-                reasoning: if m.reasoning {
-                    Some(ReasoningCapability {
-                        control: ReasoningControl::Effort,
-                        exposes_text: true,
-                        preserves_state: false,
-                        effort_budgets: None,
-                        openai_chat_mode: if m.reasoning_uses_system_message {
-                            OpenAiChatReasoningMode::SystemMessage
-                        } else {
-                            OpenAiChatReasoningMode::Standard
-                        },
-                        min_effort: ygg_ai::ReasoningEffort::Minimal,
-                        max_effort: ygg_ai::ReasoningEffort::High,
-                    })
-                } else {
-                    None
-                },
+                parallel_tool_calls: m.tools && m.parallel_tool_calls,
+                reasoning: custom_reasoning_capability(m),
                 structured_output: m.structured_output,
             },
             limits: ModelLimits {
@@ -1914,19 +2092,20 @@ fn discover_models_blocking(
             positive_u64(entry, &["max_output_tokens", "max_completion_tokens"])
                 .unwrap_or(16_384)
                 .min(ctx);
+        let (reasoning, reasoning_values, reasoning_default) = discovered_custom_reasoning(entry);
 
         models.push(CustomModel {
             api_name: id.to_string(),
             display_name: id.to_string(),
             context_window: ctx,
             max_output_tokens,
-            tools: supported_parameters.is_none() || supports("tools") || supports("tool_choice"),
+            tools: model_metadata_supports_tools(entry),
             parallel_tool_calls: supports("parallel_tool_calls"),
             vision,
             structured_output: supports("response_format"),
-            reasoning: supported_parameters.is_none()
-                || supports("reasoning")
-                || supports("reasoning_effort"),
+            reasoning,
+            reasoning_values,
+            reasoning_default,
             // Auto-discovered local models are not guaranteed to implement
             // OpenAI's newer `developer` role. vLLM Qwen chat templates, in
             // particular, reject it while still accepting `system`.
@@ -2428,6 +2607,7 @@ fn codex_user_agent() -> String {
 fn register_openai_codex(
     catalog: &mut ModelCatalog,
     store: crate::auth::codex::CredentialStore,
+    offline: bool,
 ) -> anyhow::Result<()> {
     use crate::auth::codex;
 
@@ -2441,7 +2621,18 @@ fn register_openai_codex(
     // network timeout off the launch/resume critical path without widening the
     // cache across accounts. A first launch still performs one bounded discovery
     // to seed the cache, with the conservative built-in catalog as its fallback.
-    let models = if cfg!(test) {
+    let models = if offline {
+        match load_codex_model_cache(&store, &initial_claims) {
+            Ok(Some(models)) => models,
+            Ok(None) => fallback_codex_models(initial_claims.plan.as_ref()),
+            Err(error) => {
+                eprintln!(
+                    "warning: Codex model cache was unusable ({error}); using conservative offline fallback catalog"
+                );
+                fallback_codex_models(initial_claims.plan.as_ref())
+            }
+        }
+    } else if cfg!(test) {
         fallback_codex_models(initial_claims.plan.as_ref())
     } else {
         match load_codex_model_cache(&store, &initial_claims) {
@@ -2595,13 +2786,16 @@ pub fn model_catalog() -> anyhow::Result<ModelCatalog> {
 
 fn model_catalog_with_offline(offline: bool) -> anyhow::Result<ModelCatalog> {
     let mut catalog = base_model_catalog(offline)?;
-    if offline {
-        return Ok(catalog);
-    }
-    let store = crate::auth::codex::CredentialStore::new(crate::auth::codex::default_path());
-    // Non-fatal: a stale or malformed OAuth file must never block Ygg startup.
-    if let Err(error) = register_openai_codex(&mut catalog, store) {
-        eprintln!("warning: OpenAI Codex models unavailable: {error}");
+    // Unit tests use explicit temporary credential stores and must never inspect
+    // the developer's ambient HOME. Runtime offline mode still registers a
+    // locally authenticated Codex endpoint, but never discovers or refreshes
+    // its inventory over the network.
+    if !cfg!(test) {
+        let store = crate::auth::codex::CredentialStore::new(crate::auth::codex::default_path());
+        // Non-fatal: a stale or malformed OAuth file must never block Ygg startup.
+        if let Err(error) = register_openai_codex(&mut catalog, store, offline) {
+            eprintln!("warning: OpenAI Codex models unavailable: {error}");
+        }
     }
     Ok(catalog)
 }
@@ -2846,16 +3040,26 @@ fn create_private_session_dir(path: &std::path::Path) -> std::io::Result<()> {
 fn validate_explicit_tool_policy(
     config: &Config,
     extensions: &ExtensionHost,
+    model: &Model,
 ) -> anyhow::Result<()> {
     let Some(requested) = config.tools.explicit_names() else {
         return Ok(());
     };
+    let requested = requested.collect::<Vec<_>>();
+    if !model.spec.capabilities.tools && !requested.is_empty() {
+        anyhow::bail!(
+            "model {} does not support tools, but the explicit tool policy requested: {}",
+            model.spec.id.0,
+            requested.join(", "),
+        );
+    }
     let registered = extensions
         .tool_definitions()
         .into_iter()
         .map(|definition| definition.name)
         .collect::<std::collections::BTreeSet<_>>();
     let missing = requested
+        .into_iter()
         .filter(|name| !registered.contains(*name))
         .collect::<Vec<_>>();
     if missing.is_empty() {
@@ -2932,7 +3136,7 @@ fn configured_extensions(
         sessions,
         &mut extensions,
     );
-    extensions.retain_tools(|name| config.tool_available(name));
+    extensions.retain_tools(|name| model.spec.capabilities.tools && config.tool_available(name));
     (extensions, executable_extensions)
 }
 
@@ -2990,7 +3194,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         &reasoning,
         &sessions,
     );
-    validate_explicit_tool_policy(&config, &extensions)?;
+    validate_explicit_tool_policy(&config, &extensions, &model)?;
     validate_active_skill_policy(&session, &extensions)?;
     let system_tokens = estimate_text_tokens(&system);
     let tool_schema_tokens = tool_schema_reserve(&extensions.tool_definitions());
@@ -3124,7 +3328,7 @@ pub fn rebuild_app(
         &reasoning,
         &sessions,
     );
-    validate_explicit_tool_policy(&config, &extensions)?;
+    validate_explicit_tool_policy(&config, &extensions, &model)?;
     validate_active_skill_policy(&session, &extensions)?;
     let tool_schema_tokens = tool_schema_reserve(&extensions.tool_definitions());
     let mut agent = Agent::new(AgentConfig {
@@ -3164,6 +3368,24 @@ pub fn rebuild_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_endpoint_startup_timeout_is_cold_start_safe_and_configurable() {
+        assert_eq!(
+            resolve_custom_startup_timeout(None, None).unwrap(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_custom_startup_timeout(Some(420), None).unwrap(),
+            Duration::from_secs(420)
+        );
+        assert_eq!(
+            resolve_custom_startup_timeout(Some(420), Some(" 600 ")).unwrap(),
+            Duration::from_secs(600)
+        );
+        assert!(resolve_custom_startup_timeout(None, Some("0")).is_err());
+        assert!(resolve_custom_startup_timeout(None, Some("not-a-number")).is_err());
+    }
     use crate::config::{CompactionPolicy, Mode, ResumeSelector, SandboxPolicy};
 
     fn config(directory: &std::path::Path, model: Option<&str>) -> Config {
@@ -3402,6 +3624,41 @@ mod tests {
     }
 
     #[test]
+    fn model_inventory_requires_positive_tool_capability_metadata() {
+        let response = serde_json::json!({
+            "data": [
+                {"id": "unknown"},
+                {"id": "parameters", "supported_parameters": ["tools"]},
+                {"id": "empty-parameters", "supported_parameters": []},
+                {
+                    "id": "capability-object",
+                    "capabilities": {"tool_calling": {"supported": true}}
+                },
+                {
+                    "id": "provider-metadata",
+                    "provider": {"capabilities": {"function_calling": true}}
+                },
+                {
+                    "id": "explicitly-disabled",
+                    "supports_tools": false,
+                    "supported_parameters": ["tools"]
+                }
+            ]
+        });
+        let models = api_models_from_response(&response).unwrap();
+        let tools = models
+            .iter()
+            .map(|model| (model.id.as_str(), model.tools))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert!(!tools["unknown"]);
+        assert!(tools["parameters"]);
+        assert!(!tools["empty-parameters"]);
+        assert!(tools["capability-object"]);
+        assert!(tools["provider-metadata"]);
+        assert!(!tools["explicitly-disabled"]);
+    }
+
+    #[test]
     fn openrouter_discovery_uses_live_ids_limits_and_capabilities() {
         let response = serde_json::json!({
             "data": [
@@ -3518,18 +3775,18 @@ mod tests {
         let store = crate::auth::codex::CredentialStore::new(&path);
 
         let mut catalog = base_model_catalog(true).unwrap();
-        register_openai_codex(&mut catalog, store.clone()).unwrap();
+        register_openai_codex(&mut catalog, store.clone(), false).unwrap();
         assert!(catalog.resolve(&ModelId("gpt-5.6-sol".into())).is_err());
 
         write_codex_credential(&path, true, "plus");
         let mut catalog = base_model_catalog(true).unwrap();
-        let error = register_openai_codex(&mut catalog, store.clone()).unwrap_err();
+        let error = register_openai_codex(&mut catalog, store.clone(), false).unwrap_err();
         assert!(error.to_string().contains("localhost-only"));
         assert!(catalog.resolve(&ModelId("gpt-5.6-sol".into())).is_err());
 
         write_codex_credential(&path, false, "plus");
         let mut catalog = base_model_catalog(true).unwrap();
-        register_openai_codex(&mut catalog, store).unwrap();
+        register_openai_codex(&mut catalog, store, false).unwrap();
         for model_id in crate::auth::codex::MODELS {
             let model = catalog.resolve(&ModelId((*model_id).into())).unwrap();
             assert_eq!(model.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
@@ -3559,6 +3816,54 @@ mod tests {
         // live account discovery can add or remove models independently of it.
         assert!(catalog.resolve(&ModelId("gpt-5.5-pro".into())).is_err());
         assert!(catalog.resolve(&ModelId("gpt-5.6-luna".into())).is_ok());
+    }
+
+    #[test]
+    fn offline_codex_registration_uses_account_cache_or_fallback_without_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cached-codex.json");
+        write_codex_credential(&path, false, "plus");
+        let store = crate::auth::codex::CredentialStore::new(&path);
+        let claims = crate::auth::codex::usable_subscription_claims(&store)
+            .unwrap()
+            .unwrap();
+        let cached = CodexDiscovery {
+            claims,
+            models: codex_models_from_response(
+                &serde_json::json!({
+                    "models": [{
+                        "slug": "cached-account-model",
+                        "context_window": 196_000,
+                        "max_output_tokens": 24_000
+                    }]
+                }),
+                Some(&crate::auth::codex::ChatGptPlan::Plus),
+            )
+            .unwrap(),
+        };
+        save_codex_model_cache(&store, &cached).unwrap();
+
+        let mut catalog = base_model_catalog(true).unwrap();
+        register_openai_codex(&mut catalog, store, true).unwrap();
+        let model = catalog
+            .resolve(&ModelId("cached-account-model".into()))
+            .unwrap();
+        assert_eq!(model.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
+        assert_eq!(model.spec.limits.context_window, 196_000);
+
+        let fallback_path = directory.path().join("fallback-codex.json");
+        write_codex_credential(&fallback_path, false, "plus");
+        let mut fallback_catalog = base_model_catalog(true).unwrap();
+        register_openai_codex(
+            &mut fallback_catalog,
+            crate::auth::codex::CredentialStore::new(fallback_path),
+            true,
+        )
+        .unwrap();
+        let fallback = fallback_catalog
+            .resolve(&ModelId("gpt-5.6-sol".into()))
+            .unwrap();
+        assert_eq!(fallback.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
     }
 
     #[test]
@@ -3866,6 +4171,8 @@ mod tests {
             vision: false,
             structured_output: false,
             reasoning: true,
+            reasoning_values: Vec::new(),
+            reasoning_default: String::new(),
             reasoning_uses_system_message: true,
         }];
         let mut first_headers = http::HeaderMap::new();
@@ -4032,6 +4339,76 @@ mod tests {
         });
 
         assert_eq!(extract_ctx_from_model_entry(&entry), 131_072);
+    }
+
+    #[test]
+    fn hlid_reasoning_metadata_controls_custom_capabilities_exactly() {
+        let off_only = serde_json::json!({
+            "capabilities": {"reasoning": {
+                "supported": true,
+                "control": "binary",
+                "values": ["none"],
+                "default": "none"
+            }}
+        });
+        let (reasoning, values, default) = discovered_custom_reasoning(&off_only);
+        assert!(!reasoning);
+        assert_eq!(values, ["none"]);
+        assert_eq!(default, "none");
+        let off_model = crate::auth::custom::CustomModel {
+            reasoning,
+            reasoning_values: values,
+            reasoning_default: default,
+            ..Default::default()
+        };
+        assert!(custom_reasoning_capability(&off_model).is_none());
+
+        let binary = serde_json::json!({
+            "capabilities": {"reasoning": {
+                "supported": true,
+                "control": "binary",
+                "values": ["none", "default"],
+                "default": "default"
+            }}
+        });
+        let (reasoning, values, default) = discovered_custom_reasoning(&binary);
+        let binary_model = crate::auth::custom::CustomModel {
+            reasoning,
+            reasoning_values: values,
+            reasoning_default: default,
+            reasoning_uses_system_message: true,
+            ..Default::default()
+        };
+        let binary_capability = custom_reasoning_capability(&binary_model).unwrap();
+        assert_eq!(binary_capability.control, ReasoningControl::Toggle);
+        assert!(matches!(
+            binary_capability.openai_chat_mode,
+            OpenAiChatReasoningMode::ProviderValues {
+                values,
+                default: Some(default),
+                system_message: true,
+            } if values == ["none", "default"] && default == "default"
+        ));
+
+        let levels = serde_json::json!({
+            "capabilities": {"reasoning": {
+                "supported": true,
+                "control": "levels",
+                "values": ["none", "low", "medium", "high"],
+                "default": "medium"
+            }}
+        });
+        let (reasoning, values, default) = discovered_custom_reasoning(&levels);
+        let level_model = crate::auth::custom::CustomModel {
+            reasoning,
+            reasoning_values: values,
+            reasoning_default: default,
+            ..Default::default()
+        };
+        let level_capability = custom_reasoning_capability(&level_model).unwrap();
+        assert_eq!(level_capability.control, ReasoningControl::Effort);
+        assert_eq!(level_capability.min_effort, ygg_ai::ReasoningEffort::Low);
+        assert_eq!(level_capability.max_effort, ygg_ai::ReasoningEffort::High);
     }
 
     #[test]
@@ -4365,8 +4742,13 @@ mod tests {
         config.tools.exclude("edit").unwrap();
         config.sandbox.allow_edit = false;
         let extensions = configured_test_extensions(skills, &config);
+        let boot = bootstrap(config.clone()).unwrap();
+        let model = boot
+            .catalog
+            .resolve(config.model.as_ref().unwrap())
+            .unwrap();
 
-        let error = validate_explicit_tool_policy(&config, &extensions).unwrap_err();
+        let error = validate_explicit_tool_policy(&config, &extensions, &model).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("edit, missing-extension"), "{message}");
         assert!(
@@ -4374,6 +4756,61 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("available tools: read"), "{message}");
+    }
+
+    #[test]
+    fn model_without_tool_capability_gets_no_default_surface_and_rejects_explicit_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut default_config = config(directory.path(), Some("gpt-4o-mini"));
+        let boot = bootstrap(default_config.clone()).unwrap();
+        let resolved = boot
+            .catalog
+            .resolve(default_config.model.as_ref().unwrap())
+            .unwrap();
+        let mut spec = (*resolved.spec).clone();
+        spec.capabilities.tools = false;
+        spec.capabilities.parallel_tool_calls = false;
+        let model = Model {
+            spec: Arc::new(spec),
+            endpoint: resolved.endpoint,
+        };
+        let session = Session::create(directory.path().join("no-tools-default.jsonl")).unwrap();
+        let skills: Arc<dyn SkillRegistry> = Arc::new(
+            FileSystemSkillRegistry::new(directory.path().to_owned(), vec![], false).unwrap(),
+        );
+        let (extensions, _) = configured_extensions(
+            skills.clone(),
+            &default_config,
+            &session,
+            &model,
+            &default_config.reasoning,
+            &boot.sessions,
+        );
+        assert!(extensions.tool_definitions().is_empty());
+        validate_explicit_tool_policy(&default_config, &extensions, &model).unwrap();
+
+        default_config.tools = crate::config::ToolPolicy::only(["read".to_owned()]).unwrap();
+        let explicit_session =
+            Session::create(directory.path().join("no-tools-explicit.jsonl")).unwrap();
+        let (extensions, _) = configured_extensions(
+            skills,
+            &default_config,
+            &explicit_session,
+            &model,
+            &default_config.reasoning,
+            &boot.sessions,
+        );
+        let error =
+            validate_explicit_tool_policy(&default_config, &extensions, &model).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("gpt-4o-mini does not support tools"),
+            "{message}"
+        );
+        assert!(
+            message.contains("explicit tool policy requested: read"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -1,15 +1,138 @@
 #![allow(missing_docs)]
 
-use crossterm::event::{Event, EventStream};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use ygg_agent::extension_process::ConfirmationRequest;
-use ygg_agent::tool::ToolConfirmation;
+use ygg_agent::tool::{ToolConfirmation, ToolInputRequest};
 use ygg_ai::{ModelCatalog, ModelId};
 
 use crate::config::ThinkingLevel;
 use crate::presentation::{format_token_rate_value, ModelDisplayMetadata};
 use crate::session_store::{SessionMeta, SessionStore};
 use crate::tui::view::{InteractiveShell, Panel, PanelAction, PanelResult};
+
+const MAX_SECRET_INPUT_BYTES: usize = 4096;
+
+#[derive(Default)]
+struct SecretInputBuffer(Vec<u8>);
+
+impl SecretInputBuffer {
+    fn push(&mut self, character: char) {
+        let mut encoded = [0; 4];
+        let bytes = character.encode_utf8(&mut encoded).as_bytes();
+        if self.0.len().saturating_add(bytes.len()) <= MAX_SECRET_INPUT_BYTES {
+            self.0.extend_from_slice(bytes);
+        }
+        encoded.fill(0);
+    }
+
+    fn extend_paste(&mut self, pasted: &str) {
+        let pasted = pasted.trim_end_matches(['\r', '\n']);
+        let remaining = MAX_SECRET_INPUT_BYTES.saturating_sub(self.0.len());
+        let mut end = pasted.len().min(remaining);
+        while end > 0 && !pasted.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.0.extend_from_slice(&pasted.as_bytes()[..end]);
+    }
+
+    fn backspace(&mut self) {
+        let Some((start, _)) = std::str::from_utf8(&self.0)
+            .ok()
+            .and_then(|text| text.char_indices().last())
+        else {
+            return;
+        };
+        self.0[start..].fill(0);
+        self.0.truncate(start);
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for SecretInputBuffer {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+/// Give one running tool exclusive ownership of terminal input. The answer is
+/// sent directly to its reply channel and never enters the ordinary editor.
+pub async fn tool_input_picker<S>(
+    shell: &mut InteractiveShell,
+    input: &mut S,
+    request: &ToolInputRequest,
+) -> anyhow::Result<bool>
+where
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    shell.set_tool_input_prompt(Some(request.prompt.clone()));
+    shell.render();
+    let mut secret = SecretInputBuffer::default();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = crate::tui::terminal::wait_for_shutdown_signal() => None,
+            next = input.next() => next,
+        };
+        let event = match next {
+            Some(Ok(event)) => event,
+            Some(Err(error)) => {
+                request.cancel();
+                shell.set_tool_input_prompt(None);
+                shell.render();
+                return Err(error.into());
+            }
+            None => {
+                request.cancel();
+                shell.set_tool_input_prompt(None);
+                shell.render();
+                return Ok(false);
+            }
+        };
+        match event {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        request.respond(secret.take());
+                        shell.set_tool_input_prompt(None);
+                        shell.render();
+                        return Ok(true);
+                    }
+                    KeyCode::Esc => {
+                        request.cancel();
+                        shell.set_tool_input_prompt(None);
+                        shell.render();
+                        return Ok(false);
+                    }
+                    KeyCode::Backspace => secret.backspace(),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        request.cancel();
+                        shell.set_tool_input_prompt(None);
+                        shell.render();
+                        return Ok(false);
+                    }
+                    KeyCode::Char(character)
+                        if !key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) =>
+                    {
+                        secret.push(character)
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(pasted) => secret.extend_paste(&pasted),
+            Event::Resize(columns, rows) => shell.set_size(columns, rows),
+            _ => {}
+        }
+        // Re-rendering is safe: only the fixed prompt and cursor are visible;
+        // secret bytes never influence frame contents.
+        shell.render();
+    }
+}
 
 /// Drive a panel-based selection list. Owns the event loop while the panel is open.
 async fn pick_list<S>(

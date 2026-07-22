@@ -8,6 +8,8 @@ description = "Provider-independent inference package for Ygg's agent loop."
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
+keywords = ["ai", "llm", "openai", "anthropic", "inference"]
+categories = ["api-bindings"]
 
 [lints]
 workspace = true

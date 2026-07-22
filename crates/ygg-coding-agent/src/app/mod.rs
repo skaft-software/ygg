@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use ygg_agent::Agent;
 use ygg_ai::{
-    AiClient, Model, ModelCatalog, ModelId, ReasoningConfig, ReasoningControl, ReasoningEffort,
+    AiClient, Model, ModelCatalog, ModelId, OpenAiChatReasoningMode, ReasoningConfig,
+    ReasoningControl, ReasoningEffort,
 };
 
 use crate::config::Config;
@@ -19,6 +20,7 @@ use crate::session_store::SessionStore;
 pub fn reasoning_label(reasoning: &ReasoningConfig) -> String {
     match reasoning {
         ReasoningConfig::Off => "off".to_owned(),
+        ReasoningConfig::On => "on".to_owned(),
         ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Minimal) => "minimal".to_owned(),
         ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Low) => "low".to_owned(),
         ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Medium) => "medium".to_owned(),
@@ -47,17 +49,52 @@ pub fn thinking_to_reasoning(
     if level == ThinkingLevel::Off {
         return Ok(ReasoningConfig::Off);
     }
+    if capability.control == ReasoningControl::Toggle {
+        return Ok(ReasoningConfig::On);
+    }
     // Clamp the requested tier down to the model's advertised ceiling so we
     // never emit an effort the backend would reject (mirrors pi's
     // `clampThinkingLevel`).  Also raise it to the model's floor: a request
     // below what the model distinguishes is silently upgraded rather than
     // rejected.
+    let requested = if level == ThinkingLevel::On {
+        capability.min_effort
+    } else {
+        level.to_effort()
+    };
     let effort = raise_effort(
-        clamp_effort(level.to_effort(), capability.max_effort),
+        clamp_effort(requested, capability.max_effort),
         capability.min_effort,
     );
+    let effort = match &capability.openai_chat_mode {
+        OpenAiChatReasoningMode::ProviderValues { values, .. }
+            if capability.control == ReasoningControl::Effort =>
+        {
+            let supported = values
+                .iter()
+                .filter_map(|value| match value.trim().to_ascii_lowercase().as_str() {
+                    "minimal" | "min" => Some(ReasoningEffort::Minimal),
+                    "low" => Some(ReasoningEffort::Low),
+                    "medium" | "med" => Some(ReasoningEffort::Medium),
+                    "high" => Some(ReasoningEffort::High),
+                    "xhigh" | "x-high" | "extra_high" => Some(ReasoningEffort::Xhigh),
+                    "max" => Some(ReasoningEffort::Max),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            supported
+                .iter()
+                .copied()
+                .filter(|supported| *supported <= effort)
+                .max()
+                .or_else(|| supported.iter().copied().min())
+                .unwrap_or(effort)
+        }
+        _ => effort,
+    };
     match capability.control {
         ReasoningControl::Effort => Ok(ReasoningConfig::Effort(effort)),
+        ReasoningControl::Toggle => unreachable!("toggle handled above"),
         ReasoningControl::TokenBudget => {
             let budgets = capability
                 .effort_budgets
@@ -98,6 +135,7 @@ pub fn normalize_reasoning_for_model(
 ) -> anyhow::Result<ReasoningConfig> {
     match reasoning {
         ReasoningConfig::Off => Ok(ReasoningConfig::Off),
+        ReasoningConfig::On => thinking_to_reasoning(ThinkingLevel::On, model),
         ReasoningConfig::Effort(effort) => thinking_to_reasoning(effort_level(*effort), model),
         ReasoningConfig::Budget(budget) => match &model.spec.capabilities.reasoning {
             Some(capability) if capability.control == ReasoningControl::TokenBudget => {
@@ -130,6 +168,7 @@ pub fn level_from_reasoning(
 ) -> anyhow::Result<ThinkingLevel> {
     match reasoning {
         ReasoningConfig::Off => Ok(ThinkingLevel::Off),
+        ReasoningConfig::On => Ok(ThinkingLevel::On),
         ReasoningConfig::Effort(effort) => Ok(effort_level(*effort)),
         ReasoningConfig::Budget(budget) => {
             let Some(capability) = &model.spec.capabilities.reasoning else {
@@ -160,6 +199,38 @@ pub fn supported_levels(model: &Model) -> Vec<ThinkingLevel> {
     let Some(capability) = &model.spec.capabilities.reasoning else {
         return vec![ThinkingLevel::Off];
     };
+    if let OpenAiChatReasoningMode::ProviderValues { values, .. } = &capability.openai_chat_mode {
+        let mut levels = Vec::new();
+        for value in values {
+            let level = match value.trim().to_ascii_lowercase().as_str() {
+                "none" | "off" | "disabled" => Some(ThinkingLevel::Off),
+                "default" | "on" | "enabled" => Some(ThinkingLevel::On),
+                "minimal" | "min" => Some(ThinkingLevel::Minimal),
+                "low" => Some(ThinkingLevel::Low),
+                "medium" | "med" => Some(ThinkingLevel::Medium),
+                "high" => Some(ThinkingLevel::High),
+                "xhigh" | "x-high" | "extra_high" => Some(ThinkingLevel::Xhigh),
+                "max" => Some(ThinkingLevel::Max),
+                _ => None,
+            };
+            let level = match (capability.control, level) {
+                (ReasoningControl::Toggle, Some(ThinkingLevel::Off | ThinkingLevel::On)) => level,
+                (ReasoningControl::Effort, Some(level)) if !matches!(level, ThinkingLevel::On) => {
+                    Some(level)
+                }
+                _ => None,
+            };
+            if let Some(level) = level.filter(|level| !levels.contains(level)) {
+                levels.push(level);
+            }
+        }
+        if !levels.is_empty() {
+            return levels;
+        }
+    }
+    if capability.control == ReasoningControl::Toggle {
+        return vec![ThinkingLevel::Off, ThinkingLevel::On];
+    }
     let mut levels = vec![ThinkingLevel::Off];
     levels.extend(
         [
@@ -387,6 +458,58 @@ mod tests {
         assert_eq!(
             thinking_to_reasoning(ThinkingLevel::Max, &budget).unwrap(),
             ReasoningConfig::Budget(32768)
+        );
+    }
+
+    #[test]
+    fn provider_reported_toggle_and_effort_values_are_exact() {
+        let toggle = model_with(Some(ReasoningCapability {
+            control: ReasoningControl::Toggle,
+            exposes_text: true,
+            preserves_state: false,
+            effort_budgets: None,
+            openai_chat_mode: OpenAiChatReasoningMode::ProviderValues {
+                values: vec!["none".into(), "default".into()],
+                default: Some("default".into()),
+                system_message: true,
+            },
+            min_effort: ReasoningEffort::Minimal,
+            max_effort: ReasoningEffort::High,
+        }));
+        assert_eq!(
+            supported_levels(&toggle),
+            vec![ThinkingLevel::Off, ThinkingLevel::On]
+        );
+        assert_eq!(
+            thinking_to_reasoning(ThinkingLevel::On, &toggle).unwrap(),
+            ReasoningConfig::On
+        );
+        assert_eq!(
+            normalize_reasoning_for_model(&ReasoningConfig::Effort(ReasoningEffort::High), &toggle)
+                .unwrap(),
+            ReasoningConfig::On
+        );
+
+        let levels = model_with(Some(ReasoningCapability {
+            control: ReasoningControl::Effort,
+            exposes_text: true,
+            preserves_state: false,
+            effort_budgets: None,
+            openai_chat_mode: OpenAiChatReasoningMode::ProviderValues {
+                values: vec!["none".into(), "low".into(), "high".into()],
+                default: Some("low".into()),
+                system_message: true,
+            },
+            min_effort: ReasoningEffort::Low,
+            max_effort: ReasoningEffort::High,
+        }));
+        assert_eq!(
+            supported_levels(&levels),
+            vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High]
+        );
+        assert_eq!(
+            thinking_to_reasoning(ThinkingLevel::Medium, &levels).unwrap(),
+            ReasoningConfig::Effort(ReasoningEffort::Low)
         );
     }
 

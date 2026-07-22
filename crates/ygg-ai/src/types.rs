@@ -110,7 +110,7 @@ pub enum Protocol {
 }
 
 /// Preferred transport for streaming provider responses.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointTransport {
     /// Use the provider's ordinary HTTP/SSE transport.
@@ -254,7 +254,7 @@ fn default_max_effort() -> ReasoningEffort {
 }
 
 /// Provider extension used by an OpenAI Chat Completions reasoning model.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenAiChatReasoningMode {
     /// Standard OpenAI-compatible `reasoning_effort` behavior.
@@ -269,6 +269,16 @@ pub enum OpenAiChatReasoningMode {
     /// OpenAI-compatible servers whose chat template rejects `developer`, such
     /// as Qwen3.5 served by vLLM.
     SystemMessage,
+    /// Provider-advertised `reasoning_effort` values. This preserves exact
+    /// gateway strings while exposing their semantic choices to clients.
+    ProviderValues {
+        /// Accepted wire values in provider order.
+        values: Vec<String>,
+        /// Provider default, when advertised.
+        default: Option<String>,
+        /// Keep instructions in the broadly compatible `system` role.
+        system_message: bool,
+    },
 }
 
 /// Selection control mechanism for reasoning.
@@ -277,6 +287,8 @@ pub enum OpenAiChatReasoningMode {
 pub enum ReasoningControl {
     /// Control via effort tags (Minimal, Low, Medium, High).
     Effort,
+    /// Binary off/on control.
+    Toggle,
     /// Control via explicit token budget.
     TokenBudget,
 }
@@ -766,6 +778,8 @@ pub enum ReasoningConfig {
     /// Reasoning capability turned off.
     #[default]
     Off,
+    /// Binary reasoning capability turned on.
+    On,
     /// Control reasoning via high-level effort presets.
     Effort(ReasoningEffort),
     /// Control reasoning via explicit token budget.

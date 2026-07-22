@@ -265,20 +265,25 @@ pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
                     && budgets.xhigh <= budgets.max
                     && budgets.max <= spec.limits.max_output_tokens
             }
-            (ReasoningControl::Effort, None) => true,
+            (ReasoningControl::Effort | ReasoningControl::Toggle, None) => true,
             _ => false,
         };
         let protocol_matches = match spec.protocol {
             // Anthropic supports both explicit token budgets (extended thinking)
             // and effort control (adaptive thinking + `output_config.effort`).
             Protocol::AnthropicMessages => true,
-            Protocol::OpenAiChat | Protocol::OpenAiResponses => {
-                reasoning.control == ReasoningControl::Effort
-            }
+            Protocol::OpenAiChat => matches!(
+                reasoning.control,
+                ReasoningControl::Effort | ReasoningControl::Toggle
+            ),
+            Protocol::OpenAiResponses => reasoning.control == ReasoningControl::Effort,
         };
         let chat_mode_matches = reasoning.openai_chat_mode == OpenAiChatReasoningMode::Standard
             || (spec.protocol == Protocol::OpenAiChat
-                && reasoning.control == ReasoningControl::Effort
+                && matches!(
+                    reasoning.control,
+                    ReasoningControl::Effort | ReasoningControl::Toggle
+                )
                 && reasoning.exposes_text);
         let effort_range_valid = reasoning.min_effort <= reasoning.max_effort;
         if !valid || !protocol_matches || !chat_mode_matches || !effort_range_valid {

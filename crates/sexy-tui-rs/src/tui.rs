@@ -810,24 +810,7 @@ impl<'a> TUI<'a> {
             // erase saved lines, then replay the retained frame exactly once.
             // The renderer thread owns this bounded-by-retained-state write;
             // ordinary streaming/status updates continue to use lazy tails.
-            self.begin_synchronized_output();
-            if self.previous_frame.iter().any(|line| is_image_line(line))
-                || new_lines.iter().any(|line| is_image_line(line))
-            {
-                self.terminal.write(&delete_all_kitty_images());
-            }
-            self.terminal.write("\x1b[H");
-            self.terminal.clear_screen();
-            self.terminal.write("\x1b[3J");
-            self.terminal.write("\x1b[H");
-            for (index, line) in new_lines.iter().enumerate() {
-                self.terminal.write(line);
-                if index + 1 < new_lines.len() {
-                    self.terminal.write("\n");
-                }
-            }
-            self.end_synchronized_output();
-            self.inline_bottom_row = new_lines.len().min(rows).saturating_sub(1);
+            self.rebuild_inline_scrollback(new_lines, rows);
             return;
         }
 
@@ -878,6 +861,18 @@ impl<'a> TUI<'a> {
                 .unwrap_or(prev_len.min(new_lines.len()))
         });
         if first_changed >= prev_len && new_lines.len() == prev_len {
+            return;
+        }
+
+        if first_changed < visible_start {
+            // Rows already owned by native scrollback cannot be edited. Do not
+            // clear and replay the retained timeline here: multiplexers may
+            // preserve the old history and append that replay, while terminals
+            // without synchronized paint expose it as a full-screen flash.
+            // Align the old and new visible tails instead and repaint only the
+            // physical rows whose final cells differ. Off-screen history keeps
+            // the version that was committed when it originally scrolled out.
+            self.repaint_inline_visible_rows(new_lines, rows);
             return;
         }
 
@@ -1014,6 +1009,67 @@ impl<'a> TUI<'a> {
         } else {
             (screen_row + changed.len() - 1).min(rows - 1)
         };
+    }
+
+    fn repaint_inline_visible_rows(&mut self, new_lines: &[String], rows: usize) {
+        let visible_rows = (self.inline_bottom_row + 1)
+            .min(rows)
+            .min(self.previous_frame.len())
+            .min(new_lines.len());
+        if visible_rows == 0 {
+            return;
+        }
+        let previous_start = self.previous_frame.len() - visible_rows;
+        let next_start = new_lines.len() - visible_rows;
+        let previous = &self.previous_frame[previous_start..];
+        let next = &new_lines[next_start..];
+        let delete_images = previous
+            .iter()
+            .zip(next)
+            .any(|(old, new)| old != new && (is_image_line(old) || is_image_line(new)));
+        let changed = previous
+            .iter()
+            .zip(next)
+            .enumerate()
+            .filter(|(_, (old, new))| delete_images || old != new)
+            .map(|(screen_row, (_, new))| (screen_row, new.clone()))
+            .collect::<Vec<_>>();
+        if changed.is_empty() {
+            return;
+        }
+
+        self.begin_synchronized_output();
+        if delete_images {
+            self.terminal.write(&delete_all_kitty_images());
+        }
+        for (screen_row, new) in changed {
+            self.terminal
+                .write(&format!("\x1b[{};1H", screen_row.saturating_add(1)));
+            self.terminal.clear_line();
+            self.terminal.write(&new);
+        }
+        self.end_synchronized_output();
+    }
+
+    fn rebuild_inline_scrollback(&mut self, new_lines: &[String], rows: usize) {
+        self.begin_synchronized_output();
+        if self.previous_frame.iter().any(|line| is_image_line(line))
+            || new_lines.iter().any(|line| is_image_line(line))
+        {
+            self.terminal.write(&delete_all_kitty_images());
+        }
+        self.terminal.write("\x1b[H");
+        self.terminal.clear_screen();
+        self.terminal.write("\x1b[3J");
+        self.terminal.write("\x1b[H");
+        for (index, line) in new_lines.iter().enumerate() {
+            self.terminal.write(line);
+            if index + 1 < new_lines.len() {
+                self.terminal.write("\n");
+            }
+        }
+        self.end_synchronized_output();
+        self.inline_bottom_row = new_lines.len().min(rows).saturating_sub(1);
     }
 
     fn redraw_all_from_home(&mut self, lines: &[String]) {
@@ -1715,6 +1771,147 @@ mod tests {
         assert!(!output.contains("composer"), "{output:?}");
         assert!(!output.contains("footer telemetry"), "{output:?}");
         assert_eq!(tail_clears.get(), 0, "the pinned tail must not be erased");
+    }
+
+    #[test]
+    fn large_growth_above_native_viewport_never_replays_displaced_history() {
+        const RESET: &str = "\x1b[0m\x1b]8;;\x1b\\";
+        for synchronized_output in [false, true] {
+            let size = Rc::new(Cell::new((40, 4)));
+            let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+                crate::capabilities::ColorDepth::Ansi16,
+                true,
+            )
+            .with_overrides(&crate::capabilities::CapabilityOverrides {
+                synchronized_output: Some(synchronized_output),
+                ..crate::capabilities::CapabilityOverrides::default()
+            });
+            let (terminal, clears, tail_clears, _, _, writes) =
+                recording_terminal(size, capabilities);
+            let mut next = (0..372)
+                .map(|index| format!("inserted row {index}"))
+                .collect::<Vec<_>>();
+            next.extend(
+                [
+                    "history 0",
+                    "history 1",
+                    "history 2",
+                    "history 3",
+                    "visible a",
+                    "visible b",
+                    "visible C updated",
+                    "footer",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            let lines = Rc::new(RefCell::new(next));
+            let mut tui = TUI::new(Box::new(terminal));
+            tui.set_inline_scrollback(true);
+            tui.add_child(Box::new(MutableLines(lines)));
+            tui.previous_frame = [
+                "history 0",
+                "history 1",
+                "history 2",
+                "history 3",
+                "visible a",
+                "visible b",
+                "visible c",
+                "footer",
+            ]
+            .into_iter()
+            .map(|line| format!("{line}{RESET}"))
+            .collect();
+            tui.previous_size = Some((40, 4));
+            tui.first_render = false;
+            tui.inline_bottom_row = 3;
+            tui.running = true;
+
+            tui.request_render();
+
+            let output = writes.borrow().join("");
+            assert_eq!(
+                output.contains("\x1b[?2026h"),
+                synchronized_output,
+                "{output:?}"
+            );
+            assert!(!output.contains("\x1b[3J"), "{output:?}");
+            assert!(!output.contains('\n'), "{output:?}");
+            assert_eq!(clears.get(), 0);
+            assert_eq!(tail_clears.get(), 0);
+            assert!(output.contains("\x1b[3;1H"), "{output:?}");
+            assert!(output.contains("visible C updated"), "{output:?}");
+            assert!(output.len() < 256, "unbounded repaint: {} B", output.len());
+            for replayed in [
+                "inserted row",
+                "history 0",
+                "history 3",
+                "visible a",
+                "visible b",
+                "footer",
+            ] {
+                assert!(!output.contains(replayed), "{replayed:?}: {output:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn offscreen_mutation_preserves_short_frame_screen_row_anchor() {
+        const RESET: &str = "\x1b[0m\x1b]8;;\x1b\\";
+        let size = Rc::new(Cell::new((40, 5)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
+        let mut next = (0..64)
+            .map(|index| format!("new offscreen row {index}"))
+            .collect::<Vec<_>>();
+        next.extend(
+            [
+                "history 0",
+                "history 1",
+                "history 2",
+                "history 3",
+                "history 4",
+                "visible a",
+                "visible B updated",
+                "footer",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.set_inline_scrollback(true);
+        tui.add_child(Box::new(MutableLines(Rc::new(RefCell::new(next)))));
+        tui.previous_frame = [
+            "history 0",
+            "history 1",
+            "history 2",
+            "history 3",
+            "history 4",
+            "visible a",
+            "visible b",
+            "footer",
+        ]
+        .into_iter()
+        .map(|line| format!("{line}{RESET}"))
+        .collect();
+        tui.previous_size = Some((40, 5));
+        tui.first_render = false;
+        // A prior shrink left the three-row frame tail at rows 0..=2 rather
+        // than bottom-aligning it to the five-row terminal.
+        tui.inline_bottom_row = 2;
+        tui.running = true;
+
+        tui.request_render();
+
+        let output = writes.borrow().join("");
+        assert!(output.contains("\x1b[2;1H"), "{output:?}");
+        assert!(!output.contains("\x1b[4;1H"), "{output:?}");
+        assert!(output.contains("visible B updated"), "{output:?}");
+        assert!(!output.contains('\n'), "{output:?}");
+        assert!(!output.contains("new offscreen row"), "{output:?}");
     }
 
     #[test]

@@ -66,6 +66,13 @@ pub struct CustomModel {
     /// Whether the model supports reasoning/thinking.
     #[serde(default)]
     pub reasoning: bool,
+    /// Exact reasoning selector values advertised by the endpoint. Empty
+    /// preserves the legacy effort-range behavior for manual configurations.
+    #[serde(default)]
+    pub reasoning_values: Vec<String>,
+    /// Endpoint-advertised default reasoning selector value.
+    #[serde(default)]
+    pub reasoning_default: String,
     /// Whether reasoning-capable requests must keep the system prompt as a
     /// `system` message instead of using OpenAI's `developer` role.
     #[serde(default)]
@@ -100,6 +107,8 @@ impl Default for CustomModel {
             vision: false,
             structured_output: false,
             reasoning: false,
+            reasoning_values: Vec::new(),
+            reasoning_default: String::new(),
             reasoning_uses_system_message: false,
         }
     }
@@ -228,6 +237,25 @@ impl CredentialStore {
             .with_context(|| format!("invalid cache compatibility in {}", self.path.display()))
     }
 
+    /// Load the optional response-header allowance for a cold-starting custom
+    /// endpoint. This expert setting stays outside [`CustomCredential`] so the
+    /// public credential shape remains source-compatible.
+    pub fn load_startup_timeout_secs(&self) -> Result<Option<u64>> {
+        let Some(bytes) = crate::auth::read_bounded_regular(&self.path, MAX_CREDENTIAL_BYTES)
+            .with_context(|| format!("reading {}", self.path.display()))?
+        else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("corrupt credential file {}", self.path.display()))?;
+        let Some(timeout) = value.get("startup_timeout_secs") else {
+            return Ok(None);
+        };
+        serde_json::from_value(timeout.clone())
+            .map(Some)
+            .with_context(|| format!("invalid startup timeout in {}", self.path.display()))
+    }
+
     /// Persist a credential with owner-only permissions.
     pub fn save(&self, cred: &CustomCredential) -> Result<()> {
         if let Some(parent) = self.path.parent() {
@@ -241,16 +269,18 @@ impl CredentialStore {
             }
         }
         let mut value = serde_json::to_value(cred)?;
-        // `cache` is an expert compatibility extension kept outside
-        // `CustomCredential` for source compatibility. Preserve it when the
-        // endpoint is re-saved through the normal login/configuration flow.
+        // Expert compatibility extensions stay outside `CustomCredential` for
+        // source compatibility. Preserve them when the endpoint is re-saved
+        // through the normal login/configuration flow.
         if let Ok(Some(existing)) =
             crate::auth::read_bounded_regular(&self.path, MAX_CREDENTIAL_BYTES)
         {
             if let Ok(existing) = serde_json::from_slice::<serde_json::Value>(&existing) {
-                if let Some(cache) = existing.get("cache") {
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert("cache".to_string(), cache.clone());
+                for extension in ["cache", "startup_timeout_secs"] {
+                    if let Some(extension_value) = existing.get(extension) {
+                        if let Some(object) = value.as_object_mut() {
+                            object.insert(extension.to_string(), extension_value.clone());
+                        }
                     }
                 }
             }
@@ -480,6 +510,35 @@ mod tests {
                 .cache_control_format,
             Some(ygg_ai::CacheControlFormat::Anthropic)
         );
+    }
+
+    #[test]
+    fn custom_startup_timeout_is_loaded_and_preserved_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials/custom.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+                "base_url": "http://localhost:1234/v1/",
+                "startup_timeout_secs": 420
+            }"#,
+        )
+        .unwrap();
+
+        let store = CredentialStore::new(&path);
+        assert_eq!(store.load_startup_timeout_secs().unwrap(), Some(420));
+
+        let credential = CustomCredential {
+            base_url: "http://localhost:5678/v1/".to_string(),
+            api_key: String::new(),
+            api_name: "local".to_string(),
+            headers: vec![],
+            models: vec![],
+            auto_discover: false,
+        };
+        store.save(&credential).unwrap();
+        assert_eq!(store.load_startup_timeout_secs().unwrap(), Some(420));
     }
 
     #[test]

@@ -49,8 +49,8 @@ pub struct SandboxConfig {
 impl SandboxConfig {
     /// Creates a conservative library configuration rooted at `workspace`:
     /// workspace-only paths, no edits, no process or shell execution, a 120s
-    /// exec timeout, and a 16 KiB aggregate output cap. Hosts may enable capabilities or
-    /// trusted-local path access through the public fields.
+    /// exec timeout, and a 16 KiB per-tool output cap. Hosts may enable
+    /// capabilities or trusted-local path access through the public fields.
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),

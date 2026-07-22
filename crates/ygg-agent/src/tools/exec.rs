@@ -6,6 +6,10 @@
 //! authority because any arbitrary executable can itself be an interpreter.
 
 #[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Stdio;
@@ -14,8 +18,13 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+/// Leave room for exit/capture metadata inside the per-tool result cap.
+#[cfg(unix)]
+const CAPTURE_ENVELOPE_RESERVE: usize = 256;
 use bytes::Bytes;
 use serde::Deserialize;
+#[cfg(unix)]
+use tokio::io::unix::AsyncFd;
 #[cfg(unix)]
 use tokio::io::{AsyncRead, AsyncReadExt};
 use ygg_ai::ToolDef;
@@ -60,7 +69,8 @@ impl Tool for ExecTool {
                           commands with pipes, redirections, or other shell operators \
                           use /bin/sh -c when permitted. Omit cwd to run at the \
                           workspace root. Output reports the exit status and bounded \
-                          stdout/stderr."
+                          stdout/stderr. Complete streams end with complete_<stream>=true; \
+                          truncated_<stream>=... means bytes were omitted."
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -128,6 +138,7 @@ impl ExecTool {
         }
 
         let needs_shell = shell_command_has_operators(&args.command);
+        let interactive_sudo = !needs_shell && direct_sudo_needs_terminal(&args.command);
         let (mut command, cwd) = if needs_shell {
             let mut c = tokio::process::Command::new("/bin/sh");
             c.arg("-c").arg(&args.command);
@@ -159,6 +170,10 @@ impl ExecTool {
             }
         };
 
+        if interactive_sudo {
+            return execute_interactive_pty(command, &workdir, effective_timeout, ctx).await;
+        }
+
         command
             .current_dir(&workdir)
             .stdin(Stdio::null())
@@ -178,12 +193,13 @@ impl ExecTool {
 
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
-        let budget = ctx.sandbox.max_output_bytes;
-        // stdout and stderr share one aggregate result budget. Splitting the
-        // capture capacity also prevents a noisy stderr stream from doubling
-        // the advertised limit while retaining head/tail context for both.
-        let stdout_budget = budget / 2;
-        let stderr_budget = budget.saturating_sub(stdout_budget);
+        // Capture each stream up to the complete shared allowance first. Once
+        // both byte counts are known, rebalance the retained bytes so an empty
+        // or short peer cannot strand half of the advertised result budget.
+        let capture_budget = ctx
+            .sandbox
+            .max_output_bytes
+            .saturating_sub(CAPTURE_ENVELOPE_RESERVE);
         let stdout_progress = ctx.progress.clone();
         let stderr_progress = ctx.progress.clone();
 
@@ -191,13 +207,13 @@ impl ExecTool {
             let (out, err, status) = tokio::join!(
                 read_bounded_with_progress(
                     &mut stdout_pipe,
-                    stdout_budget,
+                    capture_budget,
                     &stdout_progress,
                     OutputStream::Stdout
                 ),
                 read_bounded_with_progress(
                     &mut stderr_pipe,
-                    stderr_budget,
+                    capture_budget,
                     &stderr_progress,
                     OutputStream::Stderr
                 ),
@@ -221,7 +237,8 @@ impl ExecTool {
                     effective_timeout.as_secs_f64()
                 );
                 match drained {
-                    Ok((out, err, status)) => {
+                    Ok((mut out, mut err, status)) => {
+                        rebalance_captures(&mut out, &mut err, capture_budget);
                         guard.disarm();
                         if out.total_bytes > 0 {
                             message.push('\n');
@@ -247,7 +264,8 @@ impl ExecTool {
                 }
                 Err(ToolError::new(message))
             }
-            Ok((out, err, status)) => {
+            Ok((mut out, mut err, status)) => {
+                rebalance_captures(&mut out, &mut err, capture_budget);
                 let status = status.map_err(|e| {
                     ToolError::new(format!("error io\nfailed to wait for command: {e}"))
                 })?;
@@ -290,6 +308,252 @@ impl ExecTool {
                     Err(ToolError::new(format!("error nonzero_exit\n{text}")))
                 }
             }
+        }
+    }
+}
+
+/// Direct sudo owns a private PTY unless the caller explicitly selected a
+/// non-interactive or stdin/askpass transport. This prevents sudo from opening
+/// Ygg's controlling terminal and racing the composer's event reader.
+#[cfg(unix)]
+fn direct_sudo_needs_terminal(command: &str) -> bool {
+    let (program, arguments) = shell_word_parse(command);
+    let is_sudo = std::path::Path::new(&program)
+        .file_name()
+        .is_some_and(|name| name == "sudo");
+    is_sudo
+        && !arguments.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "-n" | "--non-interactive" | "-S" | "--stdin" | "-A" | "--askpass"
+            )
+        })
+}
+
+#[cfg(unix)]
+async fn execute_interactive_pty(
+    mut command: tokio::process::Command,
+    workdir: &std::path::Path,
+    timeout: Duration,
+    ctx: &ToolContext<'_>,
+) -> Result<ToolOutput, ToolError> {
+    let (master_fd, slave_fd) = open_private_pty()?;
+    // Own both descriptors immediately so every clone/spawn/setup error closes
+    // the complete private terminal rather than leaking its raw master fd.
+    let master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+    let slave_fd_for_child = slave.as_raw_fd();
+    command
+        .current_dir(workdir)
+        .stdin(Stdio::from(slave.try_clone().map_err(pty_error)?))
+        .stdout(Stdio::from(slave.try_clone().map_err(pty_error)?))
+        .stderr(Stdio::from(slave.try_clone().map_err(pty_error)?))
+        .kill_on_drop(true);
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave_fd_for_child, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let start = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|error| ToolError::new(format!("error pty\nfailed to start command: {error}")))?;
+    let guard = ProcessGroupGuard::exec(child.id());
+    drop(slave);
+    set_nonblocking(master.as_raw_fd())?;
+    let master =
+        AsyncFd::new(master).map_err(|error| ToolError::new(format!("error pty\n{error}")))?;
+
+    let capture_budget = ctx
+        .sandbox
+        .max_output_bytes
+        .saturating_sub(CAPTURE_ENVELOPE_RESERVE);
+    let mut capture = Capture::empty();
+    let mut was_echo_enabled = true;
+    let mut request_issued = false;
+    let mut input_request = None;
+    let mut pty_open = true;
+    let mut poll = tokio::time::interval(Duration::from_millis(10));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+
+    let status = loop {
+        tokio::select! {
+            biased;
+            _ = &mut deadline => {
+                guard.terminate_now();
+                let _ = tokio::time::timeout(POST_KILL_DRAIN_TIMEOUT, child.wait()).await;
+                return Err(ToolError::new(format!(
+                    "error timeout\ncommand exceeded the {:.0}s execution limit and was killed",
+                    timeout.as_secs_f64()
+                )));
+            }
+            response = futures_util::future::OptionFuture::from(
+                input_request.as_mut().map(|request: &mut std::pin::Pin<Box<dyn std::future::Future<Output = Option<crate::tool::ToolInputResponse>> + Send>>| request.as_mut())
+            ), if input_request.is_some() => {
+                input_request = None;
+                let Some(response) = response.flatten() else {
+                    guard.terminate_now();
+                    let _ = tokio::time::timeout(POST_KILL_DRAIN_TIMEOUT, child.wait()).await;
+                    return Err(ToolError::new("error input_cancelled\ninteractive command input was cancelled"));
+                };
+                pty_write_all(&master, response.as_bytes()).await?;
+                pty_write_all(&master, b"\n").await?;
+            }
+            ready = master.readable(), if pty_open => {
+                let mut ready = ready.map_err(pty_error)?;
+                match ready.try_io(|inner| {
+                    let mut bytes = [0u8; 8192];
+                    inner.get_ref().read(&mut bytes).map(|count| bytes[..count].to_vec())
+                }) {
+                    Ok(Ok(bytes)) if !bytes.is_empty() => {
+                        capture.push_bytes(&bytes, capture_budget);
+                        ctx.progress.output(OutputStream::Stdout, Bytes::from(bytes));
+                        let echo_enabled = pty_echo_enabled(master.get_ref().as_raw_fd())?;
+                        if was_echo_enabled && !echo_enabled && !request_issued {
+                            request_issued = true;
+                            let progress = ctx.progress.clone();
+                            input_request = Some(Box::pin(async move {
+                                progress.input("Password:".to_owned(), true).await
+                            }));
+                        } else if echo_enabled {
+                            request_issued = false;
+                        }
+                        was_echo_enabled = echo_enabled;
+                    }
+                    Ok(Ok(_)) => pty_open = false,
+                    Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Ok(Err(error)) if error.raw_os_error() == Some(libc::EIO) => {
+                        pty_open = false;
+                    }
+                    Ok(Err(error)) => return Err(pty_error(error)),
+                    Err(_) => {}
+                }
+            }
+            _ = poll.tick() => {
+                if let Some(status) = child.try_wait().map_err(pty_error)? {
+                    break status;
+                }
+            }
+        }
+    };
+
+    // Capture bytes already available when the child closed its slave.
+    drain_pty(&master, &mut capture, capture_budget, &ctx.progress)?;
+    guard.disarm();
+    capture.fit_to_budget(capture_budget);
+    let duration = start.elapsed();
+    let exit = match status.code() {
+        Some(code) => format!("exit={code}"),
+        None => "exit=signal".to_owned(),
+    };
+    let mut text = format!("{exit} duration={:.2}s", duration.as_secs_f64());
+    if capture.total_bytes == 0 {
+        text.push_str("\n(no output)");
+    } else {
+        text.push('\n');
+        text.push_str(&capture.render("terminal"));
+    }
+    if status.success() {
+        Ok(ToolOutput::new(text))
+    } else {
+        Err(ToolError::new(format!("error nonzero_exit\n{text}")))
+    }
+}
+
+#[cfg(unix)]
+fn pty_error(error: std::io::Error) -> ToolError {
+    ToolError::new(format!("error pty\n{error}"))
+}
+
+#[cfg(unix)]
+fn open_private_pty() -> Result<(libc::c_int, libc::c_int), ToolError> {
+    let mut master = -1;
+    let mut slave = -1;
+    let mut size = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    } == -1
+    {
+        return Err(pty_error(std::io::Error::last_os_error()));
+    }
+    Ok((master, slave))
+}
+
+#[cfg(unix)]
+fn set_nonblocking(fd: libc::c_int) -> Result<(), ToolError> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(pty_error(std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pty_echo_enabled(fd: libc::c_int) -> Result<bool, ToolError> {
+    let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(fd, attributes.as_mut_ptr()) } == -1 {
+        return Err(pty_error(std::io::Error::last_os_error()));
+    }
+    let attributes = unsafe { attributes.assume_init() };
+    Ok(attributes.c_lflag & libc::ECHO != 0)
+}
+
+#[cfg(unix)]
+async fn pty_write_all(master: &AsyncFd<std::fs::File>, bytes: &[u8]) -> Result<(), ToolError> {
+    let mut written = 0;
+    while written < bytes.len() {
+        let mut ready = master.writable().await.map_err(pty_error)?;
+        match ready.try_io(|inner| inner.get_ref().write(&bytes[written..])) {
+            Ok(Ok(0)) => return Err(ToolError::new("error pty\nmaster closed")),
+            Ok(Ok(count)) => written += count,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(Err(error)) => return Err(pty_error(error)),
+            Err(_) => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn drain_pty(
+    master: &AsyncFd<std::fs::File>,
+    capture: &mut Capture,
+    budget: usize,
+    progress: &ToolProgressSink,
+) -> Result<(), ToolError> {
+    loop {
+        let mut bytes = [0u8; 8192];
+        match master.get_ref().read(&mut bytes) {
+            Ok(0) => return Ok(()),
+            Ok(count) => {
+                capture.push_bytes(&bytes[..count], budget);
+                progress.output(
+                    OutputStream::Stdout,
+                    Bytes::copy_from_slice(&bytes[..count]),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(()),
+            Err(error) => return Err(pty_error(error)),
         }
     }
 }
@@ -405,12 +669,50 @@ impl Capture {
         }
     }
 
+    fn push_bytes(&mut self, bytes: &[u8], budget: usize) {
+        let head_cap = budget / 2;
+        let tail_cap = budget.saturating_sub(head_cap);
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
+        let mut remaining = bytes;
+        if self.head.len() < head_cap {
+            let take = remaining.len().min(head_cap - self.head.len());
+            self.head.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+        }
+        if !remaining.is_empty() && tail_cap > 0 {
+            self.tail.extend_from_slice(remaining);
+            if self.tail.len() > tail_cap {
+                self.tail.drain(..self.tail.len() - tail_cap);
+            }
+        }
+        self.truncated = self.total_bytes > budget;
+    }
+
+    /// Finalize a capture recorded with an equal-or-larger provisional
+    /// allowance. If every byte fits, restore the original stream exactly;
+    /// otherwise retain balanced head/tail evidence within `budget`.
+    fn fit_to_budget(&mut self, budget: usize) {
+        if self.total_bytes <= budget {
+            self.head.append(&mut self.tail);
+            self.truncated = false;
+            return;
+        }
+
+        let head_cap = budget / 2;
+        let tail_cap = budget.saturating_sub(head_cap);
+        self.head.truncate(head_cap);
+        if self.tail.len() > tail_cap {
+            self.tail.drain(..self.tail.len() - tail_cap);
+        }
+        self.truncated = true;
+    }
+
     /// Renders one output section:
     ///
     /// ```text
     /// stdout: 12 lines
     /// <lines>
-    /// truncated_stdout=false
+    /// complete_stdout=true
     /// ```
     ///
     /// or, when the byte budget was exceeded:
@@ -431,7 +733,7 @@ impl Capture {
             } else {
                 text.lines().count()
             };
-            format!("{name}: {lines} lines\n{text}\ntruncated_{name}=false")
+            format!("{name}: {lines} lines\n{text}\ncomplete_{name}=true")
         } else {
             let head = String::from_utf8_lossy(&self.head);
             let tail = String::from_utf8_lossy(&self.tail);
@@ -490,20 +792,46 @@ async fn read_bounded_with_progress<R: AsyncRead + Unpin>(
                     capture.head.extend_from_slice(&chunk[..take]);
                     chunk = &chunk[take..];
                 }
-                if !chunk.is_empty() {
-                    capture.truncated = true;
-                    if tail_cap > 0 {
-                        capture.tail.extend_from_slice(chunk);
-                        if capture.tail.len() > tail_cap {
-                            let excess = capture.tail.len() - tail_cap;
-                            capture.tail.drain(..excess);
-                        }
+                if !chunk.is_empty() && tail_cap > 0 {
+                    capture.tail.extend_from_slice(chunk);
+                    if capture.tail.len() > tail_cap {
+                        let excess = capture.tail.len() - tail_cap;
+                        capture.tail.drain(..excess);
                     }
                 }
             }
         }
     }
     capture
+}
+
+#[cfg(unix)]
+fn shared_capture_budgets(
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    budget: usize,
+) -> (usize, usize) {
+    let stdout_floor = budget / 2;
+    let stderr_floor = budget.saturating_sub(stdout_floor);
+    let mut stdout_budget = stdout_bytes.min(stdout_floor);
+    let mut stderr_budget = stderr_bytes.min(stderr_floor);
+    let mut remaining = budget.saturating_sub(stdout_budget.saturating_add(stderr_budget));
+
+    let stdout_extra = stdout_bytes.saturating_sub(stdout_budget).min(remaining);
+    stdout_budget = stdout_budget.saturating_add(stdout_extra);
+    remaining -= stdout_extra;
+
+    let stderr_extra = stderr_bytes.saturating_sub(stderr_budget).min(remaining);
+    stderr_budget = stderr_budget.saturating_add(stderr_extra);
+    (stdout_budget, stderr_budget)
+}
+
+#[cfg(unix)]
+fn rebalance_captures(stdout: &mut Capture, stderr: &mut Capture, budget: usize) {
+    let (stdout_budget, stderr_budget) =
+        shared_capture_budgets(stdout.total_bytes, stderr.total_bytes, budget);
+    stdout.fit_to_budget(stdout_budget);
+    stderr.fit_to_budget(stderr_budget);
 }
 
 #[cfg(all(test, unix))]
@@ -628,6 +956,76 @@ mod tests {
         assert!(out.text.starts_with("exit=0"), "{}", out.text);
         // Direct spawn: quotes are stripped, literal tokens preserved.
         assert!(out.text.contains("$HOME && ls"), "{}", out.text);
+    }
+
+    #[tokio::test]
+    async fn interactive_sudo_uses_private_pty_secret_input_without_echo() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = fixture();
+        let sudo = f.workspace.join("sudo");
+        std::fs::write(
+            &sudo,
+            concat!(
+                "#!/bin/sh\n",
+                "stty -echo\n",
+                "printf 'Password:'\n",
+                "IFS= read -r answer\n",
+                "stty echo\n",
+                "printf '\\naccepted=%s\\n' \"$(test \"$answer\" = swordfish && echo yes || echo no)\"\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::channel(crate::tool::PROGRESS_CHANNEL_CAPACITY);
+        let progress = ToolProgressSink::live(progress_tx);
+        let ctx = ToolContext {
+            active_skills: &[],
+            registered_tools: &[],
+            progress,
+            cancellation: Default::default(),
+            workspace: &f.workspace,
+            sandbox: &f.sandbox,
+            execution_scope: "interactive-sudo-test",
+        };
+        let command = sudo.display().to_string();
+        let execution = ExecTool.execute(json!({"command": command}), &ctx);
+        tokio::pin!(execution);
+
+        let output = loop {
+            tokio::select! {
+                result = &mut execution => break result.unwrap(),
+                progress = progress_rx.recv() => match progress.expect("progress channel") {
+                    crate::tool::ToolProgress::Input(request) => {
+                        assert!(request.secret);
+                        assert_eq!(request.prompt, "Password:");
+                        request.respond(b"swordfish".to_vec());
+                    }
+                    crate::tool::ToolProgress::Output { bytes, .. } => {
+                        assert!(
+                            !String::from_utf8_lossy(&bytes).contains("swordfish"),
+                            "secret was echoed in progress"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        };
+
+        assert!(output.text.contains("Password:"), "{}", output.text);
+        assert!(output.text.contains("accepted=yes"), "{}", output.text);
+        assert!(!output.text.contains("swordfish"), "{}", output.text);
+    }
+
+    #[test]
+    fn explicit_sudo_input_modes_do_not_claim_a_private_pty() {
+        assert!(direct_sudo_needs_terminal("sudo id"));
+        assert!(direct_sudo_needs_terminal("/usr/bin/sudo id"));
+        for command in ["sudo -n id", "sudo -S id", "sudo --askpass id"] {
+            assert!(!direct_sudo_needs_terminal(command), "{command}");
+        }
     }
 
     #[tokio::test]
@@ -782,7 +1180,35 @@ mod tests {
         assert!(error.message.contains("error nonzero_exit"), "{error}");
         assert!(error.message.contains("exit=3"), "{error}");
         assert!(error.message.contains("stderr: 1 lines\noops"), "{error}");
-        assert!(error.message.contains("truncated_stderr=false"), "{error}");
+        assert!(error.message.contains("complete_stderr=true"), "{error}");
+        assert!(!error.message.contains("truncated_stderr=false"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stdout_uses_the_unused_stderr_capture_budget() {
+        let f = fixture();
+        let mut sandbox = f.sandbox.clone();
+        sandbox.max_output_bytes = 2048;
+        let ctx = ToolContext {
+            active_skills: &[],
+            registered_tools: &[],
+            progress: ToolProgressSink::null(),
+            cancellation: Default::default(),
+            workspace: &f.workspace,
+            sandbox: &sandbox,
+            execution_scope: "exec-shared-budget-test",
+        };
+        let out = ExecTool
+            .execute(
+                json!({"command": "i=0; while [ $i -lt 150 ]; do printf 'abcdefghij\\n'; i=$((i+1)); done"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(out.text.contains("stdout: 150 lines"), "{}", out.text);
+        assert!(out.text.contains("complete_stdout=true"), "{}", out.text);
+        assert!(!out.text.contains("truncated_stdout"), "{}", out.text);
     }
 
     #[tokio::test]
@@ -860,6 +1286,11 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(
+            out.text.len() <= sandbox.max_output_bytes,
+            "result exceeded the configured cap: {} bytes",
+            out.text.len()
+        );
         assert!(out.text.len() < 8192, "output must stay bounded");
         assert!(out.text.contains("truncated_stdout=head:"), "{}", out.text);
         assert!(out.text.contains("omitted_bytes:"), "{}", out.text);

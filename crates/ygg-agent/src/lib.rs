@@ -113,8 +113,8 @@ pub use skills::{
 };
 pub use tool::{
     content_hash, CancellationToken, ErasedTool, ErasedToolAdapter, OutputStream, ReplaySafety,
-    Tool, ToolContext, ToolDefinition, ToolDescriptor, ToolError, ToolInputValidationIssue,
-    ToolOutput, ToolProgress, ToolProgressSink, TypedTool, TypedToolAdapter, ValidateToolInput,
-    MAX_PROGRESS_CHUNK_BYTES,
+    Tool, ToolContext, ToolDefinition, ToolDescriptor, ToolError, ToolInputRequest,
+    ToolInputResponse, ToolInputValidationIssue, ToolOutput, ToolProgress, ToolProgressSink,
+    TypedTool, TypedToolAdapter, ValidateToolInput, MAX_PROGRESS_CHUNK_BYTES,
 };
 pub use tools::{CoreTools, EditTool, ExecTool, ReadTool, SearchTool, WriteTool};

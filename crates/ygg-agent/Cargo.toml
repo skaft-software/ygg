@@ -8,6 +8,8 @@ description = "Stateful agent loop with tool execution and event streaming for Y
 repository.workspace = true
 homepage.workspace = true
 readme = "README.md"
+keywords = ["ai", "agents", "tools", "sessions", "llm"]
+categories = ["development-tools"]
 
 [lints]
 workspace = true

@@ -441,6 +441,7 @@ pub(crate) fn build_request(
     let reasoning_opt = if model.spec.capabilities.reasoning.is_some() {
         match req.reasoning {
             ReasoningConfig::Off => None,
+            ReasoningConfig::On => None,
             ReasoningConfig::Effort(effort) => {
                 let effort_str = match effort {
                     crate::types::ReasoningEffort::Minimal => "minimal".to_string(),
