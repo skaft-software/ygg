@@ -1,0 +1,14 @@
+: cite: docs/research/apidocs/compatibility/openAI-chat-completions/15-streaming-events.md (delta.tool_calls[].function.arguments)
+: cite: docs/design/ygg-ai.md §12.1/§13 (tool args accumulated by tool_calls[].index, parsed at end)
+data: {"id":"chatcmpl-tool","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"grep","arguments":""}}]}}]}
+
+data: {"id":"chatcmpl-tool","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pattern\":"}}]}}]}
+
+data: {"id":"chatcmpl-tool","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"foo\"}"}}]}}]}
+
+data: {"id":"chatcmpl-tool","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-tool","choices":[],"usage":{"prompt_tokens":30,"completion_tokens":10,"total_tokens":40}}
+
+data: [DONE]
+

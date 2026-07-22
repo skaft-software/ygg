@@ -1,0 +1,9 @@
+description = "Implement a task using deterministic Ygg context variables"
+argument_hint = "<task>"
+prompt = """
+Implement this task in {{workspace}}:
+
+{{prompt}}
+
+Inspect the repository before editing, keep the change narrowly scoped, and run the smallest relevant verification.
+"""

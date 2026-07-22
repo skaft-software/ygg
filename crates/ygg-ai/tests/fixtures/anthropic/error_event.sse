@@ -1,0 +1,7 @@
+: cite: docs/research/apidocs/anthropic-messages/messages.md (error event); docs/design/ygg-ai.md §12.3 (error -> Provider)
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_err","usage":{"input_tokens":10,"output_tokens":0}}}
+
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+

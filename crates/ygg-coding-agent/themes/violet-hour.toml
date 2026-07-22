@@ -1,0 +1,334 @@
+[metadata]
+name = "Violet Hour"
+description = "A literary evening room: violet structure, old-gold punctuation, elegant emphasis, and unhurried spacing."
+author = "Ygg theme pack"
+version = "1"
+terminal = "light-dark"
+adaptive = true
+
+[colors]
+accent = "#7650a5"
+muted = "#746b7c"
+error = "#bd4658"
+warning = "#a17116"
+success = "#4e795c"
+info = "#4f708f"
+border = "#756781"
+border_focused = "accent"
+tool_title = "#a17116"
+md_heading = "#7650a5"
+md_link = "#4f708f"
+md_code = "#885d9f"
+md_code_border = "#756781"
+md_quote_border = "#a17116"
+md_list_bullet = "#a17116"
+syntax_comment = "#746b7c"
+syntax_keyword = "#7650a5"
+syntax_function = "#4f708f"
+syntax_string = "#4e795c"
+syntax_number = "#a17116"
+syntax_type = "#885d9f"
+syntax_operator = "#b44e86"
+diff_added_bg = "#4e795c"
+diff_removed_bg = "#bd4658"
+violet_chapter_bg = "#3f2a57"
+violet_quote_bg = "#514224"
+violet_footnote_bg = "#342d3b"
+
+[model]
+use_lab_color = false
+
+[roles.tool_title]
+foreground = "tool_title"
+bold = true
+
+[roles.heading]
+foreground = "md_heading"
+bold = true
+
+[roles.emphasis]
+foreground = "accent"
+italic = true
+
+[roles.quote]
+foreground = "muted"
+italic = true
+
+[roles.notification]
+foreground = "info"
+italic = true
+
+[roles.confirmation]
+foreground = "warning"
+bold = true
+
+[roles."extension.flourish"]
+foreground = "accent"
+italic = true
+
+[roles."extension.status"]
+foreground = "warning"
+italic = true
+
+[roles."extension.header"]
+foreground = "accent"
+bold = true
+
+[roles."surface.user"]
+foreground = "foreground"
+background = "violet_chapter_bg"
+
+[roles."surface.user.border"]
+foreground = "accent"
+
+[roles."surface.user.label"]
+foreground = "warning"
+bold = true
+
+[roles."surface.assistant"]
+foreground = "foreground"
+
+[roles."surface.assistant.border"]
+foreground = "accent"
+
+[roles."surface.assistant.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.reasoning"]
+foreground = "muted"
+italic = true
+
+[roles."surface.reasoning.border"]
+foreground = "warning"
+
+[roles."surface.reasoning.label"]
+foreground = "warning"
+italic = true
+
+[roles."surface.tool"]
+foreground = "foreground"
+background = "violet_footnote_bg"
+
+[roles."surface.tool.border"]
+foreground = "border"
+
+[roles."surface.tool.label"]
+foreground = "warning"
+italic = true
+
+[roles."surface.shell"]
+foreground = "foreground"
+background = "violet_footnote_bg"
+
+[roles."surface.shell.border"]
+foreground = "accent"
+
+[roles."surface.shell.label"]
+foreground = "accent"
+italic = true
+
+[roles."surface.notice"]
+foreground = "foreground"
+background = "violet_quote_bg"
+italic = true
+
+[roles."surface.notice.border"]
+foreground = "warning"
+
+[roles."surface.notice.label"]
+foreground = "warning"
+bold = true
+
+[roles."surface.outcome"]
+foreground = "muted"
+
+[roles."surface.outcome.border"]
+foreground = "warning"
+
+[roles."surface.outcome.label"]
+foreground = "warning"
+italic = true
+
+[roles."surface.compaction"]
+foreground = "muted"
+italic = true
+
+[roles."surface.compaction.border"]
+foreground = "accent"
+
+[roles."surface.compaction.label"]
+foreground = "accent"
+bold = true
+
+[glyphs]
+top_left = "╭"
+top_right = "╮"
+bottom_left = "╰"
+bottom_right = "╯"
+horizontal = "─"
+vertical = "│"
+branch = "✦"
+last_branch = "└"
+rail = "│"
+prompt = "›"
+shell = "§"
+success = "✓"
+warning = "!"
+note = "❧"
+error = "×"
+interrupt = "■"
+pending = "·"
+collapsed = "▸"
+expanded = "▾"
+separator = " ✦ "
+ellipsis = "…"
+bullet = "·"
+reasoning = "⁝"
+wordmark = "YGG · 21:00"
+
+[glyphs_ascii]
+top_left = "+"
+top_right = "."
+bottom_left = "'"
+bottom_right = "'"
+horizontal = "-"
+vertical = "|"
+branch = "*-"
+last_branch = "`-"
+rail = "|"
+prompt = ">"
+shell = "S"
+success = "+"
+warning = "!"
+note = "*"
+error = "x"
+interrupt = "#"
+pending = "."
+collapsed = ">"
+expanded = "v"
+separator = " * "
+ellipsis = "..."
+bullet = "*"
+reasoning = ":"
+wordmark = "YGG 21:00"
+
+[surfaces.user]
+chrome = "rule"
+heading = "overline"
+label = "CHAPTER I · REQUEST"
+padding = 1
+width = "content"
+align = "center"
+max_width = 86
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "REQUEST"
+narrow_padding = 0
+
+[surfaces.assistant]
+chrome = "rule"
+heading = "overline"
+label = "RESPONSE"
+padding = 1
+width = "content"
+align = "center"
+max_width = 86
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.reasoning]
+chrome = "rail"
+heading = "inline"
+label = "MARGINALIA"
+padding = 1
+width = "content"
+align = "center"
+max_width = 72
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.tool]
+chrome = "card"
+heading = "tab"
+label = "FOOTNOTE · TOOL"
+padding = 1
+width = "content"
+align = "right"
+max_width = 78
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "TOOL"
+narrow_padding = 0
+
+[surfaces.shell]
+chrome = "card"
+heading = "tab"
+label = "APPENDIX · SHELL"
+padding = 1
+width = "content"
+align = "right"
+max_width = 82
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "SHELL"
+narrow_padding = 0
+
+[surfaces.notice]
+chrome = "card"
+heading = "overline"
+label = "PULL QUOTE"
+padding = 2
+width = "content"
+align = "center"
+max_width = 72
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "QUOTE"
+narrow_padding = 0
+
+[surfaces.outcome]
+chrome = "rule"
+heading = "overline"
+label = "FINIS"
+padding = 0
+width = "content"
+align = "right"
+max_width = 62
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "END"
+narrow_padding = 0
+
+[surfaces.compaction]
+chrome = "rule"
+heading = "overline"
+label = "PREVIOUSLY"
+padding = 0
+width = "content"
+align = "center"
+max_width = 82
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "RECAP"
+narrow_padding = 0
+
+[layout]
+density = "airy"
+show_header = true
+show_footer = true
+show_status_line = true
+show_tool_duration = true
+show_reasoning = true
+show_panel_borders = true
+transcript_inset = 3
+composer_padding = 2
+narrow_breakpoint = 80
+narrow_show_header = false
+narrow_show_footer = true
+narrow_show_status_line = true
+narrow_show_tool_duration = false
+narrow_show_reasoning = true
+narrow_show_panel_borders = false

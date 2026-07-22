@@ -1,0 +1,28 @@
+# Session recovery
+
+The invalid **final record** is removed before the next append. Read the [format guide](https://example.com/format).
+
+## Changes
+
+- preserves valid records without a trailing newline
+- removes invalid trailing bytes
+- supports `append()` after recovery
+
+> Recovery never rewrites a valid prefix.
+
+```rust
+fn recover(path: &Path) -> Result<usize> {
+    let valid = scan_records(path)?;
+    truncate(path, valid)?;
+    Ok(valid)
+}
+```
+
+| State | Action |
+| :--- | :--- |
+| valid | preserve |
+| partial | truncate trailing bytes |
+
+---
+
+~~obsolete~~ becomes *current*.

@@ -1,0 +1,296 @@
+[metadata]
+name = "Zen Mono"
+description = "Deliberate near-monochrome: one quiet graphite accent, minimal punctuation, no ornamental telemetry."
+author = "Ygg theme pack"
+version = "1"
+terminal = "light-dark"
+adaptive = true
+
+[colors]
+accent = "#717171"
+muted = "#777777"
+error = "#9c4f4f"
+warning = "#806b38"
+success = "#58705e"
+info = "#5f6e78"
+border = "#747474"
+border_focused = "accent"
+tool_title = "#717171"
+md_heading = "#717171"
+md_link = "#5f6e78"
+md_code = "#717171"
+md_code_border = "#747474"
+md_quote_border = "#747474"
+md_list_bullet = "#717171"
+syntax_comment = "#777777"
+syntax_keyword = "#716878"
+syntax_function = "#5f6e78"
+syntax_string = "#58705e"
+syntax_number = "#806b38"
+syntax_type = "#717171"
+syntax_operator = "#78676f"
+diff_added_bg = "#58705e"
+diff_removed_bg = "#9c4f4f"
+
+[model]
+use_lab_color = false
+
+[roles.tool_title]
+foreground = "tool_title"
+
+[roles.heading]
+foreground = "md_heading"
+bold = true
+
+[roles.emphasis]
+foreground = "foreground"
+italic = true
+
+[roles.notification]
+foreground = "muted"
+
+[roles.confirmation]
+foreground = "foreground"
+underline = true
+
+[roles."extension.quiet"]
+foreground = "muted"
+
+[roles."extension.status"]
+foreground = "muted"
+
+[roles."extension.header"]
+foreground = "foreground"
+underline = true
+
+[roles."surface.user"]
+foreground = "foreground"
+
+[roles."surface.user.border"]
+foreground = "muted"
+
+[roles."surface.user.label"]
+foreground = "muted"
+
+[roles."surface.assistant"]
+foreground = "foreground"
+
+[roles."surface.assistant.border"]
+foreground = "muted"
+
+[roles."surface.assistant.label"]
+foreground = "muted"
+
+[roles."surface.reasoning"]
+foreground = "muted"
+italic = true
+
+[roles."surface.reasoning.border"]
+foreground = "muted"
+
+[roles."surface.reasoning.label"]
+foreground = "muted"
+
+[roles."surface.tool"]
+foreground = "foreground"
+
+[roles."surface.tool.border"]
+foreground = "muted"
+
+[roles."surface.tool.label"]
+foreground = "muted"
+
+[roles."surface.shell"]
+foreground = "foreground"
+
+[roles."surface.shell.border"]
+foreground = "muted"
+
+[roles."surface.shell.label"]
+foreground = "muted"
+
+[roles."surface.notice"]
+foreground = "muted"
+
+[roles."surface.notice.border"]
+foreground = "muted"
+
+[roles."surface.notice.label"]
+foreground = "muted"
+
+[roles."surface.outcome"]
+foreground = "muted"
+
+[roles."surface.outcome.border"]
+foreground = "muted"
+
+[roles."surface.outcome.label"]
+foreground = "muted"
+
+[roles."surface.compaction"]
+foreground = "muted"
+italic = true
+
+[roles."surface.compaction.border"]
+foreground = "muted"
+
+[roles."surface.compaction.label"]
+foreground = "muted"
+
+[glyphs]
+top_left = "┌"
+top_right = "┐"
+bottom_left = "└"
+bottom_right = "┘"
+horizontal = "─"
+vertical = "│"
+branch = "│"
+last_branch = "└"
+rail = "│"
+prompt = "·"
+shell = "$"
+success = "·"
+warning = "·"
+note = "·"
+error = "×"
+interrupt = "·"
+pending = "·"
+collapsed = "+"
+expanded = "-"
+separator = "  "
+ellipsis = "…"
+bullet = "·"
+reasoning = "·"
+wordmark = "ygg"
+
+[glyphs_ascii]
+top_left = "+"
+top_right = "+"
+bottom_left = "+"
+bottom_right = "+"
+horizontal = "-"
+vertical = "|"
+branch = "|"
+last_branch = "`"
+rail = "|"
+prompt = ">"
+shell = "$"
+success = "."
+warning = "."
+note = "."
+error = "x"
+interrupt = "."
+pending = "."
+collapsed = "+"
+expanded = "-"
+separator = "  "
+ellipsis = "..."
+bullet = "."
+reasoning = "."
+wordmark = "ygg"
+
+[surfaces.user]
+chrome = "plain"
+heading = "none"
+padding = 0
+width = "content"
+align = "center"
+max_width = 68
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.assistant]
+chrome = "plain"
+heading = "none"
+padding = 0
+width = "content"
+align = "center"
+max_width = 68
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.reasoning]
+chrome = "plain"
+heading = "none"
+padding = 0
+width = "content"
+align = "center"
+max_width = 60
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.tool]
+chrome = "plain"
+heading = "none"
+padding = 0
+width = "content"
+align = "center"
+max_width = 68
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.shell]
+chrome = "plain"
+heading = "none"
+padding = 0
+width = "content"
+align = "center"
+max_width = 68
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.notice]
+chrome = "plain"
+heading = "none"
+padding = 0
+width = "content"
+align = "center"
+max_width = 56
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.outcome]
+chrome = "plain"
+heading = "none"
+padding = 0
+width = "content"
+align = "center"
+max_width = 48
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.compaction]
+chrome = "plain"
+heading = "none"
+padding = 0
+width = "content"
+align = "center"
+max_width = 60
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[layout]
+density = "airy"
+show_header = false
+show_footer = true
+show_status_line = true
+show_tool_duration = false
+show_reasoning = false
+show_panel_borders = false
+transcript_inset = 0
+composer_padding = 2
+narrow_breakpoint = 88
+narrow_show_header = false
+narrow_show_footer = true
+narrow_show_status_line = true
+narrow_show_tool_duration = false
+narrow_show_reasoning = false
+narrow_show_panel_borders = false

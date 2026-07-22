@@ -1,0 +1,329 @@
+[metadata]
+name = "Tidepool"
+description = "A calm marine workspace: tidal teal, coral warnings, soft rounded edges, and measured breathing room."
+author = "Ygg theme pack"
+version = "1"
+terminal = "light-dark"
+adaptive = true
+
+[colors]
+accent = "#168f91"
+muted = "#5b7376"
+error = "#cf5b55"
+warning = "#a06e1b"
+success = "#388064"
+info = "#347b9b"
+border = "#4f8589"
+border_focused = "accent"
+tool_title = "#168f91"
+md_heading = "#168f91"
+md_link = "#347b9b"
+md_code = "#397d83"
+md_code_border = "#4f8589"
+md_quote_border = "#168f91"
+md_list_bullet = "#cf5b55"
+syntax_comment = "#5b7376"
+syntax_keyword = "#765d9f"
+syntax_function = "#347b9b"
+syntax_string = "#388064"
+syntax_number = "#a06e1b"
+syntax_type = "#397d83"
+syntax_operator = "#b64e78"
+diff_added_bg = "#388064"
+diff_removed_bg = "#cf5b55"
+pool_shore_bg = "#633a38"
+pool_tide_bg = "#164a4d"
+pool_tool_bg = "#24434d"
+pool_notice_bg = "#4f4430"
+
+[model]
+use_lab_color = false
+
+[roles.tool_title]
+foreground = "tool_title"
+bold = true
+
+[roles.heading]
+foreground = "md_heading"
+bold = true
+
+[roles.quote]
+foreground = "muted"
+italic = true
+
+[roles.notification]
+foreground = "info"
+
+[roles.confirmation]
+foreground = "warning"
+bold = true
+
+[roles."extension.current"]
+foreground = "accent"
+italic = true
+
+[roles."extension.status"]
+foreground = "accent"
+italic = true
+
+[roles."extension.header"]
+foreground = "info"
+bold = true
+
+[roles."surface.user"]
+foreground = "foreground"
+background = "pool_shore_bg"
+
+[roles."surface.user.border"]
+foreground = "error"
+
+[roles."surface.user.label"]
+foreground = "error"
+bold = true
+
+[roles."surface.assistant"]
+foreground = "foreground"
+background = "pool_tide_bg"
+
+[roles."surface.assistant.border"]
+foreground = "accent"
+
+[roles."surface.assistant.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.reasoning"]
+foreground = "muted"
+
+[roles."surface.reasoning.border"]
+foreground = "accent"
+
+[roles."surface.reasoning.label"]
+foreground = "accent"
+italic = true
+
+[roles."surface.tool"]
+foreground = "foreground"
+background = "pool_tool_bg"
+
+[roles."surface.tool.border"]
+foreground = "info"
+
+[roles."surface.tool.label"]
+foreground = "info"
+bold = true
+
+[roles."surface.shell"]
+foreground = "foreground"
+background = "pool_tool_bg"
+
+[roles."surface.shell.border"]
+foreground = "accent"
+
+[roles."surface.shell.label"]
+foreground = "accent"
+italic = true
+
+[roles."surface.notice"]
+foreground = "foreground"
+background = "pool_notice_bg"
+
+[roles."surface.notice.border"]
+foreground = "warning"
+
+[roles."surface.notice.label"]
+foreground = "warning"
+bold = true
+
+[roles."surface.outcome"]
+foreground = "muted"
+
+[roles."surface.outcome.border"]
+foreground = "accent"
+
+[roles."surface.outcome.label"]
+foreground = "accent"
+italic = true
+
+[roles."surface.compaction"]
+foreground = "muted"
+
+[roles."surface.compaction.border"]
+foreground = "border"
+
+[roles."surface.compaction.label"]
+foreground = "muted"
+italic = true
+
+[glyphs]
+top_left = "╭"
+top_right = "╮"
+bottom_left = "╰"
+bottom_right = "╯"
+horizontal = "─"
+vertical = "│"
+branch = "∿"
+last_branch = "⌞"
+rail = "│"
+prompt = "~"
+shell = "⌁"
+success = "○"
+warning = "△"
+note = "◌"
+error = "×"
+interrupt = "●"
+pending = "·"
+collapsed = "›"
+expanded = "⌄"
+separator = " · "
+ellipsis = "…"
+bullet = "○"
+reasoning = "∼"
+wordmark = "ygg ∴ tide"
+
+[glyphs_ascii]
+top_left = "+"
+top_right = "\\"
+bottom_left = "\\"
+bottom_right = "/"
+horizontal = "~"
+vertical = "|"
+branch = "~>"
+last_branch = "`>"
+rail = "|"
+prompt = ">"
+shell = "~"
+success = "o"
+warning = "!"
+note = "o"
+error = "x"
+interrupt = "O"
+pending = "."
+collapsed = ">"
+expanded = "v"
+separator = " ~ "
+ellipsis = "..."
+bullet = "o"
+reasoning = "~"
+wordmark = "ygg tide"
+
+[surfaces.user]
+chrome = "card"
+heading = "tab"
+label = "shore / you"
+padding = 2
+width = "content"
+align = "right"
+max_width = 80
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "shore"
+narrow_padding = 0
+
+[surfaces.assistant]
+chrome = "card"
+heading = "overline"
+label = "tide / ygg"
+padding = 2
+width = "content"
+align = "left"
+max_width = 94
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "tide"
+narrow_padding = 0
+
+[surfaces.reasoning]
+chrome = "rail"
+heading = "inline"
+label = "undertow"
+padding = 1
+width = "content"
+align = "left"
+max_width = 78
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.tool]
+chrome = "card"
+heading = "tab"
+label = "drift / tool"
+padding = 1
+width = "content"
+align = "right"
+max_width = 90
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "tool"
+narrow_padding = 0
+
+[surfaces.shell]
+chrome = "card"
+heading = "tab"
+label = "current / shell"
+padding = 1
+width = "content"
+align = "left"
+max_width = 94
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "shell"
+narrow_padding = 0
+
+[surfaces.notice]
+chrome = "band"
+heading = "inline"
+label = "buoy"
+padding = 1
+width = "content"
+align = "center"
+max_width = 74
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "note"
+narrow_padding = 0
+
+[surfaces.outcome]
+chrome = "rule"
+heading = "overline"
+label = "low tide"
+padding = 0
+width = "content"
+align = "center"
+max_width = 66
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "done"
+narrow_padding = 0
+
+[surfaces.compaction]
+chrome = "rail"
+heading = "inline"
+label = "tidemark / memory"
+padding = 1
+width = "content"
+align = "right"
+max_width = 86
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "memory"
+narrow_padding = 0
+
+[layout]
+density = "airy"
+show_header = true
+show_footer = true
+show_status_line = true
+show_tool_duration = false
+show_reasoning = true
+show_panel_borders = true
+transcript_inset = 3
+composer_padding = 2
+narrow_breakpoint = 76
+narrow_show_header = false
+narrow_show_footer = true
+narrow_show_status_line = true
+narrow_show_tool_duration = false
+narrow_show_reasoning = true
+narrow_show_panel_borders = false

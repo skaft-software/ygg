@@ -1,0 +1,12 @@
+: cite: docs/research/apidocs/openai-responses/01-responses.md (response object `usage` is nullable / absent on some terminal snapshots)
+: cite: docs/design/ygg-ai.md §8 (usage optional; Finished.usage falls back to default without a Usage event)
+data: {"type":"response.created","response":{"id":"resp_nou"}}
+
+data: {"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hi"}
+
+data: {"type":"response.output_text.done","output_index":0,"content_index":0}
+
+data: {"type":"response.completed","response":{}}
+

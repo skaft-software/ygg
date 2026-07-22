@@ -1,0 +1,14 @@
+: cite: docs/research/apidocs/compatibility/openAI-chat-completions/15-streaming-events.md (delta.reasoning_content)
+: cite: docs/design/ygg-ai.md §12.1/§14 (reasoning_content -> Reasoning* with no state)
+data: {"id":"chatcmpl-reason","choices":[{"index":0,"delta":{"reasoning_content":"Let me think"}}]}
+
+data: {"id":"chatcmpl-reason","choices":[{"index":0,"delta":{"reasoning_content":" about it."}}]}
+
+data: {"id":"chatcmpl-reason","choices":[{"index":0,"delta":{"content":"Answer: 42"}}]}
+
+data: {"id":"chatcmpl-reason","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-reason","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,"completion_tokens_details":{"reasoning_tokens":5},"total_tokens":28}}
+
+data: [DONE]
+

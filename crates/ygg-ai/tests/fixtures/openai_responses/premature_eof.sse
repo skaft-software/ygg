@@ -1,0 +1,7 @@
+: cite: docs/design/ygg-ai.md §8 terminal table (clean close before response.completed -> PrematureEof)
+data: {"type":"response.created","response":{"id":"resp_eof"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"cut"}
+

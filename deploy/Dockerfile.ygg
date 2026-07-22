@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1.7
+# Build with: docker build -f deploy/Dockerfile.ygg -t ygg:alpha .
+FROM rust:1.86-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --locked --release -p ygg-coding-agent --bin ygg
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 ygg
+COPY --from=build /src/target/release/ygg /usr/local/bin/ygg
+USER ygg
+WORKDIR /workspace
+ENTRYPOINT ["ygg"]

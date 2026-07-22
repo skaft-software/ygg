@@ -1,0 +1,324 @@
+[metadata]
+name = "Signal Noir"
+description = "A monochrome operations room interrupted by one red transmission channel."
+author = "Ygg theme pack"
+version = "1"
+terminal = "light-dark"
+adaptive = true
+
+[colors]
+accent = "#b52c3a"
+muted = "#696b70"
+error = "#cf2638"
+warning = "#9d691c"
+success = "#4d735a"
+info = "#536e81"
+border = "#777a80"
+border_focused = "accent"
+tool_title = "#b52c3a"
+md_heading = "#b52c3a"
+md_link = "#536e81"
+md_code = "#74777c"
+md_code_border = "#777a80"
+md_quote_border = "#b52c3a"
+md_list_bullet = "#b52c3a"
+syntax_comment = "#696b70"
+syntax_keyword = "#785a86"
+syntax_function = "#536e81"
+syntax_string = "#4d735a"
+syntax_number = "#9d691c"
+syntax_type = "#74777c"
+syntax_operator = "#b52c3a"
+diff_added_bg = "#4d735a"
+diff_removed_bg = "#cf2638"
+signal_tx_bg = "#5a1823"
+signal_trace_bg = "#33343a"
+signal_alert_bg = "#671a26"
+
+[model]
+use_lab_color = false
+
+[roles.tool_title]
+foreground = "tool_title"
+bold = true
+
+[roles.heading]
+foreground = "md_heading"
+bold = true
+
+[roles.link]
+foreground = "md_link"
+underline = true
+
+[roles.notification]
+foreground = "info"
+inverse = true
+
+[roles.confirmation]
+foreground = "error"
+bold = true
+inverse = true
+
+[roles."extension.signal"]
+foreground = "accent"
+bold = true
+
+[roles."extension.status"]
+foreground = "accent"
+bold = true
+
+[roles."extension.header"]
+foreground = "accent"
+bold = true
+underline = true
+
+[roles."surface.user"]
+foreground = "foreground"
+background = "signal_tx_bg"
+
+[roles."surface.user.border"]
+foreground = "accent"
+
+[roles."surface.user.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.assistant"]
+foreground = "foreground"
+
+[roles."surface.assistant.border"]
+foreground = "border"
+
+[roles."surface.assistant.label"]
+foreground = "muted"
+
+[roles."surface.reasoning"]
+foreground = "muted"
+
+[roles."surface.reasoning.border"]
+foreground = "border"
+
+[roles."surface.reasoning.label"]
+foreground = "muted"
+
+[roles."surface.tool"]
+foreground = "foreground"
+background = "signal_trace_bg"
+
+[roles."surface.tool.border"]
+foreground = "border"
+
+[roles."surface.tool.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.shell"]
+foreground = "foreground"
+background = "signal_trace_bg"
+
+[roles."surface.shell.border"]
+foreground = "accent"
+
+[roles."surface.shell.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.notice"]
+foreground = "foreground"
+background = "signal_alert_bg"
+
+[roles."surface.notice.border"]
+foreground = "error"
+
+[roles."surface.notice.label"]
+foreground = "error"
+bold = true
+inverse = true
+
+[roles."surface.outcome"]
+foreground = "muted"
+
+[roles."surface.outcome.border"]
+foreground = "border"
+
+[roles."surface.outcome.label"]
+foreground = "muted"
+bold = true
+
+[roles."surface.compaction"]
+foreground = "muted"
+
+[roles."surface.compaction.border"]
+foreground = "accent"
+
+[roles."surface.compaction.label"]
+foreground = "accent"
+bold = true
+
+[glyphs]
+top_left = "┌"
+top_right = "┐"
+bottom_left = "└"
+bottom_right = "┘"
+horizontal = "─"
+vertical = "│"
+branch = "├"
+last_branch = "└"
+rail = "│"
+prompt = "▶"
+shell = "▸"
+success = "■"
+warning = "▲"
+note = "◆"
+error = "×"
+interrupt = "■"
+pending = "·"
+collapsed = "▹"
+expanded = "▿"
+separator = " // "
+ellipsis = "…"
+bullet = "▪"
+reasoning = "∙"
+wordmark = "YGG SIGNAL"
+
+[glyphs_ascii]
+top_left = "+"
+top_right = "+"
+bottom_left = "+"
+bottom_right = "+"
+horizontal = "-"
+vertical = "|"
+branch = "+-"
+last_branch = "`-"
+rail = "|"
+prompt = ">"
+shell = ">"
+success = "#"
+warning = "!"
+note = "*"
+error = "x"
+interrupt = "#"
+pending = "."
+collapsed = ">"
+expanded = "v"
+separator = " // "
+ellipsis = "..."
+bullet = "#"
+reasoning = "."
+wordmark = "YGG SIGNAL"
+
+[surfaces.user]
+chrome = "band"
+heading = "overline"
+label = "INCOMING SIGNAL"
+padding = 1
+width = "full"
+align = "left"
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "IN"
+narrow_padding = 0
+
+[surfaces.assistant]
+chrome = "plain"
+heading = "none"
+padding = 0
+width = "full"
+align = "left"
+max_width = 108
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.reasoning]
+chrome = "rail"
+heading = "inline"
+label = "LOW BAND"
+padding = 0
+width = "content"
+align = "left"
+max_width = 88
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.tool]
+chrome = "rule"
+heading = "overline"
+label = "TRACE"
+padding = 0
+width = "full"
+align = "left"
+max_width = 108
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "T"
+narrow_padding = 0
+
+[surfaces.shell]
+chrome = "band"
+heading = "tab"
+label = "CHANNEL / SHELL"
+padding = 1
+width = "full"
+align = "left"
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "SH"
+narrow_padding = 0
+
+[surfaces.notice]
+chrome = "band"
+heading = "inline"
+label = "INTERRUPT"
+padding = 1
+width = "full"
+align = "left"
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "!"
+narrow_padding = 0
+
+[surfaces.outcome]
+chrome = "plain"
+heading = "inline"
+label = "CARRIER CLOSED"
+padding = 0
+width = "content"
+align = "right"
+max_width = 72
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "END"
+narrow_padding = 0
+
+[surfaces.compaction]
+chrome = "rule"
+heading = "overline"
+label = "SIGNAL ARCHIVE"
+padding = 0
+width = "full"
+align = "left"
+max_width = 108
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "ARCHIVE"
+narrow_padding = 0
+
+[layout]
+density = "comfortable"
+show_header = true
+show_footer = true
+show_status_line = true
+show_tool_duration = true
+show_reasoning = false
+show_panel_borders = true
+transcript_inset = 2
+composer_padding = 1
+narrow_breakpoint = 66
+narrow_show_header = false
+narrow_show_footer = true
+narrow_show_status_line = true
+narrow_show_tool_duration = false
+narrow_show_reasoning = false
+narrow_show_panel_borders = false

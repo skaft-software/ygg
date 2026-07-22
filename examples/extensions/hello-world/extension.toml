@@ -1,0 +1,22 @@
+name = "hello-world"
+version = "0.1.0"
+api_version = "0.1"
+description = "A tiny language-neutral Ygg extension example"
+
+[entrypoint]
+command = "extension.py"
+
+[capabilities]
+filesystem = "none"
+process = false
+network = false
+
+[contributes]
+tools = ["hello_world"]
+commands = ["hello"]
+hooks = ["before_prompt", "after_response"]
+ui = ["status"]
+context = true
+tool_renderers = ["hello_world"]
+notifications = true
+confirmations = false

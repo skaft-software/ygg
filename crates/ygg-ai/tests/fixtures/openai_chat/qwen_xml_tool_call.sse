@@ -1,0 +1,8 @@
+data: {"id":"qwen-xml-1","choices":[{"delta":{"content":"<tool"}}]}
+
+data: {"id":"qwen-xml-1","choices":[{"delta":{"content":"_call>\n<function=read>\n<parameter=path>src/main.rs</parameter>\n</function>\n</tool_call>"}}]}
+
+data: {"id":"qwen-xml-1","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}
+
+data: [DONE]
+

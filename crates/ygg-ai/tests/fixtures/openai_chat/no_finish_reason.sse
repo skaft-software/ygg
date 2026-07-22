@@ -1,0 +1,8 @@
+: cite: OpenAI-compatible servers that omit the finish_reason chunk entirely and terminate with [DONE]
+: cite: docs/design/ygg-ai.md §12.1 ([DONE] terminal) + §8 (parts must be balanced before Finished)
+data: {"id":"chatcmpl-nofinish","choices":[{"index":0,"delta":{"role":"assistant","content":"Done without a finish chunk"}}]}
+
+data: {"id":"chatcmpl-nofinish","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}
+
+data: [DONE]
+

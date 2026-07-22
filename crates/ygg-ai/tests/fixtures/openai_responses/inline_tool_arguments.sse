@@ -1,0 +1,9 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_inline"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","name":"grep","call_id":"call_1","arguments":"{\"pattern\":\"foo\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{}}
+

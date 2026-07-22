@@ -1,0 +1,6 @@
+: cite: docs/research/apidocs/openai-responses/07-streaming-events.md (top-level error event {type:"error",code,message,param,sequence_number})
+: cite: docs/design/ygg-ai.md §12.2 (Responses top-level error -> AiError::Provider, not PrematureEof)
+data: {"type":"response.created","response":{"id":"resp_err"}}
+
+data: {"type":"error","code":"ERR_SOMETHING","message":"Something went wrong","param":null,"sequence_number":1}
+

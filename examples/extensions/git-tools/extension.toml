@@ -1,0 +1,18 @@
+name = "git-tools"
+version = "0.1.0"
+api_version = "0.1"
+description = "Read-only Git status tools with a semantic terminal renderer"
+
+[entrypoint]
+command = "extension.py"
+
+[capabilities]
+filesystem = "workspace"
+process = true
+network = false
+
+[contributes]
+tools = ["git_status"]
+commands = ["checkpoint"]
+tool_renderers = ["git_status"]
+notifications = true

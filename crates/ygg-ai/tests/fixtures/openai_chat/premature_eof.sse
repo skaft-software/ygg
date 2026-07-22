@@ -1,0 +1,3 @@
+: cite: docs/design/ygg-ai.md §8 terminal table, §17 (clean body close before terminal event -> PrematureEof)
+data: {"id":"chatcmpl-eof","choices":[{"index":0,"delta":{"role":"assistant","content":"interrupted"}}]}
+

@@ -1,0 +1,328 @@
+[metadata]
+name = "Field Notes"
+description = "A botanist's annotated notebook: moss, ochre, pencil marks, and practical ASCII-like notation."
+author = "Ygg theme pack"
+version = "1"
+terminal = "light-dark"
+adaptive = true
+
+[colors]
+accent = "#6e7e35"
+muted = "#746f58"
+error = "#b8493f"
+warning = "#9b6d18"
+success = "#56763d"
+info = "#4d7478"
+border = "#817b5e"
+border_focused = "accent"
+tool_title = "#6e7e35"
+md_heading = "#6e7e35"
+md_link = "#4d7478"
+md_code = "#8c5c36"
+md_code_border = "#817b5e"
+md_quote_border = "#9b6d18"
+md_list_bullet = "#9b6d18"
+syntax_comment = "#746f58"
+syntax_keyword = "#785482"
+syntax_function = "#4d7478"
+syntax_string = "#56763d"
+syntax_number = "#9b6d18"
+syntax_type = "#8c5c36"
+syntax_operator = "#a34c66"
+diff_added_bg = "#56763d"
+diff_removed_bg = "#b8493f"
+field_note_bg = "#6e6537"
+field_command_bg = "#4b5835"
+
+[model]
+use_lab_color = false
+
+[roles.tool_title]
+foreground = "tool_title"
+bold = true
+
+[roles.heading]
+foreground = "md_heading"
+bold = true
+
+[roles.quote]
+foreground = "muted"
+italic = true
+
+[roles.notification]
+foreground = "info"
+italic = true
+
+[roles.confirmation]
+foreground = "warning"
+underline = true
+
+[roles."extension.annotation"]
+foreground = "warning"
+italic = true
+
+[roles."extension.status"]
+foreground = "muted"
+italic = true
+
+[roles."extension.header"]
+foreground = "accent"
+underline = true
+
+[roles."surface.user"]
+foreground = "foreground"
+
+[roles."surface.user.border"]
+foreground = "warning"
+
+[roles."surface.user.label"]
+foreground = "warning"
+bold = true
+
+[roles."surface.assistant"]
+foreground = "foreground"
+
+[roles."surface.assistant.border"]
+foreground = "accent"
+
+[roles."surface.assistant.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.reasoning"]
+foreground = "muted"
+italic = true
+
+[roles."surface.reasoning.border"]
+foreground = "border"
+
+[roles."surface.reasoning.label"]
+foreground = "muted"
+bold = true
+
+[roles."surface.tool"]
+foreground = "foreground"
+background = "field_command_bg"
+
+[roles."surface.tool.border"]
+foreground = "accent"
+
+[roles."surface.tool.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.shell"]
+foreground = "foreground"
+
+[roles."surface.shell.border"]
+foreground = "warning"
+
+[roles."surface.shell.label"]
+foreground = "warning"
+bold = true
+
+[roles."surface.notice"]
+foreground = "foreground"
+background = "field_note_bg"
+
+[roles."surface.notice.border"]
+foreground = "warning"
+
+[roles."surface.notice.label"]
+foreground = "warning"
+bold = true
+underline = true
+
+[roles."surface.outcome"]
+foreground = "muted"
+
+[roles."surface.outcome.border"]
+foreground = "border"
+
+[roles."surface.outcome.label"]
+foreground = "muted"
+bold = true
+
+[roles."surface.compaction"]
+foreground = "muted"
+
+[roles."surface.compaction.border"]
+foreground = "border"
+
+[roles."surface.compaction.label"]
+foreground = "muted"
+italic = true
+
+[glyphs]
+top_left = "+"
+top_right = "+"
+bottom_left = "+"
+bottom_right = "+"
+horizontal = "-"
+vertical = "|"
+branch = "|-"
+last_branch = "`-"
+rail = "|"
+prompt = ":"
+shell = "$"
+success = "+"
+warning = "!"
+note = "*"
+error = "x"
+interrupt = "#"
+pending = "."
+collapsed = "[+]"
+expanded = "[-]"
+separator = " / "
+ellipsis = "..."
+bullet = "-"
+reasoning = ";"
+wordmark = "field:ygg"
+
+[glyphs_ascii]
+top_left = "+"
+top_right = "+"
+bottom_left = "+"
+bottom_right = "+"
+horizontal = "-"
+vertical = "|"
+branch = "|-"
+last_branch = "`-"
+rail = "|"
+prompt = ">"
+shell = "$"
+success = "+"
+warning = "!"
+note = "*"
+error = "x"
+interrupt = "#"
+pending = "."
+collapsed = "[+]"
+expanded = "[-]"
+separator = " / "
+ellipsis = "..."
+bullet = "-"
+reasoning = ";"
+wordmark = "field:ygg"
+
+[surfaces.user]
+chrome = "rail"
+heading = "inline"
+label = "Q"
+padding = 1
+width = "content"
+align = "left"
+max_width = 96
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "Q"
+narrow_padding = 0
+
+[surfaces.assistant]
+chrome = "rail"
+heading = "inline"
+label = "OBS"
+padding = 1
+width = "content"
+align = "left"
+max_width = 100
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "A"
+narrow_padding = 0
+
+[surfaces.reasoning]
+chrome = "rail"
+heading = "inline"
+label = "THINK"
+padding = 1
+width = "content"
+align = "left"
+max_width = 92
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "?"
+narrow_padding = 0
+
+[surfaces.tool]
+chrome = "rule"
+heading = "overline"
+label = "CMD"
+padding = 1
+width = "content"
+align = "left"
+max_width = 104
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "CMD"
+narrow_padding = 0
+
+[surfaces.shell]
+chrome = "rule"
+heading = "overline"
+label = "SH"
+padding = 1
+width = "content"
+align = "left"
+max_width = 104
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "SH"
+narrow_padding = 0
+
+[surfaces.notice]
+chrome = "band"
+heading = "inline"
+label = "NOTE"
+padding = 1
+width = "content"
+align = "left"
+max_width = 90
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "N"
+narrow_padding = 0
+
+[surfaces.outcome]
+chrome = "rule"
+heading = "overline"
+label = "LOG"
+padding = 0
+width = "content"
+align = "left"
+max_width = 72
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "END"
+narrow_padding = 0
+
+[surfaces.compaction]
+chrome = "rail"
+heading = "inline"
+label = "ARCHIVE"
+padding = 1
+width = "content"
+align = "left"
+max_width = 92
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "SUM"
+narrow_padding = 0
+
+[layout]
+density = "comfortable"
+show_header = true
+show_footer = true
+show_status_line = true
+show_tool_duration = false
+show_reasoning = true
+show_panel_borders = false
+transcript_inset = 2
+composer_padding = 1
+narrow_breakpoint = 78
+narrow_show_header = false
+narrow_show_footer = true
+narrow_show_status_line = true
+narrow_show_tool_duration = false
+narrow_show_reasoning = true
+narrow_show_panel_borders = false

@@ -1,0 +1,19 @@
+{
+  "_cite": "docs/research/apidocs/compatibility/openAI-chat-completions/04-audio-speech.md (completed message.audio: id,data,expires_at,transcript) + docs/design/ygg-ai.md \u00a712.1 completed-audio decode",
+  "id": "chatcmpl-audio",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "audio": {
+        "id": "audio_abc123",
+        "expires_at": 1893456000,
+        "data": "UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=",
+        "transcript": "Hello from audio."
+      }
+    },
+    "finish_reason": "stop"
+  }],
+  "usage": {"prompt_tokens": 12, "completion_tokens": 20, "total_tokens": 32}
+}

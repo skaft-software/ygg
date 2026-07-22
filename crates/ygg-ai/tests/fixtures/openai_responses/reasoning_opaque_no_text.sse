@@ -1,0 +1,14 @@
+: cite: docs/research/apidocs/openai-responses/01-responses.md (reasoning output item done carrying encrypted_content with no visible summary/text delta)
+: cite: docs/design/ygg-ai.md §6.3/§14 (opaque reasoning preserved as ReasoningPart{text:None,state})
+data: {"type":"response.created","response":{"id":"resp_op"}}
+
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_9","type":"reasoning","encrypted_content":"T1BBUVVF"}}
+
+data: {"type":"response.content_part.added","output_index":1,"content_index":0,"part":{"type":"output_text"}}
+
+data: {"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"Answer"}
+
+data: {"type":"response.output_text.done","output_index":1,"content_index":0}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}
+

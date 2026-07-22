@@ -1,0 +1,44 @@
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+yanked = "deny"
+# Dependency path: ygg-coding-agent -> sexy-tui-rs -> syntect 5.3 -> bincode
+# 1.3.3. This advisory is an unmaintained warning, not a vulnerability. Ygg
+# invokes only `SyntaxSet::load_defaults_newlines`, which decodes syntect's
+# compile-time embedded syntax dump; no session, extension, workspace, or other
+# attacker-supplied bytes reach bincode. Removal plan: upgrade when syntect
+# migrates its default-syntax dump off bincode 1, or replace `default-syntaxes`
+# with a Ygg-built trusted SyntaxSet if upstream does not migrate.
+ignore = ["RUSTSEC-2025-0141"]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  # Mozilla's reviewed root-certificate bundle is a runtime trust store.
+  "CDLA-Permissive-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "OpenSSL",
+  "Unicode-3.0",
+  "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

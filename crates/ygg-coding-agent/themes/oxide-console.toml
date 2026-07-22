@@ -1,0 +1,339 @@
+[metadata]
+name = "Oxide Console"
+description = "An industrial maintenance terminal: rust, steel, boxed readouts, and terse machine-state punctuation."
+author = "Ygg theme pack"
+version = "1"
+terminal = "light-dark"
+adaptive = true
+
+[colors]
+accent = "#b45f32"
+muted = "#69747a"
+error = "#c43e34"
+warning = "#a56b1d"
+success = "#4d7b58"
+info = "#46758a"
+border = "#707a7f"
+border_focused = "accent"
+tool_title = "#b45f32"
+md_heading = "#b45f32"
+md_link = "#46758a"
+md_code = "#a45332"
+md_code_border = "#707a7f"
+md_quote_border = "#b45f32"
+md_list_bullet = "#b45f32"
+syntax_comment = "#69747a"
+syntax_keyword = "#80538f"
+syntax_function = "#46758a"
+syntax_string = "#4d7b58"
+syntax_number = "#a56b1d"
+syntax_type = "#a45332"
+syntax_operator = "#bd465d"
+diff_added_bg = "#4d7b58"
+diff_removed_bg = "#c43e34"
+oxide_panel_bg = "#56301f"
+oxide_readout_bg = "#263a42"
+oxide_alarm_bg = "#5b2925"
+oxide_trace_bg = "#3b3e3f"
+
+[model]
+use_lab_color = false
+
+[roles.tool_title]
+foreground = "tool_title"
+bold = true
+inverse = true
+
+[roles.heading]
+foreground = "md_heading"
+bold = true
+
+[roles.code]
+foreground = "foreground"
+
+[roles.notification]
+foreground = "info"
+bold = true
+
+[roles.confirmation]
+foreground = "warning"
+bold = true
+
+[roles."extension.readout"]
+foreground = "accent"
+bold = true
+
+[roles."extension.status"]
+foreground = "accent"
+bold = true
+
+[roles."extension.header"]
+foreground = "warning"
+bold = true
+
+[roles."surface.user"]
+foreground = "foreground"
+background = "oxide_panel_bg"
+
+[roles."surface.user.border"]
+foreground = "accent"
+bold = true
+
+[roles."surface.user.label"]
+foreground = "accent"
+bold = true
+inverse = true
+
+[roles."surface.assistant"]
+foreground = "foreground"
+background = "oxide_readout_bg"
+
+[roles."surface.assistant.border"]
+foreground = "info"
+bold = true
+
+[roles."surface.assistant.label"]
+foreground = "info"
+bold = true
+
+[roles."surface.reasoning"]
+foreground = "muted"
+background = "oxide_trace_bg"
+
+[roles."surface.reasoning.border"]
+foreground = "border"
+
+[roles."surface.reasoning.label"]
+foreground = "muted"
+bold = true
+
+[roles."surface.tool"]
+foreground = "foreground"
+background = "oxide_panel_bg"
+
+[roles."surface.tool.border"]
+foreground = "tool_title"
+bold = true
+
+[roles."surface.tool.label"]
+foreground = "tool_title"
+bold = true
+inverse = true
+
+[roles."surface.shell"]
+foreground = "foreground"
+background = "oxide_readout_bg"
+
+[roles."surface.shell.border"]
+foreground = "warning"
+bold = true
+
+[roles."surface.shell.label"]
+foreground = "warning"
+bold = true
+
+[roles."surface.notice"]
+foreground = "foreground"
+background = "oxide_alarm_bg"
+
+[roles."surface.notice.border"]
+foreground = "error"
+bold = true
+
+[roles."surface.notice.label"]
+foreground = "error"
+bold = true
+inverse = true
+
+[roles."surface.outcome"]
+foreground = "foreground"
+background = "oxide_trace_bg"
+
+[roles."surface.outcome.border"]
+foreground = "border"
+bold = true
+
+[roles."surface.outcome.label"]
+foreground = "success"
+bold = true
+
+[roles."surface.compaction"]
+foreground = "muted"
+background = "oxide_trace_bg"
+
+[roles."surface.compaction.border"]
+foreground = "border"
+
+[roles."surface.compaction.label"]
+foreground = "warning"
+bold = true
+
+[glyphs]
+top_left = "╔"
+top_right = "╗"
+bottom_left = "╚"
+bottom_right = "╝"
+horizontal = "═"
+vertical = "║"
+branch = "╠"
+last_branch = "╚"
+rail = "║"
+prompt = "#"
+shell = ">"
+success = "OK"
+warning = "!!"
+note = "i"
+error = "XX"
+interrupt = "[]"
+pending = ".."
+collapsed = "[+]"
+expanded = "[-]"
+separator = " | "
+ellipsis = "..."
+bullet = "■"
+reasoning = "?"
+wordmark = "[YGG/OS]"
+
+[glyphs_ascii]
+top_left = "+"
+top_right = "+"
+bottom_left = "+"
+bottom_right = "+"
+horizontal = "="
+vertical = "|"
+branch = "+-"
+last_branch = "`-"
+rail = "|"
+prompt = ">"
+shell = ">"
+success = "OK"
+warning = "!!"
+note = "i"
+error = "XX"
+interrupt = "[]"
+pending = ".."
+collapsed = "[+]"
+expanded = "[-]"
+separator = " | "
+ellipsis = "..."
+bullet = "#"
+reasoning = "?"
+wordmark = "[YGG/OS]"
+
+[surfaces.user]
+chrome = "band"
+heading = "tab"
+label = "CONTROL / INPUT"
+padding = 1
+width = "full"
+align = "left"
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "INPUT"
+narrow_padding = 0
+
+[surfaces.assistant]
+chrome = "card"
+heading = "overline"
+label = "PROCESS / RETURN"
+padding = 1
+width = "full"
+align = "left"
+max_width = 118
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "RETURN"
+narrow_padding = 0
+
+[surfaces.reasoning]
+chrome = "band"
+heading = "inline"
+label = "TRACE BUS"
+padding = 1
+width = "full"
+align = "left"
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "TRACE"
+narrow_padding = 0
+
+[surfaces.tool]
+chrome = "card"
+heading = "tab"
+label = "INSTRUMENT / TOOL"
+padding = 1
+width = "full"
+align = "left"
+max_width = 118
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "TOOL"
+narrow_padding = 0
+
+[surfaces.shell]
+chrome = "card"
+heading = "tab"
+label = "EXEC CHANNEL"
+padding = 1
+width = "full"
+align = "left"
+max_width = 118
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "EXEC"
+narrow_padding = 0
+
+[surfaces.notice]
+chrome = "band"
+heading = "tab"
+label = "ALARM / NOTICE"
+padding = 1
+width = "full"
+align = "left"
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "ALARM"
+narrow_padding = 0
+
+[surfaces.outcome]
+chrome = "band"
+heading = "inline"
+label = "STATE REGISTER"
+padding = 1
+width = "full"
+align = "left"
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "STATE"
+narrow_padding = 0
+
+[surfaces.compaction]
+chrome = "card"
+heading = "tab"
+label = "CHECKPOINT"
+padding = 1
+width = "full"
+align = "left"
+max_width = 118
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "SAVE"
+narrow_padding = 0
+
+[layout]
+density = "compact"
+show_header = true
+show_footer = true
+show_status_line = true
+show_tool_duration = true
+show_reasoning = false
+show_panel_borders = true
+transcript_inset = 1
+composer_padding = 0
+narrow_breakpoint = 72
+narrow_show_header = false
+narrow_show_footer = true
+narrow_show_status_line = true
+narrow_show_tool_duration = true
+narrow_show_reasoning = false
+narrow_show_panel_borders = true

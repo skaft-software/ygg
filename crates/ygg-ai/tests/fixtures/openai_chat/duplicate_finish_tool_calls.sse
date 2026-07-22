@@ -1,0 +1,16 @@
+: cite: OpenRouter/Moonshot streaming quirk: `finish_reason: "tool_calls"` repeated in the trailing usage-bearing chunk
+: cite: docs/design/ygg-ai.md §12.1/§13 (tool-call assembly; *End fires exactly once per part)
+data: {"id":"gen-tools","choices":[{"index":0,"delta":{"role":"assistant","content":"Let me explore the repository."}}]}
+
+data: {"id":"gen-tools","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"grep","arguments":""}}]}}]}
+
+data: {"id":"gen-tools","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pattern\""}}]}}]}
+
+data: {"id":"gen-tools","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":": \"foo\"}"}}]}}]}
+
+data: {"id":"gen-tools","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"gen-tools","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50,"completion_tokens":10,"total_tokens":60}}
+
+data: [DONE]
+

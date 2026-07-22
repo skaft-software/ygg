@@ -1,0 +1,40 @@
+===== plain-ascii =====
+Heading
+
+strong emphasis docs (https://example.com) code
+
+| quote
+
+* item
+===== no-color-unicode =====
+<ESC>[1mHeading<ESC>[0m
+
+<ESC>[1mstrong<ESC>[0m emphasis docs (https://example.com) code
+
+│ quote
+
+• item
+===== ansi16-ascii =====
+<ESC>[1m<ESC>[94mHeading<ESC>[0m
+
+<ESC>[1mstrong<ESC>[0m emphasis <ESC>[4m<ESC>[94mdocs (https://example.com)<ESC>[0m <ESC>[31mcode<ESC>[0m
+
+<ESC>[94m| <ESC>[0mquote
+
+* item
+===== ansi256-unicode =====
+<ESC>[1m<ESC>[38;5;110mHeading<ESC>[0m
+
+<ESC>[1mstrong<ESC>[0m emphasis <ESC>[4m<ESC>[38;5;74mdocs (https://example.com)<ESC>[0m <ESC>[38;5;131mcode<ESC>[0m
+
+<ESC>[38;5;110m│ <ESC>[0mquote
+
+• item
+===== truecolor-link =====
+<ESC>[1m<ESC>[38;2;126;184;218mHeading<ESC>[0m
+
+<ESC>[1mstrong<ESC>[0m <ESC>[3memphasis<ESC>[0m <ESC>]8;;https://example.com<ESC>\<ESC>[4m<ESC>[38;2;94;163;217mdocs (https://example.com)<ESC>[0m<ESC>]8;;<ESC>\ <ESC>[38;2;166;106;63mcode<ESC>[0m
+
+<ESC>[38;2;126;184;218m│ <ESC>[0m<ESC>[3mquote<ESC>[0m
+
+• item

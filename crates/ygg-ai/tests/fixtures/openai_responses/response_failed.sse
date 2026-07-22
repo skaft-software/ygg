@@ -1,0 +1,5 @@
+: cite: docs/research/apidocs/openai-responses/07-streaming-events.md (response.failed); docs/design/ygg-ai.md §12.2 (-> Provider)
+data: {"type":"response.created","response":{"id":"resp_fail"}}
+
+data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"boom"}}}
+

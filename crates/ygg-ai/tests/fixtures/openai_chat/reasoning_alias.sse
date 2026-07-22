@@ -1,0 +1,14 @@
+: cite: OpenRouter streaming normalization: reasoning tokens arrive as the flat `delta.reasoning` string, not `reasoning_content`
+: cite: docs/design/ygg-ai.md §12.1/§14 (reasoning -> Reasoning* with no state)
+data: {"id":"gen-reason-alias","choices":[{"index":0,"delta":{"reasoning":"Let me think"}}]}
+
+data: {"id":"gen-reason-alias","choices":[{"index":0,"delta":{"reasoning":" about it."}}]}
+
+data: {"id":"gen-reason-alias","choices":[{"index":0,"delta":{"content":"Answer: 42"}}]}
+
+data: {"id":"gen-reason-alias","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"gen-reason-alias","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":8,"completion_tokens_details":{"reasoning_tokens":5},"total_tokens":28}}
+
+data: [DONE]
+

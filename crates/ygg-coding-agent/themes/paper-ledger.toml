@@ -1,0 +1,326 @@
+[metadata]
+name = "Paper Ledger"
+description = "A quiet accounting desk: ink, copper rules, generous margins, and nearly colorless prose."
+author = "Ygg theme pack"
+version = "1"
+terminal = "light-dark"
+adaptive = true
+
+[colors]
+accent = "#7d5c3b"
+muted = "#706b65"
+error = "#a94742"
+warning = "#8d681e"
+success = "#4f725c"
+info = "#526e79"
+border = "#80766b"
+border_focused = "accent"
+tool_title = "#7d5c3b"
+md_heading = "#7d5c3b"
+md_link = "#526e79"
+md_code = "#7d5c3b"
+md_code_border = "#80766b"
+md_quote_border = "#80766b"
+md_list_bullet = "#7d5c3b"
+syntax_comment = "#706b65"
+syntax_keyword = "#72587f"
+syntax_function = "#526e79"
+syntax_string = "#4f725c"
+syntax_number = "#8d681e"
+syntax_type = "#7d5c3b"
+syntax_operator = "#96516e"
+diff_added_bg = "#4f725c"
+diff_removed_bg = "#a94742"
+ledger_note_bg = "#77643c"
+ledger_entry_bg = "#584735"
+
+[model]
+use_lab_color = false
+
+[roles.tool_title]
+foreground = "tool_title"
+bold = false
+underline = true
+
+[roles.heading]
+foreground = "md_heading"
+bold = true
+
+[roles.quote]
+foreground = "muted"
+italic = true
+
+[roles.notification]
+foreground = "info"
+
+[roles.confirmation]
+foreground = "warning"
+underline = true
+
+[roles."extension.margin-note"]
+foreground = "muted"
+italic = true
+
+[roles."extension.status"]
+foreground = "muted"
+underline = true
+
+[roles."extension.header"]
+foreground = "foreground"
+bold = true
+
+[roles."surface.user"]
+foreground = "foreground"
+
+[roles."surface.user.border"]
+foreground = "border"
+
+[roles."surface.user.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.assistant"]
+foreground = "foreground"
+
+[roles."surface.assistant.border"]
+foreground = "border"
+
+[roles."surface.assistant.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.reasoning"]
+foreground = "muted"
+italic = true
+
+[roles."surface.reasoning.border"]
+foreground = "border"
+
+[roles."surface.reasoning.label"]
+foreground = "muted"
+italic = true
+
+[roles."surface.tool"]
+foreground = "foreground"
+background = "ledger_entry_bg"
+
+[roles."surface.tool.border"]
+foreground = "border"
+
+[roles."surface.tool.label"]
+foreground = "accent"
+underline = true
+
+[roles."surface.shell"]
+foreground = "foreground"
+
+[roles."surface.shell.border"]
+foreground = "border"
+
+[roles."surface.shell.label"]
+foreground = "warning"
+underline = true
+
+[roles."surface.notice"]
+foreground = "foreground"
+background = "ledger_note_bg"
+
+[roles."surface.notice.border"]
+foreground = "warning"
+
+[roles."surface.notice.label"]
+foreground = "warning"
+italic = true
+
+[roles."surface.outcome"]
+foreground = "muted"
+
+[roles."surface.outcome.border"]
+foreground = "border"
+
+[roles."surface.outcome.label"]
+foreground = "success"
+bold = true
+
+[roles."surface.compaction"]
+foreground = "muted"
+
+[roles."surface.compaction.border"]
+foreground = "border"
+
+[roles."surface.compaction.label"]
+foreground = "muted"
+italic = true
+
+[glyphs]
+top_left = "."
+top_right = "."
+bottom_left = "'"
+bottom_right = "'"
+horizontal = "-"
+vertical = "|"
+branch = "|-"
+last_branch = "`-"
+rail = "|"
+prompt = ">"
+shell = "$"
+success = "+"
+warning = "!"
+note = "*"
+error = "x"
+interrupt = "#"
+pending = "."
+collapsed = "[+]"
+expanded = "[-]"
+separator = "  "
+ellipsis = "..."
+bullet = "·"
+reasoning = "-"
+wordmark = "ygg ledger"
+
+[glyphs_ascii]
+top_left = "+"
+top_right = "."
+bottom_left = "'"
+bottom_right = "'"
+horizontal = "-"
+vertical = "|"
+branch = "|-"
+last_branch = "`-"
+rail = "|"
+prompt = ">"
+shell = "$"
+success = "+"
+warning = "!"
+note = "*"
+error = "x"
+interrupt = "#"
+pending = "."
+collapsed = "[+]"
+expanded = "[-]"
+separator = "  "
+ellipsis = "..."
+bullet = "-"
+reasoning = "-"
+wordmark = "ygg ledger"
+
+[surfaces.user]
+chrome = "rule"
+heading = "overline"
+label = "REQUEST      01"
+padding = 1
+width = "content"
+align = "center"
+max_width = 84
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "REQUEST"
+narrow_padding = 0
+
+[surfaces.assistant]
+chrome = "rule"
+heading = "overline"
+label = "RESPONSE     02"
+padding = 1
+width = "content"
+align = "center"
+max_width = 84
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "RESPONSE"
+narrow_padding = 0
+
+[surfaces.reasoning]
+chrome = "plain"
+heading = "inline"
+label = "MEMORANDUM"
+padding = 1
+width = "content"
+align = "center"
+max_width = 76
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.tool]
+chrome = "rail"
+heading = "inline"
+label = "ENTRY"
+padding = 1
+width = "content"
+align = "center"
+max_width = 84
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "ENTRY"
+narrow_padding = 0
+
+[surfaces.shell]
+chrome = "rail"
+heading = "inline"
+label = "DISBURSEMENT"
+padding = 1
+width = "content"
+align = "center"
+max_width = 84
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "SHELL"
+narrow_padding = 0
+
+[surfaces.notice]
+chrome = "band"
+heading = "inline"
+label = "MARGIN NOTE"
+padding = 1
+width = "content"
+align = "center"
+max_width = 76
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "NOTE"
+narrow_padding = 0
+
+[surfaces.outcome]
+chrome = "rule"
+heading = "overline"
+label = "BALANCE"
+padding = 0
+width = "content"
+align = "center"
+max_width = 68
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "TOTAL"
+narrow_padding = 0
+
+[surfaces.compaction]
+chrome = "rule"
+heading = "overline"
+label = "CARRY FORWARD"
+padding = 0
+width = "content"
+align = "center"
+max_width = 84
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "CARRY"
+narrow_padding = 0
+
+[layout]
+density = "airy"
+show_header = true
+show_footer = true
+show_status_line = true
+show_tool_duration = false
+show_reasoning = false
+show_panel_borders = false
+transcript_inset = 4
+composer_padding = 2
+narrow_breakpoint = 82
+narrow_show_header = false
+narrow_show_footer = true
+narrow_show_status_line = true
+narrow_show_tool_duration = false
+narrow_show_reasoning = false
+narrow_show_panel_borders = false

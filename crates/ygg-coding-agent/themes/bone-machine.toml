@@ -1,0 +1,336 @@
+[metadata]
+name = "Bone Machine"
+description = "Brutalist lab equipment: bone-white structure, surgical red signals, and dense mechanical chrome."
+author = "Ygg theme pack"
+version = "1"
+terminal = "light-dark"
+adaptive = true
+
+[colors]
+accent = "#a93434"
+muted = "#6f6a64"
+error = "#cf3030"
+warning = "#9d6615"
+success = "#3f7752"
+info = "#526d86"
+border = "#81786d"
+border_focused = "accent"
+tool_title = "#a93434"
+tool_output = "foreground"
+md_heading = "#a93434"
+md_link = "#526d86"
+md_code = "#8b4c32"
+md_code_border = "#81786d"
+md_quote_border = "#a93434"
+md_list_bullet = "#a93434"
+syntax_comment = "#6f6a64"
+syntax_keyword = "#873e70"
+syntax_function = "#4b6982"
+syntax_string = "#4c7554"
+syntax_number = "#9d6615"
+syntax_type = "#8b4c32"
+syntax_operator = "#a93434"
+diff_added_bg = "#39734a"
+diff_removed_bg = "#a93434"
+bone_input_bg = "#6d2828"
+bone_output_bg = "#45423e"
+bone_tool_bg = "#57351f"
+bone_notice_bg = "#394b58"
+
+[model]
+use_lab_color = false
+
+[roles.tool_title]
+foreground = "tool_title"
+bold = true
+
+[roles.heading]
+foreground = "md_heading"
+bold = true
+underline = true
+
+[roles.quote]
+foreground = "muted"
+italic = false
+
+[roles.notification]
+foreground = "info"
+bold = true
+
+[roles.confirmation]
+foreground = "warning"
+bold = true
+inverse = true
+
+[roles."extension.accent"]
+foreground = "accent"
+bold = true
+
+[roles."extension.status"]
+foreground = "accent"
+bold = true
+
+[roles."extension.header"]
+foreground = "foreground"
+bold = true
+underline = true
+
+[roles."surface.user"]
+foreground = "foreground"
+background = "bone_input_bg"
+
+[roles."surface.user.border"]
+foreground = "accent"
+bold = true
+
+[roles."surface.user.label"]
+foreground = "accent"
+bold = true
+inverse = true
+
+[roles."surface.assistant"]
+foreground = "foreground"
+background = "bone_output_bg"
+
+[roles."surface.assistant.border"]
+foreground = "border"
+bold = true
+
+[roles."surface.assistant.label"]
+foreground = "foreground"
+bold = true
+
+[roles."surface.reasoning"]
+foreground = "muted"
+italic = true
+
+[roles."surface.reasoning.border"]
+foreground = "border"
+
+[roles."surface.reasoning.label"]
+foreground = "muted"
+bold = true
+
+[roles."surface.tool"]
+foreground = "foreground"
+background = "bone_tool_bg"
+
+[roles."surface.tool.border"]
+foreground = "tool_title"
+bold = true
+
+[roles."surface.tool.label"]
+foreground = "tool_title"
+bold = true
+inverse = true
+
+[roles."surface.shell"]
+foreground = "foreground"
+background = "bone_tool_bg"
+
+[roles."surface.shell.border"]
+foreground = "warning"
+bold = true
+
+[roles."surface.shell.label"]
+foreground = "warning"
+bold = true
+
+[roles."surface.notice"]
+foreground = "info"
+background = "bone_notice_bg"
+
+[roles."surface.notice.border"]
+foreground = "info"
+bold = true
+
+[roles."surface.notice.label"]
+foreground = "info"
+bold = true
+inverse = true
+
+[roles."surface.outcome"]
+foreground = "muted"
+
+[roles."surface.outcome.border"]
+foreground = "border"
+
+[roles."surface.outcome.label"]
+foreground = "muted"
+bold = true
+
+[roles."surface.compaction"]
+foreground = "muted"
+
+[roles."surface.compaction.border"]
+foreground = "accent"
+
+[roles."surface.compaction.label"]
+foreground = "accent"
+bold = true
+
+[glyphs]
+top_left = "┏"
+top_right = "┓"
+bottom_left = "┗"
+bottom_right = "┛"
+horizontal = "━"
+vertical = "┃"
+branch = "┣"
+last_branch = "┗"
+rail = "┃"
+prompt = "»"
+shell = "#"
+success = "+"
+warning = "!"
+note = "◆"
+error = "×"
+interrupt = "■"
+pending = "·"
+collapsed = "[+]"
+expanded = "[-]"
+separator = " :: "
+ellipsis = "…"
+bullet = "▪"
+reasoning = ":"
+wordmark = "YGG/BONE"
+
+[glyphs_ascii]
+top_left = "+"
+top_right = "+"
+bottom_left = "+"
+bottom_right = "+"
+horizontal = "="
+vertical = "|"
+branch = "+-"
+last_branch = "`-"
+rail = "|"
+prompt = ">"
+shell = "#"
+success = "+"
+warning = "!"
+note = "*"
+error = "x"
+interrupt = "[]"
+pending = "."
+collapsed = "[+]"
+expanded = "[-]"
+separator = " :: "
+ellipsis = "..."
+bullet = "#"
+reasoning = ":"
+wordmark = "YGG/BONE"
+
+[surfaces.user]
+chrome = "band"
+heading = "tab"
+label = "INPUT / REQUEST"
+padding = 1
+width = "full"
+align = "left"
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "IN"
+narrow_padding = 0
+
+[surfaces.assistant]
+chrome = "band"
+heading = "tab"
+label = "OUTPUT / AGENT"
+padding = 1
+width = "full"
+align = "left"
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.reasoning]
+chrome = "rail"
+heading = "inline"
+label = "TRACE"
+padding = 0
+width = "full"
+align = "left"
+narrow_chrome = "rail"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.tool]
+chrome = "card"
+heading = "tab"
+label = "TOOL / ACTION"
+padding = 1
+width = "full"
+align = "left"
+max_width = 112
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "TOOL"
+narrow_padding = 0
+
+[surfaces.shell]
+chrome = "card"
+heading = "tab"
+label = "SHELL / EXEC"
+padding = 1
+width = "full"
+align = "left"
+max_width = 112
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "RUN"
+narrow_padding = 0
+
+[surfaces.notice]
+chrome = "band"
+heading = "inline"
+label = "NOTICE"
+padding = 1
+width = "full"
+align = "left"
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "!"
+narrow_padding = 0
+
+[surfaces.outcome]
+chrome = "rule"
+heading = "overline"
+label = "STATE"
+padding = 0
+width = "full"
+align = "left"
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "END"
+narrow_padding = 0
+
+[surfaces.compaction]
+chrome = "rule"
+heading = "overline"
+label = "MEMORY CUT"
+padding = 0
+width = "full"
+align = "left"
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "CUT"
+narrow_padding = 0
+
+[layout]
+density = "compact"
+show_header = true
+show_footer = true
+show_status_line = true
+show_tool_duration = true
+show_reasoning = false
+show_panel_borders = true
+transcript_inset = 1
+composer_padding = 0
+narrow_breakpoint = 68
+narrow_show_header = false
+narrow_show_footer = true
+narrow_show_status_line = true
+narrow_show_tool_duration = false
+narrow_show_reasoning = false
+narrow_show_panel_borders = false

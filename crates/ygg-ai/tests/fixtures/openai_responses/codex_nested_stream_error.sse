@@ -1,0 +1,4 @@
+data: {"type":"response.created","response":{"id":"resp_nested_error"}}
+
+data: {"type":"error","sequence_number":1,"error":{"type":"server_error","code":"upstream_failure","message":"Nested Codex stream failure","param":null}}
+

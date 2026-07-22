@@ -1,0 +1,329 @@
+[metadata]
+name = "Circuit Garden"
+description = "A living local machine: chlorophyll green, irrigation cyan, rounded growth rings, and generous space."
+author = "Ygg theme pack"
+version = "1"
+terminal = "light-dark"
+adaptive = true
+
+[colors]
+accent = "#00a87a"
+muted = "#52756c"
+error = "#d14f5d"
+warning = "#a56c19"
+success = "#25935f"
+info = "#1687a5"
+border = "#498675"
+border_focused = "accent"
+tool_title = "#1687a5"
+md_heading = "#00a87a"
+md_link = "#1687a5"
+md_code = "#4e8b68"
+md_code_border = "#498675"
+md_quote_border = "#00a87a"
+md_list_bullet = "#00a87a"
+syntax_comment = "#52756c"
+syntax_keyword = "#7b5bb2"
+syntax_function = "#1687a5"
+syntax_string = "#25935f"
+syntax_number = "#a56c19"
+syntax_type = "#008f83"
+syntax_operator = "#b64d80"
+diff_added_bg = "#25935f"
+diff_removed_bg = "#d14f5d"
+garden_seed_bg = "#124d39"
+garden_canopy_bg = "#16454a"
+garden_tool_bg = "#334928"
+garden_note_bg = "#24414c"
+
+[model]
+use_lab_color = false
+
+[roles.tool_title]
+foreground = "tool_title"
+bold = true
+
+[roles.heading]
+foreground = "md_heading"
+bold = true
+
+[roles.quote]
+foreground = "muted"
+italic = true
+
+[roles.notification]
+foreground = "info"
+
+[roles.confirmation]
+foreground = "warning"
+bold = true
+
+[roles."extension.accent"]
+foreground = "accent"
+italic = true
+
+[roles."extension.status"]
+foreground = "info"
+italic = true
+
+[roles."extension.header"]
+foreground = "accent"
+bold = true
+
+[roles."surface.user"]
+foreground = "foreground"
+background = "garden_seed_bg"
+
+[roles."surface.user.border"]
+foreground = "success"
+
+[roles."surface.user.label"]
+foreground = "success"
+bold = true
+italic = true
+
+[roles."surface.assistant"]
+foreground = "foreground"
+background = "garden_canopy_bg"
+
+[roles."surface.assistant.border"]
+foreground = "accent"
+
+[roles."surface.assistant.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.reasoning"]
+foreground = "muted"
+
+[roles."surface.reasoning.border"]
+foreground = "success"
+
+[roles."surface.reasoning.label"]
+foreground = "success"
+italic = true
+
+[roles."surface.tool"]
+foreground = "foreground"
+background = "garden_tool_bg"
+
+[roles."surface.tool.border"]
+foreground = "info"
+
+[roles."surface.tool.label"]
+foreground = "info"
+bold = true
+
+[roles."surface.shell"]
+foreground = "foreground"
+
+[roles."surface.shell.border"]
+foreground = "accent"
+
+[roles."surface.shell.label"]
+foreground = "accent"
+italic = true
+
+[roles."surface.notice"]
+foreground = "info"
+background = "garden_note_bg"
+
+[roles."surface.notice.border"]
+foreground = "info"
+
+[roles."surface.notice.label"]
+foreground = "info"
+bold = true
+
+[roles."surface.outcome"]
+foreground = "muted"
+
+[roles."surface.outcome.border"]
+foreground = "success"
+
+[roles."surface.outcome.label"]
+foreground = "success"
+italic = true
+
+[roles."surface.compaction"]
+foreground = "muted"
+
+[roles."surface.compaction.border"]
+foreground = "border"
+
+[roles."surface.compaction.label"]
+foreground = "muted"
+italic = true
+
+[glyphs]
+top_left = "╭"
+top_right = "╮"
+bottom_left = "╰"
+bottom_right = "╯"
+horizontal = "─"
+vertical = "│"
+branch = "├"
+last_branch = "╰"
+rail = "│"
+prompt = "❯"
+shell = "⌁"
+success = "✓"
+warning = "△"
+note = "❋"
+error = "×"
+interrupt = "◼"
+pending = "◌"
+collapsed = "▸"
+expanded = "▾"
+separator = " ∿ "
+ellipsis = "…"
+bullet = "•"
+reasoning = "∴"
+wordmark = "ygg.grow()"
+
+[glyphs_ascii]
+top_left = "+"
+top_right = "\\"
+bottom_left = "\\"
+bottom_right = "/"
+horizontal = "-"
+vertical = "|"
+branch = "+-"
+last_branch = "`-"
+rail = "|"
+prompt = ">"
+shell = "~"
+success = "+"
+warning = "!"
+note = "*"
+error = "x"
+interrupt = "#"
+pending = "o"
+collapsed = ">"
+expanded = "v"
+separator = " ~ "
+ellipsis = "..."
+bullet = "*"
+reasoning = ":"
+wordmark = "ygg.grow()"
+
+[surfaces.user]
+chrome = "card"
+heading = "tab"
+label = "seed / you"
+padding = 2
+width = "content"
+align = "right"
+max_width = 84
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "you"
+narrow_padding = 0
+
+[surfaces.assistant]
+chrome = "card"
+heading = "overline"
+label = "canopy / ygg"
+padding = 2
+width = "content"
+align = "left"
+max_width = 96
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "ygg"
+narrow_padding = 0
+
+[surfaces.reasoning]
+chrome = "rail"
+heading = "inline"
+label = "roots"
+padding = 1
+width = "content"
+align = "left"
+max_width = 82
+narrow_chrome = "rail"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.tool]
+chrome = "card"
+heading = "tab"
+label = "workbench"
+padding = 1
+width = "content"
+align = "left"
+max_width = 92
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "tool"
+narrow_padding = 0
+
+[surfaces.shell]
+chrome = "rail"
+heading = "inline"
+label = "irrigation / shell"
+padding = 1
+width = "content"
+align = "right"
+max_width = 96
+narrow_chrome = "rail"
+narrow_heading = "inline"
+narrow_label = "shell"
+narrow_padding = 0
+
+[surfaces.notice]
+chrome = "band"
+heading = "inline"
+label = "garden note"
+padding = 1
+width = "content"
+align = "center"
+max_width = 88
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "note"
+narrow_padding = 0
+
+[surfaces.outcome]
+chrome = "rule"
+heading = "overline"
+label = "season"
+padding = 0
+width = "content"
+align = "center"
+max_width = 70
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "done"
+narrow_padding = 0
+
+[surfaces.compaction]
+chrome = "rail"
+heading = "inline"
+label = "rings / memory"
+padding = 1
+width = "content"
+align = "left"
+max_width = 88
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "memory"
+narrow_padding = 0
+
+[layout]
+density = "airy"
+show_header = true
+show_footer = true
+show_status_line = true
+show_tool_duration = true
+show_reasoning = true
+show_panel_borders = true
+transcript_inset = 3
+composer_padding = 2
+narrow_breakpoint = 74
+narrow_show_header = false
+narrow_show_footer = true
+narrow_show_status_line = true
+narrow_show_tool_duration = false
+narrow_show_reasoning = true
+narrow_show_panel_borders = false

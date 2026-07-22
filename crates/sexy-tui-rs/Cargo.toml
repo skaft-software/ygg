@@ -1,0 +1,38 @@
+[package]
+name = "sexy-tui-rs"
+version = "0.2.1"
+edition = "2021"
+rust-version.workspace = true
+description = "Terminal-correct retained TUI and semantic rich-text renderer"
+license = "MIT"
+repository = "https://github.com/achuthanmukundan00/sexy-tui-rs"
+keywords = ["terminal", "tui", "markdown", "rendering"]
+categories = ["command-line-interface"]
+
+[features]
+default = ["syntax-highlighting"]
+syntax-highlighting = ["dep:syntect"]
+benchmarks = []
+
+[dependencies]
+crossterm = "0.28"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+serde = { version = "1", features = ["derive"] }
+syntect = { version = "5", optional = true, default-features = false, features = ["default-syntaxes", "regex-fancy"] }
+toml = "0.8"
+# Retain the reviewed grapheme behavior used by the vendored integration.
+unicode-segmentation = "=1.12.0"
+unicode-width = "0.2"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+
+[[example]]
+name = "rich_rendering"
+path = "examples/rich_rendering.rs"
+
+[[example]]
+name = "render_bench"
+path = "examples/render_bench.rs"
+required-features = ["benchmarks"]

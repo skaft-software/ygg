@@ -1,0 +1,12 @@
+: cite: OpenRouter/Moonshot streaming quirk: the trailing usage-bearing chunk repeats `finish_reason` after the finish chunk
+: cite: docs/design/ygg-ai.md §12.1 (Chat streaming decode) + §8 (exactly one *End per part)
+data: {"id":"gen-dup","choices":[{"index":0,"delta":{"role":"assistant","content":"I'll help you fix the model picker filter."}}]}
+
+data: {"id":"gen-dup","choices":[{"index":0,"delta":{"content":" Let me first explore the repository."}}]}
+
+data: {"id":"gen-dup","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"gen-dup","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}
+
+data: [DONE]
+
