@@ -4571,18 +4571,14 @@ fn render_shell_viewport_update(
 }
 
 fn append_chrome(lines: &mut Vec<String>, chrome: ShellChrome, stable_prefix_rows: usize) {
-    // Reserve the whole viewport tail for transcript + mutable chrome while a
-    // conversation is short. Once committed history exceeds the viewport, new
-    // rows grow the logical frame and sexy-tui moves them into native terminal
-    // scrollback. `lines` may be only a lazy suffix, so its retained prefix must
-    // count toward the elastic space calculation.
+    // Native mode follows the logical content height. Padding a short frame to
+    // the terminal height pins the composer to the bottom and creates a large
+    // dead zone below the transcript. Once the frame naturally grows past the
+    // viewport, sexy-tui moves committed rows into terminal-owned scrollback.
+    // `lines` may be only a lazy suffix, so its retained prefix still decides
+    // whether the transcript owns the single breathing row before chrome.
     let complete_transcript_rows = stable_prefix_rows.saturating_add(lines.len());
-    if complete_transcript_rows < chrome.transcript_rows {
-        lines.resize(
-            chrome.transcript_rows.saturating_sub(stable_prefix_rows),
-            String::new(),
-        );
-    } else if complete_transcript_rows > 0 {
+    if complete_transcript_rows > 0 {
         lines.push(String::new());
     }
     lines.extend(chrome.header);
@@ -4651,7 +4647,9 @@ fn render_shell_update(
             stable_prefix: 0,
             replacement,
             reanchor_viewport: repaint_theme,
-            rebuild_scrollback: repaint_theme,
+            // Portable terminals cannot restyle rows already owned by native
+            // scrollback. Repaint the visible viewport and preserve history.
+            rebuild_scrollback: false,
         };
     }
 
@@ -4664,7 +4662,9 @@ fn render_shell_update(
     // native-scrollback renderer must repaint that new viewport from home;
     // otherwise its physical bottom remains anchored inside the old long
     // frame and later pickers expand above a composer stranded mid-screen.
+    let leaving_overlay = frame.initialized && frame.overlay_active;
     let reanchor_viewport = repaint_theme
+        || leaving_overlay
         || (frame.initialized
             && frame.width == width
             && !frame.overlay_active
@@ -4700,7 +4700,7 @@ fn render_shell_update(
         stable_prefix,
         replacement,
         reanchor_viewport,
-        rebuild_scrollback: repaint_theme,
+        rebuild_scrollback: false,
     }
 }
 
@@ -8404,6 +8404,44 @@ mod tests {
     }
 
     #[test]
+    fn aborted_final_frame_shows_interruption_and_restored_steering() {
+        use ygg_agent::{EntryId, FinishReason};
+
+        const WIDTH: u16 = 72;
+        const HEIGHT: u16 = 18;
+        for synchronized_output in [false, true] {
+            let (mut shell, bytes) = emulated_shell_with_sync(
+                crate::tui::theme::test_theme(),
+                WIDTH,
+                HEIGHT,
+                synchronized_output,
+            );
+            let run_id = shell.begin_run("temper");
+            shell.queue_steering(&ComposedInput::from_text("inspect renderer".into()));
+            shell.queue_steering(&ComposedInput::from_text("then run tests".into()));
+
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::RunFinished {
+                    head: EntryId("aborted-head".into()),
+                    reason: FinishReason::Aborted,
+                },
+            );
+            shell.restore_queued_steering();
+            shell.render();
+
+            let output = bytes.lock().unwrap().clone();
+            let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 128);
+            terminal.process(&output);
+            let physical = terminal.screen().contents();
+            assert_eq!(physical.matches("interrupted").count(), 1, "{physical}");
+            assert!(physical.contains("inspect renderer"), "{physical}");
+            assert!(physical.contains("then run tests"), "{physical}");
+            assert!(!physical.contains("Steering prompt"), "{physical}");
+        }
+    }
+
+    #[test]
     fn steering_delivery_is_positional_fifo() {
         let mut shell = InteractiveShell::test_shell();
         shell.apply_edit(EditAction::Paste("go left".into()));
@@ -8825,6 +8863,57 @@ mod tests {
     }
 
     #[test]
+    fn closing_overlay_reanchors_without_replaying_native_scrollback() {
+        const WIDTH: u16 = 80;
+        const HEIGHT: u16 = 16;
+        for synchronized_output in [false, true] {
+            let (mut shell, bytes) = emulated_shell_with_sync(
+                crate::tui::theme::test_theme(),
+                WIDTH,
+                HEIGHT,
+                synchronized_output,
+            );
+            let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+            let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+                std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+            };
+            terminal.process(&drain(&bytes));
+
+            for index in 0..32 {
+                shell.notice(format!("overlay-history-{index:02}"));
+            }
+            shell.render();
+            terminal.process(&drain(&bytes));
+
+            shell.show_overlay_text("status overlay\nclose me".into());
+            shell.render();
+            terminal.process(&drain(&bytes));
+
+            shell.close_overlay();
+            shell.render();
+            let close_frame = drain(&bytes);
+            assert!(
+                close_frame.len() < 8 * 1024,
+                "overlay close replayed an unbounded frame ({} bytes)",
+                close_frame.len()
+            );
+            terminal.process(&close_frame);
+
+            terminal.set_size(512, WIDTH);
+            terminal.set_scrollback(usize::MAX);
+            let physical = terminal.screen().contents();
+            for index in 0..32 {
+                let sentinel = format!("overlay-history-{index:02}");
+                assert_eq!(
+                    physical.matches(&sentinel).count(),
+                    1,
+                    "{sentinel} replayed with synchronized_output={synchronized_output}:\n{physical}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn long_exec_tail_and_head_trim_never_replay_native_history() {
         const WIDTH: u16 = 96;
         const HEIGHT: u16 = 24;
@@ -8967,23 +9056,25 @@ mod tests {
     }
 
     #[test]
-    fn short_transcript_events_do_not_move_the_pinned_composer_or_footer() {
+    fn short_transcript_chrome_follows_content_without_viewport_padding() {
         let mut shell = InteractiveShell::test_shell();
-        shell.set_size(80, 14);
+        shell.set_size(80, 40);
         shell.set_identity("codex", "gpt-5.6", "high");
         let run_id = shell.begin_run("codex");
         let now = Instant::now();
 
-        let chrome_rows = |lines: &[String]| {
-            let composer = lines
+        let composer_row = |lines: &[String]| {
+            lines
                 .iter()
                 .position(|line| line.contains(CURSOR_MARKER))
-                .expect("composer cursor row");
-            (composer, lines.len().saturating_sub(1), lines.len())
+                .expect("composer cursor row")
         };
         let initial = render_shell_at(&shell.state.borrow(), 80, now);
-        let expected = chrome_rows(&initial);
-        assert_eq!(expected.2, 14, "the short frame should fill the viewport");
+        let initial_composer = composer_row(&initial);
+        assert!(
+            initial.len() < 40,
+            "native mode must not pad a short frame to the terminal height"
+        );
 
         shell.on_run_event(
             run_id,
@@ -8993,7 +9084,8 @@ mod tests {
             },
         );
         let streamed = render_shell_at(&shell.state.borrow(), 80, now);
-        assert_eq!(chrome_rows(&streamed), expected);
+        assert!(composer_row(&streamed) > initial_composer);
+        assert!(streamed.len() < 40);
 
         shell.on_run_event(
             run_id,
@@ -9004,11 +9096,13 @@ mod tests {
             },
         );
         let tool = render_shell_at(&shell.state.borrow(), 80, now);
-        assert_eq!(chrome_rows(&tool), expected);
+        assert!(composer_row(&tool) > composer_row(&streamed));
+        assert!(tool.len() < 40);
 
         shell.queue_steering(&ComposedInput::from_text("also inspect tests".into()));
         let steering = render_shell_at(&shell.state.borrow(), 80, now);
-        assert_eq!(chrome_rows(&steering), expected);
+        assert!(composer_row(&steering) > composer_row(&tool));
+        assert!(steering.len() < 40);
         let steering_plain = steering
             .iter()
             .map(|line| strip_terminal_sequences(line))
@@ -9022,16 +9116,43 @@ mod tests {
         let mut frame = ShellFrameState::default();
         let first = render_shell_update(&shell.state.borrow(), 80, now, &mut frame);
         assert_eq!(first.stable_prefix, 0);
-        assert_eq!(first.replacement.len(), 14);
+        assert_eq!(first.replacement, steering);
         assert!(!first.rebuild_scrollback);
         let next = render_shell_update(&shell.state.borrow(), 80, now, &mut frame);
         assert!(next.stable_prefix > 0);
         assert!(!next.rebuild_scrollback);
-        assert_eq!(next.stable_prefix + next.replacement.len(), 14);
+        assert!(next.stable_prefix + next.replacement.len() < 40);
         assert!(next
             .replacement
             .iter()
             .any(|line| line.contains(CURSOR_MARKER)));
+    }
+
+    #[test]
+    fn emulated_native_short_frame_does_not_pin_composer_to_terminal_bottom() {
+        const WIDTH: u16 = 80;
+        const HEIGHT: u16 = 40;
+        let (mut shell, bytes) = emulated_shell(crate::tui::theme::test_theme(), WIDTH, HEIGHT);
+        shell.set_identity("codex", "gpt-5.6", "high");
+        shell.notice("recent transcript row");
+        shell.render();
+
+        let output = bytes.lock().unwrap().clone();
+        let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 0);
+        terminal.process(&output);
+        assert!(
+            terminal
+                .screen()
+                .contents()
+                .contains("recent transcript row"),
+            "transcript was not painted: {:?}",
+            terminal.screen().contents()
+        );
+        let (cursor_row, _) = terminal.screen().cursor_position();
+        assert!(
+            cursor_row < HEIGHT / 2,
+            "short native frame pinned the composer at terminal row {cursor_row}"
+        );
     }
 
     #[test]
@@ -9065,7 +9186,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_swap_rebuilds_native_scrollback_once_without_stale_styles() {
+    fn theme_swap_repaints_visible_cells_but_preserves_native_scrollback_styles() {
         const WIDTH: u16 = 32;
         const HEIGHT: u16 = 10;
         let theme_source = |name: &str, foreground: &str| {
@@ -9080,6 +9201,7 @@ mod tests {
             ))
         };
         let first_theme = theme_source("Viewport red", "#b01020");
+        let old_foreground = role_rgb_color(&first_theme, "foreground");
         let (mut shell, bytes) = emulated_shell(first_theme, WIDTH, HEIGHT);
         {
             let mut state = shell.state.borrow_mut();
@@ -9123,20 +9245,14 @@ mod tests {
             .lock()
             .expect("emulated terminal output mutex poisoned")
             .clone();
-        let clear_saved = complete
-            .windows(b"\x1b[3J".len())
-            .rposition(|window| window == b"\x1b[3J")
-            .expect("theme swap did not rebuild terminal-owned scrollback");
-        let rebuilt = &complete[clear_saved + b"\x1b[3J".len()..];
-        assert_eq!(
-            String::from_utf8_lossy(rebuilt)
-                .matches("historic-")
-                .count(),
-            12,
-            "theme swap replayed history more than once"
+        assert!(
+            !complete
+                .windows(b"\x1b[3J".len())
+                .any(|window| window == b"\x1b[3J"),
+            "theme swap cleared terminal-owned scrollback"
         );
         let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 128);
-        terminal.process(rebuilt);
+        terminal.process(&complete);
         assert!(
             find_ascii_cell(terminal.screen(), "historic-").is_some(),
             "visible tail lost after theme repaint: {:?}",
@@ -9149,23 +9265,31 @@ mod tests {
             terminal.screen().contents()
         );
 
-        let mut found_rebuilt_history = false;
-        for offset in 0..=usize::from(HEIGHT) {
+        let mut native_history = None;
+        for offset in 1..=usize::from(HEIGHT) {
             terminal.set_scrollback(offset);
             for (row, contents) in terminal.screen().rows(0, WIDTH).enumerate() {
-                let Some(start) = contents.find("historic-") else {
+                let Some(column) = contents.find("historic-") else {
                     continue;
                 };
-                found_rebuilt_history = true;
                 let color = terminal
                     .screen()
-                    .cell(row as u16, start as u16)
+                    .cell(row as u16, column as u16)
                     .expect("historic cell inside terminal bounds")
                     .fgcolor();
-                assert_eq!(color, new_foreground, "stale theme at offset {offset}");
+                if color == old_foreground {
+                    native_history = Some((row as u16, column as u16));
+                    break;
+                }
+            }
+            if native_history.is_some() {
+                break;
             }
         }
-        assert!(found_rebuilt_history, "rebuilt scrollback had no history");
+        assert!(
+            native_history.is_some(),
+            "rows committed before the theme swap should retain their original cell style"
+        );
     }
 
     #[test]
@@ -9260,7 +9384,7 @@ mod tests {
         let fresh = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
         assert!(fresh.reanchor_viewport);
         assert!(!fresh.rebuild_scrollback);
-        assert_eq!(fresh.stable_prefix + fresh.replacement.len(), 14);
+        assert!(fresh.stable_prefix + fresh.replacement.len() < 14);
 
         shell.open_panel(Panel::SelectList {
             title: "Models".into(),
@@ -9276,7 +9400,7 @@ mod tests {
         let picker = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
         assert!(!picker.reanchor_viewport);
         assert!(!picker.rebuild_scrollback);
-        assert_eq!(picker.stable_prefix + picker.replacement.len(), 14);
+        assert!(picker.stable_prefix + picker.replacement.len() <= 14);
         assert!(picker
             .replacement
             .iter()

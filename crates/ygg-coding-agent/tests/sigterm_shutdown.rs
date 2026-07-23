@@ -74,6 +74,9 @@ impl PtyYgg {
             ws_ypixel: 0,
         };
         let opened = unsafe {
+            // macOS declares `winp` mutable while Linux declares it const, so the
+            // mutable pointer is required for this cross-platform test.
+            #[allow(clippy::unnecessary_mut_passed)]
             libc::openpty(
                 &mut master_fd,
                 &mut slave_fd,

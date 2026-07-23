@@ -353,7 +353,7 @@ fn provider_reasoning_value(
             .find(|value| predicate(value))
             .map(ToOwned::to_owned)
     };
-    match reasoning {
+    let selected = match reasoning {
         ReasoningConfig::Off => find(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
@@ -376,7 +376,15 @@ fn provider_reasoning_value(
             .find(|value| provider_effort(value) == Some(*effort))
             .map(ToOwned::to_owned),
         ReasoningConfig::Budget(_) => None,
-    }
+    };
+
+    // Capability inventories use `default` to mean "enable the provider's
+    // default reasoning behaviour". It is not necessarily a wire literal:
+    // vLLM, for example, advertises the binary values `none/default` while its
+    // request validator accepts `none` plus named effort levels. Omitting the
+    // field is the portable representation of the default; explicit `on`,
+    // `enabled`, and named levels remain provider-owned wire values.
+    selected.filter(|value| !value.trim().eq_ignore_ascii_case("default"))
 }
 
 /// Builds the OpenAI Chat Completions HTTP request parts.
@@ -2428,7 +2436,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_reasoning_values_are_preserved_on_the_wire() {
+    fn provider_reasoning_values_preserve_literals_but_omit_semantic_default() {
         let mut model = make_test_model(false, false, false, true, true, false);
         let capability = Arc::make_mut(&mut model.spec)
             .capabilities
@@ -2467,7 +2475,21 @@ mod tests {
         req.reasoning = ReasoningConfig::On;
         let body: serde_json::Value =
             serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
-        assert_eq!(body["reasoning_effort"], "default");
+        assert!(body.get("reasoning_effort").is_none());
+
+        let capability = Arc::make_mut(&mut model.spec)
+            .capabilities
+            .reasoning
+            .as_mut()
+            .unwrap();
+        capability.openai_chat_mode = OpenAiChatReasoningMode::ProviderValues {
+            values: vec!["off".into(), "on".into()],
+            default: Some("on".into()),
+            system_message: true,
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["reasoning_effort"], "on");
 
         let capability = Arc::make_mut(&mut model.spec)
             .capabilities
@@ -2486,6 +2508,53 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn binary_reasoning_default_keeps_qwen_tool_schema_on_the_wire() {
+        let mut model = make_test_model(false, false, false, true, true, false);
+        let capability = Arc::make_mut(&mut model.spec)
+            .capabilities
+            .reasoning
+            .as_mut()
+            .unwrap();
+        capability.control = crate::types::ReasoningControl::Toggle;
+        capability.openai_chat_mode = OpenAiChatReasoningMode::ProviderValues {
+            values: vec!["none".into(), "default".into()],
+            default: Some("default".into()),
+            system_message: true,
+        };
+        let request = Request {
+            system: Some("Use tools when needed.".into()),
+            messages: vec![Message::User(UserMessage {
+                content: vec![UserPart::Text("Read sentinel.txt".into())],
+            })],
+            tools: vec![crate::types::ToolDef {
+                name: "read".into(),
+                description: "Read a file".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+            }],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: None,
+            temperature: None,
+            stop: vec![],
+            reasoning: ReasoningConfig::On,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
+        };
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &request).unwrap().body).unwrap();
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tools"][0]["function"]["name"], "read");
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
