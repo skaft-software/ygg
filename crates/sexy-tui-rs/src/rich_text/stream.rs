@@ -367,6 +367,13 @@ pub struct StreamingRenderCache {
 }
 
 impl StreamingRenderCache {
+    /// Rows produced by parser-committed blocks at the current width. These
+    /// rows are byte-stable across later token deltas and may safely cross a
+    /// native-scrollback commit boundary.
+    pub fn committed_rows(&self) -> usize {
+        self.committed_lines.len()
+    }
+
     pub fn render(
         &mut self,
         stream: &StreamingMarkdown,

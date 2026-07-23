@@ -1,6 +1,6 @@
 <p align="center">
   <a href="http://skaft.org/ygg">
-    <img src="docs/assets/ygg-hero.svg" alt="Ygg — a local-first coding agent" width="100%">
+    <img src="docs/assets/ygg-hero.svg" alt="ygg — a local-first coding agent" width="100%">
   </a>
 </p>
 
@@ -24,28 +24,28 @@
 
 ---
 
-Ygg is a local-first coding agent written in Rust. It combines a polished terminal interface, a provider-independent inference layer, durable branchable sessions, bounded tools, explicit trust controls, multimodal input, automatic context compaction, and a filesystem-native customization system in one binary.
+ygg is a local-first coding agent written in Rust. It combines a polished terminal interface, a provider-independent inference layer, durable branchable sessions, bounded tools, explicit trust controls, multimodal input, automatic context compaction, and a filesystem-native customization system in one binary.
 
-It works with a local OpenAI-compatible server just as naturally as it works with OpenAI, Anthropic, OpenRouter, or another cloud provider. There is no hosted Ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local inspectable JSONL.
+It works with a local OpenAI-compatible server just as naturally as it works with OpenAI, Anthropic, OpenRouter, or another cloud provider. There is no hosted ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local inspectable JSONL.
 
-> **Release status:** `0.1.0-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. Ygg is a trusted local agent, not an operating-system sandbox.
+> **Release status:** `0.1.0-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
 
-## Why Ygg
+## Why ygg
 
-Most coding agents make you choose between a beautiful product and a system you can actually inspect. Ygg is built around the idea that you should get both.
+Most coding agents make you choose between a beautiful product and a system you can actually inspect. ygg is built around the idea that you should get both.
 
-| Principle | What it means in Ygg |
+| Principle | What it means in ygg |
 | --- | --- |
 | **Local models first** | First-class custom endpoints, offline startup, cold-start-safe timeouts, live model discovery, and exact endpoint-reported reasoning controls. |
 | **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share one typed request, message, tool, usage, and streaming model. |
-| **Durable by construction** | Sessions are append-only, parent-linked, branchable, locked, synced, repairable, and inspectable without Ygg running. |
+| **Durable by construction** | Sessions are append-only, parent-linked, branchable, locked, synced, repairable, and inspectable without ygg running. |
 | **Authority is explicit** | Workspace trust, tool allowlists, mutation controls, command controls, bounded I/O, and extension trust are visible user decisions. |
 | **The terminal is the product** | Native scrollback and selection, semantic rendering, ten bundled themes, responsive narrow layouts, stable streaming, and plain-output fallbacks. |
 | **Customization is local data** | Prompts, skills, themes, instructions, and extensions are ordinary files with deterministic precedence and reloadable snapshots. |
 
 ## Install
 
-Ygg currently supports macOS and Linux. You need [Rust 1.86 or newer](https://rustup.rs/) and [ripgrep](https://github.com/BurntSushi/ripgrep).
+ygg currently supports macOS and Linux. You need [Rust 1.86 or newer](https://rustup.rs/) and [ripgrep](https://github.com/BurntSushi/ripgrep).
 
 ### Installer
 
@@ -91,7 +91,7 @@ cargo install --locked --path crates/ygg-coding-agent --bin ygg
 
 ### Container
 
-The included image builds Ygg from the locked workspace, runs as an unprivileged
+The included image builds ygg from the locked workspace, runs as an unprivileged
 user, and expects an explicit workspace mount:
 
 ```sh
@@ -108,7 +108,7 @@ Only pass credentials and mount paths the container actually needs.
 
 ### Use a cloud model
 
-Set the provider credential, then select a model. Ygg discovers the live model catalog where the provider exposes one.
+Set the provider credential, then select a model. ygg discovers the live model catalog where the provider exposes one.
 
 ```sh
 export ANTHROPIC_API_KEY='...'
@@ -145,7 +145,7 @@ Create `~/.ygg/credentials/custom.json`:
 }
 ```
 
-Protect the credential file and start Ygg:
+Protect the credential file and start ygg:
 
 ```sh
 chmod 600 ~/.ygg/credentials/custom.json
@@ -232,7 +232,7 @@ ygg --no-tools
 
 Built-in provider presets include OpenAI, Anthropic, OpenRouter, DeepSeek, Groq, Cerebras, xAI, Together AI, Fireworks AI, NVIDIA, Hugging Face, Moonshot AI, Xiaomi, MiniMax, and OpenCode Zen. Custom OpenAI-compatible endpoints cover local servers such as llama.cpp, vLLM, SGLang, LM Studio, and compatible gateways.
 
-Capability handling is model-specific. Ygg validates modalities, tool use, structured output, output limits, and reasoning before sending a request. When a custom endpoint reports an exact reasoning control—off-only, binary on/off, or named levels—the picker and request wire values follow that metadata exactly.
+Capability handling is model-specific. ygg validates modalities, tool use, structured output, output limits, and reasoning before sending a request. When a custom endpoint reports an exact reasoning control—off-only, binary on/off, or named levels—the picker and request wire values follow that metadata exactly.
 
 ### Reasoning without transcript noise
 
@@ -271,7 +271,7 @@ Paste or mention a supported image in the composer. Attachments are represented 
 
 ### Durable branchable sessions
 
-Ygg sessions are bounded append-only JSONL, namespaced by workspace. Complete semantic boundaries are persisted; provisional streaming deltas are not. Each entry points to its parent, which makes checkout and branching cheap without rewriting history.
+ygg sessions are bounded append-only JSONL, namespaced by workspace. Complete semantic boundaries are persisted; provisional streaming deltas are not. Each entry points to its parent, which makes checkout and branching cheap without rewriting history.
 
 ```sh
 ygg --continue
@@ -299,7 +299,7 @@ See [docs/sessions.md](docs/sessions.md) for the record schema, branch semantics
 
 ### Context and compaction
 
-Ygg estimates the next provider-visible request against the active model's context window. At the configured threshold it creates a bounded summary at a safe completed-turn boundary, preserves recent turns, and keeps active skill state. Compaction can use the active model or a separately configured model.
+ygg estimates the next provider-visible request against the active model's context window. At the configured threshold it creates a bounded summary at a safe completed-turn boundary, preserves recent turns, and keeps active skill state. Compaction can use the active model or a separately configured model.
 
 ```toml
 [compaction]
@@ -312,7 +312,7 @@ Run `/compact` at any time to request a manual compaction. The compact footer us
 
 ## Terminal experience
 
-Ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats native terminal behavior as a feature, not an implementation detail.
+ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats native terminal behavior as a feature, not an implementation detail.
 
 - Native scrollback and text selection by default; application-owned mouse behavior is opt-in.
 - Stable-prefix differential rendering, synchronized atomic frames, and bounded repaint regions.
@@ -360,7 +360,7 @@ Type `/` in the composer to open live command discovery.
 | `/prompt [name] [arguments]` | List or expand named prompt templates. |
 | `/skills ...` | List, search, inspect, load, unload, or reload skills. |
 | `/extensions [reload]` | Inspect or replace enabled executable extensions. |
-| `/quit` | Exit Ygg. |
+| `/quit` | Exit ygg. |
 
 Useful keys:
 
@@ -368,7 +368,7 @@ Useful keys:
 | --- | --- |
 | `Enter` | Submit. |
 | `Shift+Enter` | Insert a newline when the terminal reports enhanced key events. |
-| `Ctrl+C` | Abort the active run; close Ygg when idle. |
+| `Ctrl+C` | Abort the active run; close ygg when idle. |
 | `Ctrl+O` | Expand or collapse reasoning, tool evidence, or shell output. |
 | `PageUp` / `PageDown` | Navigate transcript history. |
 | `@` | Complete workspace file mentions. |
@@ -454,7 +454,7 @@ Markdown and TOML prompt templates can accept arguments and include bounded file
 
 ### Skills
 
-Skills are explicit, inspectable capability packages. Ygg discovers metadata, activates only selected skills, injects active instructions once, and loads referenced resources lazily through bounded reads. Activation and resource reads are durable session events.
+Skills are explicit, inspectable capability packages. ygg discovers metadata, activates only selected skills, injects active instructions once, and loads referenced resources lazily through bounded reads. Activation and resource reads are durable session events.
 
 ### Executable extensions
 
@@ -496,7 +496,7 @@ Detailed contracts live in [docs/design/ygg-ai.md](docs/design/ygg-ai.md), [docs
 
 ## Reliability and security engineering
 
-Ygg is intentionally honest about where its boundary ends.
+ygg is intentionally honest about where its boundary ends.
 
 - **Workspace paths:** descriptor-relative, no-follow file operations prevent parent-symlink replacement from redirecting built-in reads and mutations.
 - **Bounded inputs:** provider streams, discovery payloads, configuration, credentials, context, sessions, tool arguments/results, and local reads have byte/count limits.
@@ -508,7 +508,7 @@ Ygg is intentionally honest about where its boundary ends.
 - **Dependency policy:** `cargo audit` and `cargo deny` cover advisories, licenses, bans, duplicate visibility, and source policy as release gates.
 - **Verification:** protocol fixtures, adversarial streaming tests, filesystem race tests, VT100 rendering, PTY shutdown tests, and full workspace tests cover the release invariants.
 
-These controls do not contain a command the user has chosen to enable. Run Ygg inside an OS isolation boundary when the repository, model, or extension is untrusted. Read the full [security policy](SECURITY.md) before using autonomous tools on sensitive machines.
+These controls do not contain a command the user has chosen to enable. Run ygg inside an OS isolation boundary when the repository, model, or extension is untrusted. Read the full [security policy](SECURITY.md) before using autonomous tools on sensitive machines.
 
 ## Development
 
@@ -566,7 +566,7 @@ third_party/              upstream license texts
 
 ## Built by Achu
 
-I built Ygg to demonstrate the kind of engineering I care about: ambitious AI products backed by systems-level rigor—protocol design, streaming state machines, durable data structures, terminal rendering, security boundaries, performance work, and a user experience worth shipping.
+I built ygg to demonstrate the kind of engineering I care about: ambitious AI products backed by systems-level rigor—protocol design, streaming state machines, durable data structures, terminal rendering, security boundaries, performance work, and a user experience worth shipping.
 
 I am based in Toronto and work on AI infrastructure, developer tools, and local-first systems. If you are building in that space and want someone who can carry a product from architecture through hardening and release, I would love to talk.
 
@@ -576,9 +576,9 @@ I am based in Toronto and work on AI infrastructure, developer tools, and local-
 
 ## License and acknowledgements
 
-Ygg is distributed under the [MIT License](LICENSE).
+ygg is distributed under the [MIT License](LICENSE).
 
-Ygg uses architectural concepts and terminal interaction patterns from [Pi](https://github.com/earendil-works/pi). Its development and evaluation were also informed by [Terminal-Bench](https://github.com/harbor-framework/terminal-bench). Copyright, provenance, and upstream license texts are preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [`third_party/licenses/`](third_party/licenses/).
+ygg uses architectural concepts and terminal interaction patterns from [Pi](https://github.com/earendil-works/pi). Its development and evaluation were also informed by [Terminal-Bench](https://github.com/harbor-framework/terminal-bench). Copyright, provenance, and upstream license texts are preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [`third_party/licenses/`](third_party/licenses/).
 
 ---
 

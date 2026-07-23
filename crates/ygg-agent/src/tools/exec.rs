@@ -483,6 +483,9 @@ fn open_private_pty() -> Result<(libc::c_int, libc::c_int), ToolError> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    // macOS declares `winp` mutable while Linux declares it const, so the
+    // mutable pointer is required for this cross-platform implementation.
+    #[allow(clippy::unnecessary_mut_passed)]
     if unsafe {
         libc::openpty(
             &mut master,

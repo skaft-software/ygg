@@ -651,7 +651,7 @@ fn api_models_from_response(body: &serde_json::Value) -> anyhow::Result<Vec<Disc
                         .get("top_provider")
                         .and_then(|provider| positive_u64(provider, &["max_completion_tokens"]))
                 }),
-            tools: model_metadata_supports_tools(entry),
+            tools: custom_model_metadata_supports_tools(entry),
             vision,
             audio,
         });
@@ -3649,7 +3649,7 @@ mod tests {
     }
 
     #[test]
-    fn model_inventory_requires_positive_tool_capability_metadata() {
+    fn custom_model_inventory_defaults_sparse_metadata_to_tool_capable() {
         let response = serde_json::json!({
             "data": [
                 {"id": "unknown"},
@@ -3675,7 +3675,7 @@ mod tests {
             .iter()
             .map(|model| (model.id.as_str(), model.tools))
             .collect::<std::collections::BTreeMap<_, _>>();
-        assert!(!tools["unknown"]);
+        assert!(tools["unknown"]);
         assert!(tools["parameters"]);
         assert!(!tools["empty-parameters"]);
         assert!(tools["capability-object"]);
