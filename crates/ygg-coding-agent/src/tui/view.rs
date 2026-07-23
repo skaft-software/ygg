@@ -733,6 +733,10 @@ pub(crate) struct ShellState {
     /// to repaint the complete visible viewport even when some logical rows
     /// (notably blank separators) are byte-identical across themes.
     theme_epoch: u64,
+    /// Changes only when the logical transcript is replaced (for example by
+    /// `/new` or session hydration). Visual row counts may shrink while a
+    /// streaming Markdown block reparses and must not look like a new session.
+    transcript_epoch: u64,
     /// Creator family for the active model. The dedicated model accent is
     /// reapplied whenever a named theme is loaded.
     pub(crate) model_lab: Option<crate::tui::theme::ModelLab>,
@@ -1512,12 +1516,9 @@ struct ShellFrameState {
     initialized: bool,
     width: u16,
     theme_epoch: u64,
+    transcript_epoch: u64,
     transcript_generation: u64,
     transcript_len: usize,
-    /// Height of the mutable header/popup/composer tail in the last frame.
-    /// Unlike transcript growth, a height change here inserts or removes rows
-    /// around already-painted chrome and must reanchor the native viewport.
-    chrome_rows: usize,
     overlay_active: bool,
 }
 
@@ -1541,6 +1542,7 @@ impl Component for ShellComponent {
             frame.initialized = true;
             frame.width = width;
             frame.theme_epoch = state.theme_epoch;
+            frame.transcript_epoch = state.transcript_epoch;
             lines
         } else {
             let lines = render_shell(&state, width);
@@ -4060,17 +4062,6 @@ struct ShellChrome {
     transcript_rows: usize,
 }
 
-impl ShellChrome {
-    fn rows(&self) -> usize {
-        self.header.len()
-            + self.error.len()
-            + self.pending.len()
-            + self.suggestions.len()
-            + self.panel.len()
-            + self.composer.len()
-    }
-}
-
 fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> ShellChrome {
     let rows = usize::from(state.size.1.max(5));
     let header = render_shell_header(state, width);
@@ -4652,7 +4643,7 @@ fn render_shell_viewport_update(
     frame.initialized = true;
     frame.width = width;
     frame.theme_epoch = state.theme_epoch;
-    frame.chrome_rows = shell_chrome(state, width, now).rows();
+    frame.transcript_epoch = state.transcript_epoch;
     FrameUpdate {
         stable_prefix: 0,
         replacement: render_shell_viewport_at(state, width, now),
@@ -4696,11 +4687,11 @@ fn render_shell_at(state: &ShellState, width: u16, now: Instant) -> Vec<String> 
 }
 
 fn synchronize_shell_frame(state: &ShellState, width: u16, frame: &mut ShellFrameState) {
-    frame.chrome_rows = shell_chrome(state, width, Instant::now()).rows();
     if state.overlay.is_some() {
         frame.initialized = true;
         frame.width = width;
         frame.theme_epoch = state.theme_epoch;
+        frame.transcript_epoch = state.transcript_epoch;
         frame.transcript_generation = 0;
         frame.transcript_len = 0;
         frame.overlay_active = true;
@@ -4711,6 +4702,7 @@ fn synchronize_shell_frame(state: &ShellState, width: u16, frame: &mut ShellFram
     frame.initialized = true;
     frame.width = width;
     frame.theme_epoch = state.theme_epoch;
+    frame.transcript_epoch = state.transcript_epoch;
     frame.transcript_generation = cache.generation;
     frame.transcript_len = cache.lines.len();
     frame.overlay_active = false;
@@ -4727,24 +4719,24 @@ fn render_shell_update(
 ) -> FrameUpdate {
     let repaint_theme = frame.initialized && frame.theme_epoch != state.theme_epoch;
     let chrome = shell_chrome(state, width, now);
-    let chrome_rows = chrome.rows();
-    let reanchor_chrome =
-        frame.initialized && frame.width == width && frame.chrome_rows != chrome_rows;
     if state.overlay.is_some() {
+        let entering_overlay = frame.initialized && !frame.overlay_active;
         let mut replacement = overlay_lines(state, width);
         append_chrome(&mut replacement, chrome, 0);
         frame.initialized = true;
         frame.width = width;
         frame.theme_epoch = state.theme_epoch;
+        frame.transcript_epoch = state.transcript_epoch;
         frame.transcript_generation = 0;
         frame.transcript_len = 0;
-        frame.chrome_rows = chrome_rows;
         frame.overlay_active = true;
         return FrameUpdate {
             stable_prefix: 0,
             replacement,
-            commit_boundary: Some(0),
-            reanchor_viewport: repaint_theme || reanchor_chrome,
+            // Overlays temporarily replace the grid but do not replace or
+            // advance the transcript's native-scrollback ledger.
+            commit_boundary: None,
+            reanchor_viewport: repaint_theme || entering_overlay,
             // Portable terminals cannot restyle rows already owned by native
             // scrollback. Repaint the visible viewport and preserve history.
             rebuild_scrollback: false,
@@ -4756,21 +4748,18 @@ fn render_shell_update(
         transcript.len()
     };
     let commit_boundary = transcript_commit_boundary(state, width);
-    // Hydrating `/new` (or a shorter resumed session) replaces the logical
-    // transcript rather than merely editing the visible tail. The terminal's
-    // native-scrollback renderer must repaint that new viewport from home;
-    // otherwise its physical bottom remains anchored inside the old long
-    // frame and later pickers expand above a composer stranded mid-screen.
+    // Hydrating `/new` (or another session) replaces the logical transcript.
+    // Visual row counts alone cannot identify that transition: a streaming
+    // Markdown table routinely shrinks while incomplete syntax reparses.
     let leaving_overlay = frame.initialized && frame.overlay_active;
     let cache = state.transcript_cache.borrow();
     let generation = cache.generation;
     let reanchor_viewport = repaint_theme
-        || reanchor_chrome
         || leaving_overlay
         || (frame.initialized
             && frame.width == width
             && !frame.overlay_active
-            && transcript_len < frame.transcript_len);
+            && frame.transcript_epoch != state.transcript_epoch);
     let stable_prefix = if frame.initialized && frame.width == width && !frame.overlay_active {
         if frame.transcript_generation == cache.generation {
             frame.transcript_len.min(transcript_len)
@@ -4793,9 +4782,9 @@ fn render_shell_update(
     frame.initialized = true;
     frame.width = width;
     frame.theme_epoch = state.theme_epoch;
+    frame.transcript_epoch = state.transcript_epoch;
     frame.transcript_generation = generation;
     frame.transcript_len = transcript_len;
-    frame.chrome_rows = chrome_rows;
     frame.overlay_active = false;
     FrameUpdate {
         stable_prefix,
@@ -7150,6 +7139,7 @@ impl InteractiveShell {
                     EntryValue::Compaction { summary, .. } => Some(summary.clone()),
                     _ => None,
                 });
+        state.transcript_epoch = state.transcript_epoch.wrapping_add(1);
         state.transcript.clear();
         state.block_revisions.clear();
         state.invalidate_transcript_layout();
@@ -9343,33 +9333,60 @@ mod tests {
     fn streamed_table_and_wrapped_lists_never_commit_provisional_duplicates() {
         const WIDTH: u16 = 96;
         const HEIGHT: u16 = 22;
-        let (mut shell, bytes) = emulated_shell(crate::tui::theme::test_theme(), WIDTH, HEIGHT);
+        let (mut shell, bytes) =
+            emulated_shell_with_sync(crate::tui::theme::test_theme(), WIDTH, HEIGHT, true);
         let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
         let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
             std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
         };
         terminal.process(&drain(&bytes));
 
-        let response = "\
-# Files
+        shell.on_prompt_submitted(
+            "TABLE-PROMPT-SENTINEL: stream a long table while mutable chrome changes height",
+        );
+        shell.render();
+        terminal.process(&drain(&bytes));
 
-| File | Lines | Content |
-|---|---:|---|
-| README.md | 603 | Full architecture deep-dive |
-| extracted-prompts.md | 76 | Verbatim prompt excerpts |
-| env-vars-reference.md | 518 | 512 environment variables |
-
-## Key Findings
-
-1. **Multi-Agent Architecture**
-
-- **Coordinator** spawns subagents and workers with isolated context windows
-- **Three worker types** run concurrently and preserve their own tool state
-- **Guidance** remains visible exactly once even when this sentence wraps across terminal rows
-
-2. **System Prompt Architecture**
-";
+        // Submission is painted while idle. Beginning the run changes the
+        // composer/status height before any model text arrives.
         let run_id = shell.begin_run("openai");
+        shell.render();
+        terminal.process(&drain(&bytes));
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::OutputDelta {
+                channel: OutputChannel::Reasoning,
+                text: "constructing a long boundary regression table".into(),
+            },
+        );
+        shell.state.borrow_mut().advance_reasoning_animation();
+        shell.render();
+        terminal.process(&drain(&bytes));
+
+        let mut update_probe = ShellFrameState::default();
+        let initial_probe = render_shell_update(
+            &shell.state.borrow(),
+            WIDTH,
+            Instant::now(),
+            &mut update_probe,
+        );
+        assert!(!initial_probe.reanchor_viewport);
+        let mut saw_streaming_row_shrink = false;
+
+        let mut response = String::from(
+            "# TABLE HEADING SENTINEL\n\n\
+             | Marker | Boundary condition details | Regression scenario details | Expected behavior details |\n\
+             |---|---|---|---|\n",
+        );
+        for index in 0..12 {
+            response.push_str(&format!(
+                "| ROW{index:02}SENTINEL | boundary condition {index} contains enough distinct words to wrap | streaming markdown reparses this row as tokens arrive | retain exactly one final physical copy in terminal history |\n"
+            ));
+        }
+        response.push_str(
+            "\n## LIST HEADING SENTINEL\n\n\
+             - **WRAPPED-LIST-SENTINEL** remains unique while this deliberately long list item wraps across several terminal cells and rows.\n",
+        );
         for chunk in response.as_bytes().chunks(5) {
             shell.on_run_event(
                 run_id,
@@ -9378,21 +9395,42 @@ mod tests {
                     text: String::from_utf8(chunk.to_vec()).unwrap(),
                 },
             );
+            let previous_rows = update_probe.transcript_len;
+            let probe = render_shell_update(
+                &shell.state.borrow(),
+                WIDTH,
+                Instant::now(),
+                &mut update_probe,
+            );
+            saw_streaming_row_shrink |= update_probe.transcript_len < previous_rows;
+            assert!(
+                !probe.reanchor_viewport,
+                "streaming Markdown reflow must not reset the physical viewport"
+            );
             shell.render();
             terminal.process(&drain(&bytes));
         }
+        assert!(
+            saw_streaming_row_shrink,
+            "fixture did not exercise a shrinking streamed layout"
+        );
 
         terminal.set_size(256, WIDTH);
         terminal.set_scrollback(usize::MAX);
         let physical = terminal.screen().contents();
+        assert_eq!(
+            physical.matches("│ ›").count(),
+            1,
+            "mutable composer was committed to scrollback:\n{physical}"
+        );
         for sentinel in [
-            "Files",
-            "Key Findings",
-            "Multi-Agent Architecture",
-            "Coordinator",
-            "Three worker types",
-            "Guidance",
-            "System Prompt Architecture",
+            "TABLE-PROMPT-SENTINEL",
+            "TABLE HEADING SENTINEL",
+            "ROW00SENTINEL",
+            "ROW05SENTINEL",
+            "ROW11SENTINEL",
+            "LIST HEADING SENTINEL",
+            "WRAPPED-LIST-SENTINEL",
         ] {
             assert_eq!(
                 physical.matches(sentinel).count(),
@@ -9694,7 +9732,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_popup_height_changes_reanchor_native_viewport() {
+    fn slash_popup_height_changes_use_differential_repaint() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_size(80, 20);
         for character in "/res".chars() {
@@ -9711,8 +9749,8 @@ mod tests {
         assert_eq!(shell.pending(), "/");
         let expanded = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
         assert!(
-            expanded.reanchor_viewport,
-            "growing suggestions before the composer must repaint the viewport"
+            !expanded.reanchor_viewport,
+            "growing mutable chrome must not replay the viewport"
         );
 
         for character in "res".chars() {
@@ -9720,8 +9758,8 @@ mod tests {
         }
         let collapsed = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
         assert!(
-            collapsed.reanchor_viewport,
-            "shrinking suggestions must erase the previously taller popup"
+            !collapsed.reanchor_viewport,
+            "shrinking mutable chrome must clear only its changed tail"
         );
     }
 
@@ -9931,7 +9969,7 @@ mod tests {
     }
 
     #[test]
-    fn new_session_shrink_requests_viewport_reanchoring_before_picker_growth() {
+    fn new_session_shrink_reanchors_but_picker_growth_does_not() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_size(80, 14);
         for number in 0..80 {
@@ -9946,6 +9984,7 @@ mod tests {
 
         {
             let mut state = shell.state.borrow_mut();
+            state.transcript_epoch = state.transcript_epoch.wrapping_add(1);
             state.transcript.clear();
             state.block_revisions.clear();
             state.invalidate_transcript_layout();
@@ -9969,8 +10008,8 @@ mod tests {
         });
         let picker = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
         assert!(
-            picker.reanchor_viewport,
-            "inserting picker rows before the composer must reanchor the viewport"
+            !picker.reanchor_viewport,
+            "inserting picker rows must use a differential tail repaint"
         );
         assert!(!picker.rebuild_scrollback);
         assert!(picker.stable_prefix + picker.replacement.len() <= 14);
@@ -10648,13 +10687,31 @@ mod tests {
         let assistant = AssistantBlock::finalized(
             "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new".into(),
         );
-        let rendered = assistant
-            .render(&theme.rich_renderer(), &theme, 80)
-            .join("\n");
+        let rendered_lines = assistant.render(&theme.rich_renderer(), &theme, 80);
+        let rendered = rendered_lines.join("\n");
         assert!(rendered.contains("@@ -1 +1 @@"));
         assert!(rendered.contains("-old"));
         assert!(rendered.contains("+new"));
         assert!(!rendered.contains("```"));
+
+        let terminal = emulate_rows(&rendered_lines, 80);
+        let (removed_row, removed_col) =
+            find_ascii_cell(terminal.screen(), "-old").expect("rendered removal");
+        let (added_row, added_col) =
+            find_ascii_cell(terminal.screen(), "+new").expect("rendered addition");
+        let removed = terminal
+            .screen()
+            .cell(removed_row, removed_col)
+            .expect("removal cell")
+            .bgcolor();
+        let added = terminal
+            .screen()
+            .cell(added_row, added_col)
+            .expect("addition cell")
+            .bgcolor();
+        assert_ne!(removed, vt100::Color::Default);
+        assert_ne!(added, vt100::Color::Default);
+        assert_ne!(removed, added);
     }
 
     #[test]
@@ -13194,7 +13251,10 @@ mod tests {
         );
         let renderer = unknown.rich_renderer();
         let unknown = render_block(None, &block, &unknown, &renderer, &renderer, 72, false);
-        assert!(unknown.iter().all(|line| !line.contains("\x1b[48;")));
+        assert!(
+            unknown.iter().any(|line| line.contains("\x1b[48;")),
+            "unknown terminal backgrounds must retain adaptive surfaces"
+        );
     }
 
     #[test]

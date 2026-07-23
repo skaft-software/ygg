@@ -1152,20 +1152,18 @@ fn blend(source: Rgb, destination: Rgb, amount: f64) -> Rgb {
 /// surface tint rather than a painted slab. Used for diff-add/diff-remove
 /// backgrounds so they adapt to the user's terminal profile.
 pub(crate) fn balance_background(source: &str, background: TerminalBackground) -> String {
-    // There is no single painted surface that is subtle on both unknown light
-    // and unknown dark canvases. Preserve the user's terminal background until
-    // an explicit profile is available; diff prefixes and semantic foregrounds
-    // continue to carry the state without a slab of guessed colour.
-    if background == TerminalBackground::Unknown {
-        return "default".to_owned();
-    }
     let Some(source) = parse_hex_color(source) else {
         return source.to_owned();
     };
+    // Most terminals do not export COLORFGBG (Ghostty included), so treating an
+    // unknown profile as "no surface" silently removes diff semantics. Use the
+    // universal midpoint already used for unknown-profile foregrounds: it
+    // retains the surface while remaining readable with either a black or
+    // white terminal-default foreground.
     let target_luminance = match background {
         TerminalBackground::Dark => 0.025,
         TerminalBackground::Light => 0.95,
-        TerminalBackground::Unknown => unreachable!("handled above"),
+        TerminalBackground::Unknown => UNIVERSAL_TARGET_LUMINANCE,
     };
     let source_luminance = relative_luminance(source);
     if (source_luminance - target_luminance).abs() <= 0.002 {
@@ -2119,14 +2117,29 @@ mod tests {
                     TerminalBackground::Unknown => {
                         assert!(contrast(accent, black) >= 4.5, "{} black", bundled.id);
                         assert!(contrast(accent, white) >= 4.5, "{} white", bundled.id);
-                        assert_eq!(
-                            theme.resolve::<String>("diff_added_bg").as_deref(),
-                            Some("default")
-                        );
-                        assert_eq!(
-                            theme.resolve::<String>("diff_removed_bg").as_deref(),
-                            Some("default")
-                        );
+                        for token in ["diff_added_bg", "diff_removed_bg"] {
+                            let value = theme
+                                .resolve::<String>(token)
+                                .expect("unknown-profile diff surface");
+                            let color = parse_hex_color(&value)
+                                .unwrap_or_else(|| panic!("{} {token}: {value}", bundled.id));
+                            assert!(
+                                (relative_luminance(color) - UNIVERSAL_TARGET_LUMINANCE).abs()
+                                    < 0.01,
+                                "{} {token} was {value}",
+                                bundled.id
+                            );
+                            assert!(
+                                contrast(color, black) >= 4.5,
+                                "{} {token} black",
+                                bundled.id
+                            );
+                            assert!(
+                                contrast(color, white) >= 4.5,
+                                "{} {token} white",
+                                bundled.id
+                            );
+                        }
                     }
                 }
             }
@@ -2425,6 +2438,7 @@ mod tests {
         for (background, target) in [
             (TerminalBackground::Dark, 0.025),
             (TerminalBackground::Light, 0.95),
+            (TerminalBackground::Unknown, UNIVERSAL_TARGET_LUMINANCE),
         ] {
             let theme = default_theme_for(background, capabilities);
             assert_eq!(

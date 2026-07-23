@@ -596,6 +596,17 @@ impl<'a> TUI<'a> {
         let commit_boundary = lazy_update
             .as_ref()
             .and_then(|update| update.commit_boundary);
+        // Lazy frame assembly reuses `previous_frame` with `mem::take` below.
+        // Preserve only the old physical viewport needed by pinned diffing;
+        // cloning the complete retained transcript would defeat lazy updates.
+        let pinned_previous_window = commit_boundary.map_or_else(Vec::new, |_| {
+            self.previous_frame
+                .iter()
+                .skip(self.inline_window_top)
+                .take(usize::from(height.max(1)))
+                .cloned()
+                .collect()
+        });
         let mut first_changed_hint = None;
         let mut lazy_change_hints = None;
         let cursor;
@@ -697,6 +708,7 @@ impl<'a> TUI<'a> {
                 reanchor_viewport,
                 rebuild_scrollback,
                 commit_boundary,
+                &pinned_previous_window,
                 first_changed_hint,
                 previous_len,
                 lazy_change_hints.as_ref(),
@@ -798,6 +810,7 @@ impl<'a> TUI<'a> {
         reanchor_viewport: bool,
         rebuild_scrollback: bool,
         commit_boundary: Option<usize>,
+        pinned_previous_window: &[String],
         first_changed_hint: Option<usize>,
         previous_len: usize,
         frame_change_hints: Option<&FrameChangeHints>,
@@ -809,6 +822,7 @@ impl<'a> TUI<'a> {
                 rows,
                 boundary.min(new_lines.len()),
                 size_changed || reanchor_viewport || rebuild_scrollback,
+                pinned_previous_window,
             );
             return;
         }
@@ -863,15 +877,23 @@ impl<'a> TUI<'a> {
                 self.terminal.write(&delete_all_kitty_images());
             }
             self.terminal.write("\x1b[H");
-            self.terminal.clear_screen();
-            self.terminal.write("\x1b[H");
             let start = new_lines.len().saturating_sub(rows);
             let visible = &new_lines[start..];
+            // ED 2 is not history-neutral in multiplexers such as tmux: cells
+            // erased from the grid are retained as native scrollback. Erase
+            // each physical row instead so a transient overlay, resize, or
+            // timeline reanchor cannot commit mutable chrome.
             for (index, line) in visible.iter().enumerate() {
+                self.terminal.clear_line();
                 self.terminal.write(line);
                 if index + 1 < visible.len() {
                     self.terminal.write("\n");
                 }
+            }
+            for row in visible.len()..rows {
+                self.terminal
+                    .write(&format!("\x1b[{};1H", row.saturating_add(1)));
+                self.terminal.clear_line();
             }
             self.end_synchronized_output();
             self.inline_bottom_row = visible.len().saturating_sub(1);
@@ -1046,6 +1068,7 @@ impl<'a> TUI<'a> {
         rows: usize,
         commit_boundary: usize,
         reanchor: bool,
+        previous_window: &[String],
     ) {
         if reanchor
             && (new_lines.len() <= self.inline_committed_rows
@@ -1077,10 +1100,14 @@ impl<'a> TUI<'a> {
             // exactly the newly-final chunk before the next window; natural
             // scrolling moves that chunk, and only that chunk, into history.
             self.terminal.write("\x1b[H");
-            if self.first_render || reanchor {
+            if self.first_render {
                 self.terminal.clear_screen();
                 self.terminal.write("\x1b[H");
             }
+            // Reanchors erase every addressed row below. Avoid ED 2 here:
+            // tmux preserves cells erased by a clear-screen operation in its
+            // native history, which would commit the mutable composer once per
+            // theme or session transition.
             let committed = &new_lines[self.inline_committed_rows.min(new_lines.len())
                 ..commit_target.min(new_lines.len())];
             let paint = committed.iter().chain(window.iter()).collect::<Vec<_>>();
@@ -1097,20 +1124,22 @@ impl<'a> TUI<'a> {
                 self.terminal.clear_line();
             }
         } else {
-            // Ordinary token ticks never scroll. Diff the viewport by logical
-            // row and touch only cells whose final bytes changed.
-            for (screen_row, line) in window.iter().enumerate() {
-                let logical_row = window_top + screen_row;
-                let previous = logical_row
-                    .checked_sub(self.inline_window_top)
-                    .and_then(|row| self.previous_frame.get(row));
-                if previous == Some(line) {
+            // Ordinary token ticks never scroll. Compare the old and new
+            // logical rows occupying each physical screen row. The caller
+            // snapshots this small old window before lazy frame reuse.
+            let previous_window_len = previous_window.len().min(rows);
+            for screen_row in 0..window.len().max(previous_window_len) {
+                let previous = previous_window.get(screen_row);
+                let next = window.get(screen_row);
+                if previous == next {
                     continue;
                 }
                 self.terminal
                     .write(&format!("\x1b[{};1H", screen_row.saturating_add(1)));
                 self.terminal.clear_line();
-                self.terminal.write(line);
+                if let Some(line) = next {
+                    self.terminal.write(line);
+                }
             }
         }
         self.end_synchronized_output();
@@ -1518,6 +1547,111 @@ mod tests {
     }
 
     #[test]
+    fn pinned_window_diffs_by_physical_row_after_window_shift() {
+        let size = Rc::new(Cell::new((40, 3)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            false,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.first_render = false;
+        tui.previous_frame = ["history 0", "history 1", "screen A", "screen B", "screen C"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        tui.inline_window_top = 2;
+        tui.inline_bottom_row = 2;
+
+        let shifted = [
+            "new history 0",
+            "new history 1",
+            "new history 2",
+            "screen A",
+            "screen B",
+            "screen C",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let previous_window = tui.previous_frame[2..].to_vec();
+        tui.write_inline_pinned(&shifted, 3, 0, false, &previous_window);
+
+        assert!(
+            writes.borrow().is_empty(),
+            "unchanged physical cells were repainted: {:?}",
+            writes.borrow()
+        );
+    }
+
+    #[test]
+    fn pinned_window_clears_rows_left_by_a_shorter_frame() {
+        let size = Rc::new(Cell::new((40, 3)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            false,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.first_render = false;
+        tui.previous_frame = ["screen A", "screen B", "stale C"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        tui.inline_window_top = 0;
+        tui.inline_bottom_row = 2;
+        let shorter = ["screen A", "screen B"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let previous_window = tui.previous_frame.clone();
+
+        tui.write_inline_pinned(&shorter, 3, 0, false, &previous_window);
+
+        let output = writes.borrow().join("");
+        assert!(
+            output.contains("\x1b[3;1H"),
+            "stale trailing row was not addressed for clearing: {output:?}"
+        );
+        assert!(!output.contains("stale C"), "{output:?}");
+    }
+
+    #[test]
+    fn pinned_reanchor_erases_rows_without_clear_screen() {
+        let size = Rc::new(Cell::new((40, 3)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            false,
+        );
+        let (terminal, clears, _, _, _, writes) = recording_terminal(size, capabilities);
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.first_render = false;
+        tui.previous_frame = ["old A", "old composer", "old footer"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        tui.inline_window_top = 0;
+        tui.inline_bottom_row = 2;
+        let replacement = ["new A", "new composer", "new footer"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let previous_window = tui.previous_frame.clone();
+
+        tui.write_inline_pinned(&replacement, 3, 0, true, &previous_window);
+
+        assert_eq!(
+            clears.get(),
+            0,
+            "tmux records clear-screen contents in native scrollback"
+        );
+        let output = writes.borrow().join("");
+        assert!(output.contains("\x1b[H"), "{output:?}");
+        assert!(output.contains("new composer"), "{output:?}");
+        assert!(!output.contains("old composer"), "{output:?}");
+    }
+
+    #[test]
     fn lazy_update_does_not_render_or_emit_a_hundred_thousand_stable_rows() {
         const HISTORY: usize = 100_000;
         const RESET: &str = "\x1b[0m\x1b]8;;\x1b\\";
@@ -1695,7 +1829,11 @@ mod tests {
             .find("resized plain row")
             .expect("resized replacement row was painted");
         assert!(delete_at < replacement_at, "{output:?}");
-        assert_eq!(clears.get(), 1);
+        assert_eq!(
+            clears.get(),
+            0,
+            "resize must not push the old grid into native scrollback"
+        );
     }
 
     #[test]
@@ -2110,9 +2248,10 @@ mod tests {
         tui.request_render();
         assert_eq!(
             clears.get(),
-            1,
-            "timeline replacement must repaint from home"
+            0,
+            "timeline replacement must repaint by row without mutating history"
         );
+        assert!(writes.borrow().join("").contains("\x1b[H"));
         assert_eq!(tui.inline_bottom_row, 5);
         assert!(writes.borrow().join("").contains("\x1b[5;8H"));
 
@@ -2207,7 +2346,11 @@ mod tests {
             .borrow()
             .join("")
             .replace("\u{1b}[0m\u{1b}]8;;\u{1b}\\", "");
-        assert_eq!(clears.get(), clears_before + 1);
+        assert_eq!(
+            clears.get(),
+            clears_before,
+            "inline resize must preserve terminal-owned history"
+        );
         // Only the last `height` logical lines are repainted; earlier retained
         // rows remain virtual and are not emitted during resize.
         assert!(
