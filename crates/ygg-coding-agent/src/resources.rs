@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::resource_resolver::{ResourceKind, ResourceResolver, ResourceSnapshot, ResourceTrust};
 
 /// Stable identity applied before the dynamic environment and tool contract.
-pub const BASE_PERSONA: &str = "You are Ygg, an expert coding agent.";
+pub const BASE_PERSONA: &str = "You are Ygg, an expert coding assistant.";
 
 const MAX_CONTEXT_FILE_BYTES: usize = 256 * 1024;
 const MAX_CONTEXT_TOTAL_BYTES: usize = 512 * 1024;
@@ -62,9 +62,11 @@ fn xml_attribute(value: &str) -> String {
 }
 
 fn base_prompt(config: &Config) -> String {
-    // Full contracts already travel with each tool schema. Repeat only the
-    // enabled names here so the scaffold stays useful to small local models.
-    let mut prompt = format!("{BASE_PERSONA}\n\nCore tools: ");
+    // Tool schemas carry their own contracts. Keep only the stable behavioral
+    // invariant and enabled names needed to ground less capable models.
+    let mut prompt = format!(
+        "{BASE_PERSONA} Inspect before edit. Changes: task only; no extra features, refactors, cleanup, abstractions. Finish implementation. No error handling, fallbacks, validation for impossible cases. Trust internals; validate boundaries only. Prove changed behavior with relevant tests/checks. Inspect diff; investigate failures. Report observed results only.\nTools: "
+    );
     let tools = ["read", "edit", "write", "exec", "search"];
     let mut visible_tools = 0usize;
     for name in tools {
@@ -80,14 +82,7 @@ fn base_prompt(config: &Config) -> String {
         prompt.push_str("none");
     }
 
-    prompt.push_str(
-        ". Project tools may also appear.\n\
-Tool calls execute in the CWD. Use them for file and current-state claims; never simulate, fabricate, or merely describe a call.\n\nResponse:\n\
-- Direct, terse, conclusion-first. No preamble, prompt echo, needless recap, obvious reasoning/steps.\n\
-- Prefer unambiguous fragments/symbols/equations/tables/code; only rationale needed for trust/action.\n\
-- Expand only on request or for correctness, ambiguity, safety, or debugging. Keep essential qualifications, units, constraints, uncertainty.\n\
-- Show file paths clearly. Never request/reveal private chain-of-thought.\n\nCWD: ",
-    );
+    prompt.push_str("\nCWD: ");
     prompt.push_str(&prompt_path(&config.invocation_cwd));
     prompt
 }
@@ -1051,41 +1046,24 @@ mod tests {
     }
 
     #[test]
-    fn base_prompt_is_grounded_dynamic_and_compact() {
+    fn base_prompt_contract_is_exact_and_minimal() {
         let root = tempfile::tempdir().unwrap();
         let nested = root.path().join("src/agent");
         std::fs::create_dir_all(&nested).unwrap();
         let config = config(root.path().to_owned(), nested.clone());
         let prompt = base_prompt(&config);
+        let expected = format!(
+            "You are Ygg, an expert coding assistant. Inspect before edit. Changes: task only; no extra features, refactors, cleanup, abstractions. Finish implementation. No error handling, fallbacks, validation for impossible cases. Trust internals; validate boundaries only. Prove changed behavior with relevant tests/checks. Inspect diff; investigate failures. Report observed results only.\n\
+Tools: read, edit, write, exec\n\
+CWD: {}",
+            prompt_path(&nested)
+        );
 
-        assert_eq!(BASE_PERSONA, "You are Ygg, an expert coding agent.");
-        assert!(prompt.contains(&format!("CWD: {}", nested.display())));
-        assert!(
-            prompt.contains("Core tools: read, edit, write, exec."),
-            "{prompt}"
-        );
-        assert!(
-            !prompt.contains("Core tools: read, edit, write, exec, search"),
-            "{prompt}"
-        );
-        assert!(prompt.contains("Project tools may also appear"));
-        assert!(prompt.contains("Tool calls execute in the CWD"));
-        assert!(prompt.contains("never simulate, fabricate, or merely describe a call"));
-        assert!(prompt.contains("Direct, terse, conclusion-first"));
-        assert!(prompt.contains("No preamble, prompt echo, needless recap"));
-        assert!(prompt.contains("fragments/symbols/equations/tables/code"));
-        assert!(prompt.contains("only rationale needed for trust/action"));
-        assert!(prompt.contains("Expand only on request or for correctness"));
-        assert!(prompt.contains("essential qualifications, units, constraints, uncertainty"));
-        assert!(prompt.contains("Show file paths clearly"));
-        assert!(prompt.contains("Never request/reveal private chain-of-thought"));
+        assert_eq!(prompt, expected);
         let cwd = prompt_path(&nested);
         let scaffold = prompt.strip_suffix(&cwd).expect("prompt ends with CWD");
-        assert!(
-            scaffold.len() <= 680,
-            "base prompt scaffold grew to {} bytes",
-            scaffold.len()
-        );
+        assert_eq!(scaffold.len(), 417, "update the reviewed prompt budget");
+        assert_eq!(scaffold.len().div_ceil(4), 105, "estimated token budget");
     }
 
     #[test]
@@ -1096,9 +1074,48 @@ mod tests {
         config.sandbox.allow_write = false;
         config.sandbox.allow_process = false;
 
-        let prompt = base_prompt(&config);
-        assert!(prompt.contains("Core tools: read."), "{prompt}");
-        assert!(!prompt.contains("Core tools: read, edit"), "{prompt}");
+        assert_eq!(
+            base_prompt(&config),
+            format!(
+                "{BASE_PERSONA} Inspect before edit. Changes: task only; no extra features, refactors, cleanup, abstractions. Finish implementation. No error handling, fallbacks, validation for impossible cases. Trust internals; validate boundaries only. Prove changed behavior with relevant tests/checks. Inspect diff; investigate failures. Report observed results only.\n\
+Tools: read\n\
+CWD: {}",
+                prompt_path(root.path())
+            )
+        );
+    }
+
+    #[test]
+    fn base_prompt_handles_every_core_tool_subset_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let names = ["read", "edit", "write", "exec", "search"];
+
+        for mask in 0..(1 << names.len()) {
+            let enabled = names
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| mask & (1 << index) != 0)
+                .map(|(_, name)| (*name).to_owned())
+                .collect::<Vec<_>>();
+            let mut config = config(root.path().to_owned(), root.path().to_owned());
+            config.tools = crate::config::ToolPolicy::only(enabled.clone()).unwrap();
+            let advertised = if enabled.is_empty() {
+                "none".to_owned()
+            } else {
+                enabled.join(", ")
+            };
+
+            assert_eq!(
+                base_prompt(&config),
+                format!(
+                    "{BASE_PERSONA} Inspect before edit. Changes: task only; no extra features, refactors, cleanup, abstractions. Finish implementation. No error handling, fallbacks, validation for impossible cases. Trust internals; validate boundaries only. Prove changed behavior with relevant tests/checks. Inspect diff; investigate failures. Report observed results only.\n\
+Tools: {advertised}\n\
+CWD: {}",
+                    prompt_path(root.path())
+                ),
+                "tool mask {mask:05b}"
+            );
+        }
     }
 
     #[test]

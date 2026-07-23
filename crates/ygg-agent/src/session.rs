@@ -71,6 +71,12 @@ pub enum UsageRecordKind {
     },
     /// A tool-free call used to produce a context-compaction summary.
     Compaction,
+    /// A bounded one-token decision about whether a candidate response may
+    /// return control to the user. `None` records a billable malformed answer.
+    TerminalGate {
+        /// `Some(true)` returns, `Some(false)` continues, and `None` is invalid.
+        returned: Option<bool>,
+    },
 }
 
 /// Provider usage and cost recorded for one durable operation.
@@ -1140,6 +1146,28 @@ impl Session {
     ) -> Result<(), SessionError> {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::Compaction,
+            usage,
+            endpoint: Some(endpoint),
+            model: Some(model),
+            completed_at_unix_ms: Some(now_unix_millis()),
+            cost,
+            cost_microdollars: cost.map(|cost| cost.total),
+            session_cost_microdollars: None,
+            session_cost_picodollars_remainder: None,
+        })
+    }
+
+    /// Persist usage for an isolated terminal-gate provider call.
+    pub fn record_terminal_gate_usage(
+        &mut self,
+        endpoint: EndpointId,
+        model: ModelId,
+        usage: Usage,
+        cost: Option<Cost>,
+        returned: Option<bool>,
+    ) -> Result<(), SessionError> {
+        self.record_usage(UsageRecord {
+            kind: UsageRecordKind::TerminalGate { returned },
             usage,
             endpoint: Some(endpoint),
             model: Some(model),

@@ -109,6 +109,16 @@ pub enum AgentEvent {
         result: Result<ToolOutput, ToolError>,
     },
 
+    /// A complete no-tool assistant turn was rejected by the terminal gate.
+    /// Deltas emitted since the previous `TurnFinished` are provisional and
+    /// must be discarded before the autonomous loop continues.
+    CandidateRejected {
+        /// Cumulative billable token usage, including terminal-gate calls.
+        usage: Usage,
+        /// Cost accrued during this run, including terminal-gate calls.
+        run_cost_microdollars: u64,
+    },
+
     /// The model finished a turn. The assembled assistant message has already
     /// been appended to the session.
     TurnFinished {

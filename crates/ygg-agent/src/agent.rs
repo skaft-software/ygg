@@ -103,11 +103,9 @@ pub enum CompletionPolicy {
     /// Accept the first normal no-tool response.
     #[default]
     Natural,
-    /// Require a second, internal JSON confirmation turn. Work tools are
-    /// unavailable and its text is not rendered to the user, matching Terminus
-    /// 2's parsed double `task_complete` check without exposing a looping
-    /// completion tool.
-    Confirmed,
+    /// Treat a normal no-tool response as a candidate and ask an isolated,
+    /// one-token evidence gate whether control should return to the user.
+    TerminalGate,
 }
 
 /// Configuration for [`Agent::new`].
@@ -428,51 +426,126 @@ const MAX_PROVIDER_RETRIES: usize = 3;
 /// visible, cancellable replacement attempts give the connection time to
 /// recover without charging usage or consuming an autonomous model turn.
 const MAX_NETWORK_RETRIES: usize = 5;
-const COMPLETION_CONFIRMATION_PROMPT: &str = r#"A candidate final response was produced. Based only on the current bounded state and latest verification evidence, report whether the requested task is actually complete. Do not rerun commands merely to confirm. Respond with exactly one JSON object and no Markdown or prose:
-{"complete":true|false,"reason":"concise evidence or remaining work"}"#;
+const TERMINAL_GATE_SYSTEM: &str = r#"You gate control flow for a coding agent. Output R when the candidate is a valid response to return to the user now: a substantiated completion, an answer or plan based on supplied text or general knowledge, a necessary clarification, an honest blocker or uncertainty, or a justified refusal. Output C when autonomous work should continue: promised next action, unsupported claim about current state, or requested repository or external action not substantiated by relevant successful action evidence. Do not treat an irrelevant or failed action as evidence. Respect explicit requests not to use tools or to guess. Output exactly R or C."#;
+const TERMINAL_GATE_CORRECTION: &str = "The candidate response was not returnable: requested current-state or action work is not supported by relevant successful tool evidence. Continue the work using the available tools; do not repeat the rejected candidate.";
+const TERMINAL_GATE_ATTEMPTS: usize = 2;
+const TERMINAL_GATE_TEXT_LIMIT: usize = 3_000;
+const TERMINAL_GATE_RECEIPT_LIMIT: usize = 24;
 
-#[derive(Debug)]
-struct CompletionConfirmation {
-    complete: bool,
-    reason: String,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalGateDecision {
+    Return,
+    Continue,
 }
 
-fn parse_completion_confirmation(
-    assistant: &ygg_ai::AssistantMessage,
-) -> Result<CompletionConfirmation, String> {
-    let text = assistant
-        .content
-        .iter()
-        .filter_map(|part| match part {
-            ygg_ai::AssistantPart::Text(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let text = text.trim();
-    if text.is_empty() {
-        return Err("confirmation response contained no JSON text".to_owned());
+#[derive(Debug)]
+struct TerminalActionReceipt {
+    tool: String,
+    arguments: String,
+    status: &'static str,
+    result: String,
+}
+
+fn bounded_gate_text(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_owned();
     }
-    let value = serde_json::from_str::<serde_json::Value>(text)
-        .ok()
-        .or_else(|| {
-            let start = text.find('{')?;
-            let end = text.rfind('}')?;
-            serde_json::from_str(&text[start..=end]).ok()
-        })
-        .ok_or_else(|| "confirmation response was not a valid JSON object".to_owned())?;
-    let complete = value
-        .get("complete")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| "confirmation requires boolean `complete`".to_owned())?;
-    let reason = value
-        .get("reason")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty() && reason.chars().count() <= 4000)
-        .ok_or_else(|| "confirmation requires a concise non-empty `reason`".to_owned())?
-        .to_owned();
-    Ok(CompletionConfirmation { complete, reason })
+    let half = max_chars.saturating_sub(32) / 2;
+    let head = text.chars().take(half).collect::<String>();
+    let tail = text
+        .chars()
+        .rev()
+        .take(half)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head}\n[… {count} chars total …]\n{tail}")
+}
+
+fn message_visible_text(message: &Message) -> Option<String> {
+    let text = match message {
+        Message::User(user) => user
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                UserPart::Text(text) => Some(text.as_str()),
+                UserPart::Media(_) => Some("[media]"),
+                UserPart::ToolResult(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Message::Assistant(assistant) => assistant
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                AssistantPart::Text(text) => Some(text.as_str()),
+                AssistantPart::Media(_) => Some("[generated media]"),
+                AssistantPart::Reasoning(_) | AssistantPart::ToolCall(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn recent_conversational_context(messages: &[Message]) -> String {
+    let mut selected = messages
+        .iter()
+        .rev()
+        .filter_map(message_visible_text)
+        .take(2)
+        .collect::<Vec<_>>();
+    selected.reverse();
+    bounded_gate_text(&selected.join("\n---\n"), TERMINAL_GATE_TEXT_LIMIT)
+}
+
+fn terminal_gate_capsule(
+    prior_context: &str,
+    requests: &[String],
+    candidate: &AssistantMessage,
+    receipts: &[TerminalActionReceipt],
+) -> String {
+    let candidate =
+        message_visible_text(&Message::Assistant(candidate.clone())).unwrap_or_default();
+    let omitted = receipts.len().saturating_sub(TERMINAL_GATE_RECEIPT_LIMIT);
+    let receipts = if receipts.len() <= TERMINAL_GATE_RECEIPT_LIMIT {
+        receipts.iter().collect::<Vec<_>>()
+    } else {
+        let half = TERMINAL_GATE_RECEIPT_LIMIT / 2;
+        receipts[..half]
+            .iter()
+            .chain(receipts[receipts.len() - half..].iter())
+            .collect::<Vec<_>>()
+    };
+    serde_json::json!({
+        "prior_context": bounded_gate_text(prior_context, TERMINAL_GATE_TEXT_LIMIT),
+        "requests": requests.iter().map(|text| bounded_gate_text(text, TERMINAL_GATE_TEXT_LIMIT)).collect::<Vec<_>>(),
+        "candidate": bounded_gate_text(&candidate, TERMINAL_GATE_TEXT_LIMIT),
+        "actions_omitted": omitted,
+        "actions": receipts.iter().map(|receipt| serde_json::json!({
+            "tool": receipt.tool,
+            "arguments": bounded_gate_text(&receipt.arguments, 400),
+            "status": receipt.status,
+            "result": bounded_gate_text(&receipt.result, 600),
+        })).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+fn parse_terminal_gate(response: &ygg_ai::Response) -> Option<TerminalGateDecision> {
+    if !matches!(
+        response.stop_reason,
+        StopReason::EndTurn | StopReason::StopSequence
+    ) {
+        return None;
+    }
+    match assistant_text(response)?.trim() {
+        "R" => Some(TerminalGateDecision::Return),
+        "C" => Some(TerminalGateDecision::Continue),
+        _ => None,
+    }
 }
 
 fn continuation_instruction(stop_reason: &StopReason) -> &'static str {
@@ -1620,6 +1693,86 @@ impl<'a> CompactionContext<'a> {
     }
 }
 
+struct TerminalGateContext<'a> {
+    client: &'a AiClient,
+    model: &'a Model,
+    session: &'a mut Session,
+    usage: &'a mut Usage,
+    run_cost: &'a mut CostAccumulator,
+    cache_retention: CacheRetention,
+    session_id: &'a str,
+    max_session_cost_microdollars: Option<u64>,
+    abort: &'a AbortFlag,
+}
+
+impl TerminalGateContext<'_> {
+    async fn decide(&mut self, capsule: String) -> Result<TerminalGateDecision, AgentError> {
+        for _ in 0..TERMINAL_GATE_ATTEMPTS {
+            let request = Request {
+                system: Some(TERMINAL_GATE_SYSTEM.to_owned()),
+                messages: vec![Message::User(UserMessage {
+                    content: vec![UserPart::Text(capsule.clone())],
+                })],
+                tools: Vec::new(),
+                tool_choice: ToolChoice::None,
+                max_output_tokens: Some(1),
+                temperature: Some(0.0),
+                stop: Vec::new(),
+                reasoning: ReasoningConfig::Off,
+                output_format: OutputFormat::Text,
+                output_modalities: OutputModalities::Text,
+                compatibility: CompatibilityMode::Strict,
+                cache_retention: self.cache_retention,
+                session_id: Some(format!("{}:terminal-gate", self.session_id)),
+            };
+            let input_tokens = estimate_request_tokens(
+                request.system.as_deref().unwrap_or_default(),
+                &request.messages,
+                &request.tools,
+            );
+            let budget = self.model.spec.limits.context_window.saturating_sub(1);
+            if input_tokens > budget {
+                return Err(AgentError::ContextExceeded {
+                    estimate: input_tokens,
+                    budget,
+                });
+            }
+            reserve_request_cost(
+                self.session,
+                self.model,
+                input_tokens,
+                1,
+                self.max_session_cost_microdollars,
+            )?;
+            let response = tokio::select! {
+                biased;
+                _ = self.abort.wait() => return Err(AgentError::Cancelled),
+                response = self.client.complete(self.model, request) => response?,
+            };
+            if self.abort.is_set() {
+                return Err(AgentError::Cancelled);
+            }
+            let decision = parse_terminal_gate(&response);
+            add_usage(self.usage, &response.usage);
+            let request_cost = response.cost;
+            self.session.record_terminal_gate_usage(
+                self.model.endpoint.id.clone(),
+                self.model.spec.id.clone(),
+                response.usage,
+                request_cost,
+                decision.map(|decision| decision == TerminalGateDecision::Return),
+            )?;
+            self.run_cost.add(request_cost);
+            if let Some(decision) = decision {
+                return Ok(decision);
+            }
+        }
+        Err(AgentError::IncompleteResponse {
+            stop_reason: "terminal gate returned neither R nor C after two attempts".to_owned(),
+        })
+    }
+}
+
 async fn open_provider_stream(
     client: &AiClient,
     model: &Model,
@@ -1955,10 +2108,18 @@ impl Agent {
             .take()
             .is_some_and(|lifecycle| lifecycle.dropped.load(Ordering::Acquire));
         self.recover_pending_tools(previous_run_was_dropped).await?;
+        let input = input.into();
+        let terminal_gate_prior_context =
+            if self.completion_policy == CompletionPolicy::TerminalGate {
+                recent_conversational_context(&self.session.context()?)
+            } else {
+                String::new()
+            };
+        let initial_request = input.text_summary();
         let prompt_metadata = self.prompt_entry_metadata();
         let first_entry = self
             .session
-            .append_with_metadata(user_message(input.into()), Some(prompt_metadata.clone()))?;
+            .append_with_metadata(user_message(input), Some(prompt_metadata.clone()))?;
         let lifecycle = Arc::new(RunLifecycle {
             finished: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
@@ -2027,7 +2188,8 @@ impl Agent {
             let mut followups: VecDeque<UserInput> = VecDeque::new();
             let mut control_open = true;
             let mut completed_turns: u64 = 0;
-            let mut completion_confirmation_pending = false;
+            let mut terminal_gate_requests = vec![initial_request];
+            let mut terminal_action_receipts = Vec::<TerminalActionReceipt>::new();
             let mut context_retries = 0usize;
             let mut run_usage = Usage::default();
             let mut run_cost = CostAccumulator::default();
@@ -2054,12 +2216,11 @@ impl Agent {
                 // the same model turn, after all of that turn's tools have
                 // finished.
                 if !pending_steer.is_empty() {
-                    // New user intent supersedes an internal completion check.
-                    completion_confirmation_pending = false;
                     let queued = std::mem::take(&mut pending_steer);
                     let mut delivered = Vec::with_capacity(queued.len());
                     for input in queued {
                         let summary = input.text_summary();
+                        terminal_gate_requests.push(summary.clone());
                         if let Err(e) = session.append_with_metadata(
                             user_message(input),
                             Some(prompt_metadata.clone()),
@@ -2091,18 +2252,11 @@ impl Agent {
                     }
                 }
 
-                let confirmation_turn = completion_policy == CompletionPolicy::Confirmed
-                    && completion_confirmation_pending;
-                let request_tool_defs = if confirmation_turn {
-                    Vec::new()
-                } else {
-                    tool_defs.clone()
-                };
+                let request_tool_defs = tool_defs.clone();
 
                 // ── Reconstruct and size context for this exact turn ───────
                 // This gate is inside the autonomous loop, after every tool
-                // result, and uses the exact active tool schema set. Internal
-                // confirmation turns deliberately expose no tools.
+                // result, and uses the exact active tool schema set.
                 let (compaction_event_tx, mut compaction_event_rx) =
                     mpsc::unbounded_channel::<AgentEvent>();
                 let capacity = {
@@ -2162,11 +2316,7 @@ impl Agent {
                     system: if active_system.is_empty() { None } else { Some(active_system) },
                     messages,
                     tools: request_tool_defs.clone(),
-                    tool_choice: if confirmation_turn {
-                        ToolChoice::None
-                    } else {
-                        ToolChoice::Auto
-                    },
+                    tool_choice: ToolChoice::Auto,
                     max_output_tokens: Some(max_output_tokens),
                     temperature: None,
                     stop: vec![],
@@ -2455,25 +2605,21 @@ impl Agent {
                             match event {
                             StreamEvent::TextDelta { delta, .. } => {
                                 attempt_saw_generation = true;
-                                if !confirmation_turn {
-                                    let ev = AgentEvent::OutputDelta {
-                                        channel: OutputChannel::Text,
-                                        text: delta,
-                                    };
-                                    notify_observers(&observers, &ev);
-                                    yield ev;
-                                }
+                                let ev = AgentEvent::OutputDelta {
+                                    channel: OutputChannel::Text,
+                                    text: delta,
+                                };
+                                notify_observers(&observers, &ev);
+                                yield ev;
                             }
                             StreamEvent::ReasoningDelta { delta, .. } => {
                                 attempt_saw_generation = true;
-                                if !confirmation_turn {
-                                    let ev = AgentEvent::OutputDelta {
-                                        channel: OutputChannel::Reasoning,
-                                        text: delta,
-                                    };
-                                    notify_observers(&observers, &ev);
-                                    yield ev;
-                                }
+                                let ev = AgentEvent::OutputDelta {
+                                    channel: OutputChannel::Reasoning,
+                                    text: delta,
+                                };
+                                notify_observers(&observers, &ev);
+                                yield ev;
                             }
                             // `ygg-ai`'s ResponseBuilder assembles the message
                             // and validates the stream; the agent does not
@@ -2540,24 +2686,32 @@ impl Agent {
                     break 'run FinishReason::Failed(error.into());
                 }
                 run_cost.add(turn_cost);
-                let session_cost = (session.total_cost_microdollars() > 0
-                    || model.spec.pricing.is_some())
-                .then(|| session.total_cost_microdollars());
-                let ev = AgentEvent::TurnFinished {
-                    message: assistant.clone(),
-                    turn_usage,
-                    usage: run_usage,
-                    session_cost_microdollars: session_cost,
-                    run_cost_microdollars: run_cost.microdollars,
-                };
-                notify_observers(&observers, &ev);
-                yield ev;
+                let normal_end = matches!(stop_reason, StopReason::EndTurn | StopReason::StopSequence);
+                let needs_continuation = matches!(stop_reason, StopReason::MaxTokens | StopReason::PauseTurn)
+                    || matches!(&stop_reason, StopReason::Other(reason) if reason == "tool_output_locked");
+                let gated_candidate = completion_policy == CompletionPolicy::TerminalGate
+                    && calls.is_empty()
+                    && normal_end;
 
-                // Drain any steer/follow-up that arrived while TurnFinished
-                // was being processed by the caller. Without this, a steer
-                // that lands between TurnFinished and the calls.is_empty()
-                // check below is left stranded in the channel buffer and
-                // lost when the run completes without tool calls.
+                // Candidate turns stay provisional until their isolated gate
+                // returns R. Tool turns and natural-policy answers commit now.
+                if !gated_candidate {
+                    let session_cost = (session.total_cost_microdollars() > 0
+                        || model.spec.pricing.is_some())
+                    .then(|| session.total_cost_microdollars());
+                    let ev = AgentEvent::TurnFinished {
+                        message: assistant.clone(),
+                        turn_usage,
+                        usage: run_usage,
+                        session_cost_microdollars: session_cost,
+                        run_cost_microdollars: run_cost.microdollars,
+                    };
+                    notify_observers(&observers, &ev);
+                    yield ev;
+                }
+
+                // Drain control before deciding whether a provisional candidate
+                // is terminal. New user input takes precedence over the gate.
                 while control_open {
                     match control_rx.try_recv() {
                         Ok(Control::Steer(input)) => pending_steer.push(input),
@@ -2570,10 +2724,6 @@ impl Agent {
                         Err(mpsc::error::TryRecvError::Disconnected) => control_open = false,
                     }
                 }
-
-                let normal_end = matches!(stop_reason, StopReason::EndTurn | StopReason::StopSequence);
-                let needs_continuation = matches!(stop_reason, StopReason::MaxTokens | StopReason::PauseTurn)
-                    || matches!(&stop_reason, StopReason::Other(reason) if reason == "tool_output_locked");
 
                 // A response is not successful merely because it contains no
                 // tool calls. Refusals, pauses, provider-specific reasons, and
@@ -2588,82 +2738,16 @@ impl Agent {
                     });
                 }
 
-                if confirmation_turn {
-                    let confirmation = if needs_continuation {
-                        Err("confirmation response was truncated or paused".to_owned())
-                    } else if calls.is_empty() {
-                        parse_completion_confirmation(&assistant)
-                    } else {
-                        Err("confirmation turn emitted an unexpected tool call".to_owned())
-                    };
-                    // The request exposed no tools, but pair any provider bug or
-                    // malformed historical call so strict replay remains valid.
-                    for call in &calls {
-                        if let Err(error) = session.append(EntryValue::Message(Message::User(
-                            UserMessage {
-                                content: vec![UserPart::ToolResult(ToolResult {
-                                    tool_call_id: call.id.clone(),
-                                    content: vec![ToolResultPart::Text(
-                                        "confirmation accepts JSON text only".to_owned(),
-                                    )],
-                                    is_error: true,
-                                })],
-                            },
-                        ))) {
-                            break 'run FinishReason::Failed(error.into());
-                        }
-                    }
-
-                    if abort.is_set() {
-                        break 'run FinishReason::Aborted;
-                    }
-                    match confirmation {
-                        Ok(confirmation) if confirmation.complete => {
-                            if !pending_steer.is_empty() {
-                                completion_confirmation_pending = false;
-                                continue;
-                            }
-                            if let Some(input) = followups.pop_front() {
-                                completion_confirmation_pending = false;
-                                if let Err(error) = session.append_with_metadata(
-                                    user_message(input),
-                                    Some(prompt_metadata.clone()),
-                                ) {
-                                    break 'run FinishReason::Failed(error.into());
-                                }
-                                continue;
-                            }
-                            break 'run FinishReason::Completed;
-                        }
-                        Ok(confirmation) => {
-                            completion_confirmation_pending = false;
-                            let prompt = format!(
-                                "Completion was not confirmed: {} Continue the work and produce a new final response after verification.",
-                                confirmation.reason
-                            );
-                            if let Err(error) =
-                                session.append(user_message(UserInput::from(prompt)))
-                            {
-                                break 'run FinishReason::Failed(error.into());
-                            }
-                            continue;
-                        }
-                        Err(error) => {
-                            let prompt = format!(
-                                "The completion confirmation was invalid ({error}). Return exactly the requested JSON object; no tools, Markdown, or additional prose."
-                            );
-                            if let Err(session_error) =
-                                session.append(user_message(UserInput::from(prompt)))
-                            {
-                                break 'run FinishReason::Failed(session_error.into());
-                            }
-                            continue;
-                        }
-                    }
-                }
-
                 if calls.is_empty() {
                     if abort.is_set() {
+                        if gated_candidate {
+                            let ev = AgentEvent::CandidateRejected {
+                                usage: run_usage,
+                                run_cost_microdollars: run_cost.microdollars,
+                            };
+                            notify_observers(&observers, &ev);
+                            yield ev;
+                        }
                         break 'run FinishReason::Aborted;
                     }
                     if needs_continuation {
@@ -2678,13 +2762,42 @@ impl Agent {
                             stop_reason: format!("{stop_reason:?}"),
                         });
                     }
-                    // A pending steer re-enters the loop so the model sees it;
-                    // otherwise a queued follow-up begins now that the run has
-                    // settled. A normal no-tool end turn is completion.
+                    // Steering and follow-ups make this a normal intermediate
+                    // turn, so commit it without spending a gate request.
                     if !pending_steer.is_empty() {
+                        if gated_candidate {
+                            let session_cost = (session.total_cost_microdollars() > 0
+                                || model.spec.pricing.is_some())
+                            .then(|| session.total_cost_microdollars());
+                            let ev = AgentEvent::TurnFinished {
+                                message: assistant.clone(),
+                                turn_usage,
+                                usage: run_usage,
+                                session_cost_microdollars: session_cost,
+                                run_cost_microdollars: run_cost.microdollars,
+                            };
+                            notify_observers(&observers, &ev);
+                            yield ev;
+                        }
                         continue;
                     }
                     if let Some(input) = followups.pop_front() {
+                        if gated_candidate {
+                            let session_cost = (session.total_cost_microdollars() > 0
+                                || model.spec.pricing.is_some())
+                            .then(|| session.total_cost_microdollars());
+                            let ev = AgentEvent::TurnFinished {
+                                message: assistant.clone(),
+                                turn_usage,
+                                usage: run_usage,
+                                session_cost_microdollars: session_cost,
+                                run_cost_microdollars: run_cost.microdollars,
+                            };
+                            notify_observers(&observers, &ev);
+                            yield ev;
+                        }
+                        let summary = input.text_summary();
+                        terminal_gate_requests.push(summary);
                         if let Err(e) = session.append_with_metadata(
                             user_message(input),
                             Some(prompt_metadata.clone()),
@@ -2693,14 +2806,75 @@ impl Agent {
                         }
                         continue;
                     }
-                    if completion_policy == CompletionPolicy::Confirmed {
-                        completion_confirmation_pending = true;
-                        if let Err(error) = session.append(user_message(UserInput::from(
-                            COMPLETION_CONFIRMATION_PROMPT,
-                        ))) {
-                            break 'run FinishReason::Failed(error.into());
+                    if completion_policy == CompletionPolicy::TerminalGate {
+                        let capsule = terminal_gate_capsule(
+                            &terminal_gate_prior_context,
+                            &terminal_gate_requests,
+                            &assistant,
+                            &terminal_action_receipts,
+                        );
+                        let decision = TerminalGateContext {
+                            client: &client,
+                            model: &model,
+                            session,
+                            usage: &mut run_usage,
+                            run_cost: &mut run_cost,
+                            cache_retention,
+                            session_id: &session_id,
+                            max_session_cost_microdollars,
+                            abort: &abort,
                         }
-                        continue;
+                        .decide(capsule)
+                        .await;
+                        match decision {
+                            Ok(TerminalGateDecision::Return) => {
+                                let session_cost = (session.total_cost_microdollars() > 0
+                                    || model.spec.pricing.is_some())
+                                .then(|| session.total_cost_microdollars());
+                                let ev = AgentEvent::TurnFinished {
+                                    message: assistant.clone(),
+                                    turn_usage,
+                                    usage: run_usage,
+                                    session_cost_microdollars: session_cost,
+                                    run_cost_microdollars: run_cost.microdollars,
+                                };
+                                notify_observers(&observers, &ev);
+                                yield ev;
+                                break 'run FinishReason::Completed;
+                            }
+                            Ok(TerminalGateDecision::Continue) => {
+                                let ev = AgentEvent::CandidateRejected {
+                                    usage: run_usage,
+                                    run_cost_microdollars: run_cost.microdollars,
+                                };
+                                notify_observers(&observers, &ev);
+                                yield ev;
+                                if let Err(error) = session.append(user_message(UserInput::from(
+                                    TERMINAL_GATE_CORRECTION,
+                                ))) {
+                                    break 'run FinishReason::Failed(error.into());
+                                }
+                                continue;
+                            }
+                            Err(AgentError::Cancelled) => {
+                                let ev = AgentEvent::CandidateRejected {
+                                    usage: run_usage,
+                                    run_cost_microdollars: run_cost.microdollars,
+                                };
+                                notify_observers(&observers, &ev);
+                                yield ev;
+                                break 'run FinishReason::Aborted;
+                            }
+                            Err(error) => {
+                                let ev = AgentEvent::CandidateRejected {
+                                    usage: run_usage,
+                                    run_cost_microdollars: run_cost.microdollars,
+                                };
+                                notify_observers(&observers, &ev);
+                                yield ev;
+                                break 'run FinishReason::Failed(error);
+                            }
+                        }
                     }
                     break 'run FinishReason::Completed;
                 }
@@ -2871,6 +3045,12 @@ impl Agent {
                     // bounded, continuation-aware output; this defensive cap
                     // also covers third-party tools.
                     let text = truncate_tool_text(raw_text, sandbox.max_output_bytes);
+                    terminal_action_receipts.push(TerminalActionReceipt {
+                        tool: call.name.clone(),
+                        arguments: call.arguments_json.clone(),
+                        status: if is_error { "error" } else { "ok" },
+                        result: text.clone(),
+                    });
                     let tool_result = ToolResult {
                         tool_call_id: call.id.clone(),
                         content: vec![ToolResultPart::Text(text)],
@@ -3020,6 +3200,14 @@ impl Agent {
                     text: delta,
                 } => text.push_str(&delta),
                 AgentEvent::ProviderRetry { .. } => text.truncate(committed_text_len),
+                AgentEvent::CandidateRejected {
+                    usage: total,
+                    run_cost_microdollars: cost,
+                } => {
+                    text.truncate(committed_text_len);
+                    usage = total;
+                    run_cost = cost;
+                }
                 AgentEvent::SteeringDelivered { .. }
                 | AgentEvent::CompactionStarted { .. }
                 | AgentEvent::CompactionFinished { .. } => {}

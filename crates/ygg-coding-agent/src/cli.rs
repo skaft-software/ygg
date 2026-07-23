@@ -89,8 +89,8 @@ pub struct Cli {
     /// Emit reasoning deltas in print mode.
     #[arg(long)]
     pub show_reasoning: bool,
-    /// Show the current provider turn's cost in the compact TUI footer.
-    #[arg(long)]
+    /// Deprecated compatibility flag; accumulated session cost is always shown when available.
+    #[arg(long, hide = true)]
     pub show_turn_cost: bool,
     /// Maximum model turns in one run.
     #[arg(long)]

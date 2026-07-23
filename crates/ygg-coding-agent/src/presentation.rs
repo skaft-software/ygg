@@ -713,7 +713,7 @@ impl RunTracker {
                 };
                 run.transition(phase, now);
             }
-            AgentEvent::ProviderRetry { .. } => {
+            AgentEvent::ProviderRetry { .. } | AgentEvent::CandidateRejected { .. } => {
                 let provider = run.provider.clone();
                 run.transition(RunPhase::AwaitingProvider { provider }, now);
             }

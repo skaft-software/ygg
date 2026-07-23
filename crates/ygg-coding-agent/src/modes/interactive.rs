@@ -721,19 +721,15 @@ fn handle_active_command(
             shell.notice("cost and cache reports are available at the next idle boundary")
         }
         Command::Theme(_) => shell.notice("theme commands are available at the next idle boundary"),
-        Command::Tool(id) => match shell.toggle_tool_details(id.as_deref()) {
-            Ok((id, expanded)) => shell.notice(format!(
-                "tool {id} details {}",
-                if expanded { "expanded" } else { "collapsed" }
-            )),
-            Err(error) => shell.error(error),
-        },
+        Command::Tool(_id) => {
+            shell.notice("tool details follow transcript verbosity; use Ctrl+O or /verbose")
+        }
         Command::Verbose(value) => {
             let enabled = value.unwrap_or(!shell.verbose_tools());
             shell.set_verbose_tools(enabled);
             shell.notice(format!(
-                "raw tool details {}",
-                if enabled { "shown" } else { "hidden" }
+                "verbose transcript {}",
+                if enabled { "enabled" } else { "disabled" }
             ));
         }
         Command::Extensions(_) => {
@@ -2050,19 +2046,15 @@ async fn run_idle_command(
                 shell.error(error.to_string());
             }
         },
-        Command::Tool(id) => match shell.toggle_tool_details(id.as_deref()) {
-            Ok((id, expanded)) => shell.notice(format!(
-                "tool {id} details {}",
-                if expanded { "expanded" } else { "collapsed" }
-            )),
-            Err(error) => shell.error(error),
-        },
+        Command::Tool(_id) => {
+            shell.notice("tool details follow transcript verbosity; use Ctrl+O or /verbose")
+        }
         Command::Verbose(value) => {
             let enabled = value.unwrap_or(!shell.verbose_tools());
             shell.set_verbose_tools(enabled);
             shell.notice(format!(
-                "raw tool details {}",
-                if enabled { "shown" } else { "hidden" }
+                "verbose transcript {}",
+                if enabled { "enabled" } else { "disabled" }
             ));
         }
         Command::Compact => {

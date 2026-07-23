@@ -134,6 +134,13 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
             // until `TurnFinished`, then a transient reconnect can discard its
             // provisional output without corrupting print-mode results.
             AgentEvent::ProviderRetry { .. } => pending_output.clear(),
+            AgentEvent::CandidateRejected {
+                run_cost_microdollars,
+                ..
+            } => {
+                pending_output.clear();
+                last_run_cost = run_cost_microdollars;
+            }
             AgentEvent::TurnFinished {
                 message,
                 session_cost_microdollars,

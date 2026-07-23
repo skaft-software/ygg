@@ -521,6 +521,11 @@ pub fn cost_text(session: &Session, model: &Model) -> String {
                 assistant_turn.to_string()
             }
             UsageRecordKind::Compaction => "cmp".to_owned(),
+            UsageRecordKind::TerminalGate { returned } => match returned {
+                Some(true) => "gate:R".to_owned(),
+                Some(false) => "gate:C".to_owned(),
+                None => "gate:?".to_owned(),
+            },
         };
         let model_name = record
             .model

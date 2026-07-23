@@ -357,8 +357,8 @@ pub struct Config {
     pub max_cost_microdollars: Option<u64>,
     /// Optional warning threshold for one provider turn in microdollars.
     pub cost_warning_microdollars: Option<u64>,
-    /// Show the current provider turn's cost in the compact TUI footer.
-    /// Detailed cost diagnostics remain available regardless of this setting.
+    /// Deprecated compatibility setting. Accumulated session cost is always
+    /// shown in the compact TUI footer when pricing is available.
     pub show_turn_cost: bool,
     pub max_turns: Option<u64>,
     pub show_reasoning_in_print: bool,

@@ -1639,18 +1639,17 @@ async fn restart_never_replays_a_mutating_tool_without_an_idempotency_contract()
 }
 
 #[tokio::test]
-async fn confirmed_policy_uses_an_isolated_internal_confirmation_turn() {
+async fn terminal_gate_uses_an_isolated_one_token_decision() {
     let mut h = harness(
         vec![
             text_turn("Completed and verified for the user."),
-            text_turn(
-                r#"{"complete":true,"reason":"The requested work and verification are complete."}"#,
-            ),
+            text_turn("R"),
         ],
         Some(8),
     )
     .await;
-    h.agent.set_completion_policy(CompletionPolicy::Confirmed);
+    h.agent
+        .set_completion_policy(CompletionPolicy::TerminalGate);
 
     let output = h.agent.complete("complete autonomously").await.unwrap();
     assert!(matches!(output.reason, FinishReason::Completed));
@@ -1663,45 +1662,51 @@ async fn confirmed_policy_uses_an_isolated_internal_confirmation_turn() {
         .iter()
         .all(|tool| tool["name"] != "finish"));
     assert!(request_has_no_tools(&requests[1]));
+    assert_eq!(requests[1]["max_tokens"], 1);
     assert!(!requests[1].to_string().contains("\"name\":\"exec\""));
-    // Internal JSON is persisted for audit but never added to visible output.
-    assert!(h.agent.session().entries().iter().any(|entry| {
+    assert!(h.agent.session().usage_records().iter().any(|record| {
         matches!(
+            record.kind,
+            UsageRecordKind::TerminalGate {
+                returned: Some(true)
+            }
+        )
+    }));
+    assert!(h.agent.session().entries().iter().all(|entry| {
+        !matches!(
             &entry.value,
             EntryValue::Message(Message::Assistant(assistant))
-                if assistant.content.iter().any(|part| matches!(part, AssistantPart::Text(text) if text.contains("\"complete\":true")))
+                if assistant.content.iter().any(|part| matches!(part, AssistantPart::Text(text) if text == "R"))
         )
     }));
 }
 
 #[tokio::test]
-async fn rejected_internal_confirmation_returns_to_the_normal_tool_surface() {
+async fn rejected_terminal_candidate_is_retracted_and_work_continues() {
     let mut h = harness(
         vec![
             // This is the critical local-model failure mode: a natural stop
             // while narrating the next action must not end the user prompt.
             text_turn("Let me inspect that now."),
-            text_turn(r#"{"complete":false,"reason":"The promised inspection has not happened."}"#),
+            text_turn("C"),
             tool_turn(&[(
                 "read_after_reject",
                 "read",
                 serde_json::json!({"path": "verification.txt"}),
             )]),
             text_turn("Final answer after verification."),
-            text_turn(r#"{"complete":true,"reason":"Verification now passes."}"#),
+            text_turn("R"),
         ],
         Some(8),
     )
     .await;
     std::fs::write(h.workspace.join("verification.txt"), "verified\n").unwrap();
-    h.agent.set_completion_policy(CompletionPolicy::Confirmed);
+    h.agent
+        .set_completion_policy(CompletionPolicy::TerminalGate);
 
     let output = h.agent.complete("complete and verify").await.unwrap();
     assert!(matches!(output.reason, FinishReason::Completed));
-    assert_eq!(
-        output.text,
-        "Let me inspect that now.Final answer after verification."
-    );
+    assert_eq!(output.text, "Final answer after verification.");
     let requests = wire_requests(h.server.as_ref().unwrap()).await;
     assert_eq!(requests.len(), 5);
     assert!(request_has_no_tools(&requests[1]));
@@ -1710,7 +1715,21 @@ async fn rejected_internal_confirmation_returns_to_the_normal_tool_surface() {
         .unwrap()
         .iter()
         .any(|tool| tool["name"] == "read"));
-    assert!(!requests[2].to_string().contains("\"name\":\"finish\""));
+    assert!(requests[2]
+        .to_string()
+        .contains("candidate response was not returnable"));
+    assert!(request_has_no_tools(&requests[4]));
+    let decisions = h
+        .agent
+        .session()
+        .usage_records()
+        .iter()
+        .filter_map(|record| match record.kind {
+            UsageRecordKind::TerminalGate { returned } => Some(returned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decisions, vec![Some(false), Some(true)]);
 }
 
 #[tokio::test]

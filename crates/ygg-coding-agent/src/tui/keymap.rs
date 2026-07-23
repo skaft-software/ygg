@@ -17,7 +17,7 @@ pub enum InputAction {
     SlashMenu(SlashMenuAction),
     CompleteMention,
     ShowCompactionSummary,
-    /// Toggle the most recent reasoning or compaction summary (ctrl+o); never tool evidence.
+    /// Toggle verbose transcript mode for all expandable blocks (ctrl+o).
     ExpandFocusedTool,
     Edit(EditAction),
     Resize(u16, u16),

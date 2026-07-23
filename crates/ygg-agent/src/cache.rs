@@ -192,7 +192,7 @@ fn analyze_session_cache_impl(
                 .get(assistant.0.as_str())
                 .copied()
                 .map(|index| (index, assistant, record)),
-            UsageRecordKind::Compaction => None,
+            UsageRecordKind::Compaction | UsageRecordKind::TerminalGate { .. } => None,
         })
         .collect::<Vec<_>>();
     // Usage records are append-only after their assistant entry. Filtering

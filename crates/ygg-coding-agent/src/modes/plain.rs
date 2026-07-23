@@ -40,7 +40,9 @@ impl ProviderAttemptOutput {
                 channel: OutputChannel::Text,
                 text,
             } => self.pending.push_str(text),
-            AgentEvent::ProviderRetry { .. } => self.pending.clear(),
+            AgentEvent::ProviderRetry { .. } | AgentEvent::CandidateRejected { .. } => {
+                self.pending.clear()
+            }
             AgentEvent::TurnFinished { .. } => return Some(std::mem::take(&mut self.pending)),
             _ => {}
         }
@@ -322,6 +324,12 @@ async fn run_prompt(
                                 "[retry] {error}; discarding partial response and retrying ({attempt}/{max_attempts})"
                             ),
                         )?;
+                    }
+                    AgentEvent::CandidateRejected {
+                        run_cost_microdollars,
+                        ..
+                    } => {
+                        last_run_cost = *run_cost_microdollars;
                     }
                     AgentEvent::CompactionStarted { .. } => {
                         write_log(
