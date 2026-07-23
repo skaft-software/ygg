@@ -323,6 +323,28 @@ async fn run_prompt(
                             ),
                         )?;
                     }
+                    AgentEvent::CompactionStarted { .. } => {
+                        write_log(
+                            output,
+                            &mut response_open,
+                            theme,
+                            "[working] Compacting context",
+                        )?;
+                    }
+                    AgentEvent::CompactionFinished { result, .. } => match result {
+                        Ok(_) => write_log(
+                            output,
+                            &mut response_open,
+                            theme,
+                            "[working] Context compacted",
+                        )?,
+                        Err(error) => write_log(
+                            output,
+                            &mut response_open,
+                            theme,
+                            &format!("[failed] Compaction failed: {error}"),
+                        )?,
+                    },
                     AgentEvent::ToolStarted { id, name, args } => {
                         let display = summarize_tool_with_workspace(
                             name,

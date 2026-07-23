@@ -31,21 +31,8 @@ pub enum TranscriptItem {
         is_error: bool,
     },
     CompactionMarker {
-        summary_preview: String,
+        summary: String,
     },
-}
-
-fn preview(text: &str) -> String {
-    const LIMIT: usize = 160;
-    let mut end = text.len().min(LIMIT);
-    while end < text.len() && !text.is_char_boundary(end) {
-        end += 1;
-    }
-    let mut value = text[..end].replace('\n', " ");
-    if end < text.len() {
-        value.push('…');
-    }
-    value
 }
 
 fn tool_result_text(parts: &[ToolResultPart]) -> String {
@@ -354,7 +341,7 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
             }
             EntryValue::Compaction { summary, .. } => {
                 items.push(TranscriptItem::CompactionMarker {
-                    summary_preview: preview(summary),
+                    summary: summary.clone(),
                 });
             }
             EntryValue::SkillActivated { .. }
@@ -454,6 +441,30 @@ mod tests {
         let (items, truncated) = hydrate_transcript_tail(&session, 100).unwrap();
         assert!(!truncated);
         assert_eq!(items.len(), 100);
+    }
+
+    #[test]
+    fn resumed_compaction_retains_the_complete_expandable_summary() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        let first_kept = session.append(user("kept prompt")).unwrap();
+        let summary = "# Earlier work\n\n- retained detail\n- final sentinel";
+        session
+            .append(EntryValue::Compaction {
+                summary: summary.into(),
+                first_kept,
+                active_skills: Vec::new(),
+                skill_resources: Vec::new(),
+            })
+            .unwrap();
+        drop(session);
+
+        let resumed = Session::open(path).unwrap();
+        assert!(matches!(
+            hydrate_transcript(&resumed).unwrap().last(),
+            Some(TranscriptItem::CompactionMarker { summary: hydrated }) if hydrated == summary
+        ));
     }
 
     #[test]

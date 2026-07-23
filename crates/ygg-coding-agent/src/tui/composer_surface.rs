@@ -677,7 +677,27 @@ fn activity_variants(state: &super::view::ShellState, now: Instant) -> Vec<Strin
             .map(|run| run.elapsed_at(now))
             .unwrap_or_default(),
     );
+    let compiled_default = matches!(
+        state.theme.source(),
+        crate::tui::theme::ThemeSource::CompiledDefault
+    );
     if let Some(run) = state.run.current().filter(|run| run.is_active()) {
+        if compiled_default {
+            let activity = match run.phase() {
+                crate::presentation::RunPhase::AwaitingProvider { .. } => "waiting for API",
+                crate::presentation::RunPhase::AwaitingApproval { .. } => "waiting",
+                crate::presentation::RunPhase::Preparing { summary } if summary == "compacting" => {
+                    "compacting"
+                }
+                crate::presentation::RunPhase::Thinking
+                | crate::presentation::RunPhase::Preparing { .. }
+                | crate::presentation::RunPhase::StreamingResponse
+                | crate::presentation::RunPhase::PreparingToolCall
+                | crate::presentation::RunPhase::RunningTool { .. }
+                | crate::presentation::RunPhase::Finished(_) => return Vec::new(),
+            };
+            return vec![activity.to_owned()];
+        }
         let elapsed = format_duration(session_elapsed);
         let activity = match run.phase() {
             crate::presentation::RunPhase::AwaitingProvider { .. } => {
@@ -685,6 +705,9 @@ fn activity_variants(state: &super::view::ShellState, now: Instant) -> Vec<Strin
             }
             crate::presentation::RunPhase::AwaitingApproval { .. } => {
                 format!("waiting {elapsed}")
+            }
+            crate::presentation::RunPhase::Preparing { summary } if summary == "compacting" => {
+                format!("compacting {elapsed}")
             }
             crate::presentation::RunPhase::Thinking
             | crate::presentation::RunPhase::Preparing { .. }
@@ -696,6 +719,11 @@ fn activity_variants(state: &super::view::ShellState, now: Instant) -> Vec<Strin
         return vec![activity];
     }
     if session_elapsed.is_zero() {
+        Vec::new()
+    } else if compiled_default {
+        // The compiled default keeps its idle footer purely informational.
+        // Named themes may opt into the decorative session stopwatch, while
+        // active waiting state remains visible above through the run branch.
         Vec::new()
     } else {
         vec![format_duration(session_elapsed)]

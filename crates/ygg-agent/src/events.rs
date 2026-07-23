@@ -59,6 +59,23 @@ pub enum AgentEvent {
         messages: Vec<String>,
     },
 
+    /// Autonomous context compaction has started and the next provider call
+    /// is the tool-free summary request, not a normal model turn.
+    CompactionStarted {
+        /// Why the run loop requested compaction.
+        reason: CompactionReason,
+    },
+
+    /// Autonomous context compaction ended. A successful summary and boundary
+    /// have already been persisted when this event is observed. Failures are
+    /// reported here before the run's terminal failure/abort event.
+    CompactionFinished {
+        /// Why the run loop requested compaction.
+        reason: CompactionReason,
+        /// Durable result, or a concise diagnostic when summarization failed.
+        result: Result<CompactionInfo, String>,
+    },
+
     /// A tool call was emitted by the model and its execution begins now.
     ToolStarted {
         /// The provider-assigned tool call ID.
@@ -120,6 +137,25 @@ pub enum AgentEvent {
         /// How the run ended.
         reason: FinishReason,
     },
+}
+
+/// Reason an autonomous run compacted its active context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionReason {
+    /// The configured proactive context threshold was reached.
+    Threshold,
+    /// The estimated request exceeded local capacity or the provider rejected
+    /// it as exceeding the model context window.
+    Overflow,
+}
+
+/// Durable result of one autonomous compaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionInfo {
+    /// Summary injected at the front of reconstructed provider context.
+    pub summary: String,
+    /// Oldest entry retained at full fidelity.
+    pub first_kept: EntryId,
 }
 
 /// Distinguishes normal text from reasoning output in [`AgentEvent::OutputDelta`].

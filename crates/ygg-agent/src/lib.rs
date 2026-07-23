@@ -77,13 +77,18 @@ pub mod skills;
 pub mod tool;
 pub mod tools;
 
-pub use agent::{Agent, AgentConfig, AgentError, CompletionPolicy, Run, RunControl, RunOutput};
+pub use agent::{
+    Agent, AgentConfig, AgentError, CompletionPolicy, RequestContextEstimate, Run, RunControl,
+    RunOutput,
+};
 pub use cache::{
     analyze_session_cache, analyze_session_cache_stats, CacheMiss, CacheStats,
     CACHE_MISS_NOISE_TOKENS,
 };
 pub use context::ContextSnapshot;
-pub use events::{AgentEvent, Control, FinishReason, OutputChannel};
+pub use events::{
+    AgentEvent, CompactionInfo, CompactionReason, Control, FinishReason, OutputChannel,
+};
 pub use extension::{EventObserver, Extension, ExtensionHost, ToolCallHook};
 pub use extension_process::{
     default_extension_roots, discover_extension_manifests, load_extension_manifest_paths,

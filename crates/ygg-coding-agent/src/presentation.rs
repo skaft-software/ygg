@@ -721,6 +721,18 @@ impl RunTracker {
                 let provider = run.provider.clone();
                 run.transition(RunPhase::AwaitingProvider { provider }, now);
             }
+            AgentEvent::CompactionStarted { .. } => {
+                run.transition(
+                    RunPhase::Preparing {
+                        summary: "compacting".into(),
+                    },
+                    now,
+                );
+            }
+            AgentEvent::CompactionFinished { .. } => {
+                let provider = run.provider.clone();
+                run.transition(RunPhase::AwaitingProvider { provider }, now);
+            }
             AgentEvent::TurnFinished { message, .. } => {
                 run.pending_tools.clear();
                 for part in &message.content {
@@ -1244,6 +1256,41 @@ mod tests {
         assert_eq!(
             tracker.current().unwrap().phase_elapsed_at(later),
             Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn autonomous_compaction_has_an_explicit_phase_then_returns_to_provider_wait() {
+        let now = Instant::now();
+        let mut tracker = RunTracker::default();
+        let id = tracker.begin_at("openai", now).unwrap();
+        tracker.apply_event_at(
+            id,
+            &AgentEvent::CompactionStarted {
+                reason: ygg_agent::CompactionReason::Threshold,
+            },
+            now,
+        );
+        assert_eq!(
+            tracker.current().unwrap().phase(),
+            &RunPhase::Preparing {
+                summary: "compacting".into()
+            }
+        );
+
+        tracker.apply_event_at(
+            id,
+            &AgentEvent::CompactionFinished {
+                reason: ygg_agent::CompactionReason::Threshold,
+                result: Err("summary unavailable".into()),
+            },
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            tracker.current().unwrap().phase(),
+            &RunPhase::AwaitingProvider {
+                provider: "openai".into()
+            }
         );
     }
 

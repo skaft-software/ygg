@@ -290,6 +290,15 @@ struct ShellOutput {
     spinner: String,
 }
 
+#[derive(Clone, Debug)]
+struct CompactionBlock {
+    /// Concise durable-event annotation shown while collapsed.
+    label: String,
+    /// Complete model-produced summary retained for inline inspection.
+    summary: String,
+    expanded: bool,
+}
+
 enum TranscriptBlock {
     User {
         text: String,
@@ -308,7 +317,7 @@ enum TranscriptBlock {
     Shell(Box<ShellOutput>),
     Outcome(RunOutcome),
     Notice(String),
-    Compaction(String),
+    Compaction(Box<CompactionBlock>),
 }
 
 fn reasoning_markdown_projection(source: &str) -> String {
@@ -668,6 +677,12 @@ struct QueuedSteering {
     attachments: Vec<composer::Attachment>,
 }
 
+#[derive(Clone, Debug)]
+enum ShellOverlay {
+    Text(String),
+    Context(crate::tui::context::ContextReport),
+}
+
 /// An interactive panel wedged between the transcript and composer.
 /// Two horizontal rules delimit it; the interior renders form content.
 #[derive(Clone, Debug)]
@@ -768,7 +783,7 @@ pub(crate) struct ShellState {
     pub(crate) extension_status: Option<(String, Option<String>)>,
     pub(crate) extension_footer: Option<(String, Option<String>)>,
     pub(crate) error: Option<String>,
-    pub(crate) overlay: Option<String>,
+    overlay: Option<ShellOverlay>,
     tool_panels: HashMap<ToolCallId, usize>,
     /// Per-call disclosure state. `/tool` toggles one panel without exposing
     /// protocol details for every tool in the transcript.
@@ -1499,6 +1514,10 @@ struct ShellFrameState {
     theme_epoch: u64,
     transcript_generation: u64,
     transcript_len: usize,
+    /// Height of the mutable header/popup/composer tail in the last frame.
+    /// Unlike transcript growth, a height change here inserts or removes rows
+    /// around already-painted chrome and must reanchor the native viewport.
+    chrome_rows: usize,
     overlay_active: bool,
 }
 
@@ -2577,6 +2596,9 @@ fn natural_surface_width(block: &TranscriptBlock, theme: &YggTheme) -> u16 {
         TranscriptBlock::Reasoning(reasoning) if !reasoning.reasoning_expanded => {
             collapsed_reasoning_lines(theme, reasoning).join("\n")
         }
+        TranscriptBlock::Compaction(compaction) if !compaction.expanded => {
+            format!("{} · ctrl+o to view", compaction.label)
+        }
         _ => block_copy_text(block),
     };
     let natural = copy.lines().map(visible_width).max().unwrap_or(1);
@@ -3014,16 +3036,34 @@ fn render_block_planned(
             let lines = wrap_hanging(&sanitize_for_terminal(text), &prefix, &continuation, width);
             finish_transcript_block(lines)
         }
-        TranscriptBlock::Compaction(text) => {
+        TranscriptBlock::Compaction(compaction) => {
             let marker = theme.glyph("note");
             let prefix = format!("{} ", theme.fg("model_accent", marker));
             let continuation = " ".repeat(visible_width(&prefix));
-            finish_transcript_block(wrap_hanging(
-                &sanitize_for_terminal(text),
-                &prefix,
-                &continuation,
-                width,
-            ))
+            let action = if compaction.expanded {
+                "ctrl+o to collapse"
+            } else {
+                "ctrl+o to view"
+            };
+            let label = format!("{} · {action}", sanitize_for_terminal(&compaction.label));
+            let mut lines = wrap_hanging(&label, &prefix, &continuation, width);
+            if compaction.expanded {
+                let summary = AssistantBlock::finalized(compaction.summary.clone());
+                let summary_width = width.saturating_sub(2).max(1);
+                lines.extend(
+                    summary
+                        .render_on_surface(rich_renderer, theme, summary_width, content_background)
+                        .into_iter()
+                        .map(|line| {
+                            if line.is_empty() {
+                                String::new()
+                            } else {
+                                fit_line(&format!("  {line}"), width)
+                            }
+                        }),
+                );
+            }
+            finish_transcript_block(lines)
         }
         TranscriptBlock::Shell(shell) => {
             let marker = theme.glyph("shell");
@@ -3142,9 +3182,14 @@ fn render_block(
 /// composer text, or footer text.
 fn block_copy_text(block: &TranscriptBlock) -> String {
     match block {
-        TranscriptBlock::User { text, .. }
-        | TranscriptBlock::Notice(text)
-        | TranscriptBlock::Compaction(text) => sanitize_for_terminal(text),
+        TranscriptBlock::User { text, .. } | TranscriptBlock::Notice(text) => {
+            sanitize_for_terminal(text)
+        }
+        TranscriptBlock::Compaction(compaction) => format!(
+            "{}\n{}",
+            sanitize_for_terminal(&compaction.label),
+            sexy_tui_rs::parse_markdown(&compaction.summary).plain_text()
+        ),
         TranscriptBlock::Assistant(markdown) => {
             sexy_tui_rs::parse_markdown(&markdown.text).plain_text()
         }
@@ -3984,6 +4029,17 @@ struct ShellChrome {
     transcript_rows: usize,
 }
 
+impl ShellChrome {
+    fn rows(&self) -> usize {
+        self.header.len()
+            + self.error.len()
+            + self.pending.len()
+            + self.suggestions.len()
+            + self.panel.len()
+            + self.composer.len()
+    }
+}
+
 fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> ShellChrome {
     let rows = usize::from(state.size.1.max(5));
     let header = render_shell_header(state, width);
@@ -4504,7 +4560,10 @@ fn overlay_lines(state: &ShellState, width: u16) -> Vec<String> {
     let Some(overlay) = &state.overlay else {
         return Vec::new();
     };
-    wrap_overlay_text(overlay, usize::from(width).max(1))
+    match overlay {
+        ShellOverlay::Text(text) => wrap_overlay_text(text, usize::from(width).max(1)),
+        ShellOverlay::Context(report) => report.render(&state.theme, width),
+    }
 }
 
 fn transcript_viewport_lines(state: &ShellState, width: u16, available: usize) -> Vec<String> {
@@ -4562,6 +4621,7 @@ fn render_shell_viewport_update(
     frame.initialized = true;
     frame.width = width;
     frame.theme_epoch = state.theme_epoch;
+    frame.chrome_rows = shell_chrome(state, width, now).rows();
     FrameUpdate {
         stable_prefix: 0,
         replacement: render_shell_viewport_at(state, width, now),
@@ -4571,18 +4631,14 @@ fn render_shell_viewport_update(
 }
 
 fn append_chrome(lines: &mut Vec<String>, chrome: ShellChrome, stable_prefix_rows: usize) {
-    // Reserve the whole viewport tail for transcript + mutable chrome while a
-    // conversation is short. Once committed history exceeds the viewport, new
-    // rows grow the logical frame and sexy-tui moves them into native terminal
-    // scrollback. `lines` may be only a lazy suffix, so its retained prefix must
-    // count toward the elastic space calculation.
+    // Native mode follows the logical content height. Padding a short frame to
+    // the terminal height pins the composer to the bottom and creates a large
+    // dead zone below the transcript. Once the frame naturally grows past the
+    // viewport, sexy-tui moves committed rows into terminal-owned scrollback.
+    // `lines` may be only a lazy suffix, so its retained prefix still decides
+    // whether the transcript owns the single breathing row before chrome.
     let complete_transcript_rows = stable_prefix_rows.saturating_add(lines.len());
-    if complete_transcript_rows < chrome.transcript_rows {
-        lines.resize(
-            chrome.transcript_rows.saturating_sub(stable_prefix_rows),
-            String::new(),
-        );
-    } else if complete_transcript_rows > 0 {
+    if complete_transcript_rows > 0 {
         lines.push(String::new());
     }
     lines.extend(chrome.header);
@@ -4608,6 +4664,7 @@ fn render_shell_at(state: &ShellState, width: u16, now: Instant) -> Vec<String> 
 }
 
 fn synchronize_shell_frame(state: &ShellState, width: u16, frame: &mut ShellFrameState) {
+    frame.chrome_rows = shell_chrome(state, width, Instant::now()).rows();
     if state.overlay.is_some() {
         frame.initialized = true;
         frame.width = width;
@@ -4638,6 +4695,9 @@ fn render_shell_update(
 ) -> FrameUpdate {
     let repaint_theme = frame.initialized && frame.theme_epoch != state.theme_epoch;
     let chrome = shell_chrome(state, width, now);
+    let chrome_rows = chrome.rows();
+    let reanchor_chrome =
+        frame.initialized && frame.width == width && frame.chrome_rows != chrome_rows;
     if state.overlay.is_some() {
         let mut replacement = overlay_lines(state, width);
         append_chrome(&mut replacement, chrome, 0);
@@ -4646,12 +4706,15 @@ fn render_shell_update(
         frame.theme_epoch = state.theme_epoch;
         frame.transcript_generation = 0;
         frame.transcript_len = 0;
+        frame.chrome_rows = chrome_rows;
         frame.overlay_active = true;
         return FrameUpdate {
             stable_prefix: 0,
             replacement,
-            reanchor_viewport: repaint_theme,
-            rebuild_scrollback: repaint_theme,
+            reanchor_viewport: repaint_theme || reanchor_chrome,
+            // Portable terminals cannot restyle rows already owned by native
+            // scrollback. Repaint the visible viewport and preserve history.
+            rebuild_scrollback: false,
         };
     }
 
@@ -4664,7 +4727,10 @@ fn render_shell_update(
     // native-scrollback renderer must repaint that new viewport from home;
     // otherwise its physical bottom remains anchored inside the old long
     // frame and later pickers expand above a composer stranded mid-screen.
+    let leaving_overlay = frame.initialized && frame.overlay_active;
     let reanchor_viewport = repaint_theme
+        || reanchor_chrome
+        || leaving_overlay
         || (frame.initialized
             && frame.width == width
             && !frame.overlay_active
@@ -4695,12 +4761,13 @@ fn render_shell_update(
     frame.theme_epoch = state.theme_epoch;
     frame.transcript_generation = generation;
     frame.transcript_len = transcript_len;
+    frame.chrome_rows = chrome_rows;
     frame.overlay_active = false;
     FrameUpdate {
         stable_prefix,
         replacement,
         reanchor_viewport,
-        rebuild_scrollback: repaint_theme,
+        rebuild_scrollback: false,
     }
 }
 
@@ -5123,8 +5190,12 @@ fn append_hydrated_items(state: &mut ShellState, items: impl IntoIterator<Item =
                     state.tool_panels.insert(id, index);
                 }
             }
-            TranscriptItem::CompactionMarker { summary_preview } => {
-                state.push_block(TranscriptBlock::Compaction(summary_preview));
+            TranscriptItem::CompactionMarker { summary } => {
+                state.push_block(TranscriptBlock::Compaction(Box::new(CompactionBlock {
+                    label: "Context compacted".into(),
+                    summary,
+                    expanded: false,
+                })));
             }
         }
     }
@@ -5422,6 +5493,35 @@ impl InteractiveShell {
                         prompt_color: prompt_color.clone(),
                         persisted: true,
                     });
+                }
+            }
+            AgentEvent::CompactionStarted { .. } => {
+                // Overflow recovery can begin after a partial provider
+                // attempt. Its deltas were never durable and must not survive
+                // beside the replacement compacted context.
+                state.discard_streaming_blocks();
+                state.run_label = "compacting".into();
+                state.turn_generation_started_at = None;
+                state.turn_streamed_output_bytes = 0;
+            }
+            AgentEvent::CompactionFinished { reason, result } => {
+                state.run_label.clear();
+                match result {
+                    Ok(info) => {
+                        let reason = match reason {
+                            ygg_agent::CompactionReason::Threshold => "context threshold",
+                            ygg_agent::CompactionReason::Overflow => "overflow recovery",
+                        };
+                        state.latest_compaction_summary = Some(info.summary.clone());
+                        state.push_block(TranscriptBlock::Compaction(Box::new(CompactionBlock {
+                            label: format!("Context compacted automatically · {reason}"),
+                            summary: info.summary.clone(),
+                            expanded: false,
+                        })));
+                    }
+                    Err(error) => {
+                        state.error = Some(format!("automatic compaction failed: {error}"));
+                    }
                 }
             }
             AgentEvent::ToolStarted { id, name, args } => {
@@ -6182,29 +6282,53 @@ impl InteractiveShell {
     pub fn drain_composed(&mut self) -> ComposedInput {
         let mut state = self.state.borrow_mut();
         state.editor_cursor = 0;
-        let text = std::mem::take(&mut state.editor);
-        if state.ledger.is_empty() {
-            // Drag-drop arrives as individual keystrokes rather than a
-            // bracketed paste. Classify single-line editor text as a dropped
-            // path so media files get attachment chips and plain paths don't
-            // collide with slash-command recognition.
-            if let Some(path) = composer::parse_dropped_path(&text) {
-                if composer::media_kind_for_path(&path).is_some() {
+        let mut text = std::mem::take(&mut state.editor);
+
+        // Drag/drop is not consistently delivered as a bracketed-paste event.
+        // When it arrives as ordinary keys, promote every existing media path
+        // at submit time even if the user added prompt text around it.
+        let dropped = composer::dropped_paths_in_text(&text);
+        if !dropped.is_empty() {
+            let mut rewritten = String::with_capacity(text.len());
+            let mut cursor = 0;
+            let mut errors = Vec::new();
+            for (range, path) in dropped {
+                rewritten.push_str(&text[cursor..range.start]);
+                let replacement = if composer::media_kind_for_path(&path).is_some() {
                     let modalities = state.input_modalities;
                     match state.ledger.attach_media(&path, modalities) {
-                        Ok(chip) => {
-                            return composer::compose(chip, &mut state.ledger);
-                        }
+                        Ok(chip) => Some(chip),
                         Err(error) => {
-                            state.push_block(TranscriptBlock::Notice(error.to_string()));
+                            errors.push(error.to_string());
+                            None
                         }
                     }
                 } else if composer::file_kind_for_path(&path).is_some() {
-                    if let Ok(chip) = state.ledger.attach_file_reference(&path) {
-                        return composer::compose(chip, &mut state.ledger);
+                    match state.ledger.attach_file_reference(&path) {
+                        Ok(chip) => Some(chip),
+                        Err(error) => {
+                            errors.push(error.to_string());
+                            None
+                        }
                     }
+                } else {
+                    None
+                };
+                if let Some(replacement) = replacement {
+                    rewritten.push_str(&replacement);
+                } else {
+                    rewritten.push_str(&text[range.clone()]);
                 }
+                cursor = range.end;
             }
+            rewritten.push_str(&text[cursor..]);
+            text = rewritten;
+            for error in errors {
+                state.push_block(TranscriptBlock::Notice(error));
+            }
+        }
+
+        if state.ledger.is_empty() {
             ComposedInput::from_text(text)
         } else {
             composer::compose(text, &mut state.ledger)
@@ -6629,12 +6753,15 @@ impl InteractiveShell {
     }
 
     pub fn show_overlay_text(&mut self, text: String) {
-        self.state.borrow_mut().overlay = Some(sanitize_for_terminal(&text));
+        self.state.borrow_mut().overlay = Some(ShellOverlay::Text(sanitize_for_terminal(&text)));
     }
 
-    /// Toggle the most recent expandable block (reasoning, tool, or shell;
-    /// ctrl+o).
-    /// Falls back to the compaction summary when none exists.
+    pub fn show_context_report(&mut self, report: crate::tui::context::ContextReport) {
+        self.state.borrow_mut().overlay = Some(ShellOverlay::Context(report));
+    }
+
+    /// Toggle the most recent expandable block (reasoning, tool, shell, or
+    /// compaction summary; ctrl+o).
     pub fn expand_focused_tool(&mut self) {
         let mut state = self.state.borrow_mut();
         let most_recent = state.transcript.iter().rposition(|block| {
@@ -6643,12 +6770,18 @@ impl InteractiveShell {
                 TranscriptBlock::Reasoning(_)
                     | TranscriptBlock::Tool(_)
                     | TranscriptBlock::Shell(_)
+                    | TranscriptBlock::Compaction(_)
             )
         });
         if let Some(index) = most_recent {
             if let TranscriptBlock::Reasoning(reasoning) = &mut state.transcript[index] {
                 reasoning.reasoning_expanded = !reasoning.reasoning_expanded;
                 reasoning.invalidate_layout();
+                state.touch_block(index);
+                return;
+            }
+            if let TranscriptBlock::Compaction(compaction) = &mut state.transcript[index] {
+                compaction.expanded = !compaction.expanded;
                 state.touch_block(index);
                 return;
             }
@@ -6672,18 +6805,25 @@ impl InteractiveShell {
                 _ => return,
             }
             state.touch_block(index);
-        } else if let Some(summary) = &state.latest_compaction_summary {
-            state.overlay = Some(summary.clone());
         } else {
-            state.error =
-                Some("no reasoning, tool calls, or shell commands in this session".into());
+            state.error = Some(
+                "no reasoning, tool calls, shell commands, or compaction summaries in this session"
+                    .into(),
+            );
         }
     }
 
     pub fn show_compaction_summary(&mut self) {
         let mut state = self.state.borrow_mut();
-        if let Some(summary) = &state.latest_compaction_summary {
-            state.overlay = Some(summary.clone());
+        if let Some(index) = state
+            .transcript
+            .iter()
+            .rposition(|block| matches!(block, TranscriptBlock::Compaction(_)))
+        {
+            if let TranscriptBlock::Compaction(compaction) = &mut state.transcript[index] {
+                compaction.expanded = true;
+            }
+            state.touch_block(index);
         } else {
             state.error = Some("no compaction summary found in session history".into());
         }
@@ -6692,19 +6832,19 @@ impl InteractiveShell {
     /// Show picker output that already contains Ygg-generated foreground SGR.
     #[allow(dead_code)]
     pub fn show_styled_overlay_text(&mut self, text: String) {
-        self.state.borrow_mut().overlay = Some(text);
+        self.state.borrow_mut().overlay = Some(ShellOverlay::Text(text));
     }
 
     #[allow(dead_code)]
     pub fn show_status_text(&mut self, text: String) {
         let mut state = self.state.borrow_mut();
-        state.overlay = Some(styled_status_text(&state.theme, &text));
+        state.overlay = Some(ShellOverlay::Text(styled_status_text(&state.theme, &text)));
     }
 
     pub fn show_status_text_with_telemetry(&mut self, text: String) {
         let mut state = self.state.borrow_mut();
         let text = format!("{text}\n\n{}", status_telemetry(&state, Instant::now()));
-        state.overlay = Some(styled_status_text(&state.theme, &text));
+        state.overlay = Some(ShellOverlay::Text(styled_status_text(&state.theme, &text)));
     }
 
     pub fn close_overlay(&mut self) {
@@ -6902,9 +7042,15 @@ impl InteractiveShell {
         }
     }
 
-    pub fn compaction_marker(&mut self, summary: impl Into<String>) {
+    pub fn compaction_marker(&mut self, label: impl Into<String>, summary: impl Into<String>) {
         let mut state = self.state.borrow_mut();
-        state.push_block(TranscriptBlock::Compaction(summary.into()));
+        let summary = summary.into();
+        state.latest_compaction_summary = Some(summary.clone());
+        state.push_block(TranscriptBlock::Compaction(Box::new(CompactionBlock {
+            label: label.into(),
+            summary,
+            expanded: false,
+        })));
     }
 
     /// Update stable presentation metadata when the active model changes, then
@@ -7008,6 +7154,7 @@ impl InteractiveShell {
         state.run_context_estimate = None;
         state.run_label.clear();
         state.shimmer_started_at = None;
+        state.overlay = None;
         state.error = None;
         append_hydrated_items(&mut state, items);
         state.invalidate_transcript();
@@ -7021,11 +7168,15 @@ impl InteractiveShell {
         let mut result = String::new();
         for block in &state.transcript {
             match block {
-                TranscriptBlock::User { text, .. }
-                | TranscriptBlock::Notice(text)
-                | TranscriptBlock::Compaction(text) => {
+                TranscriptBlock::User { text, .. } | TranscriptBlock::Notice(text) => {
                     result.push('\n');
                     result.push_str(text);
+                }
+                TranscriptBlock::Compaction(compaction) => {
+                    result.push('\n');
+                    result.push_str(&compaction.label);
+                    result.push('\n');
+                    result.push_str(&compaction.summary);
                 }
                 TranscriptBlock::Assistant(markdown) | TranscriptBlock::Reasoning(markdown) => {
                     result.push('\n');
@@ -7964,6 +8115,63 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_slash_discovery_contains_only_registered_executable_names() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_prompt_templates(Arc::from(vec![crate::prompts::PromptTemplateDescriptor {
+            name: "local-review".into(),
+            description: "Focused local review".into(),
+            argument_hint: None,
+            path: PathBuf::from("/tmp/local-review.md"),
+            trust: crate::prompts::PromptTrust::UserInstalled,
+            content_hash: "hash".into(),
+        }]));
+        shell.set_extension_commands(Arc::from(vec![
+            ("checkpoint".into(), "Save checkpoint".into()),
+            // A dynamic command cannot shadow a working built-in.
+            ("status".into(), "Shadow status".into()),
+        ]));
+        shell.apply_edit(EditAction::Char('/'));
+
+        let state = shell.state.borrow();
+        let suggestions = input_slash_suggestions(&state);
+        let prompt_names = state
+            .prompt_templates
+            .iter()
+            .map(|template| template.name.as_str())
+            .collect::<HashSet<_>>();
+        let extension_names = state
+            .extension_commands
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<HashSet<_>>();
+        for suggestion in suggestions.iter().filter(|suggestion| {
+            suggestion.description.starts_with("prompt ·")
+                || suggestion.description.starts_with("extension ·")
+        }) {
+            let registered = if suggestion.description.starts_with("prompt ·") {
+                prompt_names.contains(suggestion.name.as_str())
+            } else {
+                extension_names.contains(suggestion.name.as_str())
+            };
+            assert!(registered, "unregistered suggestion: {suggestion:?}");
+        }
+        assert_eq!(
+            suggestions
+                .iter()
+                .filter(|suggestion| suggestion.name == "status")
+                .count(),
+            1,
+            "dynamic command shadowed the built-in route"
+        );
+        assert!(suggestions.iter().any(|suggestion| {
+            suggestion.name == "local-review" && suggestion.description.starts_with("prompt ·")
+        }));
+        assert!(suggestions.iter().any(|suggestion| {
+            suggestion.name == "checkpoint" && suggestion.description.starts_with("extension ·")
+        }));
+    }
+
+    #[test]
     fn mention_completion_inserts_path_reference_for_text_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -8342,6 +8550,32 @@ mod tests {
     }
 
     #[test]
+    fn raw_key_drop_with_surrounding_prompt_still_attaches_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("screen shot.png");
+        std::fs::write(&image, b"png").unwrap();
+
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_input_modalities(ygg_ai::ModalitySet::none().with(ygg_ai::Modality::Image));
+        let escaped = image.display().to_string().replace(' ', "\\ ");
+        for character in format!("{escaped} diagnose this UI").chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+
+        let composed = shell.drain_composed();
+        assert!(composed
+            .display_text
+            .contains("[Image #1] diagnose this UI"));
+        assert!(composed
+            .parts
+            .iter()
+            .any(|part| matches!(part, ygg_agent::InputPart::Media(ygg_ai::Media::Image(_)))));
+        assert!(composed.parts.iter().any(
+            |part| matches!(part, ygg_agent::InputPart::Text(text) if text.contains("diagnose this UI"))
+        ));
+    }
+
+    #[test]
     fn media_paste_without_capability_inserts_plain_path_and_notice() {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("shot.png");
@@ -8401,6 +8635,47 @@ mod tests {
             recomposed.parts.as_slice(),
             [ygg_agent::InputPart::Text(text)] if text.matches("line").count() == 20
         ));
+    }
+
+    #[test]
+    fn aborted_final_frame_shows_interruption_and_restored_steering() {
+        use ygg_agent::{EntryId, FinishReason};
+
+        const WIDTH: u16 = 72;
+        const HEIGHT: u16 = 18;
+        for synchronized_output in [false, true] {
+            let (mut shell, bytes) = emulated_shell_with_sync(
+                crate::tui::theme::test_theme(),
+                WIDTH,
+                HEIGHT,
+                synchronized_output,
+            );
+            let run_id = shell.begin_run("temper");
+            shell.queue_steering(&ComposedInput::from_text("inspect renderer".into()));
+            shell.queue_steering(&ComposedInput::from_text("then run tests".into()));
+
+            // This is the production ordering at the terminal run boundary:
+            // settle the outcome, restore any undelivered queue, then publish
+            // one complete frame.
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::RunFinished {
+                    head: EntryId("aborted-head".into()),
+                    reason: FinishReason::Aborted,
+                },
+            );
+            shell.restore_queued_steering();
+            shell.render();
+
+            let output = bytes.lock().unwrap().clone();
+            let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 128);
+            terminal.process(&output);
+            let physical = terminal.screen().contents();
+            assert_eq!(physical.matches("interrupted").count(), 1, "{physical}");
+            assert!(physical.contains("inspect renderer"), "{physical}");
+            assert!(physical.contains("then run tests"), "{physical}");
+            assert!(!physical.contains("Steering prompt"), "{physical}");
+        }
     }
 
     #[test]
@@ -8825,6 +9100,266 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_o_expands_and_collapses_the_inline_compaction_summary() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.compaction_marker(
+            "Context compacted · 12,000 input tokens summarized",
+            "# Grounded summary\n\n- kept decision\n- **summary sentinel**",
+        );
+        let plain = |shell: &InteractiveShell| {
+            strip_terminal_sequences(&shell.state.borrow().rendered_transcript(80).join("\n"))
+        };
+
+        let collapsed = plain(&shell);
+        assert!(
+            collapsed.contains("12,000 input tokens summarized"),
+            "{collapsed}"
+        );
+        assert!(collapsed.contains("ctrl+o to view"), "{collapsed}");
+        assert!(!collapsed.contains("summary sentinel"), "{collapsed}");
+
+        shell.expand_focused_tool();
+        let expanded = plain(&shell);
+        assert!(expanded.contains("Grounded summary"), "{expanded}");
+        assert!(expanded.contains("summary sentinel"), "{expanded}");
+        assert!(expanded.contains("ctrl+o to collapse"), "{expanded}");
+        assert!(!shell.has_overlay(), "compaction must expand inline");
+
+        shell.expand_focused_tool();
+        let collapsed_again = plain(&shell);
+        assert!(
+            !collapsed_again.contains("summary sentinel"),
+            "{collapsed_again}"
+        );
+        assert!(
+            collapsed_again.contains("ctrl+o to view"),
+            "{collapsed_again}"
+        );
+    }
+
+    #[test]
+    fn autonomous_compaction_events_show_work_success_and_failure_inline() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_identity("openai", "gpt-5.6", "high");
+        let run_id = shell.begin_run("openai");
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::CompactionStarted {
+                reason: ygg_agent::CompactionReason::Threshold,
+            },
+        );
+        let working = strip_terminal_sequences(
+            &crate::tui::composer_surface::render_composer_surface(
+                &shell.state.borrow(),
+                80,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .join("\n"),
+        );
+        assert!(working.contains("compacting"), "{working}");
+        assert!(!working.contains("waiting for API"), "{working}");
+
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::CompactionFinished {
+                reason: ygg_agent::CompactionReason::Threshold,
+                result: Ok(ygg_agent::CompactionInfo {
+                    summary: "# Automatic summary\n\nauto-summary sentinel".into(),
+                    first_kept: ygg_agent::EntryId("kept".into()),
+                }),
+            },
+        );
+        let collapsed =
+            strip_terminal_sequences(&shell.state.borrow().rendered_transcript(80).join("\n"));
+        assert!(
+            collapsed.contains("Context compacted automatically"),
+            "{collapsed}"
+        );
+        assert!(!collapsed.contains("auto-summary sentinel"), "{collapsed}");
+        shell.expand_focused_tool();
+        let expanded =
+            strip_terminal_sequences(&shell.state.borrow().rendered_transcript(80).join("\n"));
+        assert!(expanded.contains("auto-summary sentinel"), "{expanded}");
+
+        let mut failed_shell = InteractiveShell::test_shell();
+        let failed_run = failed_shell.begin_run("openai");
+        failed_shell.on_run_event(
+            failed_run,
+            &AgentEvent::CompactionStarted {
+                reason: ygg_agent::CompactionReason::Overflow,
+            },
+        );
+        failed_shell.on_run_event(
+            failed_run,
+            &AgentEvent::CompactionFinished {
+                reason: ygg_agent::CompactionReason::Overflow,
+                result: Err("cold endpoint timed out".into()),
+            },
+        );
+        assert_eq!(
+            failed_shell.debug_error().as_deref(),
+            Some("automatic compaction failed: cold endpoint timed out")
+        );
+        assert!(failed_shell.state.borrow().run_label.is_empty());
+    }
+
+    #[test]
+    fn resumed_compaction_summary_remains_expandable_after_theme_switch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        let first_kept = session
+            .append(EntryValue::Config {
+                model: Some("gpt-5.6".into()),
+                reasoning: Some("high".into()),
+            })
+            .unwrap();
+        session
+            .append(EntryValue::Compaction {
+                summary: "# Resumed summary\n\nresume-only sentinel".into(),
+                first_kept,
+                active_skills: Vec::new(),
+                skill_resources: Vec::new(),
+            })
+            .unwrap();
+        drop(session);
+
+        let resumed = Session::open(path).unwrap();
+        let mut shell = InteractiveShell::test_shell();
+        shell.show_overlay_text("stale session overlay".into());
+        shell.hydrate(&resumed).unwrap();
+        assert!(
+            !shell.has_overlay(),
+            "resume must close session-local overlays"
+        );
+        let render = |shell: &InteractiveShell| {
+            strip_terminal_sequences(&shell.state.borrow().rendered_transcript(72).join("\n"))
+        };
+        assert!(!render(&shell).contains("resume-only sentinel"));
+
+        shell.expand_focused_tool();
+        assert!(render(&shell).contains("resume-only sentinel"));
+        shell.set_theme(crate::tui::theme::test_theme());
+        let restyled = render(&shell);
+        assert!(restyled.contains("resume-only sentinel"), "{restyled}");
+        assert!(restyled.contains("ctrl+o to collapse"), "{restyled}");
+    }
+
+    #[test]
+    fn compaction_expansion_does_not_replay_native_scrollback() {
+        const WIDTH: u16 = 88;
+        const HEIGHT: u16 = 18;
+        for synchronized_output in [false, true] {
+            let (mut shell, bytes) = emulated_shell_with_sync(
+                crate::tui::theme::test_theme(),
+                WIDTH,
+                HEIGHT,
+                synchronized_output,
+            );
+            let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+            let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+                std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+            };
+            terminal.process(&drain(&bytes));
+
+            for index in 0..24 {
+                shell.notice(format!("compaction-history-{index:02}"));
+            }
+            shell.compaction_marker(
+                "Context compacted",
+                "# Summary\n\n- compaction-detail-a\n- compaction-detail-b",
+            );
+            shell.render();
+            terminal.process(&drain(&bytes));
+
+            shell.expand_focused_tool();
+            shell.render();
+            let expansion = drain(&bytes);
+            let expansion_text = String::from_utf8_lossy(&expansion);
+            assert!(
+                expansion_text.contains("compaction-detail-a"),
+                "{expansion_text:?}"
+            );
+            assert!(
+                !expansion_text.contains("compaction-history"),
+                "expansion replayed committed history: {expansion_text:?}"
+            );
+            terminal.process(&expansion);
+
+            terminal.set_size(512, WIDTH);
+            terminal.set_scrollback(usize::MAX);
+            let physical = terminal.screen().contents();
+            for index in 0..24 {
+                let sentinel = format!("compaction-history-{index:02}");
+                assert_eq!(
+                    physical.matches(&sentinel).count(),
+                    1,
+                    "{sentinel} replayed with synchronized_output={synchronized_output}:\n{physical}"
+                );
+            }
+            assert_eq!(
+                physical.matches("compaction-detail-a").count(),
+                1,
+                "{physical}"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_overlay_reanchors_without_replaying_native_scrollback() {
+        const WIDTH: u16 = 80;
+        const HEIGHT: u16 = 16;
+        for synchronized_output in [false, true] {
+            let (mut shell, bytes) = emulated_shell_with_sync(
+                crate::tui::theme::test_theme(),
+                WIDTH,
+                HEIGHT,
+                synchronized_output,
+            );
+            let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+            let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+                std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+            };
+            terminal.process(&drain(&bytes));
+
+            for index in 0..32 {
+                shell.notice(format!("overlay-history-{index:02}"));
+            }
+            shell.render();
+            terminal.process(&drain(&bytes));
+
+            shell.show_overlay_text("status overlay\nclose me".into());
+            shell.render();
+            terminal.process(&drain(&bytes));
+
+            shell.close_overlay();
+            shell.render();
+            let close_frame = drain(&bytes);
+            // Closing a one-viewport overlay must repaint only the visible
+            // tail. Replaying the retained transcript here is what created
+            // duplicated lines in terminal-owned scrollback.
+            assert!(
+                close_frame.len() < 8 * 1024,
+                "overlay close replayed an unbounded frame ({} bytes)",
+                close_frame.len()
+            );
+            terminal.process(&close_frame);
+
+            terminal.set_size(512, WIDTH);
+            terminal.set_scrollback(usize::MAX);
+            let physical = terminal.screen().contents();
+            for index in 0..32 {
+                let sentinel = format!("overlay-history-{index:02}");
+                assert_eq!(
+                    physical.matches(&sentinel).count(),
+                    1,
+                    "{sentinel} replayed with synchronized_output={synchronized_output}:\n{physical}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn long_exec_tail_and_head_trim_never_replay_native_history() {
         const WIDTH: u16 = 96;
         const HEIGHT: u16 = 24;
@@ -8967,23 +9502,25 @@ mod tests {
     }
 
     #[test]
-    fn short_transcript_events_do_not_move_the_pinned_composer_or_footer() {
+    fn short_transcript_chrome_follows_content_without_viewport_padding() {
         let mut shell = InteractiveShell::test_shell();
-        shell.set_size(80, 14);
+        shell.set_size(80, 40);
         shell.set_identity("codex", "gpt-5.6", "high");
         let run_id = shell.begin_run("codex");
         let now = Instant::now();
 
-        let chrome_rows = |lines: &[String]| {
-            let composer = lines
+        let composer_row = |lines: &[String]| {
+            lines
                 .iter()
                 .position(|line| line.contains(CURSOR_MARKER))
-                .expect("composer cursor row");
-            (composer, lines.len().saturating_sub(1), lines.len())
+                .expect("composer cursor row")
         };
         let initial = render_shell_at(&shell.state.borrow(), 80, now);
-        let expected = chrome_rows(&initial);
-        assert_eq!(expected.2, 14, "the short frame should fill the viewport");
+        let initial_composer = composer_row(&initial);
+        assert!(
+            initial.len() < 40,
+            "native mode must not pad a short frame to the terminal height"
+        );
 
         shell.on_run_event(
             run_id,
@@ -8993,7 +9530,8 @@ mod tests {
             },
         );
         let streamed = render_shell_at(&shell.state.borrow(), 80, now);
-        assert_eq!(chrome_rows(&streamed), expected);
+        assert!(composer_row(&streamed) > initial_composer);
+        assert!(streamed.len() < 40);
 
         shell.on_run_event(
             run_id,
@@ -9004,11 +9542,13 @@ mod tests {
             },
         );
         let tool = render_shell_at(&shell.state.borrow(), 80, now);
-        assert_eq!(chrome_rows(&tool), expected);
+        assert!(composer_row(&tool) > composer_row(&streamed));
+        assert!(tool.len() < 40);
 
         shell.queue_steering(&ComposedInput::from_text("also inspect tests".into()));
         let steering = render_shell_at(&shell.state.borrow(), 80, now);
-        assert_eq!(chrome_rows(&steering), expected);
+        assert!(composer_row(&steering) > composer_row(&tool));
+        assert!(steering.len() < 40);
         let steering_plain = steering
             .iter()
             .map(|line| strip_terminal_sequences(line))
@@ -9022,16 +9562,75 @@ mod tests {
         let mut frame = ShellFrameState::default();
         let first = render_shell_update(&shell.state.borrow(), 80, now, &mut frame);
         assert_eq!(first.stable_prefix, 0);
-        assert_eq!(first.replacement.len(), 14);
+        assert_eq!(first.replacement, steering);
         assert!(!first.rebuild_scrollback);
         let next = render_shell_update(&shell.state.borrow(), 80, now, &mut frame);
         assert!(next.stable_prefix > 0);
         assert!(!next.rebuild_scrollback);
-        assert_eq!(next.stable_prefix + next.replacement.len(), 14);
+        assert!(next.stable_prefix + next.replacement.len() < 40);
         assert!(next
             .replacement
             .iter()
             .any(|line| line.contains(CURSOR_MARKER)));
+    }
+
+    #[test]
+    fn emulated_native_short_frame_does_not_pin_composer_to_terminal_bottom() {
+        const WIDTH: u16 = 80;
+        const HEIGHT: u16 = 40;
+        let (mut shell, bytes) = emulated_shell(crate::tui::theme::test_theme(), WIDTH, HEIGHT);
+        shell.set_identity("codex", "gpt-5.6", "high");
+        shell.notice("recent transcript row");
+        shell.render();
+
+        let output = bytes.lock().unwrap().clone();
+        let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 0);
+        terminal.process(&output);
+        assert!(
+            terminal
+                .screen()
+                .contents()
+                .contains("recent transcript row"),
+            "transcript was not painted: {:?}",
+            terminal.screen().contents()
+        );
+        let (cursor_row, _) = terminal.screen().cursor_position();
+        assert!(
+            cursor_row < HEIGHT / 2,
+            "short native frame pinned the composer at terminal row {cursor_row}"
+        );
+    }
+
+    #[test]
+    fn slash_popup_height_changes_reanchor_native_viewport() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(80, 20);
+        for character in "/res".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+
+        let mut frame = ShellFrameState::default();
+        let initial = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
+        assert!(!initial.reanchor_viewport);
+
+        for _ in 0..3 {
+            shell.apply_edit(EditAction::Backspace);
+        }
+        assert_eq!(shell.pending(), "/");
+        let expanded = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
+        assert!(
+            expanded.reanchor_viewport,
+            "growing suggestions before the composer must repaint the viewport"
+        );
+
+        for character in "res".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+        let collapsed = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
+        assert!(
+            collapsed.reanchor_viewport,
+            "shrinking suggestions must erase the previously taller popup"
+        );
     }
 
     #[test]
@@ -9065,7 +9664,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_swap_rebuilds_native_scrollback_once_without_stale_styles() {
+    fn theme_swap_repaints_visible_cells_but_preserves_native_scrollback_styles() {
         const WIDTH: u16 = 32;
         const HEIGHT: u16 = 10;
         let theme_source = |name: &str, foreground: &str| {
@@ -9080,6 +9679,7 @@ mod tests {
             ))
         };
         let first_theme = theme_source("Viewport red", "#b01020");
+        let old_foreground = role_rgb_color(&first_theme, "foreground");
         let (mut shell, bytes) = emulated_shell(first_theme, WIDTH, HEIGHT);
         {
             let mut state = shell.state.borrow_mut();
@@ -9123,20 +9723,14 @@ mod tests {
             .lock()
             .expect("emulated terminal output mutex poisoned")
             .clone();
-        let clear_saved = complete
-            .windows(b"\x1b[3J".len())
-            .rposition(|window| window == b"\x1b[3J")
-            .expect("theme swap did not rebuild terminal-owned scrollback");
-        let rebuilt = &complete[clear_saved + b"\x1b[3J".len()..];
-        assert_eq!(
-            String::from_utf8_lossy(rebuilt)
-                .matches("historic-")
-                .count(),
-            12,
-            "theme swap replayed history more than once"
+        assert!(
+            !complete
+                .windows(b"\x1b[3J".len())
+                .any(|window| window == b"\x1b[3J"),
+            "theme swap cleared terminal-owned scrollback"
         );
         let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 128);
-        terminal.process(rebuilt);
+        terminal.process(&complete);
         assert!(
             find_ascii_cell(terminal.screen(), "historic-").is_some(),
             "visible tail lost after theme repaint: {:?}",
@@ -9149,23 +9743,31 @@ mod tests {
             terminal.screen().contents()
         );
 
-        let mut found_rebuilt_history = false;
-        for offset in 0..=usize::from(HEIGHT) {
+        let mut native_history = None;
+        for offset in 1..=usize::from(HEIGHT) {
             terminal.set_scrollback(offset);
             for (row, contents) in terminal.screen().rows(0, WIDTH).enumerate() {
-                let Some(start) = contents.find("historic-") else {
+                let Some(column) = contents.find("historic-") else {
                     continue;
                 };
-                found_rebuilt_history = true;
                 let color = terminal
                     .screen()
-                    .cell(row as u16, start as u16)
+                    .cell(row as u16, column as u16)
                     .expect("historic cell inside terminal bounds")
                     .fgcolor();
-                assert_eq!(color, new_foreground, "stale theme at offset {offset}");
+                if color == old_foreground {
+                    native_history = Some((row as u16, column as u16));
+                    break;
+                }
+            }
+            if native_history.is_some() {
+                break;
             }
         }
-        assert!(found_rebuilt_history, "rebuilt scrollback had no history");
+        assert!(
+            native_history.is_some(),
+            "rows committed before the theme swap should retain their original cell style"
+        );
     }
 
     #[test]
@@ -9260,7 +9862,7 @@ mod tests {
         let fresh = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
         assert!(fresh.reanchor_viewport);
         assert!(!fresh.rebuild_scrollback);
-        assert_eq!(fresh.stable_prefix + fresh.replacement.len(), 14);
+        assert!(fresh.stable_prefix + fresh.replacement.len() < 14);
 
         shell.open_panel(Panel::SelectList {
             title: "Models".into(),
@@ -9274,9 +9876,12 @@ mod tests {
             ]),
         });
         let picker = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
-        assert!(!picker.reanchor_viewport);
+        assert!(
+            picker.reanchor_viewport,
+            "inserting picker rows before the composer must reanchor the viewport"
+        );
         assert!(!picker.rebuild_scrollback);
-        assert_eq!(picker.stable_prefix + picker.replacement.len(), 14);
+        assert!(picker.stable_prefix + picker.replacement.len() <= 14);
         assert!(picker
             .replacement
             .iter()
@@ -9467,7 +10072,7 @@ mod tests {
                 RunPhase::AwaitingProvider {
                     provider: "relay".into(),
                 },
-                Some("waiting for API 0.6s"),
+                Some("waiting for API"),
             ),
             (RunPhase::Thinking, None),
             (RunPhase::StreamingResponse, None),
@@ -9482,7 +10087,13 @@ mod tests {
                 RunPhase::AwaitingApproval {
                     prompt: "allow edit".into(),
                 },
-                Some("waiting 0.6s"),
+                Some("waiting"),
+            ),
+            (
+                RunPhase::Preparing {
+                    summary: "compacting".into(),
+                },
+                Some("compacting"),
             ),
         ];
         for (phase, expected) in cases {
@@ -9493,23 +10104,33 @@ mod tests {
                     "missing {expected:?}: {rendered}"
                 );
             }
-            assert!(
-                rendered.contains("0.6s"),
-                "elapsed clock missing: {rendered}"
-            );
-            let status = rendered
-                .lines()
-                .find(|line| line.contains("0.6s"))
-                .expect("active status");
+            assert!(!rendered.contains("0.6s"), "timer leaked: {rendered}");
             for hidden in ["thinking", "responding", "tool"] {
-                assert!(!status.contains(hidden), "{hidden:?} leaked: {status}");
+                assert!(!rendered.contains(hidden), "{hidden:?} leaked: {rendered}");
             }
         }
     }
 
     #[test]
-    fn active_work_status_is_elapsed_only_and_subdued_in_the_pinned_footer() {
-        let rendered = rendered_phase(RunPhase::Thinking);
+    fn named_theme_may_retain_elapsed_only_active_work_status() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_theme(crate::tui::theme::test_bundled_theme_with(
+            "bone-machine",
+            crate::tui::terminal::TerminalCapabilities::test(
+                true,
+                true,
+                crate::tui::terminal::ColorDepth::TrueColor,
+            ),
+            crate::tui::theme::TerminalBackground::Dark,
+        ));
+        let now = Instant::now();
+        {
+            let mut state = shell.state.borrow_mut();
+            let id = state.run.begin_at("relay", now).unwrap();
+            state.run.set_phase_at(id, RunPhase::Thinking, now);
+        }
+        let rendered =
+            render_shell_at(&shell.state.borrow(), 80, now + Duration::from_millis(600)).join("\n");
         let status = rendered
             .lines()
             .find(|line| line.contains("0.6s"))
@@ -9522,7 +10143,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_accumulates_agent_run_time_and_freezes_while_idle() {
+    fn default_footer_accumulates_work_but_never_shows_the_stopwatch() {
         let shell = InteractiveShell::test_shell();
         let now = Instant::now();
         {
@@ -9547,7 +10168,7 @@ mod tests {
             )
             .join("\n"),
         );
-        assert!(active.contains("6.0s"), "{active}");
+        assert!(!active.contains("6.0s"), "{active}");
 
         {
             let mut state = shell.state.borrow_mut();
@@ -9567,7 +10188,7 @@ mod tests {
             )
             .join("\n"),
         );
-        assert!(idle_later.contains("6.0s"), "{idle_later}");
+        assert!(!idle_later.contains("6.0s"), "{idle_later}");
         assert!(!idle_later.contains("36.0s"), "{idle_later}");
     }
 
@@ -11011,7 +11632,8 @@ mod tests {
         }
         let now = started + Duration::from_millis(8_700);
         let live = plain_footer(&shell, 100, now);
-        assert!(live.ends_with("waiting for API 8.7s"), "{live:?}");
+        assert!(live.ends_with("waiting for API"), "{live:?}");
+        assert!(!live.contains("8.7s"), "default timer leaked: {live:?}");
         assert!(
             live.contains("~72.4 tok/s"),
             "live estimate missing: {live:?}"
@@ -11055,7 +11677,8 @@ mod tests {
             !paid.contains("session"),
             "session cost stays in /status: {paid:?}"
         );
-        assert!(paid.ends_with("waiting for API 8.7s"));
+        assert!(paid.ends_with("waiting for API"));
+        assert!(!paid.contains("8.7s"), "default timer leaked: {paid:?}");
 
         {
             let mut state = shell.state.borrow_mut();
@@ -11078,7 +11701,10 @@ mod tests {
             active_sample.contains("72.4 tok/s"),
             "provider-final throughput should remain visible while tools run: {active_sample:?}"
         );
-        assert!(active_sample.ends_with("8.7s"));
+        assert!(
+            !active_sample.contains("8.7s"),
+            "default timer leaked: {active_sample:?}"
+        );
         assert!(!active_sample.contains("tool"));
         let final_diagnostics = status_telemetry(&shell.state.borrow(), now);
         assert!(final_diagnostics.contains("72.4 tok/s final"));
@@ -11892,7 +12518,10 @@ mod tests {
         assert!(!active_footer.contains("DeepSeek"), "{active_footer:?}");
         shell.set_size(24, 12);
         let narrow_active = plain_footer(&shell, 24, now);
-        assert!(narrow_active.ends_with("0.0s"), "{narrow_active:?}");
+        assert!(
+            !narrow_active.contains("0.0s"),
+            "default timer leaked: {narrow_active:?}"
+        );
         assert!(!narrow_active.contains("thinking"), "{narrow_active:?}");
         assert!(!narrow_active.contains("tool"), "{narrow_active:?}");
         shell.set_size(46, 12);

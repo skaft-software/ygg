@@ -309,6 +309,7 @@ impl ThinkingLevel {
 /// Automatic compaction policy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionPolicy {
+    pub enabled: bool,
     pub threshold_fraction: f64,
     pub keep_recent_turns: usize,
     /// Optional model override for summary calls. When absent, bootstrap uses
@@ -320,6 +321,7 @@ pub struct CompactionPolicy {
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
+            enabled: true,
             threshold_fraction: 0.85,
             keep_recent_turns: 4,
             compact_model: None,

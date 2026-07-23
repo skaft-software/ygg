@@ -23,7 +23,7 @@ use ygg_ai::{
     AiClient, AssistantMessage, AssistantPart, Auth, Capabilities, Endpoint, EndpointId, Media,
     Message, Modality, ModalitySet, Model, ModelId, ModelLimits, ModelSpec, Pricing, Protocol,
     ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningEffortBudgets, TokenRate,
-    ToolCall, UserMessage, UserPart,
+    ToolCall, Usage, UserMessage, UserPart,
 };
 
 const MAX_CONNECT_ATTEMPTS_FOR_TEST: usize = 6;
@@ -318,6 +318,31 @@ struct AbortableCompactionScript {
     summary_started: Arc<std::sync::atomic::AtomicBool>,
 }
 
+struct SummaryThenSlowMain;
+
+impl Respond for SummaryThenSlowMain {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let tools_empty = body
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty);
+        let response = if tools_empty {
+            text_turn("authoritative usage forced this summary")
+        } else {
+            text_turn("normal response should not open before compaction is visible")
+        };
+        let template = ResponseTemplate::new(200)
+            .set_body_string(response)
+            .insert_header("content-type", "text/event-stream");
+        if tools_empty {
+            template
+        } else {
+            template.set_delay(Duration::from_secs(5))
+        }
+    }
+}
+
 impl Respond for AbortableCompactionScript {
     fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
@@ -603,6 +628,42 @@ async fn collect(run: &mut ygg_agent::Run<'_>) -> Vec<AgentEvent> {
         events.push(event);
     }
     events
+}
+
+fn session_with_authoritative_pressure(path: &Path, total_tokens: u64) -> Session {
+    let mut session = Session::create(path).unwrap();
+    let mut latest_assistant = None;
+    for index in 0..5 {
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text(format!("prior user {index}"))],
+            })))
+            .unwrap();
+        latest_assistant = Some(
+            session
+                .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                    content: vec![AssistantPart::Text(format!("prior answer {index}"))],
+                    model: ModelId("scripted".into()),
+                    protocol: Protocol::AnthropicMessages,
+                })))
+                .unwrap(),
+        );
+    }
+    session
+        .record_assistant_usage(
+            latest_assistant.unwrap(),
+            EndpointId("test".into()),
+            ModelId("scripted".into()),
+            Usage {
+                input_tokens: total_tokens.saturating_sub(1_000),
+                output_tokens: 1_000,
+                total_tokens,
+                ..Usage::default()
+            },
+            None,
+        )
+        .unwrap();
+    session
 }
 
 /// Every started run must emit exactly one `RunFinished`, as its final event.
@@ -947,6 +1008,117 @@ async fn one_user_task_compacts_completed_tool_episodes_in_loop() {
         .entries()
         .iter()
         .any(|entry| matches!(entry.value, EntryValue::Compaction { .. })));
+}
+
+#[tokio::test]
+async fn authoritative_usage_compacts_and_reports_phase_before_opening_slow_main_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(SummaryThenSlowMain)
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let session_path = sessions.path().join("authoritative-pressure.jsonl");
+    let session = session_with_authoritative_pressure(&session_path, 180_000);
+    let mut agent = build_agent_from_session(&server.uri(), workspace.path(), session, Some(4));
+    // Even when the keep preference exceeds the number of available turns,
+    // the configured threshold still has to trigger compaction.
+    agent.set_compaction_policy(true, 0.85, 10).unwrap();
+
+    let mut run = agent.prompt("new work").await.unwrap();
+    let control = run.control();
+    let mut saw_start = false;
+    let mut saw_finish = false;
+    while !saw_finish {
+        let event = tokio::time::timeout(Duration::from_secs(1), run.next())
+            .await
+            .expect("compaction phase must be visible before the slow main route")
+            .expect("run event");
+        match event {
+            AgentEvent::CompactionStarted {
+                reason: ygg_agent::CompactionReason::Threshold,
+            } => saw_start = true,
+            AgentEvent::CompactionFinished {
+                result: Ok(ref info),
+                ..
+            } => {
+                assert!(saw_start, "finish preceded start");
+                assert!(info.summary.contains("authoritative usage"));
+                saw_finish = true;
+                control.abort();
+            }
+            _ => {}
+        }
+    }
+    let events = collect(&mut run).await;
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Aborted
+    ));
+    drop(run);
+
+    let requests = wire_requests(&server).await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "normal provider request opened too early"
+    );
+    assert!(requests[0]
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(Vec::is_empty));
+    assert!(agent
+        .session()
+        .entries()
+        .iter()
+        .any(|entry| matches!(entry.value, EntryValue::Compaction { .. })));
+}
+
+#[tokio::test]
+async fn disabled_auto_compaction_allows_below_capacity_request_past_threshold() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(text_turn("auto compaction is off"))
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let session = session_with_authoritative_pressure(
+        &sessions.path().join("disabled-auto-compaction.jsonl"),
+        180_000,
+    );
+    let mut agent = build_agent_from_session(&server.uri(), workspace.path(), session, Some(1));
+    agent.set_compaction_policy(false, 0.85, 4).unwrap();
+
+    let mut run = agent.prompt("new work").await.unwrap();
+    let events = collect(&mut run).await;
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::CompactionStarted { .. } | AgentEvent::CompactionFinished { .. }
+    )));
+    drop(run);
+    assert!(agent
+        .session()
+        .entries()
+        .iter()
+        .all(|entry| !matches!(entry.value, EntryValue::Compaction { .. })));
+    let requests = wire_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| !tools.is_empty()));
 }
 
 #[tokio::test]

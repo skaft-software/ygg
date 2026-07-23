@@ -2,6 +2,7 @@
 
 pub mod composer;
 pub mod composer_surface;
+pub(crate) mod context;
 pub mod keymap;
 pub mod pickers;
 pub mod terminal;

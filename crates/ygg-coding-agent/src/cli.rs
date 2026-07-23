@@ -172,6 +172,7 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct CompactionLayer {
+    enabled: Option<bool>,
     threshold_fraction: Option<f64>,
     keep_recent_turns: Option<usize>,
     compact_model: Option<String>,
@@ -239,6 +240,9 @@ impl ConfigLayer {
         override_some!(trusted_extensions);
         match (self.compaction.as_mut(), newer.compaction) {
             (Some(current), Some(newer)) => {
+                if newer.enabled.is_some() {
+                    current.enabled = newer.enabled;
+                }
                 if newer.threshold_fraction.is_some() {
                     current.threshold_fraction = newer.threshold_fraction;
                 }
@@ -507,6 +511,7 @@ where
 
 #[cfg(not(test))]
 fn environment_layer() -> anyhow::Result<ConfigLayer> {
+    let compaction_enabled = env_parse("YGG_AUTO_COMPACT")?;
     let threshold_fraction = env_parse("YGG_COMPACTION_THRESHOLD_FRACTION")?;
     let keep_recent_turns = env_parse("YGG_COMPACTION_KEEP_RECENT_TURNS")?;
     let compact_model = env_value("YGG_COMPACT_MODEL");
@@ -535,10 +540,12 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         offline: env_parse("YGG_OFFLINE")?,
         enabled_extensions: env_value("YGG_EXTENSIONS").map(split_names),
         trusted_extensions: env_value("YGG_TRUSTED_EXTENSIONS").map(split_names),
-        compaction: (threshold_fraction.is_some()
+        compaction: (compaction_enabled.is_some()
+            || threshold_fraction.is_some()
             || keep_recent_turns.is_some()
             || compact_model.is_some())
         .then_some(CompactionLayer {
+            enabled: compaction_enabled,
             threshold_fraction,
             keep_recent_turns,
             compact_model,
@@ -692,9 +699,12 @@ fn build_config_with_global_path(
 
     let mut compaction = CompactionPolicy::default();
     if let Some(layer) = values.compaction {
+        if let Some(value) = layer.enabled {
+            compaction.enabled = value;
+        }
         if let Some(value) = layer.threshold_fraction {
-            if !(0.0..=1.0).contains(&value) {
-                anyhow::bail!("compaction.threshold_fraction must be between 0 and 1");
+            if !value.is_finite() || value <= 0.0 || value > 1.0 {
+                anyhow::bail!("compaction.threshold_fraction must be greater than 0 and at most 1");
             }
             compaction.threshold_fraction = value;
         }
@@ -1164,7 +1174,7 @@ mod tests {
     #[test]
     fn cost_and_compaction_settings_merge_from_layered_toml() {
         let global: ConfigLayer = toml::from_str(
-            "max_cost_microdollars = 100\ncost_warning_microdollars = 25\nshow_turn_cost = false\n[compaction]\ncompact_model = 'cheap'",
+            "max_cost_microdollars = 100\ncost_warning_microdollars = 25\nshow_turn_cost = false\n[compaction]\nenabled = false\ncompact_model = 'cheap'",
         )
         .unwrap();
         let project: ConfigLayer = toml::from_str(
@@ -1177,6 +1187,7 @@ mod tests {
         assert_eq!(merged.cost_warning_microdollars, Some(40));
         assert_eq!(merged.show_turn_cost, Some(true));
         let compaction = merged.compaction.unwrap();
+        assert_eq!(compaction.enabled, Some(false));
         assert_eq!(compaction.compact_model.as_deref(), Some("cheap"));
         assert_eq!(compaction.keep_recent_turns, Some(2));
     }

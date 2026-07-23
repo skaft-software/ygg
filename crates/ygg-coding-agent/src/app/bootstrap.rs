@@ -76,9 +76,11 @@ const PROVIDER_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 // without weakening the fail-fast behavior of hosted providers.
 const CUSTOM_ENDPOINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_DISCOVERY_BODY_BYTES: usize = 8 * 1024 * 1024;
-// Version 2 invalidates inventories whose llama.cpp context length was guessed
-// because older discovery ignored hlid's nested `meta.n_ctx` field.
-const CUSTOM_MODEL_CACHE_VERSION: u8 = 3;
+// Version 2 invalidated inventories whose llama.cpp context length was guessed
+// because older discovery ignored hlid's nested `meta.n_ctx` field. Version 4
+// invalidates sparse local inventories that were incorrectly cached as
+// tool-incompatible by version 3.
+const CUSTOM_MODEL_CACHE_VERSION: u8 = 4;
 const PROVIDER_INVENTORY_CACHE_VERSION: u8 = 1;
 const MAX_PROVIDER_INVENTORY_CACHE_BYTES: usize = MAX_DISCOVERY_BODY_BYTES + 1024 * 1024;
 const PROVIDER_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -519,12 +521,11 @@ fn metadata_capability_flag(value: &serde_json::Value) -> Option<bool> {
         .or_else(|| value.get("supported").and_then(serde_json::Value::as_bool))
 }
 
-/// Inventory schemas are not standardized, but the common hosted gateways
-/// expose tool support either as a capability flag or as a list of accepted
-/// request parameters. Unknown support must remain disabled: advertising a
-/// tool schema to a text-only route makes an otherwise usable model fail before
-/// it can answer.
-fn model_metadata_supports_tools(entry: &serde_json::Value) -> bool {
+/// Inventory schemas are not standardized, but the common gateways expose
+/// tool support either as a capability flag or as a list of accepted request
+/// parameters. Keep unknown distinct from an explicit false so hosted and
+/// user-configured local endpoints can apply different safe defaults.
+fn model_metadata_tool_support(entry: &serde_json::Value) -> Option<bool> {
     for metadata in [
         Some(entry),
         entry.get("top_provider"),
@@ -540,13 +541,13 @@ fn model_metadata_supports_tools(entry: &serde_json::Value) -> bool {
             "function_calling",
         ] {
             if let Some(supported) = metadata.get(name).and_then(metadata_capability_flag) {
-                return supported;
+                return Some(supported);
             }
         }
         if let Some(capabilities) = metadata.get("capabilities") {
             for name in ["tools", "tool_calling", "function_calling"] {
                 if let Some(supported) = capabilities.get(name).and_then(metadata_capability_flag) {
-                    return supported;
+                    return Some(supported);
                 }
             }
         }
@@ -554,15 +555,29 @@ fn model_metadata_supports_tools(entry: &serde_json::Value) -> bool {
             .get("supported_parameters")
             .and_then(serde_json::Value::as_array)
         {
-            return parameters.iter().any(|parameter| {
+            return Some(parameters.iter().any(|parameter| {
                 matches!(
                     parameter.as_str(),
                     Some("tools" | "tool_choice" | "functions" | "function_call")
                 )
-            });
+            }));
         }
     }
-    false
+    None
+}
+
+/// Hosted inventories must positively advertise tools. Sending schemas to an
+/// unknown text-only route can otherwise make an ordinary prompt fail before
+/// generation begins.
+fn model_metadata_supports_tools(entry: &serde_json::Value) -> bool {
+    model_metadata_tool_support(entry).unwrap_or(false)
+}
+
+/// A custom endpoint is an explicit user-selected OpenAI-compatible runtime.
+/// Preserve Ygg's historical/local default when its sparse `/models` response
+/// says nothing about tools, while still honoring every explicit false.
+fn custom_model_metadata_supports_tools(entry: &serde_json::Value) -> bool {
+    model_metadata_tool_support(entry).unwrap_or(true)
 }
 
 /// Read provider model-inventory modality metadata without assuming a single
@@ -2099,7 +2114,7 @@ fn discover_models_blocking(
             display_name: id.to_string(),
             context_window: ctx,
             max_output_tokens,
-            tools: model_metadata_supports_tools(entry),
+            tools: custom_model_metadata_supports_tools(entry),
             parallel_tool_calls: supports("parallel_tool_calls"),
             vision,
             structured_output: supports("response_format"),
@@ -3213,6 +3228,11 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     agent.set_prompt_model_source(Some(crate::tui::theme::model_lab(&model).key().to_owned()));
     agent.set_prompt_color(Some(crate::tui::theme::prompt_color_for_model(&model)));
     agent.set_compaction_model(compact_model);
+    agent.set_compaction_policy(
+        config.compaction.enabled,
+        config.compaction.threshold_fraction,
+        config.compaction.keep_recent_turns,
+    )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
 
     Ok(App {
@@ -3346,6 +3366,11 @@ pub fn rebuild_app(
     agent.set_prompt_model_source(Some(crate::tui::theme::model_lab(&model).key().to_owned()));
     agent.set_prompt_color(Some(crate::tui::theme::prompt_color_for_model(&model)));
     agent.set_compaction_model(compact_model);
+    agent.set_compaction_policy(
+        config.compaction.enabled,
+        config.compaction.threshold_fraction,
+        config.compaction.keep_recent_turns,
+    )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
 
     Ok(App {
@@ -4339,6 +4364,47 @@ mod tests {
         });
 
         assert_eq!(extract_ctx_from_model_entry(&entry), 131_072);
+    }
+
+    #[test]
+    fn sparse_custom_inventory_preserves_local_tools_but_honors_explicit_false() {
+        // This is the live hlid shape: it advertises reasoning details but no
+        // standardized tool capability field. A user-configured local OpenAI
+        // endpoint keeps the historical tool-capable default.
+        let sparse_hlid = serde_json::json!({
+            "id": "qwen3.6-27b",
+            "capabilities": {"reasoning": {
+                "supported": true,
+                "control": "binary",
+                "values": ["none", "default"],
+                "default": "default"
+            }}
+        });
+        assert_eq!(model_metadata_tool_support(&sparse_hlid), None);
+        assert!(custom_model_metadata_supports_tools(&sparse_hlid));
+        assert!(!model_metadata_supports_tools(&sparse_hlid));
+
+        let explicitly_disabled = serde_json::json!({
+            "id": "text-only",
+            "capabilities": {"tools": {"supported": false}}
+        });
+        assert_eq!(
+            model_metadata_tool_support(&explicitly_disabled),
+            Some(false)
+        );
+        assert!(!custom_model_metadata_supports_tools(&explicitly_disabled));
+
+        let explicit_parameter_list = serde_json::json!({
+            "id": "reasoning-only",
+            "supported_parameters": ["reasoning_effort"]
+        });
+        assert_eq!(
+            model_metadata_tool_support(&explicit_parameter_list),
+            Some(false)
+        );
+        assert!(!custom_model_metadata_supports_tools(
+            &explicit_parameter_list
+        ));
     }
 
     #[test]

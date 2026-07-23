@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::catalog::Model;
 use crate::error::{
-    AiError, DecodeError, HttpError, StreamProtocolError, TransportError, TransportPhase,
+    AiError, DecodeError, HttpError, ProviderError, StreamProtocolError, TransportError,
+    TransportPhase,
 };
 use crate::stream::{ResponseBuilder, ResponseStream, StreamEvent};
 use crate::types::{Protocol, Request, Response};
@@ -15,6 +16,9 @@ use crate::types::{Protocol, Request, Response};
 /// Hard cap on a buffered non-streaming response body before JSON decode
 /// (design §20). Crossing it is a [`DecodeError::BodyTooLarge`].
 const MAX_COMPLETED_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Enough of an unexpected successful-status body to decode a structured
+/// provider error without buffering an unbounded non-SSE response.
+const MAX_SUCCESS_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// Bound DNS/TCP/TLS establishment independently from a provider's header
 /// timeout. Without this, a dead route can consume the full endpoint timeout on
 /// every retry before the UI receives an error.
@@ -80,6 +84,44 @@ fn reqwest_transport_error(
         phase,
         timeout,
         message,
+    })
+}
+
+fn json_scalar_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+/// Some OpenAI-compatible servers return a JSON error envelope with HTTP 200
+/// for request-validation failures. Detect that envelope before the empty SSE
+/// stream is misreported as a missing terminal event.
+fn provider_error_from_success_body(body: &[u8]) -> Option<ProviderError> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let error = value.get("error")?;
+    let mut message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.as_str())?
+        .to_owned();
+    truncate_transport_message(&mut message, 4096);
+    let code = error.get("code").and_then(json_scalar_string);
+    let kind = error
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let request_id = value
+        .get("request_id")
+        .or_else(|| error.get("request_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Some(ProviderError {
+        code,
+        kind,
+        message,
+        request_id,
     })
 }
 
@@ -432,6 +474,8 @@ impl AiClient {
                 // error, or feed post-terminal frames into the codec. We stop the
                 // instant the codec emits `Finished`.
                 let mut terminal_seen = false;
+                let mut provider_event_seen = false;
+                let mut successful_body_prefix = Vec::new();
                 let started_at = Instant::now();
                 'read: loop {
                     let remaining = stream_deadline.saturating_sub(started_at.elapsed());
@@ -467,7 +511,19 @@ impl AiClient {
                         )
                     })?;
 
+                    if !provider_event_seen
+                        && successful_body_prefix.len() < MAX_SUCCESS_ERROR_BODY_BYTES
+                    {
+                        let remaining = MAX_SUCCESS_ERROR_BODY_BYTES - successful_body_prefix.len();
+                        successful_body_prefix
+                            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    }
+
                     let sse_events = sse_decoder.push(&chunk).map_err(AiError::Decode)?;
+                    if !sse_events.is_empty() {
+                        provider_event_seen = true;
+                        successful_body_prefix.clear();
+                    }
 
                     for sse in sse_events {
                         let stream_events = match model_clone.spec.protocol {
@@ -491,6 +547,8 @@ impl AiClient {
                 // ignored rather than decoded into post-terminal events.
                 if !terminal_seen {
                     if let Some(sse) = sse_decoder.finish().map_err(AiError::Decode)? {
+                        provider_event_seen = true;
+                        successful_body_prefix.clear();
                         let stream_events = match model_clone.spec.protocol {
                             Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder)?,
                             Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder)?,
@@ -499,6 +557,13 @@ impl AiClient {
                         for ev in stream_events {
                             yield ev;
                         }
+                    }
+                }
+                if !terminal_seen && !provider_event_seen {
+                    if let Some(error) =
+                        provider_error_from_success_body(&successful_body_prefix)
+                    {
+                        Err(AiError::Provider(error))?;
                     }
                 }
             };

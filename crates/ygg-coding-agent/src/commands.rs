@@ -24,12 +24,14 @@ pub enum Command {
     Tool(Option<String>),
     Verbose(Option<bool>),
     Compact,
+    AutoCompact(Option<AutoCompactSetting>),
     Reload,
     New,
     Resume(Option<String>),
     Tree,
     Checkout(String),
     Status,
+    Context,
     Cost,
     Cache,
     Name(Option<String>),
@@ -43,6 +45,12 @@ pub enum Command {
     /// Inspect or reload explicitly enabled executable extensions.
     Extensions(ExtensionsSubcommand),
     Unknown(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoCompactSetting {
+    Enabled(bool),
+    ThresholdPercent(u8),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +130,12 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
     ),
     slash!("compact", "/compact", "compact conversation context", false),
     slash!(
+        "auto-compact",
+        "/auto-compact [on|off|85%]",
+        "show or configure automatic compaction",
+        true
+    ),
+    slash!(
         "theme",
         "/theme [name|list|reload]",
         "select, list, or reload themes",
@@ -153,6 +167,12 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
         true
     ),
     slash!("status", "/status", "show model and diagnostics", false),
+    slash!(
+        "context",
+        "/context",
+        "show what occupies the model context",
+        false
+    ),
     slash!("cost", "/cost", "show turn and session cost", false),
     slash!("cache", "/cache", "show prompt-cache diagnostics", false),
     slash!("name", "/name [name]", "show or rename this session", true),
@@ -297,6 +317,23 @@ pub fn parse(input: &str) -> Command {
             Some(_) => Command::Unknown(input.to_owned()),
         },
         "compact" if argument.is_none() => Command::Compact,
+        "auto-compact" => match argument.as_deref() {
+            None => Command::AutoCompact(None),
+            Some("on" | "true" | "yes") => {
+                Command::AutoCompact(Some(AutoCompactSetting::Enabled(true)))
+            }
+            Some("off" | "false" | "no") => {
+                Command::AutoCompact(Some(AutoCompactSetting::Enabled(false)))
+            }
+            Some(value) => value
+                .strip_suffix('%')
+                .and_then(|percent| percent.parse::<u8>().ok())
+                .filter(|percent| (1..=100).contains(percent))
+                .map(|percent| {
+                    Command::AutoCompact(Some(AutoCompactSetting::ThresholdPercent(percent)))
+                })
+                .unwrap_or_else(|| Command::Unknown(input.to_owned())),
+        },
         "reload" if argument.is_none() => Command::Reload,
         "new" if argument.is_none() => Command::New,
         "resume" => Command::Resume(argument),
@@ -306,6 +343,7 @@ pub fn parse(input: &str) -> Command {
             None => Command::Unknown(input.to_owned()),
         },
         "status" if argument.is_none() => Command::Status,
+        "context" if argument.is_none() => Command::Context,
         "cost" if argument.is_none() => Command::Cost,
         "cache" if argument.is_none() => Command::Cache,
         "sessions" if argument.is_none() => Command::Sessions,
@@ -768,12 +806,22 @@ mod tests {
         assert_eq!(parse("/verbose on"), Command::Verbose(Some(true)));
         assert_eq!(parse("/verbose off"), Command::Verbose(Some(false)));
         assert_eq!(parse("/compact"), Command::Compact);
+        assert_eq!(parse("/auto-compact"), Command::AutoCompact(None));
+        assert_eq!(
+            parse("/auto-compact off"),
+            Command::AutoCompact(Some(AutoCompactSetting::Enabled(false)))
+        );
+        assert_eq!(
+            parse("/auto-compact 85%"),
+            Command::AutoCompact(Some(AutoCompactSetting::ThresholdPercent(85)))
+        );
         assert_eq!(parse("/reload"), Command::Reload);
         assert_eq!(parse("/new"), Command::New);
         assert_eq!(parse("/resume id"), Command::Resume(Some("id".into())));
         assert_eq!(parse("/tree"), Command::Tree);
         assert_eq!(parse("/checkout 001"), Command::Checkout("001".into()));
         assert_eq!(parse("/status"), Command::Status);
+        assert_eq!(parse("/context"), Command::Context);
         assert_eq!(parse("/cost"), Command::Cost);
         assert_eq!(parse("/cache"), Command::Cache);
         assert_eq!(parse("/prompt"), Command::Prompt(None));
@@ -829,6 +877,23 @@ mod tests {
     }
 
     #[test]
+    fn every_discovered_builtin_has_an_executable_parser_route() {
+        for command in SLASH_COMMANDS {
+            let invocation = match command.name {
+                "checkout" => "/checkout entry-id".to_owned(),
+                "name" => "/name release audit".to_owned(),
+                "export" => "/export audit.md".to_owned(),
+                name => format!("/{name}"),
+            };
+            assert!(
+                !matches!(parse(&invocation), Command::Unknown(_)),
+                "popup advertises /{} but its representative invocation {invocation:?} has no parser route",
+                command.name
+            );
+        }
+    }
+
+    #[test]
     fn parses_unambiguous_command_prefixes() {
         assert_eq!(parse("/mod"), Command::Model(None));
         assert_eq!(
@@ -846,6 +911,8 @@ mod tests {
         assert!(matches!(parse("hello"), Command::Unknown(_)));
         assert!(matches!(parse("/new extra"), Command::Unknown(_)));
         assert!(matches!(parse("/checkout"), Command::Unknown(_)));
+        assert!(matches!(parse("/auto-compact 0%"), Command::Unknown(_)));
+        assert!(matches!(parse("/auto-compact 101%"), Command::Unknown(_)));
     }
 
     fn app_for_status() -> (tempfile::TempDir, App) {

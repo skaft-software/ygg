@@ -81,7 +81,8 @@ fn base_prompt(config: &Config) -> String {
     }
 
     prompt.push_str(
-        ". Project tools may also appear.\n\nResponse:\n\
+        ". Project tools may also appear.\n\
+Tool calls execute in the CWD. Use them for file and current-state claims; never simulate, fabricate, or merely describe a call.\n\nResponse:\n\
 - Direct, terse, conclusion-first. No preamble, prompt echo, needless recap, obvious reasoning/steps.\n\
 - Prefer unambiguous fragments/symbols/equations/tables/code; only rationale needed for trust/action.\n\
 - Expand only on request or for correctness, ambiguity, safety, or debugging. Keep essential qualifications, units, constraints, uncertainty.\n\
@@ -1068,6 +1069,8 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("Project tools may also appear"));
+        assert!(prompt.contains("Tool calls execute in the CWD"));
+        assert!(prompt.contains("never simulate, fabricate, or merely describe a call"));
         assert!(prompt.contains("Direct, terse, conclusion-first"));
         assert!(prompt.contains("No preamble, prompt echo, needless recap"));
         assert!(prompt.contains("fragments/symbols/equations/tables/code"));
@@ -1079,7 +1082,7 @@ mod tests {
         let cwd = prompt_path(&nested);
         let scaffold = prompt.strip_suffix(&cwd).expect("prompt ends with CWD");
         assert!(
-            scaffold.len() <= 550,
+            scaffold.len() <= 680,
             "base prompt scaffold grew to {} bytes",
             scaffold.len()
         );

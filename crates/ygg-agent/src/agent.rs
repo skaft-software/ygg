@@ -18,7 +18,9 @@ use ygg_ai::{
 };
 
 use crate::context::{ContextSnapshot, ContextTracker};
-use crate::events::{AgentEvent, Control, FinishReason, OutputChannel};
+use crate::events::{
+    AgentEvent, CompactionInfo, CompactionReason, Control, FinishReason, OutputChannel,
+};
 use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
@@ -84,6 +86,9 @@ pub enum AgentError {
         /// Maximum input size after reserving output capacity.
         budget: u64,
     },
+    /// The configured autonomous compaction policy is invalid.
+    #[error("invalid compaction policy: {0}")]
+    InvalidCompactionPolicy(String),
     /// Internal autonomous work was cancelled before its commit point.
     #[error("operation cancelled")]
     Cancelled,
@@ -193,6 +198,9 @@ pub struct Agent {
     /// Optional provider route used for autonomous context summaries.
     /// Defaults to the active model when unset.
     compaction_model: Option<Model>,
+    auto_compaction_enabled: bool,
+    compaction_threshold_fraction: f64,
+    compaction_keep_recent_turns: usize,
     session_id: String,
     tool_scope: String,
     completion_policy: CompletionPolicy,
@@ -248,6 +256,22 @@ pub struct RunOutput {
     /// How the run ended (never [`FinishReason::Failed`]; failures are
     /// returned as `Err` instead).
     pub reason: FinishReason,
+}
+
+/// Conservative estimate of the model-visible input for the next request.
+///
+/// `structural_tokens` comes from Ygg's request serializer. When available,
+/// `provider_tokens` is the latest tokenizer measurement for the same route
+/// and model after the latest compaction, plus structurally estimated trailing
+/// messages. `input_tokens` is the larger of those two values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestContextEstimate {
+    /// Structural estimate of the complete provider request.
+    pub structural_tokens: u64,
+    /// Provider-authoritative prefix measurement reconciled to the current head.
+    pub provider_tokens: Option<u64>,
+    /// Conservative input estimate used by autonomous capacity checks.
+    pub input_tokens: u64,
 }
 
 /// A streaming agent run: the event stream plus a clonable control handle.
@@ -679,14 +703,79 @@ fn is_transient_network_failure(error: &AiError) -> bool {
 }
 
 fn looks_like_context_error(error: &AiError) -> bool {
+    // Transport timeouts often contain phrases such as "context deadline
+    // exceeded". They are connectivity failures, not evidence that model
+    // history is too large, and must never destroy full-fidelity context.
+    if matches!(error, AiError::Transport(_)) {
+        return false;
+    }
+    if matches!(error, AiError::Http(http) if http.status.as_u16() == 429)
+        || matches!(
+            error,
+            AiError::Provider(provider)
+                if provider.code.as_deref().is_some_and(|code| {
+                    let code = code.to_ascii_lowercase();
+                    code.contains("rate_limit") || code.contains("throttl")
+                }) || provider.kind.as_deref().is_some_and(|kind| {
+                    let kind = kind.to_ascii_lowercase();
+                    kind.contains("rate_limit") || kind.contains("throttl")
+                })
+        )
+    {
+        return false;
+    }
     let text = error.to_string().to_ascii_lowercase();
     [
-        "context",
+        "context window exceeded",
+        "context window exceeds",
+        "context length exceeded",
+        "context_length_exceeded",
+        "model_context_window_exceeded",
+        "maximum context length",
+        "exceeds the context window",
+        "exceeds model's maximum context length",
+        "request_too_large",
         "too many tokens",
         "token limit",
         "prompt is too long",
         "input is too long",
-        "maximum tokens",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn retryable_provider_error(error: &ygg_ai::ProviderError) -> bool {
+    if error
+        .code
+        .as_deref()
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (500..600).contains(&code))
+    {
+        return true;
+    }
+    let text = format!(
+        "{} {} {}",
+        error.code.as_deref().unwrap_or_default(),
+        error.kind.as_deref().unwrap_or_default(),
+        error.message
+    )
+    .to_ascii_lowercase();
+    [
+        "rate_limit",
+        "rate limit",
+        "throttl",
+        "overload",
+        "temporarily_unavailable",
+        "temporarily unavailable",
+        "service_unavailable",
+        "service unavailable",
+        "server_error",
+        "server error",
+        "internal_error",
+        "internal error",
+        "timed out",
+        "timeout",
+        "try again",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -699,7 +788,7 @@ fn retryable_stream_start(error: &AiError) -> bool {
             AiError::Transport(transport)
                 if !transport.timeout && transport.phase == ygg_ai::TransportPhase::Body
         )
-        || matches!(error, AiError::Provider(_))
+        || matches!(error, AiError::Provider(provider) if retryable_provider_error(provider))
         || matches!(
             error,
             AiError::StreamProtocol(
@@ -1034,7 +1123,100 @@ fn estimate_request_tokens(system: &str, messages: &[Message], tools: &[ToolDef]
         .saturating_add(64)
 }
 
-const PROACTIVE_COMPACTION_FREE_TOKENS: u64 = 8_000;
+fn estimate_messages_tokens(messages: &[Message]) -> u64 {
+    let mut bytes = CountingWriter::default();
+    if serde_json::to_writer(&mut bytes, messages).is_err() {
+        return 64;
+    }
+    let (inline_payload_bytes, semantic_tokens) = request_media_adjustment(messages);
+    bytes
+        .0
+        .saturating_sub(inline_payload_bytes)
+        .div_ceil(4)
+        .saturating_add(semantic_tokens)
+        .saturating_add(16)
+}
+
+fn usage_context_tokens(usage: &Usage) -> u64 {
+    if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        usage
+            .input_tokens
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens)
+            .saturating_add(usage.output_tokens)
+    }
+}
+
+/// Provider usage is the best available tokenizer measurement of the prefix
+/// through its assistant response. Add structural estimates only for messages
+/// persisted after that response. Usage from before the latest compaction or
+/// from a different route/model is stale and must not retrigger compaction.
+fn provider_context_estimate(session: &Session, model: &Model) -> Option<u64> {
+    let branch = active_branch_entries(session);
+    let boundary = branch
+        .iter()
+        .rposition(|entry| matches!(entry.value, EntryValue::Compaction { .. }))
+        .map_or(0, |index| index.saturating_add(1));
+
+    for (index, entry) in branch.iter().enumerate().skip(boundary).rev() {
+        if !matches!(entry.value, EntryValue::Message(Message::Assistant(_))) {
+            continue;
+        }
+        let Some(record) = session.usage_records().iter().rev().find(|record| {
+            matches!(
+                &record.kind,
+                crate::session::UsageRecordKind::AssistantTurn { assistant }
+                    if assistant == &entry.id
+            ) && record.endpoint.as_ref() == Some(&model.endpoint.id)
+                && record.model.as_ref() == Some(&model.spec.id)
+                && usage_context_tokens(&record.usage) > 0
+        }) else {
+            continue;
+        };
+        let trailing = branch[index.saturating_add(1)..]
+            .iter()
+            .filter_map(|entry| match &entry.value {
+                EntryValue::Message(message) => Some(message),
+                _ => None,
+            })
+            .fold(0u64, |total, message| {
+                total.saturating_add(estimate_messages_tokens(std::slice::from_ref(message)))
+            });
+        return Some(usage_context_tokens(&record.usage).saturating_add(trailing));
+    }
+    None
+}
+
+fn estimate_context_tokens(
+    session: &Session,
+    model: &Model,
+    system: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+) -> u64 {
+    reconcile_context_estimate(session, model, system, messages, tools).input_tokens
+}
+
+fn reconcile_context_estimate(
+    session: &Session,
+    model: &Model,
+    system: &str,
+    messages: &[Message],
+    tools: &[ToolDef],
+) -> RequestContextEstimate {
+    let structural_tokens = estimate_request_tokens(system, messages, tools);
+    let provider_tokens = provider_context_estimate(session, model);
+    let input_tokens = provider_tokens.map_or(structural_tokens, |provider| {
+        structural_tokens.max(provider)
+    });
+    RequestContextEstimate {
+        structural_tokens,
+        provider_tokens,
+        input_tokens,
+    }
+}
 
 fn worst_case_request_cost(model: &Model, input_tokens: u64, output_tokens: u64) -> Option<u64> {
     let pricing = model.spec.pricing.as_ref()?;
@@ -1124,6 +1306,10 @@ struct CompactionContext<'a> {
     session_id: &'a str,
     max_session_cost_microdollars: Option<u64>,
     abort: &'a AbortFlag,
+    enabled: bool,
+    threshold_fraction: f64,
+    keep_recent_turns: usize,
+    events: &'a mpsc::UnboundedSender<AgentEvent>,
 }
 
 struct CapacityEstimate {
@@ -1144,6 +1330,10 @@ impl<'a> CompactionContext<'a> {
         session_id: &'a str,
         max_session_cost_microdollars: Option<u64>,
         abort: &'a AbortFlag,
+        enabled: bool,
+        threshold_fraction: f64,
+        keep_recent_turns: usize,
+        events: &'a mpsc::UnboundedSender<AgentEvent>,
     ) -> Self {
         Self {
             client,
@@ -1156,6 +1346,10 @@ impl<'a> CompactionContext<'a> {
             session_id,
             max_session_cost_microdollars,
             abort,
+            enabled,
+            threshold_fraction,
+            keep_recent_turns,
+            events,
         }
     }
 
@@ -1194,6 +1388,18 @@ impl<'a> CompactionContext<'a> {
             &request.messages,
             &request.tools,
         );
+        let input_budget = self
+            .compaction_model
+            .spec
+            .limits
+            .context_window
+            .saturating_sub(request.max_output_tokens.unwrap_or(output_tokens));
+        if input_tokens > input_budget {
+            return Err(AgentError::ContextExceeded {
+                estimate: input_tokens,
+                budget: input_budget,
+            });
+        }
         reserve_request_cost(
             self.session,
             self.compaction_model,
@@ -1245,23 +1451,84 @@ impl<'a> CompactionContext<'a> {
         .await
     }
 
-    async fn compact_one_boundary(&mut self, boundary_index: usize) -> Result<bool, AgentError> {
+    fn preferred_boundary(&self) -> Option<EntryId> {
         let starts = turn_starts(self.session);
-        let Some(first_kept) = starts.get(boundary_index).cloned() else {
-            return Ok(false);
-        };
+        (starts.len() > self.keep_recent_turns)
+            .then(|| starts[starts.len() - self.keep_recent_turns].clone())
+    }
+
+    fn oldest_reducible_boundary(&self) -> Option<EntryId> {
+        turn_starts(self.session).get(1).cloned()
+    }
+
+    async fn compact_boundary(
+        &mut self,
+        first_kept: EntryId,
+        reason: CompactionReason,
+    ) -> Result<CompactionInfo, AgentError> {
+        let _ = self.events.send(AgentEvent::CompactionStarted { reason });
         let before = self.session.context_before(&first_kept)?;
         if before.is_empty() {
-            return Ok(false);
+            let error = AgentError::ContextExceeded {
+                estimate: 0,
+                budget: self
+                    .model
+                    .spec
+                    .limits
+                    .context_window
+                    .saturating_sub(self.model.spec.limits.max_output_tokens),
+            };
+            let _ = self.events.send(AgentEvent::CompactionFinished {
+                reason,
+                result: Err(error.to_string()),
+            });
+            return Err(error);
         }
-        let Some(summary) = self.summarize(&before).await? else {
-            return Ok(false);
+        let summary = match self.summarize(&before).await {
+            Ok(Some(summary)) => summary,
+            Ok(None) => {
+                let error = AgentError::IncompleteResponse {
+                    stop_reason: "compaction summary did not finish normally".to_owned(),
+                };
+                let _ = self.events.send(AgentEvent::CompactionFinished {
+                    reason,
+                    result: Err(error.to_string()),
+                });
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = self.events.send(AgentEvent::CompactionFinished {
+                    reason,
+                    result: Err(error.to_string()),
+                });
+                return Err(error);
+            }
         };
         if self.abort.is_set() {
-            return Err(AgentError::Cancelled);
+            let error = AgentError::Cancelled;
+            let _ = self.events.send(AgentEvent::CompactionFinished {
+                reason,
+                result: Err(error.to_string()),
+            });
+            return Err(error);
         }
-        self.session.compact(summary, first_kept)?;
-        Ok(true)
+        if let Err(error) = self.session.compact(summary.clone(), first_kept.clone()) {
+            let error = AgentError::Session(error);
+            let _ = self.events.send(AgentEvent::CompactionFinished {
+                reason,
+                result: Err(error.to_string()),
+            });
+            return Err(error);
+        }
+        let info = CompactionInfo {
+            summary,
+            first_kept,
+        };
+        let _ = self.events.send(AgentEvent::CompactionFinished {
+            reason,
+            result: Ok(info.clone()),
+        });
+        Ok(info)
     }
 
     async fn ensure_capacity(
@@ -1276,26 +1543,38 @@ impl<'a> CompactionContext<'a> {
             .limits
             .context_window
             .saturating_sub(max_output_tokens);
-        // Do not wait for a provider-side context error when fewer than 8K
-        // input tokens remain. A small model gets the smaller of the configured
-        // reserve and its whole input budget.
-        let proactive_free_tokens = PROACTIVE_COMPACTION_FREE_TOKENS.min(budget);
+        let threshold = ((self.model.spec.limits.context_window as f64) * self.threshold_fraction)
+            .floor() as u64;
         loop {
             let active_system = active_system_prompt(system, self.session);
             let estimate = {
                 let messages = self.session.context_ref()?;
-                estimate_request_tokens(&active_system, &messages, tools)
+                estimate_context_tokens(self.session, self.model, &active_system, &messages, tools)
             };
-            let free_tokens = budget.saturating_sub(estimate);
-            if estimate <= budget && free_tokens >= proactive_free_tokens {
+            let over_capacity = estimate > budget;
+            let over_threshold = estimate.saturating_add(max_output_tokens) > threshold;
+            if !over_capacity && (!self.enabled || !over_threshold) {
                 return Ok(CapacityEstimate {
                     input_tokens: estimate,
                     active_system,
                 });
             }
-            // Boundary 0 is already the oldest full-fidelity episode. Recompute
-            // starts after every compaction and drop one more episode.
-            if self.compact_one_boundary(1).await? {
+            if !self.enabled {
+                return Err(AgentError::ContextExceeded { estimate, budget });
+            }
+            // `keep_recent_turns` is a preference, not permission to sail past
+            // the configured threshold. If the retained episodes themselves
+            // are unusually large, compact the oldest reducible episode.
+            let boundary = self
+                .preferred_boundary()
+                .or_else(|| self.oldest_reducible_boundary());
+            if let Some(first_kept) = boundary {
+                let reason = if over_capacity {
+                    CompactionReason::Overflow
+                } else {
+                    CompactionReason::Threshold
+                };
+                self.compact_boundary(first_kept, reason).await?;
                 continue;
             }
             if estimate <= budget {
@@ -1314,13 +1593,22 @@ impl<'a> CompactionContext<'a> {
         tools: &[ToolDef],
         max_output_tokens: u64,
     ) -> Result<(), AgentError> {
-        if self.compact_one_boundary(1).await? {
+        let boundary = self
+            .enabled
+            .then(|| {
+                self.preferred_boundary()
+                    .or_else(|| self.oldest_reducible_boundary())
+            })
+            .flatten();
+        if let Some(first_kept) = boundary {
+            self.compact_boundary(first_kept, CompactionReason::Overflow)
+                .await?;
             return Ok(());
         }
         let estimate = {
             let messages = self.session.context_ref()?;
             let active_system = active_system_prompt(system, self.session);
-            estimate_request_tokens(&active_system, &messages, tools)
+            estimate_context_tokens(self.session, self.model, &active_system, &messages, tools)
         };
         let budget = self
             .model
@@ -1378,6 +1666,9 @@ impl Agent {
             reasoning: config.reasoning,
             cache_retention: config.cache_retention,
             compaction_model: None,
+            auto_compaction_enabled: true,
+            compaction_threshold_fraction: 0.85,
+            compaction_keep_recent_turns: 4,
             session_id,
             tool_scope,
             completion_policy: CompletionPolicy::Natural,
@@ -1472,6 +1763,64 @@ impl Agent {
     /// Read-only access to the autonomous compaction model, if overridden.
     pub fn compaction_model(&self) -> Option<&Model> {
         self.compaction_model.as_ref()
+    }
+
+    /// Configure autonomous context compaction for subsequent runs.
+    ///
+    /// `threshold_fraction` is the fraction of the complete model context
+    /// window reserved by current input plus the requested output allowance.
+    /// `keep_recent_turns` is a preference: when those turns alone exceed the
+    /// configured threshold or capacity, recovery compacts the oldest episode.
+    pub fn set_compaction_policy(
+        &mut self,
+        enabled: bool,
+        threshold_fraction: f64,
+        keep_recent_turns: usize,
+    ) -> Result<(), AgentError> {
+        if !threshold_fraction.is_finite() || threshold_fraction <= 0.0 || threshold_fraction > 1.0
+        {
+            return Err(AgentError::InvalidCompactionPolicy(
+                "threshold fraction must be finite and between 0 and 1".to_owned(),
+            ));
+        }
+        if keep_recent_turns == 0 {
+            return Err(AgentError::InvalidCompactionPolicy(
+                "keep_recent_turns must be at least 1".to_owned(),
+            ));
+        }
+        self.auto_compaction_enabled = enabled;
+        self.compaction_threshold_fraction = threshold_fraction;
+        self.compaction_keep_recent_turns = keep_recent_turns;
+        Ok(())
+    }
+
+    /// Current autonomous compaction policy `(enabled, threshold, keep)`.
+    pub fn compaction_policy(&self) -> (bool, f64, usize) {
+        (
+            self.auto_compaction_enabled,
+            self.compaction_threshold_fraction,
+            self.compaction_keep_recent_turns,
+        )
+    }
+
+    /// Output-token reservation applied to each normal provider request.
+    pub fn max_output_tokens(&self) -> u64 {
+        self.max_output_tokens
+    }
+
+    /// Estimate the next request using the same provider-reconciled baseline
+    /// as autonomous capacity checks, without mutating the session.
+    pub fn request_context_estimate(&self) -> Result<RequestContextEstimate, SessionError> {
+        let messages = self.session.context_ref()?;
+        let system = active_system_prompt(&self.system, &self.session);
+        let tools = self.extensions.tool_definitions();
+        Ok(reconcile_context_estimate(
+            &self.session,
+            &self.model,
+            &system,
+            &messages,
+            &tools,
+        ))
     }
 
     /// Mutable access to the session for history operations between runs
@@ -1647,6 +1996,9 @@ impl Agent {
         let completion_policy = self.completion_policy;
         let max_output_tokens = self.max_output_tokens;
         let max_session_cost_microdollars = self.max_session_cost_microdollars;
+        let auto_compaction_enabled = self.auto_compaction_enabled;
+        let compaction_threshold_fraction = self.compaction_threshold_fraction;
+        let compaction_keep_recent_turns = self.compaction_keep_recent_turns;
         let stream_lifecycle = lifecycle.clone();
         let session = &mut self.session;
 
@@ -1751,6 +2103,8 @@ impl Agent {
                 // This gate is inside the autonomous loop, after every tool
                 // result, and uses the exact active tool schema set. Internal
                 // confirmation turns deliberately expose no tools.
+                let (compaction_event_tx, mut compaction_event_rx) =
+                    mpsc::unbounded_channel::<AgentEvent>();
                 let capacity = {
                     let mut compaction = CompactionContext::new(
                         &client,
@@ -1763,10 +2117,29 @@ impl Agent {
                         &session_id,
                         max_session_cost_microdollars,
                         &abort,
+                        auto_compaction_enabled,
+                        compaction_threshold_fraction,
+                        compaction_keep_recent_turns,
+                        &compaction_event_tx,
                     );
-                    compaction
-                        .ensure_capacity(&system, &request_tool_defs, max_output_tokens)
-                        .await
+                    let operation = compaction
+                        .ensure_capacity(&system, &request_tool_defs, max_output_tokens);
+                    tokio::pin!(operation);
+                    let result = loop {
+                        tokio::select! {
+                            biased;
+                            Some(event) = compaction_event_rx.recv() => {
+                                notify_observers(&observers, &event);
+                                yield event;
+                            }
+                            result = &mut operation => break result,
+                        }
+                    };
+                    while let Ok(event) = compaction_event_rx.try_recv() {
+                        notify_observers(&observers, &event);
+                        yield event;
+                    }
+                    result
                 };
                 let capacity = match capacity {
                     Ok(capacity) => capacity,
@@ -1869,10 +2242,32 @@ impl Agent {
                                 &session_id,
                                 max_session_cost_microdollars,
                                 &abort,
+                                auto_compaction_enabled,
+                                compaction_threshold_fraction,
+                                compaction_keep_recent_turns,
+                                &compaction_event_tx,
                             );
-                            compaction
-                                .force_one_boundary(&system, &request_tool_defs, max_output_tokens)
-                                .await
+                            let operation = compaction.force_one_boundary(
+                                &system,
+                                &request_tool_defs,
+                                max_output_tokens,
+                            );
+                            tokio::pin!(operation);
+                            let result = loop {
+                                tokio::select! {
+                                    biased;
+                                    Some(event) = compaction_event_rx.recv() => {
+                                        notify_observers(&observers, &event);
+                                        yield event;
+                                    }
+                                    result = &mut operation => break result,
+                                }
+                            };
+                            while let Ok(event) = compaction_event_rx.try_recv() {
+                                notify_observers(&observers, &event);
+                                yield event;
+                            }
+                            result
                         };
                         if let Err(compaction_error) = compacted {
                             break 'run if matches!(&compaction_error, AgentError::Cancelled) {
@@ -1974,14 +2369,32 @@ impl Agent {
                                         &session_id,
                                         max_session_cost_microdollars,
                                         &abort,
+                                        auto_compaction_enabled,
+                                        compaction_threshold_fraction,
+                                        compaction_keep_recent_turns,
+                                        &compaction_event_tx,
                                     );
-                                    compaction
-                                        .force_one_boundary(
-                                            &system,
-                                            &request_tool_defs,
-                                            max_output_tokens,
-                                        )
-                                        .await
+                                    let operation = compaction.force_one_boundary(
+                                        &system,
+                                        &request_tool_defs,
+                                        max_output_tokens,
+                                    );
+                                    tokio::pin!(operation);
+                                    let result = loop {
+                                        tokio::select! {
+                                            biased;
+                                            Some(event) = compaction_event_rx.recv() => {
+                                                notify_observers(&observers, &event);
+                                                yield event;
+                                            }
+                                            result = &mut operation => break result,
+                                        }
+                                    };
+                                    while let Ok(event) = compaction_event_rx.try_recv() {
+                                        notify_observers(&observers, &event);
+                                        yield event;
+                                    }
+                                    result
                                 };
                                 match compacted {
                                     Ok(()) => continue 'run,
@@ -2082,6 +2495,11 @@ impl Agent {
                     Ok(r) => r,
                     Err(reason) => break 'run reason,
                 };
+                // Context-recovery attempts are scoped to one logical provider
+                // turn. A successful response proves the current compacted
+                // prefix is accepted and restores the recovery budget for a
+                // later autonomous turn in the same run.
+                context_retries = 0;
                 // Max-turns counts completed provider turns. Context rejection
                 // and transport recovery happen within the same logical turn
                 // and must not consume the autonomous work budget.
@@ -2602,7 +3020,9 @@ impl Agent {
                     text: delta,
                 } => text.push_str(&delta),
                 AgentEvent::ProviderRetry { .. } => text.truncate(committed_text_len),
-                AgentEvent::SteeringDelivered { .. } => {}
+                AgentEvent::SteeringDelivered { .. }
+                | AgentEvent::CompactionStarted { .. }
+                | AgentEvent::CompactionFinished { .. } => {}
                 AgentEvent::TurnFinished {
                     usage: total,
                     run_cost_microdollars: cost,
@@ -2689,6 +3109,90 @@ mod tests {
     }
 
     #[test]
+    fn context_deadline_and_throttling_are_not_misclassified_as_overflow() {
+        let deadline = AiError::Transport(ygg_ai::TransportError {
+            phase: ygg_ai::TransportPhase::Body,
+            timeout: true,
+            message: "context deadline exceeded".into(),
+        });
+        assert!(!looks_like_context_error(&deadline));
+
+        let throttled = AiError::Provider(ygg_ai::ProviderError {
+            code: Some("rate_limit_exceeded".into()),
+            kind: Some("throttled".into()),
+            message: "context window exceeded in shared capacity".into(),
+            request_id: None,
+        });
+        assert!(!looks_like_context_error(&throttled));
+    }
+
+    #[test]
+    fn provider_validation_errors_do_not_retry_but_transient_failures_do() {
+        let validation = AiError::Provider(ygg_ai::ProviderError {
+            code: Some("400".into()),
+            kind: Some("Bad Request".into()),
+            message: "reasoning_effort is invalid".into(),
+            request_id: None,
+        });
+        assert!(!retryable_stream_start(&validation));
+
+        for transient in [
+            ygg_ai::ProviderError {
+                code: Some("503".into()),
+                kind: Some("server_error".into()),
+                message: "temporarily unavailable".into(),
+                request_id: None,
+            },
+            ygg_ai::ProviderError {
+                code: Some("rate_limit_exceeded".into()),
+                kind: Some("overloaded".into()),
+                message: "try again".into(),
+                request_id: None,
+            },
+        ] {
+            assert!(retryable_stream_start(&AiError::Provider(transient)));
+        }
+    }
+
+    #[test]
+    fn provider_context_limit_variants_are_classified_as_overflow() {
+        for message in [
+            "model_context_window_exceeded",
+            "prompt is too long",
+            "request_too_large",
+            "context window exceeds limit",
+        ] {
+            let error = AiError::Provider(ygg_ai::ProviderError {
+                code: None,
+                kind: None,
+                message: message.into(),
+                request_id: None,
+            });
+            assert!(looks_like_context_error(&error), "{message}");
+        }
+
+        let request_too_large = AiError::Http(ygg_ai::HttpError {
+            status: "413".parse().unwrap(),
+            request_id: None,
+            retry_after: None,
+            provider_code: Some("request_too_large".into()),
+            body_snippet: Some("request exceeds the context window".into()),
+            retryable: false,
+        });
+        assert!(looks_like_context_error(&request_too_large));
+
+        let media_too_large = AiError::Http(ygg_ai::HttpError {
+            status: "413".parse().unwrap(),
+            request_id: None,
+            retry_after: None,
+            provider_code: Some("image_too_large".into()),
+            body_snippet: Some("uploaded image payload exceeds 20 MB".into()),
+            retryable: false,
+        });
+        assert!(!looks_like_context_error(&media_too_large));
+    }
+
+    #[test]
     fn non_timeout_network_failure_gets_five_retries_and_friendly_failure() {
         let error = AiError::Transport(ygg_ai::TransportError {
             phase: ygg_ai::TransportPhase::ConnectOrHeaders,
@@ -2719,6 +3223,101 @@ mod tests {
             estimate < 10_000,
             "inline image bytes were miscounted as text tokens: {estimate}"
         );
+    }
+
+    #[test]
+    fn provider_usage_baseline_skips_newer_unusable_records_and_counts_trailing_messages() {
+        use ygg_ai::{AssistantMessage, AssistantPart, ModelCatalog, ModelId, Protocol};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        let model = ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        session
+            .append(user_message(UserInput::from("old prompt")))
+            .unwrap();
+        let measured = session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("old response".into())],
+                model: model.spec.id.clone(),
+                protocol: Protocol::OpenAiChat,
+            })))
+            .unwrap();
+        session
+            .record_assistant_usage(
+                measured,
+                model.endpoint.id.clone(),
+                model.spec.id.clone(),
+                Usage {
+                    input_tokens: 79_000,
+                    output_tokens: 1_000,
+                    total_tokens: 80_000,
+                    ..Usage::default()
+                },
+                None,
+            )
+            .unwrap();
+        session
+            .append(user_message(UserInput::from("x".repeat(4_000))))
+            .unwrap();
+        let unmeasured = session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("new response".into())],
+                model: model.spec.id.clone(),
+                protocol: Protocol::OpenAiChat,
+            })))
+            .unwrap();
+        session
+            .record_assistant_usage(
+                unmeasured,
+                model.endpoint.id.clone(),
+                ModelId("different-model".into()),
+                Usage::default(),
+                None,
+            )
+            .unwrap();
+
+        let estimate = provider_context_estimate(&session, &model).unwrap();
+        assert!(estimate > 81_000, "{estimate}");
+    }
+
+    #[test]
+    fn provider_usage_before_latest_compaction_is_not_reused() {
+        use ygg_ai::{AssistantMessage, AssistantPart, ModelCatalog, ModelId, Protocol};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        let model = ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        session
+            .append(user_message(UserInput::from("old prompt")))
+            .unwrap();
+        let assistant = session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("old response".into())],
+                model: model.spec.id.clone(),
+                protocol: Protocol::OpenAiChat,
+            })))
+            .unwrap();
+        session
+            .record_assistant_usage(
+                assistant.clone(),
+                model.endpoint.id.clone(),
+                model.spec.id.clone(),
+                Usage {
+                    total_tokens: 100_000,
+                    ..Usage::default()
+                },
+                None,
+            )
+            .unwrap();
+        session.compact("short summary", assistant).unwrap();
+
+        assert_eq!(provider_context_estimate(&session, &model), None);
     }
 
     #[test]

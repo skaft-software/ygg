@@ -428,9 +428,22 @@ pub async fn attempt_compaction(app: &mut App) -> anyhow::Result<CompactionOutco
     let estimated_input = estimate_text_tokens(COMPACTION_SYSTEM)
         .saturating_add(estimate_messages_tokens(&messages))
         .saturating_add(FRAMING_OVERHEAD_TOKENS);
-    if let Err(error) = app
-        .agent
-        .ensure_request_cost_capacity(&model, estimated_input, 4096)
+    let summary_output_tokens = model.spec.limits.max_output_tokens.clamp(1, 4096);
+    let input_budget = model
+        .spec
+        .limits
+        .context_window
+        .saturating_sub(summary_output_tokens);
+    if estimated_input > input_budget {
+        return Ok(CompactionOutcome::Skipped {
+            reason: format!(
+                "compaction input exceeds summary model capacity ({estimated_input} > {input_budget} tokens)"
+            ),
+        });
+    }
+    if let Err(error) =
+        app.agent
+            .ensure_request_cost_capacity(&model, estimated_input, summary_output_tokens)
     {
         return Ok(CompactionOutcome::Skipped {
             reason: error.to_string(),
@@ -463,7 +476,7 @@ pub async fn attempt_compaction(app: &mut App) -> anyhow::Result<CompactionOutco
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ygg_ai::{
         AssistantMessage, Media, ModelId, Protocol, ToolCall, ToolCallId, ToolResult,
@@ -619,7 +632,7 @@ mod tests {
         }
     }
 
-    fn app_for_estimate() -> (tempfile::TempDir, App) {
+    pub(crate) fn app_for_estimate() -> (tempfile::TempDir, App) {
         let directory = tempfile::tempdir().unwrap();
         let config = Config {
             workspace: directory.path().to_owned(),

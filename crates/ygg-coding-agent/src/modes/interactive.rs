@@ -119,6 +119,8 @@ pub enum PendingIdleAction {
     NewSession,
     ResumeSession(Option<String>),
     Compact,
+    AutoCompact(Option<commands::AutoCompactSetting>),
+    ShowContext,
     ReloadResources,
     ShowTree,
     CheckoutEntry(String),
@@ -338,6 +340,8 @@ fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> a
         Command::New => PendingIdleAction::NewSession,
         Command::Resume(id) => PendingIdleAction::ResumeSession(id),
         Command::Compact => PendingIdleAction::Compact,
+        Command::AutoCompact(setting) => PendingIdleAction::AutoCompact(setting),
+        Command::Context => PendingIdleAction::ShowContext,
         Command::Reload => PendingIdleAction::ReloadResources,
         Command::Tree => PendingIdleAction::ShowTree,
         Command::Checkout(id) => PendingIdleAction::CheckoutEntry(id),
@@ -772,6 +776,7 @@ where
         .ok_or_else(|| anyhow::anyhow!("cannot drive a run without presentation state"))?;
     let mut intents = VecDeque::<ControlIntent>::new();
     let mut in_flight: Option<ControlFuture> = None;
+    let mut aborting = false;
     let mut input_open = true;
     let mut scroll_dirty = false;
     let mut last_run_cost = 0u64;
@@ -781,7 +786,7 @@ where
         std::collections::HashMap::<ToolCallId, (String, serde_json::Value)>::new();
 
     loop {
-        if in_flight.is_none() {
+        if !aborting && in_flight.is_none() {
             if let Some(intent) = intents.pop_front() {
                 let control = control.clone();
                 in_flight = Some(Box::pin(async move {
@@ -835,6 +840,9 @@ where
                         // cannot starve the Agent's terminal RunFinished event.
                         input_open = false;
                         control.abort();
+                        aborting = true;
+                        intents.clear();
+                        in_flight = None;
                         shell.set_run_preparing(run_id, "cancelling");
                         shell.render();
                         *quit_requested = true;
@@ -898,15 +906,23 @@ where
                     }
                     InputAction::Abort => {
                         control.abort();
-                        shell.restore_queued_steering();
+                        // A steer send can be waiting for acknowledgement or
+                        // still be only a local intent. Stop dispatching both,
+                        // then let SteeringDelivered/RunFinished settle which
+                        // entries became durable before restoring the rest.
+                        aborting = true;
+                        intents.clear();
+                        in_flight = None;
                         shell.set_run_preparing(run_id, "cancelling");
                         shell.render();
                     }
                     InputAction::Steer(_) => {
-                        let composed = shell.drain_composed();
-                        if !composed.is_empty() {
-                            shell.queue_steering(&composed);
-                            intents.push_back(ControlIntent::Steer(composed.into_user_input()));
+                        if !aborting {
+                            let composed = shell.drain_composed();
+                            if !composed.is_empty() {
+                                shell.queue_steering(&composed);
+                                intents.push_back(ControlIntent::Steer(composed.into_user_input()));
+                            }
                         }
                         shell.render();
                     }
@@ -922,6 +938,9 @@ where
                         );
                         if was_quit {
                             control.abort();
+                            aborting = true;
+                            intents.clear();
+                            in_flight = None;
                             shell.set_run_preparing(run_id, "cancelling");
                             shell.render();
                         }
@@ -989,7 +1008,9 @@ where
                     InputAction::Closed => {
                         input_open = false;
                         control.abort();
-                        shell.restore_queued_steering();
+                        aborting = true;
+                        intents.clear();
+                        in_flight = None;
                         shell.set_run_preparing(run_id, "cancelling");
                         shell.render();
                         *quit_requested = true;
@@ -1105,15 +1126,24 @@ where
                                     crate::commands::format_microdollars_cents(limit)
                                 ));
                                 control.abort();
+                                aborting = true;
+                                intents.clear();
+                                in_flight = None;
                             }
                         }
+                    }
+                    let run_finished = matches!(&event, AgentEvent::RunFinished { .. });
+                    if run_finished {
+                        // The renderer is asynchronous and coalesces requests.
+                        // Restore any steer that lost the final delivery race
+                        // before requesting the terminal frame, so idle chrome,
+                        // the terminal outcome, and the editor are one atomic
+                        // presentation state.
+                        shell.restore_queued_steering();
                     }
                     shell.render();
                     if let AgentEvent::RunFinished { reason, .. } = event {
                         let ended = RunEnded::from(reason);
-                        // A control send can race the final stream event. Do not
-                        // leave undelivered steering stranded above an idle prompt.
-                        shell.restore_queued_steering();
                         return Ok(ended);
                     }
                 }
@@ -1240,12 +1270,55 @@ fn report_compaction(shell: &mut InteractiveShell, outcome: &CompactionOutcome, 
                     format!("{prompt_tokens} input tokens summarized · {cost} compaction cost")
                 },
             );
-            shell.compaction_marker(format!("Context compacted · {detail} · ctrl+o to view"));
+            let summary = session
+                .head()
+                .and_then(|head| session.entry(&head))
+                .and_then(|entry| match &entry.value {
+                    ygg_agent::EntryValue::Compaction { summary, .. } => Some(summary.clone()),
+                    _ => None,
+                });
+            if let Some(summary) = summary {
+                shell.compaction_marker(format!("Context compacted · {detail}"), summary);
+            } else {
+                shell.error("compaction completed without a durable summary marker".to_owned());
+            }
         }
         CompactionOutcome::Skipped { reason } => {
             shell.notice(format!("compaction skipped: {reason}"))
         }
     }
+}
+
+fn configure_auto_compaction(
+    app: &mut App,
+    shell: &mut InteractiveShell,
+    setting: Option<commands::AutoCompactSetting>,
+) -> anyhow::Result<()> {
+    match setting {
+        Some(commands::AutoCompactSetting::Enabled(enabled)) => {
+            app.config.compaction.enabled = enabled;
+        }
+        Some(commands::AutoCompactSetting::ThresholdPercent(percent)) => {
+            app.config.compaction.threshold_fraction = f64::from(percent) / 100.0;
+        }
+        None => {}
+    }
+    app.agent.set_compaction_policy(
+        app.config.compaction.enabled,
+        app.config.compaction.threshold_fraction,
+        app.config.compaction.keep_recent_turns,
+    )?;
+    shell.notice(format!(
+        "auto-compaction {} at {:.0}% · keep {} recent turns · this process",
+        if app.config.compaction.enabled {
+            "on"
+        } else {
+            "off"
+        },
+        app.config.compaction.threshold_fraction * 100.0,
+        app.config.compaction.keep_recent_turns,
+    ));
+    Ok(())
 }
 
 async fn reload_resources(
@@ -1452,6 +1525,13 @@ async fn apply_pending_actions(
                 report_compaction(shell, &outcome, app.agent.session());
                 update_status(shell, &app);
                 shell.set_run_label("idle");
+            }
+            PendingIdleAction::AutoCompact(setting) => {
+                configure_auto_compaction(&mut app, shell, setting)?;
+                update_status(shell, &app);
+            }
+            PendingIdleAction::ShowContext => {
+                shell.show_context_report(crate::tui::context::ContextReport::capture(&app, &[]));
             }
             PendingIdleAction::ReloadResources => {
                 app = reload_resources(app, shell, input).await?;
@@ -1748,6 +1828,9 @@ async fn run_idle_command(
         Command::Status => {
             shell.show_status_text_with_telemetry(commands::status_text(&app, None));
         }
+        Command::Context => {
+            shell.show_context_report(crate::tui::context::ContextReport::capture(&app, &[]));
+        }
         Command::Cost => {
             shell.show_overlay_text(commands::cost_text(app.agent.session(), &app.model))
         }
@@ -2005,6 +2088,10 @@ async fn run_idle_command(
                 update_status(shell, &app);
                 shell.set_run_label("idle");
             }
+        }
+        Command::AutoCompact(setting) => {
+            configure_auto_compaction(&mut app, shell, setting)?;
+            update_status(shell, &app);
         }
         Command::Reload => {
             app = reload_resources(app, shell, input).await?;
@@ -2637,6 +2724,11 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 shell.invalidate_file_index();
                 update_status(&mut shell, &app);
                 request_extension_ui(&mut shell, &mut app);
+                // `drive_active_run` settles the semantic outcome, while these
+                // idle-boundary refreshes settle the final composer/footer.
+                // Always publish that complete frame even when no queued idle
+                // action follows to trigger another render.
+                shell.render();
                 if quit_requested {
                     shutdown_for_exit(&mut app).await;
                     break;
@@ -2953,7 +3045,9 @@ mod tests {
         }
     }
 
-    async fn scripted_agent() -> (wiremock::MockServer, tempfile::TempDir, ygg_agent::Agent) {
+    async fn scripted_agent_with_delay(
+        response_delay: Duration,
+    ) -> (wiremock::MockServer, tempfile::TempDir, ygg_agent::Agent) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         use ygg_agent::{Agent, AgentConfig, CoreTools, ExtensionHost, SandboxConfig, Session};
@@ -2964,6 +3058,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
+                    .set_delay(response_delay)
                     .set_body_string(text_turn()),
             )
             .mount(&server)
@@ -2990,6 +3085,10 @@ mod tests {
         })
         .unwrap();
         (server, workspace, agent)
+    }
+
+    async fn scripted_agent() -> (wiremock::MockServer, tempfile::TempDir, ygg_agent::Agent) {
+        scripted_agent_with_delay(Duration::ZERO).await
     }
 
     struct EndsThenPanics(bool);
@@ -3139,6 +3238,89 @@ mod tests {
                     .content
                     .iter()
                     .any(|part| matches!(part, ygg_ai::UserPart::Media(_)))
+        )));
+    }
+
+    #[tokio::test]
+    async fn abort_restores_all_undelivered_steering_after_the_final_event() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let (_server, _workspace, mut agent) =
+            scripted_agent_with_delay(Duration::from_secs(2)).await;
+        let mut shell = InteractiveShell::test_shell();
+        for character in "steer first".chars() {
+            shell.apply_edit(crate::tui::keymap::EditAction::Char(character));
+        }
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL,
+            ))))
+            .await
+            .unwrap();
+        for character in "steer second".chars() {
+            sender
+                .send(Ok(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))))
+                .await
+                .unwrap();
+        }
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Char('s'),
+                KeyModifiers::CONTROL,
+            ))))
+            .await
+            .unwrap();
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))))
+            .await
+            .unwrap();
+        let _sender = sender;
+
+        let mut input = ReceiverStream::new(receiver);
+        let mut ticker = tokio::time::interval(Duration::from_millis(1));
+        let mut pending = VecDeque::new();
+        let mut quit = false;
+        let mut executable_extensions = crate::extensions::ExecutableExtensions::default();
+        let run_id = shell.begin_run("test");
+        let mut run = agent.prompt("initial").await.unwrap();
+        shell.set_awaiting_provider(run_id);
+        let control = run.control();
+        let ended = drive_active_run(
+            &mut run,
+            &control,
+            &mut shell,
+            &mut input,
+            &mut ticker,
+            &mut pending,
+            &mut quit,
+            None,
+            None,
+            &mut executable_extensions,
+        )
+        .await
+        .unwrap();
+        drop(run);
+
+        assert_eq!(ended, RunEnded::Aborted);
+        assert_eq!(shell.pending(), "steer first\n\nsteer second");
+        assert!(shell.debug_snapshot().contains("Interrupted"));
+        let context = agent.session().context().unwrap();
+        assert!(!context.iter().any(|message| matches!(
+            message,
+            ygg_ai::Message::User(user)
+                if user.content.iter().any(|part| matches!(
+                    part,
+                    ygg_ai::UserPart::Text(text) if text.starts_with("steer ")
+                ))
         )));
     }
 }

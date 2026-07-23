@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::io::Read;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use ygg_agent::{InputPart, UserInput};
@@ -152,6 +153,68 @@ pub fn looks_like_absolute_path(text: &str) -> bool {
 
 fn existing_file(path: PathBuf) -> Option<PathBuf> {
     path.is_file().then_some(path)
+}
+
+/// Find existing file paths embedded in editor text.
+///
+/// Some terminals emit drag/drop text as ordinary key events rather than one
+/// bracketed-paste event. In that mode the user commonly types a prompt after
+/// the shell-escaped or quoted path, so parsing the complete editor as one path
+/// loses the attachment. Tokenize with the quoting/escaping conventions used
+/// by terminal drag/drop and retain exact byte ranges for submit-time chips.
+pub fn dropped_paths_in_text(text: &str) -> Vec<(Range<usize>, PathBuf)> {
+    let mut paths = Vec::new();
+    let mut start = None;
+    let mut quote = None;
+    let mut escaped = false;
+
+    let mut finish = |start: usize, end: usize| {
+        if let Some(path) = parse_dropped_path(&text[start..end]) {
+            paths.push((start..end, path));
+        }
+    };
+
+    for (index, character) in text.char_indices() {
+        let Some(token_start) = start else {
+            if character.is_whitespace() {
+                continue;
+            }
+            start = Some(index);
+            if matches!(character, '\'' | '"') {
+                quote = Some(character);
+            } else if character == '\\' {
+                escaped = true;
+            }
+            continue;
+        };
+
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        if character.is_whitespace() {
+            finish(token_start, index);
+            start = None;
+        }
+    }
+    if let Some(token_start) = start {
+        finish(token_start, text.len());
+    }
+    paths
 }
 
 /// How a paste payload should enter the composer.
@@ -619,6 +682,27 @@ mod tests {
             None
         );
         assert_eq!(parse_dropped_path("just some words"), None);
+    }
+
+    #[test]
+    fn embedded_dropped_paths_keep_exact_ranges_around_prompt_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first shot.png");
+        let second = dir.path().join("second.png");
+        fs::write(&first, b"png").unwrap();
+        fs::write(&second, b"png").unwrap();
+        let escaped = first.display().to_string().replace(' ', "\\ ");
+        let text = format!("inspect {escaped} and '{}' carefully", second.display());
+
+        let found = dropped_paths_in_text(&text);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].1, first);
+        assert_eq!(found[1].1, second);
+        assert_eq!(&text[found[0].0.clone()], escaped);
+        assert_eq!(
+            &text[found[1].0.clone()],
+            format!("'{}'", found[1].1.display())
+        );
     }
 
     #[test]

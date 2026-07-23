@@ -494,6 +494,40 @@ async fn error_response_body_obeys_idle_timeout_but_preserves_status() {
 }
 
 #[tokio::test]
+async fn successful_status_json_error_is_not_misreported_as_missing_sse_finish() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "error": {
+                "message": "reasoning_effort must be one of none, low, or high",
+                "type": "Bad Request",
+                "code": 400
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let model = make_test_model(&mock_server.uri(), Protocol::OpenAiChat, false);
+    let mut stream = AiClient::new()
+        .stream(&model, text_request())
+        .await
+        .expect("HTTP 200 opens the response body stream");
+    let error = stream
+        .next()
+        .await
+        .expect("provider error event")
+        .expect_err("JSON error envelope must fail");
+    assert!(matches!(
+        error,
+        AiError::Provider(ref provider)
+            if provider.code.as_deref() == Some("400")
+                && provider.kind.as_deref() == Some("Bad Request")
+                && provider.message.contains("reasoning_effort")
+    ));
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
 async fn transient_gateway_errors_are_marked_retryable() {
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
