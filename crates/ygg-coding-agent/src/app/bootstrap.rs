@@ -78,9 +78,11 @@ const CUSTOM_ENDPOINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_DISCOVERY_BODY_BYTES: usize = 8 * 1024 * 1024;
 // Version 2 invalidated inventories whose llama.cpp context length was guessed
 // because older discovery ignored hlid's nested `meta.n_ctx` field. Version 4
-// invalidates sparse local inventories that were incorrectly cached as
-// tool-incompatible by version 3.
-const CUSTOM_MODEL_CACHE_VERSION: u8 = 4;
+// invalidated sparse local inventories that were incorrectly cached as
+// tool-incompatible by version 3. Version 5 invalidates v4 entries produced by
+// the secondary hlid discovery path before it adopted the same tri-state
+// local-tool fallback.
+const CUSTOM_MODEL_CACHE_VERSION: u8 = 5;
 const PROVIDER_INVENTORY_CACHE_VERSION: u8 = 1;
 const MAX_PROVIDER_INVENTORY_CACHE_BYTES: usize = MAX_DISCOVERY_BODY_BYTES + 1024 * 1024;
 const PROVIDER_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -4257,6 +4259,36 @@ mod tests {
                 Some(CachedCustomInventory::Unavailable)
             ),
             "an empty inventory is a valid negative cache marker"
+        );
+    }
+
+    #[test]
+    fn version_four_custom_cache_is_invalid_after_hlid_tool_fallback_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::auth::custom::CredentialStore::new(
+            directory.path().join("credentials/custom.json"),
+        );
+        let base_url = "https://ai.watchyourtemper.com/v1/";
+        let fingerprint = custom_credential_fingerprint("", &http::HeaderMap::new());
+        let stale = CustomModelCache {
+            version: 4,
+            base_url: base_url.into(),
+            credential_fingerprint: fingerprint.clone(),
+            models: vec![crate::auth::custom::CustomModel {
+                api_name: "qwen3.6-27b".into(),
+                tools: false,
+                ..Default::default()
+            }],
+        };
+        store
+            .save_model_cache(&serde_json::to_vec(&stale).unwrap())
+            .unwrap();
+
+        assert!(
+            load_custom_model_cache(&store, base_url, &fingerprint)
+                .unwrap()
+                .is_none(),
+            "v4 may contain tools=false from the pre-tri-state hlid path"
         );
     }
 
