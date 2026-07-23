@@ -11,12 +11,62 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::execute;
 use crossterm::terminal::{self, ClearType};
 
-use crate::keys::set_kitty_protocol_active;
+use crate::keys::{is_kitty_protocol_active, set_kitty_protocol_active};
 use crate::terminal_colors::is_osc11_background_color_response;
 use crate::terminal_image::get_capabilities;
 
 /// Poll interval for the input loop shutdown check.
 const POLL_TIMEOUT_MS: u64 = 50;
+const KITTY_NEGOTIATION_QUERY: &str = "\x1b[>7u\x1b[?u\x1b[c";
+const MODIFY_OTHER_KEYS_ENABLE: &str = "\x1b[>4;2m";
+const MODIFY_OTHER_KEYS_DISABLE: &str = "\x1b[>4;0m";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyboardProtocolNegotiationSequence {
+    KittyFlags(u16),
+    DeviceAttributes,
+}
+
+/// Parse exactly the startup replies consumed by Pi's keyboard negotiation.
+pub fn parse_keyboard_protocol_negotiation_sequence(
+    sequence: &str,
+) -> Option<KeyboardProtocolNegotiationSequence> {
+    if let Some(flags) = sequence
+        .strip_prefix("\x1b[?")
+        .and_then(|value| value.strip_suffix('u'))
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        return Some(KeyboardProtocolNegotiationSequence::KittyFlags(flags));
+    }
+    let attributes = sequence
+        .strip_prefix("\x1b[")
+        .and_then(|value| value.strip_suffix('c'))?;
+    attributes
+        .strip_prefix('?')
+        .is_some_and(|value| {
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b';')
+        })
+        .then_some(KeyboardProtocolNegotiationSequence::DeviceAttributes)
+}
+
+pub fn is_apple_terminal_session() -> bool {
+    cfg!(target_os = "macos")
+        && std::env::var("TERM_PROGRAM").is_ok_and(|value| value == "Apple_Terminal")
+}
+
+pub fn normalize_apple_terminal_input(
+    data: &str,
+    apple_terminal: bool,
+    shift_pressed: bool,
+) -> String {
+    if data == "\r" && apple_terminal && shift_pressed {
+        "\x1b[13;2u".into()
+    } else {
+        data.into()
+    }
+}
 
 /// Terminal-produced text for a key event.
 ///
@@ -150,6 +200,43 @@ pub trait Terminal {
     /// Clear the entire screen.
     fn clear_screen(&mut self);
 
+    /// Whether Kitty progressive keyboard enhancement was negotiated.
+    fn kitty_protocol_active(&self) -> bool {
+        is_kitty_protocol_active()
+    }
+
+    /// Drain late key releases before returning control to a parent shell.
+    fn drain_input(&mut self, max_ms: u64, idle_ms: u64) {
+        let started = std::time::Instant::now();
+        loop {
+            if started.elapsed() >= Duration::from_millis(max_ms) {
+                break;
+            }
+            match event::poll(Duration::from_millis(idle_ms)) {
+                Ok(true) => {
+                    let _ = event::read();
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn set_title(&mut self, title: &str) {
+        let title: String = title
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        self.write(&format!("\x1b]2;{title}\x07"));
+    }
+
+    fn set_progress(&mut self, active: bool) {
+        self.write(if active {
+            "\x1b]9;4;1;0\x1b\\"
+        } else {
+            "\x1b]9;4;0\x1b\\"
+        });
+    }
+
     /// Backend capability profile. Custom terminals should override this when
     /// they have negotiated more precise support than environment detection.
     fn capabilities(&self) -> crate::capabilities::TerminalCapabilities {
@@ -164,6 +251,7 @@ pub struct ProcessTerminal {
     rows: u16,
     raw_mode: bool,
     keyboard_enhancement_active: bool,
+    modify_other_keys_active: bool,
     shutdown: Arc<AtomicBool>,
     input_thread: Option<JoinHandle<()>>,
 }
@@ -177,6 +265,7 @@ impl ProcessTerminal {
             rows,
             raw_mode: false,
             keyboard_enhancement_active: false,
+            modify_other_keys_active: false,
             shutdown: Arc::new(AtomicBool::new(false)),
             input_thread: None,
         })
@@ -188,9 +277,14 @@ impl ProcessTerminal {
         execute!(self.stdout, cursor::Show).ok();
         execute!(self.stdout, crossterm::style::Print("\x1b[?2004l")).ok();
         if self.keyboard_enhancement_active {
-            execute!(self.stdout, event::PopKeyboardEnhancementFlags).ok();
+            let _ = self.stdout.write_all(b"\x1b[<u");
             self.keyboard_enhancement_active = false;
         }
+        if self.modify_other_keys_active {
+            let _ = self.stdout.write_all(MODIFY_OTHER_KEYS_DISABLE.as_bytes());
+            self.modify_other_keys_active = false;
+        }
+        set_kitty_protocol_active(false);
         if self.raw_mode {
             terminal::disable_raw_mode().ok();
             self.raw_mode = false;
@@ -204,11 +298,21 @@ impl ProcessTerminal {
     /// layout-resolved alternate text, while leaving ordinary text in the
     /// normal terminal path. Unsupported terminals ignore the request.
     fn enable_keyboard_enhancements(&mut self) {
-        let flags = event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-            | event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
-        if execute!(self.stdout, event::PushKeyboardEnhancementFlags(flags)).is_ok() {
+        // Pi asks for flags 1, 2 and 4 before querying. The DA request is the
+        // sentinel used to select modifyOtherKeys on terminals without Kitty.
+        let _ = self.stdout.write_all(KITTY_NEGOTIATION_QUERY.as_bytes());
+        let kitty_supported = get_capabilities().kitty_keyboard;
+        if kitty_supported {
+            // The first sequence in KITTY_NEGOTIATION_QUERY already pushes
+            // flags 1|2|4; do not push them a second time via crossterm.
             self.keyboard_enhancement_active = true;
+            set_kitty_protocol_active(true);
+        } else {
+            let _ = self.stdout.write_all(MODIFY_OTHER_KEYS_ENABLE.as_bytes());
+            self.modify_other_keys_active = true;
+            set_kitty_protocol_active(false);
         }
+        let _ = self.stdout.flush();
     }
 }
 
@@ -238,7 +342,6 @@ impl Terminal for ProcessTerminal {
         // Preserve ordinary terminal text while making modified controls and
         // layout-resolved alternate key text unambiguous.
         self.enable_keyboard_enhancements();
-        set_kitty_protocol_active(get_capabilities().kitty_keyboard);
 
         enum ProcessEvent {
             Input(TerminalInput),
@@ -384,6 +487,10 @@ impl Terminal for ProcessTerminal {
         execute!(self.stdout, crossterm::terminal::Clear(ClearType::All)).ok();
     }
 
+    fn kitty_protocol_active(&self) -> bool {
+        self.keyboard_enhancement_active
+    }
+
     fn capabilities(&self) -> crate::capabilities::TerminalCapabilities {
         crate::terminal_image::get_capabilities()
     }
@@ -477,6 +584,24 @@ pub(crate) fn key_to_string(event: &event::KeyEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_keyboard_negotiation_and_apple_return_normalization() {
+        assert_eq!(
+            parse_keyboard_protocol_negotiation_sequence("\x1b[?7u"),
+            Some(KeyboardProtocolNegotiationSequence::KittyFlags(7))
+        );
+        assert_eq!(
+            parse_keyboard_protocol_negotiation_sequence("\x1b[?62;4;52c"),
+            Some(KeyboardProtocolNegotiationSequence::DeviceAttributes)
+        );
+        assert_eq!(
+            normalize_apple_terminal_input("\r", true, true),
+            "\x1b[13;2u"
+        );
+        assert_eq!(normalize_apple_terminal_input("\r", true, false), "\r");
+        assert_eq!(normalize_apple_terminal_input("a", true, true), "a");
+    }
 
     #[test]
     fn process_terminal_emits_text_and_paste_semantically() {

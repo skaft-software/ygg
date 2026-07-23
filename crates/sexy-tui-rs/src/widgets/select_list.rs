@@ -90,11 +90,13 @@ impl Component for SelectList {
             } else {
                 (self.theme.no_match)("No matches")
             };
-            return vec![crate::utils::truncate_to_width(
-                &text,
-                usize::from(width),
-                Some(glyphs.ellipsis),
-            )];
+            let text =
+                crate::utils::truncate_to_width(&text, usize::from(width), Some(glyphs.ellipsis));
+            return vec![if self.capabilities.plain {
+                crate::utils::strip_terminal_sequences(&text)
+            } else {
+                text
+            }];
         }
 
         let mut lines: Vec<String> = visible
@@ -151,6 +153,11 @@ impl Component for SelectList {
                 usize::from(width),
                 Some(glyphs.ellipsis),
             ));
+        }
+        if self.capabilities.plain {
+            for line in &mut lines {
+                *line = crate::utils::strip_terminal_sequences(line);
+            }
         }
         lines
     }

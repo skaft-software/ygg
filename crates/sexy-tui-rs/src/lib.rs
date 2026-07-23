@@ -47,7 +47,7 @@ pub use keybindings::{
     KeybindingDefinitions, Keybindings, KeybindingsConfig, KeybindingsManager, TUI_KEYBINDINGS,
 };
 pub use keys::{
-    decode_kitty_printable, decode_kitty_text, is_key_release, is_key_repeat,
+    decode_kitty_printable, decode_kitty_text, decode_printable_key, is_key_release, is_key_repeat,
     is_kitty_protocol_active, matches_key, parse_key, set_kitty_protocol_active, Key, KeyEventType,
 };
 pub use live::{
@@ -69,9 +69,13 @@ pub use rich_text::{
 pub use sanitize::{
     safe_hyperlink, sanitize_line, sanitize_text, ControlPictures, SafeUrl, SanitizeOptions,
 };
-pub use stdin_buffer::{StdinBuffer, StdinBufferOptions};
+pub use stdin_buffer::{StdinBuffer, StdinBufferOptions, StdinEvent};
 pub use style::{BlockRole, BlockStyle, Color, TextAttributes, TextRole, TextStyle};
-pub use terminal::{key_text, ProcessTerminal, Terminal, TerminalInput};
+pub use terminal::{
+    is_apple_terminal_session, key_text, normalize_apple_terminal_input,
+    parse_keyboard_protocol_negotiation_sequence, KeyboardProtocolNegotiationSequence,
+    ProcessTerminal, Terminal, TerminalInput,
+};
 pub use terminal_colors::{parse_osc11_background_color, RgbColor};
 pub use terminal_image::{
     allocate_image_id, calculate_image_rows, delete_all_kitty_images, delete_kitty_image,
@@ -85,11 +89,13 @@ pub use theme::capability::CapabilityTier;
 pub use theme::Theme;
 pub use tui::{
     Component, Container, Focusable, FrameUpdate, OverlayAnchor, OverlayHandle, OverlayMargin,
-    OverlayOptions, OverlayUnfocusOptions, CURSOR_MARKER, TUI,
+    OverlayOptions, OverlayUnfocusOptions, SizeValue, CURSOR_MARKER, TUI,
 };
 pub use utils::{
-    strip_terminal_sequences, terminal_tokens, truncate_to_width, visible_width,
-    wrap_text_with_ansi, TerminalToken,
+    apply_background_to_line, extract_ansi_code, extract_segments, is_punctuation_char,
+    is_whitespace_char, normalize_terminal_output, slice_by_column, slice_with_width,
+    strip_terminal_sequences, terminal_tokens, truncate_to_width, truncate_to_width_padded,
+    visible_width, wrap_text_with_ansi, AnsiCode, ColumnSlice, ExtractedSegments, TerminalToken,
 };
 pub use widgets::{
     CancellableLoader, Editor, EditorOptions, EditorTheme, Image, ImageOptions, ImageTheme, Input,

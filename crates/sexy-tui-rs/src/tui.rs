@@ -7,9 +7,15 @@ use crate::terminal_image::{delete_all_kitty_images, is_image_line};
 use crate::utils::visible_width;
 
 /// Zero-width APC escape sequence used as a cursor position marker.
-pub const CURSOR_MARKER: &str = "\x1b_\\";
+/// Pi's zero-cell APC cursor marker.
+pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
 
-type OverlayEntry = (Rc<RefCell<OverlayHandle>>, Box<dyn Component>);
+struct OverlayEntry {
+    handle: Rc<RefCell<OverlayHandle>>,
+    component: Box<dyn Component>,
+    options: OverlayOptions,
+    focus_order: usize,
+}
 /// Global input listener. Returning `Some` consumes the input event.
 pub type InputListener<'a> = Box<dyn FnMut(&str) -> Option<String> + 'a>;
 
@@ -274,16 +280,58 @@ pub struct OverlayUnfocusOptions {
     pub target: Option<Box<dyn Component>>,
 }
 
+/// Absolute cells or a percentage of the terminal dimension.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SizeValue {
+    Cells(u16),
+    Percent(f64),
+}
+
+impl From<u16> for SizeValue {
+    fn from(value: u16) -> Self {
+        Self::Cells(value)
+    }
+}
+
+impl SizeValue {
+    pub const fn cells(value: u16) -> Self {
+        Self::Cells(value)
+    }
+    pub const fn percent(value: f64) -> Self {
+        Self::Percent(value)
+    }
+
+    fn resolve_size(self, total: usize) -> usize {
+        match self {
+            Self::Cells(value) => usize::from(value),
+            Self::Percent(value) => ((total as f64) * value / 100.0).floor().max(0.0) as usize,
+        }
+    }
+
+    fn resolve_position(self, available: usize, extent: usize, margin: usize) -> usize {
+        match self {
+            Self::Cells(value) => usize::from(value),
+            Self::Percent(value) => {
+                margin
+                    + ((available.saturating_sub(extent) as f64) * value / 100.0)
+                        .floor()
+                        .max(0.0) as usize
+            }
+        }
+    }
+}
+
 /// Options for creating an overlay.
+#[derive(Debug, Clone, Copy)]
 pub struct OverlayOptions {
-    pub width: Option<u16>,
+    pub width: Option<SizeValue>,
     pub min_width: Option<u16>,
-    pub max_height: Option<u16>,
+    pub max_height: Option<SizeValue>,
     pub anchor: OverlayAnchor,
     pub offset_x: i16,
     pub offset_y: i16,
-    pub row: Option<u16>,
-    pub col: Option<u16>,
+    pub row: Option<SizeValue>,
+    pub col: Option<SizeValue>,
     pub margin: Option<OverlayMargin>,
     pub non_capturing: bool,
 }
@@ -441,7 +489,12 @@ impl<'a> TUI<'a> {
             hidden: false,
             focused: !options.non_capturing,
         }));
-        self.overlays.push((handle.clone(), component));
+        self.overlays.push(OverlayEntry {
+            handle: handle.clone(),
+            component,
+            options,
+            focus_order: id,
+        });
         handle
     }
 
@@ -452,7 +505,9 @@ impl<'a> TUI<'a> {
 
     /// Check if any visible overlay is active.
     pub fn has_overlay(&self) -> bool {
-        self.overlays.iter().any(|(h, _)| !h.borrow().hidden)
+        self.overlays
+            .iter()
+            .any(|entry| !entry.handle.borrow().hidden)
     }
 
     /// Add an input listener for global key handling.
@@ -512,15 +567,13 @@ impl<'a> TUI<'a> {
         }
 
         // Route to focused overlay or root
-        let has_capturing_overlay = self
-            .overlays
-            .iter()
-            .any(|(h, _)| h.borrow().focused && !h.borrow().hidden);
+        let focused_overlay = self.overlays.iter().rposition(|entry| {
+            let handle = entry.handle.borrow();
+            handle.focused && !handle.hidden
+        });
 
-        if has_capturing_overlay {
-            if let Some((_, component)) = self.overlays.last_mut() {
-                component.handle_input(data);
-            }
+        if let Some(index) = focused_overlay {
+            self.overlays[index].component.handle_input(data);
         } else {
             self.root.handle_input(data);
         }
@@ -547,14 +600,12 @@ impl<'a> TUI<'a> {
                         return;
                     }
                 }
-                let has_capturing_overlay = self
-                    .overlays
-                    .iter()
-                    .any(|(h, _)| h.borrow().focused && !h.borrow().hidden);
-                if has_capturing_overlay {
-                    if let Some((_, component)) = self.overlays.last_mut() {
-                        component.handle_paste(&text);
-                    }
+                let focused_overlay = self.overlays.iter().rposition(|entry| {
+                    let handle = entry.handle.borrow();
+                    handle.focused && !handle.hidden
+                });
+                if let Some(index) = focused_overlay {
+                    self.overlays[index].component.handle_paste(&text);
                 } else {
                     self.root.handle_paste(&text);
                 }
@@ -575,7 +626,7 @@ impl<'a> TUI<'a> {
             && self
                 .overlays
                 .iter()
-                .all(|(handle, _)| handle.borrow().hidden)
+                .all(|entry| entry.handle.borrow().hidden)
             && (self.capabilities.plain
                 || (self.inline_scrollback
                     && self.capabilities.cursor_addressing
@@ -646,35 +697,10 @@ impl<'a> TUI<'a> {
                 rendered.push(self.prepare_line(line, width));
             }
 
-            // Composite any visible overlays on top of root content.
-            for (handle, component) in &self.overlays {
-                if handle.borrow().hidden {
-                    continue;
-                }
-                let overlay_lines = component
-                    .render(width)
-                    .into_iter()
-                    .map(|line| {
-                        if self.capabilities.plain {
-                            ensure_plain_line(&line, width)
-                        } else {
-                            ensure_line_width(&line, width)
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                // Composite: overlay lines replace root lines at matching indices.
-                // Lines beyond the root frame extend it, giving a "floating above" effect.
-                let n_overlay = overlay_lines.len();
-                let n_root = rendered.len();
-                for i in 0..n_overlay.max(n_root) {
-                    if i < n_overlay && i < n_root {
-                        rendered[i] = overlay_lines[i].clone();
-                    } else if i < n_overlay {
-                        rendered.push(overlay_lines[i].clone());
-                    }
-                    // else: root line exists beyond overlay — keep as-is
-                }
-            }
+            // Pi overlays are screen-relative rectangles composited into root
+            // rows. They never replace an entire row merely because an overlay
+            // produced content for it.
+            rendered = self.composite_overlays(rendered, width, height);
 
             // Extract the typed cursor marker before frame comparison. It is a
             // trusted library control token, never accepted from semantic text.
@@ -1301,6 +1327,152 @@ impl<'a> TUI<'a> {
             self.terminal.write(line);
             self.terminal.write("\n");
         }
+    }
+
+    fn resolve_overlay_layout(
+        options: OverlayOptions,
+        overlay_height: usize,
+        terminal_width: usize,
+        terminal_height: usize,
+    ) -> (usize, usize, usize, Option<usize>) {
+        let margin = options.margin.unwrap_or_else(|| OverlayMargin::all(0));
+        let available_width = terminal_width
+            .saturating_sub(usize::from(margin.left) + usize::from(margin.right))
+            .max(1);
+        let available_height = terminal_height
+            .saturating_sub(usize::from(margin.top) + usize::from(margin.bottom))
+            .max(1);
+        let mut width = options
+            .width
+            .map(|value| value.resolve_size(terminal_width))
+            .unwrap_or(80.min(available_width));
+        if let Some(minimum) = options.min_width {
+            width = width.max(usize::from(minimum));
+        }
+        width = width.clamp(1, available_width);
+        let max_height = options
+            .max_height
+            .map(|value| value.resolve_size(terminal_height))
+            .map(|value| value.clamp(1, available_height));
+        let height = max_height.map_or(overlay_height, |maximum| overlay_height.min(maximum));
+        let top = usize::from(margin.top);
+        let left = usize::from(margin.left);
+        let anchored_row = match options.anchor {
+            OverlayAnchor::TopLeft | OverlayAnchor::TopCenter | OverlayAnchor::TopRight => top,
+            OverlayAnchor::BottomLeft
+            | OverlayAnchor::BottomCenter
+            | OverlayAnchor::BottomRight => top + available_height.saturating_sub(height),
+            _ => top + available_height.saturating_sub(height) / 2,
+        };
+        let anchored_col = match options.anchor {
+            OverlayAnchor::TopLeft | OverlayAnchor::LeftCenter | OverlayAnchor::BottomLeft => left,
+            OverlayAnchor::TopRight | OverlayAnchor::RightCenter | OverlayAnchor::BottomRight => {
+                left + available_width.saturating_sub(width)
+            }
+            _ => left + available_width.saturating_sub(width) / 2,
+        };
+        let row = options
+            .row
+            .map(|value| value.resolve_position(available_height, height, top))
+            .unwrap_or(anchored_row) as i64
+            + i64::from(options.offset_y);
+        let col = options
+            .col
+            .map(|value| value.resolve_position(available_width, width, left))
+            .unwrap_or(anchored_col) as i64
+            + i64::from(options.offset_x);
+        let maximum_row = terminal_height
+            .saturating_sub(usize::from(margin.bottom) + height)
+            .max(top);
+        let maximum_col = terminal_width
+            .saturating_sub(usize::from(margin.right) + width)
+            .max(left);
+        (
+            width,
+            row.clamp(top as i64, maximum_row as i64) as usize,
+            col.clamp(left as i64, maximum_col as i64) as usize,
+            max_height,
+        )
+    }
+
+    fn composite_overlays(&self, mut lines: Vec<String>, width: u16, height: u16) -> Vec<String> {
+        use crate::utils::{extract_segments, slice_with_width};
+        let terminal_width = usize::from(width);
+        let terminal_height = usize::from(height);
+        if self.overlays.is_empty() || terminal_width == 0 || terminal_height == 0 {
+            return lines;
+        }
+        let mut order: Vec<usize> = (0..self.overlays.len()).collect();
+        order.sort_by_key(|index| self.overlays[*index].focus_order);
+        let mut rendered = Vec::new();
+        let mut minimum_lines = lines.len();
+        for index in order {
+            let entry = &self.overlays[index];
+            if entry.handle.borrow().hidden {
+                continue;
+            }
+            let (overlay_width, _, _, max_height) =
+                Self::resolve_overlay_layout(entry.options, 0, terminal_width, terminal_height);
+            let mut overlay_lines = entry.component.render(overlay_width as u16);
+            if let Some(maximum) = max_height {
+                overlay_lines.truncate(maximum);
+            }
+            let (_, row, col, _) = Self::resolve_overlay_layout(
+                entry.options,
+                overlay_lines.len(),
+                terminal_width,
+                terminal_height,
+            );
+            minimum_lines = minimum_lines.max(row + overlay_lines.len());
+            rendered.push((overlay_lines, row, col, overlay_width));
+        }
+        let working_height = lines.len().max(terminal_height).max(minimum_lines);
+        lines.resize(working_height, String::new());
+        let viewport_start = working_height.saturating_sub(terminal_height);
+        for (overlay_lines, row, col, overlay_width) in rendered {
+            for (offset, overlay_line) in overlay_lines.into_iter().enumerate() {
+                let index = viewport_start + row + offset;
+                if index >= lines.len() || is_image_line(&lines[index]) {
+                    continue;
+                }
+                let after_start = col + overlay_width;
+                let base = extract_segments(
+                    &lines[index],
+                    col,
+                    after_start,
+                    terminal_width.saturating_sub(after_start),
+                    true,
+                );
+                let overlay = slice_with_width(&overlay_line, 0, overlay_width, true);
+                let before_padding = col.saturating_sub(base.before_width);
+                let overlay_padding = overlay_width.saturating_sub(overlay.width);
+                let actual_before = col.max(base.before_width);
+                let actual_overlay = overlay_width.max(overlay.width);
+                let after_target = terminal_width.saturating_sub(actual_before + actual_overlay);
+                let after_padding = after_target.saturating_sub(base.after_width);
+                let reset = if self.capabilities.plain {
+                    ""
+                } else {
+                    "\x1b[0m\x1b]8;;\x07"
+                };
+                let mut composite = format!(
+                    "{}{}{}{}{}{}{}{}",
+                    base.before,
+                    " ".repeat(before_padding),
+                    reset,
+                    overlay.text,
+                    " ".repeat(overlay_padding),
+                    reset,
+                    base.after,
+                    " ".repeat(after_padding)
+                );
+                if visible_width(&composite) > terminal_width {
+                    composite = crate::utils::slice_by_column(&composite, 0, terminal_width, true);
+                }
+                lines[index] = composite;
+            }
+        }
+        lines
     }
 
     fn prepare_line(&self, line: String, width: u16) -> String {
@@ -2561,5 +2733,84 @@ mod tests {
         let output = synchronized_writes.borrow().join("");
         assert!(output.contains("\x1b[?2026h"));
         assert!(output.contains("\x1b[?2026l"));
+    }
+
+    struct StaticOverlay {
+        lines: Vec<String>,
+        requested_width: Rc<Cell<u16>>,
+    }
+
+    impl Component for StaticOverlay {
+        fn render(&self, width: u16) -> Vec<String> {
+            self.requested_width.set(width);
+            self.lines.clone()
+        }
+        fn invalidate(&mut self) {}
+    }
+
+    #[test]
+    fn pi_overlay_layout_composites_rectangles_without_replacing_root_rows() {
+        let size = Rc::new(Cell::new((16, 3)));
+        let (terminal, ..) =
+            recording_terminal(size, crate::capabilities::TerminalCapabilities::plain());
+        let requested_width = Rc::new(Cell::new(0));
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.show_overlay(
+            Box::new(StaticOverlay {
+                lines: vec!["XY".into()],
+                requested_width: requested_width.clone(),
+            }),
+            OverlayOptions {
+                width: Some(4.into()),
+                row: Some(1.into()),
+                col: Some(4.into()),
+                ..OverlayOptions::default()
+            },
+        );
+        let frame = tui.composite_overlays(vec!["0123456789abcdef".into(); 3], 16, 3);
+        assert_eq!(requested_width.get(), 4);
+        assert_eq!(frame[0], "0123456789abcdef");
+        assert_eq!(frame[1], "0123XY  89abcdef");
+        assert_eq!(frame[2], "0123456789abcdef");
+
+        let (overlay_width, row, col, _) = TUI::resolve_overlay_layout(
+            OverlayOptions {
+                width: Some(SizeValue::percent(50.0)),
+                row: Some(SizeValue::percent(100.0)),
+                col: Some(SizeValue::percent(50.0)),
+                ..OverlayOptions::default()
+            },
+            1,
+            16,
+            3,
+        );
+        assert_eq!((overlay_width, row, col), (8, 2, 4));
+    }
+
+    #[test]
+    fn pi_overlay_anchor_margin_offset_and_max_height_are_applied() {
+        let size = Rc::new(Cell::new((16, 6)));
+        let (terminal, ..) =
+            recording_terminal(size, crate::capabilities::TerminalCapabilities::plain());
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.show_overlay(
+            Box::new(StaticOverlay {
+                lines: vec!["A".into(), "B".into(), "C".into()],
+                requested_width: Rc::new(Cell::new(0)),
+            }),
+            OverlayOptions {
+                width: Some(4.into()),
+                max_height: Some(2.into()),
+                anchor: OverlayAnchor::BottomRight,
+                offset_x: -1,
+                margin: Some(OverlayMargin::all(1)),
+                ..OverlayOptions::default()
+            },
+        );
+        let frame = tui.composite_overlays(Vec::new(), 16, 6);
+        assert_eq!(frame.len(), 6);
+        assert_eq!(&frame[3][10..11], "A");
+        assert_eq!(&frame[4][10..11], "B");
+        assert!(!frame.iter().any(|line| line.contains('C')));
     }
 }

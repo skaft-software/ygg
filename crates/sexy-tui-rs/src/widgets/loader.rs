@@ -109,11 +109,13 @@ impl Component for Loader {
                 (self.msg_color)(&safe_message)
             )
         };
-        vec![crate::utils::truncate_to_width(
-            &line,
-            usize::from(width),
-            Some(glyphs.ellipsis),
-        )]
+        let line =
+            crate::utils::truncate_to_width(&line, usize::from(width), Some(glyphs.ellipsis));
+        vec![if self.capabilities.plain {
+            crate::utils::strip_terminal_sequences(&line)
+        } else {
+            line
+        }]
     }
 
     fn invalidate(&mut self) {}
