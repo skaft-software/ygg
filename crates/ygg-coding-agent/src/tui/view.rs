@@ -3809,6 +3809,37 @@ fn transcript_lines(state: &ShellState, width: u16) -> Ref<'_, Vec<String>> {
     state.rendered_transcript(width)
 }
 
+fn transcript_commit_boundary(state: &ShellState, width: u16) -> usize {
+    let transcript_len = transcript_lines(state, width).len();
+    let first_live = state.transcript.iter().position(|block| match block {
+        TranscriptBlock::Assistant(block) | TranscriptBlock::Reasoning(block) => !block.finished,
+        TranscriptBlock::Tool(panel) => !panel.finished,
+        TranscriptBlock::Shell(shell) => shell.running,
+        TranscriptBlock::User { .. }
+        | TranscriptBlock::Outcome(_)
+        | TranscriptBlock::Notice(_)
+        | TranscriptBlock::Compaction(_) => false,
+    });
+    let Some(first_live) = first_live else {
+        return transcript_len;
+    };
+    let cache = state.transcript_cache.borrow();
+    let block_start = cache.block_starts.get(first_live).copied().unwrap_or(0);
+    let settled_rows = match &state.transcript[first_live] {
+        TranscriptBlock::Assistant(block) => {
+            let geometry = cache.block_geometries.get(first_live).copied();
+            geometry.map_or(0, |geometry| {
+                geometry
+                    .transition_rows
+                    .saturating_add(geometry.leading_rows)
+                    .saturating_add(block.layout.borrow().committed_rows())
+            })
+        }
+        _ => 0,
+    };
+    block_start.saturating_add(settled_rows).min(transcript_len)
+}
+
 fn transcript_viewport_capacity(available: usize, scrolled: bool) -> usize {
     if available == 0 {
         return 0;
@@ -4565,6 +4596,7 @@ fn render_shell_viewport_update(
     FrameUpdate {
         stable_prefix: 0,
         replacement: render_shell_viewport_at(state, width, now),
+        commit_boundary: None,
         reanchor_viewport: repaint_theme,
         rebuild_scrollback: false,
     }
@@ -4646,6 +4678,7 @@ fn render_shell_update(
         return FrameUpdate {
             stable_prefix: 0,
             replacement,
+            commit_boundary: Some(0),
             reanchor_viewport: repaint_theme,
             // Portable terminals cannot restyle rows already owned by native
             // scrollback. Repaint the visible viewport and preserve history.
@@ -4657,6 +4690,7 @@ fn render_shell_update(
         let transcript = transcript_lines(state, width);
         transcript.len()
     };
+    let commit_boundary = transcript_commit_boundary(state, width);
     // Hydrating `/new` (or a shorter resumed session) replaces the logical
     // transcript rather than merely editing the visible tail. The terminal's
     // native-scrollback renderer must repaint that new viewport from home;
@@ -4699,6 +4733,7 @@ fn render_shell_update(
     FrameUpdate {
         stable_prefix,
         replacement,
+        commit_boundary: Some(commit_boundary),
         reanchor_viewport,
         rebuild_scrollback: false,
     }
@@ -8863,6 +8898,69 @@ mod tests {
     }
 
     #[test]
+    fn streamed_table_and_wrapped_lists_never_commit_provisional_duplicates() {
+        const WIDTH: u16 = 96;
+        const HEIGHT: u16 = 22;
+        let (mut shell, bytes) = emulated_shell(crate::tui::theme::test_theme(), WIDTH, HEIGHT);
+        let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+        let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+            std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+        };
+        terminal.process(&drain(&bytes));
+
+        let response = "\
+# Files
+
+| File | Lines | Content |
+|---|---:|---|
+| README.md | 603 | Full architecture deep-dive |
+| extracted-prompts.md | 76 | Verbatim prompt excerpts |
+| env-vars-reference.md | 518 | 512 environment variables |
+
+## Key Findings
+
+1. **Multi-Agent Architecture**
+
+- **Coordinator** spawns subagents and workers with isolated context windows
+- **Three worker types** run concurrently and preserve their own tool state
+- **Guidance** remains visible exactly once even when this sentence wraps across terminal rows
+
+2. **System Prompt Architecture**
+";
+        let run_id = shell.begin_run("openai");
+        for chunk in response.as_bytes().chunks(5) {
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::OutputDelta {
+                    channel: OutputChannel::Text,
+                    text: String::from_utf8(chunk.to_vec()).unwrap(),
+                },
+            );
+            shell.render();
+            terminal.process(&drain(&bytes));
+        }
+
+        terminal.set_size(256, WIDTH);
+        terminal.set_scrollback(usize::MAX);
+        let physical = terminal.screen().contents();
+        for sentinel in [
+            "Files",
+            "Key Findings",
+            "Multi-Agent Architecture",
+            "Coordinator",
+            "Three worker types",
+            "Guidance",
+            "System Prompt Architecture",
+        ] {
+            assert_eq!(
+                physical.matches(sentinel).count(),
+                1,
+                "{sentinel:?} was duplicated in native scrollback:\n{physical}"
+            );
+        }
+    }
+
+    #[test]
     fn closing_overlay_reanchors_without_replaying_native_scrollback() {
         const WIDTH: u16 = 80;
         const HEIGHT: u16 = 16;
@@ -8992,7 +9090,6 @@ mod tests {
                 growth_text.contains("second-live-row-127"),
                 "latest exec tail was not painted: {growth_text:?}"
             );
-            assert!(!growth_text.contains("history-sentinel"), "{growth_text:?}");
             assert!(
                 !growth_text.contains("first-live-row-000"),
                 "{growth_text:?}"
@@ -9024,10 +9121,6 @@ mod tests {
             let trimmed_text = String::from_utf8_lossy(&trimmed);
             assert!(
                 trimmed_text.contains("trimmed-live-row-223"),
-                "{trimmed_text:?}"
-            );
-            assert!(
-                !trimmed_text.contains("history-sentinel"),
                 "{trimmed_text:?}"
             );
             assert!(

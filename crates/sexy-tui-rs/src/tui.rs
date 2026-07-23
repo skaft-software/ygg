@@ -24,6 +24,10 @@ pub type InputListener<'a> = Box<dyn FnMut(&str) -> Option<String> + 'a>;
 pub struct FrameUpdate {
     pub stable_prefix: usize,
     pub replacement: Vec<String>,
+    /// First logical row that may still change. Rows before this boundary may
+    /// enter native scrollback; rows at or after it remain viewport-local.
+    /// `None` keeps the generic shell-style differential renderer.
+    pub commit_boundary: Option<usize>,
     /// The component replaced its logical timeline (for example, a resumed
     /// conversation was replaced by a new session). Repaint the visible tail
     /// from the top of the terminal so later fixed-height chrome remains
@@ -363,6 +367,11 @@ pub struct TUI<'a> {
     /// can sit above the bottom row; every inline repaint derives its cursor
     /// addressing from this anchor rather than assuming a bottom-aligned tail.
     inline_bottom_row: usize,
+    /// Rows physically appended to native scrollback by the pinned live-region
+    /// renderer. They are immutable and are never painted into the grid again.
+    inline_committed_rows: usize,
+    /// First logical row represented by grid row zero in pinned mode.
+    inline_window_top: usize,
 }
 
 impl<'a> TUI<'a> {
@@ -381,6 +390,8 @@ impl<'a> TUI<'a> {
             input_listeners: Vec::new(),
             inline_scrollback: false,
             inline_bottom_row: 0,
+            inline_committed_rows: 0,
+            inline_window_top: 0,
         }
     }
 
@@ -582,6 +593,9 @@ impl<'a> TUI<'a> {
         let rebuild_scrollback = lazy_update
             .as_ref()
             .is_some_and(|update| update.rebuild_scrollback);
+        let commit_boundary = lazy_update
+            .as_ref()
+            .and_then(|update| update.commit_boundary);
         let mut first_changed_hint = None;
         let mut lazy_change_hints = None;
         let cursor;
@@ -682,6 +696,7 @@ impl<'a> TUI<'a> {
                 size_changed,
                 reanchor_viewport,
                 rebuild_scrollback,
+                commit_boundary,
                 first_changed_hint,
                 previous_len,
                 lazy_change_hints.as_ref(),
@@ -782,11 +797,21 @@ impl<'a> TUI<'a> {
         size_changed: bool,
         reanchor_viewport: bool,
         rebuild_scrollback: bool,
+        commit_boundary: Option<usize>,
         first_changed_hint: Option<usize>,
         previous_len: usize,
         frame_change_hints: Option<&FrameChangeHints>,
     ) {
         let rows = usize::from(height.max(1));
+        if let Some(boundary) = commit_boundary {
+            self.write_inline_pinned(
+                new_lines,
+                rows,
+                boundary.min(new_lines.len()),
+                size_changed || reanchor_viewport || rebuild_scrollback,
+            );
+            return;
+        }
         if self.first_render {
             // Push the caller's existing screen content into scrollback
             // instead of erasing it, then paint the visible tail from home.
@@ -1009,6 +1034,90 @@ impl<'a> TUI<'a> {
         } else {
             (screen_row + changed.len() - 1).min(rows - 1)
         };
+    }
+
+    /// Append-only native-scrollback renderer for a frame with an explicit
+    /// live-region seam. Only finalized rows before `commit_boundary` may
+    /// scroll off the grid. The mutable suffix is always repainted in place,
+    /// so provisional Markdown layouts can never become duplicate history.
+    fn write_inline_pinned(
+        &mut self,
+        new_lines: &[String],
+        rows: usize,
+        commit_boundary: usize,
+        reanchor: bool,
+    ) {
+        if reanchor
+            && (new_lines.len() <= self.inline_committed_rows
+                || commit_boundary < self.inline_committed_rows)
+        {
+            // A shorter replacement timeline cannot share row coordinates
+            // with the old tape. Preserve old history, but restart the ledger
+            // for the new frame instead of pinning its window beyond EOF.
+            self.inline_committed_rows = 0;
+            self.inline_window_top = 0;
+        }
+        let desired_window_top = new_lines.len().saturating_sub(rows);
+        let commit_target = commit_boundary
+            .min(desired_window_top)
+            .max(self.inline_committed_rows);
+        let window_top = desired_window_top.max(commit_target);
+        let window = &new_lines[window_top.min(new_lines.len())..];
+        let commit_advanced = commit_target > self.inline_committed_rows;
+
+        self.begin_synchronized_output();
+        if self.first_render {
+            // Preserve whatever preceded the application, then establish a
+            // clean grid without erasing terminal-owned history.
+            self.terminal.write(&"\n".repeat(rows));
+        }
+
+        if self.first_render || reanchor || commit_advanced {
+            // Rebuild only the grid. When the commit boundary advances, write
+            // exactly the newly-final chunk before the next window; natural
+            // scrolling moves that chunk, and only that chunk, into history.
+            self.terminal.write("\x1b[H");
+            if self.first_render || reanchor {
+                self.terminal.clear_screen();
+                self.terminal.write("\x1b[H");
+            }
+            let committed = &new_lines[self.inline_committed_rows.min(new_lines.len())
+                ..commit_target.min(new_lines.len())];
+            let paint = committed.iter().chain(window.iter()).collect::<Vec<_>>();
+            for (index, line) in paint.iter().enumerate() {
+                self.terminal.clear_line();
+                self.terminal.write(line);
+                if index + 1 < paint.len() {
+                    self.terminal.write("\r\n");
+                }
+            }
+            for row in window.len()..rows {
+                self.terminal
+                    .write(&format!("\x1b[{};1H", row.saturating_add(1)));
+                self.terminal.clear_line();
+            }
+        } else {
+            // Ordinary token ticks never scroll. Diff the viewport by logical
+            // row and touch only cells whose final bytes changed.
+            for (screen_row, line) in window.iter().enumerate() {
+                let logical_row = window_top + screen_row;
+                let previous = logical_row
+                    .checked_sub(self.inline_window_top)
+                    .and_then(|row| self.previous_frame.get(row));
+                if previous == Some(line) {
+                    continue;
+                }
+                self.terminal
+                    .write(&format!("\x1b[{};1H", screen_row.saturating_add(1)));
+                self.terminal.clear_line();
+                self.terminal.write(line);
+            }
+        }
+        self.end_synchronized_output();
+
+        self.inline_committed_rows = commit_target;
+        self.inline_window_top = window_top;
+        self.inline_bottom_row = window.len().saturating_sub(1).min(rows.saturating_sub(1));
     }
 
     fn repaint_inline_visible_rows(&mut self, new_lines: &[String], rows: usize) {
@@ -1353,6 +1462,7 @@ mod tests {
             Some(FrameUpdate {
                 stable_prefix: self.stable_prefix,
                 replacement: vec![self.tail.borrow().clone()],
+                commit_boundary: None,
                 reanchor_viewport: false,
                 rebuild_scrollback: false,
             })
@@ -1374,6 +1484,7 @@ mod tests {
             Some(FrameUpdate {
                 stable_prefix: 0,
                 replacement: self.lines.borrow().clone(),
+                commit_boundary: None,
                 reanchor_viewport: false,
                 rebuild_scrollback: false,
             })
@@ -1397,6 +1508,7 @@ mod tests {
             Some(FrameUpdate {
                 stable_prefix: 0,
                 replacement: self.lines.borrow().clone(),
+                commit_boundary: None,
                 reanchor_viewport: self.reanchor.replace(false),
                 rebuild_scrollback: self.rebuild_scrollback.replace(false),
             })
