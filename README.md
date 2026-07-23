@@ -317,11 +317,18 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Native scrollback and text selection by default; application-owned mouse behavior is opt-in.
 - Stable-prefix differential rendering, synchronized atomic frames, and bounded repaint regions.
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
-- Semantic tool lifecycle states, rich Markdown, syntax highlighting, tables, task lists, links, and unified diffs.
+- Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links; raw tool evidence is never rendered.
 - Prompt colors tied to model labs in the default theme; named themes retain their own authored palettes.
 - Exact theme replacement: switching back to default does not retain attributes from the previous theme.
 - Ten bundled themes: `bone-machine`, `circuit-garden`, `field-notes`, `oxide-console`, `paper-ledger`, `signal-noir`, `synthwave-relay`, `tidepool`, `violet-hour`, and `zen-mono`.
 - Terminal control-sequence sanitization in user- and provider-controlled text.
+
+Tool arguments, raw/progress output, failure details, diffs, shell output, and
+extension-rendered tool payloads remain internal accountability evidence. Ctrl+O
+only expands reasoning or compaction summaries; `/tool` and `/verbose` never
+disclose tool evidence. Final structured tool results are retained and sent to
+the provider only when required to continue the tool protocol; live progress
+is neither persisted nor sent to the model.
 
 ```sh
 ygg --theme violet-hour
@@ -346,8 +353,8 @@ Type `/` in the composer to open live command discovery.
 | `/thinking [level]` | Inspect or change model-supported reasoning. |
 | `/compact` | Compact at the next safe boundary. |
 | `/theme [name\|list\|reload]` | Select, inspect, or reload themes. |
-| `/verbose [on\|off]` | Show or hide raw tool evidence. |
-| `/tool [call-id]` | Toggle one tool call's details. |
+| `/verbose [on\|off]` | Report that tool evidence is internal and never displayed. |
+| `/tool [call-id]` | Report that tool evidence is internal and never displayed. |
 | `/reload` | Reload instructions, themes, prompts, skills, and enabled extensions. |
 | `/login [provider]` | Sign in to a subscription provider. |
 | `/logout [provider]` | Remove its stored credential. |
@@ -406,7 +413,6 @@ exec_timeout_secs = 120
 max_output_bytes = 1048576
 context_files = true
 offline = false
-show_turn_cost = false
 
 # Optional budget controls, expressed in integer microdollars.
 # max_cost_microdollars = 500000
@@ -425,7 +431,7 @@ Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, 
 | Area | Options |
 | --- | --- |
 | Provider auth | `--login`, `--logout`, `--headless` |
-| Frontend | `--print`, `--plain`, `--color`, `--mouse`, `--show-reasoning`, `--show-turn-cost` |
+| Frontend | `--print`, `--plain`, `--color`, `--mouse`, `--show-reasoning` |
 | Session | `--continue`, `--resume`, `--session-dir`, `sessions ...` |
 | Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |

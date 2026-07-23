@@ -38,16 +38,21 @@ painting over the user's terminal background:
 
 Each bundled theme opts into adaptive color balancing. Ygg keeps its design
 hue while moving RGB foregrounds toward a contrast-safe luminance for the
-detected light, dark, or unknown terminal profile. It never queries the
-terminal background through an input-producing escape sequence.
+detected light, dark, or unknown terminal profile. Detection first honors
+`YGG_COLOR_SCHEME` and `COLORFGBG`; in the interactive TUI, when those are
+absent, Ygg sends a short OSC 11 background query after entering raw mode and
+uses the response when the terminal provides one.
 
 Every pack theme also retains the terminal's own default canvas: none sets a
 global background fill. Cards and bands may use a bounded, low-luminance
-semantic tint when Ygg knows the terminal is light or dark. With an unknown
-profile those tints resolve to `default`, so the recipe never guesses a canvas
-color. RGB accents are quantized through the active ANSI 256 or ANSI 16 palette,
-and plain mode removes styling and selects an explicit `[glyphs_ascii]` set
-without changing the visible text.
+semantic tint when Ygg knows the terminal is light or dark. If the profile
+remains unknown after the startup checks, those tints resolve to `default`, so
+the recipe never guesses a canvas color. The built-in default and bundled themes
+share a standard technical palette for code and diffs: syntax roles own
+foreground colors, diff rows own quiet add/delete backgrounds, and `+`/`-`
+markers carry the strongest hue. RGB accents are quantized through the active
+ANSI 256 or ANSI 16 palette, and plain mode removes styling and selects an
+explicit `[glyphs_ascii]` set without changing the visible text.
 
 User prompts are the deliberate exception to a completely unpainted canvas:
 each persisted, model-bound prompt paints its complete inner semantic row with

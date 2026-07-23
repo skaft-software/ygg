@@ -78,7 +78,9 @@ An entry has this stable envelope:
 `skill_resource_read`, and `skill_deactivated`. Prompt-template selection keeps
 the chosen name and content hash outside model-visible context. Skill entries
 make explicit activation and lazily loaded resources resumable; compaction
-records snapshot the active skill state.
+records snapshot the active skill state and cumulative Pi-compatible
+`details.readFiles`/`details.modifiedFiles` lists. Those detail fields default
+to empty lists when older session records omit them.
 
 `metadata.prompt_color` is the normalized sRGB prompt-gutter colour assigned
 at the original user append. It is inert presentation data and is never sent

@@ -172,10 +172,13 @@ initialization:
 
 All TUI contributions contain plain text and optional semantic style roles.
 Raw terminal escape sequences are not part of the extension API.
-Tool-renderer segments are a live presentation layer: Ygg sanitizes and styles
-them against the current theme in both compact and expanded views, while the
-original tool result remains the immutable evidence used by expansion, copy,
-session persistence, and export.
+Tool-renderer segments are accepted and retained as internal extension
+provenance, but are never rendered in the TUI or exposed through Ctrl+O,
+`/tool`, `/verbose`, transcript selection, or copy. The original tool result
+remains immutable evidence for the agent's required protocol result,
+session persistence, and export redaction policy; it is not a presentation
+surface. Extension header, status, footer, notification, and confirmation
+features remain separate Ygg UI surfaces.
 
 In the interactive frontend, confirmation requests made while an extension
 tool or command is running open a typed allow/deny panel. Dropping the request

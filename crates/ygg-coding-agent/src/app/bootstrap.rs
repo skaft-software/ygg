@@ -10,10 +10,7 @@ use anyhow::Context;
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
 use sha2::{Digest as _, Sha256};
-use ygg_agent::{
-    Agent, AgentConfig, CompletionPolicy, CoreTools, EntryValue, ExtensionHost, Session,
-    SkillRegistry,
-};
+use ygg_agent::{Agent, AgentConfig, CoreTools, EntryValue, ExtensionHost, Session, SkillRegistry};
 use ygg_ai::{
     AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model, ModelCatalog, ModelId,
     ModelLimits, ModelSpec, OpenAiChatReasoningMode, Pricing, PricingTier, Protocol,
@@ -3160,15 +3157,6 @@ fn configured_extensions(
     (extensions, executable_extensions)
 }
 
-/// Construct the owning Agent only after model and session selection complete.
-fn completion_policy_for_model(model: &Model) -> CompletionPolicy {
-    if model.endpoint.id.0 == crate::auth::custom::ENDPOINT_ID {
-        CompletionPolicy::TerminalGate
-    } else {
-        CompletionPolicy::Natural
-    }
-}
-
 pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> anyhow::Result<App> {
     let Bootstrap {
         mut config,
@@ -3238,7 +3226,6 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         cache_retention: config.cache_retention,
         session_id: None,
     })?;
-    agent.set_completion_policy(completion_policy_for_model(&model));
     agent.set_prompt_model_source(Some(crate::tui::theme::model_lab(&model).key().to_owned()));
     agent.set_prompt_color(Some(crate::tui::theme::prompt_color_for_model(&model)));
     agent.set_compaction_model(compact_model);
@@ -3377,7 +3364,6 @@ pub fn rebuild_app(
         cache_retention: config.cache_retention,
         session_id: None,
     })?;
-    agent.set_completion_policy(completion_policy_for_model(&model));
     agent.set_prompt_model_source(Some(crate::tui::theme::model_lab(&model).key().to_owned()));
     agent.set_prompt_color(Some(crate::tui::theme::prompt_color_for_model(&model)));
     agent.set_compaction_model(compact_model);
