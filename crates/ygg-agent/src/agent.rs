@@ -11,10 +11,10 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use ygg_ai::{
-    AiClient, AiError, AssistantPart, AudioPayload, CacheRetention, CompatibilityMode, Cost,
-    ImageSource, Media, Message, Model, OutputFormat, OutputModalities, ReasoningConfig, Request,
-    StopReason, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage,
-    UserMessage, UserPart, PICODOLLARS_PER_MICRODOLLAR,
+    AiClient, AiError, AssistantMessage, AssistantPart, AudioPayload, CacheRetention,
+    CompatibilityMode, Cost, ImageSource, Media, Message, Model, OutputFormat, OutputModalities,
+    ReasoningConfig, Request, StopReason, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolResult,
+    ToolResultPart, Usage, UserMessage, UserPart, PICODOLLARS_PER_MICRODOLLAR,
 };
 
 use crate::context::{ContextSnapshot, ContextTracker};
@@ -43,6 +43,16 @@ pub enum AgentError {
     /// The inference layer failed.
     #[error("ai error: {0}")]
     Ai(#[from] AiError),
+    /// Repeated non-timeout network failures exhausted automatic recovery.
+    #[error(
+        "network connection failed after {retries} retries. Are you connected to the internet? ({detail})"
+    )]
+    NetworkUnavailable {
+        /// Number of replacement attempts made after the initial request.
+        retries: usize,
+        /// Sanitized transport detail for diagnostics.
+        detail: String,
+    },
     /// Two tools were registered under the same name.
     #[error("duplicate tool name registered: {0}")]
     DuplicateTool(String),
@@ -379,21 +389,21 @@ const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 16 * 1024;
 /// Leave room for a visible answer after token-budget reasoning when the model
 /// advertises enough output capacity.
 const REASONING_ANSWER_RESERVE: u64 = 1024;
-/// Aggregate model-visible tool-result budget for one model turn.
-const TOOL_RESULT_TURN_BUDGET: usize = 16 * 1024;
 /// Bound actual tool executions emitted in one assistant turn. Every excess
 /// call still receives a compact error result so provider pairing remains valid.
 const MAX_TOOL_CALLS_PER_TURN: usize = 32;
+const FAILED_TURN_CONTEXT_MARKER: &str =
+    "The previous assistant turn failed before completion. Do not continue that request unless the user asks again.";
 const TOOL_TRUNCATION_MARKER: &str = "\n[tool output truncated]\n";
 /// Maximum retries for a transient provider failure. A replacement attempt is
 /// safe even after deltas were received: streamed output is provisional, the
 /// assistant message is persisted only after `Finished`, and tools are not
 /// executed until that point.
 const MAX_PROVIDER_RETRIES: usize = 3;
-/// A failed connection/header exchange is expensive (DNS/TCP/TLS/proxy waits)
-/// and has not produced model output. One visible replacement attempt avoids
-/// multiplying a long network outage into minutes of apparent UI silence.
-const MAX_CONNECT_RETRIES: usize = 1;
+/// Non-timeout network failures are usually short-lived connection loss. Five
+/// visible, cancellable replacement attempts give the connection time to
+/// recover without charging usage or consuming an autonomous model turn.
+const MAX_NETWORK_RETRIES: usize = 5;
 const COMPLETION_CONFIRMATION_PROMPT: &str = r#"A candidate final response was produced. Based only on the current bounded state and latest verification evidence, report whether the requested task is actually complete. Do not rerun commands merely to confirm. Respond with exactly one JSON object and no Markdown or prose:
 {"complete":true|false,"reason":"concise evidence or remaining work"}"#;
 
@@ -480,7 +490,7 @@ fn reasoning_token_budget(model: &Model, reasoning: &ReasoningConfig) -> u64 {
                 })
             })
             .unwrap_or_default(),
-        ReasoningConfig::Off => 0,
+        ReasoningConfig::Off | ReasoningConfig::On => 0,
     }
 }
 
@@ -554,11 +564,8 @@ fn cancelled_tool_error() -> ToolError {
     )
 }
 
-fn pending_tool_state(
-    session: &Session,
-) -> Option<(Vec<ToolCall>, HashSet<ygg_ai::ToolCallId>, usize)> {
+fn pending_tool_state(session: &Session) -> Option<(Vec<ToolCall>, HashSet<ygg_ai::ToolCallId>)> {
     let mut persisted = HashSet::new();
-    let mut persisted_text_bytes = 0usize;
     let mut cursor = session.head_ref();
     while let Some(id) = cursor {
         let entry = session.entry(id)?;
@@ -572,7 +579,7 @@ fn pending_tool_state(
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                return (!calls.is_empty()).then_some((calls, persisted, persisted_text_bytes));
+                return (!calls.is_empty()).then_some((calls, persisted));
             }
             EntryValue::Message(Message::User(user)) => {
                 for part in &user.content {
@@ -580,11 +587,6 @@ fn pending_tool_state(
                         continue;
                     };
                     persisted.insert(result.tool_call_id.clone());
-                    for content in &result.content {
-                        if let ToolResultPart::Text(text) = content {
-                            persisted_text_bytes = persisted_text_bytes.saturating_add(text.len());
-                        }
-                    }
                 }
             }
             EntryValue::Compaction { .. }
@@ -599,22 +601,20 @@ fn pending_tool_state(
     None
 }
 
-fn truncate_tool_text(text: &str, budget: usize) -> String {
-    if text.len() <= budget {
+fn truncate_tool_text(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
         return text.to_owned();
     }
-    // Once the aggregate budget is exhausted, later calls carry an empty
-    // result rather than one new omission marker each.
-    if budget == 0 {
+    if limit == 0 {
         return String::new();
     }
-    if budget <= TOOL_TRUNCATION_MARKER.len() {
-        return TOOL_TRUNCATION_MARKER[..budget].to_owned();
+    if limit <= TOOL_TRUNCATION_MARKER.len() {
+        return TOOL_TRUNCATION_MARKER[..limit].to_owned();
     }
-    let available = budget - TOOL_TRUNCATION_MARKER.len();
+    let available = limit - TOOL_TRUNCATION_MARKER.len();
     let head = available / 2;
     let tail = available - head;
-    let mut result = String::with_capacity(budget);
+    let mut result = String::with_capacity(limit);
     let mut head_end = head.min(text.len());
     while head_end > 0 && !text.is_char_boundary(head_end) {
         head_end -= 1;
@@ -630,17 +630,14 @@ fn truncate_tool_text(text: &str, budget: usize) -> String {
 }
 
 fn persist_pending_cancellations(session: &mut Session) -> Result<(), AgentError> {
-    let Some((calls, persisted, persisted_text_bytes)) = pending_tool_state(session) else {
+    let Some((calls, persisted)) = pending_tool_state(session) else {
         return Ok(());
     };
     let unresolved = calls
         .into_iter()
         .filter(|call| !persisted.contains(&call.id));
-    let mut tool_result_budget = TOOL_RESULT_TURN_BUDGET.saturating_sub(persisted_text_bytes);
     for call in unresolved {
         let text = cancelled_tool_error().message;
-        let text = truncate_tool_text(&text, tool_result_budget);
-        tool_result_budget = tool_result_budget.saturating_sub(text.len());
         session.append(EntryValue::Message(Message::User(UserMessage {
             content: vec![UserPart::ToolResult(ToolResult {
                 tool_call_id: call.id,
@@ -652,12 +649,33 @@ fn persist_pending_cancellations(session: &mut Session) -> Result<(), AgentError
     Ok(())
 }
 
+fn close_failed_turn(session: &mut Session, model: &Model) -> Result<(), AgentError> {
+    let ends_with_user = {
+        let context = session.context_ref()?;
+        matches!(context.last(), Some(Message::User(_)))
+    };
+    if ends_with_user {
+        session.append(EntryValue::Message(Message::Assistant(AssistantMessage {
+            content: vec![AssistantPart::Text(FAILED_TURN_CONTEXT_MARKER.to_owned())],
+            model: model.spec.id.clone(),
+            protocol: model.spec.protocol,
+        })))?;
+    }
+    Ok(())
+}
+
 fn retryable_before_generation(error: &AiError) -> bool {
     match error {
         AiError::Http(error) => error.is_safe_to_retry(),
-        AiError::Transport(error) => error.phase == ygg_ai::TransportPhase::ConnectOrHeaders,
+        AiError::Transport(error) => {
+            !error.timeout && error.phase == ygg_ai::TransportPhase::ConnectOrHeaders
+        }
         _ => false,
     }
+}
+
+fn is_transient_network_failure(error: &AiError) -> bool {
+    matches!(error, AiError::Transport(transport) if !transport.timeout)
 }
 
 fn looks_like_context_error(error: &AiError) -> bool {
@@ -679,7 +697,7 @@ fn retryable_stream_start(error: &AiError) -> bool {
         || matches!(
             error,
             AiError::Transport(transport)
-                if transport.phase == ygg_ai::TransportPhase::Body
+                if !transport.timeout && transport.phase == ygg_ai::TransportPhase::Body
         )
         || matches!(error, AiError::Provider(_))
         || matches!(
@@ -692,19 +710,13 @@ fn retryable_stream_start(error: &AiError) -> bool {
 }
 
 fn provider_retry_limit(error: &AiError) -> usize {
-    if matches!(
-        error,
-        AiError::Transport(transport)
-            if transport.phase == ygg_ai::TransportPhase::ConnectOrHeaders
-    ) {
-        if matches!(error, AiError::Transport(transport) if transport.timeout) {
-            // Retrying a complete response-header deadline can double a long
-            // period with no provider progress. Let the user explicitly retry
-            // after the first bounded timeout instead.
-            0
-        } else {
-            MAX_CONNECT_RETRIES
-        }
+    if matches!(error, AiError::Transport(transport) if transport.timeout) {
+        // A timeout already consumed the configured wait budget. Repeating it
+        // automatically would turn one bounded deadline into prolonged UI
+        // silence; let the user explicitly retry instead.
+        0
+    } else if is_transient_network_failure(error) {
+        MAX_NETWORK_RETRIES
     } else {
         MAX_PROVIDER_RETRIES
     }
@@ -723,10 +735,26 @@ fn retry_after(error: &AiError, attempt: usize) -> Duration {
 }
 
 fn provider_retry_diagnostic(model: &Model, error: &AiError) -> String {
-    format!(
+    let context = format!(
         "provider={} model={}: {error}",
         model.endpoint.id.0, model.spec.id.0
-    )
+    );
+    if is_transient_network_failure(error) {
+        format!("Network connection lost. Are you connected to the internet? {context}")
+    } else {
+        context
+    }
+}
+
+fn provider_failure(error: AiError, retries: usize) -> AgentError {
+    if is_transient_network_failure(&error) {
+        AgentError::NetworkUnavailable {
+            retries,
+            detail: error.to_string(),
+        }
+    } else {
+        error.into()
+    }
 }
 
 async fn execute_recovery_call(
@@ -1486,8 +1514,7 @@ impl Agent {
         &mut self,
         previous_run_was_dropped: bool,
     ) -> Result<(), AgentError> {
-        let Some((calls, persisted, persisted_text_bytes)) = pending_tool_state(&self.session)
-        else {
+        let Some((calls, persisted)) = pending_tool_state(&self.session) else {
             return Ok(());
         };
         // Keep each call's original assistant-turn index. Filtering first
@@ -1517,7 +1544,6 @@ impl Agent {
         let sandbox = self.sandbox.clone();
         let tool_scope = self.tool_scope.clone();
         let tool_call_hooks = self.extensions.tool_call_hooks.clone();
-        let mut tool_result_budget = TOOL_RESULT_TURN_BUDGET.saturating_sub(persisted_text_bytes);
         for (call_index, call) in unresolved {
             let result = if call_index >= MAX_TOOL_CALLS_PER_TURN {
                 Err(ToolError::new(
@@ -1552,15 +1578,10 @@ impl Agent {
                 .append(EntryValue::Message(Message::User(UserMessage {
                     content: vec![UserPart::ToolResult(ToolResult {
                         tool_call_id: call.id,
-                        content: vec![ToolResultPart::Text({
-                            let truncated = truncate_tool_text(&text, tool_result_budget);
-                            tool_result_budget = if text.len() > tool_result_budget {
-                                0
-                            } else {
-                                tool_result_budget.saturating_sub(text.len())
-                            };
-                            truncated
-                        })],
+                        content: vec![ToolResultPart::Text(truncate_tool_text(
+                            &text,
+                            sandbox.max_output_bytes,
+                        ))],
                         is_error,
                     })],
                 })))?;
@@ -1862,7 +1883,9 @@ impl Agent {
                         }
                         continue 'run;
                     }
-                    Err(error) => break 'run FinishReason::Failed(error.into()),
+                    Err(error) => {
+                        break 'run FinishReason::Failed(provider_failure(error, stream_retries));
+                    }
                     Ok(None) => break 'run FinishReason::Aborted,
                     Ok(Some(s)) => s,
                 };
@@ -1927,13 +1950,13 @@ impl Agent {
                                         attempt_saw_generation = false;
                                         continue 'consume;
                                     }
-                                    Ok(None) => break Err(FinishReason::Aborted),
+                                    Ok(None) => break 'consume Err(FinishReason::Aborted),
                                     Err(error) => break Err(FinishReason::Failed(error.into())),
                                 }
                             }
                             break Err(FinishReason::Failed(error.into()));
                         }
-                        Next::Event(Some(Err(error))) => {
+                        Next::Event(Some(Err(mut error))) => {
                             if !attempt_saw_generation
                                 && context_retries < MAX_PROVIDER_RETRIES
                                 && looks_like_context_error(&error)
@@ -1970,16 +1993,18 @@ impl Agent {
                                     }
                                 }
                             }
-                            if !attempt_saw_generation
-                                && stream_retries < MAX_PROVIDER_RETRIES
+                            while (!attempt_saw_generation
+                                || is_transient_network_failure(&error))
+                                && stream_retries < provider_retry_limit(&error)
                                 && retryable_stream_start(&error)
                             {
+                                let retry_limit = provider_retry_limit(&error);
                                 let delay = retry_after(&error, stream_retries);
                                 stream_retries += 1;
                                 stream_context.provider_retry();
                                 let ev = AgentEvent::ProviderRetry {
                                     attempt: stream_retries,
-                                    max_attempts: MAX_PROVIDER_RETRIES,
+                                    max_attempts: retry_limit,
                                     delay,
                                     error: provider_retry_diagnostic(&model, &error),
                                 };
@@ -2003,11 +2028,14 @@ impl Agent {
                                         attempt_saw_generation = false;
                                         continue 'consume;
                                     }
-                                    Ok(None) => break Err(FinishReason::Aborted),
-                                    Err(error) => break Err(FinishReason::Failed(error.into())),
+                                    Ok(None) => break 'consume Err(FinishReason::Aborted),
+                                    Err(next_error) => error = next_error,
                                 }
                             }
-                            break Err(FinishReason::Failed(error.into()));
+                            break Err(FinishReason::Failed(provider_failure(
+                                error,
+                                stream_retries,
+                            )));
                         }
                         Next::Event(Some(Ok(event))) => {
                             stream_context.observe_stream(&event);
@@ -2260,7 +2288,6 @@ impl Agent {
                 }
 
                 // ── Execute tools sequentially, in emitted order ───────────
-                let mut tool_result_budget = TOOL_RESULT_TURN_BUDGET;
                 for (call_index, call) in calls.into_iter().enumerate() {
                     let parsed = call.arguments_value();
                     stream_context.tool_started();
@@ -2420,12 +2447,12 @@ impl Agent {
                         Ok(output) => (output.text.as_str(), false),
                         Err(error) => (error.message.as_str(), true),
                     };
-                    let text = truncate_tool_text(raw_text, tool_result_budget);
-                    tool_result_budget = if raw_text.len() > tool_result_budget {
-                        0
-                    } else {
-                        tool_result_budget.saturating_sub(raw_text.len())
-                    };
+                    // Every tool owns the same configured output allowance.
+                    // A large early result must never starve later successful
+                    // calls in the same model turn. Core tools already return
+                    // bounded, continuation-aware output; this defensive cap
+                    // also covers third-party tools.
+                    let text = truncate_tool_text(raw_text, sandbox.max_output_bytes);
                     let tool_result = ToolResult {
                         tool_call_id: call.id.clone(),
                         content: vec![ToolResultPart::Text(text)],
@@ -2519,6 +2546,14 @@ impl Agent {
             // A fully driven prompt always leaves an explicit durable restore
             // point, including controlled abort/max-turn/failure outcomes. A
             // dropped stream is not complete and never reaches this boundary.
+            // Failed provider turns also need an assistant boundary. Without
+            // one, the next prompt is appended after the unresolved user task
+            // and models commonly continue the stale request instead.
+            if matches!(reason, FinishReason::Failed(_)) {
+                if let Err(error) = close_failed_turn(session, &model) {
+                    reason = FinishReason::Failed(error);
+                }
+            }
             let checkpoint_usage = (completed_turns > 0).then_some(run_usage);
             let checkpoint_cost = model
                 .spec
@@ -2640,6 +2675,32 @@ mod tests {
             message: "response headers stalled".into(),
         });
         assert_eq!(provider_retry_limit(&error), 0);
+    }
+
+    #[test]
+    fn body_timeout_is_not_automatically_retried() {
+        let error = AiError::Transport(ygg_ai::TransportError {
+            phase: ygg_ai::TransportPhase::Body,
+            timeout: true,
+            message: "stream idle deadline reached".into(),
+        });
+        assert!(!retryable_stream_start(&error));
+        assert_eq!(provider_retry_limit(&error), 0);
+    }
+
+    #[test]
+    fn non_timeout_network_failure_gets_five_retries_and_friendly_failure() {
+        let error = AiError::Transport(ygg_ai::TransportError {
+            phase: ygg_ai::TransportPhase::ConnectOrHeaders,
+            timeout: false,
+            message: "connection refused".into(),
+        });
+        assert!(retryable_before_generation(&error));
+        assert_eq!(provider_retry_limit(&error), 5);
+
+        let failure = provider_failure(error, 5).to_string();
+        assert!(failure.contains("Are you connected to the internet?"));
+        assert!(failure.contains("connection refused"));
     }
 
     #[test]

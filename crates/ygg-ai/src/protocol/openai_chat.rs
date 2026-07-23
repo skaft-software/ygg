@@ -15,8 +15,8 @@ use crate::stream::{
 use crate::types::{
     AssistantMessage, AssistantPart, AudioFormat, AudioMedia, AudioPayload, AudioVoice,
     ImageSource, Media, Message, OpenAiChatReasoningMode, OutputFormat, OutputModalities, Protocol,
-    ProviderMediaRef, ReasoningConfig, ReasoningPart, Request, Response, StopReason, ToolCall,
-    ToolCallId, ToolChoice, ToolResultPart, Usage, UserPart,
+    ProviderMediaRef, ReasoningConfig, ReasoningEffort, ReasoningPart, Request, Response,
+    StopReason, ToolCall, ToolCallId, ToolChoice, ToolResultPart, Usage, UserPart,
 };
 use crate::validate::{normalize_request_reasoning, validate_request};
 
@@ -330,6 +330,55 @@ struct ChatChunkFunction {
 
 // --- Core Codec Implementations ---
 
+fn provider_effort(value: &str) -> Option<ReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "minimal" | "min" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" | "med" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        "xhigh" | "x-high" | "extra_high" => Some(ReasoningEffort::Xhigh),
+        "max" => Some(ReasoningEffort::Max),
+        _ => None,
+    }
+}
+
+fn provider_reasoning_value(
+    values: &[String],
+    default: Option<&str>,
+    reasoning: &ReasoningConfig,
+) -> Option<String> {
+    let find = |predicate: fn(&str) -> bool| {
+        values
+            .iter()
+            .find(|value| predicate(value))
+            .map(ToOwned::to_owned)
+    };
+    match reasoning {
+        ReasoningConfig::Off => find(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "none" | "off" | "disabled" | "false"
+            )
+        }),
+        ReasoningConfig::On => find(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "default" | "on" | "enabled" | "true"
+            )
+        })
+        .or_else(|| {
+            default
+                .filter(|candidate| values.iter().any(|value| value == *candidate))
+                .map(ToOwned::to_owned)
+        }),
+        ReasoningConfig::Effort(effort) => values
+            .iter()
+            .find(|value| provider_effort(value) == Some(*effort))
+            .map(ToOwned::to_owned),
+        ReasoningConfig::Budget(_) => None,
+    }
+}
+
 /// Builds the OpenAI Chat Completions HTTP request parts.
 pub(crate) fn build_request(
     model: &crate::catalog::Model,
@@ -349,13 +398,18 @@ pub(crate) fn build_request(
     // 2. Map system prompt
     let reasoning_capability = model.spec.capabilities.reasoning.as_ref();
     let has_reasoning = reasoning_capability.is_some();
+    let reasoning_mode = reasoning_capability.map(|capability| &capability.openai_chat_mode);
     let deepseek_thinking = matches!(
-        reasoning_capability.map(|capability| capability.openai_chat_mode),
+        reasoning_mode,
         Some(OpenAiChatReasoningMode::DeepSeekThinking)
     );
-    let openrouter_reasoning = matches!(
-        reasoning_capability.map(|capability| capability.openai_chat_mode),
-        Some(OpenAiChatReasoningMode::OpenRouter)
+    let openrouter_reasoning = matches!(reasoning_mode, Some(OpenAiChatReasoningMode::OpenRouter));
+    let provider_uses_system_message = matches!(
+        reasoning_mode,
+        Some(OpenAiChatReasoningMode::ProviderValues {
+            system_message: true,
+            ..
+        })
     );
     let mut messages = Vec::new();
     let cache_marker = if matches!(
@@ -380,10 +434,8 @@ pub(crate) fn build_request(
         );
         if has_reasoning
             && !deepseek_thinking
-            && !matches!(
-                reasoning_capability.map(|capability| capability.openai_chat_mode),
-                Some(OpenAiChatReasoningMode::SystemMessage)
-            )
+            && !matches!(reasoning_mode, Some(OpenAiChatReasoningMode::SystemMessage))
+            && !provider_uses_system_message
         {
             messages.push(ChatCompletionsMessage::Developer { content });
         } else {
@@ -647,9 +699,18 @@ pub(crate) fn build_request(
     };
 
     // 5. Reasoning configuration
-    let reasoning_effort = if has_reasoning && !openrouter_reasoning {
+    let provider_reasoning = match reasoning_mode {
+        Some(OpenAiChatReasoningMode::ProviderValues {
+            values, default, ..
+        }) => Some((values, default.as_deref())),
+        _ => None,
+    };
+    let reasoning_effort = if let Some((values, default)) = provider_reasoning {
+        provider_reasoning_value(values, default, &req.reasoning)
+    } else if has_reasoning && !openrouter_reasoning {
         match req.reasoning {
             ReasoningConfig::Off => None,
+            ReasoningConfig::On => None,
             ReasoningConfig::Effort(e) => Some(match e {
                 // DeepSeek accepts high/low/medium/max/xhigh but not
                 // `minimal`; map Ygg's portable minimum to its lowest valid
@@ -681,13 +742,16 @@ pub(crate) fn build_request(
                 }
                 .to_string(),
             }),
-            ReasoningConfig::Off | ReasoningConfig::Budget(_) => None,
+            ReasoningConfig::Off | ReasoningConfig::On | ReasoningConfig::Budget(_) => None,
         }
     } else {
         None
     };
     let thinking = deepseek_thinking.then_some(ChatThinkingConfig {
-        r#type: if matches!(&req.reasoning, ReasoningConfig::Effort(_)) {
+        r#type: if matches!(
+            &req.reasoning,
+            ReasoningConfig::On | ReasoningConfig::Effort(_)
+        ) {
             "enabled"
         } else {
             // DeepSeek defaults thinking to enabled, so omitting this field
@@ -2360,6 +2424,67 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
         assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn provider_reasoning_values_are_preserved_on_the_wire() {
+        let mut model = make_test_model(false, false, false, true, true, false);
+        let capability = Arc::make_mut(&mut model.spec)
+            .capabilities
+            .reasoning
+            .as_mut()
+            .unwrap();
+        capability.control = crate::types::ReasoningControl::Toggle;
+        capability.openai_chat_mode = OpenAiChatReasoningMode::ProviderValues {
+            values: vec!["none".into(), "default".into()],
+            default: Some("default".into()),
+            system_message: true,
+        };
+        let mut req = Request {
+            system: Some("system prompt".to_string()),
+            messages: vec![Message::User(UserMessage {
+                content: vec![UserPart::Text("hello".to_string())],
+            })],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: None,
+            temperature: None,
+            stop: vec![],
+            reasoning: ReasoningConfig::Off,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
+        };
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["reasoning_effort"], "none");
+
+        req.reasoning = ReasoningConfig::On;
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["reasoning_effort"], "default");
+
+        let capability = Arc::make_mut(&mut model.spec)
+            .capabilities
+            .reasoning
+            .as_mut()
+            .unwrap();
+        capability.control = crate::types::ReasoningControl::Effort;
+        capability.openai_chat_mode = OpenAiChatReasoningMode::ProviderValues {
+            values: vec!["none".into(), "low".into(), "high".into()],
+            default: Some("low".into()),
+            system_message: true,
+        };
+        capability.min_effort = ReasoningEffort::Low;
+        capability.max_effort = ReasoningEffort::High;
+        req.reasoning = ReasoningConfig::Effort(ReasoningEffort::High);
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
         assert_eq!(body["reasoning_effort"], "high");
     }
 

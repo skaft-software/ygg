@@ -20,8 +20,8 @@ pub const MODIFIER_OPTION: ModifierKey = "option";
 /// Currently returns false — crossterm's KeyEvent.modifiers should be
 /// used instead for key event modifier detection.
 pub fn is_native_modifier_pressed(_key: ModifierKey) -> bool {
-    // TODO: Implement macOS modifier detection via CGEventSource if needed.
-    // For now, crossterm's KeyEvent provides modifier state per-event,
-    // which covers the primary use case (shift+enter detection, etc.).
+    // This compatibility shim is intentionally inert. Crossterm supplies the
+    // modifier state on each KeyEvent, which is the authoritative path used by
+    // the editor and avoids a platform-specific global-key-state dependency.
     false
 }

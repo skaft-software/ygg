@@ -26,7 +26,7 @@ use ygg_ai::{
     ToolCall, UserMessage, UserPart,
 };
 
-const MAX_CONNECT_ATTEMPTS_FOR_TEST: usize = 2;
+const MAX_CONNECT_ATTEMPTS_FOR_TEST: usize = 6;
 
 // ── Scripted SSE bodies (Anthropic Messages wire shapes) ───────────────────
 
@@ -206,6 +206,22 @@ impl Respond for RetryInitialOpen {
         } else {
             ResponseTemplate::new(200)
                 .set_body_string(text_turn("recovered"))
+                .insert_header("content-type", "text/event-stream")
+        }
+    }
+}
+
+struct FailThenSucceed {
+    calls: AtomicUsize,
+}
+
+impl Respond for FailThenSucceed {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            ResponseTemplate::new(400).set_body_string(r#"{"error":{"message":"request failed"}}"#)
+        } else {
+            ResponseTemplate::new(200)
+                .set_body_string(text_turn("hello from the new turn"))
                 .insert_header("content-type", "text/event-stream")
         }
     }
@@ -689,8 +705,12 @@ async fn repeated_header_transport_failure_is_visible_and_bounded() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(retries.len(), 1);
-    assert_eq!((retries[0].0, retries[0].1), (1, 1));
+    assert_eq!(retries.len(), 5);
+    assert_eq!((retries[0].0, retries[0].1), (1, 5));
+    assert_eq!((retries[4].0, retries[4].1), (5, 5));
+    assert!(retries
+        .iter()
+        .all(|(_, _, error)| error.contains("Are you connected to the internet?")));
     assert!(retries[0].2.contains("provider=test model=scripted"));
     assert!(retries[0].2.contains("ConnectOrHeaders"));
     assert!(
@@ -701,6 +721,16 @@ async fn repeated_header_transport_failure_is_visible_and_bounded() {
     assert!(!retries[0].2.contains(&uri));
     assert!(!retries[0].2.contains("test-key"));
     assert_eq!(calls.load(Ordering::SeqCst), MAX_CONNECT_ATTEMPTS_FOR_TEST);
+
+    let FinishReason::Failed(error) = assert_single_run_finished(&events) else {
+        unreachable!("failure was asserted above")
+    };
+    let failure = error.to_string();
+    assert!(failure.contains("after 5 retries"), "{failure}");
+    assert!(
+        failure.contains("Are you connected to the internet?"),
+        "{failure}"
+    );
 }
 
 #[tokio::test]
@@ -747,7 +777,7 @@ async fn connect_retry_delay_is_cancellable() {
 }
 
 #[tokio::test]
-async fn body_disconnect_after_output_is_not_retried() {
+async fn body_disconnect_after_output_discards_partial_and_retries_network_loss() {
     let (uri, calls) = interrupted_body_server(
         partial_text_turn("discarded partial"),
         text_turn("recovered exactly once"),
@@ -763,7 +793,7 @@ async fn body_disconnect_after_output_is_not_retried() {
     let events = collect(&mut run).await;
     assert!(matches!(
         assert_single_run_finished(&events),
-        FinishReason::Failed(_)
+        FinishReason::Completed
     ));
     assert!(events.iter().any(|event| matches!(
         event,
@@ -772,21 +802,95 @@ async fn body_disconnect_after_output_is_not_retried() {
             text,
         } if text.contains("discarded partial")
     )));
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, AgentEvent::ProviderRetry { .. })));
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    drop(run);
-    let assistant_messages = agent
-        .session()
-        .entries()
-        .iter()
-        .filter(|entry| matches!(entry.value, EntryValue::Message(Message::Assistant(_))))
-        .count();
-    assert_eq!(
-        assistant_messages, 0,
-        "partial attempt must neither be persisted nor replayed"
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ProviderRetry {
+            attempt: 1,
+            max_attempts: 5,
+            error,
+            ..
+        } if error.contains("Are you connected to the internet?")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text,
+        } if text.contains("recovered exactly once")
+    )));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn body_disconnect_before_output_retries_as_network_loss() {
+    let (uri, calls) =
+        interrupted_body_server(msg_start(), text_turn("recovered after reconnect")).await;
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let session_path = session_dir.path().join("session.jsonl");
+    let mut agent = build_agent(&uri, &workspace, &session_path, Some(4));
+
+    let mut run = agent.prompt("recover safely").await.unwrap();
+    let events = collect(&mut run).await;
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ProviderRetry {
+            attempt: 1,
+            max_attempts: 5,
+            error,
+            ..
+        } if error.contains("Are you connected to the internet?")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text,
+        } if text.contains("recovered after reconnect")
+    )));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn failed_provider_turn_does_not_replay_old_intent_on_next_prompt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(FailThenSucceed {
+            calls: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let mut agent = build_agent(
+        &server.uri(),
+        &workspace,
+        &session_dir.path().join("failed-turn.jsonl"),
+        Some(4),
     );
+
+    assert!(agent.complete("old request").await.is_err());
+    let output = agent.complete("hi").await.unwrap();
+    assert_eq!(output.text, "hello from the new turn");
+
+    let requests = wire_requests(&server).await;
+    assert_eq!(requests.len(), 2);
+    let messages = requests[1]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "user");
+    assert!(messages[0].to_string().contains("old request"));
+    assert_eq!(messages[1]["role"], "assistant");
+    assert!(messages[1].to_string().contains("failed before completion"));
+    assert_eq!(messages[2]["role"], "user");
+    assert!(messages[2].to_string().contains("hi"));
 }
 
 #[tokio::test]
@@ -2460,7 +2564,7 @@ async fn crash_recovery_preserves_the_live_tool_call_execution_cap() {
 }
 
 #[tokio::test]
-async fn tool_results_share_one_strict_turn_budget() {
+async fn batched_tool_results_keep_independent_bounded_outputs() {
     let h = harness(
         vec![
             tool_turn(&[
@@ -2494,11 +2598,13 @@ async fn tool_results_share_one_strict_turn_budget() {
         .iter()
         .map(|result| result["content"][0]["text"].as_str().unwrap().len())
         .sum();
-    assert!(
-        text_bytes <= 16 * 1024,
-        "aggregate tool text was {text_bytes}"
-    );
+    assert_eq!(text_bytes, 30_000);
     assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|result| {
+        result["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.len() == 10_000)
+    }));
 }
 
 #[tokio::test]
@@ -3097,8 +3203,17 @@ async fn unsupported_reasoning_fails_through_ygg_ai_validation() {
         requests.is_empty(),
         "request must be rejected before send: {requests:?}"
     );
-    // And no assistant turn was persisted.
-    assert_eq!(agent.session().entries().len(), 1);
+    // No provider-produced assistant turn was persisted, but the failed user
+    // turn is closed by the durable synthetic boundary used on the next run.
+    assert_eq!(agent.session().entries().len(), 2);
+    assert!(matches!(
+        &agent.session().entries()[1].value,
+        EntryValue::Message(Message::Assistant(message))
+            if message.content.iter().any(|part| matches!(
+                part,
+                AssistantPart::Text(text) if text.contains("failed before completion")
+            ))
+    ));
 }
 
 #[tokio::test]

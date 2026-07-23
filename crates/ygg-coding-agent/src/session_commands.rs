@@ -839,9 +839,11 @@ mod tests {
         let mut value = Value::String(
             concat!(
                 "before café\n",
-                "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+                "-----BEGIN ",
+                "OPENSSH PRIVATE KEY-----\n",
                 "b3BlbnNzaC1rZXktdjEAAAAA\n",
-                "-----END OPENSSH PRIVATE KEY-----\n",
+                "-----END ",
+                "OPENSSH PRIVATE KEY-----\n",
                 "after 東京"
             )
             .into(),

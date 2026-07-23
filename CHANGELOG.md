@@ -33,7 +33,7 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Session discovery uses bounded lightweight metadata scans, and direct resume-by-id avoids parsing unrelated session bodies.
 - TUI redraws emit exact changed rows, clear stale Kitty images, coalesce composer border colour runs, anchor scrolled readers while output arrives, and repeat only editing/navigation keys (never submit, close, or toggle actions).
 - Provider model inventories use private, scoped cache-first startup. Built-in inventories refresh in the background; stale custom inventories refresh before catalog construction so the current launch sees server changes while retaining last-known-good models on failure.
-- Connection setup and response headers have separate bounds; retries are visible and cancellable, connection/header failures retry at most once, and a full header timeout is not retried.
+- Connection setup and response headers have separate bounds. Custom endpoints have a configurable cold-start header allowance, while non-timeout network loss retries visibly and cancellably up to five times; a full transport timeout is not multiplied automatically.
 - Ordinary final answers no longer trigger a hidden second completion-confirmation inference.
 - Request sizing and transformation avoid temporary whole-history buffers and redundant context reconstruction during resume and send.
 - Codex Responses requests use zstd compression, low text verbosity, and capability-gated parallel tool-call declarations without changing generic OpenAI-compatible routes.
@@ -42,9 +42,13 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Native terminal selection and scrollback are the default again; stable-prefix frame updates avoid redrawing committed history, while application-owned semantic mouse behavior remains available through `--mouse app`.
 - Semantic transcript blocks use one consistent breathing row between actions without separating a tool header from its result or diff.
 - Custom hlid/llama.cpp discovery reads the active nested `meta.n_ctx` context window instead of falling back to training limits or a generic default.
+- Custom endpoint reasoning controls are authoritative: off-only, binary, and level-based metadata produce exactly the corresponding picker choices and wire values.
+- Reasoning is collapsed by default into a stable two-line, model-colored status that settles to an elapsed-time label and expands with `Ctrl+O`.
+- Every bundled theme retains its authored palette, while the compiled default follows the selected model lab and resets cleanly after theme switches.
+- Batched tool results retain independent bounded output allowances so a large early result cannot starve later calls in the same turn.
 
 ### Release engineering
 
-- Added root installation/security documentation, licenses, checked-in architecture docs, CI, dependency policy, fuzz target, and package metadata.
+- Added root installation/security documentation, MIT and third-party notices, checked-in architecture docs, reproducible release gates, dependency policy, a fuzz target, and complete package metadata.
 - Release builds enable ThinLTO, one codegen unit, symbol stripping, and abort-on-panic to reduce startup work and binary/RSS footprint.
 - The alpha release target is macOS and Linux; command execution is explicitly Unix-only.

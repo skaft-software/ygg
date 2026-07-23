@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::Result;
-use crossterm::{cursor, event, execute, terminal};
+use crossterm::{cursor, event, execute, queue, terminal};
 use sexy_tui_rs::{
     ColorDepth as SexyColorDepth, SupportLevel as SexySupportLevel,
     TerminalCapabilities as SexyTerminalCapabilities, TerminalSize as SexyTerminalSize,
@@ -435,15 +435,15 @@ pub fn install_signal_restore() -> std::io::Result<()> {
 ///
 /// Input is deliberately driven by the application's async crossterm stream;
 /// sexy-tui's blocking `Terminal::start` is never called.
-pub struct YggTerminal {
-    out: Stdout,
+pub struct YggTerminal<W: Write = Stdout> {
+    out: W,
     size: TerminalSize,
     last_was_cr: bool,
     pending: Vec<u8>,
     in_synchronized_frame: bool,
 }
 
-impl YggTerminal {
+impl YggTerminal<Stdout> {
     /// Enter raw mode on the primary screen, returning the shared size cell.
     #[allow(dead_code)] // Used by the separately compiled Gate-0 spike target.
     pub fn enter() -> Result<(Self, TerminalSize)> {
@@ -509,7 +509,9 @@ impl YggTerminal {
             in_synchronized_frame: false,
         })
     }
+}
 
+impl<W: Write> YggTerminal<W> {
     fn flush_pending(&mut self) {
         if self.pending.is_empty() {
             return;
@@ -519,30 +521,28 @@ impl YggTerminal {
         let _ = self.out.flush();
     }
 
-    fn flush_before_control_sequence(&mut self) {
-        // Cursor and clear operations must occur after already-buffered cursor
-        // movement, especially during sexy-tui's differential tail redraw.
-        self.flush_pending();
+    fn flush_if_outside_frame(&mut self) {
+        if !self.in_synchronized_frame {
+            self.flush_pending();
+        }
     }
 
     /// Clear operations erase using the terminal's current rendition. Reset it
     /// first: a stale background attribute must not turn an erased
     /// differential-render tail into a colored band.
     fn reset_rendition_before_clear(&mut self) {
-        self.flush_before_control_sequence();
-        let _ = self.out.write_all(b"\x1b[0m");
-        let _ = self.out.flush();
+        self.pending.extend_from_slice(b"\x1b[0m");
     }
 }
 
-impl Drop for YggTerminal {
+impl<W: Write> Drop for YggTerminal<W> {
     fn drop(&mut self) {
         self.flush_pending();
         force_restore();
     }
 }
 
-impl sexy_tui_rs::Terminal for YggTerminal {
+impl<W: Write> sexy_tui_rs::Terminal for YggTerminal<W> {
     fn start_events(
         &mut self,
         _on_input: Box<dyn FnMut(sexy_tui_rs::TerminalInput)>,
@@ -585,43 +585,49 @@ impl sexy_tui_rs::Terminal for YggTerminal {
     }
 
     fn move_by(&mut self, lines: i16) {
-        self.flush_before_control_sequence();
         let result = if lines > 0 {
-            execute!(self.out, cursor::MoveDown(lines as u16))
+            queue!(self.pending, cursor::MoveDown(lines as u16))
         } else if lines < 0 {
-            execute!(self.out, cursor::MoveUp((-lines) as u16))
+            queue!(self.pending, cursor::MoveUp((-lines) as u16))
         } else {
             Ok(())
         };
         let _ = result;
+        self.flush_if_outside_frame();
     }
 
     fn hide_cursor(&mut self) {
-        self.flush_before_control_sequence();
-        let _ = execute!(self.out, cursor::Hide);
+        let _ = queue!(self.pending, cursor::Hide);
+        self.flush_if_outside_frame();
     }
 
     fn show_cursor(&mut self) {
-        self.flush_before_control_sequence();
-        let _ = execute!(self.out, cursor::Show);
+        let _ = queue!(self.pending, cursor::Show);
+        self.flush_if_outside_frame();
     }
 
     fn clear_line(&mut self) {
         self.reset_rendition_before_clear();
-        let _ = execute!(self.out, terminal::Clear(terminal::ClearType::CurrentLine));
+        let _ = queue!(
+            self.pending,
+            terminal::Clear(terminal::ClearType::CurrentLine)
+        );
+        self.flush_if_outside_frame();
     }
 
     fn clear_from_cursor(&mut self) {
         self.reset_rendition_before_clear();
-        let _ = execute!(
-            self.out,
+        let _ = queue!(
+            self.pending,
             terminal::Clear(terminal::ClearType::FromCursorDown)
         );
+        self.flush_if_outside_frame();
     }
 
     fn clear_screen(&mut self) {
         self.reset_rendition_before_clear();
-        let _ = execute!(self.out, terminal::Clear(terminal::ClearType::All));
+        let _ = queue!(self.pending, terminal::Clear(terminal::ClearType::All));
+        self.flush_if_outside_frame();
     }
 
     fn capabilities(&self) -> SexyTerminalCapabilities {
@@ -636,6 +642,25 @@ impl sexy_tui_rs::Terminal for YggTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct RecordingWriter {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        flushes: Arc<Mutex<usize>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes.lock().unwrap().push(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let mut flushes = self.flushes.lock().unwrap();
+            *flushes += 1;
+            Ok(())
+        }
+    }
 
     // These tests intentionally mutate the process-global restoration flags.
     // Rust runs unit tests concurrently, so serialize that shared state.
@@ -747,6 +772,41 @@ mod tests {
         assert!(SYNC_OUTPUT_BEGIN.starts_with("\x1b[?2026"));
         assert!(SYNC_OUTPUT_END.starts_with("\x1b[?2026"));
         assert_ne!(SYNC_OUTPUT_BEGIN, SYNC_OUTPUT_END);
+    }
+
+    #[test]
+    fn synchronized_frame_is_one_atomic_backend_write_even_without_csi_2026_support() {
+        let writer = RecordingWriter::default();
+        let writes = writer.writes.clone();
+        let flushes = writer.flushes.clone();
+        let mut terminal = YggTerminal {
+            out: writer,
+            size: Arc::new(Mutex::new((80, 24))),
+            last_was_cr: false,
+            pending: Vec::new(),
+            in_synchronized_frame: false,
+        };
+
+        sexy_tui_rs::Terminal::write(&mut terminal, SYNC_OUTPUT_BEGIN);
+        sexy_tui_rs::Terminal::write(&mut terminal, "\x1b[4;1H");
+        sexy_tui_rs::Terminal::clear_from_cursor(&mut terminal);
+        sexy_tui_rs::Terminal::write(&mut terminal, "replacement");
+        assert!(writes.lock().unwrap().is_empty());
+        assert_eq!(*flushes.lock().unwrap(), 0);
+
+        sexy_tui_rs::Terminal::write(&mut terminal, SYNC_OUTPUT_END);
+        let writes = writes.lock().unwrap();
+        assert_eq!(
+            writes.len(),
+            1,
+            "one frame must reach the backend atomically"
+        );
+        let output = String::from_utf8_lossy(&writes[0]);
+        assert_eq!(
+            output,
+            format!("{SYNC_OUTPUT_BEGIN}\x1b[4;1H\x1b[0m\x1b[Jreplacement{SYNC_OUTPUT_END}")
+        );
+        assert_eq!(*flushes.lock().unwrap(), 1);
     }
 
     #[test]

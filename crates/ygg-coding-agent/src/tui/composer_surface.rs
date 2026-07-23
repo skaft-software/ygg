@@ -245,7 +245,8 @@ fn render_composer_box(
     // profile this moves toward white rather than turning into a black box;
     // focused input and active work use the model accent.
     let idle_border = theme.composer_idle_rgb(accent);
-    let focused = state.panel.is_none() && !state.editor.is_empty();
+    let focused =
+        state.panel.is_none() && (!state.editor.is_empty() || state.tool_input_prompt.is_some());
 
     // ---- animation ----
     let compacting = state.run_label == "compacting";
@@ -415,7 +416,11 @@ fn render_composer_box(
         format!("{left}{padding}{content}{padding}{right}")
     };
 
-    let (editor, editor_cursor) = super::view::sanitized_editor(&state.editor, state.editor_cursor);
+    let (editor, editor_cursor) = if let Some(prompt) = &state.tool_input_prompt {
+        (prompt.clone(), prompt.len())
+    } else {
+        super::view::sanitized_editor(&state.editor, state.editor_cursor)
+    };
 
     if editor.is_empty() {
         for i in 0..content_rows {
@@ -536,7 +541,11 @@ fn render_plain_content(state: &super::view::ShellState, width: u16) -> Vec<Stri
         .theme
         .bold(&state.theme.fg("model_accent", state.theme.glyph("prompt")));
     let cursor_marker = composer_cursor_marker(state);
-    let (editor, editor_cursor) = super::view::sanitized_editor(&state.editor, state.editor_cursor);
+    let (editor, editor_cursor) = if let Some(prompt) = &state.tool_input_prompt {
+        (prompt.clone(), prompt.len())
+    } else {
+        super::view::sanitized_editor(&state.editor, state.editor_cursor)
+    };
     if editor.is_empty() {
         return vec![format!("{marker} {cursor_marker}")];
     }
@@ -660,35 +669,36 @@ fn identity_variants(full_model: &str, model_names: &[String], thinking: &str) -
 }
 
 fn activity_variants(state: &super::view::ShellState, now: Instant) -> Vec<String> {
+    let session_elapsed = state.session_work_elapsed.saturating_add(
+        state
+            .run
+            .current()
+            .filter(|run| run.is_active())
+            .map(|run| run.elapsed_at(now))
+            .unwrap_or_default(),
+    );
     if let Some(run) = state.run.current().filter(|run| run.is_active()) {
-        let elapsed = format_duration(run.elapsed_at(now));
-        let label = match run.phase() {
-            crate::presentation::RunPhase::AwaitingProvider { .. } => "waiting",
+        let elapsed = format_duration(session_elapsed);
+        let activity = match run.phase() {
+            crate::presentation::RunPhase::AwaitingProvider { .. } => {
+                format!("waiting for API {elapsed}")
+            }
+            crate::presentation::RunPhase::AwaitingApproval { .. } => {
+                format!("waiting {elapsed}")
+            }
             crate::presentation::RunPhase::Thinking
-            | crate::presentation::RunPhase::Preparing { .. } => "thinking",
-            crate::presentation::RunPhase::StreamingResponse => "responding",
-            crate::presentation::RunPhase::AwaitingApproval { .. } => "waiting",
-            crate::presentation::RunPhase::PreparingToolCall
-            | crate::presentation::RunPhase::RunningTool { .. } => "tool",
+            | crate::presentation::RunPhase::Preparing { .. }
+            | crate::presentation::RunPhase::StreamingResponse
+            | crate::presentation::RunPhase::PreparingToolCall
+            | crate::presentation::RunPhase::RunningTool { .. } => elapsed,
             crate::presentation::RunPhase::Finished(_) => return Vec::new(),
         };
-        let separator = state.theme.glyph("separator");
-        return vec![format!("{label}{separator}{elapsed}")];
+        return vec![activity];
     }
-    if state.run_label.is_empty() {
+    if session_elapsed.is_zero() {
         Vec::new()
-    } else if let Some(started) = state.shimmer_started_at {
-        let separator = state.theme.glyph("separator");
-        vec![
-            format!(
-                "{}{separator}{}",
-                state.run_label,
-                format_duration(now.saturating_duration_since(started))
-            ),
-            state.run_label.clone(),
-        ]
     } else {
-        vec![state.run_label.clone()]
+        vec![format_duration(session_elapsed)]
     }
 }
 

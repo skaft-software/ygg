@@ -35,7 +35,7 @@ use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
     confirmation_picker, extension_confirmation_picker, optional_model_picker, session_picker,
-    theme_picker, thinking_picker,
+    theme_picker, thinking_picker, tool_input_picker,
 };
 use crate::tui::theme::{available_themes, load_named_theme, load_theme};
 use crate::tui::view::InteractiveShell;
@@ -1037,6 +1037,27 @@ where
                         } else {
                             "extension action denied"
                         });
+                    }
+                    if let AgentEvent::ToolProgress {
+                        progress: ygg_agent::ToolProgress::Input(request),
+                        ..
+                    } = &event
+                    {
+                        let answered = tool_input_picker(shell, input, request).await?;
+                        if !answered {
+                            shell.notice("interactive command input cancelled");
+                        }
+                    }
+                    if let AgentEvent::ProviderRetry {
+                        attempt,
+                        max_attempts,
+                        error,
+                        ..
+                    } = &event
+                    {
+                        shell.notice(format!(
+                            "{error} Retrying ({attempt}/{max_attempts})…"
+                        ));
                     }
                     shell.on_run_event(run_id, &event);
                     if let AgentEvent::ToolFinished { id, result } = &event {

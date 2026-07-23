@@ -296,6 +296,63 @@ pub struct ToolConfirmation {
     reply: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>>,
 }
 
+/// One ephemeral text request owned by a running tool. Secret answers are
+/// never included in progress events, debug output, or session state.
+#[derive(Clone)]
+pub struct ToolInputRequest {
+    /// Short prompt shown by an interactive frontend.
+    pub prompt: String,
+    /// Whether the frontend must suppress echo and ordinary editor handling.
+    pub secret: bool,
+    reply: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Option<ToolInputResponse>>>>>,
+}
+
+impl ToolInputRequest {
+    /// Deliver one answer. Repeated answers are ignored.
+    pub fn respond(&self, bytes: Vec<u8>) {
+        if let Ok(mut reply) = self.reply.lock() {
+            if let Some(reply) = reply.take() {
+                let _ = reply.send(Some(ToolInputResponse(bytes)));
+            }
+        }
+    }
+
+    /// Cancel the request without sending input to the child.
+    pub fn cancel(&self) {
+        if let Ok(mut reply) = self.reply.lock() {
+            if let Some(reply) = reply.take() {
+                let _ = reply.send(None);
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for ToolInputRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolInputRequest")
+            .field("prompt", &self.prompt)
+            .field("secret", &self.secret)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A tool input answer whose backing allocation is erased on drop.
+pub struct ToolInputResponse(Vec<u8>);
+
+impl ToolInputResponse {
+    /// Borrow the answer bytes without creating an additional secret copy.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for ToolInputResponse {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
 impl ToolConfirmation {
     /// Answer the request. Repeated answers are ignored.
     pub fn respond(&self, confirmed: bool) {
@@ -338,6 +395,9 @@ pub enum ToolProgress {
     /// A typed yes/no request. Frontends that do not handle it deny by
     /// dropping the event; tools never receive implicit approval.
     Confirmation(ToolConfirmation),
+    /// A typed input request. Interactive frontends temporarily own input;
+    /// headless consumers cancel by dropping the request.
+    Input(ToolInputRequest),
     /// Consolidated report of progress discarded because the bounded channel
     /// was full. Emitted at most once per tool execution, immediately before
     /// `ToolFinished`.
@@ -362,6 +422,7 @@ impl std::fmt::Debug for ToolProgress {
                 .finish(),
             Self::Status(s) => f.debug_tuple("Status").field(s).finish(),
             Self::Confirmation(request) => f.debug_tuple("Confirmation").field(request).finish(),
+            Self::Input(request) => f.debug_tuple("Input").field(request).finish(),
             Self::Dropped { bytes, events } => f
                 .debug_struct("Dropped")
                 .field("bytes", bytes)
@@ -384,10 +445,10 @@ pub enum OutputStream {
 /// Sink through which a tool emits live progress during execution.
 ///
 /// Cheaply cloneable (wraps an `mpsc::Sender` and an `Arc<AtomicU64>`).
-/// All methods are infallible and non‑blocking — sends use [`try_send`]
-/// against a bounded channel and are silently discarded when the channel
-/// is full or the consumer is disconnected. A tool never waits for a
-/// progress consumer.
+/// Output and status sends are infallible and non-blocking: they use
+/// [`try_send`] against a bounded channel and are discarded when full or
+/// disconnected. Typed confirmation/input methods wait only for the explicit
+/// reply; a missing or disconnected consumer resolves them as denied/cancelled.
 ///
 /// Dropped output bytes and semantic session-entry events are counted
 /// internally and can be retrieved after tool completion via `take_dropped`.
@@ -492,6 +553,18 @@ impl ToolProgressSink {
         answer.await.unwrap_or(false)
     }
 
+    /// Request ephemeral input from an interactive frontend. Secret responses
+    /// are carried only through the reply channel and wiped after use.
+    pub async fn input(&self, prompt: String, secret: bool) -> Option<ToolInputResponse> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.send_one(ToolProgress::Input(ToolInputRequest {
+            prompt,
+            secret,
+            reply: Arc::new(std::sync::Mutex::new(Some(reply))),
+        }));
+        answer.await.ok().flatten()
+    }
+
     /// Returns dropped output bytes and session-entry events since the last
     /// call, resetting both counters. `pub(crate)` — only the agent loop calls
     /// this.
@@ -507,6 +580,7 @@ impl ToolProgressSink {
             ToolProgress::Output { bytes, .. } => (bytes.len() as u64, 0),
             ToolProgress::Status(s) => (s.len() as u64, 0),
             ToolProgress::Confirmation(_) => (0, 1),
+            ToolProgress::Input(_) => (0, 1),
             ToolProgress::Dropped { .. } => (0, 0),
             ToolProgress::SessionEvent { .. } => (0, 1),
         };
@@ -713,6 +787,28 @@ mod tests {
             }
             _ => panic!("expected Output"),
         }
+    }
+
+    #[tokio::test]
+    async fn secret_input_answer_exists_only_on_the_private_reply_channel() {
+        let (tx, mut rx) = mpsc::channel::<ToolProgress>(PROGRESS_CHANNEL_CAPACITY);
+        let sink = ToolProgressSink::live(tx);
+        let waiter = tokio::spawn(async move {
+            sink.input("Password:".into(), true)
+                .await
+                .expect("interactive answer")
+        });
+        let request = match rx.recv().await.expect("input request") {
+            ToolProgress::Input(request) => request,
+            _ => panic!("expected input request"),
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("Password:"));
+        assert!(!debug.contains("swordfish"));
+        request.respond(b"swordfish".to_vec());
+        let response = waiter.await.unwrap();
+        assert_eq!(response.as_bytes(), b"swordfish");
+        assert!(!format!("{request:?}").contains("swordfish"));
     }
 
     #[test]

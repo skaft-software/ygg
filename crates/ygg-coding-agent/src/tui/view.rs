@@ -348,6 +348,15 @@ struct AssistantBlock {
     /// model switches mid-session.
     model_lab: Option<crate::tui::theme::ModelLab>,
     finished: bool,
+    /// Reasoning is retained verbatim but stays out of the mutable native
+    /// scrollback tail until the user explicitly asks to inspect it.
+    reasoning_expanded: bool,
+    /// First streamed reasoning delta, used only for the settled compact label.
+    reasoning_started_at: Option<Instant>,
+    /// Frozen reasoning duration after the block closes.
+    reasoning_elapsed: Option<Duration>,
+    /// Decorative live-label animation frame; never persisted as content.
+    reasoning_animation_frame: u64,
 }
 
 impl AssistantBlock {
@@ -360,6 +369,10 @@ impl AssistantBlock {
             layout: RefCell::new(StreamingRenderCache::default()),
             model_lab: None,
             finished: false,
+            reasoning_expanded: false,
+            reasoning_started_at: None,
+            reasoning_elapsed: None,
+            reasoning_animation_frame: 0,
         }
     }
 
@@ -374,11 +387,16 @@ impl AssistantBlock {
         let projection = reasoning_markdown_projection(text);
         let mut block = Self::streaming(&projection);
         block.text = text.to_owned();
+        block.reasoning_started_at = Some(Instant::now());
+        block.reasoning_animation_frame = 2;
         block
     }
 
     fn finalized_reasoning(text: String) -> Self {
         let mut block = Self::streaming_reasoning(&text);
+        // Hydrated sessions preserve reasoning text but do not currently store
+        // provider-phase timing, so do not invent a duration on replay.
+        block.reasoning_started_at = None;
         block.finish_reasoning();
         block
     }
@@ -423,6 +441,9 @@ impl AssistantBlock {
         if self.markdown.raw_text() != projection {
             self.markdown = StreamingMarkdown::from_text(&projection);
             self.invalidate_layout();
+        }
+        if self.reasoning_elapsed.is_none() {
+            self.reasoning_elapsed = self.reasoning_started_at.map(|started| started.elapsed());
         }
         self.finish();
     }
@@ -730,6 +751,9 @@ pub(crate) struct ShellState {
     rich_renderer: RefCell<Option<RichRenderer>>,
     reasoning_renderer: RefCell<Option<RichRenderer>>,
     pub(crate) editor: String,
+    /// Ephemeral tool-owned prompt rendered in place of the editor. Secret
+    /// keystrokes never enter `editor` or any transcript/session structure.
+    pub(crate) tool_input_prompt: Option<String>,
     /// Selection and viewport for the slash-command popup. Filtering resets
     /// both; Escape dismisses it until the command token changes again.
     prompt_templates: Arc<[crate::prompts::PromptTemplateDescriptor]>,
@@ -808,6 +832,9 @@ pub(crate) struct ShellState {
     pub(crate) show_turn_cost: bool,
     /// One authoritative presentation lifecycle for the newest run.
     pub(crate) run: RunTracker,
+    /// Sum of settled agent-run durations for this interactive session.
+    /// User reading/composition time is deliberately excluded.
+    pub(crate) session_work_elapsed: Duration,
     pub(crate) provider: String,
     /// Canonical model identifier retained for `/status` and diagnostics.
     pub(crate) model: String,
@@ -1147,6 +1174,15 @@ impl ShellState {
     }
 
     fn append_text_block(&mut self, channel: OutputChannel, text: &str) {
+        if channel == OutputChannel::Text {
+            if let Some(index) = self.active_reasoning.take() {
+                if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(index)
+                {
+                    reasoning.finish_reasoning();
+                    self.touch_block(index);
+                }
+            }
+        }
         let active_index = match channel {
             OutputChannel::Text => self.active_text,
             OutputChannel::Reasoning => self.active_reasoning,
@@ -1236,6 +1272,25 @@ impl ShellState {
                 reasoning.finish_reasoning();
                 self.touch_block(index);
             }
+        }
+    }
+
+    fn advance_reasoning_animation(&mut self) {
+        let Some(index) = self.active_reasoning else {
+            return;
+        };
+        let advanced = match self.transcript.get_mut(index) {
+            Some(TranscriptBlock::Reasoning(reasoning))
+                if !reasoning.finished && !reasoning.reasoning_expanded =>
+            {
+                reasoning.reasoning_animation_frame =
+                    reasoning.reasoning_animation_frame.wrapping_add(1);
+                true
+            }
+            _ => false,
+        };
+        if advanced {
+            self.touch_block(index);
         }
     }
 
@@ -1427,6 +1482,9 @@ fn render_loop(
             break;
         }
 
+        if animating {
+            state.borrow_mut().advance_reasoning_animation();
+        }
         tui.request_render();
         last_render = Some(Instant::now());
     }
@@ -1503,6 +1561,87 @@ pub(crate) fn semantic_separator(theme: &YggTheme) -> &str {
     theme.glyph("separator")
 }
 
+fn compact_thought_duration(duration: Duration) -> String {
+    let rounded = duration.as_secs_f64().round().max(1.0) as u64;
+    if rounded < 60 {
+        format!("{rounded}s")
+    } else {
+        format!("{}m{:02}s", rounded / 60, rounded % 60)
+    }
+}
+
+fn mix_rgb(base: (u8, u8, u8), accent: (u8, u8, u8), amount: f64) -> (u8, u8, u8) {
+    let channel = |base: u8, accent: u8| {
+        (f64::from(base) + (f64::from(accent) - f64::from(base)) * amount)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    (
+        channel(base.0, accent.0),
+        channel(base.1, accent.1),
+        channel(base.2, accent.2),
+    )
+}
+
+fn live_reasoning_label(theme: &YggTheme, reasoning: &AssistantBlock) -> String {
+    const UNICODE_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const ASCII_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+    let capabilities = theme.capabilities();
+    let frame = reasoning.reasoning_animation_frame as usize;
+    let spinner = if capabilities.unicode {
+        UNICODE_FRAMES[frame % UNICODE_FRAMES.len()]
+    } else {
+        ASCII_FRAMES[frame % ASCII_FRAMES.len()]
+    };
+    let label = format!("{spinner} thinking");
+    let Some(accent) = theme.model_rgb(reasoning.model_lab) else {
+        return label;
+    };
+    if !capabilities.animation
+        || capabilities.color == crate::tui::terminal::ColorDepth::None
+        || !capabilities.interactive
+    {
+        return theme.model_fg(reasoning.model_lab, &label);
+    }
+    let base = theme.composer_idle_rgb(accent);
+    let cells = label.chars().count().max(1);
+    label
+        .chars()
+        .enumerate()
+        .map(|(index, character)| {
+            let distance = (index + cells - (frame % cells)) % cells;
+            let wave = match distance {
+                0 => 1.0,
+                1 | 2 => 0.78,
+                3 | 4 => 0.52,
+                _ => 0.30,
+            };
+            theme.rgb_fg(mix_rgb(base, accent, wave), &character.to_string())
+        })
+        .collect()
+}
+
+fn collapsed_reasoning_lines(theme: &YggTheme, reasoning: &AssistantBlock) -> [String; 2] {
+    let label = if reasoning.finished {
+        let text = reasoning.reasoning_elapsed.map_or_else(
+            || "thought".to_owned(),
+            |elapsed| format!("thought for {}", compact_thought_duration(elapsed)),
+        );
+        theme.model_fg(reasoning.model_lab, &theme.italic(&text))
+    } else {
+        theme.bold(&live_reasoning_label(theme, reasoning))
+    };
+    let elbow = if theme.capabilities().unicode {
+        "└"
+    } else {
+        "`"
+    };
+    [
+        label,
+        subdued_text(theme, &format!("{elbow} ctrl+o to expand")),
+    ]
+}
+
 /// A low-contrast annotation that remains readable without relying on a
 /// painted background. This is used for viewport chrome and secondary tool
 /// metadata, never for the answer itself.
@@ -1536,14 +1675,17 @@ fn render_reasoning_on_surface(
     renderer: &RichRenderer,
     theme: &YggTheme,
     width: u16,
-    show_reasoning: bool,
+    _show_reasoning: bool,
     background: Option<Color>,
 ) -> Vec<String> {
-    if !show_reasoning {
-        return Vec::new();
-    }
     let marker = theme.glyph("reasoning");
     let prefix_width = visible_width(marker).saturating_add(1);
+    if !reasoning.reasoning_expanded {
+        return collapsed_reasoning_lines(theme, reasoning)
+            .into_iter()
+            .map(|line| fit_line(&line, width))
+            .collect();
+    }
     let content_width = width.saturating_sub(prefix_width as u16).max(1);
     let lines = finish_transcript_block(reasoning.render_on_surface(
         renderer,
@@ -2141,6 +2283,14 @@ fn exec_capture_footer(line: &str) -> Option<(&'static str, &str)> {
     })
 }
 
+fn is_exec_complete_footer(line: &str) -> bool {
+    ["stdout", "stderr"].into_iter().any(|stream| {
+        line.strip_prefix("complete_")
+            .and_then(|line| line.strip_prefix(stream))
+            .is_some_and(|detail| detail == "=true")
+    })
+}
+
 /// Project a bounded result into Pi-style tail output. Protocol envelope lines
 /// are excluded; capture loss is retained separately because Ctrl+O can reveal
 /// UI-tail omissions but cannot recover bytes discarded by the exec tool.
@@ -2187,7 +2337,7 @@ fn compact_exec_output(panel: &ToolPanel) -> CompactExecOutput {
             expect_stream_header = false;
             continue;
         }
-        if exec_capture_footer(trimmed).is_some() {
+        if exec_capture_footer(trimmed).is_some() || is_exec_complete_footer(trimmed) {
             expect_stream_header = true;
             continue;
         }
@@ -2251,9 +2401,6 @@ fn render_compact_exec_output(
     width: u16,
     show_tool_duration: bool,
 ) -> Vec<String> {
-    if !panel.finished {
-        return Vec::new();
-    }
     let compact = compact_exec_output(panel);
     let ellipsis = if theme.unicode() { "…" } else { "..." };
     let mut lines = Vec::new();
@@ -2284,9 +2431,14 @@ fn render_compact_exec_output(
         ));
     }
     if compact.omitted_lines > 0 {
+        let unit = if compact.omitted_lines == 1 {
+            "line"
+        } else {
+            "lines"
+        };
         let hint = format!(
-            "  {ellipsis} ({} earlier lines, ctrl+o to expand)",
-            compact.omitted_lines
+            "  {ellipsis} ({} earlier {unit}, ctrl+o to expand)",
+            compact.omitted_lines,
         );
         lines.extend(wrap_hanging(
             &understated_tool_output(theme, &hint),
@@ -2421,7 +2573,12 @@ fn surface_roles(kind: &str) -> (&'static str, &'static str, &'static str) {
 }
 
 fn natural_surface_width(block: &TranscriptBlock, theme: &YggTheme) -> u16 {
-    let copy = block_copy_text(block);
+    let copy = match block {
+        TranscriptBlock::Reasoning(reasoning) if !reasoning.reasoning_expanded => {
+            collapsed_reasoning_lines(theme, reasoning).join("\n")
+        }
+        _ => block_copy_text(block),
+    };
     let natural = copy.lines().map(visible_width).max().unwrap_or(1);
     let inner_prefix = match block {
         TranscriptBlock::User { .. } => 2,
@@ -2529,11 +2686,7 @@ fn compile_surface_plan<'a>(
         frame_left,
         frame_width,
         geometry: SurfaceGeometry {
-            transition_rows: transcript_transition_rows(
-                previous,
-                layout.density,
-                layout.show_reasoning,
-            ),
+            transition_rows: transcript_transition_rows(previous, layout.density, true),
             leading_rows,
             trailing_rows,
             content_left,
@@ -2809,7 +2962,7 @@ fn render_block_planned(
                 } else {
                     "foreground"
                 };
-                let label = theme.fg(lifecycle_role, tool);
+                let label = theme.bold(&theme.fg(lifecycle_role, tool));
                 let mut text =
                     without_redundant_tool_lead(&panel.name, &sanitize_for_terminal(summary));
                 if panel.is_error {
@@ -2874,7 +3027,7 @@ fn render_block_planned(
         }
         TranscriptBlock::Shell(shell) => {
             let marker = theme.glyph("shell");
-            let prefix = format!("{} ", theme.fg("model_accent", marker));
+            let prefix = format!("{} ", theme.bold(&theme.fg("model_accent", marker)));
             if shell.running {
                 // In-progress: command + "…" + spinner (icon on the right)
                 let line = format!(
@@ -5176,6 +5329,14 @@ impl InteractiveShell {
     }
 
     fn append_outcome(state: &mut ShellState, outcome: RunOutcome) {
+        if let Some(run) = state.run.current() {
+            state.session_work_elapsed = state
+                .session_work_elapsed
+                .saturating_add(run.elapsed_at(Instant::now()));
+        }
+        // The run's shimmer anchor is animation-only. Leaving it populated
+        // after completion made the idle footer behave like a wall clock.
+        state.shimmer_started_at = None;
         state.close_streaming_blocks();
         state.push_block(TranscriptBlock::Outcome(outcome));
         if !state.selected_model_owns_telemetry() {
@@ -5284,6 +5445,12 @@ impl InteractiveShell {
             }
             AgentEvent::ToolProgress { id, progress } => {
                 let index = state.tool_panels.get(id).copied();
+                let refreshes_compact_tail = matches!(
+                    progress,
+                    ToolProgress::Output { .. }
+                        | ToolProgress::Status(_)
+                        | ToolProgress::Dropped { .. }
+                );
                 if let Some(panel) = state.tool_output_mut(id) {
                     match progress {
                         ToolProgress::Output { bytes, .. } => {
@@ -5298,6 +5465,7 @@ impl InteractiveShell {
                                 &format!("confirmation requested: {}\n", request.prompt),
                             );
                         }
+                        ToolProgress::Input(_) => {}
                         ToolProgress::Dropped { bytes, events } => {
                             if *bytes > 0 {
                                 bounded_append(
@@ -5317,7 +5485,7 @@ impl InteractiveShell {
                         ToolProgress::SessionEvent(..) => {}
                     }
                 }
-                if state.verbose_tools {
+                if state.verbose_tools || refreshes_compact_tail {
                     if let Some(index) = index {
                         state.touch_block(index);
                     }
@@ -5996,6 +6164,16 @@ impl InteractiveShell {
         self.state.borrow().editor.clone()
     }
 
+    pub fn set_tool_input_prompt(&mut self, prompt: Option<String>) {
+        self.state.borrow_mut().tool_input_prompt = prompt.map(|prompt| {
+            sanitize_for_terminal(&prompt)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        });
+    }
+
     pub fn set_input_modalities(&mut self, modalities: ModalitySet) {
         self.state.borrow_mut().input_modalities = modalities;
     }
@@ -6454,15 +6632,26 @@ impl InteractiveShell {
         self.state.borrow_mut().overlay = Some(sanitize_for_terminal(&text));
     }
 
-    /// Toggle the most recent expandable block (tool or shell; ctrl+o).
+    /// Toggle the most recent expandable block (reasoning, tool, or shell;
+    /// ctrl+o).
     /// Falls back to the compaction summary when none exists.
     pub fn expand_focused_tool(&mut self) {
         let mut state = self.state.borrow_mut();
-        // Find the most recent Tool or Shell block.
         let most_recent = state.transcript.iter().rposition(|block| {
-            matches!(block, TranscriptBlock::Tool(_) | TranscriptBlock::Shell(_))
+            matches!(
+                block,
+                TranscriptBlock::Reasoning(_)
+                    | TranscriptBlock::Tool(_)
+                    | TranscriptBlock::Shell(_)
+            )
         });
         if let Some(index) = most_recent {
+            if let TranscriptBlock::Reasoning(reasoning) = &mut state.transcript[index] {
+                reasoning.reasoning_expanded = !reasoning.reasoning_expanded;
+                reasoning.invalidate_layout();
+                state.touch_block(index);
+                return;
+            }
             match &state.transcript[index] {
                 TranscriptBlock::Tool(panel) => {
                     let id = panel.id.clone();
@@ -6486,7 +6675,8 @@ impl InteractiveShell {
         } else if let Some(summary) = &state.latest_compaction_summary {
             state.overlay = Some(summary.clone());
         } else {
-            state.error = Some("no tool calls or shell commands in this session".into());
+            state.error =
+                Some("no reasoning, tool calls, or shell commands in this session".into());
         }
     }
 
@@ -6807,6 +6997,7 @@ impl InteractiveShell {
         state.run_cost_microdollars = checkpoint_cost.unwrap_or_default();
         state.run_cost_available = checkpoint_cost.is_some();
         state.run.clear();
+        state.session_work_elapsed = Duration::ZERO;
         state.run_model = None;
         state.run_model_lab = None;
         state.run_prompt_color = None;
@@ -6923,6 +7114,7 @@ mod tests {
     struct EmulatedTerminal {
         size: (u16, u16),
         bytes: Arc<Mutex<Vec<u8>>>,
+        synchronized_output: bool,
     }
 
     impl EmulatedTerminal {
@@ -6996,7 +7188,13 @@ mod tests {
         }
 
         fn capabilities(&self) -> sexy_tui_rs::TerminalCapabilities {
-            sexy_tui_rs::TerminalCapabilities::interactive(sexy_tui_rs::ColorDepth::TrueColor, true)
+            let mut capabilities = sexy_tui_rs::TerminalCapabilities::interactive(
+                sexy_tui_rs::ColorDepth::TrueColor,
+                true,
+            );
+            capabilities.synchronized_output = self.synchronized_output;
+            capabilities.sync_output = self.synchronized_output;
+            capabilities
         }
     }
 
@@ -7004,6 +7202,15 @@ mod tests {
         theme: YggTheme,
         width: u16,
         height: u16,
+    ) -> (InteractiveShell, Arc<Mutex<Vec<u8>>>) {
+        emulated_shell_with_sync(theme, width, height, false)
+    }
+
+    fn emulated_shell_with_sync(
+        theme: YggTheme,
+        width: u16,
+        height: u16,
+        synchronized_output: bool,
     ) -> (InteractiveShell, Arc<Mutex<Vec<u8>>>) {
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let size = Arc::new(Mutex::new((width, height)));
@@ -7016,6 +7223,7 @@ mod tests {
         let mut tui = TUI::new(Box::new(EmulatedTerminal {
             size: (width, height),
             bytes: bytes.clone(),
+            synchronized_output,
         }));
         tui.set_inline_scrollback(true);
         tui.add_child(Box::new(ShellComponent {
@@ -7078,6 +7286,22 @@ mod tests {
                 expected,
                 "foreground mismatch for {needle:?} at ({row}, {})",
                 column + offset
+            );
+        }
+    }
+
+    fn assert_ascii_bold(terminal: &vt100::Parser, needle: &str) {
+        let (row, column) = find_ascii_cell(terminal.screen(), needle).unwrap_or_else(|| {
+            panic!("{needle:?} not found in {:?}", terminal.screen().contents())
+        });
+        for offset in 0..needle.len() as u16 {
+            assert!(
+                terminal
+                    .screen()
+                    .cell(row, column + offset)
+                    .expect("text cell inside terminal bounds")
+                    .bold(),
+                "{needle:?} was not bold at offset {offset}"
             );
         }
     }
@@ -7528,6 +7752,42 @@ mod tests {
         assert_eq!(&safe[..safe_cursor], "before ␛");
         assert_eq!(safe, "before ␛[31m after");
         assert!(safe.is_char_boundary(safe_cursor));
+    }
+
+    #[test]
+    fn secret_tool_prompt_temporarily_owns_composer_without_touching_the_editor() {
+        let mut shell = InteractiveShell::test_shell();
+        for character in "ordinary draft".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+        shell.set_tool_input_prompt(Some("Password:".into()));
+        let secret_surface = crate::tui::composer_surface::render_composer_surface(
+            &shell.state.borrow(),
+            80,
+            Instant::now(),
+        )
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(secret_surface.contains("Password:"), "{secret_surface}");
+        assert!(
+            !secret_surface.contains("ordinary draft"),
+            "{secret_surface}"
+        );
+        assert_eq!(shell.pending(), "ordinary draft");
+
+        shell.set_tool_input_prompt(None);
+        let restored = crate::tui::composer_surface::render_composer_surface(
+            &shell.state.borrow(),
+            80,
+            Instant::now(),
+        )
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(restored.contains("ordinary draft"), "{restored}");
     }
 
     #[test]
@@ -8457,6 +8717,256 @@ mod tests {
     }
 
     #[test]
+    fn hidden_reasoning_stream_does_not_grow_native_scrollback() {
+        const WIDTH: u16 = 64;
+        const HEIGHT: u16 = 10;
+        let (mut shell, bytes) = emulated_shell(crate::tui::theme::test_theme(), WIDTH, HEIGHT);
+        let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+        let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+            std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+        };
+        terminal.process(&drain(&bytes));
+        terminal.set_scrollback(usize::MAX);
+        let baseline_scrollback = terminal.screen().scrollback();
+        terminal.set_scrollback(0);
+
+        let run_id = shell.begin_run("openai");
+        for index in 0..160 {
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::OutputDelta {
+                    channel: OutputChannel::Reasoning,
+                    text: format!("private sentinel {index}\n"),
+                },
+            );
+            shell.render();
+        }
+        terminal.process(&drain(&bytes));
+        terminal.set_scrollback(usize::MAX);
+        assert_eq!(
+            terminal.screen().scrollback(),
+            baseline_scrollback,
+            "collapsed streaming reasoning must not commit mutable rows"
+        );
+        terminal.set_scrollback(0);
+        let visible = terminal.screen().contents();
+        assert!(visible.contains("thinking"), "{visible:?}");
+        assert!(visible.contains("ctrl+o to expand"), "{visible:?}");
+        assert!(!visible.contains("private sentinel"), "{visible:?}");
+        let state = shell.state.borrow();
+        let TranscriptBlock::Reasoning(reasoning) = state.transcript.last().unwrap() else {
+            panic!("reasoning block expected");
+        };
+        assert!(reasoning.text.contains("private sentinel 159"));
+    }
+
+    #[test]
+    fn streamed_assistant_rows_enter_native_scrollback_once() {
+        const WIDTH: u16 = 96;
+        const HEIGHT: u16 = 48;
+        let (mut shell, bytes) = emulated_shell(crate::tui::theme::test_theme(), WIDTH, HEIGHT);
+        let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+        let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+            std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+        };
+        terminal.process(&drain(&bytes));
+
+        let run_id = shell.begin_run("openai");
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::OutputDelta {
+                channel: OutputChannel::Reasoning,
+                text: "private reasoning sentinel".into(),
+            },
+        );
+        shell.render();
+        terminal.process(&drain(&bytes));
+        let mut response = String::from("# Stream report\n\n## Findings\n\n");
+        for index in 0..48 {
+            response.push_str(&format!(
+                "- **stream-sentinel-{index:02}**: detailed finding for row {index}\n"
+            ));
+            if index == 15 {
+                response.push_str("\n## Nested concerns\n\n");
+            } else if index == 31 {
+                response.push_str("\n## Final checks\n\n");
+            }
+        }
+        let response_chars = response.chars().collect::<Vec<_>>();
+        for chunk in response_chars.chunks(7) {
+            shell.state.borrow_mut().advance_reasoning_animation();
+            shell.render();
+            terminal.process(&drain(&bytes));
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::OutputDelta {
+                    channel: OutputChannel::Text,
+                    text: chunk.iter().collect(),
+                },
+            );
+            shell.render();
+            terminal.process(&drain(&bytes));
+        }
+
+        // Grow the parser's viewport before looking back so its public
+        // contents API can expose the complete retained history at once.
+        terminal.set_size(512, WIDTH);
+        terminal.set_scrollback(usize::MAX);
+        let physical = terminal.screen().contents();
+
+        for index in 0..48 {
+            let sentinel = format!("stream-sentinel-{index:02}");
+            assert_eq!(
+                physical.matches(&sentinel).count(),
+                1,
+                "{sentinel} was duplicated in native scrollback:\n{physical}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_exec_tail_and_head_trim_never_replay_native_history() {
+        const WIDTH: u16 = 96;
+        const HEIGHT: u16 = 24;
+        for synchronized_output in [false, true] {
+            let (mut shell, bytes) = emulated_shell_with_sync(
+                crate::tui::theme::test_theme(),
+                WIDTH,
+                HEIGHT,
+                synchronized_output,
+            );
+            let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 4_096);
+            let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+                std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+            };
+            terminal.process(&drain(&bytes));
+
+            for index in 0..24 {
+                shell.notice(format!("history-sentinel-{index:02}"));
+            }
+            shell.render();
+            terminal.process(&drain(&bytes));
+
+            let run_id = shell.begin_run("openai");
+            let id = ToolCallId("long-exec".into());
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::ToolStarted {
+                    id: id.clone(),
+                    name: "exec".into(),
+                    args: serde_json::json!({"command": "long-running-audit"}),
+                },
+            );
+            shell.render();
+            terminal.process(&drain(&bytes));
+
+            // Default live exec presentation is a bounded five-row tail even
+            // when the producer emits far more output than the viewport.
+            let first = (0..32)
+                .map(|index| format!("first-live-row-{index:03} {}\n", "a".repeat(80)))
+                .collect::<String>();
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::ToolProgress {
+                    id: id.clone(),
+                    progress: ToolProgress::Output {
+                        stream: ygg_agent::OutputStream::Stdout,
+                        bytes: bytes::Bytes::from(first),
+                    },
+                },
+            );
+            shell.render();
+            terminal.process(&drain(&bytes));
+
+            let second = (0..128)
+                .map(|index| format!("second-live-row-{index:03} {}\n", "b".repeat(80)))
+                .collect::<String>();
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::ToolProgress {
+                    id: id.clone(),
+                    progress: ToolProgress::Output {
+                        stream: ygg_agent::OutputStream::Stdout,
+                        bytes: bytes::Bytes::from(second),
+                    },
+                },
+            );
+            shell.render();
+            let growth = drain(&bytes);
+            let growth_text = String::from_utf8_lossy(&growth);
+            assert_eq!(
+                growth_text.contains("\x1b[?2026h"),
+                synchronized_output,
+                "synchronized-output gating changed: {growth_text:?}"
+            );
+            assert!(
+                growth_text.contains("second-live-row-127"),
+                "latest exec tail was not painted: {growth_text:?}"
+            );
+            assert!(!growth_text.contains("history-sentinel"), "{growth_text:?}");
+            assert!(
+                !growth_text.contains("first-live-row-000"),
+                "{growth_text:?}"
+            );
+            assert!(
+                !growth.contains(&b'\n'),
+                "tail replacement must not scroll the bottom row: {growth_text:?}"
+            );
+            terminal.process(&growth);
+
+            // Cross the 64 KiB panel bound so bounded_append replaces the
+            // retained head. This mutates an already committed block far above
+            // the viewport and must still repaint only final visible cells.
+            let trimmed = (0..224)
+                .map(|index| format!("trimmed-live-row-{index:03} {}\n", "c".repeat(300)))
+                .collect::<String>();
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::ToolProgress {
+                    id: id.clone(),
+                    progress: ToolProgress::Output {
+                        stream: ygg_agent::OutputStream::Stdout,
+                        bytes: bytes::Bytes::from(trimmed),
+                    },
+                },
+            );
+            shell.render();
+            let trimmed = drain(&bytes);
+            let trimmed_text = String::from_utf8_lossy(&trimmed);
+            assert!(
+                trimmed_text.contains("trimmed-live-row-223"),
+                "{trimmed_text:?}"
+            );
+            assert!(
+                !trimmed_text.contains("history-sentinel"),
+                "{trimmed_text:?}"
+            );
+            assert!(
+                !trimmed_text.contains("long-running-audit"),
+                "{trimmed_text:?}"
+            );
+            assert!(
+                trimmed.len() < 16_384,
+                "unbounded repaint: {} B",
+                trimmed.len()
+            );
+            terminal.process(&trimmed);
+
+            terminal.set_size(2_048, WIDTH);
+            terminal.set_scrollback(usize::MAX);
+            let physical = terminal.screen().contents();
+            for index in 0..24 {
+                let sentinel = format!("history-sentinel-{index:02}");
+                assert_eq!(
+                    physical.matches(&sentinel).count(),
+                    1,
+                    "{sentinel} was replayed with synchronized_output={synchronized_output}:\n{physical}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn short_transcript_events_do_not_move_the_pinned_composer_or_footer() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_size(80, 14);
@@ -8957,47 +9467,108 @@ mod tests {
                 RunPhase::AwaitingProvider {
                     provider: "relay".into(),
                 },
-                "waiting",
+                Some("waiting for API 0.6s"),
             ),
-            (RunPhase::Thinking, "thinking"),
-            (RunPhase::StreamingResponse, "responding"),
-            (RunPhase::PreparingToolCall, "tool"),
+            (RunPhase::Thinking, None),
+            (RunPhase::StreamingResponse, None),
+            (RunPhase::PreparingToolCall, None),
             (
                 RunPhase::RunningTool {
                     summary: "running tests".into(),
                 },
-                "tool",
+                None,
             ),
             (
                 RunPhase::AwaitingApproval {
                     prompt: "allow edit".into(),
                 },
-                "waiting",
+                Some("waiting 0.6s"),
             ),
         ];
         for (phase, expected) in cases {
             let rendered = rendered_phase(phase);
-            assert!(
-                rendered.contains(expected),
-                "missing {expected:?}: {rendered}"
-            );
+            if let Some(expected) = expected {
+                assert!(
+                    rendered.contains(expected),
+                    "missing {expected:?}: {rendered}"
+                );
+            }
             assert!(
                 rendered.contains("0.6s"),
                 "elapsed clock missing: {rendered}"
             );
+            let status = rendered
+                .lines()
+                .find(|line| line.contains("0.6s"))
+                .expect("active status");
+            for hidden in ["thinking", "responding", "tool"] {
+                assert!(!status.contains(hidden), "{hidden:?} leaked: {status}");
+            }
         }
     }
 
     #[test]
-    fn thinking_status_is_subdued_in_the_pinned_footer() {
+    fn active_work_status_is_elapsed_only_and_subdued_in_the_pinned_footer() {
         let rendered = rendered_phase(RunPhase::Thinking);
         let status = rendered
             .lines()
-            .find(|line| line.contains("thinking · 0.6s"))
-            .expect("thinking status");
+            .find(|line| line.contains("0.6s"))
+            .expect("active status");
+        assert!(!status.contains("thinking"));
+        assert!(!status.contains("tool"));
         assert!(status.contains("\x1b[38;2;"));
         assert!(!status.contains("\x1b[3m"));
         assert!(!status.contains("\x1b[2m"));
+    }
+
+    #[test]
+    fn footer_accumulates_agent_run_time_and_freezes_while_idle() {
+        let shell = InteractiveShell::test_shell();
+        let now = Instant::now();
+        {
+            let mut state = shell.state.borrow_mut();
+            let first = state
+                .run
+                .begin_at("relay", now - Duration::from_secs(4))
+                .unwrap();
+            let outcome = state.run.interrupt_at(first, now).unwrap();
+            InteractiveShell::append_outcome(&mut state, outcome);
+            assert_eq!(state.session_work_elapsed, Duration::from_secs(4));
+
+            let second = state.run.begin_at("relay", now).unwrap();
+            state.run.set_phase_at(second, RunPhase::Thinking, now);
+        }
+
+        let active = strip_terminal_sequences(
+            &crate::tui::composer_surface::render_composer_surface(
+                &shell.state.borrow(),
+                80,
+                now + Duration::from_secs(2),
+            )
+            .join("\n"),
+        );
+        assert!(active.contains("6.0s"), "{active}");
+
+        {
+            let mut state = shell.state.borrow_mut();
+            let second = state.run.current_id().unwrap();
+            let outcome = state
+                .run
+                .interrupt_at(second, now + Duration::from_secs(2))
+                .unwrap();
+            InteractiveShell::append_outcome(&mut state, outcome);
+            assert_eq!(state.session_work_elapsed, Duration::from_secs(6));
+        }
+        let idle_later = strip_terminal_sequences(
+            &crate::tui::composer_surface::render_composer_surface(
+                &shell.state.borrow(),
+                80,
+                now + Duration::from_secs(32),
+            )
+            .join("\n"),
+        );
+        assert!(idle_later.contains("6.0s"), "{idle_later}");
+        assert!(!idle_later.contains("36.0s"), "{idle_later}");
     }
 
     #[test]
@@ -9474,6 +10045,7 @@ mod tests {
             reasoning.markdown.tail_revision() >= initial_revision + 256,
             "ordinary deltas must extend one incremental Markdown stream"
         );
+        reasoning.reasoning_expanded = true;
         let live = render_reasoning(&reasoning, &theme.reasoning_renderer(), &theme, 80, true)
             .into_iter()
             .map(|line| strip_terminal_sequences(&line))
@@ -9498,6 +10070,155 @@ mod tests {
     }
 
     #[test]
+    fn streamed_reasoning_stays_two_stable_collapsed_rows_until_ctrl_o() {
+        let mut shell = InteractiveShell::test_shell();
+        let run_id = shell.begin_run("openai");
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::OutputDelta {
+                channel: OutputChannel::Reasoning,
+                text: "first private sentinel".into(),
+            },
+        );
+        let transcript = |shell: &InteractiveShell| {
+            shell
+                .state
+                .borrow()
+                .rendered_transcript(80)
+                .iter()
+                .map(|line| strip_terminal_sequences(line))
+                .collect::<Vec<_>>()
+        };
+        let initial = transcript(&shell);
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|line| line.contains("thinking"))
+                .count(),
+            1,
+            "{initial:?}"
+        );
+        assert!(!initial.join("\n").contains("first private sentinel"));
+
+        let continuation = (0..128)
+            .map(|index| format!("\nprivate reasoning row {index}"))
+            .collect::<String>();
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::OutputDelta {
+                channel: OutputChannel::Reasoning,
+                text: continuation.clone(),
+            },
+        );
+        let after_stream = transcript(&shell);
+        assert_eq!(
+            after_stream, initial,
+            "hidden deltas changed transcript geometry"
+        );
+        {
+            let state = shell.state.borrow();
+            let TranscriptBlock::Reasoning(reasoning) = &state.transcript[0] else {
+                panic!("reasoning block expected");
+            };
+            assert_eq!(
+                reasoning.text,
+                format!("first private sentinel{continuation}")
+            );
+        }
+
+        shell.expand_focused_tool();
+        let expanded = transcript(&shell).join("\n");
+        assert!(expanded.contains("first private sentinel"), "{expanded}");
+        assert!(expanded.contains("private reasoning row 127"), "{expanded}");
+        assert!(!expanded.contains("ctrl+o to expand"), "{expanded}");
+
+        shell.expand_focused_tool();
+        assert_eq!(transcript(&shell), initial);
+    }
+
+    #[test]
+    fn collapsed_reasoning_shimmers_in_model_color_and_settles_with_duration() {
+        let theme = crate::tui::theme::test_theme();
+        let renderer = theme.reasoning_renderer();
+        let mut reasoning =
+            AssistantBlock::streaming_reasoning("private").with_model_lab(Some(ModelLab::Alibaba));
+        reasoning.reasoning_animation_frame = 2;
+        let live = render_reasoning(&reasoning, &renderer, &theme, 80, false);
+        let plain_live = live
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>();
+        assert_eq!(plain_live, ["⠹ thinking", "└ ctrl+o to expand"]);
+        assert!(live[0].contains("\x1b[38;2;"), "{live:?}");
+        assert!(live[0].contains("\x1b[1m"), "{live:?}");
+        assert!(live[0].contains("\x1b[22m"), "{live:?}");
+
+        reasoning.reasoning_animation_frame += 1;
+        let next = render_reasoning(&reasoning, &renderer, &theme, 80, false);
+        assert_ne!(next[0], live[0], "shimmer frame must advance");
+
+        reasoning.reasoning_elapsed = Some(Duration::from_millis(13_700));
+        reasoning.finish_reasoning();
+        let settled = render_reasoning(&reasoning, &renderer, &theme, 80, false);
+        assert_eq!(strip_terminal_sequences(&settled[0]), "thought for 14s");
+        assert_eq!(strip_terminal_sequences(&settled[1]), "└ ctrl+o to expand");
+        assert!(settled[0].contains("\x1b[3m"), "{settled:?}");
+        assert!(settled[0].contains("\x1b[38;2;"), "{settled:?}");
+        assert!(!settled[0].contains("\x1b[1m"), "{settled:?}");
+    }
+
+    #[test]
+    fn hydrated_reasoning_is_retained_but_collapsed_until_ctrl_o() {
+        use ygg_ai::{AssistantMessage, AssistantPart, Message, ModelId, Protocol, ReasoningPart};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        let source = "durable private thought\nwith a second line";
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Reasoning(ReasoningPart {
+                    text: Some(source.into()),
+                    state: None,
+                })],
+                model: ModelId("test".into()),
+                protocol: Protocol::OpenAiResponses,
+            })))
+            .unwrap();
+
+        let mut shell = InteractiveShell::test_shell();
+        shell.hydrate(&session).unwrap();
+        let render = |shell: &InteractiveShell| {
+            shell
+                .state
+                .borrow()
+                .rendered_transcript(80)
+                .iter()
+                .map(|line| strip_terminal_sequences(line))
+                .collect::<Vec<_>>()
+        };
+        let collapsed = render(&shell);
+        assert_eq!(collapsed.len(), 2, "{collapsed:?}");
+        assert!(collapsed[0].contains("thought"), "{collapsed:?}");
+        assert!(collapsed[1].contains("ctrl+o to expand"), "{collapsed:?}");
+        assert!(!collapsed.join("\n").contains(source));
+        let state = shell.state.borrow();
+        let TranscriptBlock::Reasoning(reasoning) = &state.transcript[0] else {
+            panic!("hydrated reasoning block expected");
+        };
+        assert_eq!(reasoning.text, source);
+        assert!(reasoning.finished);
+        drop(state);
+
+        shell.expand_focused_tool();
+        let expanded = render(&shell).join("\n");
+        assert!(expanded.contains("durable private thought"), "{expanded}");
+        assert!(expanded.contains("with a second line"), "{expanded}");
+
+        shell.expand_focused_tool();
+        assert_eq!(render(&shell), collapsed);
+    }
+
+    #[test]
     fn completed_reasoning_uses_rich_markdown_without_raw_delimiters() {
         let mut shell = InteractiveShell::test_shell();
         let run_id = shell.begin_run("openai");
@@ -9515,11 +10236,13 @@ mod tests {
                 text: "**Inspecting `render.rs`**".into(),
             },
         );
-        let live = render_shell(&shell.state.borrow(), 80).join("\n");
-        assert!(live.contains("Planning validation"), "{live}");
-        assert!(live.contains("Inspecting"), "{live}");
-        assert!(!live.contains("**"), "{live}");
-        assert!(!live.contains("`render.rs`"), "{live}");
+        let collapsed = render_shell(&shell.state.borrow(), 80).join("\n");
+        let collapsed_plain = strip_terminal_sequences(&collapsed);
+        assert!(collapsed_plain.contains("thinking"), "{collapsed_plain}");
+        assert!(
+            !collapsed_plain.contains("Planning validation"),
+            "{collapsed_plain}"
+        );
         {
             let state = shell.state.borrow();
             let TranscriptBlock::Reasoning(reasoning) = &state.transcript[0] else {
@@ -9528,6 +10251,12 @@ mod tests {
             assert!(reasoning.text.contains("****"));
             assert!(!reasoning.markdown.raw_text().contains("****"));
         }
+        shell.expand_focused_tool();
+        let live = render_shell(&shell.state.borrow(), 80).join("\n");
+        assert!(live.contains("Planning validation"), "{live}");
+        assert!(live.contains("Inspecting"), "{live}");
+        assert!(!live.contains("**"), "{live}");
+        assert!(!live.contains("`render.rs`"), "{live}");
 
         // A tool boundary finalizes both assistant and reasoning streams.
         shell.on_run_event(
@@ -9640,7 +10369,7 @@ mod tests {
             "inline code should be coloured"
         );
         assert!(
-            strip_terminal_sequences(&reasoning_block).starts_with("  · Thinking"),
+            strip_terminal_sequences(&reasoning_block).starts_with("  thought"),
             "thinking shares the transcript inset: {reasoning_block:?}"
         );
         assert!(reasoning.contains("Session"));
@@ -9870,6 +10599,7 @@ mod tests {
         );
         let active = emulate_rows(&active, 80);
         assert_ascii_foreground(&active, "read", muted);
+        assert_ascii_bold(&active, "read");
         assert_ascii_foreground(&active, "src/lib.rs", muted);
         assert_ascii_foreground(&active, "live output", muted);
         assert_ascii_foreground(&active, "live raw evidence", muted);
@@ -9888,6 +10618,7 @@ mod tests {
         let completed = render_block(None, &completed, &theme, &renderer, &renderer, 80, false);
         let completed = emulate_rows(&completed, 80);
         assert_ascii_foreground(&completed, "read", foreground);
+        assert_ascii_bold(&completed, "read");
         assert_ascii_foreground(&completed, "src/lib.rs", foreground);
 
         let failed = TranscriptBlock::Tool(Box::new(ToolPanel::new(
@@ -9904,6 +10635,7 @@ mod tests {
         let failed = render_block(None, &failed, &theme, &renderer, &renderer, 80, false);
         let failed = emulate_rows(&failed, 80);
         assert_ascii_foreground(&failed, "read", error);
+        assert_ascii_bold(&failed, "read");
         assert_ascii_foreground(&failed, "permission denied", error);
 
         let active_exec_args = serde_json::json!({"command":"echo active"});
@@ -10149,6 +10881,62 @@ mod tests {
     }
 
     #[test]
+    fn active_exec_renders_command_immediately_and_refreshes_bounded_live_tail() {
+        let mut shell = InteractiveShell::test_shell();
+        let run_id = shell.begin_run("openai");
+        let id = ToolCallId("live-exec".into());
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolStarted {
+                id: id.clone(),
+                name: "exec".into(),
+                args: serde_json::json!({"command": "long-running-check"}),
+            },
+        );
+
+        let render = |shell: &InteractiveShell| {
+            strip_terminal_sequences(&render_shell(&shell.state.borrow(), 100).join("\n"))
+        };
+        let started = render(&shell);
+        assert!(started.contains("$ long-running-check"), "{started}");
+
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolProgress {
+                id: id.clone(),
+                progress: ToolProgress::Output {
+                    stream: ygg_agent::OutputStream::Stdout,
+                    bytes: bytes::Bytes::from_static(
+                        b"live-1\nlive-2\nlive-3\nlive-4\nlive-5\nlive-6\n",
+                    ),
+                },
+            },
+        );
+        let streamed = render(&shell);
+        assert!(streamed.contains("live-6"), "{streamed}");
+        assert!(streamed.contains("1 earlier line"), "{streamed}");
+        assert!(!streamed.contains("  live-1\n"), "{streamed}");
+
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolProgress {
+                id: id.clone(),
+                progress: ToolProgress::Status("waiting for child".into()),
+            },
+        );
+        let status = render(&shell);
+        assert!(status.contains("waiting for child"), "{status}");
+        let state = shell.state.borrow();
+        let TranscriptBlock::Tool(panel) = &state.transcript[0] else {
+            panic!("tool panel expected");
+        };
+        assert!(
+            !panel.finished,
+            "regression must prove pre-finish rendering"
+        );
+    }
+
+    #[test]
     fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_identity(
@@ -10223,7 +11011,7 @@ mod tests {
         }
         let now = started + Duration::from_millis(8_700);
         let live = plain_footer(&shell, 100, now);
-        assert!(live.ends_with("waiting · 8.7s"), "{live:?}");
+        assert!(live.ends_with("waiting for API 8.7s"), "{live:?}");
         assert!(
             live.contains("~72.4 tok/s"),
             "live estimate missing: {live:?}"
@@ -10267,7 +11055,7 @@ mod tests {
             !paid.contains("session"),
             "session cost stays in /status: {paid:?}"
         );
-        assert!(paid.ends_with("waiting · 8.7s"));
+        assert!(paid.ends_with("waiting for API 8.7s"));
 
         {
             let mut state = shell.state.borrow_mut();
@@ -10290,7 +11078,8 @@ mod tests {
             active_sample.contains("72.4 tok/s"),
             "provider-final throughput should remain visible while tools run: {active_sample:?}"
         );
-        assert!(active_sample.ends_with("tool · 8.7s"));
+        assert!(active_sample.ends_with("8.7s"));
+        assert!(!active_sample.contains("tool"));
         let final_diagnostics = status_telemetry(&shell.state.borrow(), now);
         assert!(final_diagnostics.contains("72.4 tok/s final"));
 
@@ -10368,9 +11157,9 @@ mod tests {
         let reasoning_renderer = theme.reasoning_renderer();
         let transcript = (0..12)
             .map(|step| {
-                TranscriptBlock::Reasoning(Box::new(AssistantBlock::finalized_reasoning(format!(
-                    "Step {step}"
-                ))))
+                let mut reasoning = AssistantBlock::finalized_reasoning(format!("Step {step}"));
+                reasoning.reasoning_expanded = true;
+                TranscriptBlock::Reasoning(Box::new(reasoning))
             })
             .collect::<Vec<_>>();
 
@@ -10410,9 +11199,11 @@ mod tests {
             assert!(index < 2 || !plain[index - 2].is_empty());
         }
 
-        let verbose = TranscriptBlock::Reasoning(Box::new(AssistantBlock::finalized_reasoning(
+        let mut verbose_reasoning = AssistantBlock::finalized_reasoning(
             "First complete thought.\n\nSecond complete thought.".into(),
-        )));
+        );
+        verbose_reasoning.reasoning_expanded = true;
+        let verbose = TranscriptBlock::Reasoning(Box::new(verbose_reasoning));
         let verbose = render_block(
             None,
             &verbose,
@@ -10664,6 +11455,49 @@ mod tests {
             "{plain}"
         );
         assert!(!plain.contains("ctrl+o"), "nothing UI-hidden: {plain}");
+    }
+
+    #[test]
+    fn compact_exec_hides_current_and_legacy_complete_capture_footers() {
+        let theme = crate::tui::theme::test_theme();
+        let renderer = theme.rich_renderer();
+        for footer in [
+            "complete_stdout=true",
+            "complete_stderr=true",
+            "truncated_stdout=false",
+            "truncated_stderr=false",
+        ] {
+            let args = serde_json::json!({"command": "printf ready"});
+            let panel = ToolPanel::new(
+                ToolCallId(format!("exec-{footer}")),
+                "exec".into(),
+                args.to_string(),
+                summarize_tool("exec", &args),
+                format!("exit=0 duration=0.1s\nstdout: 1 lines\nready\n{footer}"),
+                true,
+                false,
+                None,
+                None,
+            );
+            let compact = compact_exec_output(&panel);
+            assert_eq!(compact.lines, ["ready"], "{footer}");
+            assert!(compact.capture_truncations.is_empty(), "{footer}");
+            let plain = render_block(
+                None,
+                &TranscriptBlock::Tool(Box::new(panel)),
+                &theme,
+                &renderer,
+                &renderer,
+                80,
+                false,
+            )
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+            assert!(plain.contains("ready"), "{plain}");
+            assert!(!plain.contains(footer), "{plain}");
+        }
     }
 
     #[test]
@@ -11058,8 +11892,9 @@ mod tests {
         assert!(!active_footer.contains("DeepSeek"), "{active_footer:?}");
         shell.set_size(24, 12);
         let narrow_active = plain_footer(&shell, 24, now);
-        assert!(narrow_active.contains("thinking"), "{narrow_active:?}");
-        assert!(narrow_active.contains('s'), "{narrow_active:?}");
+        assert!(narrow_active.ends_with("0.0s"), "{narrow_active:?}");
+        assert!(!narrow_active.contains("thinking"), "{narrow_active:?}");
+        assert!(!narrow_active.contains("tool"), "{narrow_active:?}");
         shell.set_size(46, 12);
         {
             let state = shell.state.borrow();
@@ -11281,6 +12116,18 @@ mod tests {
         let hidden_reasoning = TranscriptBlock::Reasoning(Box::new(
             AssistantBlock::finalized_reasoning("hidden".into()),
         ));
+        let collapsed_reasoning = render_block(
+            None,
+            &hidden_reasoning,
+            &hidden_theme,
+            &hidden_renderer,
+            &hidden_renderer,
+            80,
+            false,
+        );
+        assert_eq!(collapsed_reasoning.len(), 2);
+        assert!(strip_terminal_sequences(&collapsed_reasoning[0]).contains("thought"));
+        assert!(strip_terminal_sequences(&collapsed_reasoning[1]).contains("ctrl+o to expand"));
         let first_visible = render_block(
             Some(&hidden_reasoning),
             &current,
@@ -11290,7 +12137,13 @@ mod tests {
             80,
             false,
         );
-        assert!(first_visible.first().is_some_and(|line| !line.is_empty()));
+        assert_eq!(
+            first_visible
+                .iter()
+                .take_while(|line| line.is_empty())
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -11312,8 +12165,8 @@ mod tests {
         let at_breakpoint = render_block(None, &reasoning, &theme, &renderer, &renderer, 72, false);
         let below_breakpoint =
             render_block(None, &reasoning, &theme, &renderer, &renderer, 71, false);
-        assert!(!at_breakpoint.is_empty());
-        assert!(below_breakpoint.is_empty());
+        assert!(strip_terminal_sequences(&at_breakpoint.join("\n")).contains("thought"));
+        assert!(strip_terminal_sequences(&below_breakpoint.join("\n")).contains("thought"));
 
         let args = serde_json::json!({"command": "cargo check"});
         let tool = TranscriptBlock::Tool(Box::new(ToolPanel::new(

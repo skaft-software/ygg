@@ -7,8 +7,7 @@ use crate::config::Config;
 use crate::resource_resolver::{ResourceKind, ResourceResolver, ResourceSnapshot, ResourceTrust};
 
 /// Stable identity applied before the dynamic environment and tool contract.
-pub const BASE_PERSONA: &str =
-    "You are an expert coding assistant operating inside ygg, a coding-agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
+pub const BASE_PERSONA: &str = "You are Ygg, an expert coding agent.";
 
 const MAX_CONTEXT_FILE_BYTES: usize = 256 * 1024;
 const MAX_CONTEXT_TOTAL_BYTES: usize = 512 * 1024;
@@ -63,36 +62,30 @@ fn xml_attribute(value: &str) -> String {
 }
 
 fn base_prompt(config: &Config) -> String {
-    let mut prompt = format!("{BASE_PERSONA}\n\nAvailable tools:");
-
-    let tools = [
-        (
-            "read",
-            "Read a known file with line numbers and a content hash.",
-        ),
-        ("edit", "Make one precise replacement in an existing file."),
-        ("write", "Create or completely replace a file."),
-        (
-            "exec",
-            "Run commands for discovery, search, builds, and tests.",
-        ),
-        ("search", "Search file contents with a bounded result set."),
-    ];
+    // Full contracts already travel with each tool schema. Repeat only the
+    // enabled names here so the scaffold stays useful to small local models.
+    let mut prompt = format!("{BASE_PERSONA}\n\nCore tools: ");
+    let tools = ["read", "edit", "write", "exec", "search"];
     let mut visible_tools = 0usize;
-    for (name, description) in tools {
+    for name in tools {
         if config.tool_available(name) {
+            if visible_tools > 0 {
+                prompt.push_str(", ");
+            }
             visible_tools += 1;
-            prompt.push_str(&format!("\n- {name}: {description}"));
+            prompt.push_str(name);
         }
     }
     if visible_tools == 0 {
-        prompt.push_str("\n- None of Ygg's core tools are enabled.");
+        prompt.push_str("none");
     }
 
     prompt.push_str(
-        "\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n\
-- Be concise in your responses.\n\
-- Show file paths clearly when working with files.\n\nCurrent working directory: ",
+        ". Project tools may also appear.\n\nResponse:\n\
+- Direct, terse, conclusion-first. No preamble, prompt echo, needless recap, obvious reasoning/steps.\n\
+- Prefer unambiguous fragments/symbols/equations/tables/code; only rationale needed for trust/action.\n\
+- Expand only on request or for correctness, ambiguity, safety, or debugging. Keep essential qualifications, units, constraints, uncertainty.\n\
+- Show file paths clearly. Never request/reveal private chain-of-thought.\n\nCWD: ",
     );
     prompt.push_str(&prompt_path(&config.invocation_cwd));
     prompt
@@ -1064,19 +1057,31 @@ mod tests {
         let config = config(root.path().to_owned(), nested.clone());
         let prompt = base_prompt(&config);
 
-        assert!(BASE_PERSONA.contains("expert coding assistant"));
-        assert!(prompt.contains(&format!("Current working directory: {}", nested.display())));
-        for tool in ["read", "edit", "write", "exec"] {
-            assert!(prompt.contains(&format!("- {tool}:")), "{prompt}");
-        }
-        assert!(!prompt.contains("- search:"), "{prompt}");
-        assert!(prompt.contains("Be concise in your responses"));
-        assert!(prompt.contains("Show file paths clearly when working with files"));
-        assert!(prompt.contains("other custom tools depending on the project"));
+        assert_eq!(BASE_PERSONA, "You are Ygg, an expert coding agent.");
+        assert!(prompt.contains(&format!("CWD: {}", nested.display())));
         assert!(
-            prompt.len().saturating_sub(prompt_path(root.path()).len()) < 1_000,
+            prompt.contains("Core tools: read, edit, write, exec."),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("Core tools: read, edit, write, exec, search"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Project tools may also appear"));
+        assert!(prompt.contains("Direct, terse, conclusion-first"));
+        assert!(prompt.contains("No preamble, prompt echo, needless recap"));
+        assert!(prompt.contains("fragments/symbols/equations/tables/code"));
+        assert!(prompt.contains("only rationale needed for trust/action"));
+        assert!(prompt.contains("Expand only on request or for correctness"));
+        assert!(prompt.contains("essential qualifications, units, constraints, uncertainty"));
+        assert!(prompt.contains("Show file paths clearly"));
+        assert!(prompt.contains("Never request/reveal private chain-of-thought"));
+        let cwd = prompt_path(&nested);
+        let scaffold = prompt.strip_suffix(&cwd).expect("prompt ends with CWD");
+        assert!(
+            scaffold.len() <= 550,
             "base prompt scaffold grew to {} bytes",
-            prompt.len()
+            scaffold.len()
         );
     }
 
@@ -1089,11 +1094,8 @@ mod tests {
         config.sandbox.allow_process = false;
 
         let prompt = base_prompt(&config);
-        assert!(prompt.contains("- read:"));
-        assert!(!prompt.contains("- edit:"));
-        assert!(!prompt.contains("- write:"));
-        assert!(!prompt.contains("- exec:"));
-        assert!(!prompt.contains("exec with rg/find/ls"));
+        assert!(prompt.contains("Core tools: read."), "{prompt}");
+        assert!(!prompt.contains("Core tools: read, edit"), "{prompt}");
     }
 
     #[test]

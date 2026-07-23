@@ -558,6 +558,7 @@ pub(crate) fn build_request(
     if let Some(cap) = model.spec.capabilities.reasoning.as_ref() {
         match req.reasoning {
             ReasoningConfig::Off => {}
+            ReasoningConfig::On => {}
             ReasoningConfig::Effort(effort) => match cap.control {
                 crate::types::ReasoningControl::Effort => {
                     thinking_opt = Some(AnthropicThinkingConfig {
@@ -582,6 +583,7 @@ pub(crate) fn build_request(
                         });
                     }
                 }
+                crate::types::ReasoningControl::Toggle => {}
             },
             ReasoningConfig::Budget(b) => {
                 thinking_opt = Some(AnthropicThinkingConfig {
