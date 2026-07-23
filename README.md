@@ -1,6 +1,6 @@
-# Ygg
+# ygg
 
-Ygg is a local-first coding agent for macOS and Linux. It provides an interactive terminal UI, plain and print modes, persistent branchable sessions, tool execution, automatic context compaction, and one provider-independent conversation model across OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages.
+ygg is a local-first coding agent for macOS and Linux. It provides an interactive terminal UI, plain and print modes, persistent branchable sessions, tool execution, automatic context compaction, and one provider-independent conversation model across OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages.
 
 > **Release status:** `0.1.0-alpha`. The core safety and persistence invariants are regression-tested, but the product is evolving quickly. Ygg is not an operating-system sandbox.
 
@@ -56,7 +56,7 @@ export OPENROUTER_API_KEY='...'
 ygg --model openrouter/anthropic/claude-sonnet-4.6
 ```
 
-Ygg also supports DeepSeek, Groq, Cerebras, xAI, Together, Fireworks, NVIDIA, Hugging Face, Moonshot, MiniMax, OpenCode, and ChatGPT subscription credentials (`ygg --login codex`). Run `ygg --help` for launch controls and use `/model` in the TUI.
+ygg also supports DeepSeek, Groq, Cerebras, xAI, Together, Fireworks, NVIDIA, Hugging Face, Moonshot, MiniMax, OpenCode, and ChatGPT subscription credentials (`ygg --login codex`). Run `ygg --help` for launch controls and use `/model` in the TUI.
 
 ### Local OpenAI-compatible model
 
