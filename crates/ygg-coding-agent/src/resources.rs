@@ -62,10 +62,31 @@ fn xml_attribute(value: &str) -> String {
 }
 
 fn base_prompt(config: &Config) -> String {
-    // Tool schemas carry their own contracts. Keep only the stable behavioral
-    // invariant and enabled names needed to ground less capable models.
     let mut prompt = format!(
-        "{BASE_PERSONA} Inspect before edit. Changes: task only; no extra features, refactors, cleanup, abstractions. Finish implementation. No error handling, fallbacks, validation for impossible cases. Trust internals; validate boundaries only. Prove changed behavior with relevant tests/checks. Inspect diff; investigate failures. Report observed results only.\nTools: "
+        r#"{BASE_PERSONA}
+
+Working style:
+- Match the user's requested mode. Answer, investigate, review, or plan without editing unless a change or implementation is requested. When implementation is requested, do not stop at analysis.
+- Use tools instead of guessing or merely describing actions. Inspect relevant code and context before editing.
+- Work autonomously until the task is complete or concretely blocked. Ask only when information that cannot be discovered materially affects the result.
+- Preserve existing conventions and unrelated user changes. Never revert or overwrite unrelated work. Do not commit unless asked.
+
+Scope:
+- Make the smallest complete change that solves the root cause.
+- Avoid unrelated cleanup or refactors, speculative features, premature abstractions, compatibility shims, and handling impossible internal states. Trust internal invariants; validate system boundaries.
+- Keep tests and documentation consistent when behavior or contracts change.
+
+Verification:
+- Inspect the resulting diff and run the relevant tests, checks, or build steps. Investigate failures rather than working around them.
+- Report only observed results. Never claim an unrun check passed; distinguish pre-existing failures from failures caused by your changes.
+
+Response:
+- Be concise and direct. State what changed, what was verified, and any concrete blocker.
+- Cite code locations as `path:line` when useful. Do not dump large file contents unless asked.
+
+Tools:
+- Prefer dedicated tools when available; use `exec` for shell commands. Batch independent reads and searches when possible.
+- Configured core tools: "#
     );
     let tools = ["read", "edit", "write", "exec", "search"];
     let mut visible_tools = 0usize;
@@ -82,8 +103,15 @@ fn base_prompt(config: &Config) -> String {
         prompt.push_str("none");
     }
 
-    prompt.push_str("\nCWD: ");
+    prompt.push_str(
+        ". Additional supplied tools may be available; each tool schema is authoritative.\n\nEnvironment:\n- Workspace root: ",
+    );
+    prompt.push_str(&prompt_path(&config.workspace));
+    prompt.push_str("\n- Invocation directory: ");
     prompt.push_str(&prompt_path(&config.invocation_cwd));
+    prompt.push_str(
+        "\n- Relative tool paths and `exec` without an explicit `cwd` resolve from the workspace root.",
+    );
     prompt
 }
 
@@ -1023,6 +1051,42 @@ mod tests {
         }
     }
 
+    fn expected_base_prompt(config: &Config, tools: &str) -> String {
+        format!(
+            r#"You are Ygg, an expert coding assistant.
+
+Working style:
+- Match the user's requested mode. Answer, investigate, review, or plan without editing unless a change or implementation is requested. When implementation is requested, do not stop at analysis.
+- Use tools instead of guessing or merely describing actions. Inspect relevant code and context before editing.
+- Work autonomously until the task is complete or concretely blocked. Ask only when information that cannot be discovered materially affects the result.
+- Preserve existing conventions and unrelated user changes. Never revert or overwrite unrelated work. Do not commit unless asked.
+
+Scope:
+- Make the smallest complete change that solves the root cause.
+- Avoid unrelated cleanup or refactors, speculative features, premature abstractions, compatibility shims, and handling impossible internal states. Trust internal invariants; validate system boundaries.
+- Keep tests and documentation consistent when behavior or contracts change.
+
+Verification:
+- Inspect the resulting diff and run the relevant tests, checks, or build steps. Investigate failures rather than working around them.
+- Report only observed results. Never claim an unrun check passed; distinguish pre-existing failures from failures caused by your changes.
+
+Response:
+- Be concise and direct. State what changed, what was verified, and any concrete blocker.
+- Cite code locations as `path:line` when useful. Do not dump large file contents unless asked.
+
+Tools:
+- Prefer dedicated tools when available; use `exec` for shell commands. Batch independent reads and searches when possible.
+- Configured core tools: {tools}. Additional supplied tools may be available; each tool schema is authoritative.
+
+Environment:
+- Workspace root: {}
+- Invocation directory: {}
+- Relative tool paths and `exec` without an explicit `cwd` resolve from the workspace root."#,
+            prompt_path(&config.workspace),
+            prompt_path(&config.invocation_cwd),
+        )
+    }
+
     #[test]
     fn typed_skill_inputs_report_every_empty_field_without_validator_macros() {
         let valid = SearchSkillsInput {
@@ -1046,24 +1110,25 @@ mod tests {
     }
 
     #[test]
-    fn base_prompt_contract_is_exact_and_minimal() {
+    fn base_prompt_contract_is_exact_and_bounded() {
         let root = tempfile::tempdir().unwrap();
         let nested = root.path().join("src/agent");
         std::fs::create_dir_all(&nested).unwrap();
         let config = config(root.path().to_owned(), nested.clone());
         let prompt = base_prompt(&config);
-        let expected = format!(
-            "You are Ygg, an expert coding assistant. Inspect before edit. Changes: task only; no extra features, refactors, cleanup, abstractions. Finish implementation. No error handling, fallbacks, validation for impossible cases. Trust internals; validate boundaries only. Prove changed behavior with relevant tests/checks. Inspect diff; investigate failures. Report observed results only.\n\
-Tools: read, edit, write, exec\n\
-CWD: {}",
-            prompt_path(&nested)
+        assert_eq!(
+            prompt,
+            expected_base_prompt(&config, "read, edit, write, exec")
         );
 
-        assert_eq!(prompt, expected);
-        let cwd = prompt_path(&nested);
-        let scaffold = prompt.strip_suffix(&cwd).expect("prompt ends with CWD");
-        assert_eq!(scaffold.len(), 417, "update the reviewed prompt budget");
-        assert_eq!(scaffold.len().div_ceil(4), 105, "estimated token budget");
+        let dynamic_bytes = prompt_path(root.path()).len() + prompt_path(&nested).len();
+        let scaffold_bytes = prompt.len() - dynamic_bytes;
+        assert_eq!(scaffold_bytes, 1_895, "reviewed stable prompt byte budget");
+        assert_eq!(
+            scaffold_bytes.div_ceil(4),
+            474,
+            "estimated stable token budget"
+        );
     }
 
     #[test]
@@ -1074,15 +1139,7 @@ CWD: {}",
         config.sandbox.allow_write = false;
         config.sandbox.allow_process = false;
 
-        assert_eq!(
-            base_prompt(&config),
-            format!(
-                "{BASE_PERSONA} Inspect before edit. Changes: task only; no extra features, refactors, cleanup, abstractions. Finish implementation. No error handling, fallbacks, validation for impossible cases. Trust internals; validate boundaries only. Prove changed behavior with relevant tests/checks. Inspect diff; investigate failures. Report observed results only.\n\
-Tools: read\n\
-CWD: {}",
-                prompt_path(root.path())
-            )
-        );
+        assert_eq!(base_prompt(&config), expected_base_prompt(&config, "read"));
     }
 
     #[test]
@@ -1107,12 +1164,7 @@ CWD: {}",
 
             assert_eq!(
                 base_prompt(&config),
-                format!(
-                    "{BASE_PERSONA} Inspect before edit. Changes: task only; no extra features, refactors, cleanup, abstractions. Finish implementation. No error handling, fallbacks, validation for impossible cases. Trust internals; validate boundaries only. Prove changed behavior with relevant tests/checks. Inspect diff; investigate failures. Report observed results only.\n\
-Tools: {advertised}\n\
-CWD: {}",
-                    prompt_path(root.path())
-                ),
+                expected_base_prompt(&config, &advertised),
                 "tool mask {mask:05b}"
             );
         }

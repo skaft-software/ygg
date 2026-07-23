@@ -2,10 +2,13 @@
 
 use std::io::{self, Write};
 
-use ygg_agent::{EntryId, EntryValue, InputPart, Session};
+use ygg_agent::{
+    build_handoff_message, finish_handoff, prepare_handoff, EntryId, EntryValue,
+    HandoffPreparation, InputPart, Session, SUMMARIZATION_SYSTEM_PROMPT,
+};
 use ygg_ai::{
     AssistantPart, Media, Message, OutputFormat, OutputModalities, ReasoningConfig, Request,
-    ToolChoice, ToolResultPart, UserMessage, UserPart,
+    ToolChoice, ToolResultPart, UserPart,
 };
 
 use crate::app::App;
@@ -19,7 +22,6 @@ const PER_MESSAGE_OVERHEAD_TOKENS: u64 = 8;
 /// enforces the true limit.
 const IMAGE_TOKENS: u64 = 1_600;
 const AUDIO_TOKENS: u64 = 8_000;
-const COMPACTION_SYSTEM: &str = "Summarize the prior coding conversation for another agent. Preserve completed work, decisions, constraints, unresolved tasks, file paths, commands, failures, and tool findings. Be concise and factual; do not claim unverified completion.";
 
 /// Result of a best-effort compaction attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,81 +236,6 @@ pub fn choose_first_kept(session: &Session, keep_recent_turns: usize) -> Option<
     Some(starts[starts.len() - keep_recent_turns].clone())
 }
 
-fn synthetic_summary(summary: String) -> Message {
-    Message::User(UserMessage {
-        content: vec![UserPart::Text(format!(
-            "[summary of earlier conversation]\n{summary}"
-        ))],
-    })
-}
-
-fn is_tool_results(message: &Message) -> bool {
-    matches!(
-        message,
-        Message::User(user)
-            if !user.content.is_empty()
-                && user.content.iter().all(|part| matches!(part, UserPart::ToolResult(_)))
-    )
-}
-
-fn coalesce_tool_results(messages: Vec<Message>) -> Vec<Message> {
-    let mut result = Vec::with_capacity(messages.len());
-    for message in messages {
-        if is_tool_results(&message) {
-            if let Some(Message::User(previous)) = result.last_mut() {
-                if previous
-                    .content
-                    .iter()
-                    .all(|part| matches!(part, UserPart::ToolResult(_)))
-                {
-                    if let Message::User(current) = message {
-                        previous.content.extend(current.content);
-                        continue;
-                    }
-                }
-            }
-        }
-        result.push(message);
-    }
-    result
-}
-
-/// Reconstruct model-visible messages strictly before `first_kept` on the
-/// current active branch. Older compaction records fold to their summaries.
-pub fn messages_before(session: &Session, first_kept: &EntryId) -> anyhow::Result<Vec<Message>> {
-    let entry = session
-        .entry(first_kept)
-        .ok_or_else(|| anyhow::anyhow!("unknown first kept entry {}", first_kept.0))?;
-    let mut reverse = Vec::new();
-    let mut cursor = entry.parent.as_ref();
-    while let Some(id) = cursor {
-        let entry = session
-            .entry(id)
-            .ok_or_else(|| anyhow::anyhow!("dangling session entry {}", id.0))?;
-        reverse.push(entry);
-        cursor = entry.parent.as_ref();
-    }
-    reverse.reverse();
-
-    let mut messages = Vec::new();
-    for entry in reverse {
-        match &entry.value {
-            EntryValue::Message(message) => messages.push(message.clone()),
-            EntryValue::Compaction { summary, .. } => {
-                // The marker replaces everything represented before it.
-                messages.clear();
-                messages.push(synthetic_summary(summary.clone()));
-            }
-            EntryValue::Config { .. }
-            | EntryValue::PromptTemplateSelected { .. }
-            | EntryValue::SkillActivated { .. }
-            | EntryValue::SkillResourceRead { .. }
-            | EntryValue::SkillDeactivated { .. } => {}
-        }
-    }
-    Ok(coalesce_tool_results(messages))
-}
-
 /// Call a tool-free compaction subagent, persist its billable telemetry, and
 /// return its text.
 async fn compaction_call(
@@ -369,22 +296,22 @@ async fn compaction_call(
     Ok(text)
 }
 
-/// Produce one grounded handoff summary without replaying the original history
-/// through additional question/answer calls.
+/// Produce one Pi-compatible structured handoff without replaying the original
+/// history through additional question/answer calls.
 pub async fn summarize(
     client: &ygg_ai::AiClient,
     model: &ygg_ai::Model,
     session: &mut Session,
     cache_retention: ygg_ai::CacheRetention,
-    messages: &[Message],
+    preparation: &HandoffPreparation,
 ) -> anyhow::Result<String> {
     compaction_call(
         client,
         model,
         session,
         cache_retention,
-        COMPACTION_SYSTEM,
-        messages.to_vec(),
+        SUMMARIZATION_SYSTEM_PROMPT,
+        vec![build_handoff_message(preparation)],
         4096,
     )
     .await
@@ -401,8 +328,8 @@ pub async fn attempt_compaction(app: &mut App) -> anyhow::Result<CompactionOutco
                 })
             }
         };
-    let messages = match messages_before(app.agent.session(), &first_kept) {
-        Ok(messages) if !messages.is_empty() => messages,
+    let preparation = match prepare_handoff(app.agent.session(), &first_kept) {
+        Ok(preparation) if !preparation.messages.is_empty() => preparation,
         Ok(_) => {
             return Ok(CompactionOutcome::Skipped {
                 reason: "no prior messages to summarize".into(),
@@ -425,8 +352,9 @@ pub async fn attempt_compaction(app: &mut App) -> anyhow::Result<CompactionOutco
         .cloned()
         .unwrap_or_else(|| app.model.clone());
     let cache_retention = app.config.cache_retention;
-    let estimated_input = estimate_text_tokens(COMPACTION_SYSTEM)
-        .saturating_add(estimate_messages_tokens(&messages))
+    let summary_messages = vec![build_handoff_message(&preparation)];
+    let estimated_input = estimate_text_tokens(SUMMARIZATION_SYSTEM_PROMPT)
+        .saturating_add(estimate_messages_tokens(&summary_messages))
         .saturating_add(FRAMING_OVERHEAD_TOKENS);
     let summary_output_tokens = model.spec.limits.max_output_tokens.clamp(1, 4096);
     let input_budget = model
@@ -454,20 +382,24 @@ pub async fn attempt_compaction(app: &mut App) -> anyhow::Result<CompactionOutco
         &model,
         app.agent.session_mut(),
         cache_retention,
-        &messages,
+        &preparation,
     )
     .await
     {
-        Ok(summary) => summary,
+        Ok(summary) => finish_handoff(summary, &preparation.details),
         Err(error) => {
             return Ok(CompactionOutcome::Skipped {
                 reason: error.to_string(),
             })
         }
     };
-    match app.agent.session_mut().compact(summary, first_kept) {
+    match app
+        .agent
+        .session_mut()
+        .compact_with_details(summary, first_kept, preparation.details)
+    {
         Ok(_) => Ok(CompactionOutcome::Compacted {
-            elided: messages.len(),
+            elided: preparation.messages.len(),
         }),
         Err(error) => Ok(CompactionOutcome::Skipped {
             reason: error.to_string(),
@@ -480,7 +412,7 @@ pub(crate) mod tests {
     use super::*;
     use ygg_ai::{
         AssistantMessage, Media, ModelId, Protocol, ToolCall, ToolCallId, ToolResult,
-        ToolResultPart,
+        ToolResultPart, UserMessage,
     };
 
     use crate::app::bootstrap::{bootstrap, build_app, LaunchSelection, SessionSelection};
@@ -555,9 +487,16 @@ pub(crate) mod tests {
         session.append(user("new user 2")).unwrap();
         session.append(assistant("new assistant 2")).unwrap();
         let next = choose_first_kept(&session, 2).expect("new turns permit compaction");
-        let before = messages_before(&session, &next).unwrap();
-        assert!(before.iter().any(|message| {
-            matches!(message, Message::User(user) if user.content.iter().any(|part| matches!(part, UserPart::Text(text) if text.contains("first summary"))))
+        let preparation = prepare_handoff(&session, &next).unwrap();
+        assert_eq!(
+            preparation.previous_summary.as_deref(),
+            Some("first summary")
+        );
+        assert!(preparation.messages.iter().any(|message| {
+            matches!(message, Message::User(user) if user.content.iter().any(|part| matches!(part, UserPart::Text(text) if text == "user 4")))
+        }));
+        assert!(!preparation.messages.iter().any(|message| {
+            matches!(message, Message::User(user) if user.content.iter().any(|part| matches!(part, UserPart::Text(text) if text == "user 2")))
         }));
     }
 

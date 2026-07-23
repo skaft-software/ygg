@@ -17,6 +17,10 @@ use ygg_ai::{
     ToolResultPart, Usage, UserMessage, UserPart, PICODOLLARS_PER_MICRODOLLAR,
 };
 
+use crate::compaction::{
+    build_handoff_message, finish_handoff, prepare_handoff, HandoffPreparation,
+    SUMMARIZATION_SYSTEM_PROMPT,
+};
 use crate::context::{ContextSnapshot, ContextTracker};
 use crate::events::{
     AgentEvent, CompactionInfo, CompactionReason, Control, FinishReason, OutputChannel,
@@ -1510,15 +1514,14 @@ impl<'a> CompactionContext<'a> {
         Ok(assistant_text(&response))
     }
 
-    /// Summarize a history in one tool-free request.
-    ///
-    /// The former Terminus-style question/answer follow-ups replayed the full
-    /// expensive history, defeating prompt reuse and charging it multiple
-    /// times. A single grounded summary has the same durable handoff role.
-    async fn summarize(&mut self, messages: &[Message]) -> Result<Option<String>, AgentError> {
+    /// Generate one Pi-compatible structured handoff in a tool-free request.
+    async fn summarize(
+        &mut self,
+        preparation: &HandoffPreparation,
+    ) -> Result<Option<String>, AgentError> {
         self.call(
-            "Summarize this coding-agent history for continuation. Preserve completed work, file paths, commands, edits, failures, decisions, constraints, and unresolved work. Be concise and factual; do not claim unverified completion.",
-            messages.to_vec(),
+            SUMMARIZATION_SYSTEM_PROMPT,
+            vec![build_handoff_message(preparation)],
             4096,
         )
         .await
@@ -1540,8 +1543,8 @@ impl<'a> CompactionContext<'a> {
         reason: CompactionReason,
     ) -> Result<CompactionInfo, AgentError> {
         let _ = self.events.send(AgentEvent::CompactionStarted { reason });
-        let before = self.session.context_before(&first_kept)?;
-        if before.is_empty() {
+        let preparation = prepare_handoff(self.session, &first_kept)?;
+        if preparation.messages.is_empty() {
             let error = AgentError::ContextExceeded {
                 estimate: 0,
                 budget: self
@@ -1557,8 +1560,8 @@ impl<'a> CompactionContext<'a> {
             });
             return Err(error);
         }
-        let summary = match self.summarize(&before).await {
-            Ok(Some(summary)) => summary,
+        let summary = match self.summarize(&preparation).await {
+            Ok(Some(summary)) => finish_handoff(summary, &preparation.details),
             Ok(None) => {
                 let error = AgentError::IncompleteResponse {
                     stop_reason: "compaction summary did not finish normally".to_owned(),
@@ -1585,7 +1588,11 @@ impl<'a> CompactionContext<'a> {
             });
             return Err(error);
         }
-        if let Err(error) = self.session.compact(summary.clone(), first_kept.clone()) {
+        if let Err(error) = self.session.compact_with_details(
+            summary.clone(),
+            first_kept.clone(),
+            preparation.details,
+        ) {
             let error = AgentError::Session(error);
             let _ = self.events.send(AgentEvent::CompactionFinished {
                 reason,

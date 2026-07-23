@@ -817,13 +817,18 @@ impl<'a> TUI<'a> {
     ) {
         let rows = usize::from(height.max(1));
         if let Some(boundary) = commit_boundary {
-            self.write_inline_pinned(
-                new_lines,
-                rows,
-                boundary.min(new_lines.len()),
-                size_changed || reanchor_viewport || rebuild_scrollback,
-                pinned_previous_window,
-            );
+            let boundary = boundary.min(new_lines.len());
+            if rebuild_scrollback {
+                self.rebuild_inline_pinned_scrollback(new_lines, rows, boundary);
+            } else {
+                self.write_inline_pinned(
+                    new_lines,
+                    rows,
+                    boundary,
+                    size_changed || reanchor_viewport,
+                    pinned_previous_window,
+                );
+            }
             return;
         }
         if self.first_render {
@@ -1140,6 +1145,41 @@ impl<'a> TUI<'a> {
                 if let Some(line) = next {
                     self.terminal.write(line);
                 }
+            }
+        }
+        self.end_synchronized_output();
+
+        self.inline_committed_rows = commit_target;
+        self.inline_window_top = window_top;
+        self.inline_bottom_row = window.len().saturating_sub(1).min(rows.saturating_sub(1));
+    }
+
+    fn rebuild_inline_pinned_scrollback(
+        &mut self,
+        new_lines: &[String],
+        rows: usize,
+        commit_boundary: usize,
+    ) {
+        let window_top = new_lines.len().saturating_sub(rows);
+        let commit_target = commit_boundary.min(window_top);
+        let committed = &new_lines[..commit_target];
+        let window = &new_lines[window_top..];
+
+        self.begin_synchronized_output();
+        if self.previous_frame.iter().any(|line| is_image_line(line))
+            || new_lines.iter().any(|line| is_image_line(line))
+        {
+            self.terminal.write(&delete_all_kitty_images());
+        }
+        self.terminal.write("\x1b[H");
+        self.terminal.clear_screen();
+        self.terminal.write("\x1b[3J");
+        self.terminal.write("\x1b[H");
+        let paint = committed.iter().chain(window.iter()).collect::<Vec<_>>();
+        for (index, line) in paint.iter().enumerate() {
+            self.terminal.write(line);
+            if index + 1 < paint.len() {
+                self.terminal.write("\n");
             }
         }
         self.end_synchronized_output();
@@ -1649,6 +1689,45 @@ mod tests {
         assert!(output.contains("\x1b[H"), "{output:?}");
         assert!(output.contains("new composer"), "{output:?}");
         assert!(!output.contains("old composer"), "{output:?}");
+    }
+
+    #[test]
+    fn pinned_presentation_rebuild_commits_only_rows_before_the_boundary() {
+        let size = Rc::new(Cell::new((40, 4)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            false,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.first_render = false;
+        tui.previous_frame = vec!["old presentation".to_owned()];
+        let replacement = [
+            "settled 0",
+            "settled 1",
+            "mutable omitted 2",
+            "mutable omitted 3",
+            "mutable visible 4",
+            "mutable visible 5",
+            "composer",
+            "footer",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+        tui.rebuild_inline_pinned_scrollback(&replacement, 4, 2);
+
+        let output = writes.borrow().join("");
+        assert!(output.contains("\x1b[3J"), "{output:?}");
+        assert!(output.contains("settled 0"), "{output:?}");
+        assert!(output.contains("settled 1"), "{output:?}");
+        assert!(!output.contains("mutable omitted 2"), "{output:?}");
+        assert!(!output.contains("mutable omitted 3"), "{output:?}");
+        assert!(output.contains("composer"), "{output:?}");
+        assert_eq!(tui.inline_committed_rows, 2);
+        assert_eq!(tui.inline_window_top, 4);
+        assert_eq!(tui.inline_bottom_row, 3);
     }
 
     #[test]

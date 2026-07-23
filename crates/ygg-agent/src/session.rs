@@ -205,6 +205,9 @@ pub enum EntryValue {
         /// Snapshots of lazy resource reads active at the compaction boundary.
         #[serde(default)]
         skill_resources: Vec<SkillResourceSnapshot>,
+        /// Pi-compatible cumulative read/modified file lists for handoff.
+        #[serde(default)]
+        details: crate::compaction::CompactionDetails,
     },
     /// A configuration marker (not part of model-visible context).
     Config {
@@ -1274,6 +1277,21 @@ impl Session {
         summary: impl Into<String>,
         first_kept: EntryId,
     ) -> Result<EntryId, SessionError> {
+        self.compact_with_details(
+            summary,
+            first_kept,
+            crate::compaction::CompactionDetails::default(),
+        )
+    }
+
+    /// Appends a compaction checkpoint with cumulative Pi-compatible file
+    /// operation details used by later iterative handoffs.
+    pub fn compact_with_details(
+        &mut self,
+        summary: impl Into<String>,
+        first_kept: EntryId,
+        details: crate::compaction::CompactionDetails,
+    ) -> Result<EntryId, SessionError> {
         if !self.is_ancestor_of_head(&first_kept) {
             return Err(SessionError::NotAncestor(first_kept));
         }
@@ -1295,6 +1313,7 @@ impl Session {
             first_kept,
             active_skills,
             skill_resources,
+            details,
         })
     }
 

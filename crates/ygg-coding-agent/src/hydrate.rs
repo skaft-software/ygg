@@ -456,6 +456,7 @@ mod tests {
                 first_kept,
                 active_skills: Vec::new(),
                 skill_resources: Vec::new(),
+                details: Default::default(),
             })
             .unwrap();
         drop(session);

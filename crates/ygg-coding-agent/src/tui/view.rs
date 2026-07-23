@@ -13,9 +13,9 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sexy_tui_rs::{
-    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, Block, CodeBlock,
-    Color, Component, DetailBlock, DiffRenderOptions, Document, FrameUpdate, RichRenderer,
-    StreamingMarkdown, StreamingRenderCache, UnifiedDiff, CURSOR_MARKER, TUI,
+    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, Color, Component,
+    DiffRenderOptions, FrameUpdate, RichRenderer, StreamingMarkdown, StreamingRenderCache,
+    UnifiedDiff, CURSOR_MARKER, TUI,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
@@ -1552,6 +1552,7 @@ struct ShellFrameState {
     transcript_epoch: u64,
     transcript_generation: u64,
     transcript_len: usize,
+    verbose_tools: bool,
     overlay_active: bool,
 }
 
@@ -1576,6 +1577,7 @@ impl Component for ShellComponent {
             frame.width = width;
             frame.theme_epoch = state.theme_epoch;
             frame.transcript_epoch = state.transcript_epoch;
+            frame.verbose_tools = state.verbose_tools;
             lines
         } else {
             let lines = render_shell(&state, width);
@@ -2009,139 +2011,16 @@ fn compute_tool_diff(panel: &ToolPanel) -> Option<String> {
     None
 }
 
-/// Render `read` tool output with colored line numbers for readability.
-/// The output format is:
-///   path:offset-end/total hash=...
-///   NNN: code line
-///   ...
-///   next_offset=N truncated=bool
-fn render_read_output(output: &str, theme: &YggTheme, width: u16) -> Vec<String> {
-    let indent = "  ";
-    let content_width = usize::from(width).saturating_sub(visible_width(indent));
-    let muted = |text: &str| theme.fg("muted", text);
-    let mut lines: Vec<String> = Vec::new();
-
-    for line in output.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        // Header line: "path:1-20/100 hash=sha256:..."
-        if line.contains("hash=") && line.contains('/') {
-            lines.push(format!("{indent}{}", muted(line)));
-            continue;
-        }
-        // Footer: "next_offset=N" or "truncated=bool"
-        if line.starts_with("next_offset=") || line.starts_with("truncated=") {
-            lines.push(format!("{indent}{}", muted(line)));
-            continue;
-        }
-        // "(empty file)" marker
-        if line == "(empty file)" {
-            lines.push(format!("{indent}{}", muted(line)));
-            continue;
-        }
-        // Content line: "NNN: rest of line"
-        if let Some((num, code)) = line.split_once(':') {
-            if num.chars().all(|c| c.is_ascii_digit()) {
-                let number_gutter = theme.fg("syntax_number", &format!("{num}:"));
-                let code_str = sanitize_for_terminal(code);
-                let combined = format!("{number_gutter}{code_str}");
-                lines.push(format!(
-                    "{indent}{}",
-                    fit_line(&combined, content_width as u16)
-                ));
-                continue;
-            }
-        }
-        // Fallback: render as plain text
-        lines.push(format!("{indent}{}", sanitize_for_terminal(line)));
-    }
-    lines
-}
-
-/// Expanded proof stays in sexy-tui's semantic technical renderers. The
-/// compact action row remains a concise observation; code, diffs, arguments,
-/// and raw logs are bounded local objects rather than unstyled transcript
-/// lines.
-fn render_tool_details(
-    panel: &ToolPanel,
-    renderer: &RichRenderer,
-    theme: &YggTheme,
-    width: u16,
-) -> Vec<String> {
-    let display_line = |line: sexy_tui_rs::RenderedLine| {
-        let content = if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
-            line.plain
-        } else {
-            line.styled
-        };
-        format!("  {content}")
-    };
-
-    let mut lines = Vec::new();
-    let mut evidence = Vec::new();
-    let diff = tool_diff(panel);
-    let non_diff_output = diff
-        .as_ref()
-        .map(|d| panel.output[..panel.output.len().saturating_sub(d.len())].trim_end())
-        .unwrap_or(&panel.output);
-    if !non_diff_output.is_empty() {
-        if panel.name == "read" {
-            lines.extend(render_read_output(non_diff_output, theme, width));
-        } else {
-            evidence.push(Block::CodeBlock(CodeBlock::with_language(
-                "text",
-                non_diff_output.to_owned(),
-            )));
-        }
-    }
-    if !evidence.is_empty() {
-        let document = Document::new(vec![Block::Detail(DetailBlock::new(
-            "evidence", evidence, true,
-        ))]);
-        lines.extend(
-            renderer
-                .render(&document, width.saturating_sub(2))
-                .lines
-                .into_iter()
-                .map(&display_line),
-        );
-    }
-    if let Some(ref diff) = diff {
-        let rendered = renderer.render_diff(
-            &UnifiedDiff::parse(diff),
-            width.saturating_sub(2),
-            DiffRenderOptions {
-                line_numbers: width >= 70,
-                wrap: false,
-            },
-        );
-        lines.extend(rendered.lines.into_iter().map(display_line));
-    }
-    if panel.finished {
-        lines
-    } else {
-        // Expanded live evidence is still active tool output. Strip the rich
-        // renderer's nested colours until completion so every visible cell is
-        // predictably muted; the durable evidence is untouched and is
-        // re-rendered richly as soon as the tool settles.
-        lines
-            .into_iter()
-            .map(|line| understated_tool_output(theme, &strip_terminal_sequences(&line)))
-            .collect()
-    }
-}
-
-/// Max diff lines to show in compact (non-expanded) mode before truncating.
+/// Max diff lines to show in terse mode before truncating.
 const COMPACT_DIFF_LINES: usize = 10;
 
-/// Render only the diff portion of tool output, without the full evidence
-/// panel.  Long diffs are truncated with an indicator; ctrl+o expands them.
+/// Render an edit/write diff. Long diffs are truncated in terse mode.
 fn render_diff_only(
     panel: &ToolPanel,
     renderer: &RichRenderer,
     theme: &YggTheme,
     width: u16,
+    expanded: bool,
 ) -> Vec<String> {
     let display_line = |line: sexy_tui_rs::RenderedLine| {
         let content = if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
@@ -2163,7 +2042,7 @@ fn render_diff_only(
         },
     );
     let mut lines: Vec<String> = rendered.lines.into_iter().map(display_line).collect();
-    if lines.len() > COMPACT_DIFF_LINES + 1 {
+    if !expanded && lines.len() > COMPACT_DIFF_LINES + 1 {
         let remaining = lines.len() - COMPACT_DIFF_LINES;
         lines.truncate(COMPACT_DIFF_LINES);
         let hint = if theme.unicode() {
@@ -2176,20 +2055,27 @@ fn render_diff_only(
     lines
 }
 
-fn render_compact_tool_output(panel: &ToolPanel, theme: &YggTheme, width: u16) -> Vec<String> {
-    if panel.name == "exec" && panel.display.shell_command.is_some() {
-        return render_compact_exec_output(panel, theme, width, false);
-    }
+fn render_compact_tool_output(
+    panel: &ToolPanel,
+    theme: &YggTheme,
+    width: u16,
+    expanded: bool,
+) -> Vec<String> {
     let output = sanitize_for_terminal(&panel.output);
     let mut lines = output
         .lines()
         .filter(|line| !line.trim().is_empty() && *line != "(no output)")
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let omitted = lines.len().saturating_sub(COMPACT_EXEC_OUTPUT_LINES);
-    if omitted > 0 {
-        lines.drain(..omitted);
-    }
+    let omitted = if expanded {
+        0
+    } else {
+        let omitted = lines.len().saturating_sub(COMPACT_EXEC_OUTPUT_LINES);
+        if omitted > 0 {
+            lines.drain(..omitted);
+        }
+        omitted
+    };
     let mut rendered = Vec::new();
     if omitted > 0 {
         let unit = if omitted == 1 { "line" } else { "lines" };
@@ -2295,7 +2181,7 @@ fn tool_metadata(panel: &ToolPanel) -> Option<String> {
 /// The exec tool streams output while it runs, then emits a durable envelope
 /// containing the exit status and bounded stdout/stderr capture. The panel
 /// retains both, so presentation should prefer the last envelope without
-/// mutating the evidence stored for expansion and copy.
+/// mutating the stored tool result.
 fn final_exec_result(output: &str) -> &str {
     for (index, _) in output.rmatch_indices("exit=") {
         let candidate = &output[index..];
@@ -2366,7 +2252,7 @@ fn is_exec_complete_footer(line: &str) -> bool {
 /// Project a bounded result into Pi-style tail output. Protocol envelope lines
 /// are excluded; capture loss is retained separately because Ctrl+O can reveal
 /// UI-tail omissions but cannot recover bytes discarded by the exec tool.
-fn compact_exec_output(panel: &ToolPanel) -> CompactExecOutput {
+fn compact_exec_output(panel: &ToolPanel, expanded: bool) -> CompactExecOutput {
     let result = sanitize_for_terminal(final_exec_result(&panel.output));
     let mut capture_truncations = Vec::new();
     for line in result.lines().map(str::trim) {
@@ -2430,10 +2316,15 @@ fn compact_exec_output(panel: &ToolPanel) -> CompactExecOutput {
         }
     }
 
-    let omitted_lines = content.len().saturating_sub(COMPACT_EXEC_OUTPUT_LINES);
-    if omitted_lines > 0 {
-        content.drain(..omitted_lines);
-    }
+    let omitted_lines = if expanded {
+        0
+    } else {
+        let omitted_lines = content.len().saturating_sub(COMPACT_EXEC_OUTPUT_LINES);
+        if omitted_lines > 0 {
+            content.drain(..omitted_lines);
+        }
+        omitted_lines
+    };
     CompactExecOutput {
         lines: content,
         omitted_lines,
@@ -2471,9 +2362,10 @@ fn render_compact_exec_output(
     panel: &ToolPanel,
     theme: &YggTheme,
     width: u16,
+    expanded: bool,
     show_tool_duration: bool,
 ) -> Vec<String> {
-    let compact = compact_exec_output(panel);
+    let compact = compact_exec_output(panel, expanded);
     let ellipsis = if theme.unicode() { "…" } else { "..." };
     let mut lines = Vec::new();
     if compact.panel_elided {
@@ -3027,25 +2919,26 @@ fn render_block_planned(
                 wrap_hanging(&text, &label_prefix, &continuation, width)
             };
 
-            if verbose_tools {
-                if !panel.is_error {
-                    lines.extend(render_tool_details(panel, rich_renderer, theme, width));
-                }
-            } else if compact_exec {
-                if !panel.is_error {
-                    lines.extend(render_compact_exec_output(
+            if !panel.is_error {
+                match panel.name.as_str() {
+                    "exec" if compact_exec => lines.extend(render_compact_exec_output(
                         panel,
                         theme,
                         width,
+                        verbose_tools,
                         layout.show_tool_duration,
-                    ));
+                    )),
+                    "search" => lines.extend(render_compact_tool_output(
+                        panel,
+                        theme,
+                        width,
+                        verbose_tools,
+                    )),
+                    "edit" | "write" if tool_diff(panel).is_some() => lines.extend(
+                        render_diff_only(panel, rich_renderer, theme, width, verbose_tools),
+                    ),
+                    _ => {}
                 }
-            } else if !panel.is_error && tool_diff(panel).is_some() {
-                // Diffs remain visible at a glance without expanding protocol
-                // arguments and raw evidence.
-                lines.extend(render_diff_only(panel, rich_renderer, theme, width));
-            } else if !panel.is_error {
-                lines.extend(render_compact_tool_output(panel, theme, width));
             }
             finish_transcript_block(lines)
         }
@@ -4696,6 +4589,7 @@ fn render_shell_viewport_update(
     frame.width = width;
     frame.theme_epoch = state.theme_epoch;
     frame.transcript_epoch = state.transcript_epoch;
+    frame.verbose_tools = state.verbose_tools;
     FrameUpdate {
         stable_prefix: 0,
         replacement: render_shell_viewport_at(state, width, now),
@@ -4757,6 +4651,7 @@ fn synchronize_shell_frame(state: &ShellState, width: u16, frame: &mut ShellFram
     frame.transcript_epoch = state.transcript_epoch;
     frame.transcript_generation = cache.generation;
     frame.transcript_len = cache.lines.len();
+    frame.verbose_tools = state.verbose_tools;
     frame.overlay_active = false;
 }
 
@@ -4771,6 +4666,7 @@ fn render_shell_update(
 ) -> FrameUpdate {
     let repaint_theme = frame.initialized && frame.theme_epoch != state.theme_epoch;
     let resized = frame.initialized && frame.width != width;
+    let presentation_changed = frame.initialized && frame.verbose_tools != state.verbose_tools;
     let chrome = shell_chrome(state, width, now);
     if state.overlay.is_some() {
         let entering_overlay = frame.initialized && !frame.overlay_active;
@@ -4814,7 +4710,11 @@ fn render_shell_update(
             && frame.width == width
             && !frame.overlay_active
             && frame.transcript_epoch != state.transcript_epoch);
-    let stable_prefix = if frame.initialized && frame.width == width && !frame.overlay_active {
+    let stable_prefix = if !presentation_changed
+        && frame.initialized
+        && frame.width == width
+        && !frame.overlay_active
+    {
         if frame.transcript_generation == cache.generation {
             frame.transcript_len.min(transcript_len)
         } else {
@@ -4839,13 +4739,14 @@ fn render_shell_update(
     frame.transcript_epoch = state.transcript_epoch;
     frame.transcript_generation = generation;
     frame.transcript_len = transcript_len;
+    frame.verbose_tools = state.verbose_tools;
     frame.overlay_active = false;
     FrameUpdate {
         stable_prefix,
         replacement,
         commit_boundary: Some(commit_boundary),
         reanchor_viewport,
-        rebuild_scrollback: false,
+        rebuild_scrollback: presentation_changed,
     }
 }
 
@@ -6826,8 +6727,6 @@ impl InteractiveShell {
         self.state.borrow_mut().overlay = Some(ShellOverlay::Context(report));
     }
 
-    /// Toggle the most recent reasoning block or compaction summary.
-    /// Tool output and other evidence are never disclosure targets.
     /// Toggle the global transcript disclosure mode (ctrl+o).
     pub fn expand_focused_tool(&mut self) {
         self.toggle_verbose_tools();
@@ -9242,6 +9141,7 @@ mod tests {
                 first_kept,
                 active_skills: Vec::new(),
                 skill_resources: Vec::new(),
+                details: Default::default(),
             })
             .unwrap();
         drop(session);
@@ -9268,7 +9168,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_expansion_does_not_replay_native_scrollback() {
+    fn compaction_disclosure_rebuilds_native_presentation() {
         const WIDTH: u16 = 88;
         const HEIGHT: u16 = 18;
         for synchronized_output in [false, true] {
@@ -9287,10 +9187,14 @@ mod tests {
             for index in 0..24 {
                 shell.notice(format!("compaction-history-{index:02}"));
             }
-            shell.compaction_marker(
-                "Context compacted",
-                "# Summary\n\n- compaction-detail-a\n- compaction-detail-b",
+            let summary = format!(
+                "# Summary\n\n{}",
+                (0..40)
+                    .map(|index| format!("- compaction-detail-{index:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             );
+            shell.compaction_marker("Context compacted", summary);
             shell.render();
             terminal.process(&drain(&bytes));
 
@@ -9299,29 +9203,47 @@ mod tests {
             let expansion = drain(&bytes);
             let expansion_text = String::from_utf8_lossy(&expansion);
             assert!(
-                expansion_text.contains("compaction-detail-a"),
+                expansion_text.contains("compaction-detail-00"),
                 "{expansion_text:?}"
             );
-            // Cursor-addressed repainting may include visible historic rows;
-            // what matters is that processing the frame does not append those
-            // rows to terminal-owned scrollback a second time.
-            terminal.process(&expansion);
-
-            terminal.set_size(512, WIDTH);
-            terminal.set_scrollback(usize::MAX);
-            let physical = terminal.screen().contents();
+            assert!(
+                expansion
+                    .windows(b"\x1b[3J".len())
+                    .any(|bytes| bytes == b"\x1b[3J"),
+                "native presentation was not reset: {expansion_text:?}"
+            );
             for index in 0..24 {
                 let sentinel = format!("compaction-history-{index:02}");
                 assert_eq!(
-                    physical.matches(&sentinel).count(),
+                    expansion_text.matches(&sentinel).count(),
                     1,
-                    "{sentinel} replayed with synchronized_output={synchronized_output}:\n{physical}"
+                    "{sentinel} was not replayed exactly once with synchronized_output={synchronized_output}:\n{expansion_text}"
                 );
             }
-            assert_eq!(
-                physical.matches("compaction-detail-a").count(),
-                1,
-                "{physical}"
+
+            terminal.process(&expansion);
+            terminal.set_scrollback(0);
+            let visible = terminal.screen().contents();
+            assert!(visible.contains("compaction-detail-39"), "{visible}");
+            assert!(visible.contains("│ ›"), "composer disappeared: {visible}");
+
+            shell.expand_focused_tool();
+            shell.render();
+            let collapse = drain(&bytes);
+            assert!(
+                collapse
+                    .windows(b"\x1b[3J".len())
+                    .any(|bytes| bytes == b"\x1b[3J"),
+                "collapsed presentation was not reset"
+            );
+            terminal.process(&collapse);
+            terminal.set_scrollback(0);
+            let collapsed = terminal.screen().contents();
+            assert!(collapsed.contains("ctrl+o to view"), "{collapsed}");
+            assert!(!collapsed.contains("compaction-detail-"), "{collapsed}");
+            assert!(
+                collapsed.contains("│ ›"),
+                "composer disappeared: {collapsed}"
             );
         }
     }
@@ -11206,7 +11128,7 @@ mod tests {
         assert_ascii_foreground(&active, "read", muted);
         assert_ascii_bold(&active, "read");
         assert_ascii_foreground(&active, "src/lib.rs", muted);
-        assert!(active.screen().contents().contains("live raw evidence"));
+        assert!(!active.screen().contents().contains("live raw evidence"));
         assert!(!active.screen().contents().contains("live output"));
 
         let completed = TranscriptBlock::Tool(Box::new(ToolPanel::new(
@@ -11891,6 +11813,61 @@ mod tests {
     }
 
     #[test]
+    fn read_results_stay_hidden_in_collapsed_and_expanded_modes() {
+        use ygg_agent::ToolOutput;
+
+        let mut shell = InteractiveShell::test_shell();
+        let run_id = shell.begin_run("local");
+        let id = ToolCallId("read-hidden-result".into());
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolStarted {
+                id: id.clone(),
+                name: "read".into(),
+                args: serde_json::json!({
+                    "path": "src/private.rs",
+                    "offset": 41,
+                    "limit": 7
+                }),
+            },
+        );
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolFinished {
+                id: id.clone(),
+                result: Ok(ToolOutput::new(
+                    "READ RESULT SENTINEL\nfn private_implementation() {}",
+                )),
+            },
+        );
+        let transcript = |shell: &InteractiveShell| {
+            shell
+                .state
+                .borrow()
+                .rendered_transcript(100)
+                .iter()
+                .map(|line| strip_terminal_sequences(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let collapsed = transcript(&shell);
+        assert!(collapsed.contains("src/private.rs:41-47"), "{collapsed}");
+        assert!(!collapsed.contains("READ RESULT SENTINEL"), "{collapsed}");
+        assert!(!collapsed.to_ascii_lowercase().contains("evidence"));
+
+        shell.expand_focused_tool();
+        let expanded = transcript(&shell);
+        assert!(expanded.contains("src/private.rs:41-47"), "{expanded}");
+        assert!(!expanded.contains("READ RESULT SENTINEL"), "{expanded}");
+        assert!(!expanded.to_ascii_lowercase().contains("evidence"));
+        assert_eq!(
+            shell.debug_tool_output(&id).as_deref(),
+            Some("READ RESULT SENTINEL\nfn private_implementation() {}")
+        );
+    }
+
+    #[test]
     fn tool_output_tail_expands_with_global_ctrl_o_and_copy_stays_safe() {
         use ygg_agent::ToolOutput;
         let mut shell = InteractiveShell::test_shell();
@@ -11942,6 +11919,7 @@ mod tests {
         let expanded = transcript(&shell);
         assert!(expanded.contains("private result line 1"), "{expanded}");
         assert!(expanded.contains("private result line 8"), "{expanded}");
+        assert!(!expanded.to_ascii_lowercase().contains("evidence"));
 
         shell.expand_focused_tool();
         assert!(!shell.verbose_tools());
@@ -11953,6 +11931,94 @@ mod tests {
         let state = shell.state.borrow();
         let index = *state.tool_panels.get(&id).expect("tool panel index");
         assert!(!block_copy_text(&state.transcript[index]).contains("private result line"));
+    }
+
+    #[test]
+    fn search_output_and_edit_write_diffs_expand_with_global_ctrl_o() {
+        use ygg_agent::ToolOutput;
+
+        let mut shell = InteractiveShell::test_shell();
+        let run_id = shell.begin_run("local");
+        let search_id = ToolCallId("expand-search".into());
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolStarted {
+                id: search_id.clone(),
+                name: "search".into(),
+                args: serde_json::json!({"query": "needle", "path": "src"}),
+            },
+        );
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolFinished {
+                id: search_id,
+                result: Ok(ToolOutput::new(
+                    (1..=8)
+                        .map(|line| format!("SEARCH MATCH {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )),
+            },
+        );
+
+        for (tool, final_sentinel) in [
+            ("edit", "EDIT DIFF FINAL SENTINEL"),
+            ("write", "WRITE DIFF FINAL SENTINEL"),
+        ] {
+            let id = ToolCallId(format!("expand-{tool}"));
+            let path = format!("src/{tool}.rs");
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::ToolStarted {
+                    id: id.clone(),
+                    name: tool.into(),
+                    args: serde_json::json!({"path": path}),
+                },
+            );
+            let mut diff = format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,12 +1,12 @@\n"
+            );
+            for line in 1..=11 {
+                diff.push_str(&format!("-old {line}\n+new {line}\n"));
+            }
+            diff.push_str(&format!("-old final\n+{final_sentinel}\n"));
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::ToolFinished {
+                    id,
+                    result: Ok(ToolOutput::new(diff)),
+                },
+            );
+        }
+
+        let transcript = |shell: &InteractiveShell| {
+            shell
+                .state
+                .borrow()
+                .rendered_transcript(120)
+                .iter()
+                .map(|line| strip_terminal_sequences(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let collapsed = transcript(&shell);
+        assert!(!collapsed.contains("SEARCH MATCH 1"), "{collapsed}");
+        assert!(collapsed.contains("SEARCH MATCH 8"), "{collapsed}");
+        assert!(
+            !collapsed.contains("EDIT DIFF FINAL SENTINEL"),
+            "{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("WRITE DIFF FINAL SENTINEL"),
+            "{collapsed}"
+        );
+
+        shell.expand_focused_tool();
+        let expanded = transcript(&shell);
+        assert!(expanded.contains("SEARCH MATCH 1"), "{expanded}");
+        assert!(expanded.contains("SEARCH MATCH 8"), "{expanded}");
+        assert!(expanded.contains("EDIT DIFF FINAL SENTINEL"), "{expanded}");
+        assert!(expanded.contains("WRITE DIFF FINAL SENTINEL"), "{expanded}");
     }
 
     #[test]
@@ -12093,8 +12159,19 @@ mod tests {
             .map(|line| strip_terminal_sequences(line))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("RAW EVIDENCE"), "{rendered}");
+        assert!(!rendered.contains("RAW EVIDENCE"), "{rendered}");
         assert!(!rendered.contains("branch: main"), "{rendered}");
+        shell.expand_focused_tool();
+        let expanded = shell
+            .state
+            .borrow()
+            .rendered_transcript(100)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!expanded.contains("RAW EVIDENCE"), "{expanded}");
+        assert!(!expanded.contains("branch: main"), "{expanded}");
         let state = shell.state.borrow();
         let index = *state.tool_panels.get(&id).expect("tool panel index");
         let TranscriptBlock::Tool(panel) = &state.transcript[index] else {

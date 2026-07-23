@@ -64,6 +64,7 @@
 
 pub mod agent;
 pub mod cache;
+pub mod compaction;
 pub mod context;
 pub mod events;
 pub mod extension;
@@ -84,6 +85,12 @@ pub use agent::{
 pub use cache::{
     analyze_session_cache, analyze_session_cache_stats, CacheMiss, CacheStats,
     CACHE_MISS_NOISE_TOKENS,
+};
+pub use compaction::{
+    build_branch_handoff_message, build_handoff_message, finish_branch_handoff, finish_handoff,
+    format_file_operations, prepare_branch_handoff, prepare_handoff, serialize_conversation,
+    BranchHandoffPreparation, CompactionDetails, HandoffPreparation, BRANCH_SUMMARY_PREAMBLE,
+    SUMMARIZATION_SYSTEM_PROMPT,
 };
 pub use context::ContextSnapshot;
 pub use events::{
