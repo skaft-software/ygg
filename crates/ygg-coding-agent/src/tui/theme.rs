@@ -413,6 +413,10 @@ impl YggTheme {
         &self.metadata
     }
 
+    pub(crate) fn is_compiled_default(&self) -> bool {
+        matches!(self.source, ThemeSource::CompiledDefault)
+    }
+
     #[allow(dead_code)]
     pub fn source(&self) -> &ThemeSource {
         &self.source

@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use std::cell::{Cell, Ref, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -13,9 +13,9 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sexy_tui_rs::{
-    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, Block, CodeBlock,
-    Color, Component, DetailBlock, DiffRenderOptions, Document, FrameUpdate, RichRenderer,
-    StreamingMarkdown, StreamingRenderCache, UnifiedDiff, CURSOR_MARKER, TUI,
+    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, Color, Component,
+    DiffRenderOptions, FrameUpdate, RichRenderer, StreamingMarkdown, StreamingRenderCache,
+    UnifiedDiff, CURSOR_MARKER, TUI,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
@@ -26,9 +26,9 @@ use crate::commands;
 use crate::config::Config;
 use crate::hydrate::{hydrate_transcript, hydrate_transcript_tail, TranscriptItem};
 use crate::presentation::{
-    format_duration, is_hidden_tool_detail, summarize_tool, summarize_tool_with_workspace,
-    tool_failure_reason, tool_result_is_failure, ModelDisplayMetadata, PriceDisplay, RunId,
-    RunOutcome, RunPhase, RunTracker, ToolDisplay,
+    format_duration, summarize_tool, summarize_tool_with_workspace, tool_failure_reason,
+    tool_result_is_failure, ModelDisplayMetadata, PriceDisplay, RunId, RunOutcome, RunPhase,
+    RunTracker, ToolDisplay,
 };
 use crate::tui::composer::{self, ComposedInput};
 use crate::tui::keymap::{EditAction, SlashMenuAction};
@@ -54,9 +54,6 @@ const ANIMATION_POLL_TIMEOUT: Duration = Duration::from_millis(45);
 /// also catches terminal-manager resizes that do not emit an event.
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const ELISION_MARKER: &str = "\n… older tool output elided …\n";
-/// A compact exec row keeps enough terminal context to recognize a result
-/// while preventing a noisy command from swallowing the transcript.
-const COMPACT_EXEC_OUTPUT_LINES: usize = 5;
 
 /// Strip complete terminal sequences, replace remaining controls (except line
 /// feeds), and normalize CRLF so raw tool/provider output cannot execute
@@ -193,16 +190,6 @@ fn sanitize_extension_tool_render_segments(
         sanitized.push(ygg_agent::extension_process::ToolRenderSegment { text, style_role });
     }
     sanitized
-}
-
-fn valid_extension_tool_render_role(role: &str) -> bool {
-    !role.is_empty()
-        && role.len() <= 96
-        && !role.starts_with('.')
-        && !role.ends_with('.')
-        && role
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn visualize_editor_controls(raw: &str) -> String {
@@ -548,10 +535,6 @@ struct ToolPanel {
     /// error roles respectively.
     #[allow(dead_code)]
     model_lab: Option<crate::tui::theme::ModelLab>,
-    /// Lazily cached diff scan.  `None` = not yet computed.
-    cached_diff: RefCell<Option<Option<String>>>,
-    /// Lazily cached metadata string (test results / duration for exec).
-    cached_metadata: RefCell<Option<Option<String>>>,
 }
 
 impl ToolPanel {
@@ -580,8 +563,6 @@ impl ToolPanel {
             failure_reason,
             extension_render_segments: Vec::new(),
             model_lab,
-            cached_diff: RefCell::new(None),
-            cached_metadata: RefCell::new(None),
         }
     }
 }
@@ -789,11 +770,6 @@ pub(crate) struct ShellState {
     pub(crate) error: Option<String>,
     overlay: Option<ShellOverlay>,
     tool_panels: HashMap<ToolCallId, usize>,
-    /// Per-call disclosure state. `/tool` toggles one panel without exposing
-    /// protocol details for every tool in the transcript.
-    expanded_tools: HashSet<ToolCallId>,
-    /// Per-block expansion for `!` shell commands.
-    expanded_shells: HashSet<String>,
     active_text: Option<usize>,
     active_reasoning: Option<usize>,
     /// Distance from the live tail in visual rows. Kept for cheap wheel/page
@@ -884,14 +860,39 @@ pub(crate) struct ShellState {
     /// the run phase means a phase transition cannot change the wave velocity
     /// or reset its position.
     pub(crate) shimmer_started_at: Option<Instant>,
-    pub(crate) verbose_tools: bool,
     pub(crate) size: (u16, u16),
+    /// Start of the animated invocation header. It remains mutable until the
+    /// first real conversation block so model changes can recolor it in place.
+    startup_card_started_at: Option<Instant>,
     /// Cached editor layout so the composer shimmer animation doesn't
     /// re-wrap the prompt on every frame.
     cached_layout: RefCell<Option<EditorLayoutCache>>,
 }
 
 impl ShellState {
+    fn welcome_is_mutable(&self) -> bool {
+        self.startup_card_started_at.is_some()
+            && !self.transcript.iter().any(|block| {
+                matches!(
+                    block,
+                    TranscriptBlock::User { .. }
+                        | TranscriptBlock::Assistant(_)
+                        | TranscriptBlock::Reasoning(_)
+                        | TranscriptBlock::Tool(_)
+                        | TranscriptBlock::Shell(_)
+                        | TranscriptBlock::Outcome(_)
+                        | TranscriptBlock::Compaction(_)
+                )
+            })
+    }
+
+    fn restart_welcome_animation(&mut self) {
+        if self.welcome_is_mutable() {
+            self.startup_card_started_at = Some(Instant::now());
+            self.invalidate_transcript_layout();
+        }
+    }
+
     fn invalidate_transcript(&mut self) {
         self.transcript_cache.get_mut().dirty = true;
     }
@@ -1033,16 +1034,9 @@ impl ShellState {
         }
     }
 
-    fn show_tool_details(&self, block: &TranscriptBlock) -> bool {
-        self.verbose_tools
-            || matches!(
-                block,
-                TranscriptBlock::Tool(panel) if self.expanded_tools.contains(&panel.id)
-            )
-            || matches!(
-                block,
-                TranscriptBlock::Shell(shell) if self.expanded_shells.contains(&shell.id)
-            )
+    fn show_tool_details(&self, _block: &TranscriptBlock) -> bool {
+        // Tool evidence is never a transcript surface.
+        false
     }
 
     fn rendered_transcript(&self, width: u16) -> Ref<'_, Vec<String>> {
@@ -1077,6 +1071,9 @@ impl ShellState {
                 cache.block_revisions.clear();
                 cache.dirty_blocks.clear();
                 cache.width = Some(width);
+                cache
+                    .lines
+                    .extend(render_welcome_card(self, width, 10, Instant::now()));
 
                 for (index, block) in self.transcript.iter().enumerate() {
                     let rendered = render_block_planned(
@@ -1388,6 +1385,15 @@ fn shimmer_animating(state: &ShellState) -> bool {
     crate::tui::composer_surface::phase_speed_for(Some(run.phase())) > 0.0
 }
 
+fn welcome_animating(state: &ShellState, now: Instant) -> bool {
+    state.welcome_is_mutable()
+        && state.theme.capabilities().animation
+        && state.overlay.is_none()
+        && state.startup_card_started_at.is_some_and(|started| {
+            now.saturating_duration_since(started).as_secs_f32() < crate::tui::splash::DURATION
+        })
+}
+
 /// Reconcile the renderer's shared dimensions with the terminal itself. This
 /// is a fallback for environments where the resize signal is delayed or
 /// swallowed; the normal input path still updates the same cells immediately.
@@ -1441,17 +1447,26 @@ fn render_loop(
         // the wave stays fluid on high-refresh terminals. Otherwise use a
         // 100 ms status/resize poll; idle timeouts do not render unless the
         // terminal dimensions actually changed.
-        let (animating, is_active) = {
+        let (animating, shimmer, welcome, is_active) = {
             let s = state.borrow();
             let active = s.run.is_active();
             let compacting = s.run_label == "compacting";
+            let shimmer = (active || compacting) && shimmer_animating(&s);
+            let welcome = welcome_animating(&s, Instant::now());
             (
-                (active || compacting) && shimmer_animating(&s),
-                active || compacting,
+                shimmer || welcome,
+                shimmer,
+                welcome,
+                active || compacting || welcome,
             )
         };
         let command = if animating {
-            match rx.recv_timeout(ANIMATION_POLL_TIMEOUT) {
+            let poll = if welcome {
+                RENDER_INTERVAL
+            } else {
+                ANIMATION_POLL_TIMEOUT
+            };
+            match rx.recv_timeout(poll) {
                 Ok(command) => Some(command),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1478,7 +1493,9 @@ fn render_loop(
 
         // Cap rendering to a sensible upper bound. Shimmer is deliberately
         // slower than input/streaming frames and changes only a few cells.
-        let cap = if animating {
+        let cap = if welcome {
+            RENDER_INTERVAL
+        } else if animating {
             ANIMATION_RENDER_INTERVAL
         } else {
             RENDER_INTERVAL
@@ -1501,8 +1518,14 @@ fn render_loop(
             break;
         }
 
-        if animating {
-            state.borrow_mut().advance_reasoning_animation();
+        if shimmer || welcome {
+            let mut shell = state.borrow_mut();
+            if shimmer {
+                shell.advance_reasoning_animation();
+            }
+            if welcome {
+                shell.invalidate_transcript_layout();
+            }
         }
         tui.request_render();
         last_render = Some(Instant::now());
@@ -1669,15 +1692,6 @@ fn collapsed_reasoning_lines(theme: &YggTheme, reasoning: &AssistantBlock) -> [S
 fn subdued_text(theme: &YggTheme, text: &str) -> String {
     let italic = theme.italic(text);
     theme.fg("muted", &italic)
-}
-
-/// Render low-contrast command output without inheriting a theme role's bold
-/// flag. Commands are deliberately prominent; their output must remain the
-/// quieter second level even when a user theme makes other muted chrome bold.
-fn understated_tool_output(theme: &YggTheme, text: &str) -> String {
-    theme
-        .role_rgb("muted")
-        .map_or_else(|| text.to_owned(), |color| theme.rgb_fg(color, text))
 }
 
 #[cfg(test)]
@@ -1877,7 +1891,9 @@ fn outcome_line(outcome: &RunOutcome, theme: &YggTheme) -> String {
 fn render_outcome(outcome: &RunOutcome, theme: &YggTheme, width: u16) -> Vec<String> {
     let mut lines = vec![fit_line(&outcome_line(outcome, theme), width)];
     let detail = match outcome {
-        RunOutcome::Failed { reason, .. } => Some(("error", reason.as_str())),
+        // Failure text is internal accountability evidence; expose only the
+        // generic lifecycle row. A needs-input prompt is an actionable UI
+        // request and remains visible.
         RunOutcome::NeedsInput { prompt } => Some(("warning", prompt.as_str())),
         _ => None,
     };
@@ -1918,31 +1934,6 @@ fn wrap_hanging(text: &str, prefix: &str, continuation: &str, width: u16) -> Vec
         .collect()
 }
 
-fn render_failure_details(panel: &ToolPanel, theme: &YggTheme, width: u16) -> Vec<String> {
-    let branch = theme.fg("error", "!");
-    // Failure details are still part of the tool block, so they begin on the
-    // same outer baseline as the action row rather than acquiring a second,
-    // unrelated transcript inset.
-    let prefix = format!("{branch} ");
-    let continuation = " ".repeat(visible_width(&prefix));
-    let mut lines = Vec::new();
-    for raw in panel
-        .output
-        .lines()
-        .skip(1)
-        .filter(|line| !line.trim().is_empty() && !is_hidden_tool_detail(line))
-        .take(8)
-    {
-        lines.extend(wrap_hanging(
-            &sanitize_for_terminal(raw),
-            &prefix,
-            &continuation,
-            width,
-        ));
-    }
-    lines
-}
-
 fn looks_like_diff(text: &str) -> bool {
     let mut lines = text.lines().map(str::trim_start);
     let Some(first) = lines.find(|line| !line.is_empty()) else {
@@ -1957,259 +1948,6 @@ fn looks_like_diff(text: &str) -> bool {
     first.starts_with("--- ")
         && lines.any(|line| line.starts_with("+++ "))
         && text.lines().any(|line| line.trim_start().starts_with("@@"))
-}
-
-fn looks_like_legacy_write_creation(text: &str) -> bool {
-    let mut lines = text.lines().map(str::trim_start);
-    let Some(first) = lines.find(|line| !line.is_empty()) else {
-        return false;
-    };
-    first == "--- /dev/null" && lines.any(|line| line.starts_with("+++ b/"))
-}
-
-fn tool_diff(panel: &ToolPanel) -> Option<String> {
-    // Only cache when finished — the output may still be streaming.
-    if panel.finished {
-        if let Some(ref cached) = *panel.cached_diff.borrow() {
-            return cached.clone();
-        }
-    }
-    let result = compute_tool_diff(panel);
-    if panel.finished {
-        *panel.cached_diff.borrow_mut() = Some(result.clone());
-    }
-    result
-}
-
-fn compute_tool_diff(panel: &ToolPanel) -> Option<String> {
-    if looks_like_diff(&panel.output) {
-        return Some(panel.output.clone());
-    }
-    if panel.name != "edit" && panel.name != "write" {
-        return None;
-    }
-    let mut offset = 0;
-    for line in panel.output.split_inclusive('\n') {
-        let candidate = &panel.output[offset..];
-        if (line.trim_start().starts_with("--- ") || line.trim_start().starts_with("diff --git "))
-            && (looks_like_diff(candidate)
-                || (panel.name == "write" && looks_like_legacy_write_creation(candidate)))
-        {
-            return Some(candidate.to_owned());
-        }
-        offset += line.len();
-    }
-    None
-}
-
-/// Render `read` tool output with colored line numbers for readability.
-/// The output format is:
-///   path:offset-end/total hash=...
-///   NNN: code line
-///   ...
-///   next_offset=N truncated=bool
-fn render_read_output(output: &str, theme: &YggTheme, width: u16) -> Vec<String> {
-    let indent = "  ";
-    let content_width = usize::from(width).saturating_sub(visible_width(indent));
-    let muted = |text: &str| theme.fg("muted", text);
-    let mut lines: Vec<String> = Vec::new();
-
-    for line in output.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        // Header line: "path:1-20/100 hash=sha256:..."
-        if line.contains("hash=") && line.contains('/') {
-            lines.push(format!("{indent}{}", muted(line)));
-            continue;
-        }
-        // Footer: "next_offset=N" or "truncated=bool"
-        if line.starts_with("next_offset=") || line.starts_with("truncated=") {
-            lines.push(format!("{indent}{}", muted(line)));
-            continue;
-        }
-        // "(empty file)" marker
-        if line == "(empty file)" {
-            lines.push(format!("{indent}{}", muted(line)));
-            continue;
-        }
-        // Content line: "NNN: rest of line"
-        if let Some((num, code)) = line.split_once(':') {
-            if num.chars().all(|c| c.is_ascii_digit()) {
-                let number_gutter = theme.fg("syntax_number", &format!("{num}:"));
-                let code_str = sanitize_for_terminal(code);
-                let combined = format!("{number_gutter}{code_str}");
-                lines.push(format!(
-                    "{indent}{}",
-                    fit_line(&combined, content_width as u16)
-                ));
-                continue;
-            }
-        }
-        // Fallback: render as plain text
-        lines.push(format!("{indent}{}", sanitize_for_terminal(line)));
-    }
-    lines
-}
-
-fn render_extension_tool_segments(panel: &ToolPanel, theme: &YggTheme, width: u16) -> Vec<String> {
-    if panel.extension_render_segments.is_empty() {
-        return Vec::new();
-    }
-    let mut semantic = String::new();
-    for segment in &panel.extension_render_segments {
-        if !panel.finished {
-            // Live extension output follows the same lifecycle hierarchy as
-            // built-in tools. Extension roles become active again after the
-            // call completes, but cannot turn an in-flight feed into a bright
-            // competing surface.
-            semantic.push_str(&segment.text);
-        } else if let Some(role) = segment
-            .style_role
-            .as_deref()
-            .filter(|role| valid_extension_tool_render_role(role))
-        {
-            semantic.push_str(&theme.apply_semantic_role(role, &segment.text));
-        } else {
-            semantic.push_str(&segment.text);
-        }
-    }
-    if semantic.is_empty() {
-        Vec::new()
-    } else {
-        let semantic = if panel.finished {
-            semantic
-        } else {
-            understated_tool_output(theme, &semantic)
-        };
-        wrap_hanging(&semantic, "  ", "  ", width)
-    }
-}
-
-/// Expanded proof stays in sexy-tui's semantic technical renderers. The
-/// compact action row remains a concise observation; code, diffs, arguments,
-/// and raw logs are bounded local objects rather than unstyled transcript
-/// lines.
-fn render_tool_details(
-    panel: &ToolPanel,
-    renderer: &RichRenderer,
-    theme: &YggTheme,
-    width: u16,
-) -> Vec<String> {
-    let display_line = |line: sexy_tui_rs::RenderedLine| {
-        let content = if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
-            line.plain
-        } else {
-            line.styled
-        };
-        format!("  {content}")
-    };
-
-    let mut lines = Vec::new();
-    let mut evidence = Vec::new();
-    let diff = tool_diff(panel);
-    if !panel.args.is_empty() {
-        evidence.push(Block::CodeBlock(CodeBlock::with_language(
-            "json",
-            format!(
-                "{{\n  \"tool_call_id\": \"{}\",\n  \"arguments\": {}\n}}",
-                panel.id.0, panel.args
-            ),
-        )));
-    }
-    let non_diff_output = diff
-        .as_ref()
-        .map(|d| panel.output[..panel.output.len().saturating_sub(d.len())].trim_end())
-        .unwrap_or(&panel.output);
-    if !non_diff_output.is_empty() {
-        if panel.name == "read" {
-            lines.extend(render_read_output(non_diff_output, theme, width));
-        } else {
-            evidence.push(Block::CodeBlock(CodeBlock::with_language(
-                "text",
-                non_diff_output.to_owned(),
-            )));
-        }
-    }
-    if !evidence.is_empty() {
-        let document = Document::new(vec![Block::Detail(DetailBlock::new(
-            "evidence", evidence, true,
-        ))]);
-        lines.extend(
-            renderer
-                .render(&document, width.saturating_sub(2))
-                .lines
-                .into_iter()
-                .map(&display_line),
-        );
-    }
-    if let Some(ref diff) = diff {
-        let rendered = renderer.render_diff(
-            &UnifiedDiff::parse(diff),
-            width.saturating_sub(2),
-            DiffRenderOptions {
-                line_numbers: width >= 70,
-                wrap: false,
-            },
-        );
-        lines.extend(rendered.lines.into_iter().map(display_line));
-    }
-    if panel.finished {
-        lines
-    } else {
-        // Expanded live evidence is still active tool output. Strip the rich
-        // renderer's nested colours until completion so every visible cell is
-        // predictably muted; the durable evidence is untouched and is
-        // re-rendered richly as soon as the tool settles.
-        lines
-            .into_iter()
-            .map(|line| understated_tool_output(theme, &strip_terminal_sequences(&line)))
-            .collect()
-    }
-}
-
-/// Max diff lines to show in compact (non-expanded) mode before truncating.
-const COMPACT_DIFF_LINES: usize = 10;
-
-/// Render only the diff portion of tool output, without the full evidence
-/// panel.  Long diffs are truncated with an indicator; ctrl+o expands them.
-fn render_diff_only(
-    panel: &ToolPanel,
-    renderer: &RichRenderer,
-    theme: &YggTheme,
-    width: u16,
-) -> Vec<String> {
-    let display_line = |line: sexy_tui_rs::RenderedLine| {
-        let content = if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
-            line.plain
-        } else {
-            line.styled
-        };
-        format!("  {content}")
-    };
-    let Some(ref diff) = tool_diff(panel) else {
-        return Vec::new();
-    };
-    let rendered = renderer.render_diff(
-        &UnifiedDiff::parse(diff),
-        width.saturating_sub(2),
-        DiffRenderOptions {
-            line_numbers: width >= 70,
-            wrap: true,
-        },
-    );
-    let mut lines: Vec<String> = rendered.lines.into_iter().map(display_line).collect();
-    if lines.len() > COMPACT_DIFF_LINES + 1 {
-        let remaining = lines.len() - COMPACT_DIFF_LINES;
-        lines.truncate(COMPACT_DIFF_LINES);
-        let hint = if theme.unicode() {
-            format!("  … {remaining} more lines · ctrl+o to expand")
-        } else {
-            format!("  ... {remaining} more lines - ctrl+o to expand")
-        };
-        lines.push(subdued_text(theme, &hint));
-    }
-    lines
 }
 
 fn without_redundant_tool_lead(tool: &str, text: &str) -> String {
@@ -2231,270 +1969,6 @@ fn without_redundant_tool_lead(tool: &str, text: &str) -> String {
     }
 }
 
-fn tool_metadata(panel: &ToolPanel) -> Option<String> {
-    if let Some(ref cached) = *panel.cached_metadata.borrow() {
-        return cached.clone();
-    }
-    let result = compute_tool_metadata(panel);
-    *panel.cached_metadata.borrow_mut() = Some(result.clone());
-    result
-}
-
-/// Locate the final canonical `exec` result after any live progress bytes.
-/// The exec tool streams output while it runs, then emits a durable envelope
-/// containing the exit status and bounded stdout/stderr capture. The panel
-/// retains both, so presentation should prefer the last envelope without
-/// mutating the evidence stored for expansion and copy.
-fn final_exec_result(output: &str) -> &str {
-    for (index, _) in output.rmatch_indices("exit=") {
-        let candidate = &output[index..];
-        let mut lines = candidate.lines();
-        let header = lines.next().unwrap_or_default();
-        if !header
-            .split_whitespace()
-            .any(|part| part.starts_with("duration=") && part.len() > "duration=".len())
-        {
-            continue;
-        }
-        let next = lines.next().unwrap_or_default().trim();
-        if index == 0 || next == "(no output)" || is_exec_stream_header(next) {
-            return candidate;
-        }
-    }
-    output
-}
-
-fn is_exec_stream_header(line: &str) -> bool {
-    ["stdout", "stderr"].into_iter().any(|stream| {
-        let Some(detail) = line
-            .strip_prefix(stream)
-            .and_then(|line| line.strip_prefix(':'))
-        else {
-            return false;
-        };
-        let detail = detail.trim();
-        detail.is_empty()
-            || detail
-                .strip_suffix(" lines")
-                .is_some_and(|count| count.parse::<usize>().is_ok())
-            || (detail.contains(" bytes, showing first ") && detail.contains(" and last "))
-    })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ExecCaptureTruncation {
-    stream: &'static str,
-    omitted_bytes: Option<usize>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct CompactExecOutput {
-    lines: Vec<String>,
-    omitted_lines: usize,
-    capture_truncations: Vec<ExecCaptureTruncation>,
-    panel_elided: bool,
-}
-
-fn exec_capture_footer(line: &str) -> Option<(&'static str, &str)> {
-    ["stdout", "stderr"].into_iter().find_map(|stream| {
-        line.strip_prefix("truncated_")
-            .and_then(|line| line.strip_prefix(stream))
-            .and_then(|line| line.strip_prefix('='))
-            .map(|detail| (stream, detail))
-    })
-}
-
-fn is_exec_complete_footer(line: &str) -> bool {
-    ["stdout", "stderr"].into_iter().any(|stream| {
-        line.strip_prefix("complete_")
-            .and_then(|line| line.strip_prefix(stream))
-            .is_some_and(|detail| detail == "=true")
-    })
-}
-
-/// Project a bounded result into Pi-style tail output. Protocol envelope lines
-/// are excluded; capture loss is retained separately because Ctrl+O can reveal
-/// UI-tail omissions but cannot recover bytes discarded by the exec tool.
-fn compact_exec_output(panel: &ToolPanel) -> CompactExecOutput {
-    let result = sanitize_for_terminal(final_exec_result(&panel.output));
-    let mut capture_truncations = Vec::new();
-    for line in result.lines().map(str::trim) {
-        let Some((stream, detail)) = exec_capture_footer(line) else {
-            continue;
-        };
-        if detail == "false" {
-            continue;
-        }
-        let omitted_bytes = detail
-            .split_whitespace()
-            .find_map(|part| part.strip_prefix("omitted_bytes:"))
-            .and_then(|count| count.parse::<usize>().ok());
-        capture_truncations.push(ExecCaptureTruncation {
-            stream,
-            omitted_bytes,
-        });
-    }
-
-    let capture_was_truncated = !capture_truncations.is_empty();
-    let failure_reason = panel.failure_reason.as_deref().map(str::trim);
-    let mut content = Vec::new();
-    let mut panel_elided = false;
-    let mut protocol_error = false;
-    let mut expect_stream_header = false;
-    for (line_index, raw) in result.lines().enumerate() {
-        let line = raw.trim_end();
-        let trimmed = line.trim();
-        if line_index == 0 && trimmed.starts_with("error ") {
-            protocol_error = true;
-            expect_stream_header = true;
-            continue;
-        }
-        if trimmed.starts_with("exit=") && trimmed.contains("duration=") {
-            expect_stream_header = true;
-            continue;
-        }
-        if expect_stream_header && is_exec_stream_header(trimmed) {
-            protocol_error = false;
-            expect_stream_header = false;
-            continue;
-        }
-        if exec_capture_footer(trimmed).is_some() || is_exec_complete_footer(trimmed) {
-            expect_stream_header = true;
-            continue;
-        }
-        if trimmed.is_empty()
-            || trimmed == "(no output)"
-            || (capture_was_truncated && trimmed == "...")
-            || (content.is_empty() && failure_reason.is_some_and(|reason| reason == trimmed))
-        {
-            continue;
-        }
-        if trimmed == "… older tool output elided …" {
-            panel_elided = true;
-            continue;
-        }
-        content.push(line.to_owned());
-        if !protocol_error {
-            expect_stream_header = false;
-        }
-    }
-
-    let omitted_lines = content.len().saturating_sub(COMPACT_EXEC_OUTPUT_LINES);
-    if omitted_lines > 0 {
-        content.drain(..omitted_lines);
-    }
-    CompactExecOutput {
-        lines: content,
-        omitted_lines,
-        capture_truncations,
-        panel_elided,
-    }
-}
-
-fn compute_tool_metadata(panel: &ToolPanel) -> Option<String> {
-    if panel.name != "exec" {
-        return None;
-    }
-    let output = final_exec_result(&panel.output);
-    if let Some(duration) = output
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix("duration="))
-        .map(|value| value.trim_end_matches([',', ';']))
-        .filter(|value| !value.is_empty())
-    {
-        return Some(
-            if duration.chars().last().is_some_and(char::is_alphabetic) {
-                duration.to_owned()
-            } else {
-                format!("{duration}s")
-            },
-        );
-    }
-    None
-}
-
-fn render_compact_exec_output(
-    panel: &ToolPanel,
-    theme: &YggTheme,
-    width: u16,
-    show_tool_duration: bool,
-) -> Vec<String> {
-    let compact = compact_exec_output(panel);
-    let ellipsis = if theme.unicode() { "…" } else { "..." };
-    let mut lines = Vec::new();
-    if compact.panel_elided {
-        let hint = format!(
-            "  {ellipsis} (older live output was elided before display; unavailable to expand)"
-        );
-        lines.extend(wrap_hanging(
-            &understated_tool_output(theme, &hint),
-            "",
-            "  ",
-            width,
-        ));
-    }
-    for truncation in compact.capture_truncations {
-        let detail = truncation
-            .omitted_bytes
-            .map_or_else(|| "some bytes".to_owned(), |bytes| format!("{bytes} bytes"));
-        let hint = format!(
-            "  {ellipsis} ({} capture omitted {detail}; unavailable to expand)",
-            truncation.stream
-        );
-        lines.extend(wrap_hanging(
-            &understated_tool_output(theme, &hint),
-            "",
-            "  ",
-            width,
-        ));
-    }
-    if compact.omitted_lines > 0 {
-        let unit = if compact.omitted_lines == 1 {
-            "line"
-        } else {
-            "lines"
-        };
-        let hint = format!(
-            "  {ellipsis} ({} earlier {unit}, ctrl+o to expand)",
-            compact.omitted_lines,
-        );
-        lines.extend(wrap_hanging(
-            &understated_tool_output(theme, &hint),
-            "",
-            "  ",
-            width,
-        ));
-    }
-    for output_line in compact.lines {
-        let output_line = understated_tool_output(theme, &output_line);
-        lines.extend(wrap_hanging(&output_line, "  ", "  ", width));
-    }
-    if show_tool_duration {
-        if let Some(duration) = tool_metadata(panel) {
-            lines.push(fit_line(
-                &understated_tool_output(theme, &format!("  Took {duration}")),
-                width,
-            ));
-        }
-    }
-    lines
-}
-
-fn exec_timeout_annotation(panel: &ToolPanel) -> Option<String> {
-    let timeout_ms = serde_json::from_str::<serde_json::Value>(&panel.args)
-        .ok()?
-        .get("timeout_ms")?
-        .as_u64()?;
-    Some(if timeout_ms % 1_000 == 0 {
-        format!("timeout {}s", timeout_ms / 1_000)
-    } else {
-        format!("timeout {timeout_ms}ms")
-    })
-}
-
 fn render_exec_row(panel: &ToolPanel, command: &str, theme: &YggTheme, width: u16) -> Vec<String> {
     let lifecycle_role = if !panel.finished {
         "muted"
@@ -2507,27 +1981,16 @@ fn render_exec_row(panel: &ToolPanel, command: &str, theme: &YggTheme, width: u1
     let prefix = format!("{marker} ");
     let continuation = " ".repeat(visible_width(&prefix));
     let safe_command = sanitize_for_terminal(command);
-    let mut command = theme.bold(&theme.fg(lifecycle_role, &safe_command));
-    if let Some(timeout) = exec_timeout_annotation(panel) {
-        command.push(' ');
-        command.push_str(&understated_tool_output(theme, &format!("({timeout})")));
-    }
-    let mut lines = wrap_hanging(&command, &prefix, &continuation, width);
-
-    if panel.is_error {
-        if let Some(reason) = &panel.failure_reason {
-            let error_marker = theme.fg("error", "!");
-            let error_prefix = format!("{error_marker} ");
-            let error_continuation = " ".repeat(visible_width(&error_prefix));
-            lines.extend(wrap_hanging(
-                &theme.fg("error", &sanitize_for_terminal(reason)),
-                &error_prefix,
-                &error_continuation,
-                width,
-            ));
-        }
-    }
-    lines
+    let command = theme.bold(&theme.fg(lifecycle_role, &safe_command));
+    let status = if !panel.finished {
+        theme.dim("…")
+    } else if panel.is_error {
+        theme.fg("error", "[failed]")
+    } else {
+        theme.dim("[ok]")
+    };
+    let row = format!("{command} {status}");
+    wrap_hanging(&row, &prefix, &continuation, width)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2916,7 +2379,7 @@ fn render_block_planned(
     rich_renderer: &RichRenderer,
     reasoning_renderer: &RichRenderer,
     outer_width: u16,
-    verbose_tools: bool,
+    _verbose_tools: bool,
 ) -> RenderedTranscriptBlock {
     let layout = theme.layout_for_width(outer_width);
     let plan = compile_surface_plan(previous, block, theme, outer_width);
@@ -2953,8 +2416,7 @@ fn render_block_planned(
             content_background,
         ),
         TranscriptBlock::Tool(panel) => {
-            let compact_exec = panel.name == "exec" && panel.display.shell_command.is_some();
-            let mut lines = if let Some(command) = panel.display.shell_command.as_deref() {
+            let lines = if let Some(command) = panel.display.shell_command.as_deref() {
                 render_exec_row(panel, command, theme, width)
             } else {
                 let compact = width < 60;
@@ -2976,9 +2438,6 @@ fn render_block_planned(
                     &panel.display.success
                 };
                 let tool = panel.display.label.as_str();
-                // Tool chrome describes lifecycle, not model identity: muted
-                // while executing, normal foreground after success, and an
-                // explicit error role on failure.
                 let lifecycle_role = if !panel.finished {
                     "muted"
                 } else if panel.is_error {
@@ -2987,14 +2446,8 @@ fn render_block_planned(
                     "foreground"
                 };
                 let label = theme.bold(&theme.fg(lifecycle_role, tool));
-                let mut text =
+                let text =
                     without_redundant_tool_lead(&panel.name, &sanitize_for_terminal(summary));
-                if panel.is_error {
-                    if let Some(reason) = &panel.failure_reason {
-                        text.push_str(semantic_separator(theme));
-                        text.push_str(&sanitize_for_terminal(reason));
-                    }
-                }
                 let text = theme.fg(lifecycle_role, &text);
                 let label_width: usize = if compact { 7 } else { 8 };
                 let label_prefix = format!(
@@ -3004,25 +2457,8 @@ fn render_block_planned(
                 let continuation = " ".repeat(label_width);
                 wrap_hanging(&text, &label_prefix, &continuation, width)
             };
-
-            if panel.is_error && !verbose_tools && !compact_exec {
-                lines.extend(render_failure_details(panel, theme, width));
-            }
-            lines.extend(render_extension_tool_segments(panel, theme, width));
-            if verbose_tools {
-                lines.extend(render_tool_details(panel, rich_renderer, theme, width));
-            } else if compact_exec {
-                lines.extend(render_compact_exec_output(
-                    panel,
-                    theme,
-                    width,
-                    layout.show_tool_duration,
-                ));
-            } else if tool_diff(panel).is_some() {
-                // Diffs remain visible at a glance without expanding protocol
-                // arguments and raw evidence.
-                lines.extend(render_diff_only(panel, rich_renderer, theme, width));
-            }
+            // Arguments, results, failure details, diffs, process output, and
+            // extension-rendered tool payloads remain internal evidence.
             finish_transcript_block(lines)
         }
         TranscriptBlock::Outcome(outcome) => render_outcome(outcome, theme, width),
@@ -3071,7 +2507,6 @@ fn render_block_planned(
             let marker = theme.glyph("shell");
             let prefix = format!("{} ", theme.bold(&theme.fg("model_accent", marker)));
             if shell.running {
-                // In-progress: command + "…" + spinner (icon on the right)
                 let line = format!(
                     "{} {} {} {}",
                     prefix,
@@ -3080,59 +2515,17 @@ fn render_block_planned(
                     shell.spinner,
                 );
                 finish_transcript_block(vec![fit_line(&line, width)])
-            } else if verbose_tools {
-                // Expanded: command header (icon on right) + full output + exit code
-                let mut lines: Vec<String> = Vec::new();
-                let header = format!(
-                    "{} {} {}",
-                    prefix,
-                    theme.fg("model_accent", &sanitize_for_terminal(&shell.command)),
-                    shell.spinner,
-                );
-                lines.push(fit_line(&header, width));
-                // Output
-                let output = shell.output.trim();
-                if !output.is_empty() {
-                    for line in output.lines() {
-                        lines.push(format!("  {}", theme.dim(&sanitize_for_terminal(line))));
-                    }
-                }
-                // Exit code
-                let exit = if shell.exit_code == 0 {
-                    format!("[exit: {}]", shell.exit_code)
-                } else {
-                    theme.fg("error", &format!("[exit: {}]", shell.exit_code))
-                };
-                lines.push(format!("  {exit}"));
-                finish_transcript_block(lines)
             } else {
-                // Collapsed: command + summary + exit + icon (on the right)
-                let summary = if shell.output.is_empty() {
-                    "(no output)".to_string()
+                let status = if shell.exit_code == 0 {
+                    theme.dim(" [ok]")
                 } else {
-                    let trimmed = shell.output.trim();
-                    let first_line = trimmed.lines().next().unwrap_or("");
-                    let summary = sanitize_for_terminal(first_line);
-                    if trimmed.lines().count() > 1 {
-                        format!("{summary} …")
-                    } else {
-                        summary
-                    }
-                };
-                let exit = if shell.exit_code == 0 {
-                    " [ok]".to_string()
-                } else {
-                    format!(" [exit: {}]", shell.exit_code)
+                    theme.fg("error", " [failed]")
                 };
                 let line = format!(
-                    "{} {}  {}",
+                    "{} {}{} {}",
                     prefix,
-                    theme.dim(&format!(
-                        "{}  {}{}",
-                        sanitize_for_terminal(&shell.command),
-                        summary,
-                        exit
-                    )),
+                    theme.dim(&sanitize_for_terminal(&shell.command)),
+                    status,
                     shell.spinner,
                 );
                 finish_transcript_block(vec![fit_line(&line, width)])
@@ -3208,27 +2601,22 @@ fn block_copy_text(block: &TranscriptBlock) -> String {
             } else {
                 &panel.display.active
             };
-            let mut text = if let Some(command) = &panel.display.shell_command {
+            let text = if let Some(command) = &panel.display.shell_command {
                 format!("$ {command}")
             } else {
                 format!("{}  {summary}", panel.display.label)
             };
-            if !panel.output.is_empty() {
-                text.push('\n');
-                text.push_str(&panel.output);
-            }
             sanitize_for_terminal(&text)
         }
         TranscriptBlock::Shell(shell) => {
-            let mut text = format!("$ {}", shell.command);
-            if !shell.output.is_empty() {
-                text.push('\n');
-                text.push_str(&shell.output);
-            }
-            if shell.exit_code != 0 {
-                text.push_str(&format!("\n[exit: {}]", shell.exit_code));
-            }
-            sanitize_for_terminal(&text)
+            let status = if shell.running {
+                "running"
+            } else if shell.exit_code == 0 {
+                "completed"
+            } else {
+                "failed"
+            };
+            sanitize_for_terminal(&format!("$ {} [{status}]", shell.command))
         }
         TranscriptBlock::Outcome(outcome) => match outcome {
             RunOutcome::Completed { elapsed, summary } => format!(
@@ -3239,8 +2627,8 @@ fn block_copy_text(block: &TranscriptBlock) -> String {
             RunOutcome::CompletedWithWarnings { elapsed, .. } => {
                 format!("completed with notes · {}", format_duration(*elapsed))
             }
-            RunOutcome::Failed { elapsed, reason } => {
-                format!("failed · {reason} · {}", format_duration(*elapsed))
+            RunOutcome::Failed { elapsed, .. } => {
+                format!("failed · {}", format_duration(*elapsed))
             }
             RunOutcome::Interrupted { elapsed } => {
                 format!("interrupted · {}", format_duration(*elapsed))
@@ -3852,11 +3240,91 @@ fn render_pending_steering(state: &ShellState, width: u16, max_rows: usize) -> V
     lines
 }
 
+fn welcome_workspace(state: &ShellState) -> String {
+    let Some(path) = state.workspace.as_deref() else {
+        return "workspace unavailable".to_owned();
+    };
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Ok(relative) = path.strip_prefix(home) {
+            return format!("~/{}", relative.display());
+        }
+    }
+    path.display().to_string()
+}
+
+fn render_welcome_card(
+    state: &ShellState,
+    width: u16,
+    max_rows: usize,
+    now: Instant,
+) -> Vec<String> {
+    let Some(started) = state.startup_card_started_at else {
+        return Vec::new();
+    };
+    if state.overlay.is_some() || width < 24 || max_rows < 7 {
+        return Vec::new();
+    }
+
+    const ROWS: usize = 6;
+    let elapsed = if state.theme.capabilities().animation && state.welcome_is_mutable() {
+        now.saturating_duration_since(started).as_secs_f32()
+    } else {
+        crate::tui::splash::DURATION
+    };
+    let logo_width = (usize::from(width) / 3).clamp(14, 24);
+    let adaptive_accent = state
+        .theme
+        .is_compiled_default()
+        .then(|| state.theme.model_rgb(state.model_lab))
+        .flatten();
+    let logo =
+        crate::tui::splash::render_logo(&state.theme, logo_width, ROWS, elapsed, adaptive_accent);
+
+    let model = if state.model_display.trim().is_empty() {
+        state.model.as_str()
+    } else {
+        state.model_display.as_str()
+    };
+    let model = if model.trim().is_empty() {
+        "selecting model…"
+    } else {
+        model
+    };
+    let text = [
+        format!(
+            "{} {}",
+            state.theme.bold(&state.theme.fg("model_accent", "ygg")),
+            state.theme.dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        ),
+        String::new(),
+        state
+            .theme
+            .fg("foreground", &format!("{model} / {}", state.reasoning)),
+        state.theme.dim(&welcome_workspace(state)),
+        String::new(),
+        format!(
+            "{} {}",
+            state.theme.bold("Ctrl+D"),
+            state.theme.dim("to exit")
+        ),
+    ];
+
+    let mut lines = Vec::with_capacity(ROWS + 1);
+    for row in 0..ROWS {
+        lines.push(fit_line(&format!("  {}   {}", logo[row], text[row]), width));
+    }
+    lines.push(String::new());
+    lines
+}
+
 fn transcript_lines(state: &ShellState, width: u16) -> Ref<'_, Vec<String>> {
     state.rendered_transcript(width)
 }
 
 fn transcript_commit_boundary(state: &ShellState, width: u16) -> usize {
+    if welcome_animating(state, Instant::now()) {
+        return 0;
+    }
     let transcript_len = transcript_lines(state, width).len();
     let first_live = state.transcript.iter().position(|block| match block {
         TranscriptBlock::Assistant(block) | TranscriptBlock::Reasoning(block) => !block.finished,
@@ -4640,6 +4108,7 @@ fn render_shell_viewport_update(
     frame: &mut ShellFrameState,
 ) -> FrameUpdate {
     let repaint_theme = frame.initialized && frame.theme_epoch != state.theme_epoch;
+    let resized = frame.initialized && frame.width != width;
     frame.initialized = true;
     frame.width = width;
     frame.theme_epoch = state.theme_epoch;
@@ -4648,7 +4117,7 @@ fn render_shell_viewport_update(
         stable_prefix: 0,
         replacement: render_shell_viewport_at(state, width, now),
         commit_boundary: None,
-        reanchor_viewport: repaint_theme,
+        reanchor_viewport: repaint_theme || resized,
         rebuild_scrollback: false,
     }
 }
@@ -4718,6 +4187,7 @@ fn render_shell_update(
     frame: &mut ShellFrameState,
 ) -> FrameUpdate {
     let repaint_theme = frame.initialized && frame.theme_epoch != state.theme_epoch;
+    let resized = frame.initialized && frame.width != width;
     let chrome = shell_chrome(state, width, now);
     if state.overlay.is_some() {
         let entering_overlay = frame.initialized && !frame.overlay_active;
@@ -4736,7 +4206,7 @@ fn render_shell_update(
             // Overlays temporarily replace the grid but do not replace or
             // advance the transcript's native-scrollback ledger.
             commit_boundary: None,
-            reanchor_viewport: repaint_theme || entering_overlay,
+            reanchor_viewport: repaint_theme || resized || entering_overlay,
             // Portable terminals cannot restyle rows already owned by native
             // scrollback. Repaint the visible viewport and preserve history.
             rebuild_scrollback: false,
@@ -4755,6 +4225,7 @@ fn render_shell_update(
     let cache = state.transcript_cache.borrow();
     let generation = cache.generation;
     let reanchor_viewport = repaint_theme
+        || resized
         || leaving_overlay
         || (frame.initialized
             && frame.width == width
@@ -5255,6 +4726,7 @@ impl InteractiveShell {
             theme,
             size: initial_size,
             follow_tail: true,
+            startup_card_started_at: Some(Instant::now()),
             ..ShellState::default()
         });
         let (render_tx, render_rx) = mpsc::sync_channel(1);
@@ -5496,7 +4968,7 @@ impl InteractiveShell {
                     .saturating_add(text.len() as u64);
                 state.append_text_block(*channel, text);
             }
-            AgentEvent::ProviderRetry { .. } => {
+            AgentEvent::ProviderRetry { .. } | AgentEvent::CandidateRejected { .. } => {
                 state.discard_streaming_blocks();
                 state.turn_generation_started_at = None;
                 state.turn_streamed_output_bytes = 0;
@@ -5568,13 +5040,6 @@ impl InteractiveShell {
                 state.tool_panels.insert(id.clone(), index);
             }
             AgentEvent::ToolProgress { id, progress } => {
-                let index = state.tool_panels.get(id).copied();
-                let refreshes_compact_tail = matches!(
-                    progress,
-                    ToolProgress::Output { .. }
-                        | ToolProgress::Status(_)
-                        | ToolProgress::Dropped { .. }
-                );
                 if let Some(panel) = state.tool_output_mut(id) {
                     match progress {
                         ToolProgress::Output { bytes, .. } => {
@@ -5607,11 +5072,6 @@ impl InteractiveShell {
                             }
                         }
                         ToolProgress::SessionEvent(..) => {}
-                    }
-                }
-                if state.verbose_tools || refreshes_compact_tail {
-                    if let Some(index) = index {
-                        state.touch_block(index);
                     }
                 }
             }
@@ -6134,6 +5594,7 @@ impl InteractiveShell {
 
     pub fn set_identity(&mut self, provider: &str, model: &str, reasoning: &str) {
         let mut state = self.state.borrow_mut();
+        let welcome_changed = state.model != model || state.reasoning != reasoning;
         if state.model != model {
             if !state.run.is_active() && state.telemetry_model.as_deref() != Some(model) {
                 state.clear_turn_telemetry();
@@ -6147,51 +5608,9 @@ impl InteractiveShell {
         state.provider = provider.to_owned();
         state.model = model.to_owned();
         state.reasoning = reasoning.to_owned();
-    }
-
-    pub fn set_verbose_tools(&mut self, verbose: bool) {
-        let mut state = self.state.borrow_mut();
-        if state.verbose_tools != verbose {
-            state.verbose_tools = verbose;
-            state.invalidate_transcript_layout();
+        if welcome_changed {
+            state.restart_welcome_animation();
         }
-    }
-
-    pub fn verbose_tools(&self) -> bool {
-        self.state.borrow().verbose_tools
-    }
-
-    /// Toggle one tool panel by call ID, or the most recent panel when omitted.
-    pub fn toggle_tool_details(
-        &mut self,
-        requested_id: Option<&str>,
-    ) -> std::result::Result<(String, bool), String> {
-        let mut state = self.state.borrow_mut();
-        let index = if let Some(id) = requested_id {
-            state
-                .tool_panels
-                .get(&ToolCallId(id.to_owned()))
-                .copied()
-                .ok_or_else(|| format!("unknown tool call id {id}"))?
-        } else {
-            state
-                .transcript
-                .iter()
-                .rposition(|block| matches!(block, TranscriptBlock::Tool(_)))
-                .ok_or_else(|| "there are no tool calls in this session".to_string())?
-        };
-        let TranscriptBlock::Tool(panel) = &state.transcript[index] else {
-            return Err("tool panel index is inconsistent".to_string());
-        };
-        let id = panel.id.clone();
-        let expanded = if state.expanded_tools.remove(&id) {
-            false
-        } else {
-            state.expanded_tools.insert(id.clone());
-            true
-        };
-        state.touch_block(index);
-        Ok((id.0, expanded))
     }
 
     pub fn set_status_detail(&mut self, detail: String) {
@@ -6410,7 +5829,6 @@ impl InteractiveShell {
             .collect::<Vec<_>>();
         state.block_revisions.clear();
         state.tool_panels.clear();
-        state.expanded_tools.clear();
         state.deferred_session_path = None;
         append_hydrated_items(&mut state, items);
         for block in local_blocks {
@@ -6784,57 +6202,25 @@ impl InteractiveShell {
         self.state.borrow_mut().overlay = Some(ShellOverlay::Context(report));
     }
 
-    /// Toggle the most recent expandable block (reasoning, tool, shell, or
-    /// compaction summary; ctrl+o).
+    /// Toggle the most recent reasoning block or compaction summary.
+    /// Tool output and other evidence are never disclosure targets.
     pub fn expand_focused_tool(&mut self) {
         let mut state = self.state.borrow_mut();
-        let most_recent = state.transcript.iter().rposition(|block| {
+        let Some(index) = state.transcript.iter().rposition(|block| {
             matches!(
                 block,
-                TranscriptBlock::Reasoning(_)
-                    | TranscriptBlock::Tool(_)
-                    | TranscriptBlock::Shell(_)
-                    | TranscriptBlock::Compaction(_)
+                TranscriptBlock::Reasoning(_) | TranscriptBlock::Compaction(_)
             )
-        });
-        if let Some(index) = most_recent {
-            if let TranscriptBlock::Reasoning(reasoning) = &mut state.transcript[index] {
-                reasoning.reasoning_expanded = !reasoning.reasoning_expanded;
-                reasoning.invalidate_layout();
-                state.touch_block(index);
-                return;
-            }
-            if let TranscriptBlock::Compaction(compaction) = &mut state.transcript[index] {
-                compaction.expanded = !compaction.expanded;
-                state.touch_block(index);
-                return;
-            }
-            match &state.transcript[index] {
-                TranscriptBlock::Tool(panel) => {
-                    let id = panel.id.clone();
-                    if state.expanded_tools.remove(&id) {
-                        // Collapse.
-                    } else {
-                        state.expanded_tools.insert(id);
-                    }
-                }
-                TranscriptBlock::Shell(shell) => {
-                    let id = shell.id.clone();
-                    if state.expanded_shells.remove(&id) {
-                        // Collapse.
-                    } else {
-                        state.expanded_shells.insert(id);
-                    }
-                }
-                _ => return,
-            }
-            state.touch_block(index);
-        } else {
-            state.error = Some(
-                "no reasoning, tool calls, shell commands, or compaction summaries in this session"
-                    .into(),
-            );
+        }) else {
+            return;
+        };
+        if let TranscriptBlock::Reasoning(reasoning) = &mut state.transcript[index] {
+            reasoning.reasoning_expanded = !reasoning.reasoning_expanded;
+            reasoning.invalidate_layout();
+        } else if let TranscriptBlock::Compaction(compaction) = &mut state.transcript[index] {
+            compaction.expanded = !compaction.expanded;
         }
+        state.touch_block(index);
     }
 
     pub fn show_compaction_summary(&mut self) {
@@ -7089,6 +6475,7 @@ impl InteractiveShell {
         state.model_compact_names = metadata.compact_names;
         state.price_display = price_display;
         state.prompt_color = Some(prompt_color);
+        state.restart_welcome_animation();
         if state.model_lab == Some(lab) {
             return;
         }
@@ -7145,8 +6532,6 @@ impl InteractiveShell {
         state.invalidate_transcript_layout();
         state.steering_queue.clear();
         state.tool_panels.clear();
-        state.expanded_tools.clear();
-        state.expanded_shells.clear();
         state.close_streaming_blocks();
         state.jump_to_tail();
         state.last_turn_usage = checkpoint_usage;
@@ -7285,6 +6670,8 @@ impl sexy_tui_rs::Terminal for TestTerminal {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     struct EmulatedTerminal {
@@ -9495,140 +8882,41 @@ mod tests {
     }
 
     #[test]
-    fn long_exec_tail_and_head_trim_never_replay_native_history() {
-        const WIDTH: u16 = 96;
-        const HEIGHT: u16 = 24;
-        for synchronized_output in [false, true] {
-            let (mut shell, bytes) = emulated_shell_with_sync(
-                crate::tui::theme::test_theme(),
-                WIDTH,
-                HEIGHT,
-                synchronized_output,
-            );
-            let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 4_096);
-            let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
-                std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
-            };
-            terminal.process(&drain(&bytes));
-
-            for index in 0..24 {
-                shell.notice(format!("history-sentinel-{index:02}"));
-            }
-            shell.render();
-            terminal.process(&drain(&bytes));
-
-            let run_id = shell.begin_run("openai");
-            let id = ToolCallId("long-exec".into());
-            shell.on_run_event(
-                run_id,
-                &AgentEvent::ToolStarted {
-                    id: id.clone(),
-                    name: "exec".into(),
-                    args: serde_json::json!({"command": "long-running-audit"}),
+    fn tool_progress_never_enters_the_rendered_transcript() {
+        let mut shell = InteractiveShell::test_shell();
+        let run_id = shell.begin_run("openai");
+        let id = ToolCallId("long-exec".into());
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolStarted {
+                id: id.clone(),
+                name: "exec".into(),
+                args: serde_json::json!({"command": "long-running-audit"}),
+            },
+        );
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolProgress {
+                id: id.clone(),
+                progress: ToolProgress::Output {
+                    stream: ygg_agent::OutputStream::Stdout,
+                    bytes: bytes::Bytes::from_static(b"private live output"),
                 },
-            );
-            shell.render();
-            terminal.process(&drain(&bytes));
-
-            // Default live exec presentation is a bounded five-row tail even
-            // when the producer emits far more output than the viewport.
-            let first = (0..32)
-                .map(|index| format!("first-live-row-{index:03} {}\n", "a".repeat(80)))
-                .collect::<String>();
-            shell.on_run_event(
-                run_id,
-                &AgentEvent::ToolProgress {
-                    id: id.clone(),
-                    progress: ToolProgress::Output {
-                        stream: ygg_agent::OutputStream::Stdout,
-                        bytes: bytes::Bytes::from(first),
-                    },
-                },
-            );
-            shell.render();
-            terminal.process(&drain(&bytes));
-
-            let second = (0..128)
-                .map(|index| format!("second-live-row-{index:03} {}\n", "b".repeat(80)))
-                .collect::<String>();
-            shell.on_run_event(
-                run_id,
-                &AgentEvent::ToolProgress {
-                    id: id.clone(),
-                    progress: ToolProgress::Output {
-                        stream: ygg_agent::OutputStream::Stdout,
-                        bytes: bytes::Bytes::from(second),
-                    },
-                },
-            );
-            shell.render();
-            let growth = drain(&bytes);
-            let growth_text = String::from_utf8_lossy(&growth);
-            assert_eq!(
-                growth_text.contains("\x1b[?2026h"),
-                synchronized_output,
-                "synchronized-output gating changed: {growth_text:?}"
-            );
-            assert!(
-                growth_text.contains("second-live-row-127"),
-                "latest exec tail was not painted: {growth_text:?}"
-            );
-            assert!(
-                !growth_text.contains("first-live-row-000"),
-                "{growth_text:?}"
-            );
-            assert!(
-                !growth.contains(&b'\n'),
-                "tail replacement must not scroll the bottom row: {growth_text:?}"
-            );
-            terminal.process(&growth);
-
-            // Cross the 64 KiB panel bound so bounded_append replaces the
-            // retained head. This mutates an already committed block far above
-            // the viewport and must still repaint only final visible cells.
-            let trimmed = (0..224)
-                .map(|index| format!("trimmed-live-row-{index:03} {}\n", "c".repeat(300)))
-                .collect::<String>();
-            shell.on_run_event(
-                run_id,
-                &AgentEvent::ToolProgress {
-                    id: id.clone(),
-                    progress: ToolProgress::Output {
-                        stream: ygg_agent::OutputStream::Stdout,
-                        bytes: bytes::Bytes::from(trimmed),
-                    },
-                },
-            );
-            shell.render();
-            let trimmed = drain(&bytes);
-            let trimmed_text = String::from_utf8_lossy(&trimmed);
-            assert!(
-                trimmed_text.contains("trimmed-live-row-223"),
-                "{trimmed_text:?}"
-            );
-            assert!(
-                !trimmed_text.contains("long-running-audit"),
-                "{trimmed_text:?}"
-            );
-            assert!(
-                trimmed.len() < 16_384,
-                "unbounded repaint: {} B",
-                trimmed.len()
-            );
-            terminal.process(&trimmed);
-
-            terminal.set_size(2_048, WIDTH);
-            terminal.set_scrollback(usize::MAX);
-            let physical = terminal.screen().contents();
-            for index in 0..24 {
-                let sentinel = format!("history-sentinel-{index:02}");
-                assert_eq!(
-                    physical.matches(&sentinel).count(),
-                    1,
-                    "{sentinel} was replayed with synchronized_output={synchronized_output}:\n{physical}"
-                );
-            }
-        }
+            },
+        );
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolProgress {
+                id: id.clone(),
+                progress: ToolProgress::Status("private status detail".into()),
+            },
+        );
+        let rendered =
+            strip_terminal_sequences(&render_shell(&shell.state.borrow(), 96).join("\n"));
+        assert!(rendered.contains("$ long-running-audit"), "{rendered}");
+        assert!(!rendered.contains("private live output"), "{rendered}");
+        assert!(!rendered.contains("private status detail"), "{rendered}");
+        assert!(shell.debug_tool_output(&id).is_some());
     }
 
     #[test]
@@ -10389,9 +9677,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_rendering_shows_intent_hides_protocol_and_contains_failures() {
+    fn tool_rendering_shows_intent_and_hides_all_evidence() {
         use ygg_agent::{ToolError, ToolOutput};
-
         let mut shell = InteractiveShell::test_shell();
         let run_id = shell.begin_run("openai");
         let id = ToolCallId("provider-call-secret".into());
@@ -10400,9 +9687,7 @@ mod tests {
             &AgentEvent::ToolStarted {
                 id: id.clone(),
                 name: "exec".into(),
-                args: serde_json::json!({
-                    "command": "cargo test --workspace"
-                }),
+                args: serde_json::json!({"command": "cargo test --workspace", "timeout_ms": 1000}),
             },
         );
         shell.on_run_event(
@@ -10410,46 +9695,21 @@ mod tests {
             &AgentEvent::ToolFinished {
                 id,
                 result: Ok(ToolOutput::new(
-                    "exit=1 duration=0.2s\nstderr:\ntest result: FAILED. 76 passed; 2 failed",
+                    "exit=1 duration=0.2s\nstderr: FAILED 76 passed",
                 )),
             },
         );
-        let rendered = render_shell(&shell.state.borrow(), 80).join("\n");
-        let plain = strip_terminal_sequences(&rendered);
-        // General shell execution uses terminal semantics while preserving the
-        // internal tool ID and full command for expanded evidence.
+        let plain = strip_terminal_sequences(&render_shell(&shell.state.borrow(), 80).join("\n"));
         assert!(plain.contains("$ cargo test --workspace"), "{plain:?}");
-        assert!(plain.contains("command exited 1"), "{plain:?}");
-        assert!(plain.contains("76 passed; 2 failed"));
-        assert!(!rendered.contains("provider-call-secret"));
-        // The command may be truncated in collapsed view; the full args are
-        // visible when expanded (verified below).
-
-        let (toggled, expanded) = shell
-            .toggle_tool_details(Some("provider-call-secret"))
-            .unwrap();
-        assert_eq!(toggled, "provider-call-secret");
-        assert!(expanded);
-        let expanded_one = render_shell(&shell.state.borrow(), 80).join("\n");
-        assert!(expanded_one.contains("provider-call-secret"));
-        assert!(expanded_one.contains("--workspace"));
-        assert!(
-            !shell
-                .toggle_tool_details(Some("provider-call-secret"))
-                .unwrap()
-                .1
-        );
-
-        shell.set_verbose_tools(true);
-        let verbose = render_shell(&shell.state.borrow(), 80).join("\n");
-        assert!(verbose.contains("provider-call-secret"));
-        assert!(verbose.contains("--workspace"));
-
-        let stale_id = ToolCallId("stale-edit-id".into());
+        assert!(!plain.contains("provider-call-secret"), "{plain:?}");
+        assert!(!plain.contains("exit=1"), "{plain:?}");
+        assert!(!plain.contains("duration=0.2s"), "{plain:?}");
+        assert!(!plain.contains("76 passed"), "{plain:?}");
+        let stale = ToolCallId("stale-edit-id".into());
         shell.on_run_event(
             run_id,
             &AgentEvent::ToolStarted {
-                id: stale_id.clone(),
+                id: stale.clone(),
                 name: "edit".into(),
                 args: serde_json::json!({"path":"src/lib.rs"}),
             },
@@ -10457,52 +9717,17 @@ mod tests {
         shell.on_run_event(
             run_id,
             &AgentEvent::ToolFinished {
-                id: stale_id,
+                id: stale,
                 result: Err(ToolError::new(
-                    "error stale_file\nsrc/lib.rs expected hash=aaa actual=bbb\nThe file changed",
+                    "error stale_file\nexpected hash=aaa actual=bbb\nThe file changed",
                 )),
             },
         );
-        shell.set_verbose_tools(false);
-        let default = render_shell(&shell.state.borrow(), 120).join("\n");
-        assert!(default.contains("The file changed"));
-        assert!(!default.contains("hash=aaa"));
-        assert!(!default.contains("actual=bbb"));
-
-        shell.set_verbose_tools(true);
-        let verbose = render_shell(&shell.state.borrow(), 120).join("\n");
-        assert!(verbose.contains("hash=aaa"));
-        assert!(verbose.contains("actual=bbb"));
-    }
-
-    #[test]
-    fn tool_metadata_ignores_file_content() {
-        let panel = ToolPanel {
-            id: ToolCallId("read".into()),
-            name: "read".into(),
-            args: String::new(),
-            display: summarize_tool("read", &serde_json::json!({"path":"docs/design/ygg-ai.md"})),
-            output:
-                "docs/design/ygg-ai.md:1-2/2 hash=x\n2: `Model` is the value passed to the client"
-                    .into(),
-            finished: true,
-            is_error: false,
-            failure_reason: None,
-            extension_render_segments: Vec::new(),
-            model_lab: None,
-            cached_diff: RefCell::new(None),
-            cached_metadata: RefCell::new(None),
-        };
-        assert_eq!(tool_metadata(&panel), None);
-
-        let exec = ToolPanel {
-            name: "exec".into(),
-            output: "exit=0 duration=0.2s\ntest result: ok. 1 passed".into(),
-            cached_diff: RefCell::new(None),
-            cached_metadata: RefCell::new(None),
-            ..panel
-        };
-        assert_eq!(tool_metadata(&exec).as_deref(), Some("0.2s"));
+        let plain = strip_terminal_sequences(&render_shell(&shell.state.borrow(), 120).join("\n"));
+        assert!(plain.contains("failed"), "{plain:?}");
+        assert!(!plain.contains("The file changed"), "{plain:?}");
+        assert!(!plain.contains("hash=aaa"), "{plain:?}");
+        assert!(!plain.contains("actual=bbb"), "{plain:?}");
     }
 
     #[test]
@@ -11371,8 +10596,8 @@ mod tests {
         assert_ascii_foreground(&active, "read", muted);
         assert_ascii_bold(&active, "read");
         assert_ascii_foreground(&active, "src/lib.rs", muted);
-        assert_ascii_foreground(&active, "live output", muted);
-        assert_ascii_foreground(&active, "live raw evidence", muted);
+        assert!(!active.screen().contents().contains("live output"));
+        assert!(!active.screen().contents().contains("live raw evidence"));
 
         let completed = TranscriptBlock::Tool(Box::new(ToolPanel::new(
             ToolCallId("completed-read".into()),
@@ -11406,7 +10631,7 @@ mod tests {
         let failed = emulate_rows(&failed, 80);
         assert_ascii_foreground(&failed, "read", error);
         assert_ascii_bold(&failed, "read");
-        assert_ascii_foreground(&failed, "permission denied", error);
+        assert!(!failed.screen().contents().contains("permission denied"));
 
         let active_exec_args = serde_json::json!({"command":"echo active"});
         let active_exec = TranscriptBlock::Tool(Box::new(ToolPanel::new(
@@ -11414,7 +10639,7 @@ mod tests {
             "exec".into(),
             active_exec_args.to_string(),
             summarize_tool("exec", &active_exec_args),
-            "streaming output".into(),
+            "private streaming output".into(),
             false,
             false,
             None,
@@ -11423,7 +10648,10 @@ mod tests {
         let active_exec = render_block(None, &active_exec, &theme, &renderer, &renderer, 80, true);
         let active_exec = emulate_rows(&active_exec, 80);
         assert_ascii_foreground(&active_exec, "echo active", muted);
-        assert_ascii_foreground(&active_exec, "streaming output", muted);
+        assert!(!active_exec
+            .screen()
+            .contents()
+            .contains("private streaming output"));
 
         for (command, is_error, expected) in [
             ("echo complete", false, foreground),
@@ -11651,7 +10879,7 @@ mod tests {
     }
 
     #[test]
-    fn active_exec_renders_command_immediately_and_refreshes_bounded_live_tail() {
+    fn active_exec_renders_only_command_and_lifecycle() {
         let mut shell = InteractiveShell::test_shell();
         let run_id = shell.begin_run("openai");
         let id = ToolCallId("live-exec".into());
@@ -11663,47 +10891,28 @@ mod tests {
                 args: serde_json::json!({"command": "long-running-check"}),
             },
         );
-
-        let render = |shell: &InteractiveShell| {
-            strip_terminal_sequences(&render_shell(&shell.state.borrow(), 100).join("\n"))
-        };
-        let started = render(&shell);
-        assert!(started.contains("$ long-running-check"), "{started}");
-
         shell.on_run_event(
             run_id,
             &AgentEvent::ToolProgress {
                 id: id.clone(),
                 progress: ToolProgress::Output {
                     stream: ygg_agent::OutputStream::Stdout,
-                    bytes: bytes::Bytes::from_static(
-                        b"live-1\nlive-2\nlive-3\nlive-4\nlive-5\nlive-6\n",
-                    ),
+                    bytes: bytes::Bytes::from_static(b"private live output"),
                 },
             },
         );
-        let streamed = render(&shell);
-        assert!(streamed.contains("live-6"), "{streamed}");
-        assert!(streamed.contains("1 earlier line"), "{streamed}");
-        assert!(!streamed.contains("  live-1\n"), "{streamed}");
-
         shell.on_run_event(
             run_id,
             &AgentEvent::ToolProgress {
-                id: id.clone(),
-                progress: ToolProgress::Status("waiting for child".into()),
+                id,
+                progress: ToolProgress::Status("private status detail".into()),
             },
         );
-        let status = render(&shell);
-        assert!(status.contains("waiting for child"), "{status}");
-        let state = shell.state.borrow();
-        let TranscriptBlock::Tool(panel) = &state.transcript[0] else {
-            panic!("tool panel expected");
-        };
-        assert!(
-            !panel.finished,
-            "regression must prove pre-finish rendering"
-        );
+        let rendered =
+            strip_terminal_sequences(&render_shell(&shell.state.borrow(), 100).join("\n"));
+        assert!(rendered.contains("$ long-running-check"), "{rendered}");
+        assert!(!rendered.contains("private live output"), "{rendered}");
+        assert!(!rendered.contains("private status detail"), "{rendered}");
     }
 
     #[test]
@@ -11819,8 +11028,8 @@ mod tests {
         }
         let paid = plain_footer(&shell, 100, now);
         assert!(
-            paid.contains("~$0.082"),
-            "turn cost should be visible: {paid:?}"
+            paid.contains("$0.120"),
+            "accumulated session cost should be visible: {paid:?}"
         );
         assert!(
             !paid.contains("session"),
@@ -11905,7 +11114,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_footer_shows_cache_but_keeps_session_cost_in_status() {
+    fn idle_footer_shows_accumulated_session_cost_without_opt_in() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_identity("openai", "gpt-5.6-luna", "high");
         {
@@ -11921,7 +11130,10 @@ mod tests {
         assert!(footer.contains("102/272k"), "{footer:?}");
         assert!(footer.contains("cache 92.4%"), "{footer:?}");
         assert!(!footer.contains("session"), "{footer:?}");
-        assert!(!footer.contains('$'), "no completed turn cost: {footer:?}");
+        assert!(
+            footer.contains("$0.0914"),
+            "accumulated session cost missing: {footer:?}"
+        );
         assert!(!footer.contains('~'), "{footer:?}");
     }
 
@@ -12069,242 +11281,28 @@ mod tests {
     }
 
     #[test]
-    fn shell_tool_rows_wrap_without_exec_labels_or_internal_blank_rows() {
-        let theme = crate::tui::theme::test_theme();
-        let args = serde_json::json!({
-            "command": "cargo test --workspace --all-targets --all-features"
-        });
-        let panel = TranscriptBlock::Tool(Box::new(ToolPanel::new(
-            ToolCallId("exec-wrap".into()),
-            "exec".into(),
-            args.to_string(),
-            summarize_tool("exec", &args),
-            "exit=0 duration=0.2s\ntest result: ok. 12 passed".into(),
-            true,
-            false,
-            None,
-            Some(ModelLab::OpenAi),
-        )));
-        let renderer = theme.rich_renderer();
-        let lines = render_block(None, &panel, &theme, &renderer, &renderer, 32, false)
-            .into_iter()
-            .map(|line| strip_terminal_sequences(&line))
-            .collect::<Vec<_>>();
-        let joined = lines.join("\n");
-
-        assert!(joined.contains("$ cargo test"), "{joined:?}");
-        assert!(joined.contains("0.2s"), "{joined:?}");
-        assert!(!joined.to_ascii_lowercase().contains("exec"), "{joined:?}");
-        assert!(lines.iter().all(|line| !line.is_empty()));
-        assert!(lines.iter().all(|line| visible_width(line) <= 32));
-    }
-
-    #[test]
-    fn compact_exec_rows_show_a_muted_five_line_tail_under_a_bold_command() {
-        let theme = crate::tui::theme::test_theme();
-        let args = serde_json::json!({
-            "command": "ssh host journalctl -k -b",
-            "timeout_ms": 60_000
-        });
-        let output_lines = (1..=9)
-            .map(|line| format!("kernel output {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let panel = ToolPanel::new(
-            ToolCallId("exec-tail".into()),
-            "exec".into(),
-            args.to_string(),
-            summarize_tool("exec", &args),
-            format!(
-                "exit=0 duration=1.0s\nstdout: 9 lines\n{output_lines}\ntruncated_stdout=false"
-            ),
-            true,
-            false,
-            None,
-            Some(ModelLab::OpenAi),
-        );
-
-        let compact = compact_exec_output(&panel);
-        assert_eq!(compact.omitted_lines, 4);
-        assert_eq!(
-            compact.lines,
-            (5..=9)
-                .map(|line| format!("kernel output {line}"))
-                .collect::<Vec<_>>()
-        );
-
-        let renderer = theme.rich_renderer();
-        let rendered = render_block(
-            None,
-            &TranscriptBlock::Tool(Box::new(panel)),
-            &theme,
-            &renderer,
-            &renderer,
-            80,
-            false,
-        );
-        let command = rendered
-            .iter()
-            .find(|line| strip_terminal_sequences(line).contains("ssh host"))
-            .expect("command row");
-        assert!(
-            command.contains("\x1b[1m"),
-            "command should be bold: {command:?}"
-        );
-        let output = rendered
-            .iter()
-            .find(|line| strip_terminal_sequences(line).contains("kernel output 9"))
-            .expect("tail output row");
-        assert!(
-            !output.contains("\x1b[1m"),
-            "output must never inherit bold: {output:?}"
-        );
-        let duration = rendered
-            .iter()
-            .find(|line| strip_terminal_sequences(line).contains("Took 1.0s"))
-            .expect("duration row");
-        assert!(
-            !duration.contains("\x1b[1m"),
-            "duration must remain understated: {duration:?}"
-        );
-        let plain = rendered
-            .iter()
-            .map(|line| strip_terminal_sequences(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            plain.contains("… (4 earlier lines, ctrl+o to expand)"),
-            "{plain}"
-        );
-        assert!(!plain.contains("kernel output 4"), "{plain}");
-        assert!(plain.contains("kernel output 5"), "{plain}");
-        assert!(plain.contains("(timeout 60s)"), "{plain}");
-        assert!(plain.find("kernel output 9") < plain.find("Took 1.0s"));
-    }
-
-    #[test]
-    fn compact_exec_rows_distinguish_capture_loss_from_expandable_ui_elision() {
-        let theme = crate::tui::theme::test_theme();
-        let args = serde_json::json!({"command": "produce-huge-output"});
-        let panel = ToolPanel::new(
-            ToolCallId("exec-capture-truncated".into()),
-            "exec".into(),
-            args.to_string(),
-            summarize_tool("exec", &args),
-            "exit=0 duration=0.8s\nstdout: 4096 bytes, showing first 2 and last 2 lines\nhead one\nhead two\n...\ntail one\ntail two\ntruncated_stdout=head:2 tail:2 omitted_bytes:3000".into(),
-            true,
-            false,
-            None,
-            None,
-        );
-        let compact = compact_exec_output(&panel);
-        assert_eq!(compact.omitted_lines, 0);
-        assert_eq!(
-            compact.lines,
-            ["head one", "head two", "tail one", "tail two"]
-        );
-        assert_eq!(
-            compact.capture_truncations,
-            [ExecCaptureTruncation {
-                stream: "stdout",
-                omitted_bytes: Some(3000),
-            }]
-        );
-
-        let renderer = theme.rich_renderer();
-        let plain = render_block(
-            None,
-            &TranscriptBlock::Tool(Box::new(panel)),
-            &theme,
-            &renderer,
-            &renderer,
-            80,
-            false,
-        )
-        .iter()
-        .map(|line| strip_terminal_sequences(line))
-        .collect::<Vec<_>>()
-        .join("\n");
-        assert!(
-            plain.contains("stdout capture omitted 3000 bytes; unavailable to expand"),
-            "{plain}"
-        );
-        assert!(!plain.contains("ctrl+o"), "nothing UI-hidden: {plain}");
-    }
-
-    #[test]
-    fn compact_exec_hides_current_and_legacy_complete_capture_footers() {
-        let theme = crate::tui::theme::test_theme();
-        let renderer = theme.rich_renderer();
-        for footer in [
-            "complete_stdout=true",
-            "complete_stderr=true",
-            "truncated_stdout=false",
-            "truncated_stderr=false",
-        ] {
-            let args = serde_json::json!({"command": "printf ready"});
-            let panel = ToolPanel::new(
-                ToolCallId(format!("exec-{footer}")),
-                "exec".into(),
-                args.to_string(),
-                summarize_tool("exec", &args),
-                format!("exit=0 duration=0.1s\nstdout: 1 lines\nready\n{footer}"),
-                true,
-                false,
-                None,
-                None,
-            );
-            let compact = compact_exec_output(&panel);
-            assert_eq!(compact.lines, ["ready"], "{footer}");
-            assert!(compact.capture_truncations.is_empty(), "{footer}");
-            let plain = render_block(
-                None,
-                &TranscriptBlock::Tool(Box::new(panel)),
-                &theme,
-                &renderer,
-                &renderer,
-                80,
-                false,
-            )
-            .iter()
-            .map(|line| strip_terminal_sequences(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-            assert!(plain.contains("ready"), "{plain}");
-            assert!(!plain.contains(footer), "{plain}");
-        }
-    }
-
-    #[test]
-    fn ctrl_o_roundtrip_expands_exec_evidence_without_mutating_or_restyling_output() {
+    fn tool_evidence_stays_hidden_after_ctrl_o_and_copy() {
         use ygg_agent::ToolOutput;
-
         let mut shell = InteractiveShell::test_shell();
         let run_id = shell.begin_run("local");
         let id = ToolCallId("exec-roundtrip".into());
+        let secret = "exit=0 duration=0.1s\nprivate result line";
         shell.on_run_event(
             run_id,
             &AgentEvent::ToolStarted {
                 id: id.clone(),
                 name: "exec".into(),
-                args: serde_json::json!({"command": "printf '\\033[31mline\\033[0m\\n'"}),
+                args: serde_json::json!({"command": "printf private"}),
             },
         );
-        let body = (1..=8)
-            .map(|line| format!("\x1b[31mresult {line}\x1b[0m"))
-            .collect::<Vec<_>>()
-            .join("\n");
         shell.on_run_event(
             run_id,
             &AgentEvent::ToolFinished {
                 id: id.clone(),
-                result: Ok(ToolOutput::new(format!(
-                    "exit=0 duration=0.1s\nstdout: 8 lines\n{body}\ntruncated_stdout=false"
-                ))),
+                result: Ok(ToolOutput::new(secret)),
             },
         );
-        let evidence = shell.debug_tool_output(&id).expect("stored evidence");
-        let plain_transcript = |shell: &InteractiveShell| {
+        let transcript = |shell: &InteractiveShell| {
             shell
                 .state
                 .borrow()
@@ -12314,59 +11312,21 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-
-        let collapsed = plain_transcript(&shell);
-        assert!(!collapsed.contains("result 1"), "{collapsed}");
-        assert!(collapsed.contains("result 8"), "{collapsed}");
-        assert!(
-            collapsed
-                .lines()
-                .filter(|line| line.contains("result"))
-                .all(|line| !line.contains("[31m")),
-            "output ANSI leaked: {collapsed}"
-        );
-
+        assert!(transcript(&shell).contains("$ printf private"));
+        assert!(!transcript(&shell).contains("private result line"));
+        assert_eq!(shell.debug_tool_output(&id).as_deref(), Some(secret));
         shell.expand_focused_tool();
-        let expanded = plain_transcript(&shell);
-        assert!(expanded.contains("result 1"), "{expanded}");
-        assert_eq!(
-            shell.debug_tool_output(&id).as_deref(),
-            Some(evidence.as_str())
-        );
-
-        shell.expand_focused_tool();
-        let collapsed_again = plain_transcript(&shell);
-        assert!(!collapsed_again.contains("result 1"), "{collapsed_again}");
-        assert!(collapsed_again.contains("result 8"), "{collapsed_again}");
-        assert_eq!(
-            shell.debug_tool_output(&id).as_deref(),
-            Some(evidence.as_str())
-        );
-        assert_eq!(
-            block_copy_text(&shell.state.borrow().transcript[0]),
-            format!("$ printf '\\033[31mline\\033[0m\\n'\n{evidence}")
-        );
+        assert!(!transcript(&shell).contains("private result line"));
+        let state = shell.state.borrow();
+        let index = *state.tool_panels.get(&id).expect("tool panel index");
+        assert!(!block_copy_text(&state.transcript[index]).contains("private result line"));
     }
 
     #[test]
-    fn extension_tool_renderer_is_live_semantic_presentation_not_evidence() {
+    fn extension_tool_renderer_stays_internal_to_the_tool_record() {
         use ygg_agent::extension_process::ToolRenderSegment;
         use ygg_agent::ToolOutput;
-
-        let red_theme = crate::tui::theme::test_theme_from_source(
-            r##"
-                [metadata]
-                name = "Renderer red"
-
-                [roles."extension.test.label"]
-                foreground = "#ff0000"
-                bold = true
-
-                [roles."extension.test.value"]
-                foreground = "#00aa00"
-            "##,
-        );
-        let mut shell = InteractiveShell::test_shell_with_theme(red_theme);
+        let mut shell = InteractiveShell::test_shell();
         let run_id = shell.begin_run("local");
         let id = ToolCallId("extension-render".into());
         shell.on_run_event(
@@ -12381,249 +11341,33 @@ mod tests {
             run_id,
             &AgentEvent::ToolFinished {
                 id: id.clone(),
-                result: Ok(ToolOutput::new("RAW EVIDENCE\nsecond raw line")),
-            },
-        );
-
-        let evidence_before = shell.debug_tool_output(&id).expect("stored evidence");
-        let copy_before = {
-            let state = shell.state.borrow();
-            let index = *state.tool_panels.get(&id).expect("tool panel index");
-            block_copy_text(&state.transcript[index])
-        };
-        shell.apply_extension_tool_renderer(
-            &id,
-            &[
-                ToolRenderSegment {
-                    text: "\x1b[31mbranch:\x1b[0m ".into(),
-                    style_role: Some("extension.test.label\x1b[31m".into()),
-                },
-                ToolRenderSegment {
-                    text: "main\n".into(),
-                    style_role: Some("extension.test.value".into()),
-                },
-                ToolRenderSegment {
-                    text: "clean\x07".into(),
-                    style_role: Some("extension bad".into()),
-                },
-            ],
-        );
-
-        let stored_before = {
-            let state = shell.state.borrow();
-            let index = *state.tool_panels.get(&id).expect("tool panel index");
-            let TranscriptBlock::Tool(panel) = &state.transcript[index] else {
-                panic!("tool panel index should resolve to a tool")
-            };
-            assert_eq!(panel.output, evidence_before);
-            assert!(!panel.extension_render_segments.is_empty());
-            assert!(panel
-                .extension_render_segments
-                .iter()
-                .all(|segment| !segment.text.contains('\x1b')));
-            assert!(panel
-                .extension_render_segments
-                .iter()
-                .filter_map(|segment| segment.style_role.as_deref())
-                .all(|role| !role.contains('\x1b')));
-            panel.extension_render_segments.clone()
-        };
-        let rendered_transcript = |shell: &InteractiveShell| {
-            shell
-                .state
-                .borrow()
-                .rendered_transcript(100)
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-
-        let collapsed = rendered_transcript(&shell);
-        let collapsed_plain = strip_terminal_sequences(&collapsed);
-        assert!(
-            collapsed_plain.contains("branch: main"),
-            "{collapsed_plain}"
-        );
-        assert!(collapsed_plain.contains("clean␇"), "{collapsed_plain}");
-        assert!(
-            !collapsed_plain.contains("RAW EVIDENCE"),
-            "{collapsed_plain}"
-        );
-        let branch_line = collapsed
-            .lines()
-            .find(|line| strip_terminal_sequences(line).contains("branch:"))
-            .expect("semantic renderer row");
-        assert!(
-            branch_line.contains("\x1b[38;2;255;0;0m"),
-            "{branch_line:?}"
-        );
-        let branch = collapsed_plain.find("branch: main").unwrap();
-        let clean = collapsed_plain.find("clean␇").unwrap();
-        assert!(
-            collapsed_plain[branch..clean].contains('\n'),
-            "explicit segment newline was lost: {collapsed_plain:?}"
-        );
-
-        shell.expand_focused_tool();
-        let expanded = strip_terminal_sequences(&rendered_transcript(&shell));
-        assert!(expanded.contains("branch: main"), "{expanded}");
-        assert!(expanded.contains("RAW EVIDENCE"), "{expanded}");
-        assert_eq!(
-            shell.debug_tool_output(&id).as_deref(),
-            Some(evidence_before.as_str())
-        );
-
-        shell.expand_focused_tool();
-        let blue_theme = crate::tui::theme::test_theme_from_source(
-            r##"
-                [metadata]
-                name = "Renderer blue"
-
-                [roles."extension.test.label"]
-                foreground = "#0000ff"
-                bold = true
-
-                [roles."extension.test.value"]
-                foreground = "#00aa00"
-            "##,
-        );
-        shell.set_theme(blue_theme);
-        let restyled = rendered_transcript(&shell);
-        let branch_line = restyled
-            .lines()
-            .find(|line| strip_terminal_sequences(line).contains("branch:"))
-            .expect("restyled semantic renderer row");
-        assert!(
-            branch_line.contains("\x1b[38;2;0;0;255m"),
-            "{branch_line:?}"
-        );
-        assert!(
-            !branch_line.contains("\x1b[38;2;255;0;0m"),
-            "{branch_line:?}"
-        );
-
-        let state = shell.state.borrow();
-        let index = *state.tool_panels.get(&id).expect("tool panel index");
-        let TranscriptBlock::Tool(panel) = &state.transcript[index] else {
-            panic!("tool panel index should resolve to a tool")
-        };
-        assert_eq!(panel.output, evidence_before);
-        assert_eq!(panel.extension_render_segments, stored_before);
-        assert_eq!(block_copy_text(&state.transcript[index]), copy_before);
-    }
-
-    #[test]
-    fn extension_tool_renderer_degrades_to_plain_text_without_color() {
-        use ygg_agent::extension_process::ToolRenderSegment;
-        use ygg_agent::ToolOutput;
-
-        let capabilities = crate::tui::terminal::TerminalCapabilities::test(
-            false,
-            false,
-            crate::tui::terminal::ColorDepth::None,
-        );
-        let theme = crate::tui::theme::test_theme_source_with(
-            r##"
-                [metadata]
-                name = "Renderer plain"
-
-                [roles."extension.test"]
-                foreground = "#ff0000"
-                bold = true
-            "##,
-            capabilities,
-            crate::tui::theme::TerminalBackground::Unknown,
-        );
-        let mut shell = InteractiveShell::test_shell_with_theme(theme);
-        let run_id = shell.begin_run("local");
-        let id = ToolCallId("extension-render-plain".into());
-        shell.on_run_event(
-            run_id,
-            &AgentEvent::ToolStarted {
-                id: id.clone(),
-                name: "custom_tool".into(),
-                args: serde_json::json!({}),
-            },
-        );
-        shell.on_run_event(
-            run_id,
-            &AgentEvent::ToolFinished {
-                id: id.clone(),
-                result: Ok(ToolOutput::new("private raw evidence")),
+                result: Ok(ToolOutput::new("RAW EVIDENCE")),
             },
         );
         shell.apply_extension_tool_renderer(
             &id,
             &[ToolRenderSegment {
-                text: "semantic summary".into(),
-                style_role: Some("extension.test".into()),
+                text: "branch: main".into(),
+                style_role: Some("extension.test.label".into()),
             }],
         );
-
-        let render = |shell: &InteractiveShell| {
-            shell
-                .state
-                .borrow()
-                .rendered_transcript(80)
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
+        let rendered = shell
+            .state
+            .borrow()
+            .rendered_transcript(100)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("RAW EVIDENCE"), "{rendered}");
+        assert!(!rendered.contains("branch: main"), "{rendered}");
+        let state = shell.state.borrow();
+        let index = *state.tool_panels.get(&id).expect("tool panel index");
+        let TranscriptBlock::Tool(panel) = &state.transcript[index] else {
+            panic!("tool panel")
         };
-        let collapsed = render(&shell);
-        assert!(!collapsed.contains('\x1b'), "{collapsed:?}");
-        assert!(collapsed.contains("semantic summary"), "{collapsed}");
-        assert!(!collapsed.contains("private raw evidence"), "{collapsed}");
-
-        shell.expand_focused_tool();
-        let expanded = render(&shell);
-        assert!(!expanded.contains('\x1b'), "{expanded:?}");
-        assert!(expanded.contains("semantic summary"), "{expanded}");
-        assert!(expanded.contains("private raw evidence"), "{expanded}");
-        assert_eq!(
-            shell.debug_tool_output(&id).as_deref(),
-            Some("private raw evidence")
-        );
-    }
-
-    #[test]
-    fn compact_exec_empty_and_single_line_outputs_degrade_cleanly_without_color() {
-        let capabilities = crate::tui::terminal::TerminalCapabilities::test(
-            false,
-            false,
-            crate::tui::terminal::ColorDepth::None,
-        );
-        let theme = crate::tui::theme::test_theme_with(capabilities);
-        let renderer = theme.rich_renderer();
-        for (output, expected) in [
-            ("exit=0 duration=0.2s\n(no output)", None),
-            (
-                "exit=0 duration=0.2s\nstdout: 1 lines\n1827 /tmp/timeline.txt\ntruncated_stdout=false",
-                Some("1827 /tmp/timeline.txt"),
-            ),
-        ] {
-            let args = serde_json::json!({"command": "wc -l /tmp/timeline.txt"});
-            let block = TranscriptBlock::Tool(Box::new(ToolPanel::new(
-                ToolCallId(format!("plain-{expected:?}")),
-                "exec".into(),
-                args.to_string(),
-                summarize_tool("exec", &args),
-                output.into(),
-                true,
-                false,
-                None,
-                None,
-            )));
-            let lines = render_block(None, &block, &theme, &renderer, &renderer, 28, false);
-            assert!(lines.iter().all(|line| !line.contains('\x1b')));
-            assert!(lines.iter().all(|line| visible_width(line) <= 28));
-            let joined = lines.join("\n");
-            match expected {
-                Some(expected) => assert!(joined.contains(expected), "{joined}"),
-                None => assert!(!joined.contains("no output"), "{joined}"),
-            }
-        }
+        assert_eq!(panel.output, "RAW EVIDENCE");
+        assert_eq!(panel.extension_render_segments[0].text, "branch: main");
     }
 
     #[test]

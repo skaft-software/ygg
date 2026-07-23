@@ -906,24 +906,16 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
     } else {
         state.price_display
     };
-    let cost = if !state.show_turn_cost {
-        None
+    // This is the durable session total, not the cost accumulated by the
+    // current autonomous run. Session spend remains meaningful when the
+    // selected model changes, so it must not depend on turn telemetry ownership.
+    let cost = if let Some(cost) = state.session_cost_microdollars {
+        Some(format_microdollars(cost))
     } else {
         match price_display {
-            crate::presentation::PriceDisplay::Unknown => None,
             crate::presentation::PriceDisplay::ExplicitZero => Some("$0".to_owned()),
-            crate::presentation::PriceDisplay::Priced
-                if show_turn_telemetry
-                    && state.run_cost_available
-                    && state.run_cost_microdollars > 0 =>
-            {
-                Some(format!(
-                    "{}{}",
-                    if active { "~" } else { "" },
-                    format_microdollars(state.run_cost_microdollars)
-                ))
-            }
-            crate::presentation::PriceDisplay::Priced => None,
+            crate::presentation::PriceDisplay::Unknown
+            | crate::presentation::PriceDisplay::Priced => None,
         }
     };
     if let Some(cost) = cost {
