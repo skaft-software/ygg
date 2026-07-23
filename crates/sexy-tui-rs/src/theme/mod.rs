@@ -162,7 +162,7 @@ impl Theme {
         let mut attributes = TextAttributes::default();
         match role {
             TextRole::Heading | TextRole::Strong | TextRole::DiffHeader => attributes.bold = true,
-            TextRole::Muted | TextRole::Subtle | TextRole::SyntaxComment => attributes.dim = true,
+            TextRole::Muted | TextRole::Subtle => attributes.dim = true,
             TextRole::Emphasis | TextRole::Quote => attributes.italic = true,
             TextRole::Link => attributes.underline = true,
             _ => {}

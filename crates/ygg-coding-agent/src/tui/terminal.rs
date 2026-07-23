@@ -1,8 +1,11 @@
 #![allow(missing_docs)]
 
 use std::io::{IsTerminal, Stdout, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{cursor, event, execute, queue, terminal};
@@ -289,6 +292,120 @@ fn keyboard_enhancement_flags() -> event::KeyboardEnhancementFlags {
 // terminal in one flush rather than dozens of tiny writes.
 const SYNC_OUTPUT_BEGIN: &str = "\x1b[?2026h";
 const SYNC_OUTPUT_END: &str = "\x1b[?2026l";
+const OSC11_BACKGROUND_QUERY: &str = "\x1b]11;?\x1b\\";
+
+fn parse_osc11_background_from_buffer(
+    buffer: &str,
+) -> Option<sexy_tui_rs::terminal_colors::RgbColor> {
+    for (start, _) in buffer.match_indices("\x1b]11;") {
+        let tail = &buffer[start..];
+        if let Some(end) = tail.find('\x07') {
+            if let Some(color) =
+                sexy_tui_rs::terminal_colors::parse_osc11_background_color(&tail[..=end])
+            {
+                return Some(color);
+            }
+        }
+        if let Some(end) = tail.find("\x1b\\") {
+            if let Some(color) =
+                sexy_tui_rs::terminal_colors::parse_osc11_background_color(&tail[..end + 2])
+            {
+                return Some(color);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn append_event_text(buffer: &mut String, terminal_event: event::Event) {
+    match terminal_event {
+        event::Event::Key(key) => match key.code {
+            event::KeyCode::Char(character) => buffer.push(character),
+            event::KeyCode::Esc => buffer.push('\x1b'),
+            _ => {}
+        },
+        event::Event::Paste(text) => buffer.push_str(&text),
+        _ => {}
+    }
+}
+
+#[cfg(unix)]
+fn read_osc11_response(timeout: Duration) -> Option<sexy_tui_rs::terminal_colors::RgbColor> {
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    let deadline = Instant::now() + timeout;
+    let mut buffer = String::with_capacity(128);
+    loop {
+        if let Some(color) = parse_osc11_background_from_buffer(&buffer) {
+            return Some(color);
+        }
+        let now = Instant::now();
+        if now >= deadline || buffer.len() > 512 {
+            return None;
+        }
+        let remaining_ms = deadline
+            .saturating_duration_since(now)
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
+        let mut fds = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `fds` points to one valid pollfd and lives for the call.
+        let ready = unsafe { libc::poll(&mut fds, 1, remaining_ms) };
+        if ready <= 0 || (fds.revents & libc::POLLIN) == 0 {
+            return None;
+        }
+        let mut chunk = [0u8; 128];
+        // SAFETY: `chunk` is a valid writable byte buffer and `fd` is stdin.
+        let read = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if read <= 0 {
+            return None;
+        }
+        buffer.push_str(&String::from_utf8_lossy(&chunk[..read as usize]));
+    }
+}
+
+#[cfg(not(unix))]
+fn read_osc11_response(timeout: Duration) -> Option<sexy_tui_rs::terminal_colors::RgbColor> {
+    let deadline = Instant::now() + timeout;
+    let mut buffer = String::with_capacity(128);
+    loop {
+        if let Some(color) = parse_osc11_background_from_buffer(&buffer) {
+            return Some(color);
+        }
+        let now = Instant::now();
+        if now >= deadline || buffer.len() > 512 {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        if !event::poll(remaining).ok()? {
+            return None;
+        }
+        append_event_text(&mut buffer, event::read().ok()?);
+    }
+}
+
+/// Query the terminal's default background via OSC 11 while raw mode is active.
+/// This is intentionally a best-effort startup probe: environment/config wins,
+/// unsupported terminals are ignored, and a timeout falls back to Unknown.
+pub(crate) fn query_terminal_background_color(timeout: Duration) -> Option<(u8, u8, u8)> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return None;
+    }
+    if !terminal::is_raw_mode_enabled().ok()? {
+        return None;
+    }
+
+    let mut out = std::io::stdout();
+    write!(out, "{OSC11_BACKGROUND_QUERY}").ok()?;
+    out.flush().ok()?;
+
+    let color = read_osc11_response(timeout)?;
+    Some((color.r, color.g, color.b))
+}
 
 fn normalize_line_endings(data: &str, last_was_cr: &mut bool) -> String {
     let mut normalized = String::with_capacity(data.len().saturating_add(8));
@@ -677,6 +794,17 @@ mod tests {
             no_color: false,
             explicit_plain: false,
         }
+    }
+
+    #[test]
+    fn osc11_background_response_can_be_extracted_from_input_noise() {
+        let color = parse_osc11_background_from_buffer("abc\x1b]11;rgb:12/34/56\x1b\\def")
+            .expect("OSC 11 response should parse");
+        assert_eq!((color.r, color.g, color.b), (18, 52, 86));
+
+        let color = parse_osc11_background_from_buffer("\x1b]11;#f0f0f0\x07")
+            .expect("BEL-terminated OSC 11 response should parse");
+        assert_eq!((color.r, color.g, color.b), (240, 240, 240));
     }
 
     #[test]

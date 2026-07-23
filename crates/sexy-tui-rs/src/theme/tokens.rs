@@ -32,6 +32,8 @@ pub fn apply_defaults(values: &mut HashMap<String, String>) {
         ("tool_error_bg", "default"),
         ("diff_added", "#00b847"),
         ("diff_removed", "#c74747"),
+        ("diff_added_marker", "#087a45"),
+        ("diff_removed_marker", "#b4233a"),
         // Surfaces are opt-in. Foreground-only diffs remain readable on both
         // light and dark terminal profiles without knowing their background.
         ("diff_added_bg", "default"),

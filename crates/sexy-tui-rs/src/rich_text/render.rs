@@ -1325,39 +1325,63 @@ impl RichRenderer {
         language: Option<&str>,
         diff_style: TextStyle,
     ) -> Option<Vec<RichRun>> {
-        if !self.options.syntax_highlighting
-            || !matches!(
-                kind,
-                DiffLineKind::Context | DiffLineKind::Addition | DiffLineKind::Removal
-            )
-        {
+        if !matches!(
+            kind,
+            DiffLineKind::Context | DiffLineKind::Addition | DiffLineKind::Removal
+        ) {
             return None;
         }
-        let language = language?;
         let (marker, source) = match kind {
             DiffLineKind::Addition => ("+", text.strip_prefix('+').unwrap_or(text)),
             DiffLineKind::Removal => ("-", text.strip_prefix('-').unwrap_or(text)),
-            DiffLineKind::Context => (" ", text.strip_prefix(' ').unwrap_or(text)),
+            DiffLineKind::Context if text.starts_with(' ') => {
+                (" ", text.strip_prefix(' ').unwrap_or(text))
+            }
+            DiffLineKind::Context => ("", text),
             _ => return None,
         };
 
-        #[cfg(feature = "syntax-highlighting")]
-        {
-            let highlighted = super::highlight::highlight(source, language)?;
-            let mut runs = vec![RichRun::new(marker.to_owned(), diff_style, None)];
-            for region in highlighted.into_iter().flatten() {
-                let token_style = region
-                    .role
-                    .map_or(diff_style, |role| diff_style.merge(self.theme.style(role)));
-                runs.push(RichRun::new(region.text, token_style, None));
-            }
-            Some(runs)
-        }
+        let mut runs = vec![RichRun::new(
+            marker.to_owned(),
+            self.diff_marker_style(kind, diff_style),
+            None,
+        )];
         #[cfg(not(feature = "syntax-highlighting"))]
-        {
-            let _ = (marker, source, language, diff_style);
-            None
+        let _ = language;
+
+        #[cfg(feature = "syntax-highlighting")]
+        if self.options.syntax_highlighting {
+            if let Some(language) = language {
+                if let Some(highlighted) = super::highlight::highlight(source, language) {
+                    for region in highlighted.into_iter().flatten() {
+                        let token_style = region
+                            .role
+                            .map_or(diff_style, |role| diff_style.merge(self.theme.style(role)));
+                        runs.push(RichRun::new(region.text, token_style, None));
+                    }
+                    return Some(runs);
+                }
+            }
         }
+
+        runs.push(RichRun::new(source.to_owned(), diff_style, None));
+        Some(runs)
+    }
+
+    fn diff_marker_style(&self, kind: DiffLineKind, mut style: TextStyle) -> TextStyle {
+        let token = match kind {
+            DiffLineKind::Addition => "diff_added_marker",
+            DiffLineKind::Removal => "diff_removed_marker",
+            _ => return style,
+        };
+        if let Some(color) = self
+            .theme
+            .resolve_color(token)
+            .filter(|color| *color != Color::Default)
+        {
+            style.foreground = color;
+        }
+        style
     }
 
     /// Code wrapping is deliberately literal: unlike prose wrapping it never
@@ -1934,6 +1958,7 @@ mod tests {
         let capabilities = TerminalCapabilities::interactive(ColorDepth::TrueColor, true);
         let mut theme = Theme::with_capabilities(capabilities);
         theme.override_token("diff_added", "#04aa05");
+        theme.override_token("diff_added_marker", "#04aa05");
         theme.override_token("syntax_keyword", "#010203");
         theme.override_token("syntax_string", "#060708");
         let renderer = RichRenderer::new(theme, capabilities, RenderOptions::default());

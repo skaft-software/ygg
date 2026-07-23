@@ -447,6 +447,11 @@ impl YggTheme {
             .resolve(narrow)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn background(&self) -> TerminalBackground {
+        self.background
+    }
+
     /// Return a theme glyph with deterministic ASCII fallback. Theme files can
     /// change semantic marks, but cannot force Unicode into a conservative
     /// terminal profile.
@@ -1046,8 +1051,9 @@ const UNIVERSAL_TARGET_LUMINANCE: f64 = 0.179;
 // Tokens that receive terminal-background-aware luminance balancing.
 // These are semantic UI signals (errors, warnings, model accent) whose
 // source colours may be unreadable on dark or light terminals without
-// adjustment.  Everything else (diffs, syntax, Markdown chrome) is used
-// verbatim so the user gets the exact hex value they set.
+// adjustment.  The compiled default and bundled themes additionally receive
+// the standard technical code/diff palette below; user file themes keep their
+// configured code colours unless they opt into their own role overrides.
 const BALANCED_FOREGROUNDS: &[(&str, &str)] = &[
     ("muted", "#777777"),
     ("dim", "#777777"),
@@ -1098,11 +1104,67 @@ const VERBATIM_FOREGROUNDS: &[(&str, &str)] = &[
 
 /// Subtle terminal-background-aware surfaces. These retain their semantic hue
 /// without replacing syntax foregrounds or looking like terminal selection.
-const DEFAULT_BACKGROUNDS: &[(&str, &str)] = &[
-    ("diff_added_bg", "#4f8f68"),
-    ("diff_removed_bg", "#ad6868"),
-    ("user_msg_bg", DEFAULT_ACCENT),
+const DEFAULT_BACKGROUNDS: &[(&str, &str)] = &[("user_msg_bg", DEFAULT_ACCENT)];
+
+// Standard technical palette for code and diffs. Bundled themes may keep their
+// distinctive chrome, but source code needs one predictable language-neutral
+// grammar: syntax owns foregrounds, diff owns quiet row surfaces, and the +/-
+// marker carries the high-salience add/remove hue.
+const STANDARD_SYNTAX_COLORS: &[(&str, &str, &str)] = &[
+    ("syntax_comment", "#9da8b5", "#505c68"),
+    ("syntax_keyword", "#f29e74", "#813d00"),
+    ("syntax_type", "#76c7c0", "#005c5e"),
+    ("syntax_function", "#a8c7fa", "#2456a6"),
+    ("syntax_variable", "#d6dee8", "#1f2933"),
+    ("syntax_string", "#a8d279", "#335e00"),
+    ("syntax_number", "#d6a6e8", "#7d3c98"),
+    ("syntax_operator", "#aab4c0", "#4d5966"),
+    ("syntax_punctuation", "#aab4c0", "#4d5966"),
+    ("diff_hunk", "#8ab4f8", "#355f9e"),
 ];
+
+const STANDARD_DIFF_COLORS: &[(&str, &str, &str)] = &[
+    ("diff_added_marker", "#67d391", "#087a45"),
+    ("diff_removed_marker", "#ff7d8a", "#b4233a"),
+];
+
+const STANDARD_DIFF_SURFACES: &[(&str, &str, &str)] = &[
+    ("diff_added_bg", "#10261e", "#e8f6ee"),
+    ("diff_removed_bg", "#2a171b", "#fcebed"),
+];
+
+fn standard_foreground(dark: &str, light: &str, background: TerminalBackground) -> String {
+    match background {
+        TerminalBackground::Dark => dark.to_owned(),
+        TerminalBackground::Light => light.to_owned(),
+        TerminalBackground::Unknown => balance_foreground(light, TerminalBackground::Unknown),
+    }
+}
+
+fn standard_surface(dark: &str, light: &str, background: TerminalBackground) -> String {
+    match background {
+        TerminalBackground::Dark => dark.to_owned(),
+        TerminalBackground::Light => light.to_owned(),
+        // Unknown terminal backgrounds cannot safely receive absolute RGB row
+        // surfaces. Preserve diff semantics through +/- text and marker colour.
+        TerminalBackground::Unknown => "default".to_owned(),
+    }
+}
+
+fn apply_standard_technical_palette(theme: &mut YggTheme, background: TerminalBackground) {
+    theme.override_token("diff_added", "default");
+    theme.override_token("diff_removed", "default");
+    theme.override_token("diff_context", "default");
+    for &(token, dark, light) in STANDARD_SYNTAX_COLORS {
+        theme.override_token(token, &standard_foreground(dark, light, background));
+    }
+    for &(token, dark, light) in STANDARD_DIFF_COLORS {
+        theme.override_token(token, &standard_foreground(dark, light, background));
+    }
+    for &(token, dark, light) in STANDARD_DIFF_SURFACES {
+        theme.override_token(token, &standard_surface(dark, light, background));
+    }
+}
 
 fn parse_hex_color(value: &str) -> Option<Rgb> {
     let hex = value.strip_prefix('#')?;
@@ -1275,6 +1337,18 @@ fn background_from_override(value: &str) -> Option<TerminalBackground> {
     }
 }
 
+pub(crate) fn background_from_terminal_rgb(red: u8, green: u8, blue: u8) -> TerminalBackground {
+    let background = Rgb { red, green, blue };
+    let luminance = relative_luminance(background);
+    let contrast_with_black = (luminance + 0.05) / 0.05;
+    let contrast_with_white = 1.05 / (luminance + 0.05);
+    if contrast_with_black >= contrast_with_white {
+        TerminalBackground::Light
+    } else {
+        TerminalBackground::Dark
+    }
+}
+
 fn terminal_background() -> TerminalBackground {
     std::env::var("YGG_COLOR_SCHEME")
         .ok()
@@ -1330,6 +1404,7 @@ fn default_theme_for(
     theme.override_token("md_code_bg", "default");
     theme.override_token("md_code_inline_bg", "default");
     apply_required_surfaces(&mut theme, background);
+    apply_standard_technical_palette(&mut theme, background);
     // There is no model before the startup picker. Use Ygg green until the
     // selected model's lab is known.
     let neutral_model_accent = balance_foreground(DEFAULT_ACCENT, background);
@@ -1577,6 +1652,9 @@ fn build_parsed_theme(
         theme.override_token(token, &value);
     }
     apply_required_surfaces(&mut theme, background);
+    if matches!(source, ThemeSource::Bundled(_)) {
+        apply_standard_technical_palette(&mut theme, background);
+    }
     for (name, style) in &parsed.roles {
         apply_role_style(&mut theme, name, style, adaptive)?;
     }
@@ -1656,14 +1734,11 @@ pub fn load_theme_path(path: &Path, config: &Config) -> anyhow::Result<YggTheme>
     )
 }
 
-/// Compile text already read by the shared resource resolver. This keeps
-/// secure descriptor traversal, trust, diagnostics, and precedence in the
-/// shared layer while retaining the resolved path for inspectability/reload.
-#[allow(dead_code)]
-pub fn load_resolved_theme(
+fn load_resolved_theme_for(
     path: &Path,
     source_text: &str,
-    config: &Config,
+    capabilities: TerminalCapabilities,
+    background: TerminalBackground,
 ) -> anyhow::Result<YggTheme> {
     let fallback_name = path
         .file_stem()
@@ -1674,6 +1749,23 @@ pub fn load_resolved_theme(
         &path.display().to_string(),
         ThemeSource::File(path.to_owned()),
         fallback_name,
+        capabilities,
+        background,
+    )
+}
+
+/// Compile text already read by the shared resource resolver. This keeps
+/// secure descriptor traversal, trust, diagnostics, and precedence in the
+/// shared layer while retaining the resolved path for inspectability/reload.
+#[allow(dead_code)]
+pub fn load_resolved_theme(
+    path: &Path,
+    source_text: &str,
+    config: &Config,
+) -> anyhow::Result<YggTheme> {
+    load_resolved_theme_for(
+        path,
+        source_text,
         TerminalCapabilities::detect(config.color, config.plain),
         terminal_background(),
     )
@@ -1701,9 +1793,12 @@ pub fn bundled_theme_summaries() -> Vec<ThemeSummary> {
 }
 
 /// Load a named theme or return an error without altering the current theme.
-pub fn load_named_theme(name: &str, config: &Config) -> anyhow::Result<YggTheme> {
+pub(crate) fn load_named_theme_for_background(
+    name: &str,
+    config: &Config,
+    background: TerminalBackground,
+) -> anyhow::Result<YggTheme> {
     let capabilities = TerminalCapabilities::detect(config.color, config.plain);
-    let background = terminal_background();
     if name.trim().eq_ignore_ascii_case(DEFAULT_THEME_NAME) {
         return Ok(default_theme_for(background, capabilities));
     }
@@ -1714,25 +1809,41 @@ pub fn load_named_theme(name: &str, config: &Config) -> anyhow::Result<YggTheme>
     let snapshot = resolver.discover(ResourceKind::Theme, &config.theme_paths);
     if let Some(resource) = snapshot.get(resource_name) {
         let source = resolver.read_text(resource)?;
-        return load_resolved_theme(&resource.path, &source, config);
+        return load_resolved_theme_for(&resource.path, &source, capabilities, background);
     }
     load_bundled_theme_for(name, capabilities, background)
+}
+
+/// Load a named theme or return an error without altering the current theme.
+#[allow(dead_code)]
+pub fn load_named_theme(name: &str, config: &Config) -> anyhow::Result<YggTheme> {
+    load_named_theme_for_background(name, config, terminal_background())
+}
+
+/// Load the startup theme for an already-detected terminal background. Missing
+/// or malformed files intentionally fall back to Ygg's default token set instead
+/// of affecting launch/print mode.
+pub(crate) fn load_theme_for_background(
+    config: &Config,
+    background: TerminalBackground,
+) -> YggTheme {
+    match config
+        .theme
+        .as_deref()
+        .map(|name| load_named_theme_for_background(name, config, background))
+    {
+        Some(Ok(theme)) => theme,
+        _ => default_theme_for(
+            background,
+            TerminalCapabilities::detect(config.color, config.plain),
+        ),
+    }
 }
 
 /// Load the startup theme. Missing or malformed files intentionally fall back
 /// to Ygg's default token set instead of affecting launch/print mode.
 pub fn load_theme(config: &Config) -> YggTheme {
-    match config
-        .theme
-        .as_deref()
-        .map(|name| load_named_theme(name, config))
-    {
-        Some(Ok(theme)) => theme,
-        _ => default_theme_for(
-            terminal_background(),
-            TerminalCapabilities::detect(config.color, config.plain),
-        ),
-    }
+    load_theme_for_background(config, terminal_background())
 }
 
 #[cfg(test)]
@@ -2122,25 +2233,10 @@ mod tests {
                         assert!(contrast(accent, black) >= 4.5, "{} black", bundled.id);
                         assert!(contrast(accent, white) >= 4.5, "{} white", bundled.id);
                         for token in ["diff_added_bg", "diff_removed_bg"] {
-                            let value = theme
-                                .resolve::<String>(token)
-                                .expect("unknown-profile diff surface");
-                            let color = parse_hex_color(&value)
-                                .unwrap_or_else(|| panic!("{} {token}: {value}", bundled.id));
-                            assert!(
-                                (relative_luminance(color) - UNIVERSAL_TARGET_LUMINANCE).abs()
-                                    < 0.01,
-                                "{} {token} was {value}",
-                                bundled.id
-                            );
-                            assert!(
-                                contrast(color, black) >= 4.5,
-                                "{} {token} black",
-                                bundled.id
-                            );
-                            assert!(
-                                contrast(color, white) >= 4.5,
-                                "{} {token} white",
+                            assert_eq!(
+                                theme.resolve::<String>(token).as_deref(),
+                                Some("default"),
+                                "{} {token} should not paint unknown terminal backgrounds",
                                 bundled.id
                             );
                         }
@@ -2437,12 +2533,11 @@ mod tests {
     }
 
     #[test]
-    fn diff_rows_use_subtle_background_surfaces_and_normal_foregrounds() {
+    fn diff_rows_use_standard_background_surfaces_and_normal_foregrounds() {
         let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
-        for (background, target) in [
-            (TerminalBackground::Dark, 0.025),
-            (TerminalBackground::Light, 0.95),
-            (TerminalBackground::Unknown, UNIVERSAL_TARGET_LUMINANCE),
+        for (background, expected_add, expected_remove) in [
+            (TerminalBackground::Dark, "#10261e", "#2a171b"),
+            (TerminalBackground::Light, "#e8f6ee", "#fcebed"),
         ] {
             let theme = default_theme_for(background, capabilities);
             assert_eq!(
@@ -2453,14 +2548,92 @@ mod tests {
                 theme.resolve::<String>("diff_removed").as_deref(),
                 Some("default")
             );
-            for token in ["diff_added_bg", "diff_removed_bg"] {
-                let value = theme.resolve::<String>(token).expect("diff surface token");
-                let color = parse_hex_color(&value).expect("balanced RGB surface");
-                assert!(
-                    (relative_luminance(color) - target).abs() < 0.01,
-                    "{background:?} {token} was {value}"
-                );
+            assert_eq!(
+                theme.resolve::<String>("diff_added_bg").as_deref(),
+                Some(expected_add)
+            );
+            assert_eq!(
+                theme.resolve::<String>("diff_removed_bg").as_deref(),
+                Some(expected_remove)
+            );
+        }
+
+        let unknown = default_theme_for(TerminalBackground::Unknown, capabilities);
+        assert_eq!(
+            unknown.resolve::<String>("diff_added_bg").as_deref(),
+            Some("default")
+        );
+        assert_eq!(
+            unknown.resolve::<String>("diff_removed_bg").as_deref(),
+            Some("default")
+        );
+    }
+
+    fn required_rgb_token(theme: &YggTheme, token: &str) -> Rgb {
+        let value = theme
+            .resolve::<String>(token)
+            .unwrap_or_else(|| panic!("missing token {token}"));
+        parse_hex_color(&value).unwrap_or_else(|| panic!("{token} was not RGB: {value}"))
+    }
+
+    #[test]
+    fn standard_syntax_palette_contrasts_with_diff_surfaces() {
+        let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
+        let syntax_tokens = STANDARD_SYNTAX_COLORS
+            .iter()
+            .map(|(token, _, _)| *token)
+            .chain(["diff_added_marker", "diff_removed_marker"]);
+
+        for background in [TerminalBackground::Dark, TerminalBackground::Light] {
+            let mut themes = vec![default_theme_for(background, capabilities)];
+            themes.extend(theme_pack::THEMES.iter().map(|bundled| {
+                load_bundled_theme_for(bundled.id, capabilities, background)
+                    .unwrap_or_else(|error| panic!("{}: {error}", bundled.id))
+            }));
+
+            for theme in themes {
+                for surface in ["diff_added_bg", "diff_removed_bg"] {
+                    let surface_color = required_rgb_token(&theme, surface);
+                    for token in syntax_tokens.clone() {
+                        let foreground = required_rgb_token(&theme, token);
+                        assert!(
+                            contrast(foreground, surface_color) >= 4.5,
+                            "{:?} {:?} {token} on {surface}",
+                            theme.source(),
+                            background
+                        );
+                    }
+                }
             }
+        }
+    }
+
+    #[test]
+    fn unknown_background_uses_no_fixed_diff_surfaces_and_universal_syntax() {
+        let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
+        let theme = default_theme_for(TerminalBackground::Unknown, capabilities);
+        let black = Rgb {
+            red: 0,
+            green: 0,
+            blue: 0,
+        };
+        let white = Rgb {
+            red: 255,
+            green: 255,
+            blue: 255,
+        };
+
+        for surface in ["diff_added_bg", "diff_removed_bg"] {
+            assert_eq!(theme.resolve::<String>(surface).as_deref(), Some("default"));
+        }
+        for token in STANDARD_SYNTAX_COLORS
+            .iter()
+            .map(|(token, _, _)| *token)
+            .chain(["diff_added_marker", "diff_removed_marker"])
+        {
+            let foreground = required_rgb_token(&theme, token);
+            assert!(contrast(foreground, black) >= 4.5, "{token} on black");
+            assert!(contrast(foreground, white) >= 4.5, "{token} on white");
         }
     }
 
@@ -2754,7 +2927,7 @@ mod tests {
     }
 
     #[test]
-    fn colorfgbg_and_explicit_override_detect_backgrounds() {
+    fn colorfgbg_explicit_override_and_osc_rgb_detect_backgrounds() {
         assert_eq!(
             background_from_colorfgbg("15;0"),
             Some(TerminalBackground::Dark)
@@ -2766,6 +2939,14 @@ mod tests {
         assert_eq!(
             background_from_override("universal"),
             Some(TerminalBackground::Unknown)
+        );
+        assert_eq!(
+            background_from_terminal_rgb(12, 18, 24),
+            TerminalBackground::Dark
+        );
+        assert_eq!(
+            background_from_terminal_rgb(240, 240, 240),
+            TerminalBackground::Light
         );
     }
 }

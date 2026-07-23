@@ -37,7 +37,10 @@ use crate::tui::pickers::{
     confirmation_picker, extension_confirmation_picker, optional_model_picker, session_picker,
     theme_picker, thinking_picker, tool_input_picker,
 };
-use crate::tui::theme::{available_themes, load_named_theme, load_theme};
+use crate::tui::theme::{
+    available_themes, background_from_terminal_rgb, load_named_theme_for_background, load_theme,
+    load_theme_for_background, TerminalBackground,
+};
 use crate::tui::view::InteractiveShell;
 
 /// Ordered controls sent to the frozen Agent during an active run.
@@ -650,8 +653,9 @@ async fn apply_theme(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("theme configuration is unavailable"))?;
     let theme_name = name.to_owned();
+    let background = shell.theme().background();
     let theme = run_blocking_lifecycle(shell, input, "loading theme…", move || {
-        load_named_theme(&theme_name, &config)
+        load_named_theme_for_background(&theme_name, &config, background)
     })
     .await?;
     shell.set_theme(theme);
@@ -1322,12 +1326,13 @@ async fn reload_resources(
     shell: &mut InteractiveShell,
     input: &mut EventStream,
 ) -> anyhow::Result<App> {
+    let background = shell.theme().background();
     let (app, theme) = run_blocking_lifecycle(shell, input, "reloading resources…", move || {
         let mut app = app;
         app.system = compose_instructions(&app.config)?;
         app.system_tokens = estimate_text_tokens(&app.system);
         let app = rebuild_app(app, None, None, None)?;
-        let theme = load_theme(&app.config);
+        let theme = load_theme_for_background(&app.config, background);
         Ok((app, theme))
     })
     .await?;
@@ -2254,6 +2259,35 @@ async fn shutdown_for_exit(app: &mut App) {
     }
 }
 
+fn explicit_terminal_background_override() -> bool {
+    std::env::var("YGG_COLOR_SCHEME")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "dark" | "light" | "unknown" | "universal"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn apply_detected_terminal_background(
+    shell: &mut InteractiveShell,
+    config: &crate::config::Config,
+) {
+    if explicit_terminal_background_override()
+        || shell.theme().background() != TerminalBackground::Unknown
+    {
+        return;
+    }
+    let Some((red, green, blue)) =
+        crate::tui::terminal::query_terminal_background_color(Duration::from_millis(120))
+    else {
+        return;
+    };
+    let background = background_from_terminal_rgb(red, green, blue);
+    shell.set_theme(load_theme_for_background(config, background));
+}
+
 /// Run the interactive frontend with explicit idle and active borrow phases.
 pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let initial_prompt = boot.config.initial_prompt.clone();
@@ -2262,6 +2296,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let mut shell =
         InteractiveShell::enter_with_mouse(theme, size, boot.config.mouse.application_owned())?;
     shell.set_theme_config(boot.config.clone());
+    apply_detected_terminal_background(&mut shell, &boot.config);
     let mut input = EventStream::new();
     // The shell owns a dedicated renderer thread, but sexy-tui still renders
     // synchronously when that thread receives a request. This clock only
