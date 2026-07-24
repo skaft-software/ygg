@@ -30,6 +30,10 @@ It works with a local OpenAI-compatible server just as naturally as it works wit
 
 > **Release status:** `0.1.1-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
 
+<p align="center">
+  <img src="docs/assets/ygg-demo.gif" alt="ygg terminal demo" width="100%">
+</p>
+
 ## Why ygg
 
 Most coding agents make you choose between a beautiful product and a system you can actually inspect. ygg is built around the idea that you should get both.
