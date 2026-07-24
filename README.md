@@ -1,3 +1,7 @@
+
+  <h1 align="center">ygg</h1>
+
+
 <p align="center">
   <a href="http://skaft.org/ygg">
     <img src="docs/assets/ygg-demo.gif" alt="ygg — a local-first coding agent - terminal demo"  width="80%">
