@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::{CompatibilityMode, Message, Model, Usage, UserMessage};
+
 /// An opaque Responses input or output item.
 ///
 /// The value is required to be a JSON object so it can safely be used wherever
@@ -96,6 +98,62 @@ impl ResponsesInput {
     }
 }
 
+/// One chronological component of a complete local Responses replay window.
+///
+/// User messages remain canonical so the normal Responses wire mapping is
+/// reused for text, media, and tool results. Assistant turns and native compact
+/// checkpoints are represented by their authoritative opaque output and are
+/// inserted verbatim.
+#[derive(Clone, Debug)]
+pub enum ResponsesReplayItem {
+    /// A canonical user message, including any tool-result parts.
+    User(UserMessage),
+    /// Authoritative terminal Responses output for an assistant turn.
+    Output(ResponsesOutput),
+    /// Complete output from `POST /responses/compact`.
+    ///
+    /// When this is the first replay item it replaces the earlier input
+    /// window verbatim, including the instructions that were compacted.
+    Compacted(ResponsesOutput),
+}
+
+/// Encodes a complete local Responses replay window.
+///
+/// The request-level prompt is encoded with the same `system` versus
+/// `developer` role selection as an ordinary canonical request. Canonical user
+/// and tool-result parts use the normal Responses mapping, while every opaque
+/// output item is inserted without normalization. In particular, provider item
+/// IDs, function `call_id`s, encrypted reasoning, phase fields, programmatic
+/// tool fields, and unknown future fields survive unchanged.
+///
+/// Callers must only supply route-affine authoritative output for the selected
+/// model. This low-level encoder cannot prove provenance; durable session
+/// implementations should perform that association before calling it.
+pub fn encode_responses_replay(
+    model: &Model,
+    system: Option<&str>,
+    items: &[ResponsesReplayItem],
+) -> ResponsesInput {
+    crate::protocol::openai_responses::encode_replay_input(model, system, items)
+}
+
+/// Encodes ordinary canonical messages using the same input mapper as opaque
+/// replay. This is crate-visible so the private HTTP codec cannot drift from
+/// the public replay encoder.
+pub(crate) fn encode_canonical_responses_input(
+    model: &Model,
+    system: Option<&str>,
+    messages: &[Message],
+    compatibility: CompatibilityMode,
+) -> ResponsesInput {
+    crate::protocol::openai_responses::encode_canonical_input(
+        model,
+        system,
+        messages,
+        compatibility,
+    )
+}
+
 /// Complete output returned by `POST /responses/compact`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -138,6 +196,22 @@ pub struct ResponsesOptions {
     pub store: bool,
 }
 
+impl ResponsesOptions {
+    /// Creates durable full-local-replay options.
+    ///
+    /// Full input is deliberately never mixed with `previous_response_id`, and
+    /// storage is explicitly disabled rather than delegated to a provider
+    /// default.
+    pub fn full_replay(input: ResponsesInput) -> Self {
+        Self {
+            input: Some(input),
+            previous_response_id: None,
+            context_management: None,
+            store: false,
+        }
+    }
+}
+
 /// Native `POST /responses/compact` request.
 #[derive(Clone, Debug, Serialize)]
 pub struct ResponsesCompactRequest {
@@ -155,6 +229,65 @@ pub struct ResponsesCompactRequest {
 pub struct ResponsesCompactResponse {
     /// Complete, unpruned opaque output window.
     pub output: ResponsesOutput,
+    /// Provider-reported compact-request usage in canonical disjoint buckets.
+    #[serde(default, deserialize_with = "deserialize_compact_usage")]
+    pub usage: Usage,
+}
+
+#[derive(Default, Deserialize)]
+struct CompactUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: Option<CompactInputTokenDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<CompactOutputTokenDetails>,
+}
+
+#[derive(Default, Deserialize)]
+struct CompactInputTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
+}
+
+#[derive(Default, Deserialize)]
+struct CompactOutputTokenDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
+}
+
+fn deserialize_compact_usage<'de, D>(deserializer: D) -> Result<Usage, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(usage) = Option::<CompactUsage>::deserialize(deserializer)? else {
+        return Ok(Usage::default());
+    };
+    let details = usage.input_tokens_details.unwrap_or_default();
+    let output_details = usage.output_tokens_details.unwrap_or_default();
+    let input_tokens = usage
+        .input_tokens
+        .saturating_sub(details.cached_tokens)
+        .saturating_sub(details.cache_write_tokens);
+    let output_tokens = usage.output_tokens.max(output_details.reasoning_tokens);
+    let total_tokens = input_tokens
+        .checked_add(details.cached_tokens)
+        .and_then(|value| value.checked_add(details.cache_write_tokens))
+        .and_then(|value| value.checked_add(output_tokens))
+        .ok_or_else(|| serde::de::Error::custom("compact usage token total overflow"))?;
+    Ok(Usage {
+        input_tokens,
+        cache_read_tokens: details.cached_tokens,
+        cache_write_tokens: details.cache_write_tokens,
+        cache_write_1h_tokens: 0,
+        output_tokens,
+        reasoning_tokens: output_details.reasoning_tokens,
+        total_tokens,
+    })
 }
 
 #[cfg(test)]
@@ -181,5 +314,13 @@ mod tests {
         );
         let output = ResponsesOutput::new(input.into_items());
         assert_eq!(output.into_input().items().len(), 3);
+    }
+
+    #[test]
+    fn full_replay_never_mixes_server_chaining_or_storage() {
+        let options = ResponsesOptions::full_replay(ResponsesInput::new(vec![item("message")]));
+        assert!(options.input.is_some());
+        assert_eq!(options.previous_response_id, None);
+        assert!(!options.store);
     }
 }

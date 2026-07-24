@@ -10,7 +10,10 @@ use anyhow::Context;
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
 use sha2::{Digest as _, Sha256};
-use ygg_agent::{Agent, AgentConfig, CoreTools, EntryValue, ExtensionHost, Session, SkillRegistry};
+use ygg_agent::{
+    Agent, AgentCompactionMode, AgentConfig, CoreTools, EntryValue, ExtensionHost, Session,
+    SkillRegistry,
+};
 use ygg_ai::{
     AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model, ModelCatalog, ModelId,
     ModelLimits, ModelSpec, OpenAiChatReasoningMode, Pricing, PricingTier, Protocol,
@@ -21,7 +24,7 @@ use crate::app::{
     level_from_reasoning, normalize_reasoning_for_model, normalize_reasoning_mode_for_model,
     thinking_to_reasoning, App,
 };
-use crate::config::{Config, ResumeSelector};
+use crate::config::{CompactionMode, Config, ResumeSelector};
 use crate::extensions::ExecutableExtensions;
 use crate::modes::interactive::run_blocking_lifecycle;
 use crate::prompts::PromptRegistry;
@@ -61,6 +64,43 @@ pub struct LaunchSelection {
     pub reasoning: ReasoningConfig,
     /// Effective execution mode restored independently from reasoning effort.
     pub reasoning_mode: ReasoningMode,
+}
+
+fn validate_compaction_route(
+    mode: CompactionMode,
+    active: &Model,
+    compact_model: Option<&Model>,
+) -> anyhow::Result<()> {
+    if mode != CompactionMode::NativeResponses {
+        return Ok(());
+    }
+    if active.spec.protocol != Protocol::OpenAiResponses {
+        anyhow::bail!(
+            "native Responses compaction requires an OpenAI Responses route; model {} uses {:?}",
+            active.spec.id.0,
+            active.spec.protocol
+        );
+    }
+    if let Some(compact_model) = compact_model {
+        if compact_model.endpoint.id != active.endpoint.id
+            || compact_model.spec.id != active.spec.id
+        {
+            anyhow::bail!(
+                "native Responses compaction requires exact route affinity; compaction.compact_model must match active endpoint/model {}/{}",
+                active.endpoint.id.0,
+                active.spec.id.0
+            );
+        }
+    }
+    Ok(())
+}
+
+fn agent_compaction_mode(mode: CompactionMode) -> AgentCompactionMode {
+    match mode {
+        CompactionMode::Disabled => AgentCompactionMode::Disabled,
+        CompactionMode::Local => AgentCompactionMode::Local,
+        CompactionMode::NativeResponses => AgentCompactionMode::NativeResponses,
+    }
 }
 
 const DEEPSEEK_ENDPOINT_ID: &str = "deepseek";
@@ -3236,6 +3276,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         .map(|id| catalog.resolve(id))
         .transpose()
         .with_context(|| "configured compaction model could not be resolved")?;
+    validate_compaction_route(config.compaction.mode, &model, compact_model.as_ref())?;
     let mut prepared_session = prepared_session.into_inner();
     let mut session = match launch.session {
         SessionSelection::CreateNew(path) => {
@@ -3295,8 +3336,8 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     agent.set_prompt_model_source(Some(crate::tui::theme::model_lab(&model).key().to_owned()));
     agent.set_prompt_color(Some(crate::tui::theme::prompt_color_for_model(&model)));
     agent.set_compaction_model(compact_model);
-    agent.set_compaction_policy(
-        config.compaction.enabled,
+    agent.set_compaction_mode(
+        agent_compaction_mode(config.compaction.mode),
         config.compaction.threshold_fraction,
         config.compaction.keep_recent_turns,
     )?;
@@ -3353,6 +3394,7 @@ pub fn rebuild_app(
         .map(|id| catalog.resolve(id))
         .transpose()
         .with_context(|| "configured compaction model could not be resolved")?;
+    validate_compaction_route(config.compaction.mode, &model, compact_model.as_ref())?;
     let current_path = agent.session().path().to_owned();
     drop(agent);
 
@@ -3442,8 +3484,8 @@ pub fn rebuild_app(
     agent.set_prompt_model_source(Some(crate::tui::theme::model_lab(&model).key().to_owned()));
     agent.set_prompt_color(Some(crate::tui::theme::prompt_color_for_model(&model)));
     agent.set_compaction_model(compact_model);
-    agent.set_compaction_policy(
-        config.compaction.enabled,
+    agent.set_compaction_mode(
+        agent_compaction_mode(config.compaction.mode),
         config.compaction.threshold_fraction,
         config.compaction.keep_recent_turns,
     )?;
@@ -3597,6 +3639,52 @@ mod tests {
                 .compaction_model()
                 .map(|model| model.spec.id.0.as_str()),
             Some("gpt-4o-mini")
+        );
+    }
+
+    #[test]
+    fn native_compaction_rejects_non_responses_and_route_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = config(directory.path(), Some("gpt-4o-mini"));
+        let boot = bootstrap(config.clone()).unwrap();
+        let chat = boot
+            .catalog
+            .resolve(config.model.as_ref().unwrap())
+            .unwrap();
+        let error =
+            validate_compaction_route(CompactionMode::NativeResponses, &chat, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an OpenAI Responses route"),
+            "{error}"
+        );
+
+        let mut responses_spec = (*chat.spec).clone();
+        responses_spec.protocol = Protocol::OpenAiResponses;
+        let responses = Model {
+            spec: Arc::new(responses_spec),
+            endpoint: chat.endpoint.clone(),
+        };
+        validate_compaction_route(
+            CompactionMode::NativeResponses,
+            &responses,
+            Some(&responses),
+        )
+        .unwrap();
+
+        let mut other_spec = (*responses.spec).clone();
+        other_spec.id = ModelId("other-responses-model".into());
+        let other = Model {
+            spec: Arc::new(other_spec),
+            endpoint: responses.endpoint.clone(),
+        };
+        let error =
+            validate_compaction_route(CompactionMode::NativeResponses, &responses, Some(&other))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("exact route affinity"),
+            "{error}"
         );
     }
 

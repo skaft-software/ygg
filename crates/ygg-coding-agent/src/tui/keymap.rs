@@ -10,6 +10,7 @@ use sexy_tui_rs::key_text;
 #[allow(dead_code)]
 pub enum InputAction {
     Abort,
+    ClearEditor,
     Steer(String),
     Submit(String),
     Command(String),
@@ -30,7 +31,7 @@ pub enum InputAction {
     /// Explicit return to the newest transcript output (Ctrl+End).
     JumpToTail,
     /// Application-owned transcript selection actions. Ctrl+C remains
-    /// interruption/close and is never repurposed.
+    /// draft-clear/interruption and is never repurposed as copy.
     SelectAllTranscript,
     CopyTranscriptSelection,
     /// A pointer gesture that began in the transcript. Coordinates remain
@@ -161,15 +162,21 @@ pub fn translate_with_popup(
                 return InputAction::Ignore;
             }
 
-            let control_c =
-                key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
             let control_d =
                 key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL;
-            if control_c || control_d {
-                return if active {
+            if control_d {
+                return InputAction::Closed;
+            }
+
+            let control_c =
+                key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
+            if control_c {
+                return if !editor_text.is_empty() {
+                    InputAction::ClearEditor
+                } else if active {
                     InputAction::Abort
                 } else {
-                    InputAction::Closed
+                    InputAction::Ignore
                 };
             }
 
@@ -397,17 +404,29 @@ mod tests {
     }
 
     #[test]
-    fn control_c_aborts_active_and_closes_idle() {
+    fn control_c_clears_text_then_aborts_only_an_active_empty_prompt() {
         let event = Some(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        for active in [false, true] {
+            assert_eq!(
+                translate(event.clone(), active, "draft"),
+                InputAction::ClearEditor
+            );
+        }
         assert_eq!(translate(event.clone(), true, ""), InputAction::Abort);
-        assert_eq!(translate(event, false, ""), InputAction::Closed);
+        assert_eq!(translate(event, false, ""), InputAction::Ignore);
     }
 
     #[test]
-    fn control_d_aborts_active_and_closes_idle() {
+    fn control_d_closes_with_or_without_text_while_active_or_idle() {
         let event = Some(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
-        assert_eq!(translate(event.clone(), true, ""), InputAction::Abort);
-        assert_eq!(translate(event, false, ""), InputAction::Closed);
+        for active in [false, true] {
+            for editor in ["", "draft"] {
+                assert_eq!(
+                    translate(event.clone(), active, editor),
+                    InputAction::Closed
+                );
+            }
+        }
     }
 
     #[test]

@@ -357,6 +357,11 @@ impl AttachmentLedger {
         self.entries.is_empty()
     }
 
+    /// Discard every pending attachment while preserving the monotonic chip ID.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Collapse a large paste into a chip; the text returns at compose time.
     pub fn attach_pasted_text(&mut self, text: String) -> String {
         let id = self.next_id();

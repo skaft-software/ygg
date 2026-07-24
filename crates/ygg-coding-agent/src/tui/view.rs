@@ -2426,6 +2426,11 @@ fn compute_tool_metadata(panel: &ToolPanel) -> Option<String> {
     None
 }
 
+fn bash_content_gutter() -> usize {
+    let action = "Bash";
+    visible_width(action) + 6usize.saturating_sub(visible_width(action)).max(2)
+}
+
 fn render_compact_bash_output(
     panel: &ToolPanel,
     theme: &YggTheme,
@@ -2435,19 +2440,29 @@ fn render_compact_bash_output(
 ) -> Vec<String> {
     let compact = compact_bash_output(panel, expanded);
     let ellipsis = if theme.unicode() { "…" } else { "..." };
+    let gutter = " ".repeat(bash_content_gutter());
     let mut lines = Vec::new();
     let mut first_detail = true;
-    let push_detail = |lines: &mut Vec<String>, first_detail: &mut bool, detail: String| {
+    let push_output = |lines: &mut Vec<String>, first_detail: &mut bool, output: String| {
         *first_detail = false;
         lines.extend(wrap_hanging(
-            &understated_tool_output(theme, &detail),
-            "  ",
-            "  ",
+            &theme.fg("tool_output", &output),
+            &gutter,
+            &gutter,
+            width,
+        ));
+    };
+    let push_metadata = |lines: &mut Vec<String>, first_detail: &mut bool, detail: String| {
+        *first_detail = false;
+        lines.extend(wrap_hanging(
+            &subdued_text(theme, &detail),
+            &gutter,
+            &gutter,
             width,
         ));
     };
     if compact.panel_elided {
-        push_detail(
+        push_metadata(
             &mut lines,
             &mut first_detail,
             format!(
@@ -2459,7 +2474,7 @@ fn render_compact_bash_output(
         let detail = truncation
             .omitted_bytes
             .map_or_else(|| "some bytes".to_owned(), |bytes| format!("{bytes} bytes"));
-        push_detail(
+        push_metadata(
             &mut lines,
             &mut first_detail,
             format!(
@@ -2474,17 +2489,17 @@ fn render_compact_bash_output(
         } else {
             "lines"
         };
-        push_detail(
+        push_metadata(
             &mut lines,
             &mut first_detail,
-            format!("{} {unit} hidden", compact.omitted_lines),
+            format!("{ellipsis} {} {unit} hidden", compact.omitted_lines),
         );
     }
     for output_line in compact.lines {
-        push_detail(&mut lines, &mut first_detail, output_line);
+        push_output(&mut lines, &mut first_detail, output_line);
     }
     if first_detail {
-        push_detail(
+        push_metadata(
             &mut lines,
             &mut first_detail,
             if panel.finished {
@@ -2497,7 +2512,7 @@ fn render_compact_bash_output(
     if show_tool_duration {
         if let Some(duration) = tool_metadata(panel) {
             lines.push(fit_line(
-                &understated_tool_output(theme, &format!("  Took {duration}")),
+                &subdued_text(theme, &format!("{gutter}Took {duration}")),
                 width,
             ));
         }
@@ -2518,7 +2533,7 @@ fn render_bash_row(
         theme.bold(&theme.fg("foreground", action)),
         " ".repeat(action_gap)
     );
-    let continuation = " ".repeat(visible_width(&prefix));
+    let continuation = " ".repeat(bash_content_gutter());
     let content_width = width
         .saturating_sub(u16::try_from(visible_width(&prefix)).unwrap_or(u16::MAX))
         .max(1);
@@ -5219,6 +5234,9 @@ fn apply_hydrated_tool_result(panel: &mut ToolPanel, text: &str, is_error: bool)
     panel.finished = true;
     let replayed = Ok(ygg_agent::ToolOutput::new(text.to_owned()));
     panel.is_error = is_error || tool_result_is_failure(&panel.name, &replayed);
+    if !panel.is_error {
+        panel.display.mark_media_read_from_result(text);
+    }
     panel.failure_reason = if is_error {
         tool_failure_reason(
             &panel.name,
@@ -5325,6 +5343,11 @@ fn append_hydrated_items(state: &mut ShellState, items: impl IntoIterator<Item =
                     summary,
                     expanded: false,
                 })));
+            }
+            TranscriptItem::NativeCompactionMarker => {
+                state.push_block(TranscriptBlock::Notice(
+                    "Context compacted natively · opaque Responses state retained".into(),
+                ));
             }
         }
     }
@@ -5642,12 +5665,25 @@ impl InteractiveShell {
                             ygg_agent::CompactionReason::Threshold => "context threshold",
                             ygg_agent::CompactionReason::Overflow => "overflow recovery",
                         };
-                        state.latest_compaction_summary = Some(info.summary.clone());
-                        state.push_block(TranscriptBlock::Compaction(Box::new(CompactionBlock {
-                            label: format!("Context compacted automatically · {reason}"),
-                            summary: info.summary.clone(),
-                            expanded: false,
-                        })));
+                        match &info.kind {
+                            ygg_agent::CompactionKind::Local => {
+                                state.latest_compaction_summary = Some(info.summary.clone());
+                                state.push_block(TranscriptBlock::Compaction(Box::new(
+                                    CompactionBlock {
+                                        label: format!(
+                                            "Context compacted automatically · {reason}"
+                                        ),
+                                        summary: info.summary.clone(),
+                                        expanded: false,
+                                    },
+                                )));
+                            }
+                            ygg_agent::CompactionKind::NativeResponses { .. } => {
+                                state.push_block(TranscriptBlock::Notice(format!(
+                                    "Context compacted natively · {reason} · opaque Responses state retained"
+                                )));
+                            }
+                        }
                     }
                     Err(error) => {
                         state.error = Some(format!("automatic compaction failed: {error}"));
@@ -5729,7 +5765,10 @@ impl InteractiveShell {
                     panel.is_error = tool_result_is_failure(&panel.name, result);
                     panel.failure_reason = tool_failure_reason(&panel.name, result);
                     match result {
-                        Ok(output) => bounded_append(&mut panel.output, &output.text),
+                        Ok(output) => {
+                            panel.display.mark_media_read(output.media_kinds());
+                            bounded_append(&mut panel.output, &output.text);
+                        }
                         Err(error) => bounded_append(&mut panel.output, &error.message),
                     }
                 }
@@ -6463,6 +6502,17 @@ impl InteractiveShell {
         state.ledger.restore(composed.attachments);
     }
 
+    /// Discard the current draft and every attachment it owns.
+    pub fn clear_editor(&mut self) {
+        let mut state = self.state.borrow_mut();
+        state.editor.clear();
+        state.editor_cursor = 0;
+        state.ledger.clear();
+        state.slash_selection = 0;
+        state.slash_scroll = 0;
+        state.slash_popup_dismissed = false;
+    }
+
     pub fn drain_editor(&mut self) -> String {
         let mut state = self.state.borrow_mut();
         state.editor_cursor = 0;
@@ -7133,6 +7183,12 @@ impl InteractiveShell {
             summary,
             expanded: false,
         })));
+    }
+
+    pub fn native_compaction_marker(&mut self, label: impl Into<String>) {
+        self.state
+            .borrow_mut()
+            .push_block(TranscriptBlock::Notice(label.into()));
     }
 
     /// Update stable presentation metadata when the active model changes, then
@@ -8634,24 +8690,86 @@ mod tests {
     }
 
     #[test]
-    fn vertical_editor_navigation_snaps_to_document_boundaries() {
+    fn vertical_editor_navigation_snaps_to_document_boundaries_in_one_step() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_size(40, 12);
         for character in "first\nsecond\nthird".chars() {
             shell.apply_edit(EditAction::Char(character));
         }
-        shell.apply_edit(EditAction::Home);
-        shell.apply_edit(EditAction::Up);
-        shell.apply_edit(EditAction::Up);
+
+        shell.state.borrow_mut().editor_cursor = 3;
         shell.apply_edit(EditAction::Up);
         assert_eq!(shell.state.borrow().editor_cursor, 0);
 
-        shell.apply_edit(EditAction::End);
+        let editor_len = shell.state.borrow().editor.len();
+        shell.state.borrow_mut().editor_cursor = editor_len - 2;
         shell.apply_edit(EditAction::Down);
+        assert_eq!(shell.state.borrow().editor_cursor, editor_len);
+    }
+
+    #[test]
+    fn vertical_editor_navigation_snaps_at_soft_wrapped_boundaries() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(8, 12);
+        for character in "abcdefghijklm".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+
+        shell.state.borrow_mut().editor_cursor = 3;
+        shell.apply_edit(EditAction::Up);
+        assert_eq!(shell.state.borrow().editor_cursor, 0);
+
+        let editor_len = shell.state.borrow().editor.len();
+        shell.state.borrow_mut().editor_cursor = editor_len - 2;
+        let (editor, cursor) = {
+            let state = shell.state.borrow();
+            (state.editor.clone(), state.editor_cursor)
+        };
+        assert_eq!(
+            editor_layout(&editor, cursor, 8).cursor_row,
+            2,
+            "fixture cursor must begin on the bottom soft-wrapped row"
+        );
         shell.apply_edit(EditAction::Down);
-        shell.apply_edit(EditAction::Down);
-        let state = shell.state.borrow();
-        assert_eq!(state.editor_cursor, state.editor.len());
+        assert_eq!(shell.state.borrow().editor_cursor, editor_len);
+    }
+
+    #[test]
+    fn clear_editor_discards_attachments_and_resets_composer_navigation() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.apply_edit(EditAction::Paste("discarded\n".repeat(20)));
+        assert!(!shell.state.borrow().ledger.is_empty());
+        {
+            let mut state = shell.state.borrow_mut();
+            state.editor_cursor = 3;
+            state.slash_selection = 4;
+            state.slash_scroll = 2;
+            state.slash_popup_dismissed = true;
+        }
+
+        shell.clear_editor();
+
+        {
+            let state = shell.state.borrow();
+            assert!(state.editor.is_empty());
+            assert_eq!(state.editor_cursor, 0);
+            assert!(state.ledger.is_empty());
+            assert_eq!(state.slash_selection, 0);
+            assert_eq!(state.slash_scroll, 0);
+            assert!(!state.slash_popup_dismissed);
+        }
+
+        shell.apply_edit(EditAction::Paste("kept\n".repeat(20)));
+        assert!(
+            shell.pending().starts_with("[Pasted text #2:"),
+            "clearing a draft must not reuse an attachment ID"
+        );
+        let composed = shell.drain_composed();
+        assert!(matches!(
+            composed.parts.as_slice(),
+            [ygg_agent::InputPart::Text(text)]
+                if text.contains("kept") && !text.contains("discarded")
+        ));
     }
 
     #[test]
@@ -9307,6 +9425,7 @@ mod tests {
             &AgentEvent::CompactionFinished {
                 reason: ygg_agent::CompactionReason::Threshold,
                 result: Ok(ygg_agent::CompactionInfo {
+                    kind: ygg_agent::CompactionKind::Local,
                     summary: "# Automatic summary\n\nauto-summary sentinel".into(),
                     first_kept: ygg_agent::EntryId("kept".into()),
                 }),
@@ -9323,6 +9442,34 @@ mod tests {
         let expanded =
             strip_terminal_sequences(&shell.state.borrow().rendered_transcript(80).join("\n"));
         assert!(expanded.contains("auto-summary sentinel"), "{expanded}");
+
+        let mut native_shell = InteractiveShell::test_shell();
+        let native_run = native_shell.begin_run("openai");
+        native_shell.on_run_event(
+            native_run,
+            &AgentEvent::CompactionFinished {
+                reason: ygg_agent::CompactionReason::Threshold,
+                result: Ok(ygg_agent::CompactionInfo {
+                    kind: ygg_agent::CompactionKind::NativeResponses {
+                        checkpoint: ygg_agent::EntryId("checkpoint".into()),
+                        covered_through: ygg_agent::EntryId("covered".into()),
+                    },
+                    summary: String::new(),
+                    first_kept: ygg_agent::EntryId("covered".into()),
+                }),
+            },
+        );
+        let native = strip_terminal_sequences(
+            &native_shell
+                .state
+                .borrow()
+                .rendered_transcript(80)
+                .join("\n"),
+        );
+        assert!(native.contains("Context compacted natively"), "{native}");
+        assert!(native.contains("opaque Responses state"), "{native}");
+        assert!(native.contains("retained"), "{native}");
+        assert!(!native.contains("checkpoint"), "{native}");
 
         let mut failed_shell = InteractiveShell::test_shell();
         let failed_run = failed_shell.begin_run("openai");
@@ -10489,6 +10636,85 @@ mod tests {
     }
 
     #[test]
+    fn successful_media_reads_render_payload_free_capability_indicators() {
+        use ygg_agent::{ToolError, ToolOutput};
+
+        let mut shell = InteractiveShell::test_shell();
+        let run_id = shell.begin_run("openai");
+        let image_id = ToolCallId("image-read".into());
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolStarted {
+                id: image_id.clone(),
+                name: "read".into(),
+                args: serde_json::json!({"path": "capture.png"}),
+            },
+        );
+        let image_output = ToolOutput::new("image summary")
+            .with_media(ygg_ai::Media::image_bytes(
+                bytes::Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
+                mime::IMAGE_PNG,
+            ))
+            .without_media_payloads();
+        assert!(image_output.media().is_empty());
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolFinished {
+                id: image_id,
+                result: Ok(image_output),
+            },
+        );
+
+        for (id, path, result) in [
+            (
+                "text-read",
+                "notes.txt",
+                Ok(ToolOutput::new("plain text summary")),
+            ),
+            (
+                "failed-read",
+                "broken.png",
+                Err(ToolError::new("unsupported image encoding")),
+            ),
+        ] {
+            let id = ToolCallId(id.into());
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::ToolStarted {
+                    id: id.clone(),
+                    name: "read".into(),
+                    args: serde_json::json!({"path": path}),
+                },
+            );
+            shell.on_run_event(run_id, &AgentEvent::ToolFinished { id, result });
+        }
+
+        let rendered = shell
+            .state
+            .borrow()
+            .rendered_transcript(100)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>();
+        let image = rendered
+            .iter()
+            .find(|line| line.contains("capture.png"))
+            .expect("successful image read row");
+        assert!(image.contains('◉'), "{rendered:?}");
+        assert!(!image.contains('♪'), "{rendered:?}");
+        for path in ["notes.txt", "broken.png"] {
+            let line = rendered
+                .iter()
+                .find(|line| line.contains(path))
+                .expect("non-media read row");
+            assert!(
+                !line.contains('◉') && !line.contains('♪'),
+                "unsupported or failed reads must not imply media ingestion: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
     fn responsive_header_drops_metadata_instead_of_truncating_every_field() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_identity("relay", "gpt-5.6", "high");
@@ -11457,7 +11683,7 @@ mod tests {
         assert_ascii_foreground(&active_bash, "Bash", foreground);
         assert_ascii_bold(&active_bash, "Bash");
         assert_ascii_foreground(&active_bash, "\"active\"", syntax_string);
-        assert_ascii_foreground(&active_bash, "private streaming output", muted);
+        assert_ascii_foreground(&active_bash, "private streaming output", foreground);
         assert!(active_bash
             .screen()
             .contents()
@@ -11909,7 +12135,27 @@ mod tests {
         .collect::<Vec<_>>();
 
         assert!(rendered[0].starts_with("• Bash"), "{rendered:?}");
-        assert!(rendered.iter().any(|line| line.trim() == "(no output)"));
+        let command_byte = rendered[0].find("node").expect("command on Bash row");
+        let command_column = visible_width(&rendered[0][..command_byte]);
+        let no_output = rendered
+            .iter()
+            .find(|line| line.contains("(no output)"))
+            .expect("no-output metadata");
+        assert_eq!(
+            no_output.find("(no output)"),
+            Some(command_column),
+            "Bash metadata must share the command content gutter: {rendered:?}"
+        );
+        for continuation in rendered
+            .iter()
+            .skip(1)
+            .take_while(|line| !line.contains("(no output)"))
+        {
+            assert!(
+                continuation.len() - continuation.trim_start().len() >= command_column,
+                "wrapped commands must stay at or beyond their first command cell: {rendered:?}"
+            );
+        }
         assert!(
             rendered
                 .iter()
@@ -11921,6 +12167,80 @@ mod tests {
                 .chars()
                 .any(|character| matches!(character, '✓' | '×' | '…'))),
             "the margin dot is the only lifecycle marker: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bash_output_and_hidden_metadata_share_a_terminal_content_gutter() {
+        let theme = crate::tui::theme::test_theme();
+        let command = "printf result";
+        let args = serde_json::json!({"command": command});
+        let output = (1..=8)
+            .map(|line| format!("result line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let panel = ToolPanel::new(
+            ToolCallId("bash-gutter".into()),
+            "bash".into(),
+            args.to_string(),
+            summarize_tool("bash", &args),
+            format!("exit=0 duration=0.2s\nstdout: 8 lines\n{output}"),
+            true,
+            false,
+            None,
+            None,
+        );
+
+        let details = render_compact_bash_output(&panel, &theme, 80, false, false);
+        assert!(
+            details[0].contains("\x1b[38;2;"),
+            "hidden-line metadata should use the muted metadata style: {details:?}"
+        );
+        assert!(
+            !details[1].contains("\x1b[38;2;"),
+            "raw Bash output should retain the tool-output style: {details:?}"
+        );
+
+        let block = TranscriptBlock::Tool(Box::new(panel));
+        let rendered = render_block(
+            None,
+            &block,
+            &theme,
+            &theme.rich_renderer(),
+            &theme.reasoning_renderer(),
+            80,
+            false,
+        )
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>();
+        let command_byte = rendered[0].find(command).expect("command on Bash row");
+        let command_column = visible_width(&rendered[0][..command_byte]);
+        let hidden = rendered
+            .iter()
+            .find(|line| line.contains("3 lines hidden"))
+            .expect("synthetic hidden-line metadata");
+        let output = rendered
+            .iter()
+            .find(|line| line.contains("result line 4"))
+            .expect("first retained output row");
+        let hidden_byte = hidden.find('…').expect("hidden metadata marker");
+        assert_eq!(
+            visible_width(&hidden[..hidden_byte]),
+            command_column,
+            "{rendered:?}"
+        );
+        assert_eq!(
+            output.find("result line 4"),
+            Some(command_column),
+            "{rendered:?}"
+        );
+        let TranscriptBlock::Tool(panel) = &block else {
+            unreachable!("fixture is a Bash tool panel");
+        };
+        assert!(
+            !panel.output.contains("lines hidden"),
+            "synthetic UI metadata must not enter the raw tool payload"
         );
     }
 

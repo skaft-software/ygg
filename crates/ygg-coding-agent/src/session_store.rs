@@ -181,6 +181,8 @@ enum SummaryMessage {
 enum SummaryEntryValue {
     Message(SummaryMessage),
     Compaction { first_kept: EntryId },
+    ResponsesTurn {},
+    ResponsesCompaction {},
     Config {},
     PromptTemplateSelected {},
     SkillActivated {},
@@ -440,6 +442,8 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                         (SummaryEntryKind::Other, None)
                     }
                     SummaryEntryValue::Config {}
+                    | SummaryEntryValue::ResponsesTurn {}
+                    | SummaryEntryValue::ResponsesCompaction {}
                     | SummaryEntryValue::PromptTemplateSelected {}
                     | SummaryEntryValue::SkillActivated {}
                     | SummaryEntryValue::SkillResourceRead {}

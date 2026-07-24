@@ -33,6 +33,7 @@ pub enum TranscriptItem {
     CompactionMarker {
         summary: String,
     },
+    NativeCompactionMarker,
 }
 
 fn tool_result_text(parts: &[ToolResultPart]) -> String {
@@ -344,6 +345,9 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
                     summary: summary.clone(),
                 });
             }
+            EntryValue::ResponsesCompaction { .. } => {
+                items.push(TranscriptItem::NativeCompactionMarker);
+            }
             EntryValue::ResponsesTurn { .. }
             | EntryValue::SkillActivated { .. }
             | EntryValue::PromptTemplateSelected { .. }
@@ -467,6 +471,37 @@ mod tests {
             hydrate_transcript(&resumed).unwrap().last(),
             Some(TranscriptItem::CompactionMarker { summary: hydrated }) if hydrated == summary
         ));
+    }
+
+    #[test]
+    fn resumed_native_compaction_renders_only_a_payload_free_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        let covered_through = session.append(user("kept prompt")).unwrap();
+        session
+            .append(EntryValue::ResponsesCompaction {
+                endpoint: ygg_ai::EndpointId("responses".into()),
+                model: ModelId("gpt-test".into()),
+                covered_through,
+                output: ygg_ai::ResponsesOutput::new(vec![ygg_ai::ResponsesItem::new(
+                    serde_json::json!({
+                        "type": "compaction",
+                        "encrypted_content": "must-never-render"
+                    }),
+                )
+                .unwrap()]),
+            })
+            .unwrap();
+        drop(session);
+
+        let resumed = Session::open(path).unwrap();
+        let items = hydrate_transcript(&resumed).unwrap();
+        assert!(matches!(
+            items.last(),
+            Some(TranscriptItem::NativeCompactionMarker)
+        ));
+        assert!(!format!("{items:?}").contains("must-never-render"));
     }
 
     #[test]

@@ -735,7 +735,8 @@ impl<'a> TUI<'a> {
 
         // A terminal reflows the old frame before delivering its resize event.
         // Cursor-relative differential updates are therefore invalid even when
-        // the logical line count did not change; clear and redraw from home.
+        // the logical line count did not change; re-anchor and repaint the
+        // visible grid without rewriting terminal-owned history.
         if self.capabilities.plain {
             self.write_plain_changes(&new_lines, first_changed_hint, previous_len);
             self.first_render = false;
@@ -859,23 +860,6 @@ impl<'a> TUI<'a> {
         frame_change_hints: Option<&FrameChangeHints>,
     ) {
         let rows = usize::from(height.max(1));
-        if size_changed {
-            // Match Pi's resize contract: terminal reflow invalidates every
-            // retained physical-row assumption, so clear both the grid and
-            // saved lines and rebuild once at the new dimensions. Components
-            // with a live-region seam replay only committed history plus the
-            // current viewport, keeping provisional output out of scrollback.
-            if let Some(boundary) = commit_boundary {
-                self.rebuild_inline_pinned_scrollback(
-                    new_lines,
-                    rows,
-                    boundary.min(new_lines.len()),
-                );
-            } else {
-                self.rebuild_inline_scrollback(new_lines, rows);
-            }
-            return;
-        }
         if let Some(boundary) = commit_boundary {
             let boundary = boundary.min(new_lines.len());
             if rebuild_scrollback {
@@ -2207,10 +2191,13 @@ mod tests {
         assert!(delete_at < replacement_at, "{output:?}");
         assert_eq!(
             clears.get(),
-            1,
-            "Pi-compatible resize must clear the old grid before rebuilding"
+            0,
+            "inline resize must not clear the grid or native history"
         );
-        assert!(output.contains("\x1b[3J"), "{output:?}");
+        assert!(
+            !output.contains("\x1b[3J"),
+            "inline resize must preserve saved scrollback: {output:?}"
+        );
     }
 
     #[test]
@@ -2698,7 +2685,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_scrollback_resize_rebuilds_at_the_new_dimensions() {
+    fn inline_scrollback_resize_repaints_only_the_visible_tail() {
         let size = Rc::new(Cell::new((20, 3)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
@@ -2725,14 +2712,18 @@ mod tests {
             .replace("\u{1b}[0m\u{1b}]8;;\u{1b}\\", "");
         assert_eq!(
             clears.get(),
-            clears_before + 1,
-            "Pi-compatible resize must clear and rebuild the terminal"
+            clears_before,
+            "inline resize must preserve terminal-owned history"
         );
-        assert!(repaint.contains("\x1b[3J"), "{repaint:?}");
         assert!(
-            repaint.contains("row 0\nrow 1\nrow 2\nrow 3\nrow 4\nrow 5"),
+            !repaint.contains("\x1b[3J"),
+            "ordinary resize must never clear saved scrollback: {repaint:?}"
+        );
+        assert!(
+            repaint.contains("row 2\nrow 3\nrow 4\nrow 5"),
             "{repaint:?}"
         );
+        assert!(!repaint.contains("row 1"), "{repaint:?}");
     }
 
     #[test]
@@ -2742,22 +2733,22 @@ mod tests {
             crate::capabilities::ColorDepth::Ansi16,
             true,
         );
-        let (terminal, _, _, _, _, writes) = recording_terminal(size.clone(), capabilities);
-        let lines = Rc::new(RefCell::new(
-            [
-                "history 0",
-                "history 1",
-                "history 2",
-                "history 3",
-                "visible 4",
-                "visible 5",
-                "empty composer",
-                "footer",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>(),
-        ));
+        let (terminal, clears, _, _, _, writes) = recording_terminal(size.clone(), capabilities);
+        let mut initial_lines = [
+            "history 0",
+            "history 1",
+            "history 2",
+            "history 3",
+            "visible 4",
+            "visible 5",
+            "empty composer",
+            "footer",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        initial_lines[6].push_str(CURSOR_MARKER);
+        let lines = Rc::new(RefCell::new(initial_lines));
         let mut tui = TUI::new(Box::new(terminal));
         tui.set_inline_scrollback(true);
         tui.add_child(Box::new(LazyPinnedLines {
@@ -2766,18 +2757,36 @@ mod tests {
         }));
         tui.start();
         assert_eq!(tui.inline_window_top, 4);
+        let clears_after_start = clears.get();
 
         // Growing and widening the terminal pulls two logical rows into the
         // viewport and invalidates wrapping. Losing pinned metadata on this
         // repaint leaves `inline_window_top` at four, so the next composer
         // diff is addressed two rows too high.
+        writes.borrow_mut().clear();
         size.set((50, 6));
         tui.request_render();
+        let resized = writes.borrow().join("");
         assert_eq!(tui.inline_window_top, 2);
         assert_eq!(tui.inline_bottom_row, 5);
+        assert_eq!(
+            clears.get(),
+            clears_after_start,
+            "pinned resize must preserve the grid and terminal history"
+        );
+        assert!(
+            !resized.contains("\x1b[3J"),
+            "pinned resize must not erase saved scrollback: {resized:?}"
+        );
+        assert!(resized.contains("history 2"), "{resized:?}");
+        assert!(!resized.contains("history 1"), "{resized:?}");
+        assert!(
+            resized.contains("\x1b[5;15H"),
+            "composer cursor must follow the resized pinned window: {resized:?}"
+        );
 
         writes.borrow_mut().clear();
-        lines.borrow_mut()[6] = "typed composer".into();
+        lines.borrow_mut()[6] = format!("typed composer{CURSOR_MARKER}");
         tui.request_render();
         let output = writes.borrow().join("");
         assert!(output.contains("\x1b[5;1H"), "{output:?}");

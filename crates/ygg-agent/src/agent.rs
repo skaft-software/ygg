@@ -13,8 +13,9 @@ use tokio::sync::mpsc;
 use ygg_ai::{
     AiClient, AiError, AssistantMessage, AssistantPart, AudioPayload, CacheRetention,
     CompatibilityMode, Cost, ImageSource, Media, Message, Model, OutputFormat, OutputModalities,
-    ReasoningConfig, ReasoningMode, Request, StopReason, StreamEvent, ToolCall, ToolChoice,
-    ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart, PICODOLLARS_PER_MICRODOLLAR,
+    Protocol, ReasoningConfig, ReasoningMode, Request, ResponsesCompactRequest, ResponsesInput,
+    ResponsesOptions, StopReason, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolResult,
+    ToolResultPart, Usage, UserMessage, UserPart, PICODOLLARS_PER_MICRODOLLAR,
 };
 
 use crate::compaction::{
@@ -23,15 +24,16 @@ use crate::compaction::{
 };
 use crate::context::{ContextSnapshot, ContextTracker};
 use crate::events::{
-    AgentEvent, CompactionInfo, CompactionReason, Control, FinishReason, OutputChannel,
+    AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
+    OutputChannel,
 };
 use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
 use crate::session::{EntryId, EntryMetadata, EntryValue, Session, SessionError};
 use crate::tool::{
-    CancellationToken, ReplaySafety, Tool, ToolContext, ToolError, ToolOutput, ToolProgress,
-    ToolProgressSink, PROGRESS_CHANNEL_CAPACITY,
+    CancellationToken, ReplaySafety, Tool, ToolContext, ToolError, ToolOutput, ToolOutputMediaKind,
+    ToolProgress, ToolProgressSink, PROGRESS_CHANNEL_CAPACITY,
 };
 
 /// Errors surfaced by [`Agent`] APIs.
@@ -110,6 +112,18 @@ pub enum CompletionPolicy {
     /// Treat a normal no-tool response as a candidate and ask an isolated,
     /// one-token evidence gate whether control should return to the user.
     TerminalGate,
+}
+
+/// Autonomous context-reduction strategy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AgentCompactionMode {
+    /// Disable autonomous compaction.
+    Disabled,
+    /// Generate a provider-independent summary and retain a canonical tail.
+    #[default]
+    Local,
+    /// Use OpenAI Responses native opaque compaction on the active route.
+    NativeResponses,
 }
 
 /// Configuration for [`Agent::new`].
@@ -203,7 +217,7 @@ pub struct Agent {
     /// Optional provider route used for autonomous context summaries.
     /// Defaults to the active model when unset.
     compaction_model: Option<Model>,
-    auto_compaction_enabled: bool,
+    auto_compaction_mode: AgentCompactionMode,
     compaction_threshold_fraction: f64,
     compaction_keep_recent_turns: usize,
     session_id: String,
@@ -686,6 +700,7 @@ fn pending_tool_state(session: &Session) -> Option<(Vec<ToolCall>, HashSet<ygg_a
             }
             EntryValue::Compaction { .. }
             | EntryValue::ResponsesTurn { .. }
+            | EntryValue::ResponsesCompaction { .. }
             | EntryValue::Config { .. }
             | EntryValue::PromptTemplateSelected { .. }
             | EntryValue::SkillActivated { .. }
@@ -723,6 +738,106 @@ fn truncate_tool_text(text: &str, limit: usize) -> String {
     }
     result.push_str(&text[tail_start..]);
     result
+}
+
+fn lower_tool_result(
+    call_id: ygg_ai::ToolCallId,
+    result: &Result<ToolOutput, ToolError>,
+    model: &Model,
+    text_limit: usize,
+) -> (UserMessage, Vec<ToolOutputMediaKind>, String, bool) {
+    let (raw_text, is_error) = match result {
+        Ok(output) => (output.text.as_str(), false),
+        Err(error) => (error.message.as_str(), true),
+    };
+    let persisted_text = truncate_tool_text(raw_text, text_limit);
+    let mut result_parts = vec![ToolResultPart::Text(persisted_text.clone())];
+    let mut adjacent_media = Vec::new();
+    let mut accepted_kinds = Vec::new();
+    let mut omissions = Vec::new();
+
+    if let Ok(output) = result {
+        for media in output.media() {
+            match media {
+                Media::Image(_) => {
+                    if !model
+                        .spec
+                        .capabilities
+                        .input_modalities
+                        .contains(ygg_ai::Modality::Image)
+                    {
+                        omissions.push(
+                            "[image omitted: the active model does not accept image input]"
+                                .to_owned(),
+                        );
+                    } else {
+                        accepted_kinds.push(ToolOutputMediaKind::Image);
+                        match model.spec.protocol {
+                            Protocol::OpenAiResponses | Protocol::AnthropicMessages => {
+                                result_parts.push(ToolResultPart::Media(media.clone()));
+                            }
+                            Protocol::OpenAiChat => adjacent_media.push(media.clone()),
+                        }
+                    }
+                }
+                Media::Audio(audio) => {
+                    if !model
+                        .spec
+                        .capabilities
+                        .input_modalities
+                        .contains(ygg_ai::Modality::Audio)
+                    {
+                        omissions.push(
+                            "[audio omitted: the active model does not accept audio input]"
+                                .to_owned(),
+                        );
+                    } else if model.spec.protocol != Protocol::OpenAiChat {
+                        omissions.push(
+                            "[audio omitted: this protocol cannot replay audio tool output]"
+                                .to_owned(),
+                        );
+                    } else if !matches!(
+                        audio.format,
+                        ygg_ai::AudioFormat::Wav | ygg_ai::AudioFormat::Mp3
+                    ) {
+                        omissions.push(format!(
+                            "[audio omitted: OpenAI Chat accepts WAV or MP3 input, got {:?}]",
+                            audio.format
+                        ));
+                    } else {
+                        accepted_kinds.push(ToolOutputMediaKind::Audio);
+                        adjacent_media.push(media.clone());
+                    }
+                }
+            }
+        }
+    }
+    result_parts.extend(omissions.iter().cloned().map(ToolResultPart::Text));
+    let effective_is_error = is_error
+        || result
+            .as_ref()
+            .is_ok_and(|output| !output.media().is_empty() && accepted_kinds.is_empty());
+    let presented_text = if omissions.is_empty() {
+        persisted_text.clone()
+    } else if persisted_text.is_empty() {
+        omissions.join("\n")
+    } else {
+        format!("{persisted_text}\n{}", omissions.join("\n"))
+    };
+
+    let mut content = Vec::with_capacity(1 + adjacent_media.len());
+    content.push(UserPart::ToolResult(ToolResult {
+        tool_call_id: call_id,
+        content: result_parts,
+        is_error: effective_is_error,
+    }));
+    content.extend(adjacent_media.into_iter().map(UserPart::Media));
+    (
+        UserMessage { content },
+        accepted_kinds,
+        presented_text,
+        effective_is_error,
+    )
 }
 
 fn persist_pending_cancellations(session: &mut Session) -> Result<(), AgentError> {
@@ -1075,6 +1190,7 @@ fn previous_message_is_user(session: &Session, entry: &crate::session::Entry) ->
             EntryValue::Message(Message::Assistant(_)) => return false,
             EntryValue::Compaction { .. }
             | EntryValue::ResponsesTurn { .. }
+            | EntryValue::ResponsesCompaction { .. }
             | EntryValue::Config { .. }
             | EntryValue::PromptTemplateSelected { .. }
             | EntryValue::SkillActivated { .. }
@@ -1196,6 +1312,59 @@ fn estimate_request_tokens(system: &str, messages: &[Message], tools: &[ToolDef]
         .saturating_add(64)
 }
 
+fn exact_responses_replay_input(
+    session: &Session,
+    model: &Model,
+    system: &str,
+) -> Option<ResponsesInput> {
+    if model.spec.protocol != Protocol::OpenAiResponses {
+        return None;
+    }
+    let replay = session
+        .responses_replay_items(&model.endpoint.id, &model.spec.id)
+        .ok()
+        .flatten()?;
+    Some(ygg_ai::responses::encode_responses_replay(
+        model,
+        (!system.is_empty()).then_some(system),
+        &replay,
+    ))
+}
+
+fn current_head_is_native_checkpoint(session: &Session, model: &Model) -> bool {
+    session
+        .head_ref()
+        .and_then(|head| session.entry(head))
+        .is_some_and(|entry| {
+            matches!(
+                &entry.value,
+                EntryValue::ResponsesCompaction {
+                    endpoint,
+                    model: recorded_model,
+                    ..
+                } if endpoint == &model.endpoint.id && recorded_model == &model.spec.id
+            )
+        })
+}
+
+fn durable_responses_options(
+    session: &Session,
+    model: &Model,
+    system: &str,
+) -> Option<ResponsesOptions> {
+    exact_responses_replay_input(session, model, system).map(ResponsesOptions::full_replay)
+}
+
+fn estimate_responses_request_tokens(input: &ResponsesInput, tools: &[ToolDef]) -> u64 {
+    let mut bytes = CountingWriter::default();
+    if serde_json::to_writer(&mut bytes, &(input, tools)).is_err() {
+        return 64;
+    }
+    // Opaque replay and native compact checkpoints are estimated from exactly
+    // what will be serialized, never from canonical history they replaced.
+    bytes.0.div_ceil(4).saturating_add(64)
+}
+
 fn estimate_messages_tokens(messages: &[Message]) -> u64 {
     let mut bytes = CountingWriter::default();
     if serde_json::to_writer(&mut bytes, messages).is_err() {
@@ -1230,7 +1399,12 @@ fn provider_context_estimate(session: &Session, model: &Model) -> Option<u64> {
     let branch = active_branch_entries(session);
     let boundary = branch
         .iter()
-        .rposition(|entry| matches!(entry.value, EntryValue::Compaction { .. }))
+        .rposition(|entry| {
+            matches!(
+                entry.value,
+                EntryValue::Compaction { .. } | EntryValue::ResponsesCompaction { .. }
+            )
+        })
         .map_or(0, |index| index.saturating_add(1));
 
     for (index, entry) in branch.iter().enumerate().skip(boundary).rev() {
@@ -1279,7 +1453,10 @@ fn reconcile_context_estimate(
     messages: &[Message],
     tools: &[ToolDef],
 ) -> RequestContextEstimate {
-    let structural_tokens = estimate_request_tokens(system, messages, tools);
+    let structural_tokens = exact_responses_replay_input(session, model, system).map_or_else(
+        || estimate_request_tokens(system, messages, tools),
+        |input| estimate_responses_request_tokens(&input, tools),
+    );
     let provider_tokens = provider_context_estimate(session, model);
     let input_tokens = provider_tokens.map_or(structural_tokens, |provider| {
         structural_tokens.max(provider)
@@ -1379,7 +1556,7 @@ struct CompactionContext<'a> {
     session_id: &'a str,
     max_session_cost_microdollars: Option<u64>,
     abort: &'a AbortFlag,
-    enabled: bool,
+    mode: AgentCompactionMode,
     threshold_fraction: f64,
     keep_recent_turns: usize,
     events: &'a mpsc::UnboundedSender<AgentEvent>,
@@ -1403,7 +1580,7 @@ impl<'a> CompactionContext<'a> {
         session_id: &'a str,
         max_session_cost_microdollars: Option<u64>,
         abort: &'a AbortFlag,
-        enabled: bool,
+        mode: AgentCompactionMode,
         threshold_fraction: f64,
         keep_recent_turns: usize,
         events: &'a mpsc::UnboundedSender<AgentEvent>,
@@ -1419,7 +1596,7 @@ impl<'a> CompactionContext<'a> {
             session_id,
             max_session_cost_microdollars,
             abort,
-            enabled,
+            mode,
             threshold_fraction,
             keep_recent_turns,
             events,
@@ -1535,6 +1712,103 @@ impl<'a> CompactionContext<'a> {
         turn_starts(self.session).get(1).cloned()
     }
 
+    async fn compact_native_responses(
+        &mut self,
+        system: &str,
+        reason: CompactionReason,
+    ) -> Result<CompactionInfo, AgentError> {
+        let _ = self.events.send(AgentEvent::CompactionStarted { reason });
+        let operation = async {
+            if self.model.spec.protocol != Protocol::OpenAiResponses {
+                return Err(AgentError::InvalidCompactionPolicy(
+                    "native Responses compaction requires an OpenAI Responses model route"
+                        .to_owned(),
+                ));
+            }
+            if current_head_is_native_checkpoint(self.session, self.model) {
+                return Err(AgentError::InvalidCompactionPolicy(
+                    "native Responses compaction made no progress since the previous checkpoint"
+                        .to_owned(),
+                ));
+            }
+            let replay = self
+                .session
+                .responses_replay_items(&self.model.endpoint.id, &self.model.spec.id)?
+                .ok_or_else(|| {
+                    AgentError::InvalidCompactionPolicy(
+                        "native Responses compaction requires complete route-affine opaque replay"
+                            .to_owned(),
+                    )
+                })?;
+            let input = ygg_ai::responses::encode_responses_replay(
+                self.model,
+                (!system.is_empty()).then_some(system),
+                &replay,
+            );
+            let input_tokens = estimate_responses_request_tokens(&input, &[]);
+            reserve_request_cost(
+                self.session,
+                self.model,
+                input_tokens,
+                self.model.spec.limits.max_output_tokens,
+                self.max_session_cost_microdollars,
+            )?;
+            let covered_through = self.session.head().ok_or(SessionError::EmptySession)?;
+            let request = ResponsesCompactRequest {
+                model: self.model.spec.api_name.clone(),
+                input,
+                instructions: None,
+            };
+            let response = tokio::select! {
+                biased;
+                _ = self.abort.wait() => return Err(AgentError::Cancelled),
+                response = self.client.compact_responses(self.model, request) => response?,
+            };
+            if self.abort.is_set() {
+                return Err(AgentError::Cancelled);
+            }
+            let usage = response.usage;
+            let cost = self
+                .model
+                .spec
+                .pricing
+                .as_ref()
+                .and_then(|pricing| ygg_ai::pricing::cost_of(pricing, &usage).ok());
+            add_usage(self.usage, &usage);
+            self.session.record_compaction_usage(
+                self.model.endpoint.id.clone(),
+                self.model.spec.id.clone(),
+                usage,
+                cost,
+            )?;
+            self.run_cost.add(cost);
+            let checkpoint = self.session.append_responses_compaction(
+                self.model.endpoint.id.clone(),
+                self.model.spec.id.clone(),
+                response.output,
+            )?;
+            Ok(CompactionInfo {
+                kind: CompactionKind::NativeResponses {
+                    checkpoint,
+                    covered_through: covered_through.clone(),
+                },
+                summary: String::new(),
+                first_kept: covered_through,
+            })
+        }
+        .await;
+
+        let event_result = operation
+            .as_ref()
+            .map(Clone::clone)
+            .map_err(ToString::to_string);
+        let _ = self.events.send(AgentEvent::CompactionFinished {
+            reason,
+            result: event_result,
+        });
+        operation
+    }
+
     async fn compact_boundary(
         &mut self,
         first_kept: EntryId,
@@ -1599,6 +1873,7 @@ impl<'a> CompactionContext<'a> {
             return Err(error);
         }
         let info = CompactionInfo {
+            kind: CompactionKind::Local,
             summary,
             first_kept,
         };
@@ -1623,6 +1898,7 @@ impl<'a> CompactionContext<'a> {
             .saturating_sub(max_output_tokens);
         let threshold = ((self.model.spec.limits.context_window as f64) * self.threshold_fraction)
             .floor() as u64;
+        let mut native_attempted = false;
         loop {
             let active_system = active_system_prompt(system, self.session);
             let estimate = {
@@ -1631,14 +1907,37 @@ impl<'a> CompactionContext<'a> {
             };
             let over_capacity = estimate > budget;
             let over_threshold = estimate.saturating_add(max_output_tokens) > threshold;
-            if !over_capacity && (!self.enabled || !over_threshold) {
+            if !over_capacity && (self.mode == AgentCompactionMode::Disabled || !over_threshold) {
                 return Ok(CapacityEstimate {
                     input_tokens: estimate,
                     active_system,
                 });
             }
-            if !self.enabled {
+            if self.mode == AgentCompactionMode::Disabled {
                 return Err(AgentError::ContextExceeded { estimate, budget });
+            }
+            let reason = if over_capacity {
+                CompactionReason::Overflow
+            } else {
+                CompactionReason::Threshold
+            };
+            if self.mode == AgentCompactionMode::NativeResponses {
+                // One native compaction attempt per capacity check. If the
+                // provider returns an output that does not make progress, do
+                // not loop forever or silently switch to local summarization.
+                if native_attempted {
+                    if over_capacity {
+                        return Err(AgentError::ContextExceeded { estimate, budget });
+                    }
+                    return Ok(CapacityEstimate {
+                        input_tokens: estimate,
+                        active_system,
+                    });
+                }
+                self.compact_native_responses(&active_system, reason)
+                    .await?;
+                native_attempted = true;
+                continue;
             }
             // `keep_recent_turns` is a preference, not permission to sail past
             // the configured threshold. If the retained episodes themselves
@@ -1647,11 +1946,6 @@ impl<'a> CompactionContext<'a> {
                 .preferred_boundary()
                 .or_else(|| self.oldest_reducible_boundary());
             if let Some(first_kept) = boundary {
-                let reason = if over_capacity {
-                    CompactionReason::Overflow
-                } else {
-                    CompactionReason::Threshold
-                };
                 self.compact_boundary(first_kept, reason).await?;
                 continue;
             }
@@ -1671,8 +1965,13 @@ impl<'a> CompactionContext<'a> {
         tools: &[ToolDef],
         max_output_tokens: u64,
     ) -> Result<(), AgentError> {
-        let boundary = self
-            .enabled
+        if self.mode == AgentCompactionMode::NativeResponses {
+            let active_system = active_system_prompt(system, self.session);
+            self.compact_native_responses(&active_system, CompactionReason::Overflow)
+                .await?;
+            return Ok(());
+        }
+        let boundary = (self.mode == AgentCompactionMode::Local)
             .then(|| {
                 self.preferred_boundary()
                     .or_else(|| self.oldest_reducible_boundary())
@@ -1827,7 +2126,7 @@ impl Agent {
             reasoning_mode: config.reasoning_mode,
             cache_retention: config.cache_retention,
             compaction_model: None,
-            auto_compaction_enabled: true,
+            auto_compaction_mode: AgentCompactionMode::Local,
             compaction_threshold_fraction: 0.85,
             compaction_keep_recent_turns: 4,
             session_id,
@@ -1938,6 +2237,24 @@ impl Agent {
         threshold_fraction: f64,
         keep_recent_turns: usize,
     ) -> Result<(), AgentError> {
+        self.set_compaction_mode(
+            if enabled {
+                AgentCompactionMode::Local
+            } else {
+                AgentCompactionMode::Disabled
+            },
+            threshold_fraction,
+            keep_recent_turns,
+        )
+    }
+
+    /// Configure the autonomous compaction strategy for subsequent runs.
+    pub fn set_compaction_mode(
+        &mut self,
+        mode: AgentCompactionMode,
+        threshold_fraction: f64,
+        keep_recent_turns: usize,
+    ) -> Result<(), AgentError> {
         if !threshold_fraction.is_finite() || threshold_fraction <= 0.0 || threshold_fraction > 1.0
         {
             return Err(AgentError::InvalidCompactionPolicy(
@@ -1949,7 +2266,14 @@ impl Agent {
                 "keep_recent_turns must be at least 1".to_owned(),
             ));
         }
-        self.auto_compaction_enabled = enabled;
+        if mode == AgentCompactionMode::NativeResponses
+            && self.model.spec.protocol != Protocol::OpenAiResponses
+        {
+            return Err(AgentError::InvalidCompactionPolicy(
+                "native Responses compaction requires an OpenAI Responses model route".to_owned(),
+            ));
+        }
+        self.auto_compaction_mode = mode;
         self.compaction_threshold_fraction = threshold_fraction;
         self.compaction_keep_recent_turns = keep_recent_turns;
         Ok(())
@@ -1958,10 +2282,15 @@ impl Agent {
     /// Current autonomous compaction policy `(enabled, threshold, keep)`.
     pub fn compaction_policy(&self) -> (bool, f64, usize) {
         (
-            self.auto_compaction_enabled,
+            self.auto_compaction_mode != AgentCompactionMode::Disabled,
             self.compaction_threshold_fraction,
             self.compaction_keep_recent_turns,
         )
+    }
+
+    /// Current autonomous compaction strategy.
+    pub fn compaction_mode(&self) -> AgentCompactionMode {
+        self.auto_compaction_mode
     }
 
     /// Output-token reservation applied to each normal provider request.
@@ -1982,6 +2311,98 @@ impl Agent {
             &messages,
             &tools,
         ))
+    }
+
+    /// Complete route-affine Responses replay input for the active branch.
+    ///
+    /// `None` means the active route is not Responses or a legacy/crash gap
+    /// makes exact opaque replay unavailable. Route-mismatched sidecars are
+    /// returned as an explicit session error.
+    pub fn responses_replay_input(&self) -> Result<Option<ResponsesInput>, SessionError> {
+        if self.model.spec.protocol != Protocol::OpenAiResponses {
+            return Ok(None);
+        }
+        let Some(replay) = self
+            .session
+            .responses_replay_items(&self.model.endpoint.id, &self.model.spec.id)?
+        else {
+            return Ok(None);
+        };
+        let system = active_system_prompt(&self.system, &self.session);
+        Ok(Some(ygg_ai::responses::encode_responses_replay(
+            &self.model,
+            (!system.is_empty()).then_some(system.as_str()),
+            &replay,
+        )))
+    }
+
+    /// Performs one native Responses compaction while the agent is idle.
+    ///
+    /// The complete unpruned provider output is durably appended as a
+    /// route-affine branch checkpoint and becomes the next replay base.
+    pub async fn compact_responses_native(&mut self) -> Result<CompactionInfo, AgentError> {
+        if self.model.spec.protocol != Protocol::OpenAiResponses {
+            return Err(AgentError::InvalidCompactionPolicy(
+                "native Responses compaction requires an OpenAI Responses model route".to_owned(),
+            ));
+        }
+        if current_head_is_native_checkpoint(&self.session, &self.model) {
+            return Err(AgentError::InvalidCompactionPolicy(
+                "native Responses compaction made no progress since the previous checkpoint"
+                    .to_owned(),
+            ));
+        }
+        let input = self.responses_replay_input()?.ok_or_else(|| {
+            AgentError::InvalidCompactionPolicy(
+                "native Responses compaction requires complete route-affine opaque replay"
+                    .to_owned(),
+            )
+        })?;
+        let input_tokens = estimate_responses_request_tokens(&input, &[]);
+        reserve_request_cost(
+            &self.session,
+            &self.model,
+            input_tokens,
+            self.model.spec.limits.max_output_tokens,
+            self.max_session_cost_microdollars,
+        )?;
+        let covered_through = self.session.head().ok_or(SessionError::EmptySession)?;
+        let response = self
+            .client
+            .compact_responses(
+                &self.model,
+                ResponsesCompactRequest {
+                    model: self.model.spec.api_name.clone(),
+                    input,
+                    instructions: None,
+                },
+            )
+            .await?;
+        let cost = self
+            .model
+            .spec
+            .pricing
+            .as_ref()
+            .and_then(|pricing| ygg_ai::pricing::cost_of(pricing, &response.usage).ok());
+        self.session.record_compaction_usage(
+            self.model.endpoint.id.clone(),
+            self.model.spec.id.clone(),
+            response.usage,
+            cost,
+        )?;
+        let checkpoint = self.session.append_responses_compaction(
+            self.model.endpoint.id.clone(),
+            self.model.spec.id.clone(),
+            response.output,
+        )?;
+        Ok(CompactionInfo {
+            kind: CompactionKind::NativeResponses {
+                checkpoint,
+                covered_through: covered_through.clone(),
+            },
+            summary: String::new(),
+            first_kept: covered_through,
+        })
     }
 
     /// Mutable access to the session for history operations between runs
@@ -2080,21 +2501,10 @@ impl Agent {
                     ))),
                 }
             };
-            let (text, is_error) = match result {
-                Ok(output) => (output.text, false),
-                Err(error) => (error.message, true),
-            };
+            let (message, _, _, _) =
+                lower_tool_result(call.id, &result, &self.model, sandbox.max_output_bytes);
             self.session
-                .append(EntryValue::Message(Message::User(UserMessage {
-                    content: vec![UserPart::ToolResult(ToolResult {
-                        tool_call_id: call.id,
-                        content: vec![ToolResultPart::Text(truncate_tool_text(
-                            &text,
-                            sandbox.max_output_bytes,
-                        ))],
-                        is_error,
-                    })],
-                })))?;
+                .append(EntryValue::Message(Message::User(message)))?;
         }
         Ok(())
     }
@@ -2166,7 +2576,7 @@ impl Agent {
         let completion_policy = self.completion_policy;
         let max_output_tokens = self.max_output_tokens;
         let max_session_cost_microdollars = self.max_session_cost_microdollars;
-        let auto_compaction_enabled = self.auto_compaction_enabled;
+        let auto_compaction_mode = self.auto_compaction_mode;
         let compaction_threshold_fraction = self.compaction_threshold_fraction;
         let compaction_keep_recent_turns = self.compaction_keep_recent_turns;
         let stream_lifecycle = lifecycle.clone();
@@ -2280,7 +2690,7 @@ impl Agent {
                         &session_id,
                         max_session_cost_microdollars,
                         &abort,
-                        auto_compaction_enabled,
+                        auto_compaction_mode,
                         compaction_threshold_fraction,
                         compaction_keep_recent_turns,
                         &compaction_event_tx,
@@ -2320,6 +2730,7 @@ impl Agent {
                     Err(e) => break 'run FinishReason::Failed(e.into()),
                 };
                 let active_system = capacity.active_system;
+                let responses = durable_responses_options(session, &model, &active_system);
 
                 let request = Request {
                     system: if active_system.is_empty() { None } else { Some(active_system) },
@@ -2331,7 +2742,7 @@ impl Agent {
                     stop: vec![],
                     reasoning: reasoning.clone(),
                     reasoning_mode,
-                    responses: None,
+                    responses,
                     output_format: OutputFormat::Text,
                     output_modalities: OutputModalities::Text,
                     compatibility: CompatibilityMode::Strict,
@@ -2403,7 +2814,7 @@ impl Agent {
                                 &session_id,
                                 max_session_cost_microdollars,
                                 &abort,
-                                auto_compaction_enabled,
+                                auto_compaction_mode,
                                 compaction_threshold_fraction,
                                 compaction_keep_recent_turns,
                                 &compaction_event_tx,
@@ -2530,7 +2941,7 @@ impl Agent {
                                         &session_id,
                                         max_session_cost_microdollars,
                                         &abort,
-                                        auto_compaction_enabled,
+                                        auto_compaction_mode,
                                         compaction_threshold_fraction,
                                         compaction_keep_recent_turns,
                                         &compaction_event_tx,
@@ -2698,12 +3109,12 @@ impl Agent {
                     break 'run FinishReason::Failed(error.into());
                 }
                 if let Some(output) = raw_responses_output {
-                    if let Err(error) = session.append(EntryValue::ResponsesTurn {
-                        assistant: assistant_entry.clone(),
-                        endpoint: model.endpoint.id.clone(),
-                        model: model.spec.id.clone(),
+                    if let Err(error) = session.append_responses_turn(
+                        assistant_entry.clone(),
+                        model.endpoint.id.clone(),
+                        model.spec.id.clone(),
                         output,
-                    }) {
+                    ) {
                         break 'run FinishReason::Failed(error.into());
                     }
                 }
@@ -3057,32 +3468,25 @@ impl Agent {
                     // draining progress or checking abort. An abort
                     // received after this point cannot erase an already-
                     // committed result.
-                    let (raw_text, is_error) = match &result {
-                        Ok(output) => (output.text.as_str(), false),
-                        Err(error) => (error.message.as_str(), true),
-                    };
                     // Every tool owns the same configured output allowance.
                     // A large early result must never starve later successful
-                    // calls in the same model turn. Core tools already return
-                    // bounded, continuation-aware output; this defensive cap
-                    // also covers third-party tools.
-                    let text = truncate_tool_text(raw_text, sandbox.max_output_bytes);
+                    // calls in the same model turn. Structured media is lowered
+                    // only when the active model/protocol can replay it safely.
+                    let (message, accepted_media, text, is_error) = lower_tool_result(
+                        call.id.clone(),
+                        &result,
+                        &model,
+                        sandbox.max_output_bytes,
+                    );
                     terminal_action_receipts.push(TerminalActionReceipt {
                         tool: call.name.clone(),
                         arguments: call.arguments_json.clone(),
                         status: if is_error { "error" } else { "ok" },
                         result: text.clone(),
                     });
-                    let tool_result = ToolResult {
-                        tool_call_id: call.id.clone(),
-                        content: vec![ToolResultPart::Text(text)],
-                        is_error,
-                    };
-                    if let Err(e) = session.append(EntryValue::Message(Message::User(
-                        UserMessage {
-                            content: vec![UserPart::ToolResult(tool_result)],
-                        },
-                    ))) {
+                    if let Err(e) =
+                        session.append(EntryValue::Message(Message::User(message)))
+                    {
                         break 'run FinishReason::Failed(e.into());
                     }
 
@@ -3137,6 +3541,11 @@ impl Agent {
                     }
 
                     stream_context.tool_finished();
+                    let result = match result {
+                        Ok(_output) if is_error => Err(ToolError::new(text.clone())),
+                        Ok(output) => Ok(output.without_media_payloads_for(accepted_media)),
+                        Err(error) => Err(error),
+                    };
                     let ev = AgentEvent::ToolFinished {
                         id: call.id.clone(),
                         result,
@@ -3432,6 +3841,265 @@ mod tests {
         assert!(
             estimate < 10_000,
             "inline image bytes were miscounted as text tokens: {estimate}"
+        );
+    }
+
+    fn tool_media_model(protocol: Protocol, modalities: ygg_ai::ModalitySet) -> Model {
+        let base = ygg_ai::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let mut spec = (*base.spec).clone();
+        spec.protocol = protocol;
+        spec.capabilities.input_modalities = modalities;
+        Model {
+            spec: Arc::new(spec),
+            endpoint: base.endpoint,
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_image_stays_inside_the_paired_result() {
+        let model = tool_media_model(
+            Protocol::AnthropicMessages,
+            ygg_ai::ModalitySet::none().with(ygg_ai::Modality::Image),
+        );
+        let result = Ok(ToolOutput::new("read=image").with_media(Media::image_bytes(
+            bytes::Bytes::from_static(b"png"),
+            "image/png".parse().unwrap(),
+        )));
+        let (message, accepted, _, is_error) =
+            lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
+        assert_eq!(accepted, vec![ToolOutputMediaKind::Image]);
+        assert!(!is_error);
+        assert_eq!(message.content.len(), 1);
+        let UserPart::ToolResult(result) = &message.content[0] else {
+            panic!("tool result must remain first");
+        };
+        assert!(matches!(
+            result.content.get(1),
+            Some(ToolResultPart::Media(Media::Image(_)))
+        ));
+    }
+
+    #[test]
+    fn openai_chat_wav_and_mp3_follow_the_paired_tool_result() {
+        let model = tool_media_model(
+            Protocol::OpenAiChat,
+            ygg_ai::ModalitySet::none().with(ygg_ai::Modality::Audio),
+        );
+        for format in [ygg_ai::AudioFormat::Wav, ygg_ai::AudioFormat::Mp3] {
+            let result = Ok(ToolOutput::new("read=audio").with_media(Media::audio_bytes(
+                bytes::Bytes::from_static(b"audio"),
+                format,
+            )));
+            let (message, accepted, _, is_error) =
+                lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
+            assert_eq!(accepted, vec![ToolOutputMediaKind::Audio]);
+            assert!(!is_error);
+            assert!(matches!(message.content[0], UserPart::ToolResult(_)));
+            assert!(matches!(
+                message.content[1],
+                UserPart::Media(Media::Audio(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn unsupported_tool_audio_is_an_error_without_media_or_indicator() {
+        let responses = tool_media_model(
+            Protocol::OpenAiResponses,
+            ygg_ai::ModalitySet::none().with(ygg_ai::Modality::Audio),
+        );
+        let audio = Ok(ToolOutput::new("read=audio").with_media(Media::audio_bytes(
+            bytes::Bytes::from_static(b"audio"),
+            ygg_ai::AudioFormat::Wav,
+        )));
+        let (message, accepted, text, is_error) =
+            lower_tool_result(ygg_ai::ToolCallId("call".into()), &audio, &responses, 4096);
+        assert!(accepted.is_empty());
+        assert!(is_error);
+        assert!(text.contains("protocol cannot replay audio"));
+        assert_eq!(message.content.len(), 1);
+
+        let chat = tool_media_model(
+            Protocol::OpenAiChat,
+            ygg_ai::ModalitySet::none().with(ygg_ai::Modality::Audio),
+        );
+        let aac = Ok(ToolOutput::new("read=audio").with_media(Media::audio_bytes(
+            bytes::Bytes::from_static(b"audio"),
+            ygg_ai::AudioFormat::Aac,
+        )));
+        let (message, accepted, text, is_error) =
+            lower_tool_result(ygg_ai::ToolCallId("call".into()), &aac, &chat, 4096);
+        assert!(accepted.is_empty());
+        assert!(is_error);
+        assert!(text.contains("accepts WAV or MP3"));
+        assert_eq!(message.content.len(), 1);
+    }
+
+    #[test]
+    fn exact_responses_replay_estimate_counts_opaque_provider_payloads() {
+        use ygg_ai::{ModelCatalog, ModelId, ResponsesItem, ResponsesOutput};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        let model = ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-5.4-mini-responses".into()))
+            .unwrap();
+        session
+            .append(user_message(UserInput::from("small prompt")))
+            .unwrap();
+        let assistant = session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("small answer".into())],
+                model: model.spec.id.clone(),
+                protocol: Protocol::OpenAiResponses,
+            })))
+            .unwrap();
+        session
+            .append_responses_turn(
+                assistant,
+                model.endpoint.id.clone(),
+                model.spec.id.clone(),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_large",
+                    "encrypted_content": "x".repeat(40_000),
+                    "unknown": {"phase": "analysis"}
+                }))
+                .unwrap()]),
+            )
+            .unwrap();
+
+        let messages = session.context().unwrap();
+        let canonical = estimate_request_tokens("system", &messages, &[]);
+        let estimate = reconcile_context_estimate(&session, &model, "system", &messages, &[]);
+        assert!(
+            estimate.structural_tokens > canonical.saturating_add(8_000),
+            "opaque replay must drive the structural estimate: canonical={canonical}, replay={}",
+            estimate.structural_tokens
+        );
+        assert_eq!(estimate.provider_tokens, None);
+
+        let options = durable_responses_options(&session, &model, "system").unwrap();
+        assert!(options.input.is_some());
+        assert_eq!(options.previous_response_id, None);
+        assert!(!options.store);
+    }
+
+    #[test]
+    fn native_checkpoint_estimate_excludes_compacted_canonical_media() {
+        use ygg_ai::{ModelCatalog, ModelId, ResponsesItem, ResponsesOutput};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        let model = ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-5.4-mini-responses".into()))
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Media(Media::image_bytes(
+                    bytes::Bytes::from(vec![7u8; 1024 * 1024]),
+                    "image/png".parse().unwrap(),
+                ))],
+            })))
+            .unwrap();
+        let assistant = session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("seen".into())],
+                model: model.spec.id.clone(),
+                protocol: Protocol::OpenAiResponses,
+            })))
+            .unwrap();
+        session
+            .append_responses_turn(
+                assistant,
+                model.endpoint.id.clone(),
+                model.spec.id.clone(),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "message",
+                    "id": "old-output"
+                }))
+                .unwrap()]),
+            )
+            .unwrap();
+        session
+            .append_responses_compaction(
+                model.endpoint.id.clone(),
+                model.spec.id.clone(),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "compaction",
+                    "id": "small-checkpoint",
+                    "encrypted_content": "opaque"
+                }))
+                .unwrap()]),
+            )
+            .unwrap();
+
+        let messages = session.context().unwrap();
+        let estimate = reconcile_context_estimate(
+            &session,
+            &model,
+            "system must already be compacted",
+            &messages,
+            &[],
+        );
+        assert!(
+            estimate.structural_tokens < 1_000,
+            "compacted-away media leaked into the replay estimate: {estimate:?}"
+        );
+        let input =
+            exact_responses_replay_input(&session, &model, "system must already be compacted")
+                .unwrap();
+        let wire = serde_json::to_string(&input).unwrap();
+        assert!(wire.contains("small-checkpoint"));
+        assert!(!wire.contains("system must already be compacted"));
+    }
+
+    #[tokio::test]
+    async fn native_compaction_honors_the_session_cost_limit_before_network() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        session
+            .append(user_message(UserInput::from("compact this")))
+            .unwrap();
+        let model = ygg_ai::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ygg_ai::ModelId("gpt-5.4-mini-responses".into()))
+            .unwrap();
+        let mut agent = Agent::new(AgentConfig {
+            client: AiClient::new(),
+            model,
+            session,
+            system: "system".into(),
+            sandbox: SandboxConfig::new(directory.path()),
+            extensions: ExtensionHost::new(),
+            max_turns: Some(1),
+            reasoning: ReasoningConfig::Off,
+            reasoning_mode: ReasoningMode::Standard,
+            cache_retention: CacheRetention::Short,
+            session_id: None,
+        })
+        .unwrap();
+        agent.set_max_session_cost_microdollars(Some(0));
+
+        let error = agent.compact_responses_native().await.unwrap_err();
+        assert!(matches!(error, AgentError::CostLimit { limit: 0, .. }));
+        assert!(
+            !matches!(
+                agent
+                    .session()
+                    .head_ref()
+                    .and_then(|head| agent.session().entry(head)),
+                Some(crate::session::Entry {
+                    value: EntryValue::ResponsesCompaction { .. },
+                    ..
+                })
+            ),
+            "a rejected native request must not persist a checkpoint"
         );
     }
 

@@ -12,7 +12,8 @@ use tokio::time::{Interval, MissedTickBehavior};
 #[cfg(unix)]
 use ygg_agent::extension_process::ProcessGroupGuard;
 use ygg_agent::{
-    analyze_session_cache_stats, AgentError, AgentEvent, EntryId, Run, RunControl, Session,
+    analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId, Run,
+    RunControl, Session,
 };
 use ygg_ai::{ModelId, ReasoningConfig, ReasoningMode, ToolCallId};
 
@@ -27,7 +28,7 @@ use crate::commands::{self, Command};
 use crate::compaction::{
     attempt_compaction, context_window, estimate_next_request_tokens, CompactionOutcome,
 };
-use crate::config::ThinkingLevel;
+use crate::config::{CompactionMode, ThinkingLevel};
 use crate::modes::RunEnded;
 use crate::prompts::{render_and_record, RenderedPrompt};
 use crate::resources::{compose_instructions, validate_skill_requirements};
@@ -311,6 +312,10 @@ where
                         shell.render();
                     }
                     InputAction::CycleThinking => return Ok(Idle::CycleThinking),
+                    InputAction::ClearEditor => {
+                        shell.clear_editor();
+                        shell.render();
+                    }
                     InputAction::Close => {
                         shell.clear_error();
                         shell.render();
@@ -318,9 +323,7 @@ where
                     InputAction::Submit(_) => return Ok(Idle::Submit(shell.drain_composed())),
                     InputAction::Command(_) => return Ok(Idle::Command(shell.drain_editor())),
                     InputAction::Closed => return Ok(Idle::Quit),
-                    InputAction::Ignore
-                    | InputAction::Abort
-                    | InputAction::Steer(_) => {}
+                    InputAction::Ignore | InputAction::Abort | InputAction::Steer(_) => {}
                 }
             }
             // Mouse/trackpad events arrive in bursts. Apply every delta to
@@ -928,6 +931,10 @@ where
                         shell.set_run_preparing(run_id, "cancelling");
                         shell.render();
                     }
+                    InputAction::ClearEditor => {
+                        shell.clear_editor();
+                        shell.render();
+                    }
                     InputAction::Steer(_) => {
                         if !aborting {
                             let composed = shell.drain_composed();
@@ -1300,6 +1307,29 @@ fn report_compaction(shell: &mut InteractiveShell, outcome: &CompactionOutcome, 
                 shell.error("compaction completed without a durable summary marker".to_owned());
             }
         }
+        CompactionOutcome::NativeCompacted => {
+            let usage = session
+                .usage_records()
+                .iter()
+                .rev()
+                .find(|record| matches!(record.kind, ygg_agent::UsageRecordKind::Compaction));
+            let detail = usage.map_or_else(
+                || "opaque Responses state retained".to_owned(),
+                |record| {
+                    let cost = record
+                        .cost_microdollars
+                        .map(commands::format_microdollars)
+                        .unwrap_or_else(|| "cost unavailable".to_owned());
+                    let prompt_tokens = record
+                        .usage
+                        .input_tokens
+                        .saturating_add(record.usage.cache_read_tokens)
+                        .saturating_add(record.usage.cache_write_tokens);
+                    format!("{prompt_tokens} input tokens compacted · {cost} compaction cost")
+                },
+            );
+            shell.native_compaction_marker(format!("Context compacted natively · {detail}"));
+        }
         CompactionOutcome::Skipped { reason } => {
             shell.notice(format!("compaction skipped: {reason}"))
         }
@@ -1312,26 +1342,50 @@ fn configure_auto_compaction(
     setting: Option<commands::AutoCompactSetting>,
 ) -> anyhow::Result<()> {
     match setting {
-        Some(commands::AutoCompactSetting::Enabled(enabled)) => {
-            app.config.compaction.enabled = enabled;
+        Some(commands::AutoCompactSetting::Mode(mode)) => {
+            if mode == CompactionMode::NativeResponses
+                && app.model.spec.protocol != ygg_ai::Protocol::OpenAiResponses
+            {
+                shell.error(format!(
+                    "native Responses compaction is unavailable for {:?}; select an OpenAI Responses model or use local compaction",
+                    app.model.spec.protocol
+                ));
+                return Ok(());
+            }
+            if mode == CompactionMode::NativeResponses
+                && app
+                    .config
+                    .compaction
+                    .compact_model
+                    .as_ref()
+                    .is_some_and(|model| model != &app.model.spec.id)
+            {
+                shell.error(
+                    "native Responses compaction requires compaction.compact_model to match the active model"
+                        .to_owned(),
+                );
+                return Ok(());
+            }
+            app.config.compaction.mode = mode;
         }
         Some(commands::AutoCompactSetting::ThresholdPercent(percent)) => {
             app.config.compaction.threshold_fraction = f64::from(percent) / 100.0;
         }
         None => {}
     }
-    app.agent.set_compaction_policy(
-        app.config.compaction.enabled,
+    let agent_mode = match app.config.compaction.mode {
+        CompactionMode::Disabled => AgentCompactionMode::Disabled,
+        CompactionMode::Local => AgentCompactionMode::Local,
+        CompactionMode::NativeResponses => AgentCompactionMode::NativeResponses,
+    };
+    app.agent.set_compaction_mode(
+        agent_mode,
         app.config.compaction.threshold_fraction,
         app.config.compaction.keep_recent_turns,
     )?;
     shell.notice(format!(
         "auto-compaction {} at {:.0}% · keep {} recent turns · this process",
-        if app.config.compaction.enabled {
-            "on"
-        } else {
-            "off"
-        },
+        app.config.compaction.mode.label(),
         app.config.compaction.threshold_fraction * 100.0,
         app.config.compaction.keep_recent_turns,
     ));

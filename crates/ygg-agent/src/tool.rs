@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use ygg_ai::ToolDef;
+use ygg_ai::{Media, ToolDef};
 
 use crate::sandbox::{self, SandboxConfig};
 /// Whether an unresolved call may be executed automatically after reopening a
@@ -681,17 +681,90 @@ impl ToolContext<'_> {
     }
 }
 
-/// Successful tool output: compact, line-oriented text for the model.
+/// Media kind attached to a successful tool output.
+///
+/// This small metadata enum is safe to pass to presentation layers without
+/// copying or exposing the underlying binary payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolOutputMediaKind {
+    /// An image that the model can inspect with vision.
+    Image,
+    /// Audio that the model can hear or transcribe.
+    Audio,
+}
+
+impl ToolOutputMediaKind {
+    fn from_media(media: &Media) -> Self {
+        match media {
+            Media::Image(_) => Self::Image,
+            Media::Audio(_) => Self::Audio,
+        }
+    }
+}
+
+/// Successful tool output: compact text plus optional structured media.
 #[derive(Clone, Debug)]
 pub struct ToolOutput {
     /// Compact, line-oriented text optimized for LLM consumption.
     pub text: String,
+    media: Vec<Media>,
+    media_kinds: Vec<ToolOutputMediaKind>,
 }
 
 impl ToolOutput {
     /// Creates a tool output from text.
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            media: Vec::new(),
+            media_kinds: Vec::new(),
+        }
+    }
+
+    /// Attaches one structured image or audio payload to this output.
+    ///
+    /// Agent hosts persist supported media as canonical tool-result parts (or
+    /// as an adjacent user-media part when the target protocol cannot carry
+    /// media inside a tool result).
+    pub fn with_media(mut self, media: Media) -> Self {
+        self.media_kinds
+            .push(ToolOutputMediaKind::from_media(&media));
+        self.media.push(media);
+        self
+    }
+
+    /// Returns the structured media payloads for canonical persistence.
+    pub fn media(&self) -> &[Media] {
+        &self.media
+    }
+
+    /// Returns presentation-safe media metadata without exposing payloads.
+    pub fn media_kinds(&self) -> &[ToolOutputMediaKind] {
+        &self.media_kinds
+    }
+
+    /// Returns a copy suitable for observers and presentation layers.
+    ///
+    /// Text and media-kind metadata remain available, while binary payloads
+    /// stay inside the agent's persistence boundary.
+    pub fn without_media_payloads(&self) -> Self {
+        self.without_media_payloads_for(self.media_kinds.iter().copied())
+    }
+
+    /// Returns a presentation copy containing only successfully ingested
+    /// media kinds.
+    ///
+    /// Hosts use this after protocol/capability lowering so an unsupported
+    /// payload cannot produce a misleading vision or audio indicator.
+    pub fn without_media_payloads_for(
+        &self,
+        media_kinds: impl IntoIterator<Item = ToolOutputMediaKind>,
+    ) -> Self {
+        Self {
+            text: self.text.clone(),
+            media: Vec::new(),
+            media_kinds: media_kinds.into_iter().collect(),
+        }
     }
 }
 
@@ -740,6 +813,22 @@ mod tests {
             content_hash(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn tool_output_presentation_copy_keeps_kind_but_drops_payload() {
+        let media = Media::image_bytes(
+            Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
+            "image/png".parse().unwrap(),
+        );
+        let output = ToolOutput::new("read=vision").with_media(media);
+        assert_eq!(output.media().len(), 1);
+        assert_eq!(output.media_kinds(), &[ToolOutputMediaKind::Image]);
+
+        let presentation = output.without_media_payloads();
+        assert_eq!(presentation.text, "read=vision");
+        assert!(presentation.media().is_empty());
+        assert_eq!(presentation.media_kinds(), &[ToolOutputMediaKind::Image]);
     }
 
     // ── ToolProgressSink unit tests ──────────────────────────────────────

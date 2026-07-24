@@ -2,6 +2,7 @@
 
 use crate::app::{reasoning_label, App, Reconfig};
 use crate::compaction::{context_window, estimate_next_request_tokens};
+use crate::config::CompactionMode;
 use crate::presentation::{format_token_rate, ModelDisplayMetadata};
 use crate::session_store::active_branch_title;
 use ygg_agent::{
@@ -50,7 +51,7 @@ pub enum Command {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoCompactSetting {
-    Enabled(bool),
+    Mode(CompactionMode),
     ThresholdPercent(u8),
 }
 
@@ -132,7 +133,7 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
     slash!("compact", "/compact", "compact conversation context", false),
     slash!(
         "auto-compact",
-        "/auto-compact [on|off|85%]",
+        "/auto-compact [off|local|native|85%]",
         "show or configure automatic compaction",
         true
     ),
@@ -322,10 +323,18 @@ pub fn parse(input: &str) -> Command {
         "auto-compact" => match argument.as_deref() {
             None => Command::AutoCompact(None),
             Some("on" | "true" | "yes") => {
-                Command::AutoCompact(Some(AutoCompactSetting::Enabled(true)))
+                Command::AutoCompact(Some(AutoCompactSetting::Mode(CompactionMode::Local)))
             }
             Some("off" | "false" | "no") => {
-                Command::AutoCompact(Some(AutoCompactSetting::Enabled(false)))
+                Command::AutoCompact(Some(AutoCompactSetting::Mode(CompactionMode::Disabled)))
+            }
+            Some("local") => {
+                Command::AutoCompact(Some(AutoCompactSetting::Mode(CompactionMode::Local)))
+            }
+            Some("native" | "native-responses" | "native_responses" | "responses") => {
+                Command::AutoCompact(Some(AutoCompactSetting::Mode(
+                    CompactionMode::NativeResponses,
+                )))
             }
             Some(value) => value
                 .strip_suffix('%')
@@ -821,7 +830,13 @@ mod tests {
         assert_eq!(parse("/auto-compact"), Command::AutoCompact(None));
         assert_eq!(
             parse("/auto-compact off"),
-            Command::AutoCompact(Some(AutoCompactSetting::Enabled(false)))
+            Command::AutoCompact(Some(AutoCompactSetting::Mode(CompactionMode::Disabled)))
+        );
+        assert_eq!(
+            parse("/auto-compact native"),
+            Command::AutoCompact(Some(AutoCompactSetting::Mode(
+                CompactionMode::NativeResponses
+            )))
         );
         assert_eq!(
             parse("/auto-compact 85%"),

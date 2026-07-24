@@ -8,7 +8,8 @@ use ygg_ai::ModelId;
 
 use crate::app::bootstrap::resolve_model_id;
 use crate::config::{
-    self, ColorMode, CompactionPolicy, Config, Mode, ResumeSelector, SandboxPolicy, ToolPolicy,
+    self, ColorMode, CompactionMode, CompactionPolicy, Config, Mode, ResumeSelector, SandboxPolicy,
+    ToolPolicy,
 };
 use crate::session_commands::SessionCommand;
 
@@ -178,6 +179,9 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct CompactionLayer {
+    #[serde(alias = "policy")]
+    mode: Option<String>,
+    /// Deprecated boolean spelling retained for existing configuration.
     enabled: Option<bool>,
     threshold_fraction: Option<f64>,
     keep_recent_turns: Option<usize>,
@@ -251,8 +255,12 @@ impl ConfigLayer {
         override_some!(trusted_extensions);
         match (self.compaction.as_mut(), newer.compaction) {
             (Some(current), Some(newer)) => {
-                if newer.enabled.is_some() {
+                if newer.mode.is_some() {
+                    current.mode = newer.mode;
+                    current.enabled = None;
+                } else if newer.enabled.is_some() {
                     current.enabled = newer.enabled;
+                    current.mode = None;
                 }
                 if newer.threshold_fraction.is_some() {
                     current.threshold_fraction = newer.threshold_fraction;
@@ -533,6 +541,7 @@ where
 
 #[cfg(not(test))]
 fn environment_layer() -> anyhow::Result<ConfigLayer> {
+    let compaction_mode = env_value("YGG_COMPACTION_MODE");
     let compaction_enabled = env_parse("YGG_AUTO_COMPACT")?;
     let threshold_fraction = env_parse("YGG_COMPACTION_THRESHOLD_FRACTION")?;
     let keep_recent_turns = env_parse("YGG_COMPACTION_KEEP_RECENT_TURNS")?;
@@ -565,11 +574,13 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         offline: env_parse("YGG_OFFLINE")?,
         enabled_extensions: env_value("YGG_EXTENSIONS").map(split_names),
         trusted_extensions: env_value("YGG_TRUSTED_EXTENSIONS").map(split_names),
-        compaction: (compaction_enabled.is_some()
+        compaction: (compaction_mode.is_some()
+            || compaction_enabled.is_some()
             || threshold_fraction.is_some()
             || keep_recent_turns.is_some()
             || compact_model.is_some())
         .then_some(CompactionLayer {
+            mode: compaction_mode,
             enabled: compaction_enabled,
             threshold_fraction,
             keep_recent_turns,
@@ -739,9 +750,12 @@ fn build_config_with_global_path(
 
     let mut compaction = CompactionPolicy::default();
     if let Some(layer) = values.compaction {
-        if let Some(value) = layer.enabled {
-            compaction.enabled = value;
-        }
+        compaction.mode = match (layer.mode, layer.enabled) {
+            (Some(value), _) => CompactionMode::parse(&value)?,
+            (None, Some(true)) => CompactionMode::Local,
+            (None, Some(false)) => CompactionMode::Disabled,
+            (None, None) => compaction.mode,
+        };
         if let Some(value) = layer.threshold_fraction {
             if !value.is_finite() || value <= 0.0 || value > 1.0 {
                 anyhow::bail!("compaction.threshold_fraction must be greater than 0 and at most 1");
@@ -1261,6 +1275,29 @@ mod tests {
         assert_eq!(compaction.enabled, Some(false));
         assert_eq!(compaction.compact_model.as_deref(), Some("cheap"));
         assert_eq!(compaction.keep_recent_turns, Some(2));
+    }
+
+    #[test]
+    fn explicit_compaction_mode_and_legacy_enabled_map_without_silent_fallback() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "[compaction]\nmode = 'native-responses'\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.compaction.mode, CompactionMode::NativeResponses);
+
+        std::fs::write(&global, "[compaction]\nenabled = true\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.compaction.mode, CompactionMode::Local);
+
+        std::fs::write(&global, "[compaction]\nenabled = false\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.compaction.mode, CompactionMode::Disabled);
     }
 
     // --- persist_model_to_path ---

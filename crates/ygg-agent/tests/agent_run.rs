@@ -138,6 +138,33 @@ fn openai_text_turn(text: &str) -> String {
     )
 }
 
+fn openai_tool_turn(calls: &[(&str, &str, serde_json::Value)]) -> String {
+    let mut body = String::new();
+    for (index, (id, name, arguments)) in calls.iter().enumerate() {
+        let chunk = serde_json::json!({
+            "id": "chat-tools",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": index,
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments.to_string(),
+                        },
+                    }],
+                },
+            }],
+        });
+        body += &format!("data: {chunk}\n\n");
+    }
+    body += "data: {\"id\":\"chat-tools\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+    body += "data: [DONE]\n\n";
+    body
+}
+
 /// A syntactically valid stream prefix with visible output but no terminal
 /// message event. Closing the HTTP body after this prefix reproduces the
 /// provider/proxy disconnect that used to fail long Ygg runs.
@@ -1929,6 +1956,70 @@ async fn multiple_sequential_tool_calls_execute_in_order_and_coalesce() {
     let last_message = requests[1]["messages"].as_array().unwrap().last().unwrap();
     assert_eq!(last_message["role"], "user");
     assert_eq!(count_tool_results(last_message), 2);
+}
+
+#[tokio::test]
+async fn parallel_media_tool_results_precede_the_adjacent_user_message_on_the_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Script {
+            bodies: vec![
+                openai_tool_turn(&[
+                    ("call_a", "read", serde_json::json!({"path": "a.png"})),
+                    ("call_b", "read", serde_json::json!({"path": "b.png"})),
+                ]),
+                openai_text_turn("both images received"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("a.png"), b"\x89PNG\r\n\x1a\nfirst").unwrap();
+    std::fs::write(workspace.path().join("b.png"), b"\x89PNG\r\n\x1a\nsecond").unwrap();
+    let mut agent = build_agent_with_reasoning(
+        openai_multimodal_model(&server.uri()),
+        &sessions.path().join("parallel-media.jsonl"),
+        workspace.path(),
+        ReasoningConfig::Off,
+        Some(4),
+    );
+
+    let output = agent.complete("read both images").await.unwrap();
+    assert_eq!(output.text, "both images received");
+
+    let requests = wire_requests(&server).await;
+    assert_eq!(requests.len(), 2);
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let tool_call_turn = messages
+        .iter()
+        .rposition(|message| {
+            message["role"] == "assistant"
+                && message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| calls.len() == 2)
+        })
+        .expect("parallel tool-call turn");
+    let follow_up = &messages[tool_call_turn + 1..];
+    let roles: Vec<_> = follow_up
+        .iter()
+        .map(|message| message["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, vec!["tool", "tool", "user"]);
+    assert_eq!(follow_up[0]["tool_call_id"], "call_a");
+    assert_eq!(follow_up[1]["tool_call_id"], "call_b");
+    assert_eq!(
+        follow_up[2]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|part| part["type"] == "image_url")
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
