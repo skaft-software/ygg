@@ -24,6 +24,13 @@ missing_docs = "warn"
 # (Enforced per-module where relevant; kept off the workspace default to avoid
 # false positives on legitimate f32 sampling knobs like `temperature`.)
 
+[profile.dev]
+# Keep incremental compilation on for fast iteration, but use a low
+# codegen-unit count to reduce the number of parallel compilation units
+# (each one produces incremental artifacts that accumulate over time).
+# Cargo's default is 16 for dev builds; 1 gives the fewest artifacts.
+codegen-units = 1
+
 [profile.release]
 # The interactive binary is latency- and footprint-sensitive. Thin LTO keeps
 # most of the cross-crate wins without the much longer full-LTO link, while a

@@ -626,12 +626,14 @@ impl<'a> TUI<'a> {
         let size_changed = self
             .previous_size
             .is_some_and(|size| size != (width, height));
+        let width_changed = self
+            .previous_size
+            .is_some_and(|(previous_width, _)| previous_width != width);
 
-        let lazy_update = (!size_changed
-            && self
-                .overlays
-                .iter()
-                .all(|entry| entry.handle.borrow().hidden)
+        let lazy_update = (self
+            .overlays
+            .iter()
+            .all(|entry| entry.handle.borrow().hidden)
             && (self.capabilities.plain
                 || (self.inline_scrollback
                     && self.capabilities.cursor_addressing
@@ -641,8 +643,12 @@ impl<'a> TUI<'a> {
         let previous_len = self.previous_frame.len();
         // A prefix beyond the retained frame cannot be validated. Fall back to
         // the component's full renderer rather than pairing its replacement
-        // with the wrong historic rows.
-        let lazy_update = lazy_update.filter(|update| update.stable_prefix <= previous_len);
+        // with the wrong historic rows. Width reflow likewise requires a full
+        // replacement, but retaining a zero-prefix update preserves pinned
+        // viewport metadata across both width and height changes.
+        let lazy_update = lazy_update.filter(|update| {
+            update.stable_prefix <= previous_len && (!width_changed || update.stable_prefix == 0)
+        });
         let reanchor_viewport = lazy_update
             .as_ref()
             .is_some_and(|update| update.reanchor_viewport);
@@ -853,6 +859,23 @@ impl<'a> TUI<'a> {
         frame_change_hints: Option<&FrameChangeHints>,
     ) {
         let rows = usize::from(height.max(1));
+        if size_changed {
+            // Match Pi's resize contract: terminal reflow invalidates every
+            // retained physical-row assumption, so clear both the grid and
+            // saved lines and rebuild once at the new dimensions. Components
+            // with a live-region seam replay only committed history plus the
+            // current viewport, keeping provisional output out of scrollback.
+            if let Some(boundary) = commit_boundary {
+                self.rebuild_inline_pinned_scrollback(
+                    new_lines,
+                    rows,
+                    boundary.min(new_lines.len()),
+                );
+            } else {
+                self.rebuild_inline_scrollback(new_lines, rows);
+            }
+            return;
+        }
         if let Some(boundary) = commit_boundary {
             let boundary = boundary.min(new_lines.len());
             if rebuild_scrollback {
@@ -1126,7 +1149,14 @@ impl<'a> TUI<'a> {
         let commit_target = commit_boundary
             .min(desired_window_top)
             .max(self.inline_committed_rows);
-        let window_top = desired_window_top.max(commit_target);
+        // The commit ledger is monotonic because terminal-owned history cannot
+        // be pulled back onto the grid. The viewport is not: final Markdown
+        // parsing and shrinking chrome can move its logical top backward.
+        // Keeping the two coordinates coupled omits rows from the new viewport,
+        // paints the composer too high, and leaves stale transcript/chrome
+        // beneath it. Repaint the actual bottom-aligned window while retaining
+        // the higher ledger so those historic rows are never committed twice.
+        let window_top = desired_window_top;
         let window = &new_lines[window_top.min(new_lines.len())..];
         let commit_advanced = commit_target > self.inline_committed_rows;
 
@@ -1753,6 +1783,29 @@ mod tests {
         fn invalidate(&mut self) {}
     }
 
+    struct LazyPinnedLines {
+        lines: Rc<RefCell<Vec<String>>>,
+        commit_boundary: Rc<Cell<usize>>,
+    }
+
+    impl Component for LazyPinnedLines {
+        fn render(&self, _width: u16) -> Vec<String> {
+            self.lines.borrow().clone()
+        }
+
+        fn render_update(&self, _width: u16) -> Option<FrameUpdate> {
+            Some(FrameUpdate {
+                stable_prefix: 0,
+                replacement: self.lines.borrow().clone(),
+                commit_boundary: Some(self.commit_boundary.get()),
+                reanchor_viewport: false,
+                rebuild_scrollback: false,
+            })
+        }
+
+        fn invalidate(&mut self) {}
+    }
+
     struct LazyReanchoredLines {
         lines: Rc<RefCell<Vec<String>>>,
         reanchor: Rc<Cell<bool>>,
@@ -1813,6 +1866,59 @@ mod tests {
             "unchanged physical cells were repainted: {:?}",
             writes.borrow()
         );
+    }
+
+    #[test]
+    fn pinned_window_shrink_repaints_from_the_new_viewport_top() {
+        let size = Rc::new(Cell::new((40, 4)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            false,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.first_render = false;
+        tui.previous_frame = [
+            "settled 0",
+            "settled 1",
+            "settled 2",
+            "settled 3",
+            "old visible 4",
+            "old visible 5",
+            "empty composer",
+            "footer",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        tui.inline_committed_rows = 4;
+        tui.inline_window_top = 4;
+        tui.inline_bottom_row = 3;
+
+        // Finalizing streamed Markdown can reduce the logical row count after
+        // rows above the old viewport have already entered native scrollback.
+        // The new grid must still begin at its actual bottom-aligned viewport
+        // top; the committed-row ledger is not a lower bound for that top.
+        let shrunk = [
+            "settled 0",
+            "settled 1",
+            "settled 2",
+            "new visible 3",
+            "new visible 4",
+            "typed composer",
+            "footer",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let previous_window = tui.previous_frame[4..].to_vec();
+        tui.write_inline_pinned(&shrunk, 4, 7, false, &previous_window);
+
+        let output = writes.borrow().join("");
+        assert!(output.contains("new visible 3"), "{output:?}");
+        assert_eq!(tui.inline_committed_rows, 4);
+        assert_eq!(tui.inline_window_top, 3);
+        assert_eq!(tui.inline_bottom_row, 3);
     }
 
     #[test]
@@ -2101,9 +2207,10 @@ mod tests {
         assert!(delete_at < replacement_at, "{output:?}");
         assert_eq!(
             clears.get(),
-            0,
-            "resize must not push the old grid into native scrollback"
+            1,
+            "Pi-compatible resize must clear the old grid before rebuilding"
         );
+        assert!(output.contains("\x1b[3J"), "{output:?}");
     }
 
     #[test]
@@ -2591,7 +2698,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_scrollback_resize_repaints_only_the_visible_tail() {
+    fn inline_scrollback_resize_rebuilds_at_the_new_dimensions() {
         let size = Rc::new(Cell::new((20, 3)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
@@ -2618,16 +2725,63 @@ mod tests {
             .replace("\u{1b}[0m\u{1b}]8;;\u{1b}\\", "");
         assert_eq!(
             clears.get(),
-            clears_before,
-            "inline resize must preserve terminal-owned history"
+            clears_before + 1,
+            "Pi-compatible resize must clear and rebuild the terminal"
         );
-        // Only the last `height` logical lines are repainted; earlier retained
-        // rows remain virtual and are not emitted during resize.
+        assert!(repaint.contains("\x1b[3J"), "{repaint:?}");
         assert!(
-            repaint.contains("row 2\nrow 3\nrow 4\nrow 5"),
+            repaint.contains("row 0\nrow 1\nrow 2\nrow 3\nrow 4\nrow 5"),
             "{repaint:?}"
         );
-        assert!(!repaint.contains("row 1"));
+    }
+
+    #[test]
+    fn pinned_resize_updates_the_window_origin_before_the_next_diff() {
+        let size = Rc::new(Cell::new((30, 4)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size.clone(), capabilities);
+        let lines = Rc::new(RefCell::new(
+            [
+                "history 0",
+                "history 1",
+                "history 2",
+                "history 3",
+                "visible 4",
+                "visible 5",
+                "empty composer",
+                "footer",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        ));
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.set_inline_scrollback(true);
+        tui.add_child(Box::new(LazyPinnedLines {
+            lines: lines.clone(),
+            commit_boundary: Rc::new(Cell::new(8)),
+        }));
+        tui.start();
+        assert_eq!(tui.inline_window_top, 4);
+
+        // Growing and widening the terminal pulls two logical rows into the
+        // viewport and invalidates wrapping. Losing pinned metadata on this
+        // repaint leaves `inline_window_top` at four, so the next composer
+        // diff is addressed two rows too high.
+        size.set((50, 6));
+        tui.request_render();
+        assert_eq!(tui.inline_window_top, 2);
+        assert_eq!(tui.inline_bottom_row, 5);
+
+        writes.borrow_mut().clear();
+        lines.borrow_mut()[6] = "typed composer".into();
+        tui.request_render();
+        let output = writes.borrow().join("");
+        assert!(output.contains("\x1b[5;1H"), "{output:?}");
+        assert!(output.contains("typed composer"), "{output:?}");
     }
 
     #[test]

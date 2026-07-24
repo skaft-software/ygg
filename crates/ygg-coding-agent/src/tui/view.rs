@@ -1662,15 +1662,6 @@ pub(crate) fn semantic_separator(theme: &YggTheme) -> &str {
     theme.glyph("separator")
 }
 
-fn compact_thought_duration(duration: Duration) -> String {
-    let rounded = duration.as_secs_f64().round().max(1.0) as u64;
-    if rounded < 60 {
-        format!("{rounded}s")
-    } else {
-        format!("{}m{:02}s", rounded / 60, rounded % 60)
-    }
-}
-
 fn mix_rgb(base: (u8, u8, u8), accent: (u8, u8, u8), amount: f64) -> (u8, u8, u8) {
     let channel = |base: u8, accent: u8| {
         (f64::from(base) + (f64::from(accent) - f64::from(base)) * amount)
@@ -1723,15 +1714,13 @@ fn live_reasoning_label(theme: &YggTheme, reasoning: &AssistantBlock) -> String 
 }
 
 fn collapsed_reasoning_lines(theme: &YggTheme, reasoning: &AssistantBlock) -> Vec<String> {
-    let label = if reasoning.finished {
-        let text = reasoning.reasoning_elapsed.map_or_else(
-            || "thought".to_owned(),
-            |elapsed| format!("thought for {}", compact_thought_duration(elapsed)),
-        );
-        theme.model_fg(reasoning.model_lab, &theme.italic(&text))
-    } else {
-        theme.bold(&live_reasoning_label(theme, reasoning))
-    };
+    // Finished reasoning leaves no trace in the transcript when collapsed.
+    // The live spinner is enough feedback while the model is working, and
+    // Ctrl+O (verbose) reveals everything via the expanded path.
+    if reasoning.finished {
+        return Vec::new();
+    }
+    let label = theme.bold(&live_reasoning_label(theme, reasoning));
     let elbow = if theme.capabilities().unicode {
         "└"
     } else {
@@ -10872,11 +10861,10 @@ mod tests {
         reasoning.reasoning_elapsed = Some(Duration::from_millis(13_700));
         reasoning.finish_reasoning();
         let settled = render_reasoning(&reasoning, &renderer, &theme, 80, false);
-        assert_eq!(strip_terminal_sequences(&settled[0]), "thought for 14s");
-        assert_eq!(strip_terminal_sequences(&settled[1]), "└ ctrl+o to expand");
-        assert!(settled[0].contains("\x1b[3m"), "{settled:?}");
-        assert!(settled[0].contains("\x1b[38;2;"), "{settled:?}");
-        assert!(!settled[0].contains("\x1b[1m"), "{settled:?}");
+        assert!(
+            settled.is_empty(),
+            "finished reasoning leaves no trace when collapsed"
+        );
     }
 
     #[test]
@@ -10909,9 +10897,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let collapsed = render(&shell);
-        assert_eq!(collapsed.len(), 2, "{collapsed:?}");
-        assert!(collapsed[0].contains("thought"), "{collapsed:?}");
-        assert!(collapsed[1].contains("ctrl+o to expand"), "{collapsed:?}");
+        assert_eq!(collapsed.len(), 0, "{collapsed:?}");
         assert!(!collapsed.join("\n").contains(source));
         let state = shell.state.borrow();
         let TranscriptBlock::Reasoning(reasoning) = &state.transcript[0] else {
@@ -11020,9 +11006,10 @@ mod tests {
         .expect("prompt line");
         let reasoning_block = render_block(
             None,
-            &TranscriptBlock::Reasoning(Box::new(AssistantBlock::finalized_reasoning(
-                "Thinking about `Session`".into(),
-            ))),
+            &TranscriptBlock::Reasoning(Box::new(
+                AssistantBlock::streaming_reasoning("Thinking about `Session`")
+                    .with_model_lab(Some(ModelLab::Unknown)),
+            )),
             &theme,
             &theme.rich_renderer(),
             &theme.reasoning_renderer(),
@@ -11081,7 +11068,7 @@ mod tests {
             "inline code should be coloured"
         );
         assert!(
-            strip_terminal_sequences(&reasoning_block).starts_with("  thought"),
+            strip_terminal_sequences(&reasoning_block).starts_with("  ⠹ thinking"),
             "thinking shares the transcript inset: {reasoning_block:?}"
         );
         assert!(reasoning.contains("Session"));
@@ -12675,9 +12662,11 @@ mod tests {
             80,
             false,
         );
-        assert_eq!(collapsed_reasoning.len(), 2);
-        assert!(strip_terminal_sequences(&collapsed_reasoning[0]).contains("thought"));
-        assert!(strip_terminal_sequences(&collapsed_reasoning[1]).contains("ctrl+o to expand"));
+        assert_eq!(
+            collapsed_reasoning.len(),
+            0,
+            "finished reasoning produces no collapsed lines when hidden: {collapsed_reasoning:?}"
+        );
         let first_visible = render_block(
             Some(&hidden_reasoning),
             &current,
@@ -12715,8 +12704,14 @@ mod tests {
         let at_breakpoint = render_block(None, &reasoning, &theme, &renderer, &renderer, 72, false);
         let below_breakpoint =
             render_block(None, &reasoning, &theme, &renderer, &renderer, 71, false);
-        assert!(strip_terminal_sequences(&at_breakpoint.join("\n")).contains("thought"));
-        assert!(strip_terminal_sequences(&below_breakpoint.join("\n")).contains("thought"));
+        assert!(
+            at_breakpoint.is_empty(),
+            "finished reasoning leaves no collapsed trace"
+        );
+        assert!(
+            below_breakpoint.is_empty(),
+            "finished reasoning leaves no collapsed trace"
+        );
 
         let args = serde_json::json!({"command": "cargo check"});
         let tool = TranscriptBlock::Tool(Box::new(ToolPanel::new(
