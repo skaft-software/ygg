@@ -235,6 +235,7 @@ pub(crate) mod harness {
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: true,
+                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: crate::types::OpenAiChatReasoningMode::Standard,
                     min_effort: crate::types::ReasoningEffort::Minimal,

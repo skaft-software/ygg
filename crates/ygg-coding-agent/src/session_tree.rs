@@ -132,6 +132,7 @@ mod tests {
         EntryValue::Config {
             model: Some(model.to_owned()),
             reasoning: None,
+            reasoning_mode: None,
         }
     }
 

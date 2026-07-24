@@ -106,7 +106,7 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
             biased;
             _ = crate::tui::terminal::wait_for_shutdown_signal() => {
                 control.abort();
-                ygg_agent::extension_process::terminate_exec_process_groups(
+                ygg_agent::extension_process::terminate_bash_process_groups(
                     std::time::Duration::from_millis(400),
                 )
                 .await;

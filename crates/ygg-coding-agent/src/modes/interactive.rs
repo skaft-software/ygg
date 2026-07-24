@@ -14,7 +14,7 @@ use ygg_agent::extension_process::ProcessGroupGuard;
 use ygg_agent::{
     analyze_session_cache_stats, AgentError, AgentEvent, EntryId, Run, RunControl, Session,
 };
-use ygg_ai::{ModelId, ReasoningConfig, ToolCallId};
+use ygg_ai::{ModelId, ReasoningConfig, ReasoningMode, ToolCallId};
 
 use crate::app::bootstrap::{
     build_app, estimate_text_tokens, rebuild_app, resolve_launch_interactive, Bootstrap,
@@ -35,8 +35,8 @@ use crate::session_tree::render_session_tree;
 use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
-    confirmation_picker, extension_confirmation_picker, optional_model_picker, session_picker,
-    theme_picker, thinking_picker, tool_input_picker,
+    confirmation_picker, extension_confirmation_picker, optional_model_picker,
+    reasoning_mode_picker, session_picker, theme_picker, thinking_picker, tool_input_picker,
 };
 use crate::tui::theme::{
     available_themes, background_from_terminal_rgb, load_named_theme_for_background, load_theme,
@@ -817,7 +817,7 @@ where
                 shell.restore_queued_steering();
                 shell.set_run_preparing(run_id, "shutting down");
                 shell.render();
-                ygg_agent::extension_process::terminate_exec_process_groups(
+                ygg_agent::extension_process::terminate_bash_process_groups(
                     Duration::from_millis(400),
                 )
                 .await;
@@ -1054,7 +1054,7 @@ where
                                 shell.restore_queued_steering();
                                 shell.set_run_preparing(run_id, "shutting down");
                                 shell.render();
-                                ygg_agent::extension_process::terminate_exec_process_groups(
+                                ygg_agent::extension_process::terminate_bash_process_groups(
                                     Duration::from_millis(400),
                                 )
                                 .await;
@@ -1348,7 +1348,7 @@ async fn reload_resources(
         let mut app = app;
         app.system = compose_instructions(&app.config)?;
         app.system_tokens = estimate_text_tokens(&app.system);
-        let app = rebuild_app(app, None, None, None)?;
+        let app = rebuild_app(app, None, None, None, None)?;
         let theme = load_theme_for_background(&app.config, background);
         Ok((app, theme))
     })
@@ -1365,7 +1365,10 @@ fn next_model_id(app: &App) -> anyhow::Result<ModelId> {
 }
 
 fn next_thinking_level(app: &App) -> anyhow::Result<ThinkingLevel> {
-    let levels = supported_levels(&app.model);
+    let mut levels = supported_levels(&app.model);
+    if app.reasoning_mode == ReasoningMode::Pro {
+        levels.retain(|level| *level != ThinkingLevel::Off);
+    }
     let current = level_from_reasoning(&app.reasoning, &app.model)?;
     let index = levels
         .iter()
@@ -1375,6 +1378,36 @@ fn next_thinking_level(app: &App) -> anyhow::Result<ThinkingLevel> {
         .get((index + 1) % levels.len())
         .copied()
         .ok_or_else(|| anyhow::anyhow!("no thinking levels are available"))
+}
+
+async fn thinking_configuration_picker(
+    app: &App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<Option<(ReasoningMode, ThinkingLevel)>> {
+    let supports_pro = app
+        .model
+        .spec
+        .capabilities
+        .reasoning
+        .as_ref()
+        .is_some_and(|capability| capability.supports_pro_mode);
+    let mode = if supports_pro {
+        let Some(mode) = reasoning_mode_picker(shell, input, app.reasoning_mode).await? else {
+            return Ok(None);
+        };
+        mode
+    } else {
+        ReasoningMode::Standard
+    };
+    let mut levels = supported_levels(&app.model);
+    if mode == ReasoningMode::Pro {
+        levels.retain(|level| *level != ThinkingLevel::Off);
+    }
+    let Some(level) = thinking_picker(shell, input, &levels).await? else {
+        return Ok(None);
+    };
+    Ok(Some((mode, level)))
 }
 
 fn next_model_id_in_catalog(
@@ -1424,6 +1457,7 @@ async fn checkout_entry(
         app.agent.session_mut().checkout(EntryId(id.clone()))?;
         match rebuild_app(
             app,
+            None,
             None,
             None,
             Some(crate::app::bootstrap::SessionSelection::OpenExisting(
@@ -1523,7 +1557,24 @@ async fn apply_pending_actions(
                 if let Err(e) = crate::cli::persist_reasoning(&reasoning_label(&reasoning)) {
                     shell.error(format!("failed to save thinking preference: {e}"));
                 }
-                app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
+                if reasoning == ReasoningConfig::Off && app.reasoning_mode == ReasoningMode::Pro {
+                    if let Err(error) = crate::cli::persist_reasoning_mode(ReasoningMode::Standard)
+                    {
+                        shell.error(format!("failed to save reasoning mode preference: {error}"));
+                    }
+                    app = transition(
+                        app,
+                        shell,
+                        input,
+                        Reconfig::ThinkingMode {
+                            mode: ReasoningMode::Standard,
+                            reasoning,
+                        },
+                    )
+                    .await?;
+                } else {
+                    app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
+                }
                 shell.notice("queued thinking change applied");
             }
             PendingIdleAction::ChangeThinkingLevel(level) => {
@@ -1590,11 +1641,20 @@ async fn apply_pending_actions(
                 }
             }
             PendingIdleAction::PickThinking => {
-                if let Some(level) =
-                    thinking_picker(shell, input, &supported_levels(&app.model)).await?
+                if let Some((mode, level)) =
+                    thinking_configuration_picker(&app, shell, input).await?
                 {
+                    if let Err(error) = crate::cli::persist_reasoning_mode(mode) {
+                        shell.error(format!("failed to save reasoning mode preference: {error}"));
+                    }
                     let reasoning = thinking_to_reasoning(level, &app.model)?;
-                    app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
+                    app = transition(
+                        app,
+                        shell,
+                        input,
+                        Reconfig::ThinkingMode { mode, reasoning },
+                    )
+                    .await?;
                     shell.notice("queued thinking change applied");
                 }
             }
@@ -2052,7 +2112,23 @@ async fn run_idle_command(
             if let Err(e) = crate::cli::persist_reasoning(level.label()) {
                 shell.error(format!("failed to save thinking preference: {e}"));
             }
-            app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
+            if level == ThinkingLevel::Off && app.reasoning_mode == ReasoningMode::Pro {
+                if let Err(error) = crate::cli::persist_reasoning_mode(ReasoningMode::Standard) {
+                    shell.error(format!("failed to save reasoning mode preference: {error}"));
+                }
+                app = transition(
+                    app,
+                    shell,
+                    input,
+                    Reconfig::ThinkingMode {
+                        mode: ReasoningMode::Standard,
+                        reasoning,
+                    },
+                )
+                .await?;
+            } else {
+                app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
+            }
             shell.notice("thinking changed");
         }
         Command::Model(None) => {
@@ -2065,11 +2141,18 @@ async fn run_idle_command(
             }
         }
         Command::Thinking(None) => {
-            if let Some(level) =
-                thinking_picker(shell, input, &supported_levels(&app.model)).await?
-            {
+            if let Some((mode, level)) = thinking_configuration_picker(&app, shell, input).await? {
+                if let Err(error) = crate::cli::persist_reasoning_mode(mode) {
+                    shell.error(format!("failed to save reasoning mode preference: {error}"));
+                }
                 let reasoning = thinking_to_reasoning(level, &app.model)?;
-                app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
+                app = transition(
+                    app,
+                    shell,
+                    input,
+                    Reconfig::ThinkingMode { mode, reasoning },
+                )
+                .await?;
                 shell.notice("thinking changed");
             }
         }
@@ -2327,7 +2410,7 @@ fn rendered_shell_captures(
 
 async fn shutdown_for_exit(app: &mut App) {
     if crate::tui::terminal::received_shutdown_signal().is_some() {
-        ygg_agent::extension_process::terminate_exec_process_groups(Duration::from_millis(400))
+        ygg_agent::extension_process::terminate_bash_process_groups(Duration::from_millis(400))
             .await;
         let _ = tokio::time::timeout(
             Duration::from_millis(1400),
@@ -2462,7 +2545,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 }
             }
             Idle::Submit(mut composed) => {
-                // Shell escapes have the same authority as the model `exec`
+                // Shell escapes have the same authority as the model `bash`
                 // tool and executable extensions. Never let this local UX
                 // bypass the product-wide process gate.
                 if let Some(command) = composed
@@ -2515,7 +2598,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         }
                     };
                     #[cfg(unix)]
-                    let group_guard = ProcessGroupGuard::exec(child.id());
+                    let group_guard = ProcessGroupGuard::bash(child.id());
 
                     // Animate a braille spinner while the process runs.
                     const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -2534,7 +2617,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         BoundedShellOutput::new(stderr_budget),
                     ));
                     let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
-                    let command_timeout = Duration::from_secs(app.config.sandbox.exec_timeout_secs);
+                    let command_timeout = Duration::from_secs(app.config.sandbox.bash_timeout_secs);
                     #[cfg(unix)]
                     let command_started = tokio::time::Instant::now();
                     let stdout_capture = stdout.clone();
@@ -2630,7 +2713,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         #[cfg(unix)]
                         {
                             let process_cleanup =
-                                ygg_agent::extension_process::terminate_exec_process_groups(
+                                ygg_agent::extension_process::terminate_bash_process_groups(
                                     Duration::from_millis(400),
                                 );
                             let _ = tokio::time::timeout(Duration::from_millis(500), async {
@@ -2668,7 +2751,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         }
                     } else {
                         #[cfg(unix)]
-                        group_guard.supervise_exec_descendants(
+                        group_guard.supervise_bash_descendants(
                             command_timeout.saturating_sub(command_started.elapsed()),
                             Default::default(),
                         );
@@ -2693,7 +2776,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                             } else if timed_out {
                                 combined.push_str(&format!(
                                     "command exceeded the {}s execution limit",
-                                    app.config.sandbox.exec_timeout_secs
+                                    app.config.sandbox.bash_timeout_secs
                                 ));
                             } else {
                                 combined.push_str(&format!("process error: {error}"));
@@ -2981,12 +3064,14 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("model".to_string()),
                 reasoning: Some("off".to_string()),
+                reasoning_mode: None,
             })
             .unwrap();
         let child = session
             .append(EntryValue::Config {
                 model: None,
                 reasoning: Some("high".to_string()),
+                reasoning_mode: None,
             })
             .unwrap();
         session.checkout(root.clone()).unwrap();
@@ -3005,12 +3090,14 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("model".to_string()),
                 reasoning: Some("off".to_string()),
+                reasoning_mode: None,
             })
             .unwrap();
         let target = session
             .append(EntryValue::Config {
                 model: Some("missing-model".to_string()),
                 reasoning: None,
+                reasoning_mode: None,
             })
             .unwrap();
         session.checkout(target).unwrap();
@@ -3205,6 +3292,7 @@ mod tests {
             extensions,
             max_turns: Some(4),
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: ygg_ai::ReasoningMode::Standard,
             cache_retention: ygg_ai::CacheRetention::default(),
             session_id: None,
         })

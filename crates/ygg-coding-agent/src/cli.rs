@@ -65,6 +65,9 @@ pub struct Cli {
     /// Reasoning: off, minimal, low, medium, high, xhigh, max, or budget=N.
     #[arg(long)]
     pub reasoning: Option<String>,
+    /// Reasoning execution mode: standard or pro. Pro requires an entitled ChatGPT OAuth model.
+    #[arg(long, value_name = "MODE")]
+    pub reasoning_mode: Option<String>,
     /// Prompt-cache retention: none, short, or long.
     #[arg(long, value_name = "POLICY")]
     pub cache_retention: Option<String>,
@@ -156,15 +159,18 @@ pub struct Cli {
     /// Explicitly enable command execution (overrides a disabling user setting).
     #[arg(long)]
     pub allow_shell: bool,
+    /// Bash-compatible shell executable used by the `bash` tool.
+    #[arg(long, value_name = "PATH")]
+    pub shell_path: Option<PathBuf>,
     /// Do not load global or workspace AGENTS.md files.
     #[arg(long)]
     pub no_context_files: bool,
     /// Disable optional provider/model discovery network requests at startup.
     #[arg(long)]
     pub offline: bool,
-    /// Maximum execution time in seconds.
-    #[arg(long)]
-    pub exec_timeout_secs: Option<u64>,
+    /// Maximum `bash` tool execution time in seconds.
+    #[arg(long, alias = "exec-timeout-secs")]
+    pub bash_timeout_secs: Option<u64>,
     /// Maximum persisted tool output size in bytes.
     #[arg(long)]
     pub max_output_bytes: Option<usize>,
@@ -182,6 +188,7 @@ struct CompactionLayer {
 struct ConfigLayer {
     model: Option<String>,
     reasoning: Option<String>,
+    reasoning_mode: Option<String>,
     cache_retention: Option<String>,
     theme: Option<String>,
     color: Option<String>,
@@ -192,7 +199,9 @@ struct ConfigLayer {
     allow_write: Option<bool>,
     allow_process: Option<bool>,
     allow_shell: Option<bool>,
-    exec_timeout_secs: Option<u64>,
+    shell_path: Option<PathBuf>,
+    #[serde(alias = "exec_timeout_secs")]
+    bash_timeout_secs: Option<u64>,
     max_output_bytes: Option<usize>,
     session_dir: Option<PathBuf>,
     max_turns: Option<u64>,
@@ -217,6 +226,7 @@ impl ConfigLayer {
         }
         override_some!(model);
         override_some!(reasoning);
+        override_some!(reasoning_mode);
         override_some!(cache_retention);
         override_some!(theme);
         override_some!(color);
@@ -227,7 +237,8 @@ impl ConfigLayer {
         override_some!(allow_write);
         override_some!(allow_process);
         override_some!(allow_shell);
-        override_some!(exec_timeout_secs);
+        override_some!(shell_path);
+        override_some!(bash_timeout_secs);
         override_some!(max_output_bytes);
         override_some!(session_dir);
         override_some!(max_turns);
@@ -287,8 +298,8 @@ impl ConfigLayer {
         tighten_bool(&mut self.allow_shell, project.allow_shell.take());
         tighten_bool(&mut self.context_files, project.context_files.take());
         lower_u64(
-            &mut self.exec_timeout_secs,
-            project.exec_timeout_secs.take(),
+            &mut self.bash_timeout_secs,
+            project.bash_timeout_secs.take(),
         );
         lower_usize(&mut self.max_output_bytes, project.max_output_bytes.take());
         lower_u64(&mut self.max_turns, project.max_turns.take());
@@ -333,6 +344,17 @@ pub fn persist_reasoning(reasoning: &str) -> anyhow::Result<()> {
         anyhow::anyhow!("cannot persist reasoning: user home directory is unavailable")
     })?;
     persist_key_to_path("reasoning", reasoning, &path)
+}
+
+pub fn persist_reasoning_mode(mode: ygg_ai::ReasoningMode) -> anyhow::Result<()> {
+    let path = global_config_path().ok_or_else(|| {
+        anyhow::anyhow!("cannot persist reasoning mode: user home directory is unavailable")
+    })?;
+    let value = match mode {
+        ygg_ai::ReasoningMode::Standard => "standard",
+        ygg_ai::ReasoningMode::Pro => "pro",
+    };
+    persist_key_to_path("reasoning_mode", value, &path)
 }
 
 fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow::Result<()> {
@@ -518,6 +540,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
     Ok(ConfigLayer {
         model: env_value("YGG_MODEL"),
         reasoning: env_value("YGG_REASONING"),
+        reasoning_mode: env_value("YGG_REASONING_MODE"),
         cache_retention: env_value("YGG_CACHE_RETENTION")
             .or_else(|| env_value("PI_CACHE_RETENTION")),
         theme: env_value("YGG_THEME"),
@@ -529,7 +552,9 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         allow_write: env_parse("YGG_ALLOW_WRITE")?,
         allow_process: env_parse("YGG_ALLOW_PROCESS")?,
         allow_shell: env_parse("YGG_ALLOW_SHELL")?,
-        exec_timeout_secs: env_parse("YGG_EXEC_TIMEOUT_SECS")?,
+        shell_path: env_value("YGG_SHELL_PATH").map(PathBuf::from),
+        bash_timeout_secs: env_parse("YGG_BASH_TIMEOUT_SECS")?
+            .or(env_parse("YGG_EXEC_TIMEOUT_SECS")?),
         max_output_bytes: env_parse("YGG_MAX_OUTPUT_BYTES")?,
         session_dir: env_value("YGG_SESSION_DIR").map(PathBuf::from),
         max_turns: env_parse("YGG_MAX_TURNS")?,
@@ -577,6 +602,7 @@ fn build_config_with_global_path(
 
     let model_explicit = cli.model.is_some();
     let reasoning_explicit = cli.reasoning.is_some();
+    let reasoning_mode_explicit = cli.reasoning_mode.is_some();
 
     // A missing home directory disables global config. Never reinterpret the
     // invocation directory as user scope: that would let an untrusted project
@@ -603,6 +629,14 @@ fn build_config_with_global_path(
     let reasoning = match cli.reasoning.as_deref().or(values.reasoning.as_deref()) {
         Some(value) => config::parse_reasoning(value)?,
         None => ygg_ai::ReasoningConfig::Off,
+    };
+    let reasoning_mode = match cli
+        .reasoning_mode
+        .as_deref()
+        .or(values.reasoning_mode.as_deref())
+    {
+        Some(value) => config::parse_reasoning_mode(value)?,
+        None => ygg_ai::ReasoningMode::Standard,
     };
     let cache_retention = match cli
         .cache_retention
@@ -637,8 +671,11 @@ fn build_config_with_global_path(
     if let Some(value) = values.allow_shell {
         sandbox.allow_shell = value;
     }
-    if let Some(value) = values.exec_timeout_secs {
-        sandbox.exec_timeout_secs = value;
+    if let Some(value) = values.shell_path {
+        sandbox.shell_path = Some(value);
+    }
+    if let Some(value) = values.bash_timeout_secs {
+        sandbox.bash_timeout_secs = value;
     }
     if let Some(value) = values.max_output_bytes {
         sandbox.max_output_bytes = value;
@@ -660,13 +697,16 @@ fn build_config_with_global_path(
         sandbox.allow_process = true;
         sandbox.allow_shell = true;
     }
-    if let Some(value) = cli.exec_timeout_secs {
-        sandbox.exec_timeout_secs = value;
+    if let Some(value) = cli.shell_path {
+        sandbox.shell_path = Some(value);
+    }
+    if let Some(value) = cli.bash_timeout_secs {
+        sandbox.bash_timeout_secs = value;
     }
     if let Some(value) = cli.max_output_bytes {
         sandbox.max_output_bytes = value;
     }
-    sandbox.exec_timeout_secs = sandbox.exec_timeout_secs.clamp(1, 3_600);
+    sandbox.bash_timeout_secs = sandbox.bash_timeout_secs.clamp(1, 3_600);
     sandbox.max_output_bytes = sandbox.max_output_bytes.clamp(1_024, 1024 * 1024);
 
     let mut tools = match cli.tools {
@@ -685,7 +725,7 @@ fn build_config_with_global_path(
         tools.exclude("write")?;
     }
     if cli.no_process || cli.no_shell {
-        tools.exclude("exec")?;
+        tools.exclude("bash")?;
     }
     if !sandbox.allow_edit {
         tools.exclude("edit")?;
@@ -694,7 +734,7 @@ fn build_config_with_global_path(
         tools.exclude("write")?;
     }
     if !(sandbox.allow_process && sandbox.allow_shell) {
-        tools.exclude("exec")?;
+        tools.exclude("bash")?;
     }
 
     let mut compaction = CompactionPolicy::default();
@@ -754,6 +794,8 @@ fn build_config_with_global_path(
         model_explicit,
         reasoning,
         reasoning_explicit,
+        reasoning_mode,
+        reasoning_mode_explicit,
         cache_retention,
         sandbox,
         theme: cli.theme.or(values.theme),
@@ -822,6 +864,7 @@ mod tests {
             resume: None,
             model: None,
             reasoning: None,
+            reasoning_mode: None,
             cache_retention: None,
             workspace: None,
             theme: None,
@@ -849,9 +892,10 @@ mod tests {
             no_process: false,
             no_shell: false,
             allow_shell: false,
+            shell_path: None,
             no_context_files: false,
             offline: false,
-            exec_timeout_secs: None,
+            bash_timeout_secs: None,
             max_output_bytes: None,
         }
     }
@@ -878,6 +922,21 @@ mod tests {
         cli.color = Some("never".into());
         let config = config_with_empty_global(cli, directory.path()).unwrap();
         assert_eq!(config.color, ColorMode::Never);
+    }
+
+    #[test]
+    fn shell_path_and_bash_timeout_resolve_from_cli() {
+        let directory = cwd();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.shell_path = Some(PathBuf::from("/opt/homebrew/bin/bash"));
+        cli.bash_timeout_secs = Some(45);
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(
+            config.sandbox.shell_path,
+            Some(PathBuf::from("/opt/homebrew/bin/bash"))
+        );
+        assert_eq!(config.sandbox.bash_timeout_secs, 45);
     }
 
     #[test]
@@ -945,7 +1004,19 @@ mod tests {
 
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
+        cli.reasoning_mode = Some("pro".into());
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(config.reasoning_mode, ygg_ai::ReasoningMode::Pro);
+        assert!(config.reasoning_mode_explicit);
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
         cli.reasoning = Some("nonsense".into());
+        assert!(config_with_empty_global(cli, directory.path()).is_err());
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.reasoning_mode = Some("turbo".into());
         assert!(config_with_empty_global(cli, directory.path()).is_err());
     }
 
@@ -1020,7 +1091,7 @@ mod tests {
         assert_eq!(config.session_dir, PathBuf::from("global-sessions"));
         assert!(!config.tools.enabled("edit"));
         assert!(!config.tools.enabled("write"));
-        assert!(!config.tools.enabled("exec"));
+        assert!(!config.tools.enabled("bash"));
     }
 
     #[test]

@@ -547,7 +547,7 @@ struct ToolPanel {
     model_lab: Option<crate::tui::theme::ModelLab>,
     /// Lazily cached diff scan. `None` means not yet computed.
     cached_diff: RefCell<Option<Option<String>>>,
-    /// Lazily cached metadata string for completed exec results.
+    /// Lazily cached metadata string for completed bash results.
     cached_metadata: RefCell<Option<Option<String>>>,
 }
 
@@ -706,6 +706,8 @@ pub(crate) enum PanelAction {
     SelectSession(Vec<std::path::PathBuf>),
     /// Select a thinking level.
     SelectThinking(Vec<crate::config::ThinkingLevel>),
+    /// Select a reasoning execution mode.
+    SelectReasoningMode(Vec<ygg_ai::ReasoningMode>),
     /// Select a theme name.
     SelectTheme(Vec<String>),
     /// Confirm or deny a typed executable-extension request.
@@ -2217,7 +2219,12 @@ fn without_redundant_tool_lead(tool: &str, text: &str) -> String {
     let redundant = match tool {
         "read" => matches!(first, "read" | "reading"),
         "search" => matches!(first, "search" | "searched" | "searching" | "explored"),
-        "exec" => matches!(first, "exec" | "run" | "ran" | "running" | "failed:"),
+        "bash" | "exec" => {
+            matches!(
+                first,
+                "bash" | "exec" | "run" | "ran" | "running" | "failed:"
+            )
+        }
         "edit" => matches!(first, "edit" | "edited" | "updating" | "updated"),
         "write" => matches!(first, "write" | "wrote" | "writing"),
         _ => matches!(first, "run" | "running" | "finished") || first == tool,
@@ -2238,12 +2245,12 @@ fn tool_metadata(panel: &ToolPanel) -> Option<String> {
     result
 }
 
-/// Locate the final canonical `exec` result after any live progress bytes.
-/// The exec tool streams output while it runs, then emits a durable envelope
+/// Locate the final canonical `bash` result after any live progress bytes.
+/// The bash tool streams output while it runs, then emits a durable envelope
 /// containing the exit status and bounded stdout/stderr capture. The panel
 /// retains both, so presentation should prefer the last envelope without
 /// mutating the stored tool result.
-fn final_exec_result(output: &str) -> &str {
+fn final_bash_result(output: &str) -> &str {
     for (index, _) in output.rmatch_indices("exit=") {
         let candidate = &output[index..];
         let mut lines = candidate.lines();
@@ -2255,14 +2262,14 @@ fn final_exec_result(output: &str) -> &str {
             continue;
         }
         let next = lines.next().unwrap_or_default().trim();
-        if index == 0 || next == "(no output)" || is_exec_stream_header(next) {
+        if index == 0 || next == "(no output)" || is_bash_stream_header(next) {
             return candidate;
         }
     }
     output
 }
 
-fn is_exec_stream_header(line: &str) -> bool {
+fn is_bash_stream_header(line: &str) -> bool {
     ["stdout", "stderr"].into_iter().any(|stream| {
         let Some(detail) = line
             .strip_prefix(stream)
@@ -2280,20 +2287,20 @@ fn is_exec_stream_header(line: &str) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ExecCaptureTruncation {
+struct BashCaptureTruncation {
     stream: &'static str,
     omitted_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct CompactExecOutput {
+struct CompactBashOutput {
     lines: Vec<String>,
     omitted_lines: usize,
-    capture_truncations: Vec<ExecCaptureTruncation>,
+    capture_truncations: Vec<BashCaptureTruncation>,
     panel_elided: bool,
 }
 
-fn exec_capture_footer(line: &str) -> Option<(&'static str, &str)> {
+fn bash_capture_footer(line: &str) -> Option<(&'static str, &str)> {
     ["stdout", "stderr"].into_iter().find_map(|stream| {
         line.strip_prefix("truncated_")
             .and_then(|line| line.strip_prefix(stream))
@@ -2302,7 +2309,7 @@ fn exec_capture_footer(line: &str) -> Option<(&'static str, &str)> {
     })
 }
 
-fn is_exec_complete_footer(line: &str) -> bool {
+fn is_bash_complete_footer(line: &str) -> bool {
     ["stdout", "stderr"].into_iter().any(|stream| {
         line.strip_prefix("complete_")
             .and_then(|line| line.strip_prefix(stream))
@@ -2312,12 +2319,12 @@ fn is_exec_complete_footer(line: &str) -> bool {
 
 /// Project a bounded result into Pi-style tail output. Protocol envelope lines
 /// are excluded; capture loss is retained separately because Ctrl+O can reveal
-/// UI-tail omissions but cannot recover bytes discarded by the exec tool.
-fn compact_exec_output(panel: &ToolPanel, expanded: bool) -> CompactExecOutput {
-    let result = sanitize_for_terminal(final_exec_result(&panel.output));
+/// UI-tail omissions but cannot recover bytes discarded by the bash tool.
+fn compact_bash_output(panel: &ToolPanel, expanded: bool) -> CompactBashOutput {
+    let result = sanitize_for_terminal(final_bash_result(&panel.output));
     let mut capture_truncations = Vec::new();
     for line in result.lines().map(str::trim) {
-        let Some((stream, detail)) = exec_capture_footer(line) else {
+        let Some((stream, detail)) = bash_capture_footer(line) else {
             continue;
         };
         if detail == "false" {
@@ -2327,7 +2334,7 @@ fn compact_exec_output(panel: &ToolPanel, expanded: bool) -> CompactExecOutput {
             .split_whitespace()
             .find_map(|part| part.strip_prefix("omitted_bytes:"))
             .and_then(|count| count.parse::<usize>().ok());
-        capture_truncations.push(ExecCaptureTruncation {
+        capture_truncations.push(BashCaptureTruncation {
             stream,
             omitted_bytes,
         });
@@ -2351,12 +2358,12 @@ fn compact_exec_output(panel: &ToolPanel, expanded: bool) -> CompactExecOutput {
             expect_stream_header = true;
             continue;
         }
-        if expect_stream_header && is_exec_stream_header(trimmed) {
+        if expect_stream_header && is_bash_stream_header(trimmed) {
             protocol_error = false;
             expect_stream_header = false;
             continue;
         }
-        if exec_capture_footer(trimmed).is_some() || is_exec_complete_footer(trimmed) {
+        if bash_capture_footer(trimmed).is_some() || is_bash_complete_footer(trimmed) {
             expect_stream_header = true;
             continue;
         }
@@ -2386,7 +2393,7 @@ fn compact_exec_output(panel: &ToolPanel, expanded: bool) -> CompactExecOutput {
         }
         omitted_lines
     };
-    CompactExecOutput {
+    CompactBashOutput {
         lines: content,
         omitted_lines,
         capture_truncations,
@@ -2395,10 +2402,10 @@ fn compact_exec_output(panel: &ToolPanel, expanded: bool) -> CompactExecOutput {
 }
 
 fn compute_tool_metadata(panel: &ToolPanel) -> Option<String> {
-    if panel.name != "exec" {
+    if !matches!(panel.name.as_str(), "bash" | "exec") {
         return None;
     }
-    let output = final_exec_result(&panel.output);
+    let output = final_bash_result(&panel.output);
     if let Some(duration) = output
         .lines()
         .next()
@@ -2419,14 +2426,14 @@ fn compute_tool_metadata(panel: &ToolPanel) -> Option<String> {
     None
 }
 
-fn render_compact_exec_output(
+fn render_compact_bash_output(
     panel: &ToolPanel,
     theme: &YggTheme,
     width: u16,
     expanded: bool,
     show_tool_duration: bool,
 ) -> Vec<String> {
-    let compact = compact_exec_output(panel, expanded);
+    let compact = compact_bash_output(panel, expanded);
     let ellipsis = if theme.unicode() { "…" } else { "..." };
     let mut lines = Vec::new();
     let mut first_detail = true;
@@ -2498,7 +2505,7 @@ fn render_compact_exec_output(
     lines
 }
 
-fn render_exec_row(
+fn render_bash_row(
     command: &str,
     renderer: &RichRenderer,
     theme: &YggTheme,
@@ -2878,9 +2885,7 @@ fn event_margin_marker(
         TranscriptBlock::Tool(panel) if panel.is_error => {
             Some(theme.settled_event_dot("error", dot))
         }
-        TranscriptBlock::Tool(panel)
-            if matches!(panel.name.as_str(), "exec" | "write" | "edit") =>
-        {
+        TranscriptBlock::Tool(panel) if matches!(panel.name.as_str(), "bash" | "exec") => {
             Some(theme.settled_event_dot("success", dot))
         }
         TranscriptBlock::Shell(shell) if shell.running => Some(if active_dot_visible {
@@ -3013,9 +3018,10 @@ fn render_block_planned(
             content_background,
         ),
         TranscriptBlock::Tool(panel) => {
-            let compact_exec = panel.name == "exec" && panel.display.shell_command.is_some();
+            let compact_bash = matches!(panel.name.as_str(), "bash" | "exec")
+                && panel.display.shell_command.is_some();
             let mut lines = if let Some(command) = panel.display.shell_command.as_deref() {
-                render_exec_row(command, rich_renderer, theme, width)
+                render_bash_row(command, rich_renderer, theme, width)
             } else {
                 let compact = width < 60;
                 let summary = if !panel.finished {
@@ -3056,7 +3062,7 @@ fn render_block_planned(
 
             if !panel.is_error {
                 match panel.name.as_str() {
-                    "exec" if compact_exec => lines.extend(render_compact_exec_output(
+                    "bash" | "exec" if compact_bash => lines.extend(render_compact_bash_output(
                         panel,
                         theme,
                         width,
@@ -8114,6 +8120,19 @@ mod tests {
     }
 
     #[test]
+    fn welcome_card_shows_the_current_package_version() {
+        let shell = InteractiveShell::test_shell();
+        shell.state.borrow_mut().startup_card_started_at = Some(Instant::now());
+        let rendered =
+            render_welcome_card(&shell.state.borrow(), 80, 10, Instant::now()).join("\n");
+        let rendered = strip_terminal_sequences(&rendered);
+        assert!(
+            rendered.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn rich_text_renders_gfm_tables_tasks_links_and_fenced_code() {
         let theme = crate::tui::theme::test_theme();
         let rendered = markdown_lines(
@@ -9336,6 +9355,7 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("gpt-5.6".into()),
                 reasoning: Some("high".into()),
+                reasoning_mode: None,
             })
             .unwrap();
         session
@@ -9620,12 +9640,12 @@ mod tests {
     fn tool_progress_repaints_the_bounded_rendered_tail() {
         let mut shell = InteractiveShell::test_shell();
         let run_id = shell.begin_run("openai");
-        let id = ToolCallId("long-exec".into());
+        let id = ToolCallId("long-bash".into());
         shell.on_run_event(
             run_id,
             &AgentEvent::ToolStarted {
                 id: id.clone(),
-                name: "exec".into(),
+                name: "bash".into(),
                 args: serde_json::json!({"command": "long-running-audit"}),
             },
         );
@@ -10424,7 +10444,7 @@ mod tests {
             run_id,
             &AgentEvent::ToolStarted {
                 id: id.clone(),
-                name: "exec".into(),
+                name: "bash".into(),
                 args: serde_json::json!({"command": "cargo test --workspace", "timeout_ms": 1000}),
             },
         );
@@ -11420,25 +11440,25 @@ mod tests {
         assert_ascii_bold(&failed, "Read");
         assert!(!failed.screen().contents().contains("permission denied"));
 
-        let active_exec_args = serde_json::json!({"command":"echo \"active\""});
-        let active_exec = TranscriptBlock::Tool(Box::new(ToolPanel::new(
-            ToolCallId("active-exec".into()),
-            "exec".into(),
-            active_exec_args.to_string(),
-            summarize_tool("exec", &active_exec_args),
+        let active_bash_args = serde_json::json!({"command":"echo \"active\""});
+        let active_bash = TranscriptBlock::Tool(Box::new(ToolPanel::new(
+            ToolCallId("active-bash".into()),
+            "bash".into(),
+            active_bash_args.to_string(),
+            summarize_tool("bash", &active_bash_args),
             "private streaming output".into(),
             false,
             false,
             None,
             None,
         )));
-        let active_exec = render_block(None, &active_exec, &theme, &renderer, &renderer, 80, true);
-        let active_exec = emulate_rows(&active_exec, 80);
-        assert_ascii_foreground(&active_exec, "Bash", foreground);
-        assert_ascii_bold(&active_exec, "Bash");
-        assert_ascii_foreground(&active_exec, "\"active\"", syntax_string);
-        assert_ascii_foreground(&active_exec, "private streaming output", muted);
-        assert!(active_exec
+        let active_bash = render_block(None, &active_bash, &theme, &renderer, &renderer, 80, true);
+        let active_bash = emulate_rows(&active_bash, 80);
+        assert_ascii_foreground(&active_bash, "Bash", foreground);
+        assert_ascii_bold(&active_bash, "Bash");
+        assert_ascii_foreground(&active_bash, "\"active\"", syntax_string);
+        assert_ascii_foreground(&active_bash, "private streaming output", muted);
+        assert!(active_bash
             .screen()
             .contents()
             .contains("private streaming output"));
@@ -11447,9 +11467,9 @@ mod tests {
             let args = serde_json::json!({"command":command});
             let panel = TranscriptBlock::Tool(Box::new(ToolPanel::new(
                 ToolCallId(command.into()),
-                "exec".into(),
+                "bash".into(),
                 args.to_string(),
-                summarize_tool("exec", &args),
+                summarize_tool("bash", &args),
                 String::new(),
                 true,
                 is_error,
@@ -11480,7 +11500,7 @@ mod tests {
     }
 
     #[test]
-    fn event_margin_markers_toggle_live_and_settle_mutations_by_outcome() {
+    fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
         let theme = crate::tui::theme::test_theme();
         let args = serde_json::json!({"path":"src/lib.rs"});
         let panel = |finished, is_error| {
@@ -11507,7 +11527,7 @@ mod tests {
 
         let settled_edit =
             event_margin_marker(&panel(true, false), &theme, false).expect("edit marker");
-        assert_eq!(settled_edit, theme.settled_event_dot("success", "•"));
+        assert_eq!(settled_edit, theme.settled_event_dot("neutral", "•"));
 
         let failed =
             event_margin_marker(&panel(true, true), &theme, false).expect("failure marker");
@@ -11516,9 +11536,9 @@ mod tests {
         let bash_args = serde_json::json!({"command":"cargo test"});
         let bash = TranscriptBlock::Tool(Box::new(ToolPanel::new(
             ToolCallId("bash".into()),
-            "exec".into(),
+            "bash".into(),
             bash_args.to_string(),
-            summarize_tool("exec", &bash_args),
+            summarize_tool("bash", &bash_args),
             String::new(),
             true,
             false,
@@ -11632,7 +11652,7 @@ mod tests {
             "src for pattern"
         );
         assert_eq!(
-            without_redundant_tool_lead("exec", "running cargo test --workspace"),
+            without_redundant_tool_lead("bash", "running cargo test --workspace"),
             "cargo test --workspace"
         );
         assert_eq!(
@@ -11823,15 +11843,15 @@ mod tests {
     }
 
     #[test]
-    fn active_exec_renders_command_and_latest_output_tail() {
+    fn active_bash_renders_command_and_latest_output_tail() {
         let mut shell = InteractiveShell::test_shell();
         let run_id = shell.begin_run("openai");
-        let id = ToolCallId("live-exec".into());
+        let id = ToolCallId("live-bash".into());
         shell.on_run_event(
             run_id,
             &AgentEvent::ToolStarted {
                 id: id.clone(),
-                name: "exec".into(),
+                name: "bash".into(),
                 args: serde_json::json!({"command": "long-running-check"}),
             },
         );
@@ -11866,9 +11886,9 @@ mod tests {
         let args = serde_json::json!({"command":command});
         let block = TranscriptBlock::Tool(Box::new(ToolPanel::new(
             ToolCallId("quiet-bash".into()),
-            "exec".into(),
+            "bash".into(),
             args.to_string(),
-            summarize_tool("exec", &args),
+            summarize_tool("bash", &args),
             "exit=0 duration=0.2s\n(no output)".into(),
             true,
             false,
@@ -12242,8 +12262,8 @@ mod tests {
         let tools = [
             tool("read", "read", serde_json::json!({"path":"src/lib.rs"})),
             tool(
-                "exec",
-                "exec",
+                "bash",
+                "bash",
                 serde_json::json!({"command":"cargo test -p ygg-coding-agent"}),
             ),
             tool("edit", "edit", serde_json::json!({"path":"src/lib.rs"})),
@@ -12331,7 +12351,7 @@ mod tests {
         use ygg_agent::ToolOutput;
         let mut shell = InteractiveShell::test_shell();
         let run_id = shell.begin_run("local");
-        let id = ToolCallId("exec-roundtrip".into());
+        let id = ToolCallId("bash-roundtrip".into());
         let output_lines = (1..=8)
             .map(|line| format!("private result line {line}"))
             .collect::<Vec<_>>()
@@ -12343,7 +12363,7 @@ mod tests {
             run_id,
             &AgentEvent::ToolStarted {
                 id: id.clone(),
-                name: "exec".into(),
+                name: "bash".into(),
                 args: serde_json::json!({"command": "printf private"}),
             },
         );
@@ -12499,9 +12519,9 @@ mod tests {
             )));
             state.push_block(TranscriptBlock::Tool(Box::new(ToolPanel::new(
                 ToolCallId("global-tool".into()),
-                "exec".into(),
+                "bash".into(),
                 args.to_string(),
-                summarize_tool("exec", &args),
+                summarize_tool("bash", &args),
                 format!("exit=0 duration=0.1s\nstdout: 6 lines\n{tool_output}"),
                 true,
                 false,
@@ -13000,9 +13020,9 @@ mod tests {
         let args = serde_json::json!({"command": "cargo check"});
         let tool = TranscriptBlock::Tool(Box::new(ToolPanel::new(
             ToolCallId("duration-breakpoint".into()),
-            "exec".into(),
+            "bash".into(),
             args.to_string(),
-            summarize_tool("exec", &args),
+            summarize_tool("bash", &args),
             "exit=0 duration=0.2s".into(),
             true,
             false,

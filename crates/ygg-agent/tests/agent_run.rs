@@ -497,6 +497,7 @@ fn build_agent_from_session(
         extensions,
         max_turns,
         reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     })
@@ -513,6 +514,7 @@ fn scripted_model_with_reasoning(uri: &str) -> Model {
         control: ReasoningControl::TokenBudget,
         exposes_text: true,
         preserves_state: true,
+        supports_pro_mode: false,
         min_effort: ygg_ai::ReasoningEffort::Minimal,
         effort_budgets: Some(ReasoningEffortBudgets {
             minimal: 1024,
@@ -556,6 +558,7 @@ fn build_agent_with_reasoning(
         extensions,
         max_turns,
         reasoning,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     })
@@ -993,6 +996,7 @@ async fn one_user_task_compacts_completed_tool_episodes_in_loop() {
         extensions,
         max_turns: Some(10),
         reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     })
@@ -1149,6 +1153,7 @@ async fn hard_cost_reservation_blocks_network_before_a_request_can_overshoot() {
         extensions,
         max_turns: Some(2),
         reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     })
@@ -1213,6 +1218,7 @@ async fn provider_context_error_forces_one_compaction_before_retry() {
         extensions,
         max_turns: Some(10),
         reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     })
@@ -1340,6 +1346,7 @@ async fn repeated_context_rejection_advances_compaction_without_spending_turns()
         // opens and summary calls must not consume this logical-turn budget.
         max_turns: Some(4),
         reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     })
@@ -1663,7 +1670,7 @@ async fn terminal_gate_uses_an_isolated_one_token_decision() {
         .all(|tool| tool["name"] != "finish"));
     assert!(request_has_no_tools(&requests[1]));
     assert_eq!(requests[1]["max_tokens"], 1);
-    assert!(!requests[1].to_string().contains("\"name\":\"exec\""));
+    assert!(!requests[1].to_string().contains("\"name\":\"bash\""));
     assert!(h.agent.session().usage_records().iter().any(|record| {
         matches!(
             record.kind,
@@ -2121,7 +2128,7 @@ async fn abort_during_model_streaming_finishes_once_and_preserves_entries() {
 async fn abort_during_process_execution_kills_the_tool() {
     let mut h = harness(
         vec![
-            tool_turn(&[("call_1", "exec", serde_json::json!({"command": "sleep 60"}))]),
+            tool_turn(&[("call_1", "bash", serde_json::json!({"command": "sleep 60"}))]),
             text_turn("never reached"),
         ],
         Some(8),
@@ -2294,6 +2301,7 @@ async fn duplicate_tool_registration_is_rejected() {
         extensions,
         max_turns: Some(8),
         reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     });
@@ -2557,6 +2565,7 @@ async fn tool_context_sees_the_exact_post_filter_core_and_extension_set() {
         extensions,
         max_turns: Some(4),
         reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     })
@@ -2654,6 +2663,7 @@ fn build_agent_with_extra_tool(
         extensions,
         max_turns,
         reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     })
@@ -2717,6 +2727,7 @@ async fn crash_recovery_preserves_the_live_tool_call_execution_cap() {
         extensions,
         max_turns: Some(2),
         reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     })

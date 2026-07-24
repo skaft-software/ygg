@@ -215,6 +215,9 @@ pub enum EntryValue {
         model: Option<String>,
         /// Reasoning setting recorded at this point, if any.
         reasoning: Option<String>,
+        /// Reasoning execution mode recorded at this point, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_mode: Option<String>,
     },
     /// A named prompt template was expanded before a user prompt. Keeping this
     /// as a non-model-visible append-only marker makes template provenance
@@ -2304,6 +2307,7 @@ mod tests {
                     EntryValue::Config {
                         model: None,
                         reasoning: None,
+                        reasoning_mode: None,
                     }
                 },
             };
@@ -2543,6 +2547,7 @@ mod tests {
         s.append(EntryValue::Config {
             model: Some("claude".to_string()),
             reasoning: Some("high".to_string()),
+            reasoning_mode: None,
         })
         .unwrap();
         s.append(assistant("hello")).unwrap();

@@ -15,7 +15,7 @@
 
 ## Sessions
 
-Sessions are append-only JSONL records containing entries, head updates, provider usage, and checkpoints. Entries form a parent-linked tree and the latest durable head selects the active branch. Compaction adds a summary and `first_kept` boundary without deleting ancestry.
+Sessions are append-only JSONL records containing entries, head updates, provider usage, and checkpoints. Entries form a parent-linked tree and the latest durable head selects the active branch. Compaction adds a Pi-structured summary, `first_kept` boundary, active-skill snapshot, and cumulative `readFiles`/`modifiedFiles` details without deleting ancestry. Both product-triggered and autonomous compaction use the same serialized handoff contract.
 
 Writes use an advisory exclusive lock, compare the observed file length under that lock, append complete record buffers, and call `sync_data` before updating in-memory state. Read-only inspection uses a shared lock and never repairs or truncates. Writable open performs explicit torn-tail recovery while exclusively locked. Files are `0600` on Unix and parsing is bounded by bytes and record count.
 

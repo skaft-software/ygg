@@ -25,7 +25,7 @@ pub enum ReplaySafety {
 
 /// A tool the model can call.
 ///
-/// Core tools (`read`, `search`, `edit`, `write`, `exec`) and third-party tools
+/// Core tools (`read`, `search`, `edit`, `write`, `bash`) and third-party tools
 /// implement the same trait and register through the same
 /// [`ExtensionHost::tool`](crate::ExtensionHost::tool) method — nothing is
 /// hardcoded into the agent loop.
@@ -898,6 +898,7 @@ mod tests {
             Box::new(crate::session::EntryValue::Config {
                 model: None,
                 reasoning: None,
+                reasoning_mode: None,
             }),
             Arc::new(std::sync::Mutex::new(Some(reply_tx))),
         ));

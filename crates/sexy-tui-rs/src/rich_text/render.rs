@@ -204,7 +204,7 @@ impl RichRenderer {
         let source = self.sanitize(source);
         let code = CodeBlock::with_language(language, source.clone());
         let base_style = self.theme.style(TextRole::Code);
-        let runs = self.highlighted(&code).map_or_else(
+        let mut runs = self.highlighted(&code).map_or_else(
             || vec![RichRun::new(source.clone(), base_style, None)],
             |highlighted| {
                 let mut runs = Vec::new();
@@ -225,6 +225,13 @@ impl RichRenderer {
                 runs
             },
         );
+        if matches!(
+            language.trim().to_ascii_lowercase().as_str(),
+            "bash" | "sh" | "shell" | "zsh"
+        ) {
+            let program_style = base_style.merge(self.theme.style(TextRole::SyntaxFunction));
+            runs = restyle_ranges(runs, &shell_program_ranges(&source), program_style);
+        }
         let width = usize::from(width).max(1);
         let lines = self
             .hard_wrap_runs(&runs, width)
@@ -1637,6 +1644,235 @@ struct NeverHighlightedRegion {
     role: Option<TextRole>,
 }
 
+/// Locate executable words in a shell command without attempting to parse the
+/// complete shell grammar. A command begins at the start of the source and
+/// after the separators that start a new pipeline/list element. Assignments
+/// and redirection targets are deliberately skipped so flags and arguments
+/// retain their normal syntax roles.
+fn shell_program_ranges(source: &str) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut ranges = Vec::new();
+    let mut index = 0usize;
+    let mut expect_program = true;
+    let mut skip_redirection_target = false;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b' ' | b'\t' | b'\r' => {
+                index += 1;
+                continue;
+            }
+            b'\n' => {
+                expect_program = true;
+                skip_redirection_target = false;
+                index += 1;
+                continue;
+            }
+            b'#' => {
+                index = source[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline);
+                continue;
+            }
+            b'|' | b';' | b'&' => {
+                expect_program = true;
+                skip_redirection_target = false;
+                let separator = bytes[index];
+                index += 1;
+                if bytes.get(index) == Some(&separator)
+                    || (separator == b'|' && bytes.get(index) == Some(&b'&'))
+                {
+                    index += 1;
+                }
+                continue;
+            }
+            b'(' => {
+                expect_program = true;
+                skip_redirection_target = false;
+                index += 1;
+                continue;
+            }
+            b')' => {
+                expect_program = false;
+                skip_redirection_target = false;
+                index += 1;
+                continue;
+            }
+            b'<' | b'>' => {
+                skip_redirection_target = true;
+                index += 1;
+                while matches!(bytes.get(index), Some(b'<') | Some(b'>')) {
+                    index += 1;
+                }
+                if bytes.get(index) == Some(&b'&') {
+                    index += 1;
+                }
+                continue;
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                expect_program = true;
+                skip_redirection_target = false;
+                index += 2;
+                continue;
+            }
+            _ => {}
+        }
+
+        let start = index;
+        let mut quote = None;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if let Some(delimiter) = quote {
+                if byte == b'\\' && delimiter == b'"' {
+                    index = (index + 2).min(bytes.len());
+                } else {
+                    index += 1;
+                    if byte == delimiter {
+                        quote = None;
+                    }
+                }
+                continue;
+            }
+            match byte {
+                b'\'' | b'"' | b'`' => {
+                    quote = Some(byte);
+                    index += 1;
+                }
+                b'\\' => index = (index + 2).min(bytes.len()),
+                b' ' | b'\t' | b'\r' | b'\n' | b'|' | b';' | b'&' | b'(' | b')' | b'<' | b'>' => {
+                    break
+                }
+                _ => index += 1,
+            }
+        }
+
+        if start == index {
+            index += 1;
+            continue;
+        }
+        let word = &source[start..index];
+        if skip_redirection_target {
+            skip_redirection_target = false;
+            continue;
+        }
+        if !expect_program || shell_assignment(word) {
+            continue;
+        }
+        if shell_reserved_word(word) {
+            expect_program = matches!(
+                word,
+                "if" | "then" | "elif" | "else" | "do" | "while" | "until" | "!"
+            );
+            continue;
+        }
+        ranges.push((start, index));
+        expect_program = false;
+    }
+
+    ranges
+}
+
+fn shell_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let name = name.strip_suffix('+').unwrap_or(name);
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn shell_reserved_word(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then"
+            | "elif"
+            | "else"
+            | "fi"
+            | "for"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "case"
+            | "in"
+            | "esac"
+            | "select"
+            | "function"
+            | "time"
+            | "coproc"
+            | "!"
+            | "{"
+            | "}"
+    )
+}
+
+fn restyle_ranges(
+    runs: Vec<RichRun>,
+    ranges: &[(usize, usize)],
+    range_style: TextStyle,
+) -> Vec<RichRun> {
+    if ranges.is_empty() {
+        return runs;
+    }
+    let mut output = Vec::new();
+    let mut offset = 0usize;
+    let mut range_index = 0usize;
+    for run in runs {
+        let run_end = offset.saturating_add(run.text.len());
+        let mut cursor = offset;
+        while cursor < run_end {
+            while ranges
+                .get(range_index)
+                .is_some_and(|(_, end)| *end <= cursor)
+            {
+                range_index += 1;
+            }
+            let Some((range_start, range_end)) = ranges.get(range_index).copied() else {
+                push_run(
+                    &mut output,
+                    run.text[cursor - offset..].to_owned(),
+                    run.style,
+                    run.link.clone(),
+                );
+                break;
+            };
+            if range_start >= run_end {
+                push_run(
+                    &mut output,
+                    run.text[cursor - offset..].to_owned(),
+                    run.style,
+                    run.link.clone(),
+                );
+                break;
+            }
+            if cursor < range_start {
+                let end = range_start.min(run_end);
+                push_run(
+                    &mut output,
+                    run.text[cursor - offset..end - offset].to_owned(),
+                    run.style,
+                    run.link.clone(),
+                );
+                cursor = end;
+                continue;
+            }
+            let end = range_end.min(run_end);
+            push_run(
+                &mut output,
+                run.text[cursor - offset..end - offset].to_owned(),
+                range_style,
+                run.link.clone(),
+            );
+            cursor = end;
+        }
+        offset = run_end;
+    }
+    output
+}
+
 /// Infer the syntax token from a unified-diff file header. Timestamps are
 /// ignored, and backup suffixes are not treated as programming languages.
 fn diff_language_hint(header: &str) -> Option<String> {
@@ -2057,20 +2293,45 @@ mod tests {
         let capabilities = TerminalCapabilities::interactive(ColorDepth::TrueColor, true);
         let mut theme = Theme::with_capabilities(capabilities);
         theme.override_token("md_code_block", "#111213");
+        theme.override_token("syntax_function", "#010203");
         theme.override_token("syntax_string", "#060708");
+        theme.override_token("syntax_number", "#0c0d0e");
         theme.override_token("syntax_operator", "#090a0b");
         let renderer = RichRenderer::new(theme, capabilities, RenderOptions::default());
-        let source = "printf '%s\\n' \"hello\" && cargo test";
-        let rendered = renderer.render_inline_syntax(source, "bash", 80);
+        let source =
+            "find . -name \"*.rs\" 2>&1 | grep -v target && cargo test\nprintf '%s\\n' \"hello\"";
+        let rendered = renderer.render_inline_syntax(source, "bash", 160);
+        let styled = rendered.styled_text();
 
         assert_eq!(rendered.plain_text(), source);
         assert_eq!(rendered.copy_text, source);
-        assert!(!rendered.styled_text().contains("\x1b[48;"));
+        assert!(!styled.contains("\x1b[48;"));
         assert!(!rendered.plain_text().contains('│'));
+        for program in ["find", "grep", "cargo", "printf"] {
+            assert!(
+                styled.contains(&format!("\x1b[38;2;1;2;3m{program}")),
+                "{program} was not classified as a shell program: {styled:?}"
+            );
+        }
         assert!(
-            rendered.styled_text().contains("\x1b[38;2;6;7;8m"),
-            "{rendered:?}"
+            !styled.contains("\x1b[38;2;1;2;3m-name") && !styled.contains("\x1b[38;2;1;2;3m-v"),
+            "flags inherited the shell program role: {styled:?}"
         );
+        assert!(styled.contains("\x1b[38;2;6;7;8m\"*.rs\""), "{styled:?}");
+        assert!(
+            styled.contains("\x1b[38;2;12;13;14m2") && styled.contains("\x1b[38;2;12;13;14m1"),
+            "{styled:?}"
+        );
+    }
+
+    #[test]
+    fn shell_program_ranges_follow_lists_pipelines_and_redirections() {
+        let source = "A=1 find . 2>/dev/null | grep -v target; git diff\n< input cargo test";
+        let programs = shell_program_ranges(source)
+            .into_iter()
+            .map(|(start, end)| &source[start..end])
+            .collect::<Vec<_>>();
+        assert_eq!(programs, ["find", "grep", "git", "cargo"]);
     }
 
     #[test]

@@ -82,6 +82,11 @@ impl ChatGptPlan {
     pub(crate) fn uses_max_context_window(&self) -> bool {
         matches!(self, Self::Pro | Self::ProLite)
     }
+
+    /// Consumer ChatGPT Pro variants enable GPT-5.6 pro mode.
+    pub(crate) fn supports_pro_reasoning_mode(&self) -> bool {
+        matches!(self, Self::Pro | Self::ProLite)
+    }
 }
 
 /// Non-secret routing and entitlement claims derived from a subscription JWT.
@@ -435,6 +440,9 @@ mod tests {
         assert!(ChatGptPlan::Pro.uses_max_context_window());
         assert!(ChatGptPlan::ProLite.uses_max_context_window());
         assert!(!ChatGptPlan::Plus.uses_max_context_window());
+        assert!(ChatGptPlan::Pro.supports_pro_reasoning_mode());
+        assert!(ChatGptPlan::ProLite.supports_pro_reasoning_mode());
+        assert!(!ChatGptPlan::Plus.supports_pro_reasoning_mode());
         assert_eq!(
             ChatGptPlan::from_raw(" Future_Tier "),
             Some(ChatGptPlan::Unknown("future_tier".into()))

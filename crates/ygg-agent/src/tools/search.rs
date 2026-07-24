@@ -42,7 +42,7 @@ enum SearchMode {
 /// with explicit truncation metadata. "No matches" is a successful output,
 /// not an error.
 ///
-/// Cleanup note: unlike `exec`, ripgrep is cancelled via `kill_on_drop` on
+/// Cleanup note: unlike `bash`, ripgrep is cancelled via `kill_on_drop` on
 /// the direct child only — `rg` spawns no subprocess tree, so no process-group
 /// handling is needed.
 pub struct SearchTool;
@@ -175,12 +175,12 @@ impl Tool for SearchTool {
             }
             (results, truncated)
         };
-        let (results, truncated) = tokio::time::timeout(ctx.sandbox.exec_timeout, collect)
+        let (results, truncated) = tokio::time::timeout(ctx.sandbox.bash_timeout, collect)
             .await
             .map_err(|_| {
                 ToolError::new(format!(
                     "search exceeded the {:.0}s execution limit",
-                    ctx.sandbox.exec_timeout.as_secs_f64()
+                    ctx.sandbox.bash_timeout.as_secs_f64()
                 ))
             })?;
 

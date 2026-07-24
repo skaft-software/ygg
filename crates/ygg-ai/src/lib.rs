@@ -67,10 +67,10 @@ pub use types::{
     EndpointId, EndpointTransport, ImageDetail, ImageMedia, ImageSource, JsonSchemaFormat, Media,
     Message, Modality, ModalitySet, ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode,
     OutputFormat, OutputModalities, Protocol, ProviderMediaRef, ReasoningCapability,
-    ReasoningConfig, ReasoningControl, ReasoningEffort, ReasoningEffortBudgets, ReasoningPart,
-    ReasoningState, ReasoningStateKind, Request, Response, SessionAffinityFormat, StopReason,
-    ToolCall, ToolCallId, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage,
-    UserPart,
+    ReasoningConfig, ReasoningControl, ReasoningEffort, ReasoningEffortBudgets, ReasoningMode,
+    ReasoningPart, ReasoningState, ReasoningStateKind, Request, Response, SessionAffinityFormat,
+    StopReason, ToolCall, ToolCallId, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage,
+    UserMessage, UserPart,
 };
 
 /// Strictness for cross-protocol / capability degradation.

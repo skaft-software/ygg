@@ -2,6 +2,57 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## 0.1.1-alpha — 2026-07-24
+
+### Added
+
+- Restored the animated, model-tinted braille-tree startup identity. The startup
+  card reports the package version, selected model, reasoning configuration, and
+  workspace without taking over the terminal background.
+- Added entitlement-gated GPT-5.6 Pro reasoning mode for ChatGPT OAuth Pro
+  routes, with independent CLI, configuration, session persistence, picker, and
+  OpenAI Responses wire support.
+- Added `shell_path`, `--shell-path`, and `YGG_SHELL_PATH` for explicit
+  Bash-compatible shell selection.
+- Added syntax-aware inline Bash command rendering, including distinct command
+  names, strings, operators, flags, and arguments.
+
+### Changed
+
+- Renamed the model command tool from `exec` to `bash`. Every command is now
+  passed intact to one Bash-compatible shell with `-c`, matching Pi's Unix
+  semantics: explicit `shell_path`, `/bin/bash`, `bash` on `PATH`, then `sh`.
+  Ygg does not consult `$SHELL`.
+- Renamed the primary execution limit to `bash_timeout_secs`,
+  `--bash-timeout-secs`, and `YGG_BASH_TIMEOUT_SECS`. The prior configuration,
+  CLI, and environment spellings remain compatibility aliases.
+- Reworked the transcript hierarchy around one live reasoning indicator,
+  in-place activity, bold neutral tool names, restrained metadata, quieter
+  collapsed-output hints, consistent spacing, and model-provenance user prompts.
+- Tool lifecycle dots now blink in lockstep while work is active, settle dimly,
+  use green only for successful Bash commands, and reserve red for failures.
+- Completed reasoning disappears by default and remains available through the
+  global verbose disclosure mode.
+- Ported Pi-compatible terminal input, selection, paste, key-repeat, and overlay
+  behavior while preserving native terminal selection and scrollback.
+- Long-session rendering now hydrates a bounded tail, caches stable transcript
+  rows, and avoids replaying or repainting committed native scrollback.
+- Simplified tool output presentation: Bash output remains neutral, file tools
+  expose diffs when relevant, and completed tool evidence stays collapsed unless
+  explicitly expanded.
+
+### Compatibility and reliability
+
+- Existing sessions containing historical `exec` calls continue to render as
+  Bash events; new provider schemas advertise only `bash`.
+- Command cancellation and timeouts retain process-group cleanup, bounded
+  stdout/stderr capture, live progress, and detached-descendant supervision.
+- Added regression coverage for shell selection and Bash expansion, Pro-mode
+  entitlement and persistence, synchronized event-dot animation, startup version
+  display, reasoning cleanup, command syntax styling, and transcript lifecycle.
+- Reduced development-profile codegen units to limit incremental artifact
+  accumulation without disabling incremental compilation.
+
 ## 0.1.0-alpha — 2026-07-22
 
 ### Added

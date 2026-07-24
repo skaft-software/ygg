@@ -743,6 +743,10 @@ pub(crate) fn status_text_with_metrics(
         .max_cost_microdollars
         .map(format_microdollars_cents)
         .unwrap_or_else(|| "disabled".to_owned());
+    let reasoning = match app.reasoning_mode {
+        ygg_ai::ReasoningMode::Standard => reasoning_label(&app.reasoning),
+        ygg_ai::ReasoningMode::Pro => format!("pro · {}", reasoning_label(&app.reasoning)),
+    };
     let cost_warning = app
         .config
         .cost_warning_microdollars
@@ -762,7 +766,7 @@ pub(crate) fn status_text_with_metrics(
         app.model.endpoint.base_url,
         app.model.spec.protocol,
         app.model.endpoint.transport,
-        reasoning_label(&app.reasoning),
+        reasoning,
         pricing,
         context,
         context_window,
@@ -937,6 +941,8 @@ mod tests {
             model_explicit: false,
             reasoning: ReasoningConfig::Off,
             reasoning_explicit: false,
+            reasoning_mode: ygg_ai::ReasoningMode::Standard,
+            reasoning_mode_explicit: false,
             cache_retention: ygg_ai::CacheRetention::Short,
             sandbox: SandboxPolicy::default(),
             theme: None,
@@ -974,6 +980,7 @@ mod tests {
                 model: ModelId("gpt-4o-mini".into()),
                 session: SessionSelection::CreateNew(directory.path().join("session.jsonl")),
                 reasoning: ReasoningConfig::Off,
+                reasoning_mode: ygg_ai::ReasoningMode::Standard,
             },
             "system".into(),
         )

@@ -224,6 +224,10 @@ pub struct ReasoningCapability {
     pub exposes_text: bool,
     /// Whether the model preserves reasoning/thinking signatures or state for continuation.
     pub preserves_state: bool,
+    /// Whether this exact model route is entitled to OpenAI Responses pro mode.
+    /// This is false for API-key routes and non-Pro subscription accounts.
+    #[serde(default)]
+    pub supports_pro_mode: bool,
     /// Budget maps from portable effort to token budgets, required iff control is TokenBudget.
     pub effort_budgets: Option<ReasoningEffortBudgets>,
     /// OpenAI Chat-Completions-specific reasoning behavior.
@@ -729,6 +733,9 @@ pub struct Request {
     pub stop: Vec<String>,
     /// Reasoning effort or budget configuration.
     pub reasoning: ReasoningConfig,
+    /// Reasoning execution mode. Pro mode is independently capability-gated.
+    #[serde(default)]
+    pub reasoning_mode: ReasoningMode,
     /// Requested formatting for model response (text or JSON).
     #[serde(default)]
     pub output_format: OutputFormat,
@@ -784,6 +791,18 @@ pub enum ReasoningConfig {
     Effort(ReasoningEffort),
     /// Control reasoning via explicit token budget.
     Budget(u64),
+}
+
+/// Reasoning execution mode.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningMode {
+    /// Normal model execution.
+    #[default]
+    Standard,
+    /// Additional model work for difficult requests. This is available only on
+    /// explicitly entitled OpenAI Responses subscription routes.
+    Pro,
 }
 
 /// High-level reasoning effort presets.
@@ -1072,6 +1091,7 @@ mod tests {
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: false,
+                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: OpenAiChatReasoningMode::Standard,
                     min_effort: ReasoningEffort::Minimal,
@@ -1231,6 +1251,7 @@ mod tests {
             temperature: Some(0.7),
             stop: vec!["\n".to_string()],
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,

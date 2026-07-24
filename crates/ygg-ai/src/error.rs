@@ -163,6 +163,9 @@ pub enum UnsupportedError {
     /// Reasoning is not supported.
     #[error("Reasoning is unsupported")]
     Reasoning,
+    /// The requested reasoning execution mode is not available on this route.
+    #[error("Reasoning mode is unsupported")]
+    ReasoningMode,
     /// Reasoning continuation state protocol mismatch.
     #[error("Reasoning state mismatch: have {have:?}, want {want:?}")]
     ReasoningStateMismatch {

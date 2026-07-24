@@ -37,7 +37,7 @@ first input; older active-branch blocks are loaded when semantic navigation or
 select-all reaches beyond that tail.
 
 Held-key repeats are accepted only for text editing and navigation. One-shot
-actions such as submit, panel confirmation, close, abort, and tool expansion
+actions such as submit, panel confirmation, close, abort, and reasoning/summary expansion
 require a fresh key press.
 
 The composer supports multiline editing, bracketed paste, large-paste chips,
@@ -46,20 +46,23 @@ capability-gated at attachment time and remains ordered with text when submitted
 
 ## Tool presentation
 
-Tool calls default to deterministic intent summaries. Protocol arguments and
-bulk output stay hidden unless needed for a failure summary. Users can:
+Tool calls expose only deterministic intent and lifecycle rows. Protocol
+arguments, raw/progress output, failure text, diffs, shell output, and
+extension-rendered tool payloads are internal accountability/provenance data;
+they are never rendered in the TUI, copied from transcript blocks, or revealed
+by a disclosure control. Tool rows may show the sanitized command/intent and a
+generic completion or failure state.
 
-- press Ctrl+O to expand or collapse the most recent tool or shell block;
-- toggle the latest or a named call with `/tool [call-id]`;
-- expand or collapse all calls with `/verbose [on|off]`.
+Ctrl+O expands or collapses only the most recent reasoning block or compaction
+summary. `/tool [call-id]` and `/verbose [on|off]` remain accepted for command
+compatibility and report that evidence is internal; neither changes visibility.
 
-Per-call expansion state is independent, survives transcript reflow, and never
-changes provider-visible tool results. Bounded output, unified edit diffs, exit
-status, and recoverable failures remain inspectable. Completed `exec` calls
-show a bold command followed by at most five muted tail lines and a quiet
-`Took ...` duration. Their compact hint counts only UI-hidden lines that Ctrl+O
-can reveal; a separate warning identifies output already discarded by bounded
-process capture.
+Final structured tool results remain provider-visible and persisted when the
+agent protocol requires them to continue a tool turn. This is operational
+model context, not a TUI disclosure channel. Live `ToolProgress` is ephemeral
+and is not persisted or sent to the model. Terminal-gate action receipts are
+bounded accountability input to the gate checker only, not ordinary model
+context.
 
 ## Sessions and resources
 

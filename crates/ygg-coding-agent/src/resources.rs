@@ -85,10 +85,10 @@ Response:
 - Cite code locations as `path:line` when useful. Do not dump large file contents unless asked.
 
 Tools:
-- Prefer dedicated tools when available; use `exec` for shell commands. Batch independent reads and searches when possible.
+- Prefer dedicated tools when available; use `bash` for shell commands. Batch independent reads and searches when possible.
 - Configured core tools: "#
     );
-    let tools = ["read", "edit", "write", "exec", "search"];
+    let tools = ["read", "edit", "write", "bash", "search"];
     let mut visible_tools = 0usize;
     for name in tools {
         if config.tool_available(name) {
@@ -110,7 +110,7 @@ Tools:
     prompt.push_str("\n- Invocation directory: ");
     prompt.push_str(&prompt_path(&config.invocation_cwd));
     prompt.push_str(
-        "\n- Relative tool paths and `exec` without an explicit `cwd` resolve from the workspace root.",
+        "\n- Relative tool paths and `bash` without an explicit `cwd` resolve from the workspace root.",
     );
     prompt
 }
@@ -1019,6 +1019,8 @@ mod tests {
             model_explicit: false,
             reasoning: ygg_ai::ReasoningConfig::Off,
             reasoning_explicit: false,
+            reasoning_mode: ygg_ai::ReasoningMode::Standard,
+            reasoning_mode_explicit: false,
             cache_retention: ygg_ai::CacheRetention::Short,
             sandbox: SandboxPolicy::default(),
             theme: None,
@@ -1075,13 +1077,13 @@ Response:
 - Cite code locations as `path:line` when useful. Do not dump large file contents unless asked.
 
 Tools:
-- Prefer dedicated tools when available; use `exec` for shell commands. Batch independent reads and searches when possible.
+- Prefer dedicated tools when available; use `bash` for shell commands. Batch independent reads and searches when possible.
 - Configured core tools: {tools}. Additional supplied tools may be available; each tool schema is authoritative.
 
 Environment:
 - Workspace root: {}
 - Invocation directory: {}
-- Relative tool paths and `exec` without an explicit `cwd` resolve from the workspace root."#,
+- Relative tool paths and `bash` without an explicit `cwd` resolve from the workspace root."#,
             prompt_path(&config.workspace),
             prompt_path(&config.invocation_cwd),
         )
@@ -1118,7 +1120,7 @@ Environment:
         let prompt = base_prompt(&config);
         assert_eq!(
             prompt,
-            expected_base_prompt(&config, "read, edit, write, exec")
+            expected_base_prompt(&config, "read, edit, write, bash")
         );
 
         let dynamic_bytes = prompt_path(root.path()).len() + prompt_path(&nested).len();
@@ -1145,7 +1147,7 @@ Environment:
     #[test]
     fn base_prompt_handles_every_core_tool_subset_exactly() {
         let root = tempfile::tempdir().unwrap();
-        let names = ["read", "edit", "write", "exec", "search"];
+        let names = ["read", "edit", "write", "bash", "search"];
 
         for mask in 0..(1 << names.len()) {
             let enabled = names

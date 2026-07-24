@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img alt="Release: alpha" src="https://img.shields.io/badge/release-0.1.0--alpha-536dfe?style=flat-square">
+  <img alt="Release: alpha" src="https://img.shields.io/badge/release-0.1.1--alpha-536dfe?style=flat-square">
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -28,7 +28,7 @@ ygg is a local-first coding agent written in Rust. It combines a polished termin
 
 It works with a local OpenAI-compatible server just as naturally as it works with OpenAI, Anthropic, OpenRouter, or another cloud provider. There is no hosted ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local inspectable JSONL.
 
-> **Release status:** `0.1.0-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
+> **Release status:** `0.1.1-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
 
 ## Why ygg
 
@@ -53,7 +53,7 @@ The installer builds the pinned alpha tag and adds Cargo's binary directory to z
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/skaft-software/ygg/v0.1.0-alpha/scripts/install.sh | sh
+  https://raw.githubusercontent.com/skaft-software/ygg/v0.1.1-alpha/scripts/install.sh | sh
 ```
 
 Restart the shell, then verify the installation:
@@ -70,7 +70,7 @@ To install without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.1.0-alpha \
+  --tag v0.1.1-alpha \
   --bin ygg \
   ygg-coding-agent
 ```
@@ -201,7 +201,7 @@ All three frontends use the same agent loop, provider layer, session format, saf
 | `read` | Bounded text reads with line-oriented output. | On |
 | `edit` | Exact, stale-aware replacements within the workspace policy. | On |
 | `write` | Create or replace complete files within the workspace policy. | On |
-| `exec` | Run commands with bounded output, timeout, cancellation, and process-group cleanup. | On |
+| `bash` | Run commands through a Bash-compatible shell with bounded output, timeout, cancellation, and process-group cleanup. | On |
 | `search` | Ripgrep-backed workspace search. | Opt-in |
 
 The model-visible schema and executable registry are built from the same final policy. A disabled tool cannot remain advertised to the model.
@@ -220,7 +220,12 @@ ygg --no-process
 ygg --no-tools
 ```
 
-`exec` runs with the authority of the current operating-system user. `--no-process` and `--no-shell` are equivalent because directly invoking an interpreter is shell-equivalent authority. For untrusted repositories, use a container, VM, or restricted account; see [SECURITY.md](SECURITY.md).
+`bash` runs with the authority of the current operating-system user. Like Pi, it
+passes every complete command to one selected shell with `-c`; on Unix Ygg uses
+an explicit `shell_path` first, then `/bin/bash`, `bash` on `PATH`, and finally
+`sh`. It does not consult `$SHELL`. `--no-process` and `--no-shell` are
+equivalent authority gates. For untrusted repositories, use a container, VM, or
+restricted account; see [SECURITY.md](SECURITY.md).
 
 ### Provider and protocol support
 
@@ -398,6 +403,7 @@ Example `~/.ygg/config.toml`:
 ```toml
 model = "custom/Qwen3 Coder Next"
 reasoning = "high"
+reasoning_mode = "standard"
 cache_retention = "short"
 theme = "default"
 color = "auto"
@@ -409,7 +415,7 @@ allow_edit = true
 allow_write = true
 allow_process = true
 allow_shell = true
-exec_timeout_secs = 120
+bash_timeout_secs = 120
 max_output_bytes = 1048576
 context_files = true
 offline = false
@@ -424,7 +430,7 @@ keep_recent_turns = 4
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_EXEC_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_REASONING_MODE`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. The previous `YGG_EXEC_TIMEOUT_SECS` name remains a compatibility fallback.
 
 ### CLI reference
 
@@ -433,10 +439,10 @@ Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, 
 | Provider auth | `--login`, `--logout`, `--headless` |
 | Frontend | `--print`, `--plain`, `--color`, `--mouse`, `--show-reasoning` |
 | Session | `--continue`, `--resume`, `--session-dir`, `sessions ...` |
-| Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
+| Model | `--model`, `--reasoning`, `--reasoning-mode`, `--cache-retention`, `--max-turns` |
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
-| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell` |
-| Limits | `--exec-timeout-secs`, `--max-output-bytes` |
+| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--shell-path` |
+| Limits | `--bash-timeout-secs`, `--max-output-bytes` |
 | Customization | `--theme`, `--theme-dir`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
 
 Run `ygg --help` and `ygg sessions --help` for the authoritative generated reference.
@@ -559,7 +565,7 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.1.0-alpha.md) | Alpha installation, highlights, and limitations. |
+| [Release notes](docs/releases/v0.1.1-alpha.md) | Current alpha installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Themes](docs/themes.md) | Theme schema, roles, glyphs, responsive layout, and fallback behavior. |

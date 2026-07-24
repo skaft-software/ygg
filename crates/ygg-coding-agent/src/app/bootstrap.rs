@@ -14,10 +14,13 @@ use ygg_agent::{Agent, AgentConfig, CoreTools, EntryValue, ExtensionHost, Sessio
 use ygg_ai::{
     AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model, ModelCatalog, ModelId,
     ModelLimits, ModelSpec, OpenAiChatReasoningMode, Pricing, PricingTier, Protocol,
-    ReasoningCapability, ReasoningConfig, ReasoningControl, TokenRate, ToolDef,
+    ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningMode, TokenRate, ToolDef,
 };
 
-use crate::app::{level_from_reasoning, normalize_reasoning_for_model, thinking_to_reasoning, App};
+use crate::app::{
+    level_from_reasoning, normalize_reasoning_for_model, normalize_reasoning_mode_for_model,
+    thinking_to_reasoning, App,
+};
 use crate::config::{Config, ResumeSelector};
 use crate::extensions::ExecutableExtensions;
 use crate::modes::interactive::run_blocking_lifecycle;
@@ -56,6 +59,8 @@ pub struct LaunchSelection {
     pub session: SessionSelection,
     /// Effective reasoning restored from session state or invocation defaults.
     pub reasoning: ReasoningConfig,
+    /// Effective execution mode restored independently from reasoning effort.
+    pub reasoning_mode: ReasoningMode,
 }
 
 const DEEPSEEK_ENDPOINT_ID: &str = "deepseek";
@@ -827,6 +832,7 @@ fn register_openai_compatible_models(
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: true,
+                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: OpenAiChatReasoningMode::Standard,
                     min_effort: ygg_ai::ReasoningEffort::Minimal,
@@ -984,6 +990,7 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
                 control: ReasoningControl::Effort,
                 exposes_text: true,
                 preserves_state: false,
+                supports_pro_mode: false,
                 effort_budgets: None,
                 openai_chat_mode: OpenAiChatReasoningMode::DeepSeekThinking,
                 min_effort: ygg_ai::ReasoningEffort::High,
@@ -1049,6 +1056,7 @@ fn register_discovered_deepseek_models(catalog: &mut ModelCatalog) -> anyhow::Re
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: false,
+                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: OpenAiChatReasoningMode::DeepSeekThinking,
                     min_effort: ygg_ai::ReasoningEffort::Minimal,
@@ -1261,6 +1269,7 @@ fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<V
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: false,
+                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: OpenAiChatReasoningMode::OpenRouter,
                     min_effort: ygg_ai::ReasoningEffort::Minimal,
@@ -1326,6 +1335,7 @@ fn static_model_reasoning(model: &StaticModelPreset) -> Option<ReasoningCapabili
         control: ReasoningControl::Effort,
         exposes_text: true,
         preserves_state: model.protocol != Protocol::OpenAiChat,
+        supports_pro_mode: false,
         effort_budgets: None,
         openai_chat_mode: if model.protocol == Protocol::OpenAiChat
             && model.id.starts_with("deepseek-")
@@ -1764,6 +1774,7 @@ fn custom_reasoning_capability(
         control,
         exposes_text: true,
         preserves_state: false,
+        supports_pro_mode: false,
         effort_budgets: None,
         openai_chat_mode,
         min_effort,
@@ -2685,6 +2696,10 @@ fn register_openai_codex(
             },
         }
     };
+    let pro_subscription = initial_claims
+        .plan
+        .as_ref()
+        .is_some_and(crate::auth::codex::ChatGptPlan::supports_pro_reasoning_mode);
     let resolver = std::sync::Arc::new(codex::CodexResolver::new(store));
 
     let mut default_headers = http::HeaderMap::new();
@@ -2723,6 +2738,7 @@ fn register_openai_codex(
         };
         let pricing = codex_pricing(&model.id);
         let supports_image_input = codex_supports_image_input(&model.id);
+        let supports_pro_mode = pro_subscription && model.id.starts_with("gpt-5.6");
         catalog.register_model(ModelSpec {
             id: catalog_id,
             endpoint: EndpointId(codex::ENDPOINT_ID.into()),
@@ -2742,6 +2758,7 @@ fn register_openai_codex(
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: true,
+                    supports_pro_mode,
                     effort_budgets: None,
                     openai_chat_mode: OpenAiChatReasoningMode::Standard,
                     min_effort: model.min_effort,
@@ -2851,6 +2868,7 @@ pub fn resolve_model_id(
 struct PersistedSessionConfig {
     model: Option<ModelId>,
     reasoning: Option<ReasoningConfig>,
+    reasoning_mode: Option<ReasoningMode>,
 }
 
 fn persisted_session_config(session: &Session) -> anyhow::Result<PersistedSessionConfig> {
@@ -2861,7 +2879,12 @@ fn persisted_session_config(session: &Session) -> anyhow::Result<PersistedSessio
         let entry = session
             .entry(id)
             .ok_or_else(|| anyhow::anyhow!("session head references missing entry {}", id.0))?;
-        if let EntryValue::Config { model, reasoning } = &entry.value {
+        if let EntryValue::Config {
+            model,
+            reasoning,
+            reasoning_mode,
+        } = &entry.value
+        {
             if persisted.model.is_none() {
                 persisted.model = model.clone().map(ModelId);
             }
@@ -2878,7 +2901,23 @@ fn persisted_session_config(session: &Session) -> anyhow::Result<PersistedSessio
                         )
                     })?;
             }
-            if persisted.model.is_some() && persisted.reasoning.is_some() {
+            if persisted.reasoning_mode.is_none() {
+                persisted.reasoning_mode = reasoning_mode
+                    .as_deref()
+                    .map(crate::config::parse_reasoning_mode)
+                    .transpose()
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "invalid reasoning mode in session {} at entry {}: {error}",
+                            path.display(),
+                            id.0
+                        )
+                    })?;
+            }
+            if persisted.model.is_some()
+                && persisted.reasoning.is_some()
+                && persisted.reasoning_mode.is_some()
+            {
                 break;
             }
         }
@@ -2891,14 +2930,25 @@ fn append_config_if_changed(
     session: &mut Session,
     model: &ModelId,
     reasoning: &ReasoningConfig,
+    reasoning_mode: ReasoningMode,
 ) -> anyhow::Result<()> {
     let persisted = persisted_session_config(session)?;
-    if persisted.model.as_ref() == Some(model) && persisted.reasoning.as_ref() == Some(reasoning) {
+    if persisted.model.as_ref() == Some(model)
+        && persisted.reasoning.as_ref() == Some(reasoning)
+        && persisted.reasoning_mode == Some(reasoning_mode)
+    {
         return Ok(());
     }
     session.append(EntryValue::Config {
         model: Some(model.0.clone()),
         reasoning: Some(crate::app::reasoning_label(reasoning)),
+        reasoning_mode: Some(
+            match reasoning_mode {
+                ReasoningMode::Standard => "standard",
+                ReasoningMode::Pro => "pro",
+            }
+            .to_owned(),
+        ),
     })?;
     Ok(())
 }
@@ -2906,7 +2956,12 @@ fn append_config_if_changed(
 fn launch_configuration_parts(
     config: &Config,
     session: &SessionSelection,
-) -> anyhow::Result<(Option<Session>, Option<ModelId>, ReasoningConfig)> {
+) -> anyhow::Result<(
+    Option<Session>,
+    Option<ModelId>,
+    ReasoningConfig,
+    ReasoningMode,
+)> {
     let prepared = match session {
         SessionSelection::OpenExisting(path) => Some(Session::open(path)?),
         SessionSelection::CreateNew(_) => None,
@@ -2928,16 +2983,22 @@ fn launch_configuration_parts(
             .reasoning
             .unwrap_or_else(|| config.reasoning.clone())
     };
-    Ok((prepared, model, reasoning))
+    let reasoning_mode = if config.reasoning_mode_explicit {
+        config.reasoning_mode
+    } else {
+        persisted.reasoning_mode.unwrap_or(config.reasoning_mode)
+    };
+    Ok((prepared, model, reasoning, reasoning_mode))
 }
 
 fn launch_configuration(
     boot: &Bootstrap,
     session: &SessionSelection,
-) -> anyhow::Result<(Option<ModelId>, ReasoningConfig)> {
-    let (prepared, model, reasoning) = launch_configuration_parts(&boot.config, session)?;
+) -> anyhow::Result<(Option<ModelId>, ReasoningConfig, ReasoningMode)> {
+    let (prepared, model, reasoning, reasoning_mode) =
+        launch_configuration_parts(&boot.config, session)?;
     *boot.prepared_session.borrow_mut() = prepared;
-    Ok((model, reasoning))
+    Ok((model, reasoning, reasoning_mode))
 }
 
 /// Resolve an interactive launch and open pickers only while no Agent exists.
@@ -2983,7 +3044,7 @@ pub async fn resolve_launch_interactive(
     };
     let config = boot.config.clone();
     let selected_session = session.clone();
-    let (prepared, model, reasoning) =
+    let (prepared, model, reasoning, reasoning_mode) =
         run_blocking_lifecycle(shell, input, "replaying session…", move || {
             launch_configuration_parts(&config, &selected_session)
         })
@@ -2997,6 +3058,7 @@ pub async fn resolve_launch_interactive(
         model,
         session,
         reasoning,
+        reasoning_mode,
     })
 }
 
@@ -3012,7 +3074,7 @@ pub fn resolve_launch_print(boot: &Bootstrap, stamp: &str) -> anyhow::Result<Lau
             anyhow::bail!("--resume needs a session id in print mode")
         }
     };
-    let (model, reasoning) = launch_configuration(boot, &session)?;
+    let (model, reasoning, reasoning_mode) = launch_configuration(boot, &session)?;
     let model = model.ok_or_else(|| {
         let mut models = boot
             .catalog
@@ -3030,6 +3092,7 @@ pub fn resolve_launch_print(boot: &Bootstrap, stamp: &str) -> anyhow::Result<Lau
         model,
         session,
         reasoning,
+        reasoning_mode,
     })
 }
 
@@ -3187,10 +3250,18 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         },
     };
 
-    let reasoning = normalize_reasoning_for_model(&launch.reasoning, &model)?;
-    append_config_if_changed(&mut session, &model.spec.id, &reasoning)?;
+    let reasoning_mode = normalize_reasoning_mode_for_model(launch.reasoning_mode, &model)?;
+    let requested_reasoning =
+        if reasoning_mode == ReasoningMode::Pro && launch.reasoning == ReasoningConfig::Off {
+            ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Medium)
+        } else {
+            launch.reasoning
+        };
+    let reasoning = normalize_reasoning_for_model(&requested_reasoning, &model)?;
+    append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
     config.model = Some(model.spec.id.clone());
     config.reasoning = reasoning.clone();
+    config.reasoning_mode = reasoning_mode;
 
     let skills: Arc<dyn SkillRegistry> = Arc::new(FileSystemSkillRegistry::new(
         config.workspace.clone(),
@@ -3223,6 +3294,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         extensions,
         max_turns: config.max_turns,
         reasoning: reasoning.clone(),
+        reasoning_mode,
         cache_retention: config.cache_retention,
         session_id: None,
     })?;
@@ -3244,6 +3316,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         catalog,
         sessions,
         reasoning,
+        reasoning_mode,
         system,
         system_tokens,
         tool_schema_tokens,
@@ -3259,6 +3332,7 @@ pub fn rebuild_app(
     app: App,
     new_model: Option<Model>,
     new_reasoning: Option<ReasoningConfig>,
+    new_reasoning_mode: Option<ReasoningMode>,
     selection: Option<SessionSelection>,
 ) -> anyhow::Result<App> {
     let App {
@@ -3269,6 +3343,7 @@ pub fn rebuild_app(
         catalog,
         sessions,
         reasoning,
+        reasoning_mode,
         system,
         system_tokens,
         tool_schema_tokens: _,
@@ -3314,6 +3389,15 @@ pub fn rebuild_app(
         }
         (None, None) => normalize_reasoning_for_model(&reasoning, &model)?,
     };
+    let reasoning_mode = new_reasoning_mode
+        .or(persisted.reasoning_mode)
+        .unwrap_or(reasoning_mode);
+    let reasoning_mode = normalize_reasoning_mode_for_model(reasoning_mode, &model)?;
+    let reasoning = if reasoning_mode == ReasoningMode::Pro && reasoning == ReasoningConfig::Off {
+        thinking_to_reasoning(crate::config::ThinkingLevel::Medium, &model)?
+    } else {
+        reasoning
+    };
     let mut session = match selection {
         Some(SessionSelection::CreateNew(path)) => {
             if let Some(parent) = path.parent() {
@@ -3327,10 +3411,11 @@ pub fn rebuild_app(
         },
         None => Session::open(current_path)?,
     };
-    append_config_if_changed(&mut session, &model.spec.id, &reasoning)?;
+    append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
 
     config.model = Some(model.spec.id.clone());
     config.reasoning = reasoning.clone();
+    config.reasoning_mode = reasoning_mode;
     let skills: Arc<dyn SkillRegistry> = Arc::new(FileSystemSkillRegistry::new(
         config.workspace.clone(),
         config.skill_paths.clone(),
@@ -3361,6 +3446,7 @@ pub fn rebuild_app(
         extensions,
         max_turns: config.max_turns,
         reasoning: reasoning.clone(),
+        reasoning_mode,
         cache_retention: config.cache_retention,
         session_id: None,
     })?;
@@ -3382,6 +3468,7 @@ pub fn rebuild_app(
         catalog,
         sessions,
         reasoning,
+        reasoning_mode,
         system,
         system_tokens,
         tool_schema_tokens,
@@ -3422,6 +3509,8 @@ mod tests {
             model_explicit: model.is_some(),
             reasoning: ReasoningConfig::Off,
             reasoning_explicit: false,
+            reasoning_mode: ygg_ai::ReasoningMode::Standard,
+            reasoning_mode_explicit: false,
             cache_retention: ygg_ai::CacheRetention::Short,
             sandbox: SandboxPolicy::default(),
             theme: None,
@@ -3509,6 +3598,7 @@ mod tests {
                 model: ModelId("gpt-4o-mini".into()),
                 session: SessionSelection::CreateNew(directory.path().join("session.jsonl")),
                 reasoning: ReasoningConfig::Off,
+                reasoning_mode: ygg_ai::ReasoningMode::Standard,
             },
             "system".into(),
         )
@@ -3890,6 +3980,63 @@ mod tests {
             .resolve(&ModelId("gpt-5.6-sol".into()))
             .unwrap();
         assert_eq!(fallback.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
+    }
+
+    #[test]
+    fn codex_pro_mode_is_exposed_only_to_pro_oauth_accounts_and_gpt_5_6() {
+        let directory = tempfile::tempdir().unwrap();
+
+        let pro_path = directory.path().join("pro-codex.json");
+        write_codex_credential(&pro_path, false, "pro");
+        let mut pro_catalog = base_model_catalog(true).unwrap();
+        register_openai_codex(
+            &mut pro_catalog,
+            crate::auth::codex::CredentialStore::new(pro_path),
+            true,
+        )
+        .unwrap();
+        let pro_model = pro_catalog.resolve(&ModelId("gpt-5.6-sol".into())).unwrap();
+        assert!(
+            pro_model
+                .spec
+                .capabilities
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .supports_pro_mode
+        );
+        let older = pro_catalog.resolve(&ModelId("gpt-5.5".into())).unwrap();
+        assert!(
+            !older
+                .spec
+                .capabilities
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .supports_pro_mode
+        );
+
+        let plus_path = directory.path().join("plus-codex.json");
+        write_codex_credential(&plus_path, false, "plus");
+        let mut plus_catalog = base_model_catalog(true).unwrap();
+        register_openai_codex(
+            &mut plus_catalog,
+            crate::auth::codex::CredentialStore::new(plus_path),
+            true,
+        )
+        .unwrap();
+        let plus_model = plus_catalog
+            .resolve(&ModelId("gpt-5.6-sol".into()))
+            .unwrap();
+        assert!(
+            !plus_model
+                .spec
+                .capabilities
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .supports_pro_mode
+        );
     }
 
     #[test]
@@ -4632,6 +4779,7 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("gpt-5.4-mini-responses".to_string()),
                 reasoning: Some("high".to_string()),
+                reasoning_mode: None,
             })
             .unwrap();
         session
@@ -4672,11 +4820,12 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("gpt-5.4-mini-responses".to_owned()),
                 reasoning: Some("high".to_owned()),
+                reasoning_mode: None,
             })
             .unwrap();
         drop(session);
 
-        let (prepared, model, reasoning) =
+        let (prepared, model, reasoning, reasoning_mode) =
             launch_configuration_parts(&config, &SessionSelection::OpenExisting(path.clone()))
                 .unwrap();
 
@@ -4686,6 +4835,7 @@ mod tests {
             reasoning,
             ReasoningConfig::Effort(ygg_ai::ReasoningEffort::High)
         );
+        assert_eq!(reasoning_mode, ReasoningMode::Standard);
     }
 
     #[test]
@@ -4772,6 +4922,7 @@ mod tests {
                 model: ModelId("gpt-4o-mini".into()),
                 session: SessionSelection::OpenExisting(path),
                 reasoning: ReasoningConfig::Off,
+                reasoning_mode: ygg_ai::ReasoningMode::Standard,
             },
             "system".into(),
         ) {
@@ -4804,13 +4955,14 @@ mod tests {
                 model: ModelId("gpt-4o-mini".into()),
                 session: SessionSelection::OpenExisting(path),
                 reasoning: ReasoningConfig::Off,
+                reasoning_mode: ygg_ai::ReasoningMode::Standard,
             },
             "system".into(),
         )
         .unwrap();
         app.config.tools = crate::config::ToolPolicy::only(["read".to_owned()]).unwrap();
 
-        let error = match rebuild_app(app, None, None, None) {
+        let error = match rebuild_app(app, None, None, None, None) {
             Ok(_) => panic!("rebuild must revalidate persisted active skills"),
             Err(error) => error,
         };
@@ -4926,7 +5078,8 @@ mod tests {
             Some(EntryValue::Config {
                 model: Some(model),
                 reasoning: Some(reasoning),
-            }) if model == "gpt-4o-mini" && reasoning == "off"
+                reasoning_mode: Some(reasoning_mode),
+            }) if model == "gpt-4o-mini" && reasoning == "off" && reasoning_mode == "standard"
         ));
     }
 
@@ -4943,7 +5096,7 @@ mod tests {
             .iter()
             .map(|definition| definition.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["read", "edit", "write", "exec"]);
+        assert_eq!(names, vec!["read", "edit", "write", "bash"]);
         let default_reserve = tool_schema_reserve(&definitions);
         assert!(default_reserve > 0);
         assert_eq!(default_reserve, tool_schema_reserve(&definitions));
@@ -4956,7 +5109,7 @@ mod tests {
                 .iter()
                 .map(|definition| definition.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["read", "edit", "write", "exec", "search"]
+            vec!["read", "edit", "write", "bash", "search"]
         );
         assert!(tool_schema_reserve(&all_core_definitions) > default_reserve);
     }
@@ -4983,7 +5136,7 @@ mod tests {
         let path = app.agent.session().path().to_owned();
         let entries_before = app.agent.session().entries().len();
         let bytes_before = std::fs::metadata(&path).unwrap().len();
-        let app = rebuild_app(app, None, None, None).unwrap();
+        let app = rebuild_app(app, None, None, None, None).unwrap();
         assert!(app.agent.session().entry(&entry).is_some());
         assert_eq!(app.agent.session().entries().len(), entries_before);
         assert_eq!(std::fs::metadata(path).unwrap().len(), bytes_before);
@@ -4999,12 +5152,14 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("gpt-5.4-mini-responses".to_string()),
                 reasoning: Some("medium".to_string()),
+                reasoning_mode: None,
             })
             .unwrap();
         drop(session);
 
         let app = rebuild_app(
             app,
+            None,
             None,
             None,
             Some(SessionSelection::OpenExisting(target)),
@@ -5022,8 +5177,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let app = fresh_app(directory.path());
         let new_path = directory.path().join("new.jsonl");
-        let app =
-            rebuild_app(app, None, None, Some(SessionSelection::CreateNew(new_path))).unwrap();
+        let app = rebuild_app(
+            app,
+            None,
+            None,
+            None,
+            Some(SessionSelection::CreateNew(new_path)),
+        )
+        .unwrap();
         assert!(app.agent.session().context().unwrap().is_empty());
         assert_eq!(app.agent.session().entries().len(), 1);
         assert!(matches!(

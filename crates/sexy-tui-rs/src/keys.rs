@@ -517,13 +517,16 @@ pub fn is_key_repeat(data: &str) -> bool {
 }
 
 pub fn matches_key(data: &str, key_id: &str) -> bool {
+    matches_key_for_protocol(data, key_id, is_kitty_protocol_active())
+}
+
+fn matches_key_for_protocol(data: &str, key_id: &str, kitty: bool) -> bool {
     let Some(parsed) = parse_key_id(key_id) else {
         return false;
     };
     let key_lower = parsed.key.to_ascii_lowercase();
     let key = key_lower.as_str();
     let modifier = modifier(&parsed);
-    let kitty = is_kitty_protocol_active();
     match key {
         "escape" | "esc" => {
             modifier == 0
@@ -781,13 +784,16 @@ fn legacy_key_id(data: &str) -> Option<&'static str> {
 }
 
 pub fn parse_key(data: &str) -> Option<String> {
+    parse_key_for_protocol(data, is_kitty_protocol_active())
+}
+
+fn parse_key_for_protocol(data: &str, kitty: bool) -> Option<String> {
     if let Some(parsed) = parse_kitty_sequence(data) {
         return format_parsed(parsed.codepoint, parsed.modifier, parsed.base);
     }
     if let Some((codepoint, modifier)) = parse_modify_other_keys(data) {
         return format_parsed(codepoint, modifier, None);
     }
-    let kitty = is_kitty_protocol_active();
     if kitty && matches!(data, "\x1b\r" | "\n") {
         return Some("shift+enter".into());
     }
@@ -920,15 +926,17 @@ mod tests {
 
     #[test]
     fn pi_kitty_alternate_layout_and_modifiers() {
-        set_kitty_protocol_active(true);
-        assert!(matches_key("\x1b[1089::99;5u", "ctrl+c"));
-        assert!(!matches_key("\x1b[107::118;5u", "ctrl+v"));
-        assert!(matches_key("\x1b[107::118;5u", "ctrl+k"));
+        assert!(matches_key_for_protocol("\x1b[1089::99;5u", "ctrl+c", true));
+        assert!(!matches_key_for_protocol(
+            "\x1b[107::118;5u",
+            "ctrl+v",
+            true
+        ));
+        assert!(matches_key_for_protocol("\x1b[107::118;5u", "ctrl+k", true));
         assert_eq!(
-            parse_key("\x1b[107;14u").as_deref(),
+            parse_key_for_protocol("\x1b[107;14u", true).as_deref(),
             Some("shift+ctrl+super+k")
         );
-        set_kitty_protocol_active(false);
     }
 
     #[test]
@@ -941,11 +949,13 @@ mod tests {
 
     #[test]
     fn pi_legacy_sequences() {
-        set_kitty_protocol_active(false);
-        assert!(matches_key("\x1bOA", "up"));
-        assert!(matches_key("\x1b[2^", "ctrl+insert"));
-        assert!(matches_key("\x1b\x03", "ctrl+alt+c"));
-        assert_eq!(parse_key("\x1b[[5~").as_deref(), Some("pageUp"));
+        assert!(matches_key_for_protocol("\x1bOA", "up", false));
+        assert!(matches_key_for_protocol("\x1b[2^", "ctrl+insert", false));
+        assert!(matches_key_for_protocol("\x1b\x03", "ctrl+alt+c", false));
+        assert_eq!(
+            parse_key_for_protocol("\x1b[[5~", false).as_deref(),
+            Some("pageUp")
+        );
     }
 
     #[test]

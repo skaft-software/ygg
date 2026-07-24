@@ -15,7 +15,7 @@ categories = ["development-tools"]
 workspace = true
 
 [dependencies]
-ygg-ai = { version = "=0.1.0-alpha", path = "../ygg-ai" }
+ygg-ai = { version = "=0.1.1-alpha", path = "../ygg-ai" }
 bytes = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,7 +32,7 @@ futures-util = "0.3"
 fs2 = "0.4"
 sha2 = "0.10"
 
-# One `libc::kill(-pgid, SIGKILL)` call terminates a cancelled exec tool's whole
+# One `libc::kill(-pgid, SIGKILL)` call terminates a cancelled bash tool's whole
 # process group (tokio's kill_on_drop only reaches the direct child).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

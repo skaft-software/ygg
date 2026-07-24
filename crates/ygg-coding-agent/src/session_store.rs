@@ -769,6 +769,7 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("model".into()),
                 reasoning: None,
+                reasoning_mode: None,
             })
             .unwrap();
 
@@ -994,6 +995,7 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("model".into()),
                 reasoning: Some("high".into()),
+                reasoning_mode: None,
             })
             .unwrap();
 

@@ -837,7 +837,7 @@ pub struct ToolDisplay {
     pub plain_tag: &'static str,
     /// Stable user-facing label, independent of the protocol tool identifier.
     pub label: String,
-    /// Presentation-only shell command. The internal tool remains `exec`.
+    /// Presentation-only command string for the `bash` tool.
     pub shell_command: Option<String>,
     pub changed_path: Option<String>,
 }
@@ -876,7 +876,8 @@ pub fn summarize_tool_with_workspace(
         }
         "edit" => path_tool(args, "updating", "updated", "updating", "edit", workspace),
         "write" => path_tool(args, "writing", "wrote", "writing", "write", workspace),
-        "exec" => summarize_exec(args, workspace),
+        // `exec` is retained only as a renderer for pre-rename sessions.
+        "bash" | "exec" => summarize_bash(args, workspace),
         other => {
             let readable = other.replace(['_', '-'], " ");
             ToolDisplay {
@@ -946,7 +947,7 @@ fn summarize_read(args: &serde_json::Value, workspace: Option<&Path>) -> ToolDis
     }
 }
 
-fn summarize_exec(args: &serde_json::Value, workspace: Option<&Path>) -> ToolDisplay {
+fn summarize_bash(args: &serde_json::Value, workspace: Option<&Path>) -> ToolDisplay {
     let command =
         normalize_shell_command(string_arg(args, "command").unwrap_or("command"), workspace);
     let program = command
@@ -963,8 +964,8 @@ fn summarize_exec(args: &serde_json::Value, workspace: Option<&Path>) -> ToolDis
         compact_active: format!("running {program}"),
         compact_success: format!("ran {program}"),
         compact_failure: format!("{program} failed"),
-        plain_tag: "run",
-        label: "shell".to_owned(),
+        plain_tag: "bash",
+        label: "bash".to_owned(),
         shell_command: Some(command),
         changed_path: None,
     }
@@ -1031,7 +1032,7 @@ pub fn compact_path(path: &str) -> String {
 pub fn tool_result_is_failure(name: &str, result: &Result<ToolOutput, ToolError>) -> bool {
     match result {
         Err(_) => true,
-        Ok(output) if name == "exec" => exec_exit_reason(&output.text).is_some(),
+        Ok(output) if matches!(name, "bash" | "exec") => bash_exit_reason(&output.text).is_some(),
         Ok(_) => false,
     }
 }
@@ -1039,12 +1040,12 @@ pub fn tool_result_is_failure(name: &str, result: &Result<ToolOutput, ToolError>
 pub fn tool_failure_reason(name: &str, result: &Result<ToolOutput, ToolError>) -> Option<String> {
     match result {
         Err(error) => Some(error_reason(&error.message)),
-        Ok(output) if name == "exec" => exec_exit_reason(&output.text),
+        Ok(output) if matches!(name, "bash" | "exec") => bash_exit_reason(&output.text),
         Ok(_) => None,
     }
 }
 
-fn exec_exit_reason(output: &str) -> Option<String> {
+fn bash_exit_reason(output: &str) -> Option<String> {
     let first = output.lines().next()?.trim();
     let exit = first
         .split_whitespace()
@@ -1377,7 +1378,7 @@ mod tests {
             id,
             &AgentEvent::ToolStarted {
                 id: ToolCallId("call".into()),
-                name: "exec".into(),
+                name: "bash".into(),
                 args: serde_json::json!({"mode":"process","program":"cargo","args":["test"]}),
             },
             now,
@@ -1479,11 +1480,25 @@ mod tests {
         assert_eq!(read.compact_active, "reading lib.rs");
 
         let tests = summarize_tool(
-            "exec",
+            "bash",
             &serde_json::json!({"command":"cargo test --workspace"}),
         );
         assert_eq!(tests.active, "running cargo test --workspace");
-        assert_eq!(tests.plain_tag, "run");
+        assert_eq!(tests.plain_tag, "bash");
+    }
+
+    #[test]
+    fn legacy_exec_history_uses_the_bash_presentation() {
+        let display = summarize_tool(
+            "exec",
+            &serde_json::json!({"command":"cargo test --workspace"}),
+        );
+        assert_eq!(display.label, "bash");
+        assert_eq!(display.plain_tag, "bash");
+        assert_eq!(
+            display.shell_command.as_deref(),
+            Some("cargo test --workspace")
+        );
     }
 
     #[test]
@@ -1501,12 +1516,12 @@ mod tests {
         assert_eq!(read.active, "reading src/main.rs");
 
         let command = format!("cd {} && printf ok", dir.path().display());
-        let exec = summarize_tool_with_workspace(
-            "exec",
+        let bash = summarize_tool_with_workspace(
+            "bash",
             &serde_json::json!({"command":command}),
             Some(dir.path()),
         );
-        assert_eq!(exec.active, "running printf ok");
+        assert_eq!(bash.active, "running printf ok");
     }
 
     #[test]
@@ -1524,11 +1539,11 @@ mod tests {
     }
 
     #[test]
-    fn nonzero_exec_is_a_specific_warning() {
+    fn nonzero_bash_is_a_specific_warning() {
         let result = Ok(ToolOutput::new("exit=1 duration=0.20s\nstderr:\nfailed"));
-        assert!(tool_result_is_failure("exec", &result));
+        assert!(tool_result_is_failure("bash", &result));
         assert_eq!(
-            tool_failure_reason("exec", &result).as_deref(),
+            tool_failure_reason("bash", &result).as_deref(),
             Some("command exited 1")
         );
     }

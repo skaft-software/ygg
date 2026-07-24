@@ -284,7 +284,7 @@ async fn run_prompt(
             biased;
             _ = crate::tui::terminal::wait_for_shutdown_signal() => {
                 control.abort();
-                ygg_agent::extension_process::terminate_exec_process_groups(
+                ygg_agent::extension_process::terminate_bash_process_groups(
                     Duration::from_millis(400),
                 )
                 .await;
@@ -612,7 +612,7 @@ pub async fn run_plain(boot: Bootstrap, initial_prompt: Option<String>) -> anyho
         let next = tokio::select! {
             biased;
             _ = crate::tui::terminal::wait_for_shutdown_signal() => {
-                ygg_agent::extension_process::terminate_exec_process_groups(
+                ygg_agent::extension_process::terminate_bash_process_groups(
                     Duration::from_millis(400),
                 )
                 .await;

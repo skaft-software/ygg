@@ -2,7 +2,7 @@
 set -eu
 
 repository="https://github.com/skaft-software/ygg"
-version="v0.1.0-alpha"
+version="v0.1.1-alpha"
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 bin_dir="$cargo_home/bin"
 

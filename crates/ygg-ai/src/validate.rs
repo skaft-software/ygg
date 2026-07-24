@@ -3,8 +3,8 @@
 use crate::error::{AiError, Diagnostic, UnsupportedError, ValidationError};
 use crate::types::{
     AssistantPart, AudioFormat, AudioPayload, Capabilities, ImageSource, Media, Message, ModelId,
-    ModelLimits, OutputFormat, OutputModalities, Protocol, ReasoningConfig, Request, ToolCallId,
-    ToolChoice, ToolResultPart, UserPart,
+    ModelLimits, OutputFormat, OutputModalities, Protocol, ReasoningConfig, ReasoningMode, Request,
+    ToolCallId, ToolChoice, ToolResultPart, UserPart,
 };
 use crate::CompatibilityMode;
 use std::borrow::Cow;
@@ -561,7 +561,24 @@ pub(crate) fn validate_request(
         }
     }
 
-    // 7. Reasoning capability and control checks
+    // 7. Reasoning capability, execution mode, and control checks
+    if req.reasoning_mode == ReasoningMode::Pro {
+        let supported = protocol == Protocol::OpenAiResponses
+            && caps
+                .reasoning
+                .as_ref()
+                .is_some_and(|capability| capability.supports_pro_mode);
+        if !supported {
+            if mode == CompatibilityMode::Strict {
+                return Err(AiError::Unsupported(UnsupportedError::ReasoningMode));
+            }
+            diagnostics.push(Diagnostic {
+                code: "ignored_reasoning_mode".to_string(),
+                message: "Pro reasoning mode is unavailable on this model route".to_string(),
+            });
+        }
+    }
+
     if req.reasoning != ReasoningConfig::Off {
         if let ReasoningConfig::Budget(budget) = &req.reasoning {
             let effective_output_limit = req.max_output_tokens.unwrap_or(limits.max_output_tokens);
@@ -698,6 +715,7 @@ mod tests {
                     control: crate::types::ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: true,
+                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: crate::types::OpenAiChatReasoningMode::Standard,
                     min_effort: crate::types::ReasoningEffort::Minimal,
@@ -734,6 +752,7 @@ mod tests {
             temperature: None,
             stop: vec![],
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -783,6 +802,7 @@ mod tests {
             temperature: None,
             stop: vec![],
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -835,6 +855,7 @@ mod tests {
             temperature: None,
             stop: vec![],
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -885,6 +906,7 @@ mod tests {
             temperature: None,
             stop: vec![],
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -967,6 +989,7 @@ mod matrix_tests {
                     control: crate::types::ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: true,
+                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: crate::types::OpenAiChatReasoningMode::Standard,
                     min_effort: crate::types::ReasoningEffort::Minimal,
@@ -996,6 +1019,7 @@ mod matrix_tests {
             temperature: None,
             stop: vec![],
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: Strict,

@@ -129,7 +129,10 @@ struct ResponsesTool {
 
 #[derive(Serialize)]
 struct ResponsesReasoningConfig {
-    effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
     // Request visible summary deltas in addition to encrypted continuation
     // state. Without this, reasoning-capable Codex models think silently.
     summary: &'static str,
@@ -439,25 +442,33 @@ pub(crate) fn build_request(
 
     // 5. Reasoning Configuration
     let reasoning_opt = if model.spec.capabilities.reasoning.is_some() {
-        match req.reasoning {
-            ReasoningConfig::Off => None,
-            ReasoningConfig::On => None,
-            ReasoningConfig::Effort(effort) => {
-                let effort_str = match effort {
-                    crate::types::ReasoningEffort::Minimal => "minimal".to_string(),
-                    crate::types::ReasoningEffort::Low => "low".to_string(),
-                    crate::types::ReasoningEffort::Medium => "medium".to_string(),
-                    crate::types::ReasoningEffort::High => "high".to_string(),
-                    crate::types::ReasoningEffort::Xhigh => "xhigh".to_string(),
-                    crate::types::ReasoningEffort::Max => "max".to_string(),
-                };
-                Some(ResponsesReasoningConfig {
-                    effort: effort_str,
-                    summary: "auto",
-                })
-            }
-            ReasoningConfig::Budget(_) => None,
-        }
+        let effort = match req.reasoning {
+            ReasoningConfig::Effort(effort) => Some(
+                match effort {
+                    crate::types::ReasoningEffort::Minimal => "minimal",
+                    crate::types::ReasoningEffort::Low => "low",
+                    crate::types::ReasoningEffort::Medium => "medium",
+                    crate::types::ReasoningEffort::High => "high",
+                    crate::types::ReasoningEffort::Xhigh => "xhigh",
+                    crate::types::ReasoningEffort::Max => "max",
+                }
+                .to_string(),
+            ),
+            ReasoningConfig::Off | ReasoningConfig::On | ReasoningConfig::Budget(_) => None,
+        };
+        let mode = (req.reasoning_mode == crate::types::ReasoningMode::Pro
+            && model
+                .spec
+                .capabilities
+                .reasoning
+                .as_ref()
+                .is_some_and(|capability| capability.supports_pro_mode))
+        .then_some("pro");
+        (effort.is_some() || mode.is_some()).then_some(ResponsesReasoningConfig {
+            effort,
+            mode,
+            summary: "auto",
+        })
     } else {
         None
     };
@@ -1377,6 +1388,7 @@ mod tests {
             temperature: None,
             stop: vec![],
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility,
@@ -1402,6 +1414,7 @@ mod tests {
                         control: crate::types::ReasoningControl::Effort,
                         exposes_text: true,
                         preserves_state: true,
+                        supports_pro_mode: false,
                         effort_budgets: None,
                         openai_chat_mode: crate::types::OpenAiChatReasoningMode::Standard,
                         min_effort: crate::types::ReasoningEffort::Minimal,
@@ -1449,6 +1462,7 @@ mod tests {
             temperature: Some(0.5),
             stop: vec![],
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -1478,6 +1492,40 @@ mod tests {
         assert_eq!(body["input"][1]["role"], "user");
         assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][1]["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn pro_reasoning_mode_is_serialized_only_for_entitled_routes() {
+        let base = make_test_model(true);
+        let mut spec = (*base.spec).clone();
+        spec.capabilities
+            .reasoning
+            .as_mut()
+            .unwrap()
+            .supports_pro_mode = true;
+        let model = Model {
+            spec: Arc::new(spec),
+            endpoint: base.endpoint.clone(),
+        };
+        let mut req = user_req(
+            vec![UserPart::Text("review this migration".to_string())],
+            CompatibilityMode::Strict,
+        );
+        req.reasoning = ReasoningConfig::Effort(crate::types::ReasoningEffort::Medium);
+        req.reasoning_mode = crate::types::ReasoningMode::Pro;
+
+        let parts = build_request(&model, &req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
+        assert_eq!(body["reasoning"]["mode"], "pro");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+
+        let unsupported = build_request(&make_test_model(true), &req);
+        assert!(matches!(
+            unsupported,
+            Err(AiError::Unsupported(
+                crate::error::UnsupportedError::ReasoningMode
+            ))
+        ));
     }
 
     #[test]
@@ -1730,6 +1778,7 @@ mod tests {
             temperature: None,
             stop: vec![],
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -1834,6 +1883,7 @@ mod tests {
             temperature: None,
             stop: vec![],
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,

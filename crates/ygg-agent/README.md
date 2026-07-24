@@ -16,14 +16,14 @@ Included:
   `follow_up`: ordered text and media parts (`ygg_ai::Media`) pass through
   the agent to the model unchanged; text-only callers remain compatible via
   `From<String>` / `From<&str>`.
-- Five built-in tools — `read`, `search`, `edit`, `write`, `exec` — registered through
+- Five built-in tools — `read`, `search`, `edit`, `write`, `bash` — registered through
   the same `Extension` boundary available to third-party tools.
 - A concrete `SandboxConfig`: relative paths use the workspace and hosts may
   enable trusted-local absolute/`~/`/external paths, or opt into a workspace-only
   descriptor-bound workspace guard. It also provides mutation and unified
   command-execution gates, an execution timeout, output-byte limits, and
   process-group cleanup for cancelled child processes
-  (`exec` is unix-only in v0.1 — it fails clearly rather than weakening cleanup
+  (`bash` is unix-only in v0.1 — it fails clearly rather than weakening cleanup
   on other platforms). Neither path mode is an OS sandbox: spawned processes
   run with the current user's full access. Ygg is a trusted local agent — see
   the repository-root `SECURITY.md`.

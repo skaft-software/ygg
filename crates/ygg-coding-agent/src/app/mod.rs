@@ -8,7 +8,7 @@ use std::sync::Arc;
 use ygg_agent::Agent;
 use ygg_ai::{
     AiClient, Model, ModelCatalog, ModelId, OpenAiChatReasoningMode, ReasoningConfig,
-    ReasoningControl, ReasoningEffort,
+    ReasoningControl, ReasoningEffort, ReasoningMode,
 };
 
 use crate::config::Config;
@@ -160,6 +160,26 @@ pub fn normalize_reasoning_for_model(
     }
 }
 
+/// Validate a reasoning execution mode against the exact resolved route.
+pub fn normalize_reasoning_mode_for_model(
+    mode: ReasoningMode,
+    model: &Model,
+) -> anyhow::Result<ReasoningMode> {
+    if mode == ReasoningMode::Pro
+        && !model
+            .spec
+            .capabilities
+            .reasoning
+            .as_ref()
+            .is_some_and(|capability| capability.supports_pro_mode)
+    {
+        anyhow::bail!(
+            "pro reasoning mode requires a GPT-5.6 ChatGPT model on an entitled OpenAI OAuth Pro subscription"
+        );
+    }
+    Ok(mode)
+}
+
 /// Convert a current model-specific reasoning setting back to a portable level
 /// before switching models. Custom token budgets cannot be safely translated.
 pub fn level_from_reasoning(
@@ -255,6 +275,10 @@ pub fn supported_levels(model: &Model) -> Vec<ThinkingLevel> {
 pub enum Reconfig {
     Model(ModelId),
     Thinking(ReasoningConfig),
+    ThinkingMode {
+        mode: ReasoningMode,
+        reasoning: ReasoningConfig,
+    },
     NewSession,
     Resume(PathBuf),
 }
@@ -264,13 +288,19 @@ pub fn apply_reconfig(app: App, reconfig: Reconfig) -> anyhow::Result<App> {
     match reconfig {
         Reconfig::Model(id) => {
             let model = app.catalog.resolve(&id)?;
-            bootstrap::rebuild_app(app, Some(model), None, None)
+            bootstrap::rebuild_app(app, Some(model), None, None, None)
         }
-        Reconfig::Thinking(reasoning) => bootstrap::rebuild_app(app, None, Some(reasoning), None),
+        Reconfig::Thinking(reasoning) => {
+            bootstrap::rebuild_app(app, None, Some(reasoning), None, None)
+        }
+        Reconfig::ThinkingMode { mode, reasoning } => {
+            bootstrap::rebuild_app(app, None, Some(reasoning), Some(mode), None)
+        }
         Reconfig::NewSession => {
             let path = app.sessions.new_path(&crate::modes::timestamp());
             bootstrap::rebuild_app(
                 app,
+                None,
                 None,
                 None,
                 Some(bootstrap::SessionSelection::CreateNew(path)),
@@ -278,6 +308,7 @@ pub fn apply_reconfig(app: App, reconfig: Reconfig) -> anyhow::Result<App> {
         }
         Reconfig::Resume(path) => bootstrap::rebuild_app(
             app,
+            None,
             None,
             None,
             Some(bootstrap::SessionSelection::OpenExisting(path)),
@@ -294,6 +325,7 @@ pub struct App {
     pub catalog: ModelCatalog,
     pub sessions: SessionStore,
     pub reasoning: ReasoningConfig,
+    pub reasoning_mode: ReasoningMode,
     pub system: String,
     pub system_tokens: u64,
     pub tool_schema_tokens: u64,
@@ -323,11 +355,46 @@ mod tests {
     }
 
     #[test]
+    fn pro_mode_requires_an_entitled_model_route() {
+        let unsupported = model_with(Some(ReasoningCapability {
+            control: ReasoningControl::Effort,
+            exposes_text: true,
+            preserves_state: true,
+            supports_pro_mode: false,
+            effort_budgets: None,
+            openai_chat_mode: ygg_ai::OpenAiChatReasoningMode::Standard,
+            min_effort: ReasoningEffort::Minimal,
+            max_effort: ReasoningEffort::Max,
+        }));
+        assert!(normalize_reasoning_mode_for_model(ReasoningMode::Pro, &unsupported).is_err());
+        assert_eq!(
+            normalize_reasoning_mode_for_model(ReasoningMode::Standard, &unsupported).unwrap(),
+            ReasoningMode::Standard
+        );
+
+        let mut spec = (*unsupported.spec).clone();
+        spec.capabilities
+            .reasoning
+            .as_mut()
+            .unwrap()
+            .supports_pro_mode = true;
+        let entitled = Model {
+            spec: Arc::new(spec),
+            endpoint: unsupported.endpoint,
+        };
+        assert_eq!(
+            normalize_reasoning_mode_for_model(ReasoningMode::Pro, &entitled).unwrap(),
+            ReasoningMode::Pro
+        );
+    }
+
+    #[test]
     fn maps_effort_and_token_budget_thinking() {
         let effort = model_with(Some(ReasoningCapability {
             control: ReasoningControl::Effort,
             exposes_text: true,
             preserves_state: false,
+            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: ygg_ai::OpenAiChatReasoningMode::Standard,
             min_effort: ygg_ai::ReasoningEffort::Minimal,
@@ -342,6 +409,7 @@ mod tests {
             control: ReasoningControl::TokenBudget,
             exposes_text: true,
             preserves_state: false,
+            supports_pro_mode: false,
             effort_budgets: Some(ReasoningEffortBudgets {
                 minimal: 1024,
                 low: 2048,
@@ -371,6 +439,7 @@ mod tests {
             control: ReasoningControl::Effort,
             exposes_text: true,
             preserves_state: false,
+            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: ygg_ai::OpenAiChatReasoningMode::Standard,
             min_effort: ReasoningEffort::Minimal,
@@ -439,6 +508,7 @@ mod tests {
             control: ReasoningControl::TokenBudget,
             exposes_text: true,
             preserves_state: false,
+            supports_pro_mode: false,
             effort_budgets: Some(ReasoningEffortBudgets {
                 minimal: 1024,
                 low: 2048,
@@ -467,6 +537,7 @@ mod tests {
             control: ReasoningControl::Toggle,
             exposes_text: true,
             preserves_state: false,
+            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: OpenAiChatReasoningMode::ProviderValues {
                 values: vec!["none".into(), "default".into()],
@@ -494,6 +565,7 @@ mod tests {
             control: ReasoningControl::Effort,
             exposes_text: true,
             preserves_state: false,
+            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: OpenAiChatReasoningMode::ProviderValues {
                 values: vec!["none".into(), "low".into(), "high".into()],

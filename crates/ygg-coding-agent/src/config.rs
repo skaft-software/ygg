@@ -7,7 +7,10 @@ use std::time::Duration;
 use ygg_agent::SandboxConfig;
 
 pub use crate::tui::terminal::ColorMode;
-use ygg_ai::{CacheRetention, ModelId, ReasoningConfig, ReasoningEffort, ReasoningEffortBudgets};
+use ygg_ai::{
+    CacheRetention, ModelId, ReasoningConfig, ReasoningEffort, ReasoningEffortBudgets,
+    ReasoningMode,
+};
 
 /// Resolve the workspace root: an explicit path, the nearest `.git` ancestor,
 /// or the current directory. The returned path is canonicalized.
@@ -79,7 +82,8 @@ pub struct SandboxPolicy {
     pub allow_write: bool,
     pub allow_process: bool,
     pub allow_shell: bool,
-    pub exec_timeout_secs: u64,
+    pub shell_path: Option<PathBuf>,
+    pub bash_timeout_secs: u64,
     pub max_output_bytes: usize,
 }
 
@@ -94,7 +98,8 @@ impl Default for SandboxPolicy {
             allow_write: true,
             allow_process: true,
             allow_shell: true,
-            exec_timeout_secs: 120,
+            shell_path: None,
+            bash_timeout_secs: 120,
             max_output_bytes: 16 * 1024,
         }
     }
@@ -106,7 +111,7 @@ pub const SUPPORTED_TOOL_NAMES: [&str; 8] = [
     "search",
     "edit",
     "write",
-    "exec",
+    "bash",
     "search_skills",
     "load_skill",
     "read_skill_resource",
@@ -130,7 +135,7 @@ impl Default for ToolPolicy {
         Self {
             enabled: SUPPORTED_TOOL_NAMES
                 .into_iter()
-                // `exec` already provides faster, composable discovery through
+                // `bash` already provides faster, composable discovery through
                 // rg/find/ls. Keep the narrower search schema available for
                 // explicit allowlists without charging every default request.
                 .filter(|name| *name != "search")
@@ -215,7 +220,7 @@ fn valid_tool_name(name: &str) -> bool {
 impl SandboxPolicy {
     /// Whether this process is permitted to start *any* child process.
     ///
-    /// Shell escapes, executable extensions, and the model `exec` tool all
+    /// Shell escapes, executable extensions, and the model `bash` tool all
     /// have process authority. Keep this gate shared so `--no-process` and
     /// `--no-shell` are truthful product-wide guarantees.
     pub fn process_execution_allowed(&self) -> bool {
@@ -230,7 +235,8 @@ impl SandboxPolicy {
         sandbox.allow_write = self.allow_write;
         sandbox.allow_process = self.allow_process;
         sandbox.allow_shell = self.allow_shell;
-        sandbox.exec_timeout = Duration::from_secs(self.exec_timeout_secs);
+        sandbox.shell_path = self.shell_path.clone();
+        sandbox.bash_timeout = Duration::from_secs(self.bash_timeout_secs);
         sandbox.max_output_bytes = self.max_output_bytes;
         sandbox
     }
@@ -341,6 +347,10 @@ pub struct Config {
     pub reasoning: ReasoningConfig,
     /// True when `reasoning` came from an explicit command-line override.
     pub reasoning_explicit: bool,
+    /// Standard or Pro execution, selected independently from reasoning effort.
+    pub reasoning_mode: ReasoningMode,
+    /// True when the reasoning mode came from an explicit command-line override.
+    pub reasoning_mode_explicit: bool,
     pub cache_retention: CacheRetention,
     pub sandbox: SandboxPolicy,
     pub theme: Option<String>,
@@ -402,7 +412,7 @@ impl Config {
                 "edit" => self.sandbox.allow_edit,
                 "write" => self.sandbox.allow_write,
                 // Process mode deliberately has shell-equivalent authority.
-                "exec" => self.sandbox.process_execution_allowed(),
+                "bash" => self.sandbox.process_execution_allowed(),
                 _ => true,
             }
     }
@@ -429,6 +439,15 @@ pub fn parse_reasoning(value: &str) -> anyhow::Result<ReasoningConfig> {
         }
     };
     Ok(config)
+}
+
+/// Parse a reasoning execution mode.
+pub fn parse_reasoning_mode(value: &str) -> anyhow::Result<ReasoningMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "standard" | "default" => Ok(ReasoningMode::Standard),
+        "pro" => Ok(ReasoningMode::Pro),
+        _ => anyhow::bail!("invalid reasoning mode {value:?}; use standard or pro"),
+    }
 }
 
 /// Parse a prompt-cache retention policy.
@@ -540,9 +559,9 @@ mod tests {
     }
 
     #[test]
-    fn default_tool_policy_uses_exec_instead_of_a_redundant_search_schema() {
+    fn default_tool_policy_uses_bash_instead_of_a_redundant_search_schema() {
         let policy = ToolPolicy::default();
-        for name in ["read", "edit", "write", "exec"] {
+        for name in ["read", "edit", "write", "bash"] {
             assert!(policy.enabled(name), "{name}");
         }
         assert!(!policy.enabled("search"));
@@ -573,6 +592,20 @@ mod tests {
         }
         assert_eq!(ThinkingLevel::Xhigh.to_effort(), ReasoningEffort::Xhigh);
         assert_eq!(ThinkingLevel::Max.to_effort(), ReasoningEffort::Max);
+    }
+
+    #[test]
+    fn reasoning_modes_parse_independently_from_effort() {
+        assert_eq!(
+            parse_reasoning_mode("standard").unwrap(),
+            ReasoningMode::Standard
+        );
+        assert_eq!(
+            parse_reasoning_mode("default").unwrap(),
+            ReasoningMode::Standard
+        );
+        assert_eq!(parse_reasoning_mode("pro").unwrap(), ReasoningMode::Pro);
+        assert!(parse_reasoning_mode("max").is_err());
     }
 
     #[test]

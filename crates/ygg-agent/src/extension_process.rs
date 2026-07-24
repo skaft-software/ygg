@@ -79,12 +79,12 @@ async fn host_shutdown_requested() {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RegisteredProcessKind {
-    Exec,
+    Bash,
     Extension,
 }
 
 #[cfg(unix)]
-struct DetachedExecSupervision {
+struct DetachedBashSupervision {
     deadline: Instant,
     cancellation: CancellationToken,
 }
@@ -93,7 +93,7 @@ struct DetachedExecSupervision {
 struct RegisteredProcessGroup {
     kind: RegisteredProcessKind,
     registration_id: u64,
-    detached_exec: Option<DetachedExecSupervision>,
+    detached_bash: Option<DetachedBashSupervision>,
 }
 
 #[cfg(unix)]
@@ -104,15 +104,15 @@ static NEXT_PROCESS_GROUP_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(unix)]
 const DETACHED_EXEC_REAPER_POLL: Duration = Duration::from_millis(25);
 
-/// One process-wide reaper owns successful `exec` groups whose direct leader
+/// One process-wide reaper owns successful `bash` groups whose direct leader
 /// has exited while background descendants remain. A standard thread keeps the
 /// cleanup boundary alive during async-runtime teardown without spawning one
 /// task per command.
 #[cfg(unix)]
 static DETACHED_EXEC_REAPER: LazyLock<Option<std::thread::Thread>> = LazyLock::new(|| {
     std::thread::Builder::new()
-        .name("ygg-exec-group-reaper".into())
-        .spawn(detached_exec_reaper_loop)
+        .name("ygg-bash-group-reaper".into())
+        .spawn(detached_bash_reaper_loop)
         .ok()
         .map(|handle| handle.thread().clone())
 });
@@ -132,7 +132,7 @@ fn register_process_group(process_group_id: u64, kind: RegisteredProcessKind) ->
             RegisteredProcessGroup {
                 kind,
                 registration_id,
-                detached_exec: None,
+                detached_bash: None,
             },
         );
     }
@@ -169,9 +169,9 @@ pub struct ProcessGroupGuard {
 }
 
 impl ProcessGroupGuard {
-    /// Registers a shell or built-in `exec` child process group.
-    pub fn exec(pid: Option<u32>) -> Self {
-        Self::new(pid.map(u64::from).unwrap_or(0), RegisteredProcessKind::Exec)
+    /// Registers a shell or built-in `bash` child process group.
+    pub fn bash(pid: Option<u32>) -> Self {
+        Self::new(pid.map(u64::from).unwrap_or(0), RegisteredProcessKind::Bash)
     }
 
     fn extension(process_group_id: u64) -> Self {
@@ -199,11 +199,11 @@ impl ProcessGroupGuard {
         unregister_process_group(process_group_id, self.registration_id);
     }
 
-    /// Transfers a successfully reaped direct `exec` child to the centralized
+    /// Transfers a successfully reaped direct `bash` child to the centralized
     /// descendant supervisor. The registry entry remains live until the group
     /// disappears naturally, the run is cancelled, the original execution
     /// deadline expires, or host shutdown begins.
-    pub fn supervise_exec_descendants(self, lifetime: Duration, cancellation: CancellationToken) {
+    pub fn supervise_bash_descendants(self, lifetime: Duration, cancellation: CancellationToken) {
         #[cfg(unix)]
         {
             let process_group_id = self.process_group_id.load(Ordering::Acquire);
@@ -238,11 +238,11 @@ impl ProcessGroupGuard {
                     return;
                 };
                 if entry.registration_id != self.registration_id
-                    || entry.kind != RegisteredProcessKind::Exec
+                    || entry.kind != RegisteredProcessKind::Bash
                 {
                     return;
                 }
-                entry.detached_exec = Some(DetachedExecSupervision {
+                entry.detached_bash = Some(DetachedBashSupervision {
                     deadline,
                     cancellation,
                 });
@@ -282,11 +282,11 @@ fn registered_process_groups(kind: Option<RegisteredProcessKind>) -> Vec<i32> {
 }
 
 #[cfg(unix)]
-fn detached_exec_process_groups() -> Vec<(i32, u64, Instant, CancellationToken)> {
+fn detached_bash_process_groups() -> Vec<(i32, u64, Instant, CancellationToken)> {
     lock_std_mutex(&REGISTERED_PROCESS_GROUPS)
         .iter()
         .filter_map(|(process_group_id, registered)| {
-            registered.detached_exec.as_ref().map(|supervision| {
+            registered.detached_bash.as_ref().map(|supervision| {
                 (
                     *process_group_id,
                     registered.registration_id,
@@ -299,9 +299,9 @@ fn detached_exec_process_groups() -> Vec<(i32, u64, Instant, CancellationToken)>
 }
 
 #[cfg(unix)]
-fn detached_exec_reaper_loop() {
+fn detached_bash_reaper_loop() {
     loop {
-        let supervised = detached_exec_process_groups();
+        let supervised = detached_bash_process_groups();
         if supervised.is_empty() {
             std::thread::park();
             continue;
@@ -353,12 +353,12 @@ fn process_group_is_alive(process_group_id: i32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Gracefully terminates registered shell/`exec` groups, then force-kills and
+/// Gracefully terminates registered shell/`bash` groups, then force-kills and
 /// waits for survivors, all within the supplied total timeout.
-pub async fn terminate_exec_process_groups(timeout: Duration) {
+pub async fn terminate_bash_process_groups(timeout: Duration) {
     #[cfg(unix)]
     {
-        let process_group_ids = registered_process_groups(Some(RegisteredProcessKind::Exec));
+        let process_group_ids = registered_process_groups(Some(RegisteredProcessKind::Bash));
         if process_group_ids.is_empty() {
             return;
         }
@@ -388,7 +388,7 @@ pub async fn terminate_exec_process_groups(timeout: Duration) {
     let _ = timeout;
 }
 
-/// Force-kills every registered shell, `exec`, and extension process group.
+/// Force-kills every registered shell, `bash`, and extension process group.
 ///
 /// This is the last-resort watchdog path after coordinated cleanup times out.
 pub fn force_kill_registered_process_groups() {

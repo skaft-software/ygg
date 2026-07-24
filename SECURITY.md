@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Ygg is currently an alpha. Security fixes are made on the latest `0.1.0-alpha` branch; older snapshots are not supported.
+Ygg is currently an alpha. Security fixes are made on the latest `0.1.1-alpha` release; older snapshots are not supported.
 
 ## Boundary and defaults
 
@@ -15,13 +15,13 @@ Ygg nevertheless treats its own policy and persistence boundaries as security in
 - Trusted project settings may tighten global authority/resource floors but cannot relax them. Environment and explicit CLI settings remain user-controlled higher-trust layers.
 - Context/config/credential files must be bounded regular files. Workspace context symlinks and special files are rejected.
 - Disabled tools are removed from both the provider schema and execution registry. `--no-edit` disables `edit` and `write`; `--tools read,search` and `--no-tools` provide complete allowlisting.
-- Arbitrary process execution and shell execution are treated as equivalent authority. `exec` requires both compatibility gates to be enabled.
+- Arbitrary process execution and shell execution are treated as equivalent authority. `bash` requires both compatibility gates to be enabled.
 - Mutating or unknown tool calls left unresolved by a crash are never replayed automatically. They are paired with an indeterminate result for explicit reconciliation.
 - Session mutation uses advisory interprocess locking, stale-generation checks, private permissions, bounded parsing, and synced records. Session listing is byte-for-byte read-only.
 - Provider streams, discovery responses, context, configuration, credentials, sessions, tool arguments/results, and local file reads have hard aggregate limits.
 - Run cancellation reaches provider streaming, retry waits, tools, and autonomous compaction. Once cancellation wins a request race, no summary or usage record from that request is committed.
 
-These controls reduce accidental authority and defend documented Ygg boundaries. They do not contain a command that the user has enabled. In particular, an enabled `exec` can read credentials, access the network, and start descendants with the user's authority.
+These controls reduce accidental authority and defend documented Ygg boundaries. They do not contain a command that the user has enabled. In particular, an enabled `bash` can read credentials, access the network, and start descendants with the user's authority.
 
 ## Recommended untrusted-repository workflow
 

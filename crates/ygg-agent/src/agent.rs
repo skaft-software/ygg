@@ -13,8 +13,8 @@ use tokio::sync::mpsc;
 use ygg_ai::{
     AiClient, AiError, AssistantMessage, AssistantPart, AudioPayload, CacheRetention,
     CompatibilityMode, Cost, ImageSource, Media, Message, Model, OutputFormat, OutputModalities,
-    ReasoningConfig, Request, StopReason, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolResult,
-    ToolResultPart, Usage, UserMessage, UserPart, PICODOLLARS_PER_MICRODOLLAR,
+    ReasoningConfig, ReasoningMode, Request, StopReason, StreamEvent, ToolCall, ToolChoice,
+    ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart, PICODOLLARS_PER_MICRODOLLAR,
 };
 
 use crate::compaction::{
@@ -125,7 +125,7 @@ pub struct AgentConfig {
     /// Capability gates and limits for tool execution.
     pub sandbox: SandboxConfig,
     /// Registered tools and event observers. Register [`CoreTools`](crate::tools::CoreTools)
-    /// here for the built-in `read`/`edit`/`write`/`exec`/`search` tools.
+    /// here for the built-in `read`/`edit`/`write`/`bash`/`search` tools.
     pub extensions: ExtensionHost,
     /// Maximum model turns per run; exceeding it finishes the run with
     /// [`FinishReason::MaxTurns`].  `None` disables the limit.
@@ -136,6 +136,8 @@ pub struct AgentConfig {
     /// validation when the run opens its stream, surfacing as
     /// [`FinishReason::Failed`].
     pub reasoning: ReasoningConfig,
+    /// Reasoning execution mode applied independently from effort.
+    pub reasoning_mode: ReasoningMode,
     /// Prompt-cache retention policy for model turns. Defaults to short in
     /// application configuration, matching pi.
     pub cache_retention: CacheRetention,
@@ -196,6 +198,7 @@ pub struct Agent {
     system: String,
     max_turns: Option<u64>,
     reasoning: ReasoningConfig,
+    reasoning_mode: ReasoningMode,
     cache_retention: CacheRetention,
     /// Optional provider route used for autonomous context summaries.
     /// Defaults to the active model when unset.
@@ -230,17 +233,8 @@ impl Drop for Agent {
             let _ = persist_pending_cancellations(&mut self.session);
         }
 
-        // PTY sessions are process resources, not durable conversation state.
-        // Scope cleanup to this exact Agent so concurrent sessions in the same
-        // workspace cannot kill each other's interactive children.
-        if self
-            .extensions
-            .tools
-            .iter()
-            .any(|tool| tool.definition().name == "exec")
-        {
-            crate::tools::cleanup_pty_scope(&self.tool_scope);
-        }
+        // Tool process groups are owned by per-call RAII guards. There are no
+        // persistent shell sessions to clean up when the agent is dropped.
     }
 }
 
@@ -1454,6 +1448,7 @@ impl<'a> CompactionContext<'a> {
             temperature: None,
             stop: Vec::new(),
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: ReasoningMode::Standard,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -1726,6 +1721,7 @@ impl TerminalGateContext<'_> {
                 temperature: Some(0.0),
                 stop: Vec::new(),
                 reasoning: ReasoningConfig::Off,
+                reasoning_mode: ReasoningMode::Standard,
                 output_format: OutputFormat::Text,
                 output_modalities: OutputModalities::Text,
                 compatibility: CompatibilityMode::Strict,
@@ -1824,6 +1820,7 @@ impl Agent {
             system: config.system,
             max_turns: config.max_turns,
             reasoning: config.reasoning,
+            reasoning_mode: config.reasoning_mode,
             cache_retention: config.cache_retention,
             compaction_model: None,
             auto_compaction_enabled: true,
@@ -2158,6 +2155,7 @@ impl Agent {
         let tool_call_hooks = self.extensions.tool_call_hooks.clone();
         let max_turns = self.max_turns;
         let reasoning = self.reasoning.clone();
+        let reasoning_mode = self.reasoning_mode;
         let cache_retention = self.cache_retention;
         let session_id = self.session_id.clone();
         let tool_scope = self.tool_scope.clone();
@@ -2328,6 +2326,7 @@ impl Agent {
                     temperature: None,
                     stop: vec![],
                     reasoning: reasoning.clone(),
+                    reasoning_mode,
                     output_format: OutputFormat::Text,
                     output_modalities: OutputModalities::Text,
                     compatibility: CompatibilityMode::Strict,

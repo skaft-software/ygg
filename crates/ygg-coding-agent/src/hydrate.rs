@@ -556,6 +556,7 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("local-alias-b".into()),
                 reasoning: Some("high".into()),
+                reasoning_mode: None,
             })
             .unwrap();
         session
@@ -609,6 +610,7 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("gpt-5.6".into()),
                 reasoning: None,
+                reasoning_mode: None,
             })
             .unwrap();
         session.append(user("old A")).unwrap();
@@ -616,6 +618,7 @@ mod tests {
             .append(EntryValue::Config {
                 model: Some("deepseek-v4".into()),
                 reasoning: None,
+                reasoning_mode: None,
             })
             .unwrap();
         session.append(user("old B")).unwrap();

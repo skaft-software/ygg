@@ -79,6 +79,7 @@ async fn test_client_complete_happy_path() {
         temperature: None,
         stop: vec![],
         reasoning: ygg_ai::ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: Strict,

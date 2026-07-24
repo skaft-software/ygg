@@ -2289,6 +2289,7 @@ context = true
             extensions: ExtensionHost::new(),
             max_turns: None,
             reasoning: ReasoningConfig::Off,
+            reasoning_mode: ygg_ai::ReasoningMode::Standard,
             cache_retention: CacheRetention::Short,
             session_id: None,
         })

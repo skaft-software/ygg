@@ -2119,6 +2119,8 @@ mod tests {
             model_explicit: false,
             reasoning: ygg_ai::ReasoningConfig::Off,
             reasoning_explicit: false,
+            reasoning_mode: ygg_ai::ReasoningMode::Standard,
+            reasoning_mode_explicit: false,
             cache_retention: ygg_ai::CacheRetention::Short,
             sandbox: SandboxPolicy::default(),
             theme: None,

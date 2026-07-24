@@ -264,6 +264,47 @@ pub async fn theme_picker(
     Ok(Some(names[index].clone()))
 }
 
+/// Ask the user to select standard or Pro execution before choosing effort.
+pub async fn reasoning_mode_picker(
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    current: ygg_ai::ReasoningMode,
+) -> anyhow::Result<Option<ygg_ai::ReasoningMode>> {
+    let other = match current {
+        ygg_ai::ReasoningMode::Standard => ygg_ai::ReasoningMode::Pro,
+        ygg_ai::ReasoningMode::Pro => ygg_ai::ReasoningMode::Standard,
+    };
+    let modes = vec![current, other];
+    let items = modes
+        .iter()
+        .map(|mode| match mode {
+            ygg_ai::ReasoningMode::Standard => "standard".to_owned(),
+            ygg_ai::ReasoningMode::Pro => "pro".to_owned(),
+        })
+        .collect();
+    let Some(index) = pick_list(
+        shell,
+        input,
+        "Select reasoning mode",
+        items,
+        modes
+            .iter()
+            .map(|mode| match mode {
+                ygg_ai::ReasoningMode::Standard => Some("normal model execution".to_owned()),
+                ygg_ai::ReasoningMode::Pro => {
+                    Some("more model work; higher latency and token usage".to_owned())
+                }
+            })
+            .collect(),
+        PanelAction::SelectReasoningMode(modes.clone()),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(modes[index]))
+}
+
 /// Ask the user to select a capability-supported thinking level.
 pub async fn thinking_picker(
     shell: &mut InteractiveShell,

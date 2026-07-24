@@ -17,7 +17,7 @@
 //!
 //! ```no_run
 //! use ygg_agent::{Agent, AgentConfig, CoreTools, ExtensionHost, SandboxConfig, Session};
-//! use ygg_ai::{AiClient, CacheRetention, ModelCatalog, ModelId, ReasoningConfig};
+//! use ygg_ai::{AiClient, CacheRetention, ModelCatalog, ModelId, ReasoningConfig, ReasoningMode};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let catalog = ModelCatalog::builtin()?;
@@ -33,6 +33,7 @@
 //!     extensions,
 //!     max_turns: Some(40),
 //!     reasoning: ReasoningConfig::Off,
+//!     reasoning_mode: ReasoningMode::Standard,
 //!     cache_retention: CacheRetention::Short,
 //!     session_id: None,
 //! })?;
@@ -129,4 +130,4 @@ pub use tool::{
     ToolInputResponse, ToolInputValidationIssue, ToolOutput, ToolProgress, ToolProgressSink,
     TypedTool, TypedToolAdapter, ValidateToolInput, MAX_PROGRESS_CHUNK_BYTES,
 };
-pub use tools::{CoreTools, EditTool, ExecTool, ReadTool, SearchTool, WriteTool};
+pub use tools::{BashTool, CoreTools, EditTool, ReadTool, SearchTool, WriteTool};

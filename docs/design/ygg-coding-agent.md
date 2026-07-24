@@ -37,24 +37,49 @@ tail or selects the complete semantic transcript.
 
 ## System prompt
 
-The base prompt is generated from the effective runtime configuration. It names
-the workspace root and workspace-relative invocation directory, advertises only
-core tools whose schema and implementation are actually enabled, and carries a
-small completion, preservation, and verification contract. Volatile or
-discoverable details such as Git status, model IDs, OS metadata, and product
-documentation stay out of every request.
+The stable, model-agnostic base contract gives both local and cloud models an
+explicit completion trajectory: honor answer/investigate/review/plan/implement
+mode; use tools rather than guess; inspect before editing; continue until done
+or concretely blocked; preserve unrelated work; make the smallest complete
+change; verify the diff and relevant checks; and report concise observed
+results with `path:line` references. It forbids commits unless requested and
+makes clear that supplied tool schemas are authoritative.
+
+The environment block truthfully distinguishes the workspace root from the
+invocation directory. Relative tool paths and the default `bash` working
+directory resolve from the workspace root. Enabled core-tool names are listed,
+while the contract acknowledges extension and skill tools supplied alongside
+them. Behavioral changes require regression tests rather than model-specific
+prompt tuning.
 
 Global and trusted workspace `AGENTS.md` files retain root-to-leaf precedence
 and are wrapped in path-labelled `<project_instructions>` blocks. Active skill
 instructions use labelled blocks with stable IDs and hashes.
+
+## Compaction and handoff summaries
+
+The product pre-request gate and `ygg-agent` overflow recovery share one
+Pi-compatible summarization implementation. Conversation messages are first
+serialized inside `<conversation>` tags so the model cannot mistake them for a
+live turn. Initial and iterative summaries use Pi's exact structured Markdown
+contracts; iterative calls provide the prior checkpoint in
+`<previous-summary>` tags. Branch-handoff helpers use Pi's corresponding branch
+prompt and preamble.
+
+File tracking is deterministic host behavior, not model output. Successful or
+failed assistant calls to `read`, `write`, and `edit` contribute paths;
+modified paths supersede read-only paths; and deduplicated sorted lists are
+appended as `<read-files>` and `<modified-files>` blocks. The cumulative
+`readFiles`/`modifiedFiles` details are persisted on compaction entries so later
+summaries retain them. Legacy entries deserialize with empty details.
 
 ## Agent construction and tools
 
 Every build or idle-boundary rebuild creates one `ExtensionHost` and registers,
 in order:
 
-- Core tools: `read`, `edit`, `write`, `exec`, then opt-in `search`. The default
-  surface omits `search` because `exec` already provides `rg`/`find`/`ls`.
+- Core tools: `read`, `edit`, `write`, `bash`, then opt-in `search`. The default
+  surface omits `search` because `bash` already provides `rg`/`find`/`ls`.
 - Skill tools: `search_skills`, `load_skill`, `read_skill_resource`.
 
 Context budgeting reserves the serialized schemas from that exact host rather

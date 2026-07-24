@@ -92,6 +92,7 @@ async fn live_openai_compatible_inline_png_reaches_the_model() {
         extensions: ExtensionHost::new(),
         max_turns: Some(2),
         reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: CacheRetention::None,
         session_id: None,
     })

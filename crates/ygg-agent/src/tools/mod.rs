@@ -1,18 +1,18 @@
-//! The built-in tools (`read`, `edit`, `write`, `exec`, `search`) and the [`CoreTools`]
+//! The built-in tools (`read`, `edit`, `write`, `bash`, `search`) and the [`CoreTools`]
 //! extension that registers them.
 //!
 //! Core tools are not special: they implement the same [`Tool`](crate::Tool)
 //! trait and register through the same [`ExtensionHost::tool`] method as any
 //! third-party tool.
 
+mod bash;
 mod edit;
-mod exec;
 mod read;
 mod search;
 mod write;
 
+pub use bash::BashTool;
 pub use edit::EditTool;
-pub use exec::ExecTool;
 pub use read::ReadTool;
 pub use search::SearchTool;
 pub use write::WriteTool;
@@ -27,20 +27,12 @@ pub(crate) const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 /// boundary.
 pub struct CoreTools;
 
-#[cfg(unix)]
-pub(crate) fn cleanup_pty_scope(execution_scope: &str) {
-    exec::cleanup_pty_scope(execution_scope);
-}
-
-#[cfg(not(unix))]
-pub(crate) fn cleanup_pty_scope(_execution_scope: &str) {}
-
 impl Extension for CoreTools {
     fn register(&self, host: &mut ExtensionHost) {
         host.tool(ReadTool);
         host.tool(EditTool);
         host.tool(WriteTool);
-        host.tool(ExecTool);
+        host.tool(BashTool);
         // The coding product disables this redundant schema by default, while
         // keeping it available to embedders and explicit tool allowlists.
         host.tool(SearchTool);

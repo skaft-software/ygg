@@ -23,7 +23,7 @@ pub struct SandboxConfig {
     pub workspace: PathBuf,
     /// Permit absolute paths, `~` paths, `..`, and symlinks outside the workspace.
     ///
-    /// When false, built-in file tools and `exec` working directories are
+    /// When false, built-in file tools and `bash` working directories are
     /// workspace-only. Spawned processes are never filesystem-confined by this
     /// flag.
     pub allow_external_paths: bool,
@@ -33,15 +33,17 @@ pub struct SandboxConfig {
     pub allow_write: bool,
     /// First half of the unified command-execution gate.
     ///
-    /// Arbitrary process execution has shell-equivalent authority; `exec`
+    /// Arbitrary process execution has shell-equivalent authority; `bash`
     /// requires this and `allow_shell` together.
     pub allow_process: bool,
     /// Second half of the unified command-execution gate. Keeping both fields
-    /// preserves configuration compatibility without pretending that direct
-    /// interpreter execution is less powerful than `/bin/sh -c`.
+    /// preserves configuration compatibility at the authority boundary.
     pub allow_shell: bool,
-    /// Maximum duration for an `exec` call (also bounds `search`).
-    pub exec_timeout: Duration,
+    /// Explicit Bash-compatible shell executable. When unset on Unix, Ygg
+    /// follows Pi's order: `/bin/bash`, `bash` on `PATH`, then `sh`.
+    pub shell_path: Option<PathBuf>,
+    /// Maximum duration for a `bash` call (also bounds `search`).
+    pub bash_timeout: Duration,
     /// Maximum bytes of tool output before truncation.
     pub max_output_bytes: usize,
 }
@@ -49,7 +51,7 @@ pub struct SandboxConfig {
 impl SandboxConfig {
     /// Creates a conservative library configuration rooted at `workspace`:
     /// workspace-only paths, no edits, no process or shell execution, a 120s
-    /// exec timeout, and a 16 KiB per-tool output cap. Hosts may enable
+    /// execution timeout, and a 16 KiB per-tool output cap. Hosts may enable
     /// capabilities or trusted-local path access through the public fields.
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
@@ -59,7 +61,8 @@ impl SandboxConfig {
             allow_write: false,
             allow_process: false,
             allow_shell: false,
-            exec_timeout: Duration::from_secs(120),
+            shell_path: None,
+            bash_timeout: Duration::from_secs(120),
             max_output_bytes: 16 * 1024,
         }
     }

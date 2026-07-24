@@ -20,8 +20,8 @@ name = "ygg"
 path = "src/main.rs"
 
 [dependencies]
-ygg-ai = { version = "=0.1.0-alpha", path = "../ygg-ai" }
-ygg-agent = { version = "=0.1.0-alpha", path = "../ygg-agent" }
+ygg-ai = { version = "=0.1.1-alpha", path = "../ygg-ai" }
+ygg-agent = { version = "=0.1.1-alpha", path = "../ygg-agent" }
 # Vendored semantic rich-rendering integration. Keeping it in this workspace
 # makes fresh clones build the exact implementation reviewed with Ygg.
 sexy-tui-rs = { version = "=0.2.1", path = "../sexy-tui-rs" }
