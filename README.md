@@ -1,17 +1,17 @@
 <p align="center">
   <a href="http://skaft.org/ygg">
-    <img src="docs/assets/ygg-hero.svg" alt="ygg — a local-first coding agent" width="100%">
+    <img src="docs/assets/ygg-demo.gif" alt="ygg — a local-first coding agent - terminal demo"  width="80%">
   </a>
 </p>
 
 <p align="center">
-  <strong>A fast, durable coding agent for local models, cloud models, and everything in between.</strong>
+  <strong>A tiny and fast coding agent for local models, cloud models, and everything in between.</strong>
 </p>
 
 <p align="center">
   <a href="http://skaft.org/ygg"><strong>Website</strong></a> ·
-  <a href="#install"><strong>Install</strong></a> ·
-  <a href="#documentation"><strong>Documentation</strong></a> ·
+  <a href="http://skaft.org/ygg/#install"><strong>Install</strong></a> ·
+  <a href="http://skaft.org/ygg/docs"><strong>Documentation</strong></a> ·
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
 
@@ -24,15 +24,11 @@
 
 ---
 
-ygg is a local-first coding agent written in Rust. It combines a polished terminal interface, a provider-independent inference layer, durable branchable sessions, bounded tools, explicit trust controls, multimodal input, automatic context compaction, and a filesystem-native customization system in one binary.
+ygg is a local-first coding agent written in Rust. It combines a polished terminal interface, a provider-agnostic inference layer, durable sessions, explicit tools, omnimodal input, configurable compaction, and a rich, customizable theme engine.
 
 It works with a local OpenAI-compatible server just as naturally as it works with OpenAI, Anthropic, OpenRouter, or another cloud provider. There is no hosted ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local inspectable JSONL.
 
 > **Release status:** `0.1.1-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
-
-<p align="center">
-  <img src="docs/assets/ygg-demo.gif" alt="ygg terminal demo" width="100%">
-</p>
 
 ## Why ygg
 
