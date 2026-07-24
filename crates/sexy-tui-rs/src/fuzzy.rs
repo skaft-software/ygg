@@ -128,7 +128,11 @@ fn regex_alpha_digits(s: &str) -> Option<AlphaDigits> {
     let letters_end = s.find(|c: char| c.is_ascii_digit())?;
     let letters = s[..letters_end].to_string();
     let digits = s[letters_end..].to_string();
-    if letters.is_empty() || digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+    if letters.is_empty()
+        || digits.is_empty()
+        || !letters.chars().all(|c| c.is_ascii_alphabetic())
+        || !digits.chars().all(|c| c.is_ascii_digit())
+    {
         return None;
     }
     Some(AlphaDigits { letters, digits })
@@ -138,7 +142,11 @@ fn regex_digits_alpha(s: &str) -> Option<AlphaDigits> {
     let digits_end = s.find(|c: char| c.is_ascii_alphabetic())?;
     let digits = s[..digits_end].to_string();
     let letters = s[digits_end..].to_string();
-    if digits.is_empty() || letters.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+    if digits.is_empty()
+        || letters.is_empty()
+        || !digits.chars().all(|c| c.is_ascii_digit())
+        || !letters.chars().all(|c| c.is_ascii_alphabetic())
+    {
         return None;
     }
     Some(AlphaDigits { letters, digits })

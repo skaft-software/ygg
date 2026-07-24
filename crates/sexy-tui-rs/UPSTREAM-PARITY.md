@@ -40,7 +40,9 @@ Port order:
 | Keys | `keys.test.ts` | In progress; Kitty, alternate-layout, keypad, modifyOtherKeys and legacy families ported |
 | Stdin buffering | `stdin-buffer.test.ts` | In progress; sequence splitting, semantic paste, timeout polling and Kitty duplicate suppression ported |
 | Terminal | `terminal.test.ts` | In progress; negotiation parser/lifecycle sequences and Apple Return normalization ported |
+| Terminal colors | `terminal-colors.test.ts` | In progress; strict OSC 11 and color-scheme parsers ported; TUI query lifecycle remains |
 | TUI | overlay tests plus `tui-*.test.ts` | In progress; options now drive layout and segment composition; full frame/focus parity remains |
+| Input/keybindings/select list | corresponding pinned tests | In progress; core editing, kill/yank, undo, layout and selection behavior ported; complete named test parity remains |
 | Editor/autocomplete/widgets | corresponding pinned tests | Not ported |
 | Image/Markdown | corresponding pinned tests | Not ported |
 

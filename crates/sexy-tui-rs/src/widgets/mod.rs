@@ -20,7 +20,10 @@ pub use input::Input;
 pub use loader::{Loader, LoaderIndicatorOptions};
 pub use markdown::{Markdown, MarkdownOptions, MarkdownTheme, StreamingMarkdownWidget};
 pub use panel::Panel;
-pub use select_list::{SelectItem, SelectList, SelectListTheme};
+pub use select_list::{
+    SelectItem, SelectItemHandler, SelectList, SelectListLayoutOptions, SelectListTheme,
+    TruncatePrimary,
+};
 pub use settings_list::{SettingItem, SettingsList, SettingsListTheme};
 pub use spacer::Spacer;
 pub use text::{RichText, Text};

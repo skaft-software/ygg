@@ -139,6 +139,7 @@ pub struct TruncatedText {
     content: String,
     padding_x: u16,
     padding_y: u16,
+    trusted_ansi: bool,
     capabilities: crate::TerminalCapabilities,
 }
 
@@ -148,8 +149,17 @@ impl TruncatedText {
             content: content.to_string(),
             padding_x,
             padding_y,
+            trusted_ansi: true,
             capabilities: crate::terminal_image::get_capabilities(),
         }
+    }
+
+    /// Rust/Ygg compatibility layer for untrusted text. Pi's core constructor
+    /// treats SGR in component content as intentional styling.
+    pub fn untrusted(content: &str, padding_x: u16, padding_y: u16) -> Self {
+        let mut component = Self::new(content, padding_x, padding_y);
+        component.trusted_ansi = false;
+        component
     }
 
     pub fn set_capabilities(&mut self, capabilities: crate::TerminalCapabilities) {
@@ -159,18 +169,28 @@ impl TruncatedText {
 
 impl Component for TruncatedText {
     fn render(&self, width: u16) -> Vec<String> {
-        let padding_x = self.padding_x.min(width / 2);
-        let inner = usize::from(width.saturating_sub(padding_x.saturating_mul(2)));
-        let safe = crate::sanitize::sanitize_line(&self.content, !self.capabilities.unicode);
-        let glyphs = crate::GlyphSet::for_capabilities(self.capabilities);
-        let truncated = crate::utils::truncate_to_width(&safe, inner, Some(glyphs.ellipsis));
-        let mut lines = vec!["".to_string(); self.padding_y as usize];
-        lines.push(format!(
-            "{}{}",
-            " ".repeat(usize::from(padding_x)),
-            truncated
-        ));
-        lines.extend(vec!["".to_string(); self.padding_y as usize]);
+        let width = usize::from(width);
+        let empty = " ".repeat(width);
+        let padding_x = usize::from(self.padding_x);
+        let inner = width.saturating_sub(padding_x.saturating_mul(2)).max(1);
+        let first_line = self.content.split('\n').next().unwrap_or_default();
+        let safe = if self.trusted_ansi {
+            std::borrow::Cow::Borrowed(first_line)
+        } else {
+            crate::sanitize::sanitize_line(first_line, !self.capabilities.unicode)
+        };
+        let truncated = crate::utils::truncate_to_width(&safe, inner, None);
+        let mut content = format!(
+            "{}{}{}",
+            " ".repeat(padding_x),
+            truncated,
+            " ".repeat(padding_x)
+        );
+        content.push_str(&" ".repeat(width.saturating_sub(crate::utils::visible_width(&content))));
+
+        let mut lines = vec![empty.clone(); usize::from(self.padding_y)];
+        lines.push(content);
+        lines.extend(vec![empty; usize::from(self.padding_y)]);
         lines
     }
     fn invalidate(&mut self) {}

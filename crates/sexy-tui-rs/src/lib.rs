@@ -76,7 +76,10 @@ pub use terminal::{
     parse_keyboard_protocol_negotiation_sequence, KeyboardProtocolNegotiationSequence,
     ProcessTerminal, Terminal, TerminalInput,
 };
-pub use terminal_colors::{parse_osc11_background_color, RgbColor};
+pub use terminal_colors::{
+    is_osc11_background_color_response, parse_osc11_background_color,
+    parse_terminal_color_scheme_report, RgbColor, TerminalColorScheme,
+};
 pub use terminal_image::{
     allocate_image_id, calculate_image_rows, delete_all_kitty_images, delete_kitty_image,
     detect_capabilities, encode_iterm2, encode_kitty, get_capabilities, get_cell_dimensions,
