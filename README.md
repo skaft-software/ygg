@@ -30,6 +30,10 @@ It works with a local OpenAI-compatible server just as naturally as it works wit
 
 > **Release status:** `0.1.1-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
 
+<p align="center">
+  <img src="docs/assets/ygg-demo.gif" alt="ygg terminal demo" width="100%">
+</p>
+
 ## Why ygg
 
 Most coding agents make you choose between a beautiful product and a system you can actually inspect. ygg is built around the idea that you should get both.
@@ -132,55 +136,94 @@ ygg --login codex
 ygg --model gpt-5.6
 ```
 
-### Use a local model
+### Use custom OpenAI-compatible providers
 
-Create `~/.ygg/credentials/custom.json`:
-
-```json
-{
-  "base_url": "http://127.0.0.1:8000/v1/",
-  "api_key": "",
-  "auto_discover": true,
-  "startup_timeout_secs": 900
-}
-```
-
-Protect the credential file and start ygg:
-
-```sh
-chmod 600 ~/.ygg/credentials/custom.json
-ygg --model custom/my-model
-```
-
-`startup_timeout_secs` applies to the initial response headers from a cold custom endpoint, so a local server can load model weights without being mistaken for a dead connection. Ordinary connection loss remains bounded, visible, cancellable, and retried up to five times.
-
-If the endpoint cannot provide a useful `GET /models`, configure its inventory explicitly:
+Configure all custom endpoints together in `~/.ygg/credentials/custom.json`:
 
 ```json
 {
-  "base_url": "http://127.0.0.1:8000/v1/",
-  "api_key": "",
-  "auto_discover": false,
-  "startup_timeout_secs": 900,
-  "models": [
-    {
-      "api_name": "Qwen/Qwen3-Coder-Next",
-      "display_name": "Qwen3 Coder Next",
-      "context_window": 131072,
-      "max_output_tokens": 16384,
-      "tools": true,
-      "parallel_tool_calls": false,
-      "vision": false,
-      "structured_output": false,
-      "reasoning": true,
-      "reasoning_values": ["none", "default"],
-      "reasoning_default": "default"
+  "version": 1,
+  "providers": {
+    "apple-fm": {
+      "label": "Apple Foundation Models",
+      "base_url": "http://127.0.0.1:1976/v1/",
+      "auth": { "kind": "none" },
+      "auto_discover": true,
+      "startup_timeout_secs": 300,
+      "models": [
+        {
+          "api_name": "system",
+          "context_window": 8192,
+          "max_output_tokens": 1024,
+          "tools": true,
+          "parallel_tool_calls": false,
+          "vision": false,
+          "structured_output": false,
+          "reasoning": true,
+          "reasoning_configurable": false
+        }
+      ]
+    },
+    "home-server": {
+      "label": "Home Server",
+      "base_url": "http://192.168.1.20:8000/v1/",
+      "auth": { "kind": "bearer_env", "var": "HOME_SERVER_API_KEY" },
+      "auto_discover": true
     }
-  ]
+  }
 }
 ```
 
-Use `--offline` to skip optional model discovery during startup. Inference still reaches the selected endpoint.
+Apple Foundation Models advertises sparse model metadata, so keep the explicit
+`system` entry at its documented 8192-token context window. Its on-device model
+thinks by default and exposes `on` as the only ygg thinking option; it does not
+support a configurable `reasoning_effort`, so keep `reasoning` enabled and
+`reasoning_configurable` disabled. Configured model metadata overrides matching
+discovery results.
+
+Each provider is independently discovered and selectable. Models use stable,
+provider-qualified IDs such as `custom/apple-fm/<model-id>`, and the configured
+labels appear in the picker and `/status`. API keys should be referenced through
+environment variables rather than written to this file.
+
+Existing single-object `custom.json` files are still accepted and normalized to
+the legacy `custom-openai` provider in memory, so their existing model IDs keep
+working. New configurations should use the registry shape above.
+
+If an endpoint cannot provide a useful `GET /v1/models`, set
+`auto_discover` to `false` and configure its inventory under that provider:
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "local": {
+      "label": "Local Qwen",
+      "base_url": "http://127.0.0.1:8000/v1/",
+      "auth": { "kind": "none" },
+      "auto_discover": false,
+      "models": [
+        {
+          "api_name": "Qwen/Qwen3-Coder-Next",
+          "display_name": "Qwen3 Coder Next",
+          "context_window": 131072,
+          "max_output_tokens": 16384,
+          "tools": true,
+          "parallel_tool_calls": false,
+          "vision": false,
+          "structured_output": false,
+          "reasoning": true,
+          "reasoning_values": ["none", "default"],
+          "reasoning_default": "default"
+        }
+      ]
+    }
+  }
+}
+```
+
+Protect the credential file with `chmod 600`. Use `--offline` to skip optional
+model discovery during startup; inference still reaches the selected endpoint.
 
 ## What ships in the binary
 
@@ -343,6 +386,21 @@ ygg --mouse terminal
 ```
 
 Custom themes are local TOML files and can control semantic roles, glyphs, density, responsive breakpoints, transcript surfaces, and terminal capability fallbacks. See [docs/themes.md](docs/themes.md).
+
+## sexy-tui-rs themability
+
+The vendored [`sexy-tui-rs`](crates/sexy-tui-rs) renderer is themeable by design. These recordings show the same terminal experience across four different visual treatments:
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/assets/ygg-theme-demo-1.gif" alt="sexy-tui-rs theme demo 1" width="100%"></td>
+    <td width="50%"><img src="docs/assets/ygg-theme-demo-2.gif" alt="sexy-tui-rs theme demo 2" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/assets/ygg-theme-demo-3.gif" alt="sexy-tui-rs theme demo 3" width="100%"></td>
+    <td width="50%"><img src="docs/assets/ygg-theme-demo-4.gif" alt="sexy-tui-rs theme demo 4" width="100%"></td>
+  </tr>
+</table>
 
 ## Interactive command reference
 

@@ -2088,6 +2088,27 @@ fn compute_tool_diff(panel: &ToolPanel) -> Option<String> {
     None
 }
 
+/// Minimum width reserved for the tool label before its value/output column.
+const TOOL_VALUE_MIN_WIDTH: usize = 6;
+
+fn tool_display_label(name: &str) -> &'static str {
+    match name {
+        "read" => "Read",
+        "search" => "Explored",
+        "edit" => "Edit",
+        "write" => "Write",
+        _ => "Used",
+    }
+}
+
+fn tool_value_indent_width(label: &str) -> usize {
+    TOOL_VALUE_MIN_WIDTH.max(visible_width(label).saturating_add(2))
+}
+
+fn tool_value_indent(label: &str) -> String {
+    " ".repeat(tool_value_indent_width(label))
+}
+
 /// Max diff lines to show in terse mode before truncating.
 const COMPACT_DIFF_LINES: usize = 10;
 
@@ -2098,21 +2119,23 @@ fn render_diff_only(
     theme: &YggTheme,
     width: u16,
     expanded: bool,
+    output_indent: &str,
 ) -> Vec<String> {
+    let output_indent_width = u16::try_from(visible_width(output_indent)).unwrap_or(u16::MAX);
     let display_line = |line: sexy_tui_rs::RenderedLine| {
         let content = if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
             line.plain
         } else {
             line.styled
         };
-        format!("  {content}")
+        format!("{output_indent}{content}")
     };
     let Some(ref diff) = tool_diff(panel) else {
         return Vec::new();
     };
     let rendered = renderer.render_diff(
         &UnifiedDiff::parse(diff),
-        width.saturating_sub(2),
+        width.saturating_sub(output_indent_width),
         DiffRenderOptions {
             line_numbers: width >= 70,
             wrap: true,
@@ -2123,7 +2146,7 @@ fn render_diff_only(
         let remaining = lines.len() - COMPACT_DIFF_LINES;
         lines.truncate(COMPACT_DIFF_LINES);
         let unit = if remaining == 1 { "line" } else { "lines" };
-        let hint = format!("  {remaining} {unit} hidden");
+        let hint = format!("{output_indent}{remaining} {unit} hidden");
         lines.push(subdued_text(theme, &hint));
     }
     lines
@@ -2134,6 +2157,7 @@ fn render_compact_tool_output(
     theme: &YggTheme,
     width: u16,
     expanded: bool,
+    output_indent: &str,
 ) -> Vec<String> {
     let output = sanitize_for_terminal(&panel.output);
     let mut lines = output
@@ -2153,19 +2177,19 @@ fn render_compact_tool_output(
     let mut rendered = Vec::new();
     if omitted > 0 {
         let unit = if omitted == 1 { "line" } else { "lines" };
-        let hint = format!("  {omitted} {unit} hidden");
+        let hint = format!("{omitted} {unit} hidden");
         rendered.extend(wrap_hanging(
             &understated_tool_output(theme, &hint),
-            "",
-            "  ",
+            output_indent,
+            output_indent,
             width,
         ));
     }
     for line in lines {
         rendered.extend(wrap_hanging(
             &understated_tool_output(theme, &line),
-            "  ",
-            "  ",
+            output_indent,
+            output_indent,
             width,
         ));
     }
@@ -2441,18 +2465,18 @@ fn render_compact_bash_output(
     width: u16,
     expanded: bool,
     show_tool_duration: bool,
+    output_indent: &str,
 ) -> Vec<String> {
     let compact = compact_bash_output(panel, expanded);
     let ellipsis = if theme.unicode() { "…" } else { "..." };
-    let gutter = " ".repeat(bash_content_gutter());
     let mut lines = Vec::new();
     let mut first_detail = true;
     let push_output = |lines: &mut Vec<String>, first_detail: &mut bool, output: String| {
         *first_detail = false;
         lines.extend(wrap_hanging(
             &theme.fg("tool_output", &output),
-            &gutter,
-            &gutter,
+            output_indent,
+            output_indent,
             width,
         ));
     };
@@ -2460,8 +2484,8 @@ fn render_compact_bash_output(
         *first_detail = false;
         lines.extend(wrap_hanging(
             &subdued_text(theme, &detail),
-            &gutter,
-            &gutter,
+            output_indent,
+            output_indent,
             width,
         ));
     };
@@ -2516,7 +2540,7 @@ fn render_compact_bash_output(
     if show_tool_duration {
         if let Some(duration) = tool_metadata(panel) {
             lines.push(fit_line(
-                &subdued_text(theme, &format!("{gutter}Took {duration}")),
+                &subdued_text(theme, &format!("{output_indent}Took {duration}")),
                 width,
             ));
         }
@@ -2531,7 +2555,7 @@ fn render_bash_row(
     width: u16,
 ) -> Vec<String> {
     let action = "Bash";
-    let action_gap = 6usize.saturating_sub(visible_width(action)).max(2);
+    let action_gap = tool_value_indent_width(action).saturating_sub(visible_width(action));
     let prefix = format!(
         "{}{}",
         theme.bold(&theme.fg("foreground", action)),
@@ -2721,15 +2745,13 @@ fn compile_surface_plan<'a>(
         .saturating_add(chrome_left)
         .saturating_add(padding);
     let content_width = frame_width.saturating_sub(overhead).max(1);
-    let leading_rows = if chrome == ThemeSurfaceChrome::Card
-        || chrome == ThemeSurfaceChrome::Rule
-        || heading != ThemeSurfaceHeading::None
-    {
-        1
-    } else {
-        0
-    };
-    let trailing_rows = usize::from(chrome == ThemeSurfaceChrome::Card);
+    let is_user_card = kind == "user" && chrome == ThemeSurfaceChrome::Card;
+    let leading_rows = usize::from(
+        chrome == ThemeSurfaceChrome::Card
+            || chrome == ThemeSurfaceChrome::Rule
+            || heading != ThemeSurfaceHeading::None,
+    ) + usize::from(is_user_card);
+    let trailing_rows = usize::from(chrome == ThemeSurfaceChrome::Card) + usize::from(is_user_card);
     SurfacePlan {
         kind,
         chrome,
@@ -2946,11 +2968,23 @@ fn decorate_surface(
     if plan.geometry.leading_rows > 0 {
         rows.push(styled_surface_heading(plan, theme));
     }
+    if plan.geometry.leading_rows > 1 {
+        rows.extend(std::iter::repeat_n(
+            render_surface_content_line("", plan, theme, prompt_color),
+            plan.geometry.leading_rows - 1,
+        ));
+    }
     rows.extend(
         content
             .iter()
             .map(|line| render_surface_content_line(line, plan, theme, prompt_color)),
     );
+    if plan.geometry.trailing_rows > 1 {
+        rows.extend(std::iter::repeat_n(
+            render_surface_content_line("", plan, theme, prompt_color),
+            plan.geometry.trailing_rows - 1,
+        ));
+    }
     if plan.geometry.trailing_rows > 0 {
         let (_, border_role, _) = surface_roles(plan.kind);
         let middle = horizontal_rule(theme, usize::from(plan.frame_width.saturating_sub(2)));
@@ -3039,6 +3073,12 @@ fn render_block_planned(
         TranscriptBlock::Tool(panel) => {
             let compact_bash = matches!(panel.name.as_str(), "bash" | "exec")
                 && panel.display.shell_command.is_some();
+            let tool = if panel.display.shell_command.is_some() {
+                "Bash"
+            } else {
+                tool_display_label(&panel.name)
+            };
+            let output_indent = tool_value_indent(tool);
             let mut lines = if let Some(command) = panel.display.shell_command.as_deref() {
                 render_bash_row(command, rich_renderer, theme, width)
             } else {
@@ -3060,20 +3100,14 @@ fn render_block_planned(
                 } else {
                     &panel.display.success
                 };
-                let tool = match panel.name.as_str() {
-                    "read" => "Read",
-                    "search" => "Explored",
-                    "edit" => "Edit",
-                    "write" => "Write",
-                    _ => "Used",
-                };
+                let tool = tool_display_label(&panel.name);
                 // The margin dot owns lifecycle colour. Tool text stays
                 // neutral so failures do not wash the whole event red.
                 let label = theme.bold(&theme.fg("foreground", tool));
                 let text =
                     without_redundant_tool_lead(&panel.name, &sanitize_for_terminal(summary));
                 let text = theme.fg("muted", &text);
-                let gap = 6usize.saturating_sub(visible_width(tool)).max(2);
+                let gap = tool_value_indent_width(tool).saturating_sub(visible_width(tool));
                 let label_prefix = format!("{label}{}", " ".repeat(gap));
                 let continuation = " ".repeat(visible_width(&label_prefix));
                 wrap_hanging(&text, &label_prefix, &continuation, width)
@@ -3087,16 +3121,25 @@ fn render_block_planned(
                         width,
                         verbose_tools,
                         layout.show_tool_duration,
+                        &output_indent,
                     )),
                     "search" => lines.extend(render_compact_tool_output(
                         panel,
                         theme,
                         width,
                         verbose_tools,
+                        &output_indent,
                     )),
-                    "edit" | "write" if tool_diff(panel).is_some() => lines.extend(
-                        render_diff_only(panel, rich_renderer, theme, width, verbose_tools),
-                    ),
+                    "edit" | "write" if tool_diff(panel).is_some() => {
+                        lines.extend(render_diff_only(
+                            panel,
+                            rich_renderer,
+                            theme,
+                            width,
+                            verbose_tools,
+                            &output_indent,
+                        ))
+                    }
                     _ => {}
                 }
             }
@@ -9609,7 +9652,7 @@ mod tests {
             terminal.set_scrollback(0);
             let visible = terminal.screen().contents();
             assert!(visible.contains("compaction-detail-39"), "{visible}");
-            assert!(visible.contains("│  ›"), "composer disappeared: {visible}");
+            assert!(visible.contains("│ ›"), "composer disappeared: {visible}");
 
             shell.expand_focused_tool();
             shell.render();
@@ -9626,7 +9669,7 @@ mod tests {
             assert!(collapsed.contains("ctrl+o to view"), "{collapsed}");
             assert!(!collapsed.contains("compaction-detail-"), "{collapsed}");
             assert!(
-                collapsed.contains("│  ›"),
+                collapsed.contains("│ ›"),
                 "composer disappeared: {collapsed}"
             );
         }
@@ -9722,7 +9765,7 @@ mod tests {
         terminal.set_scrollback(usize::MAX);
         let physical = terminal.screen().contents();
         assert_eq!(
-            physical.matches("│  ›").count(),
+            physical.matches("│ ›").count(),
             1,
             "mutable composer was committed to scrollback:\n{physical}"
         );
@@ -10593,6 +10636,48 @@ mod tests {
         let cache = state.transcript_cache.borrow();
         assert_eq!(cache.width, Some(100));
         assert_eq!(cache.dirty_blocks, [256]);
+    }
+
+    #[test]
+    fn tool_output_starts_under_tool_input() {
+        let theme = crate::tui::theme::test_theme();
+        let renderer = theme.rich_renderer();
+        let args = serde_json::json!({"command": "printf hello"});
+        let block = TranscriptBlock::Tool(Box::new(ToolPanel::new(
+            ToolCallId("aligned-tool-output".into()),
+            "bash".into(),
+            args.to_string(),
+            summarize_tool("bash", &args),
+            "exit=0 duration=0.2s\nstdout:\nhello\ncomplete_stdout=true".into(),
+            true,
+            false,
+            None,
+            None,
+        )));
+        let lines = render_block(None, &block, &theme, &renderer, &renderer, 80, false)
+            .into_iter()
+            .map(|line| strip_terminal_sequences(&line))
+            .collect::<Vec<_>>();
+        let command = lines
+            .iter()
+            .find(|line| line.contains("Bash  printf hello"))
+            .expect("tool input should render");
+        let output = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("hello"))
+            .expect("tool output should render");
+        let input_column = command
+            .find("printf hello")
+            .map(|index| visible_width(&command[..index]))
+            .expect("tool input value should render");
+        let output_column = output
+            .find("hello")
+            .map(|index| visible_width(&output[..index]))
+            .expect("tool output value should render");
+        assert_eq!(
+            input_column, output_column,
+            "tool output should align with the tool input: {lines:?}"
+        );
     }
 
     #[test]
@@ -12205,7 +12290,14 @@ mod tests {
             None,
         );
 
-        let details = render_compact_bash_output(&panel, &theme, 80, false, false);
+        let details = render_compact_bash_output(
+            &panel,
+            &theme,
+            80,
+            false,
+            false,
+            &tool_value_indent("Bash"),
+        );
         assert!(
             details[0].contains("\x1b[38;2;"),
             "hidden-line metadata should use the muted metadata style: {details:?}"
@@ -13502,8 +13594,8 @@ mod tests {
                 rows,
             )
         };
-        assert_eq!(geometry.leading_rows, 1);
-        assert_eq!(geometry.trailing_rows, 1);
+        assert_eq!(geometry.leading_rows, 2);
+        assert_eq!(geometry.trailing_rows, 2);
         assert!(selection_position_for_visual_cell(&shell.state.borrow(), start, 0).is_none());
         assert!(
             selection_position_for_visual_cell(&shell.state.borrow(), start + length - 1, 79,)
@@ -13568,8 +13660,8 @@ mod tests {
         };
         let wide = compile_surface_plan(None, &block, &theme, 80);
         assert_eq!(wide.chrome, ThemeSurfaceChrome::Card);
-        assert_eq!(wide.geometry.leading_rows, 1);
-        assert_eq!(wide.geometry.trailing_rows, 1);
+        assert_eq!(wide.geometry.leading_rows, 2);
+        assert_eq!(wide.geometry.trailing_rows, 2);
 
         let narrow = compile_surface_plan(None, &block, &theme, 40);
         assert_eq!(narrow.chrome, ThemeSurfaceChrome::Rail);
@@ -13684,7 +13776,7 @@ mod tests {
         let now = Instant::now();
         let composer = plain_composer_surface(&shell, 80, now);
         assert_eq!(composer.len(), 3, "hidden footer leaves only the box");
-        assert!(composer[1].starts_with("│    ›"), "{composer:?}");
+        assert!(composer[1].starts_with("│   ›"), "{composer:?}");
         assert!(composer.iter().all(|line| visible_width(line) == 80));
 
         let wide_header = shell_chrome(&shell.state.borrow(), 80, now).header;

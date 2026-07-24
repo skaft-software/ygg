@@ -610,33 +610,41 @@ async fn logout_codex(
     Ok(app)
 }
 
-/// Save a default custom endpoint credential and reload the catalog.
+/// Save a default custom provider registry and reload the catalog.
 fn login_custom(shell: &mut InteractiveShell) -> anyhow::Result<()> {
-    use crate::auth::custom::{self, CustomCredential};
+    use crate::auth::custom::{
+        self, CustomAuthConfig, CustomCredential, CustomProvider, CustomRegistry,
+    };
     let store = custom::CredentialStore::new(custom::default_path());
     let path = custom::default_path();
 
-    if store.load()?.is_some() {
+    if store.load_registry()?.is_some() {
         shell.notice(format!(
-            "custom endpoint already configured at {}; use /logout custom first to replace it",
+            "custom provider registry already configured at {}; use /logout custom first to replace it",
             path.display()
         ));
         return Ok(());
     }
 
-    // Save a default credential that the user can edit.
-    let cred = CustomCredential {
-        base_url: "http://localhost:1234/v1/".into(),
-        api_key: String::new(),
-        api_name: "local-model".into(),
-        headers: Vec::new(),
-        models: Vec::new(),
-        auto_discover: true,
+    let provider = CustomProvider {
+        label: "Local endpoint".into(),
+        credential: CustomCredential {
+            base_url: "http://localhost:1234/v1/".into(),
+            api_key: String::new(),
+            api_name: "local-model".into(),
+            headers: Vec::new(),
+            models: Vec::new(),
+            auto_discover: true,
+        },
+        auth: Some(CustomAuthConfig::None),
+        api_key_env: None,
+        cache: None,
+        startup_timeout_secs: None,
     };
-    store.save(&cred)?;
+    store.save_registry(&CustomRegistry::single("local", provider))?;
     shell.notice(format!(
-        "custom endpoint template saved to {}\n\
-         edit it with your endpoint details, then /reload to register the model",
+        "custom provider registry template saved to {}\n\
+         edit it with your provider details, then /reload to register the models",
         path.display()
     ));
     Ok(())
@@ -651,13 +659,14 @@ async fn logout_custom(
     use crate::auth::custom;
 
     let store = custom::CredentialStore::new(custom::default_path());
-    if store.load()?.is_none() {
-        shell.notice("no custom endpoint configured");
+    if store.load_registry()?.is_none() {
+        shell.notice("no custom provider registry configured");
         return Ok(app);
     }
 
-    // Pick a replacement model if the active model is the custom one.
-    let needs_replacement = app.model.endpoint.id.0 == custom::ENDPOINT_ID;
+    // Pick a replacement model if the active model belongs to any custom
+    // provider in the unified registry.
+    let needs_replacement = custom::is_endpoint_id(&app.model.endpoint.id.0);
     if needs_replacement {
         let catalog = crate::app::bootstrap::model_catalog()?;
         // Temporarily remove custom from consideration.
@@ -1309,8 +1318,12 @@ fn status_context_estimate(app: &App) -> u64 {
 fn update_status(shell: &mut InteractiveShell, app: &App) {
     let context_estimate = status_context_estimate(app);
     let cache_stats = analyze_session_cache_stats(app.agent.session());
+    let endpoint_label = app
+        .catalog
+        .endpoint_label(&app.model.endpoint.id)
+        .unwrap_or(&app.model.endpoint.id.0);
     shell.set_identity(
-        &app.model.endpoint.id.0,
+        endpoint_label,
         &app.model.spec.id.0,
         &crate::app::reasoning_label(&app.reasoning),
     );

@@ -743,6 +743,10 @@ pub(crate) fn status_text_with_metrics(
     let context = token_count(context_estimate);
     let context_window = token_count(context_window(&app.model));
     let display = ModelDisplayMetadata::resolve(&app.model.spec);
+    let provider = app
+        .catalog
+        .endpoint_label(&app.model.endpoint.id)
+        .unwrap_or(&app.model.endpoint.id.0);
     let pricing = model_pricing_text(&app.model);
     let cache_rate = cache_stats
         .hit_rate_basis_points()
@@ -769,7 +773,7 @@ pub(crate) fn status_text_with_metrics(
          Security model: local agent with workspace trust gates\nBuilt-in file paths: {}\nFile edits: {}\nFile write: {}\n\
          Remote media reads: {}\nProcess execution: {}\nShell execution: {}\nOS isolation: none\n\
          Process privileges: current user\nRepository trust: {}\nQueued reconfiguration: {}",
-        app.model.endpoint.id.0,
+        provider,
         app.model.spec.id.0,
         display.name,
         app.model.spec.api_name,

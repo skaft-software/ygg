@@ -583,7 +583,8 @@ pub(crate) fn build_request(
                         });
                     }
                 }
-                crate::types::ReasoningControl::Toggle => {}
+                crate::types::ReasoningControl::AlwaysOn
+                | crate::types::ReasoningControl::Toggle => {}
             },
             ReasoningConfig::Budget(b) => {
                 thinking_opt = Some(AnthropicThinkingConfig {

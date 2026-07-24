@@ -291,6 +291,8 @@ pub enum OpenAiChatReasoningMode {
 pub enum ReasoningControl {
     /// Control via effort tags (Minimal, Low, Medium, High).
     Effort,
+    /// Reasoning is always enabled by the provider and accepts no control parameter.
+    AlwaysOn,
     /// Binary off/on control.
     Toggle,
     /// Control via explicit token budget.

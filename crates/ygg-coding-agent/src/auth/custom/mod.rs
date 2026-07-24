@@ -1,26 +1,34 @@
 #![allow(missing_docs)]
 
-//! Custom OpenAI-compatible endpoint credentials.
+//! Custom OpenAI-compatible provider credentials.
 //!
-//! A single custom endpoint can be configured and stored at
-//! `~/.ygg/credentials/custom.json`. The file uses the same 0600 private-write
-//! path as the Codex credential store.
+//! Multiple named providers are configured together in
+//! `~/.ygg/credentials/custom.json`. Each provider gets an isolated endpoint,
+//! authentication scope, model inventory, cache namespace, and display label.
 //!
-//! Gateways can opt into nonstandard prompt-cache behavior with a top-level
-//! `cache` object using [`ygg_ai::CacheCompatibility`] field names, for example:
-//!
-//! ```text
-//! "cache": {
-//!   "cache_control_format": "anthropic",
-//!   "send_session_affinity_headers": true,
-//!   "session_affinity_format": "open_ai_no_session",
-//!   "supports_long_retention": false
-//! }
-//! ```
+//! The original single-endpoint object is accepted and normalized in memory so
+//! existing installations continue to work without a separate runtime mode.
 
 mod store;
 
-pub use store::{default_path, CredentialStore, CustomCredential, CustomModel};
+pub use store::{
+    default_path, CredentialStore, CustomAuthConfig, CustomCredential, CustomModel, CustomProvider,
+    CustomRegistry,
+};
 
-/// Endpoint id registered in the model catalog for the custom endpoint.
+/// Endpoint id used by the original single custom endpoint.
 pub const ENDPOINT_ID: &str = "custom-openai";
+
+/// Convert a stable provider key into its catalog endpoint id.
+pub fn endpoint_id(provider_id: &str) -> String {
+    if provider_id == ENDPOINT_ID {
+        ENDPOINT_ID.to_owned()
+    } else {
+        format!("custom-{provider_id}")
+    }
+}
+
+/// Whether a catalog endpoint belongs to the custom provider registry.
+pub fn is_endpoint_id(endpoint_id: &str) -> bool {
+    endpoint_id == ENDPOINT_ID || endpoint_id.starts_with("custom-")
+}
