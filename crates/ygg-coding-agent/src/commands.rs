@@ -533,6 +533,7 @@ pub fn cost_text(session: &Session, model: &Model) -> String {
                 assistant_turn.to_string()
             }
             UsageRecordKind::Compaction => "cmp".to_owned(),
+            UsageRecordKind::RejectedResponsesTurn => "rejected".to_owned(),
             UsageRecordKind::TerminalGate { returned } => match returned {
                 Some(true) => "gate:R".to_owned(),
                 Some(false) => "gate:C".to_owned(),
@@ -766,7 +767,7 @@ pub(crate) fn status_text_with_metrics(
          Workspace      {}\nSession        {} — {}\nSession cost   {} ({})\nCost guardrails limit {} · turn warning {}\nCache hit rate  {}\nModel turns    {}\nTool calls     {}\nSkills         {} active / {} discovered\n\n\
          Extensions     {}\n\n\
          Security model: local agent with workspace trust gates\nBuilt-in file paths: {}\nFile edits: {}\nFile write: {}\n\
-         Process execution: {}\nShell execution: {}\nOS isolation: none\n\
+         Remote media reads: {}\nProcess execution: {}\nShell execution: {}\nOS isolation: none\n\
          Process privileges: current user\nRepository trust: {}\nQueued reconfiguration: {}",
         app.model.endpoint.id.0,
         app.model.spec.id.0,
@@ -795,6 +796,7 @@ pub(crate) fn status_text_with_metrics(
         path_access(sandbox.allow_external_paths),
         gate(sandbox.allow_edit),
         gate(sandbox.allow_write),
+        gate(sandbox.allow_remote_read),
         gate(sandbox.allow_process && sandbox.allow_shell),
         gate(sandbox.allow_process && sandbox.allow_shell),
         if app.config.workspace_trusted {

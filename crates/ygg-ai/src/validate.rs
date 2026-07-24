@@ -63,6 +63,10 @@ pub(crate) fn validate_request(
 ) -> Result<Vec<Diagnostic>, AiError> {
     let mut diagnostics = Vec::new();
 
+    if req.responses.is_some() && protocol != Protocol::OpenAiResponses {
+        return Err(AiError::Unsupported(UnsupportedError::ResponsesOptions));
+    }
+
     // 1. Temperature check
     if let Some(temp) = req.temperature {
         if !temp.is_finite() || !(0.0..=2.0).contains(&temp) {
@@ -1035,6 +1039,24 @@ mod matrix_tests {
 
     fn user(parts: Vec<UserPart>) -> Message {
         Message::User(UserMessage { content: parts })
+    }
+
+    #[test]
+    fn responses_options_fail_closed_on_other_protocols() {
+        let mut req = base();
+        req.responses = Some(crate::responses::ResponsesOptions::full_replay(
+            crate::responses::ResponsesInput::default(),
+        ));
+        for protocol in [Protocol::OpenAiChat, Protocol::AnthropicMessages] {
+            assert!(matches!(
+                run(
+                    &req,
+                    &caps(false, false, false, true, false, false),
+                    protocol
+                ),
+                Err(AiError::Unsupported(UnsupportedError::ResponsesOptions))
+            ));
+        }
     }
 
     fn run(

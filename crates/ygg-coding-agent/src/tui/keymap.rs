@@ -109,6 +109,14 @@ pub(crate) fn accepts_key_event(key: &KeyEvent) -> bool {
     }
 }
 
+/// Ctrl+D is the global, one-shot coordinated-close gesture. Input owners that
+/// temporarily bypass the normal translator must recognize the same predicate.
+pub(crate) fn is_close_key(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('d')
+        && key.modifiers == KeyModifiers::CONTROL
+}
+
 /// Translate one crossterm event according to the product keymap.
 #[cfg(test)]
 pub fn translate(event: Option<Event>, active: bool, editor_text: &str) -> InputAction {
@@ -162,9 +170,7 @@ pub fn translate_with_popup(
                 return InputAction::Ignore;
             }
 
-            let control_d =
-                key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL;
-            if control_d {
+            if is_close_key(&key) {
                 return InputAction::Closed;
             }
 

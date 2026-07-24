@@ -62,7 +62,7 @@ pub use mime::Mime;
 pub use pricing::{Cost, Pricing, PricingTier, TokenRate, PICODOLLARS_PER_MICRODOLLAR};
 pub use responses::{
     ResponsesCompactRequest, ResponsesCompactResponse, ResponsesInput, ResponsesItem,
-    ResponsesItemError, ResponsesOptions, ResponsesOutput,
+    ResponsesItemError, ResponsesOptions, ResponsesOutput, ResponsesReplayItem,
 };
 pub use stream::{ResponseStream, StreamEvent};
 pub use transform::transform_messages;

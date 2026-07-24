@@ -20,6 +20,7 @@ const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_AUDIO_BYTES: usize = 20 * 1024 * 1024;
 const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const REMOTE_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq)]
 enum MediaKind {
@@ -76,7 +77,8 @@ impl Tool for ReadTool {
             name: "read".to_string(),
             description: "Read text, images, or audio. `path` may be a workspace-relative local path, \
                           an absolute/~/ path when trusted-local access is enabled, a local `file://` \
-                          URL, or an HTTPS image/audio URL. Text returns numbered lines plus a whole-file \
+                          URL, or an HTTPS image/audio URL when remote reads are explicitly enabled. \
+                          Text returns numbered lines plus a whole-file \
                           hash and continuation metadata. Image/audio returns bounded structured media \
                           for protocol-aware ingestion and a payload-free summary for the TUI; the active \
                           model may reject a recognized audio format it cannot accept. Existing bracketed \
@@ -88,7 +90,7 @@ impl Tool for ReadTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Local file path, file:// URL, or HTTPS image/audio URL."
+                        "description": "Local file path, file:// URL, or (when explicitly enabled) an HTTPS image/audio URL."
                     },
                     "offset": {
                         "type": "integer",
@@ -119,7 +121,13 @@ impl Tool for ReadTool {
         let args: ReadArgs = parse_args(args)?;
         if let Some(url) = parse_url_source(&args.path)? {
             return match url.scheme() {
-                "http" | "https" => read_remote_media(url, ctx).await,
+                "http" | "https" if ctx.sandbox.allow_remote_read => {
+                    read_remote_media(url, ctx).await
+                }
+                "http" | "https" => Err(ToolError::new(
+                    "remote URL reads are disabled; enable `allow_remote_read` \
+                     (or pass `--allow-remote-read`) to permit public HTTPS image/audio fetches",
+                )),
                 "file" => {
                     let path = local_path_from_url(&url)?;
                     read_local(&args, &path, ctx).await
@@ -205,12 +213,21 @@ fn local_path_from_url(url: &reqwest::Url) -> Result<String, ToolError> {
 async fn validated_remote_endpoint(
     url: &reqwest::Url,
     display: &str,
-) -> Result<(String, std::net::SocketAddr), ToolError> {
-    let host = url
-        .host_str()
+) -> Result<(String, Option<std::net::IpAddr>, Vec<std::net::SocketAddr>), ToolError> {
+    let (host, literal_ip) = match url
+        .host()
         .ok_or_else(|| ToolError::new(format!("{display}: URL has no host")))?
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    {
+        url::Host::Domain(domain) => (domain.trim_end_matches('.').to_ascii_lowercase(), None),
+        url::Host::Ipv4(address) => {
+            let address = std::net::IpAddr::V4(address);
+            (address.to_string(), Some(address))
+        }
+        url::Host::Ipv6(address) => {
+            let address = std::net::IpAddr::V6(address);
+            (address.to_string(), Some(address))
+        }
+    };
     if host == "localhost"
         || host.ends_with(".localhost")
         || host.ends_with(".local")
@@ -224,11 +241,8 @@ async fn validated_remote_endpoint(
     let port = url
         .port_or_known_default()
         .ok_or_else(|| ToolError::new(format!("{display}: URL has no known port")))?;
-    let test_loopback_http = cfg!(test)
-        && url.scheme() == "http"
-        && host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
+    let test_loopback_http =
+        cfg!(test) && url.scheme() == "http" && literal_ip.is_some_and(|ip| ip.is_loopback());
     match url.scheme() {
         "https" if port == 443 => {}
         "https" => {
@@ -249,10 +263,18 @@ async fn validated_remote_endpoint(
         }
     }
 
-    let addresses = tokio::net::lookup_host((host.as_str(), port))
+    let addresses = if let Some(address) = literal_ip {
+        vec![std::net::SocketAddr::new(address, port)]
+    } else {
+        tokio::time::timeout(
+            REMOTE_DNS_TIMEOUT,
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
         .await
+        .map_err(|_| ToolError::new(format!("{display}: DNS lookup timed out")))?
         .map_err(|error| ToolError::new(format!("{display}: DNS lookup failed: {error}")))?
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>()
+    };
     if addresses.is_empty() {
         return Err(ToolError::new(format!(
             "{display}: DNS lookup returned no addresses"
@@ -272,7 +294,7 @@ async fn validated_remote_endpoint(
             "{display}: private, link-local, metadata, and non-public targets are not allowed"
         )));
     }
-    Ok((host, addresses[0]))
+    Ok((host, literal_ip, addresses))
 }
 
 fn is_public_remote_ip(ip: std::net::IpAddr) -> bool {
@@ -288,6 +310,7 @@ fn is_public_remote_ip(ip: std::net::IpAddr) -> bool {
                 || (a == 192 && b == 168)
                 || (a == 192 && b == 0 && c == 0)
                 || (a == 192 && b == 0 && c == 2)
+                || (a == 192 && b == 88 && c == 99)
                 || (a == 198 && (b == 18 || b == 19))
                 || (a == 198 && b == 51 && c == 100)
                 || (a == 203 && b == 0 && c == 113)
@@ -298,31 +321,70 @@ fn is_public_remote_ip(ip: std::net::IpAddr) -> bool {
             if let Some(mapped) = ip.to_ipv4() {
                 return is_public_remote_ip(std::net::IpAddr::V4(mapped));
             }
+            let octets = ip.octets();
+            // RFC 6052's well-known NAT64 prefix embeds an IPv4 address in the
+            // final 32 bits. Apply the IPv4 denylist to the translated target,
+            // while rejecting the local-use translation prefix outright.
+            if octets[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+                return is_public_remote_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    octets[12], octets[13], octets[14], octets[15],
+                )));
+            }
+            if octets[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01] {
+                return false;
+            }
+            // 6to4 exposes its embedded IPv4 relay target directly. Teredo
+            // carries multiple obfuscated IPv4 fields; reject it entirely
+            // rather than attempt a permissive partial decode.
+            if octets[..2] == [0x20, 0x02] {
+                return is_public_remote_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    octets[2], octets[3], octets[4], octets[5],
+                )));
+            }
+            if octets[..4] == [0x20, 0x01, 0x00, 0x00] {
+                return false;
+            }
             let segments = ip.segments();
-            !(ip.is_unspecified()
-                || ip.is_loopback()
-                || ip.is_multicast()
-                || segments[0] & 0xfe00 == 0xfc00
-                || segments[0] & 0xffc0 == 0xfe80
-                || segments[0] & 0xffc0 == 0xfec0
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+            // Remote reads are public-only. Start from the global-unicast
+            // allocation (2000::/3), then subtract special-purpose space
+            // within it; everything else is fail-closed.
+            segments[0] & 0xe000 == 0x2000
+                && !(ip.is_unspecified()
+                    || ip.is_loopback()
+                    || ip.is_multicast()
+                    || segments[0] & 0xfe00 == 0xfc00
+                    || segments[0] & 0xffc0 == 0xfe80
+                    || segments[0] & 0xffc0 == 0xfec0
+                    || (segments[0] == 0x2001 && segments[1] <= 0x01ff)
+                    || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                    || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0))
         }
     }
 }
 
 async fn read_remote_media(
-    url: reqwest::Url,
+    mut url: reqwest::Url,
     ctx: &ToolContext<'_>,
 ) -> Result<ToolOutput, ToolError> {
     let requested_display = display_remote_url(&url);
-    let (host, endpoint) = validated_remote_endpoint(&url, &requested_display).await?;
+    let (host, literal_ip, endpoints) = validated_remote_endpoint(&url, &requested_display).await?;
+    // `ClientBuilder::resolve` keys exact host spellings. Normalize the URL to
+    // the validated spelling too, otherwise a trailing dot can miss the pinned
+    // override and trigger a second, unvalidated DNS lookup at connect time.
+    if let Some(address) = literal_ip {
+        url.set_ip_host(address)
+            .map_err(|_| ToolError::new(format!("{requested_display}: invalid normalized host")))?;
+    } else {
+        url.set_host(Some(&host))
+            .map_err(|_| ToolError::new(format!("{requested_display}: invalid normalized host")))?;
+    }
     let mut client_builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(REMOTE_CONNECT_TIMEOUT)
         .timeout(REMOTE_READ_TIMEOUT)
         .user_agent(concat!("ygg/", env!("CARGO_PKG_VERSION")))
         .no_proxy()
-        .resolve(&host, endpoint);
+        .resolve_to_addrs(&host, &endpoints);
     if url.scheme() == "https" {
         client_builder = client_builder.https_only(true);
     }
@@ -668,6 +730,12 @@ mod tests {
         }
     }
 
+    fn remote_fixture() -> Fixture {
+        let mut fixture = fixture();
+        fixture.sandbox.allow_remote_read = true;
+        fixture
+    }
+
     impl Fixture {
         fn ctx(&self) -> ToolContext<'_> {
             ToolContext {
@@ -794,6 +862,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_reads_are_default_off_and_rejected_before_network_access() {
+        let server = MockServer::start().await;
+        let f = fixture();
+
+        let error = ReadTool
+            .execute(
+                json!({"path": format!("{}/capture?local-secret", server.uri())}),
+                &f.ctx(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.message.contains("remote URL reads are disabled"),
+            "{error}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn remote_link_requires_matching_mime_and_magic_and_redacts_query() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -805,7 +893,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let f = fixture();
+        let f = remote_fixture();
         let url = format!("{}/capture?token=secret", server.uri());
 
         let output = ReadTool
@@ -829,7 +917,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let f = fixture();
+        let f = remote_fixture();
         let error = ReadTool
             .execute(
                 json!({"path": format!("{}/fake.png", server.uri())}),
@@ -848,7 +936,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(PNG_BYTES))
             .mount(&server)
             .await;
-        let f = fixture();
+        let f = remote_fixture();
         let error = ReadTool
             .execute(
                 json!({"path": format!("{}/capture", server.uri())}),
@@ -861,7 +949,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_link_rejects_private_https_targets_before_connecting() {
-        let f = fixture();
+        let f = remote_fixture();
         let error = ReadTool
             .execute(
                 json!({"path": "https://169.254.169.254/latest/meta-data"}),
@@ -870,6 +958,82 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.message.contains("non-public"), "{error}");
+    }
+
+    #[test]
+    fn transition_ipv6_cannot_embed_a_nonpublic_ipv4_target() {
+        for address in [
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::808:808",
+            "2002:a9fe:a9fe::",
+            "2001:0000::1",
+        ] {
+            let address = address.parse::<std::net::IpAddr>().unwrap();
+            assert!(
+                !is_public_remote_ip(address),
+                "accepted transition address {address}"
+            );
+        }
+        assert!(is_public_remote_ip(
+            "64:ff9b::808:808".parse::<std::net::IpAddr>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn reserved_address_space_is_not_treated_as_public() {
+        for address in [
+            "192.88.99.2",
+            "100::1",
+            "2001:2::1",
+            "3fff::1",
+            "5f00::1",
+            "4000::1",
+        ] {
+            let address = address.parse::<std::net::IpAddr>().unwrap();
+            assert!(!is_public_remote_ip(address), "accepted {address}");
+        }
+        assert!(is_public_remote_ip(
+            "2606:4700:4700::1111".parse::<std::net::IpAddr>().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_ipv6_literal_is_normalized_without_dns_or_brackets() {
+        let url = reqwest::Url::parse("https://[2606:4700:4700::1111]/image.png").unwrap();
+        let (host, literal, addresses) = validated_remote_endpoint(&url, "public IPv6 literal")
+            .await
+            .unwrap();
+        let expected = "2606:4700:4700::1111".parse::<std::net::IpAddr>().unwrap();
+        assert_eq!(host, "2606:4700:4700::1111");
+        assert_eq!(literal, Some(expected));
+        assert_eq!(addresses, vec![std::net::SocketAddr::new(expected, 443)]);
+    }
+
+    #[tokio::test]
+    async fn trailing_dot_loopback_url_uses_the_normalized_pinned_host() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/capture.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(PNG_BYTES),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let port = reqwest::Url::parse(&server.uri()).unwrap().port().unwrap();
+        let f = remote_fixture();
+        let output = ReadTool
+            .execute(
+                json!({"path": format!("http://127.0.0.1.:{port}/capture.png")}),
+                &f.ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(output.text.contains("read=vision"), "{}", output.text);
+        assert!(output.text.contains("http://127.0.0.1:"), "{}", output.text);
+        assert!(!output.text.contains("127.0.0.1.:"), "{}", output.text);
     }
 
     #[tokio::test]

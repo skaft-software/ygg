@@ -775,6 +775,10 @@ pub(crate) struct ShellState {
     /// Ephemeral tool-owned prompt rendered in place of the editor. Secret
     /// keystrokes never enter `editor` or any transcript/session structure.
     pub(crate) tool_input_prompt: Option<String>,
+    /// Durable request to leave the interactive frontend. Exclusive picker and
+    /// lifecycle loops set this so the owning outer loop can finish in-flight
+    /// cleanup before exiting.
+    close_requested: bool,
     /// Selection and viewport for the slash-command popup. Filtering resets
     /// both; Escape dismisses it until the command token changes again.
     prompt_templates: Arc<[crate::prompts::PromptTemplateDescriptor]>,
@@ -6972,6 +6976,16 @@ impl InteractiveShell {
 
     pub fn has_overlay(&self) -> bool {
         self.state.borrow().overlay.is_some()
+    }
+
+    /// Requests a coordinated interactive close at the next owning boundary.
+    pub fn request_close(&mut self) {
+        self.state.borrow_mut().close_requested = true;
+    }
+
+    /// Returns whether any input owner requested a coordinated close.
+    pub fn close_requested(&self) -> bool {
+        self.state.borrow().close_requested
     }
 
     /// Open an interactive panel.

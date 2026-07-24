@@ -8,5 +8,4 @@ data: {"type":"response.output_text.delta","output_index":0,"delta":"partial"}
 
 data: {"type":"response.output_text.done","output_index":0}
 
-data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":5,"output_tokens":16,"total_tokens":21}}}
-
+data: {"type":"response.incomplete","response":{"output":[{"type":"message","id":"msg_terminal_partial","role":"assistant","content":[{"type":"output_text","text":"partial","annotations":[]}],"unknown":{"kept":"verbatim"}}],"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":5,"output_tokens":16,"total_tokens":21}}}

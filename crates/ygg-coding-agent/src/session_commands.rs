@@ -352,6 +352,7 @@ fn sensitive_key(key: &str) -> bool {
         "credential",
         "cookie",
         "private_key",
+        "encrypted_content",
     ];
     if separated
         .iter()
@@ -377,6 +378,7 @@ fn sensitive_key(key: &str) -> bool {
         "credential",
         "cookie",
         "privatekey",
+        "encryptedcontent",
     ]
     .iter()
     .any(|needle| compact == *needle || compact.ends_with(needle))
@@ -777,8 +779,8 @@ mod tests {
     use super::*;
     use ygg_agent::EntryValue;
     use ygg_ai::{
-        AssistantMessage, AssistantPart, Message, ModelId, Protocol, ToolCall, ToolCallId,
-        ToolResult, ToolResultPart, UserMessage, UserPart,
+        AssistantMessage, AssistantPart, EndpointId, Message, ModelId, Protocol, ResponsesItem,
+        ResponsesOutput, ToolCall, ToolCallId, ToolResult, ToolResultPart, UserMessage, UserPart,
     };
 
     #[test]
@@ -794,6 +796,86 @@ mod tests {
         assert_eq!(value["authorization"], "[REDACTED]");
         assert_eq!(value["nested"]["text"], "[REDACTED]");
         assert_eq!(value["ordinary"], "hello");
+    }
+
+    #[test]
+    fn portable_export_redacts_replayable_encrypted_provider_state_unless_explicitly_included() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let destination_root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let id = "encrypted-provider-state";
+        let path = store.dir().join(format!("{id}.jsonl"));
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("export safety".into())],
+            })))
+            .unwrap();
+        let model = ModelId("responses-model".into());
+        let endpoint = EndpointId("responses-endpoint".into());
+        let assistant = session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("done".into())],
+                model: model.clone(),
+                protocol: Protocol::OpenAiResponses,
+            })))
+            .unwrap();
+        session
+            .append_responses_turn(
+                assistant,
+                endpoint.clone(),
+                model.clone(),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "reasoning",
+                    "encrypted_content": "reasoning-capability"
+                }))
+                .unwrap()]),
+            )
+            .unwrap();
+        session
+            .append_responses_compaction(
+                endpoint,
+                model,
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": "compaction-capability"
+                }))
+                .unwrap()]),
+            )
+            .unwrap();
+        drop(session);
+
+        let redacted = export_portable(
+            &store,
+            id,
+            Some(destination_root.path().join("redacted.json")),
+            destination_root.path(),
+            false,
+            false,
+        )
+        .unwrap();
+        let redacted_text = std::fs::read_to_string(redacted.destination).unwrap();
+        assert!(!redacted_text.contains("reasoning-capability"));
+        assert!(!redacted_text.contains("compaction-capability"));
+        assert!(redacted_text.contains(REDACTION));
+        assert_eq!(redacted.redaction_count, 2);
+
+        let raw = export_portable(
+            &store,
+            id,
+            Some(destination_root.path().join("raw.json")),
+            destination_root.path(),
+            true,
+            false,
+        )
+        .unwrap();
+        let raw_text = std::fs::read_to_string(raw.destination).unwrap();
+        assert!(raw_text.contains("reasoning-capability"));
+        assert!(raw_text.contains("compaction-capability"));
+        assert_eq!(raw.redaction_count, 0);
+        assert!(raw.included_secrets);
     }
 
     #[test]

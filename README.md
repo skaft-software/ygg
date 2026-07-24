@@ -381,7 +381,8 @@ Useful keys:
 | --- | --- |
 | `Enter` | Submit. |
 | `Shift+Enter` | Insert a newline when the terminal reports enhanced key events. |
-| `Ctrl+C` | Abort the active run; close ygg when idle. |
+| `Ctrl+C` | Clear a nonempty draft; with an empty draft, abort active work and do nothing when idle. |
+| `Ctrl+D` | Close ygg from any interactive input surface, settling active work and child-process cleanup first. |
 | `Ctrl+O` | Expand or collapse reasoning, tool evidence, or shell output. |
 | `PageUp` / `PageDown` | Navigate transcript history. |
 | `@` | Complete workspace file mentions. |
@@ -416,6 +417,8 @@ allow_edit = true
 allow_write = true
 allow_process = true
 allow_shell = true
+# Remote HTTPS image/audio reads are default-off network authority.
+allow_remote_read = false
 bash_timeout_secs = 120
 max_output_bytes = 1048576
 context_files = true
@@ -432,7 +435,7 @@ keep_recent_turns = 4
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_REASONING_MODE`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_REASONING_MODE`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
 ### CLI reference
 

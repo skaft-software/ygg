@@ -6,7 +6,10 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{CompatibilityMode, Message, Model, Usage, UserMessage};
+use crate::{
+    AssistantMessage, CacheRetention, CompatibilityMode, Message, Model, OutputFormat,
+    ReasoningConfig, ReasoningMode, ToolDef, Usage, UserMessage,
+};
 
 /// An opaque Responses input or output item.
 ///
@@ -42,6 +45,15 @@ impl ResponsesItem {
 
     fn is_compaction(&self) -> bool {
         self.0.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+    }
+
+    fn is_valid_compaction(&self) -> bool {
+        self.is_compaction()
+            && self
+                .0
+                .get("encrypted_content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|content| !content.is_empty())
     }
 }
 
@@ -85,6 +97,13 @@ impl ResponsesInput {
         self.0
     }
 
+    /// Returns whether the input contains an authoritative compaction item.
+    /// Providers may retain leading output items around the checkpoint, so
+    /// callers must not infer compacted provenance from item zero alone.
+    pub fn contains_compaction(&self) -> bool {
+        self.0.iter().any(ResponsesItem::is_compaction)
+    }
+
     /// Prunes history before the latest compaction item for ordinary server
     /// compaction chaining. This must not be applied to standalone compact
     /// output, whose entire output is the next canonical input window.
@@ -108,6 +127,11 @@ impl ResponsesInput {
 pub enum ResponsesReplayItem {
     /// A canonical user message, including any tool-result parts.
     User(UserMessage),
+    /// A deliberately local assistant boundary, such as the marker persisted
+    /// after a failed turn. Durable sessions must only construct this variant
+    /// from explicit local provenance; it is not a substitute for missing
+    /// authoritative provider output.
+    LocalAssistant(AssistantMessage),
     /// Authoritative terminal Responses output for an assistant turn.
     Output(ResponsesOutput),
     /// Complete output from `POST /responses/compact`.
@@ -174,6 +198,21 @@ impl ResponsesOutput {
     pub fn into_input(self) -> ResponsesInput {
         ResponsesInput(self.0)
     }
+
+    /// Returns whether native compact output contains exactly one structurally
+    /// complete provider checkpoint.
+    pub fn has_valid_compaction(&self) -> bool {
+        let mut compactions = self.0.iter().filter(|item| item.is_compaction());
+        compactions
+            .next()
+            .is_some_and(ResponsesItem::is_valid_compaction)
+            && compactions.next().is_none()
+    }
+
+    /// Returns whether the provider output has no replay items.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// Responses-specific request state.
@@ -222,6 +261,53 @@ pub struct ResponsesCompactRequest {
     /// Optional instructions forwarded to the API.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Function tool schemas active for the replay window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<serde_json::Value>>,
+    /// Whether the selected model may emit parallel function calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// Responses reasoning controls, shaped exactly like a normal request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
+    /// Responses text controls, shaped exactly like a normal request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<serde_json::Value>,
+    /// Stable provider prompt-cache key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// Stable transport affinity identifier. This is sent only as headers.
+    #[serde(skip)]
+    pub session_id: Option<String>,
+}
+
+impl ResponsesCompactRequest {
+    /// Builds a native compact request with the same tool, reasoning, text,
+    /// cache-key, and session-affinity controls as an ordinary Responses call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_model(
+        model: &Model,
+        input: ResponsesInput,
+        instructions: Option<String>,
+        tools: &[ToolDef],
+        reasoning: &ReasoningConfig,
+        reasoning_mode: ReasoningMode,
+        output_format: &OutputFormat,
+        cache_retention: CacheRetention,
+        session_id: Option<&str>,
+    ) -> Self {
+        crate::protocol::openai_responses::build_compact_request(
+            model,
+            input,
+            instructions,
+            tools,
+            reasoning,
+            reasoning_mode,
+            output_format,
+            cache_retention,
+            session_id,
+        )
+    }
 }
 
 /// Native `POST /responses/compact` result.
@@ -273,19 +359,39 @@ where
         .input_tokens
         .saturating_sub(details.cached_tokens)
         .saturating_sub(details.cache_write_tokens);
-    let output_tokens = usage.output_tokens.max(output_details.reasoning_tokens);
-    let total_tokens = input_tokens
-        .checked_add(details.cached_tokens)
-        .and_then(|value| value.checked_add(details.cache_write_tokens))
-        .and_then(|value| value.checked_add(output_tokens))
-        .ok_or_else(|| serde::de::Error::custom("compact usage token total overflow"))?;
-    Ok(Usage {
+    normalize_responses_usage(
         input_tokens,
-        cache_read_tokens: details.cached_tokens,
-        cache_write_tokens: details.cache_write_tokens,
+        details.cached_tokens,
+        details.cache_write_tokens,
+        usage.output_tokens,
+        output_details.reasoning_tokens,
+    )
+    .ok_or_else(|| serde::de::Error::custom("compact usage token total overflow"))
+}
+
+pub(crate) fn normalize_responses_usage(
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+) -> Option<Usage> {
+    let output_tokens = if reasoning_tokens > output_tokens {
+        output_tokens.checked_add(reasoning_tokens)?
+    } else {
+        output_tokens
+    };
+    let total_tokens = input_tokens
+        .checked_add(cache_read_tokens)?
+        .checked_add(cache_write_tokens)?
+        .checked_add(output_tokens)?;
+    Some(Usage {
+        input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         cache_write_1h_tokens: 0,
         output_tokens,
-        reasoning_tokens: output_details.reasoning_tokens,
+        reasoning_tokens,
         total_tokens,
     })
 }
@@ -322,5 +428,46 @@ mod tests {
         assert!(options.input.is_some());
         assert_eq!(options.previous_response_id, None);
         assert!(!options.store);
+    }
+
+    #[test]
+    fn compact_usage_preserves_reasoning_detail_beyond_the_aggregate() {
+        let response: ResponsesCompactResponse = serde_json::from_value(serde_json::json!({
+            "output": [{"type": "compaction", "encrypted_content": "opaque"}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 3,
+                "output_tokens_details": {"reasoning_tokens": 5}
+            }
+        }))
+        .unwrap();
+        assert_eq!(response.usage.output_tokens, 8);
+        assert_eq!(response.usage.reasoning_tokens, 5);
+        assert_eq!(response.usage.total_tokens, 18);
+    }
+
+    #[test]
+    fn compact_output_requires_one_nonempty_encrypted_checkpoint() {
+        for value in [
+            serde_json::json!([]),
+            serde_json::json!([{"type": "message"}]),
+            serde_json::json!([{"type": "compaction"}]),
+            serde_json::json!([{"type": "compaction", "encrypted_content": ""}]),
+            serde_json::json!([
+                {"type": "compaction", "encrypted_content": "one"},
+                {"type": "compaction", "encrypted_content": "two"}
+            ]),
+        ] {
+            let output: ResponsesOutput = serde_json::from_value(value).unwrap();
+            assert!(!output.has_valid_compaction());
+        }
+
+        let output: ResponsesOutput = serde_json::from_value(serde_json::json!([
+            {"type": "message", "id": "leading"},
+            {"type": "compaction", "encrypted_content": "opaque"},
+            {"type": "message", "id": "trailing"}
+        ]))
+        .unwrap();
+        assert!(output.has_valid_compaction());
     }
 }

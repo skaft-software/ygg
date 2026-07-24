@@ -81,7 +81,11 @@ Model selection is available through a picker, direct `/model <id>`, and
 
 - Enter queues a follow-up.
 - Ctrl+S steers at the next model boundary.
-- Escape or Ctrl+C interrupts active work.
+- Escape interrupts active work. Ctrl+C first clears a nonempty draft; with an
+  empty draft it interrupts active work and is ignored while idle.
+- Ctrl+D requests a coordinated close from every input owner, including
+  pickers, tool prompts, lifecycle waits, and local shell commands. Active work
+  is aborted and settled before the process exits.
 - Safe presentation commands execute immediately.
 - Model, reasoning, session, compaction, reload, and checkout work is queued in
   order and applied after the active `Run` releases its Agent borrow.

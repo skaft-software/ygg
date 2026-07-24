@@ -95,6 +95,22 @@ fn validate_compaction_route(
     Ok(())
 }
 
+fn validate_native_compaction_replay(
+    mode: CompactionMode,
+    session: &Session,
+    model: &Model,
+) -> anyhow::Result<()> {
+    if mode != CompactionMode::NativeResponses {
+        return Ok(());
+    }
+    match session.responses_replay_items(&model.endpoint.id, &model.spec.id)? {
+        Some(_) => Ok(()),
+        None => anyhow::bail!(
+            "native Responses compaction requires complete route-affine opaque replay on the active branch"
+        ),
+    }
+}
+
 fn agent_compaction_mode(mode: CompactionMode) -> AgentCompactionMode {
     match mode {
         CompactionMode::Disabled => AgentCompactionMode::Disabled,
@@ -3293,6 +3309,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
 
     let reasoning_mode = normalize_reasoning_mode_for_model(launch.reasoning_mode, &model)?;
     let reasoning = normalize_reasoning_for_model(&launch.reasoning, &model)?;
+    validate_native_compaction_replay(config.compaction.mode, &session, &model)?;
     append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
     config.model = Some(model.spec.id.clone());
     config.reasoning = reasoning.clone();
@@ -3386,7 +3403,6 @@ pub fn rebuild_app(
         prompts: _,
         mut executable_extensions,
     } = app;
-    executable_extensions.shutdown_blocking();
     let compact_model = config
         .compaction
         .compact_model
@@ -3394,9 +3410,7 @@ pub fn rebuild_app(
         .map(|id| catalog.resolve(id))
         .transpose()
         .with_context(|| "configured compaction model could not be resolved")?;
-    validate_compaction_route(config.compaction.mode, &model, compact_model.as_ref())?;
     let current_path = agent.session().path().to_owned();
-    drop(agent);
 
     let (persisted, mut prepared_session) = match selection.as_ref() {
         Some(SessionSelection::OpenExisting(path)) => {
@@ -3416,6 +3430,7 @@ pub fn rebuild_app(
     let model = new_model
         .or(restored_model)
         .unwrap_or_else(|| old_model.clone());
+    validate_compaction_route(config.compaction.mode, &model, compact_model.as_ref())?;
     let reasoning = match (new_reasoning, persisted.reasoning) {
         (Some(reasoning), _) => normalize_reasoning_for_model(&reasoning, &model)?,
         (None, Some(reasoning)) => normalize_reasoning_for_model(&reasoning, &model)?,
@@ -3429,6 +3444,18 @@ pub fn rebuild_app(
         .or(persisted.reasoning_mode)
         .unwrap_or(reasoning_mode);
     let reasoning_mode = normalize_reasoning_mode_for_model(reasoning_mode, &model)?;
+    let candidate_session = match selection.as_ref() {
+        Some(SessionSelection::OpenExisting(_)) => prepared_session.as_ref(),
+        Some(SessionSelection::CreateNew(_)) => None,
+        None => Some(agent.session()),
+    };
+    if let Some(candidate_session) = candidate_session {
+        validate_native_compaction_replay(config.compaction.mode, candidate_session, &model)?;
+    }
+    // Do not tear down the working agent or its executable extensions until
+    // the complete candidate route and reasoning configuration is known valid.
+    executable_extensions.shutdown_blocking();
+    drop(agent);
     let mut session = match selection {
         Some(SessionSelection::CreateNew(path)) => {
             if let Some(parent) = path.parent() {
@@ -5268,5 +5295,65 @@ mod tests {
             app.agent.session().entries()[0].value,
             EntryValue::Config { .. }
         ));
+    }
+
+    #[test]
+    fn rebuild_validates_native_compaction_against_the_candidate_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config(directory.path(), Some("gpt-5.4-mini-responses"));
+        config.compaction.mode = CompactionMode::NativeResponses;
+        let boot = bootstrap(config).unwrap();
+        let launch = resolve_launch_print(&boot, "native-rebuild").unwrap();
+        let app = build_app(boot, launch, "system".into()).unwrap();
+        let chat = app.catalog.resolve(&ModelId("gpt-4o-mini".into())).unwrap();
+
+        let error = match rebuild_app(app, Some(chat), None, None, None) {
+            Ok(_) => panic!("candidate Chat model must fail native compaction validation"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("native Responses compaction requires an OpenAI Responses route"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn rebuild_prevalidates_native_replay_before_replacing_the_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let boot = bootstrap(config(directory.path(), Some("gpt-5.4-mini-responses"))).unwrap();
+        let launch = resolve_launch_print(&boot, "native-replay-rebuild").unwrap();
+        let mut app = build_app(boot, launch, "system".into()).unwrap();
+        app.agent
+            .session_mut()
+            .append(EntryValue::Message(ygg_ai::Message::User(
+                ygg_ai::UserMessage {
+                    content: vec![ygg_ai::UserPart::Text("legacy prompt".into())],
+                },
+            )))
+            .unwrap();
+        app.agent
+            .session_mut()
+            .append(EntryValue::Message(ygg_ai::Message::Assistant(
+                ygg_ai::AssistantMessage {
+                    content: vec![ygg_ai::AssistantPart::Text("legacy answer".into())],
+                    model: app.model.spec.id.clone(),
+                    protocol: Protocol::OpenAiResponses,
+                },
+            )))
+            .unwrap();
+        app.config.compaction.mode = CompactionMode::NativeResponses;
+
+        let error = match rebuild_app(app, None, None, None, None) {
+            Ok(_) => panic!("legacy Responses history must fail native replay prevalidation"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("requires complete route-affine opaque replay"),
+            "{error:#}"
+        );
     }
 }

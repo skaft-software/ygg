@@ -82,6 +82,7 @@ pub struct SandboxPolicy {
     pub allow_write: bool,
     pub allow_process: bool,
     pub allow_shell: bool,
+    pub allow_remote_read: bool,
     pub shell_path: Option<PathBuf>,
     pub bash_timeout_secs: u64,
     pub max_output_bytes: usize,
@@ -98,6 +99,9 @@ impl Default for SandboxPolicy {
             allow_write: true,
             allow_process: true,
             allow_shell: true,
+            // Direct network reads are separate from trusted-local filesystem
+            // and process defaults and require an explicit opt-in.
+            allow_remote_read: false,
             shell_path: None,
             bash_timeout_secs: 120,
             max_output_bytes: 16 * 1024,
@@ -235,6 +239,7 @@ impl SandboxPolicy {
         sandbox.allow_write = self.allow_write;
         sandbox.allow_process = self.allow_process;
         sandbox.allow_shell = self.allow_shell;
+        sandbox.allow_remote_read = self.allow_remote_read;
         sandbox.shell_path = self.shell_path.clone();
         sandbox.bash_timeout = Duration::from_secs(self.bash_timeout_secs);
         sandbox.max_output_bytes = self.max_output_bytes;
@@ -576,8 +581,10 @@ mod tests {
         assert!(policy.allow_write);
         assert!(policy.allow_process);
         assert!(policy.allow_shell);
+        assert!(!policy.allow_remote_read);
         let sandbox = policy.to_sandbox_config(directory.path());
         assert!(sandbox.allow_external_paths);
+        assert!(!sandbox.allow_remote_read);
     }
 
     #[test]

@@ -69,6 +69,9 @@ pub enum UsageRecordKind {
         /// The assistant entry that received the provider response.
         assistant: EntryId,
     },
+    /// A billable Responses turn rejected before assistant persistence because
+    /// explicit native replay mode did not receive authoritative raw output.
+    RejectedResponsesTurn,
     /// A tool-free call used to produce a context-compaction summary.
     Compaction,
     /// A bounded one-token decision about whether a candidate response may
@@ -134,6 +137,10 @@ pub struct EntryMetadata {
     /// replayable model input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
+    /// Marks a locally generated assistant boundary that intentionally has no
+    /// authoritative provider sidecar.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_synthetic_assistant: bool,
 }
 
 impl EntryMetadata {
@@ -166,8 +173,9 @@ impl EntryMetadata {
         (self.prompt_model.is_some()
             || self.prompt_model_source.is_some()
             || self.prompt_color.is_some()
-            || self.display_text.is_some())
-        .then_some(self)
+            || self.display_text.is_some()
+            || self.local_synthetic_assistant)
+            .then_some(self)
     }
 }
 
@@ -774,7 +782,10 @@ impl Session {
                             }
                         }
                         EntryValue::ResponsesTurn {
-                            assistant, model, ..
+                            assistant,
+                            model,
+                            output,
+                            ..
                         } => {
                             let valid_assistant = index
                                 .get(assistant)
@@ -787,7 +798,10 @@ impl Session {
                                                 && &message.model == model
                                     )
                                 });
-                            if !valid_assistant || entry.parent.as_ref() != Some(assistant) {
+                            if !valid_assistant
+                                || entry.parent.as_ref() != Some(assistant)
+                                || output.is_empty()
+                            {
                                 return Err(SessionError::Corrupt {
                                     line: line_no,
                                     message: format!(
@@ -798,19 +812,20 @@ impl Session {
                             }
                         }
                         EntryValue::ResponsesCompaction {
-                            covered_through, ..
-                        } => {
-                            if !index.contains_key(covered_through)
-                                || entry.parent.as_ref() != Some(covered_through)
-                            {
-                                return Err(SessionError::Corrupt {
-                                    line: line_no,
-                                    message: format!(
-                                        "Responses compaction {:?} is not a direct checkpoint of {:?}",
-                                        entry.id.0, covered_through.0
-                                    ),
-                                });
-                            }
+                            covered_through,
+                            output,
+                            ..
+                        } if !index.contains_key(covered_through)
+                            || entry.parent.as_ref() != Some(covered_through)
+                            || !output.has_valid_compaction() =>
+                        {
+                            return Err(SessionError::Corrupt {
+                                line: line_no,
+                                message: format!(
+                                    "Responses compaction {:?} is not a direct checkpoint of {:?}",
+                                    entry.id.0, covered_through.0
+                                ),
+                            });
                         }
                         _ => {}
                     }
@@ -1051,7 +1066,10 @@ impl Session {
     ) -> Result<EntryId, SessionError> {
         match &value {
             EntryValue::ResponsesTurn {
-                assistant, model, ..
+                assistant,
+                model,
+                output,
+                ..
             } => {
                 let valid_assistant = self.head.as_ref() == Some(assistant)
                     && self.entry(assistant).is_some_and(|entry| {
@@ -1062,7 +1080,7 @@ impl Session {
                                     && &message.model == model
                         )
                     });
-                if !valid_assistant {
+                if !valid_assistant || output.is_empty() {
                     return Err(SessionError::InvalidResponsesSidecar(format!(
                         "Responses turn is not a direct sidecar of a Responses assistant from model {}",
                         model.0
@@ -1070,8 +1088,10 @@ impl Session {
                 }
             }
             EntryValue::ResponsesCompaction {
-                covered_through, ..
-            } if self.head.as_ref() != Some(covered_through) => {
+                covered_through,
+                output,
+                ..
+            } if self.head.as_ref() != Some(covered_through) || !output.has_valid_compaction() => {
                 return Err(SessionError::InvalidResponsesSidecar(format!(
                     "Responses compaction is not a direct checkpoint of {:?}",
                     covered_through.0
@@ -1274,6 +1294,28 @@ impl Session {
     ) -> Result<(), SessionError> {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::Compaction,
+            usage,
+            endpoint: Some(endpoint),
+            model: Some(model),
+            completed_at_unix_ms: Some(now_unix_millis()),
+            cost,
+            cost_microdollars: cost.map(|cost| cost.total),
+            session_cost_microdollars: None,
+            session_cost_picodollars_remainder: None,
+        })
+    }
+
+    /// Persist usage for a Responses turn whose terminal output could not
+    /// satisfy explicit native replay mode.
+    pub fn record_rejected_responses_turn_usage(
+        &mut self,
+        endpoint: EndpointId,
+        model: ModelId,
+        usage: Usage,
+        cost: Option<Cost>,
+    ) -> Result<(), SessionError> {
+        self.record_usage(UsageRecord {
+            kind: UsageRecordKind::RejectedResponsesTurn,
             usage,
             endpoint: Some(endpoint),
             model: Some(model),
@@ -1608,6 +1650,17 @@ impl Session {
             match &entry.value {
                 EntryValue::Message(Message::User(user)) => {
                     replay.push(ygg_ai::responses::ResponsesReplayItem::User(user.clone()));
+                }
+                EntryValue::Message(Message::Assistant(assistant))
+                    if entry.metadata.as_ref().is_some_and(|metadata| {
+                        metadata.local_synthetic_assistant
+                            && assistant.protocol == ygg_ai::Protocol::OpenAiResponses
+                            && assistant.model == *model
+                    }) =>
+                {
+                    replay.push(ygg_ai::responses::ResponsesReplayItem::LocalAssistant(
+                        assistant.clone(),
+                    ));
                 }
                 EntryValue::Message(Message::Assistant(_)) => {
                     let Some((recorded_endpoint, recorded_model, output)) =
@@ -2048,6 +2101,22 @@ mod tests {
         .unwrap()])
     }
 
+    fn responses_compact_output(id: &str) -> ygg_ai::ResponsesOutput {
+        ygg_ai::ResponsesOutput::new(vec![
+            ygg_ai::ResponsesItem::new(serde_json::json!({
+                "type": "message",
+                "id": format!("leading-{id}")
+            }))
+            .unwrap(),
+            ygg_ai::ResponsesItem::new(serde_json::json!({
+                "type": "compaction",
+                "id": id,
+                "encrypted_content": "opaque"
+            }))
+            .unwrap(),
+        ])
+    }
+
     fn tool_result(call_id: &str, text: &str) -> EntryValue {
         EntryValue::Message(Message::User(UserMessage {
             content: vec![UserPart::ToolResult(ToolResult {
@@ -2112,6 +2181,7 @@ mod tests {
                     prompt_model_source: Some("  deepseek  ".into()),
                     prompt_color: Some("  #22AACC  ".into()),
                     display_text: Some("visible\ndraft".into()),
+                    local_synthetic_assistant: false,
                 }),
             )
             .unwrap();
@@ -2123,6 +2193,7 @@ mod tests {
                     prompt_model_source: Some("#2243e6".into()),
                     prompt_color: Some("rgb(1,2,3)\u{1b}".into()),
                     display_text: Some("bad\u{1b}".into()),
+                    local_synthetic_assistant: false,
                 }),
             )
             .unwrap();
@@ -2136,6 +2207,7 @@ mod tests {
                 prompt_model_source: Some("deepseek".into()),
                 prompt_color: Some("#22aacc".into()),
                 display_text: Some("visible\ndraft".into()),
+                local_synthetic_assistant: false,
             })
         );
         assert_eq!(session.entry(&invalid).unwrap().metadata, None);
@@ -3305,6 +3377,62 @@ mod tests {
     }
 
     #[test]
+    fn responses_sidecars_reject_non_authoritative_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(temp_path(&dir)).unwrap();
+        session.append(user("prompt")).unwrap();
+        let assistant = session.append(responses_assistant("answer")).unwrap();
+        let error = session
+            .append_responses_turn(
+                assistant,
+                EndpointId("responses".into()),
+                ModelId("m".into()),
+                ygg_ai::ResponsesOutput::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SessionError::InvalidResponsesSidecar(_)));
+
+        let error = session
+            .append_responses_compaction(
+                EndpointId("responses".into()),
+                ModelId("m".into()),
+                responses_output("not-a-compaction"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SessionError::InvalidResponsesSidecar(_)));
+    }
+
+    #[test]
+    fn reopening_rejects_a_semantically_invalid_compact_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut session = Session::create(&path).unwrap();
+        let covered = session.append(user("prompt")).unwrap();
+        drop(session);
+
+        let malformed = serde_json::json!({
+            "type": "entry",
+            "id": "999",
+            "parent": covered,
+            "value": {
+                "type": "responses_compaction",
+                "endpoint": "responses",
+                "model": "m",
+                "covered_through": covered,
+                "output": [{"type": "message", "id": "not-compacted"}]
+            }
+        });
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        serde_json::to_writer(&mut file, &malformed).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let error = Session::open(&path).unwrap_err();
+        assert!(matches!(error, SessionError::Corrupt { .. }), "{error}");
+        assert!(error.to_string().contains("direct checkpoint"), "{error}");
+    }
+
+    #[test]
     fn native_responses_compaction_is_a_branch_local_replay_base() {
         let dir = tempfile::tempdir().unwrap();
         let endpoint = EndpointId("responses".into());
@@ -3324,7 +3452,7 @@ mod tests {
             .append_responses_compaction(
                 endpoint.clone(),
                 model.clone(),
-                responses_output("compact_raw"),
+                responses_compact_output("compact_raw"),
             )
             .unwrap();
         session.append(user("after compact")).unwrap();
@@ -3337,7 +3465,7 @@ mod tests {
         let ygg_ai::responses::ResponsesReplayItem::Compacted(output) = &replay[0] else {
             panic!("native compact output must be the replay base");
         };
-        assert_eq!(output.items()[0].as_json()["id"], "compact_raw");
+        assert_eq!(output.items()[1].as_json()["id"], "compact_raw");
 
         // Checking out the covered head abandons the checkpoint. The new
         // sibling reconstructs from canonical messages plus the turn sidecar.
@@ -3362,6 +3490,9 @@ mod tests {
             .map(|item| match item {
                 ygg_ai::responses::ResponsesReplayItem::User(user) => {
                     serde_json::to_value(user).unwrap()
+                }
+                ygg_ai::responses::ResponsesReplayItem::LocalAssistant(assistant) => {
+                    serde_json::to_value(assistant).unwrap()
                 }
                 ygg_ai::responses::ResponsesReplayItem::Output(output) => {
                     serde_json::to_value(output).unwrap()

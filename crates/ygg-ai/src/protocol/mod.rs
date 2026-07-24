@@ -14,14 +14,28 @@ pub(crate) struct CacheControl {
 }
 
 pub(crate) fn cache_session_id(req: &Request) -> Option<&str> {
-    (req.cache_retention != CacheRetention::None)
-        .then_some(req.session_id.as_deref())
+    cache_session_id_for(req.cache_retention, req.session_id.as_deref())
+}
+
+pub(crate) fn cache_session_id_for(
+    retention: CacheRetention,
+    session_id: Option<&str>,
+) -> Option<&str> {
+    (retention != CacheRetention::None)
+        .then_some(session_id)
         .flatten()
         .filter(|id| !id.is_empty())
 }
 
 pub(crate) fn prompt_cache_key(req: &Request) -> Option<String> {
-    let id = cache_session_id(req)?;
+    prompt_cache_key_for(req.cache_retention, req.session_id.as_deref())
+}
+
+pub(crate) fn prompt_cache_key_for(
+    retention: CacheRetention,
+    session_id: Option<&str>,
+) -> Option<String> {
+    let id = cache_session_id_for(retention, session_id)?;
     let key: String = id.chars().take(64).collect();
     (!key.is_empty()).then_some(key)
 }

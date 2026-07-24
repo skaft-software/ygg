@@ -92,6 +92,13 @@ where
                 return Ok(false);
             }
         };
+        if matches!(&event, Event::Key(key) if crate::tui::keymap::is_close_key(key)) {
+            request.cancel();
+            shell.set_tool_input_prompt(None);
+            shell.request_close();
+            shell.render();
+            return Ok(false);
+        }
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 match key.code {
@@ -182,6 +189,12 @@ where
                 return Ok(None);
             }
         };
+        if matches!(&event, Event::Key(key) if crate::tui::keymap::is_close_key(key)) {
+            shell.close_panel();
+            shell.request_close();
+            shell.render();
+            return Ok(None);
+        }
         // Mouse events pass through to the shell for transcript scrolling.
         if matches!(event, Event::Mouse(_)) {
             continue;
@@ -500,6 +513,38 @@ pub async fn model_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    #[tokio::test]
+    async fn ctrl_d_closes_a_picker_and_propagates_the_close_request() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            ))))
+            .await
+            .unwrap();
+        drop(sender);
+        let mut input = ReceiverStream::new(receiver);
+        let mut shell = InteractiveShell::test_shell();
+
+        let selected = pick_list(
+            &mut shell,
+            &mut input,
+            "Choose",
+            vec!["one".into()],
+            vec![None],
+            PanelAction::SelectTheme(vec!["one".into()]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selected, None);
+        assert!(!shell.has_panel());
+        assert!(shell.close_requested());
+    }
 
     #[test]
     fn model_label_uses_friendly_metadata_without_wire_id_noise() {
