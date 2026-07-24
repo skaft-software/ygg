@@ -555,6 +555,21 @@ impl<'a> TUI<'a> {
             self.synchronized_output_depth = 0;
         }
         if !self.capabilities.plain {
+            // Inline scrollback paints a mutable frame on the primary screen.
+            // Its editor marker can leave the hardware cursor in the middle of
+            // that frame. Anchor it at the final painted row before handing
+            // the terminal back so the caller's normal-mode cleanup can move
+            // to a fresh line without letting the shell prompt overwrite the
+            // composer while leaving its footer behind.
+            if self.inline_scrollback
+                && self.capabilities.cursor_addressing
+                && !self.previous_frame.is_empty()
+            {
+                self.terminal.write(&format!(
+                    "\x1b[{};1H",
+                    self.inline_bottom_row.saturating_add(1)
+                ));
+            }
             self.terminal.write("\x1b[0m\x1b]8;;\x1b\\");
             self.terminal.show_cursor();
         }
@@ -2921,6 +2936,36 @@ mod tests {
         assert!(
             begin < cursor && cursor < end,
             "cursor placement must be atomic: {output:?}"
+        );
+    }
+
+    #[test]
+    fn inline_scrollback_stop_anchors_after_the_final_frame_row() {
+        let size = Rc::new(Cell::new((20, 8)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        );
+        let (terminal, _, _, stops, shows, writes) = recording_terminal(size, capabilities);
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.set_inline_scrollback(true);
+        tui.add_child(Box::new(MutableLines(Rc::new(RefCell::new(vec![
+            "header".into(),
+            format!("composer{CURSOR_MARKER}"),
+            "footer".into(),
+        ])))));
+        tui.start();
+        assert_eq!(tui.inline_bottom_row, 2);
+        writes.borrow_mut().clear();
+
+        tui.stop();
+
+        assert_eq!(stops.get(), 1);
+        assert_eq!(shows.get(), 2);
+        assert_eq!(
+            writes.borrow().join(""),
+            "\x1b[3;1H\x1b[0m\x1b]8;;\x1b\\",
+            "shutdown must leave the caller below the complete inline frame"
         );
     }
 
