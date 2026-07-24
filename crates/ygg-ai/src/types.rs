@@ -920,6 +920,9 @@ pub struct Response {
     pub cost: Option<crate::pricing::Cost>,
     /// Provider-assigned response identifier.
     pub response_id: Option<String>,
+    /// Complete opaque Responses output, when the provider supplied an
+    /// authoritative terminal output snapshot.
+    pub responses_output: Option<crate::responses::ResponsesOutput>,
     /// Lossy mode diagnostics. Empty in Strict mode.
     pub diagnostics: Vec<crate::error::Diagnostic>,
 }

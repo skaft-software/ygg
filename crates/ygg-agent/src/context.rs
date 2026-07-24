@@ -220,6 +220,7 @@ mod tests {
             },
             cost: None,
             response_id: Some("r2".into()),
+            responses_output: None,
             diagnostics: Vec::new(),
         }));
         tracker.tool_started();

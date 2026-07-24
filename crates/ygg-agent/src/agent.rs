@@ -685,6 +685,7 @@ fn pending_tool_state(session: &Session) -> Option<(Vec<ToolCall>, HashSet<ygg_a
                 }
             }
             EntryValue::Compaction { .. }
+            | EntryValue::ResponsesTurn { .. }
             | EntryValue::Config { .. }
             | EntryValue::PromptTemplateSelected { .. }
             | EntryValue::SkillActivated { .. }
@@ -1073,6 +1074,7 @@ fn previous_message_is_user(session: &Session, entry: &crate::session::Entry) ->
             EntryValue::Message(Message::User(user)) => return !user.content.is_empty(),
             EntryValue::Message(Message::Assistant(_)) => return false,
             EntryValue::Compaction { .. }
+            | EntryValue::ResponsesTurn { .. }
             | EntryValue::Config { .. }
             | EntryValue::PromptTemplateSelected { .. }
             | EntryValue::SkillActivated { .. }
@@ -2667,6 +2669,7 @@ impl Agent {
                 // a successful completion.
                 let stop_reason = response.stop_reason.clone();
                 let turn_usage = response.usage;
+                let raw_responses_output = response.responses_output.clone();
                 let assistant = response.message;
                 let calls: Vec<ToolCall> = assistant
                     .content
@@ -2686,13 +2689,23 @@ impl Agent {
                 add_usage(&mut run_usage, &turn_usage);
                 let turn_cost = response.cost;
                 if let Err(error) = session.record_assistant_usage(
-                    assistant_entry,
+                    assistant_entry.clone(),
                     model.endpoint.id.clone(),
                     model.spec.id.clone(),
                     turn_usage,
                     turn_cost,
                 ) {
                     break 'run FinishReason::Failed(error.into());
+                }
+                if let Some(output) = raw_responses_output {
+                    if let Err(error) = session.append(EntryValue::ResponsesTurn {
+                        assistant: assistant_entry.clone(),
+                        endpoint: model.endpoint.id.clone(),
+                        model: model.spec.id.clone(),
+                        output,
+                    }) {
+                        break 'run FinishReason::Failed(error.into());
+                    }
                 }
                 run_cost.add(turn_cost);
                 let normal_end = matches!(stop_reason, StopReason::EndTurn | StopReason::StopSequence);

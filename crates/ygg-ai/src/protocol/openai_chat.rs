@@ -1172,6 +1172,7 @@ pub(crate) fn decode_response(
         usage,
         cost,
         response_id: Some(resp.id),
+        responses_output: None,
         diagnostics: Vec::new(),
     })
 }

@@ -808,6 +808,10 @@ struct ResponsesResponseItemDone {
 
 #[derive(Deserialize)]
 struct ResponsesResponseCompletedBlock {
+    /// Full terminal output is the only authoritative raw replay source. Added
+    /// events are intentionally not used because some servers send skeletons.
+    #[serde(default)]
+    output: Option<Vec<crate::responses::ResponsesItem>>,
     // `usage` is nullable in the Responses object (apidocs
     // openai-responses/01-responses.md: `usage: null` on non-terminal snapshots,
     // populated on completion). Model it as optional so a documented terminal
@@ -1258,6 +1262,9 @@ pub(crate) fn decode_stream_event(
                 StopReason::ToolUse
             };
             builder.set_stop_reason(stop);
+            if let Some(output) = response.output {
+                builder.responses_output = Some(crate::responses::ResponsesOutput::new(output));
+            }
             close_open_tool_calls(&mut events, builder)?;
             // Usage is optional on the wire; only emit a `Usage` event when the
             // provider reported one so `Finished.usage` is a default rather than a

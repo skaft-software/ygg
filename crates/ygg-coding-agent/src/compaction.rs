@@ -207,6 +207,7 @@ fn previous_message_is_user(session: &Session, entry: &ygg_agent::Entry) -> bool
             EntryValue::Message(Message::User(user)) => return !user.content.is_empty(),
             EntryValue::Message(Message::Assistant(_)) => return false,
             EntryValue::Compaction { .. }
+            | EntryValue::ResponsesTurn { .. }
             | EntryValue::Config { .. }
             | EntryValue::PromptTemplateSelected { .. }
             | EntryValue::SkillActivated { .. }

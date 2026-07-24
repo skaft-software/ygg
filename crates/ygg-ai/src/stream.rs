@@ -143,6 +143,8 @@ pub(crate) struct ResponseBuilder {
     pub(crate) protocol: Protocol,
     pub(crate) pricing: Option<Pricing>,
     pub(crate) response_id: Option<String>,
+    /// Authoritative terminal OpenAI Responses output, if supplied.
+    pub(crate) responses_output: Option<crate::responses::ResponsesOutput>,
     pub(crate) text_buffers: HashMap<usize, String>,
     pub(crate) reasoning_text_buffers: HashMap<usize, String>,
     pub(crate) reasoning_states: HashMap<usize, ReasoningState>,
@@ -208,6 +210,7 @@ impl ResponseBuilder {
             protocol,
             pricing,
             response_id: None,
+            responses_output: None,
             text_buffers: HashMap::with_capacity(4),
             reasoning_text_buffers: HashMap::with_capacity(2),
             reasoning_states: HashMap::with_capacity(2),
@@ -549,6 +552,7 @@ impl ResponseBuilder {
             usage,
             cost,
             response_id: self.response_id,
+            responses_output: self.responses_output,
             diagnostics: self.diagnostics,
         })
     }
@@ -947,6 +951,7 @@ mod tests {
                 usage: Usage::default(),
                 cost: None,
                 response_id: None,
+                responses_output: None,
                 diagnostics: vec![],
             })),
             Ok(StreamEvent::TextStart { index: 0 }),

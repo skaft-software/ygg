@@ -209,6 +209,18 @@ pub enum EntryValue {
         #[serde(default)]
         details: crate::compaction::CompactionDetails,
     },
+    /// Opaque complete Responses output attached beside its canonical assistant
+    /// message. It is not model-visible canonical context.
+    ResponsesTurn {
+        /// Assistant message entry produced by this provider turn.
+        assistant: EntryId,
+        /// Exact endpoint that produced the opaque output.
+        endpoint: EndpointId,
+        /// Exact model that produced the opaque output.
+        model: ModelId,
+        /// Complete terminal output, preserved without normalization.
+        output: ygg_ai::ResponsesOutput,
+    },
     /// A configuration marker (not part of model-visible context).
     Config {
         /// Model selection recorded at this point, if any.
@@ -998,7 +1010,9 @@ impl Session {
                     append_context_message(messages, message);
                 }
             }
-            EntryValue::Config { .. } | EntryValue::PromptTemplateSelected { .. } => {}
+            EntryValue::Config { .. }
+            | EntryValue::PromptTemplateSelected { .. }
+            | EntryValue::ResponsesTurn { .. } => {}
             EntryValue::Compaction { .. }
             | EntryValue::SkillActivated { .. }
             | EntryValue::SkillResourceRead { .. }
@@ -1364,7 +1378,9 @@ impl Session {
                 .ok_or_else(|| SessionError::UnknownEntry(id.clone()))?;
             match &entry.value {
                 EntryValue::Message(m) => newest_first.push(m.clone()),
-                EntryValue::Config { .. } | EntryValue::PromptTemplateSelected { .. } => {}
+                EntryValue::Config { .. }
+                | EntryValue::PromptTemplateSelected { .. }
+                | EntryValue::ResponsesTurn { .. } => {}
                 EntryValue::Compaction {
                     summary: compaction_summary,
                     first_kept,
@@ -1458,6 +1474,7 @@ impl Session {
                 }
                 EntryValue::Config { .. }
                 | EntryValue::PromptTemplateSelected { .. }
+                | EntryValue::ResponsesTurn { .. }
                 | EntryValue::SkillActivated { .. }
                 | EntryValue::SkillResourceRead { .. }
                 | EntryValue::SkillDeactivated { .. } => {}

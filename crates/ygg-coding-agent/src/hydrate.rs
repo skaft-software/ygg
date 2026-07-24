@@ -344,7 +344,8 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
                     summary: summary.clone(),
                 });
             }
-            EntryValue::SkillActivated { .. }
+            EntryValue::ResponsesTurn { .. }
+            | EntryValue::SkillActivated { .. }
             | EntryValue::PromptTemplateSelected { .. }
             | EntryValue::SkillResourceRead { .. }
             | EntryValue::SkillDeactivated { .. } => {}
