@@ -33,6 +33,25 @@ pub enum CodeOverflow {
     Wrap,
 }
 
+/// Marker used for unordered rich-text lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnorderedListMarker {
+    #[default]
+    Bullet,
+    Dash,
+}
+
+impl UnorderedListMarker {
+    const fn glyph(self, capabilities: TerminalCapabilities) -> &'static str {
+        match (self, capabilities.unicode && !capabilities.plain) {
+            (Self::Bullet, true) => "•",
+            (Self::Bullet, false) => "*",
+            (Self::Dash, true) => "—",
+            (Self::Dash, false) => "-",
+        }
+    }
+}
+
 /// Rich-rendering options.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderOptions {
@@ -41,6 +60,7 @@ pub struct RenderOptions {
     pub code_borders: bool,
     pub syntax_highlighting: bool,
     pub tables: bool,
+    pub unordered_list_marker: UnorderedListMarker,
 }
 
 impl Default for RenderOptions {
@@ -51,6 +71,7 @@ impl Default for RenderOptions {
             code_borders: true,
             syntax_highlighting: cfg!(feature = "syntax-highlighting"),
             tables: true,
+            unordered_list_marker: UnorderedListMarker::Bullet,
         }
     }
 }
@@ -169,6 +190,51 @@ impl RichRenderer {
 
     pub fn render(&self, document: &Document, width: u16) -> RenderedDocument {
         self.render_document(document, width, self.options.syntax_highlighting)
+    }
+
+    /// Render source code with syntax foregrounds but without code-block
+    /// chrome, padding, or background. This is useful for command transcripts,
+    /// where the source should read as code while adjacent output stays neutral.
+    pub fn render_inline_syntax(
+        &self,
+        source: &str,
+        language: &str,
+        width: u16,
+    ) -> RenderedDocument {
+        let source = self.sanitize(source);
+        let code = CodeBlock::with_language(language, source.clone());
+        let base_style = self.theme.style(TextRole::Code);
+        let runs = self.highlighted(&code).map_or_else(
+            || vec![RichRun::new(source.clone(), base_style, None)],
+            |highlighted| {
+                let mut runs = Vec::new();
+                for (line_index, line) in highlighted.iter().enumerate() {
+                    if line_index > 0 {
+                        runs.push(RichRun::new("\n".to_owned(), base_style, None));
+                    }
+                    for region in line {
+                        runs.push(RichRun::new(
+                            self.sanitize(&region.text),
+                            region.role.map_or(base_style, |role| {
+                                base_style.merge(self.theme.style(role))
+                            }),
+                            None,
+                        ));
+                    }
+                }
+                runs
+            },
+        );
+        let width = usize::from(width).max(1);
+        let lines = self
+            .hard_wrap_runs(&runs, width)
+            .into_iter()
+            .map(|line| self.encode_line(line, width))
+            .collect();
+        RenderedDocument {
+            lines,
+            copy_text: source,
+        }
     }
 
     /// Render a document on a fixed row surface. The background is composed
@@ -422,14 +488,16 @@ impl RichRenderer {
     }
 
     fn render_list(&self, list: &List, width: usize, syntax_highlighting: bool) -> Vec<RichLine> {
-        let glyphs = GlyphSet::for_capabilities(self.capabilities);
         let mut output = Vec::new();
         for (index, item) in list.items.iter().enumerate() {
             if index > 0 && (item.blocks.len() > 1 || list.items[index - 1].blocks.len() > 1) {
                 push_blank(&mut output);
             }
             let marker = match list.kind {
-                ListKind::Unordered => format!("{} ", glyphs.bullet),
+                ListKind::Unordered => format!(
+                    "{} ",
+                    self.options.unordered_list_marker.glyph(self.capabilities)
+                ),
                 ListKind::Ordered { start } => format!("{}. ", start.saturating_add(index as u64)),
             };
             let marker = match item.task {
@@ -1981,6 +2049,37 @@ mod tests {
             rendered.contains("\x1b[38;2;6;7;8m\"text\""),
             "{rendered:?}"
         );
+    }
+
+    #[cfg(feature = "syntax-highlighting")]
+    #[test]
+    fn inline_syntax_renderer_colours_source_without_code_block_chrome() {
+        let capabilities = TerminalCapabilities::interactive(ColorDepth::TrueColor, true);
+        let mut theme = Theme::with_capabilities(capabilities);
+        theme.override_token("md_code_block", "#111213");
+        theme.override_token("syntax_string", "#060708");
+        theme.override_token("syntax_operator", "#090a0b");
+        let renderer = RichRenderer::new(theme, capabilities, RenderOptions::default());
+        let source = "printf '%s\\n' \"hello\" && cargo test";
+        let rendered = renderer.render_inline_syntax(source, "bash", 80);
+
+        assert_eq!(rendered.plain_text(), source);
+        assert_eq!(rendered.copy_text, source);
+        assert!(!rendered.styled_text().contains("\x1b[48;"));
+        assert!(!rendered.plain_text().contains('│'));
+        assert!(
+            rendered.styled_text().contains("\x1b[38;2;6;7;8m"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn inline_syntax_renderer_degrades_to_plain_source() {
+        let renderer = RichRenderer::plain();
+        let source = "printf '%s\\n' \"hello\" && cargo test";
+        let rendered = renderer.render_inline_syntax(source, "bash", 80);
+        assert_eq!(rendered.plain_text(), source);
+        assert_eq!(rendered.styled_text(), source);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use sexy_tui_rs::theme::{capability::CapabilityTier, Theme as SexyTheme};
 use sexy_tui_rs::widgets::SelectListTheme;
 use sexy_tui_rs::{
     CapabilityOverrides, CodeOverflow, Color, RenderOptions, RichRenderer, SupportLevel, TextRole,
-    TextStyle,
+    TextStyle, UnorderedListMarker,
 };
 use ygg_ai::{Model, ModelSpec};
 
@@ -608,17 +608,12 @@ impl YggTheme {
         self.color_text(Rgb { red, green, blue }, text)
     }
 
-    /// Paint a prompt-row span with the exact persisted model colour. The view
-    /// passes the complete padded semantic row so the background reaches its
-    /// right edge. Only inert `#rrggbb` data reaches this boundary;
-    /// unsupported terminal tiers are degraded by sexy-tui's colour encoder.
+    /// Render a historical prompt cell using the exact model colour stored
+    /// with that turn and a readable foreground chosen for that colour.
     pub(crate) fn prompt_color_cell(&self, color: Option<&str>, text: &str) -> String {
         let Some(color) = color.and_then(parse_hex_color) else {
             return text.to_owned();
         };
-        // A fixed contrast decision depends only on the stored colour, not on
-        // the current theme or terminal background, so replay cannot restyle
-        // an old prompt after a model/theme switch.
         let luminance =
             u32::from(color.red) * 299 + u32::from(color.green) * 587 + u32::from(color.blue) * 114;
         let foreground = if luminance >= 150_000 {
@@ -662,7 +657,7 @@ impl YggTheme {
                 blue: 0,
             },
         };
-        let idle = blend(source, destination, 0.80);
+        let idle = blend(source, destination, 0.88);
         (idle.red, idle.green, idle.blue)
     }
 
@@ -730,12 +725,43 @@ impl YggTheme {
         self.fg("muted", text)
     }
 
-    pub fn italic(&self, text: &str) -> String {
-        if self.capabilities.italics {
-            format!("\x1b[3m{text}\x1b[23m")
-        } else {
-            text.to_owned()
-        }
+    pub(crate) fn settled_event_dot(&self, tone: &str, text: &str) -> String {
+        let source = match tone {
+            "success" => Rgb {
+                red: 78,
+                green: 170,
+                blue: 106,
+            },
+            "error" => Rgb {
+                red: 207,
+                green: 77,
+                blue: 77,
+            },
+            _ => self.resolve_rgb("muted").unwrap_or(Rgb {
+                red: 119,
+                green: 119,
+                blue: 119,
+            }),
+        };
+        let destination = match self.background {
+            TerminalBackground::Light => Rgb {
+                red: 255,
+                green: 255,
+                blue: 255,
+            },
+            TerminalBackground::Dark => Rgb {
+                red: 0,
+                green: 0,
+                blue: 0,
+            },
+            TerminalBackground::Unknown => Rgb {
+                red: 85,
+                green: 85,
+                blue: 85,
+            },
+        };
+        let color = blend(source, destination, 0.62);
+        self.color_text(color, text)
     }
 
     pub fn override_token(&mut self, key: &str, value: &str) {
@@ -754,9 +780,8 @@ impl YggTheme {
     }
 
     /// Build the renderer used for model reasoning. Every semantic role keeps
-    /// its own colour, but receives a dim/italic overlay so inline code,
-    /// headings, and syntax remain readable while the stream recedes behind
-    /// the final response.
+    /// its own colour while prose receives a muted foreground, so the stream
+    /// recedes behind the final response without changing font shape.
     pub fn reasoning_renderer(&self) -> RichRenderer {
         let mut theme = self.inner.clone();
         let reasoning_foreground = balance_foreground("#777777", self.background);
@@ -770,7 +795,7 @@ impl YggTheme {
             // Do not use SGR faint here. A muted foreground gives the desired
             // hierarchy without changing the terminal's font weight/shape.
             style.attributes.dim = false;
-            style.attributes.italic = true;
+            style.attributes.italic = false;
             theme.override_style(*role, style);
         }
         // Muted/subtle roles are used by code-frame labels and ellipses. Keep
@@ -803,6 +828,7 @@ impl YggTheme {
                 code_borders: true,
                 syntax_highlighting: true,
                 tables: true,
+                unordered_list_marker: UnorderedListMarker::Dash,
                 ..RenderOptions::default()
             },
         )
@@ -2645,9 +2671,9 @@ mod tests {
         let light = default_theme_for(TerminalBackground::Light, capabilities);
         let unknown = default_theme_for(TerminalBackground::Unknown, capabilities);
 
-        assert_eq!(dark.composer_idle_rgb(accent), (19, 16, 13));
-        assert_eq!(light.composer_idle_rgb(accent), (223, 220, 217));
-        assert_eq!(unknown.composer_idle_rgb(accent), (19, 16, 13));
+        assert_eq!(dark.composer_idle_rgb(accent), (12, 10, 8));
+        assert_eq!(light.composer_idle_rgb(accent), (236, 234, 232));
+        assert_eq!(unknown.composer_idle_rgb(accent), (12, 10, 8));
     }
 
     #[test]

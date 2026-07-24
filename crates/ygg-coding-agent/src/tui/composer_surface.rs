@@ -6,7 +6,6 @@ use std::time::{Duration, Instant};
 
 use sexy_tui_rs::{visible_width, CURSOR_MARKER};
 
-use crate::presentation::format_duration;
 use crate::tui::terminal::ColorDepth;
 use crate::tui::view::fit_line;
 
@@ -221,7 +220,12 @@ fn render_composer_box(
     }
 
     let theme = &state.theme;
-    let horizontal_padding = usize::from(theme.layout_for_width(width).composer_padding);
+    let horizontal_padding = usize::from(
+        theme
+            .layout_for_width(width)
+            .composer_padding
+            .saturating_add(1),
+    );
     let inner_width = w.saturating_sub(2 + horizontal_padding.saturating_mul(2));
     if inner_width == 0 {
         return render_plain_content(state, width);
@@ -668,66 +672,11 @@ fn identity_variants(full_model: &str, model_names: &[String], thinking: &str) -
     variants
 }
 
-fn activity_variants(state: &super::view::ShellState, now: Instant) -> Vec<String> {
-    let session_elapsed = state.session_work_elapsed.saturating_add(
-        state
-            .run
-            .current()
-            .filter(|run| run.is_active())
-            .map(|run| run.elapsed_at(now))
-            .unwrap_or_default(),
-    );
-    let compiled_default = matches!(
-        state.theme.source(),
-        crate::tui::theme::ThemeSource::CompiledDefault
-    );
-    if let Some(run) = state.run.current().filter(|run| run.is_active()) {
-        if compiled_default {
-            let activity = match run.phase() {
-                crate::presentation::RunPhase::AwaitingProvider { .. } => "waiting for API",
-                crate::presentation::RunPhase::AwaitingApproval { .. } => "waiting",
-                crate::presentation::RunPhase::Preparing { summary } if summary == "compacting" => {
-                    "compacting"
-                }
-                crate::presentation::RunPhase::Thinking
-                | crate::presentation::RunPhase::Preparing { .. }
-                | crate::presentation::RunPhase::StreamingResponse
-                | crate::presentation::RunPhase::PreparingToolCall
-                | crate::presentation::RunPhase::RunningTool { .. }
-                | crate::presentation::RunPhase::Finished(_) => return Vec::new(),
-            };
-            return vec![activity.to_owned()];
-        }
-        let elapsed = format_duration(session_elapsed);
-        let activity = match run.phase() {
-            crate::presentation::RunPhase::AwaitingProvider { .. } => {
-                format!("waiting for API {elapsed}")
-            }
-            crate::presentation::RunPhase::AwaitingApproval { .. } => {
-                format!("waiting {elapsed}")
-            }
-            crate::presentation::RunPhase::Preparing { summary } if summary == "compacting" => {
-                format!("compacting {elapsed}")
-            }
-            crate::presentation::RunPhase::Thinking
-            | crate::presentation::RunPhase::Preparing { .. }
-            | crate::presentation::RunPhase::StreamingResponse
-            | crate::presentation::RunPhase::PreparingToolCall
-            | crate::presentation::RunPhase::RunningTool { .. } => elapsed,
-            crate::presentation::RunPhase::Finished(_) => return Vec::new(),
-        };
-        return vec![activity];
-    }
-    if session_elapsed.is_zero() {
-        Vec::new()
-    } else if compiled_default {
-        // The compiled default keeps its idle footer purely informational.
-        // Named themes may opt into the decorative session stopwatch, while
-        // active waiting state remains visible above through the run branch.
-        Vec::new()
-    } else {
-        vec![format_duration(session_elapsed)]
-    }
+fn activity_variants(_state: &super::view::ShellState, _now: Instant) -> Vec<String> {
+    // Live activity belongs in the transcript: reasoning owns the braille
+    // shimmer, and active tools own a blinking margin marker. Keeping the
+    // footer informational avoids a second competing activity surface.
+    Vec::new()
 }
 
 /// Render exactly one semantic, width-aware status row. The composer owns this
@@ -1010,7 +959,14 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
     let context_is_urgent = displayed_context
         .is_some_and(|(used, limit)| limit > 0 && used as f64 * 100.0 / limit as f64 >= 90.0);
     let style_segment = |segment: &FooterSegment| match segment.kind {
-        FooterKind::Identity => state.theme.fg("foreground", segment.text()),
+        FooterKind::Identity => state.theme.model_fg(
+            if active {
+                state.run_model_lab
+            } else {
+                state.model_lab
+            },
+            segment.text(),
+        ),
         FooterKind::Context if context_is_urgent => state.theme.fg("error", segment.text()),
         FooterKind::Cost
             if state
@@ -1028,14 +984,7 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
         {
             state.theme.fg("warning", segment.text())
         }
-        FooterKind::Activity => state.theme.model_fg(
-            if active {
-                state.run_model_lab
-            } else {
-                state.model_lab
-            },
-            segment.text(),
-        ),
+        FooterKind::Activity => state.theme.fg("foreground", segment.text()),
         FooterKind::Extension => {
             let role = state
                 .extension_footer
@@ -1174,7 +1123,7 @@ pub fn render_composer_surface(
         width.saturating_sub(padding.saturating_add(2)).max(1)
     } else {
         width
-            .saturating_sub(2 + layout.composer_padding.saturating_mul(2))
+            .saturating_sub(2 + layout.composer_padding.saturating_add(1).saturating_mul(2))
             .max(1)
     };
     let visual_lines = if editor.is_empty() {

@@ -58,6 +58,7 @@ pub use rich_text::diff::{DiffLine, DiffLineKind, DiffRenderOptions, UnifiedDiff
 pub use rich_text::markdown::parse as parse_markdown;
 pub use rich_text::render::{
     CodeOverflow, RenderOptions, RenderedDocument, RenderedLine, RichRenderer, SyntaxCacheStats,
+    UnorderedListMarker,
 };
 pub use rich_text::stream::{
     StreamingMarkdown, StreamingRenderCache, StreamingStats, MAX_UNSTABLE_PARSE_BYTES,

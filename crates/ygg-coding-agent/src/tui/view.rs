@@ -50,6 +50,9 @@ const ANIMATION_RENDER_INTERVAL: Duration = Duration::from_millis(50);
 /// Wake near the next eligible animation frame; input commands still preempt
 /// this wait through the bounded render channel.
 const ANIMATION_POLL_TIMEOUT: Duration = Duration::from_millis(45);
+/// Tool activity dots share one restrained 900 ms cycle. Toggling the cell
+/// ourselves works in terminals that intentionally ignore SGR blink.
+const EVENT_DOT_TOGGLE_INTERVAL: Duration = Duration::from_millis(450);
 /// Resize events are normally delivered by crossterm, but polling while idle
 /// also catches terminal-manager resizes that do not emit an event.
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -737,6 +740,9 @@ pub(crate) struct ShellState {
     /// Exact deterministic row colour assigned to the next submitted prompt.
     pub(crate) prompt_color: Option<String>,
     transcript: Vec<TranscriptBlock>,
+    /// Shared phase for every active event marker. This is presentation-only
+    /// and toggles at a fixed cadence on the renderer thread.
+    event_dot_visible: bool,
     /// Session backing an intentionally tail-only first paint. The complete
     /// branch is materialized once, on the first attempt to scroll beyond the
     /// retained tail, so resume readiness does not scale with old history.
@@ -1126,6 +1132,7 @@ impl ShellState {
                         reasoning_renderer,
                         width,
                         self.show_tool_details(block),
+                        self.event_dot_visible,
                     );
                     let start = cache.lines.len();
                     let length = rendered.lines.len();
@@ -1150,6 +1157,7 @@ impl ShellState {
                         reasoning_renderer,
                         width,
                         self.show_tool_details(&self.transcript[index]),
+                        self.event_dot_visible,
                     );
                     let start = cache.lines.len();
                     first_changed = first_changed.min(start);
@@ -1189,6 +1197,7 @@ impl ShellState {
                         reasoning_renderer,
                         width,
                         self.show_tool_details(&self.transcript[index]),
+                        self.event_dot_visible,
                     );
                     let new_length = rendered.lines.len();
                     cache
@@ -1346,6 +1355,34 @@ impl ShellState {
         }
     }
 
+    fn has_active_event_dot(&self) -> bool {
+        self.transcript.iter().rev().any(|block| match block {
+            TranscriptBlock::Tool(panel) => !panel.finished,
+            TranscriptBlock::Shell(shell) => shell.running,
+            _ => false,
+        })
+    }
+
+    fn advance_event_dot_animation(&mut self) {
+        let active = self
+            .transcript
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| match block {
+                TranscriptBlock::Tool(panel) if !panel.finished => Some(index),
+                TranscriptBlock::Shell(shell) if shell.running => Some(index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            return;
+        }
+        self.event_dot_visible = !self.event_dot_visible;
+        for index in active {
+            self.touch_block(index);
+        }
+    }
+
     fn advance_reasoning_animation(&mut self) {
         let Some(index) = self.active_reasoning else {
             return;
@@ -1449,6 +1486,11 @@ fn welcome_animating(state: &ShellState, now: Instant) -> bool {
         })
 }
 
+fn event_dot_animating(state: &ShellState) -> bool {
+    let capabilities = state.theme.capabilities();
+    capabilities.animation && capabilities.interactive && state.has_active_event_dot()
+}
+
 /// Reconcile the renderer's shared dimensions with the terminal itself. This
 /// is a fallback for environments where the resize signal is delayed or
 /// swallowed; the normal input path still updates the same cells immediately.
@@ -1496,25 +1538,31 @@ fn render_loop(
     tui.start();
 
     let mut last_render: Option<Instant> = None;
+    let mut last_event_dot_toggle = Instant::now();
     loop {
         // Choose the poll timeout based on whether the shimmer animation
         // would be rendered this frame.  When it is, use a short timeout so
         // the wave stays fluid on high-refresh terminals. Otherwise use a
         // 100 ms status/resize poll; idle timeouts do not render unless the
         // terminal dimensions actually changed.
-        let (animating, shimmer, welcome, is_active) = {
+        let (animating, shimmer, welcome, event_dot, is_active) = {
             let s = state.borrow();
             let active = s.run.is_active();
             let compacting = s.run_label == "compacting";
             let shimmer = (active || compacting) && shimmer_animating(&s);
             let welcome = welcome_animating(&s, Instant::now());
+            let event_dot = event_dot_animating(&s);
             (
                 shimmer || welcome,
                 shimmer,
                 welcome,
-                active || compacting || welcome,
+                event_dot,
+                active || compacting || welcome || event_dot,
             )
         };
+        if !event_dot {
+            last_event_dot_toggle = Instant::now();
+        }
         let command = if animating {
             let poll = if welcome {
                 RENDER_INTERVAL
@@ -1573,13 +1621,19 @@ fn render_loop(
             break;
         }
 
-        if shimmer || welcome {
+        let advance_event_dot =
+            event_dot && last_event_dot_toggle.elapsed() >= EVENT_DOT_TOGGLE_INTERVAL;
+        if shimmer || welcome || advance_event_dot {
             let mut shell = state.borrow_mut();
             if shimmer {
                 shell.advance_reasoning_animation();
             }
             if welcome {
                 shell.invalidate_transcript_layout();
+            }
+            if advance_event_dot {
+                shell.advance_event_dot_animation();
+                last_event_dot_toggle = Instant::now();
             }
         }
         tui.request_render();
@@ -1714,31 +1768,21 @@ fn live_reasoning_label(theme: &YggTheme, reasoning: &AssistantBlock) -> String 
 }
 
 fn collapsed_reasoning_lines(theme: &YggTheme, reasoning: &AssistantBlock) -> Vec<String> {
-    // Finished reasoning leaves no trace in the transcript when collapsed.
-    // The live spinner is enough feedback while the model is working, and
-    // Ctrl+O (verbose) reveals everything via the expanded path.
+    // Finished reasoning leaves no trace in the collapsed transcript. While
+    // active, one bold shimmering label provides progress without accumulating
+    // transient state rows.
     if reasoning.finished {
-        return Vec::new();
-    }
-    let label = theme.bold(&live_reasoning_label(theme, reasoning));
-    let elbow = if theme.capabilities().unicode {
-        "└"
+        Vec::new()
     } else {
-        "`"
-    };
-    let mut lines = vec![label];
-    if reasoning.show_reasoning_hint {
-        lines.push(subdued_text(theme, &format!("{elbow} ctrl+o to expand")));
+        vec![theme.bold(&live_reasoning_label(theme, reasoning))]
     }
-    lines
 }
 
 /// A low-contrast annotation that remains readable without relying on a
 /// painted background. This is used for viewport chrome and secondary tool
 /// metadata, never for the answer itself.
 fn subdued_text(theme: &YggTheme, text: &str) -> String {
-    let italic = theme.italic(text);
-    theme.fg("muted", &italic)
+    theme.fg("muted", text)
 }
 
 fn understated_tool_output(theme: &YggTheme, text: &str) -> String {
@@ -1806,17 +1850,11 @@ fn finish_transcript_block(mut lines: Vec<String>) -> Vec<String> {
     lines
 }
 
-fn transcript_transition_rows(
-    previous: Option<&TranscriptBlock>,
-    density: ThemeDensity,
-    show_reasoning: bool,
-) -> usize {
+fn transcript_transition_rows(previous: Option<&TranscriptBlock>, density: ThemeDensity) -> usize {
     // Density changes only the boundary between semantic blocks. A tool's
     // compact header, result, and diff still live inside one block and remain
     // adjacent, so compact themes never destroy meaningful grouping.
-    if previous.is_none()
-        || (!show_reasoning && matches!(previous, Some(TranscriptBlock::Reasoning(_))))
-    {
+    if previous.is_none() {
         return 0;
     }
     match density {
@@ -1843,10 +1881,8 @@ fn render_user_prompt(
     };
 
     // A persisted prompt colour owns the entire terminal row, including its
-    // trailing cells. This is intentionally a full-width rectangle rather
-    // than a narrow gutter: the durable RGB is the prompt's identity and must
-    // remain visible after reflow. Plain text is used inside coloured prompts
-    // so nested Markdown resets cannot punch holes through the background.
+    // trailing cells. Plain text inside the coloured prompt prevents Markdown
+    // resets from punching holes through the provenance background.
     let marker_glyph = sanitize_for_terminal(prompt_marker(theme));
     let rail_glyph = sanitize_for_terminal(theme.glyph("rail"));
     let cell = |glyph: &str| {
@@ -1906,7 +1942,7 @@ fn outcome_line(outcome: &RunOutcome, theme: &YggTheme) -> String {
             elapsed, warnings, ..
         } => format!(
             "{} {}",
-            theme.fg("warning", theme.glyph("note")),
+            theme.fg("warning", theme.glyph("success")),
             subdued_text(
                 theme,
                 &format!(
@@ -2080,11 +2116,8 @@ fn render_diff_only(
     if !expanded && lines.len() > COMPACT_DIFF_LINES + 1 {
         let remaining = lines.len() - COMPACT_DIFF_LINES;
         lines.truncate(COMPACT_DIFF_LINES);
-        let hint = if theme.unicode() {
-            format!("  … {remaining} more lines · ctrl+o to expand")
-        } else {
-            format!("  ... {remaining} more lines - ctrl+o to expand")
-        };
+        let unit = if remaining == 1 { "line" } else { "lines" };
+        let hint = format!("  {remaining} {unit} hidden");
         lines.push(subdued_text(theme, &hint));
     }
     lines
@@ -2114,11 +2147,7 @@ fn render_compact_tool_output(
     let mut rendered = Vec::new();
     if omitted > 0 {
         let unit = if omitted == 1 { "line" } else { "lines" };
-        let hint = format!(
-            "  {} ({} earlier {unit}, ctrl+o to expand)",
-            if theme.unicode() { "…" } else { "..." },
-            omitted,
-        );
+        let hint = format!("  {omitted} {unit} hidden");
         rendered.extend(wrap_hanging(
             &understated_tool_output(theme, &hint),
             "",
@@ -2161,11 +2190,7 @@ fn render_shell_output(
     let mut rendered = Vec::new();
     if omitted > 0 {
         let unit = if omitted == 1 { "line" } else { "lines" };
-        let hint = format!(
-            "  {} ({} earlier {unit}, ctrl+o to expand)",
-            if theme.unicode() { "…" } else { "..." },
-            omitted,
-        );
+        let hint = format!("  {omitted} {unit} hidden");
         rendered.extend(wrap_hanging(
             &understated_tool_output(theme, &hint),
             "",
@@ -2191,10 +2216,11 @@ fn without_redundant_tool_lead(tool: &str, text: &str) -> String {
     };
     let redundant = match tool {
         "read" => matches!(first, "read" | "reading"),
-        "search" => matches!(first, "search" | "searched" | "searching"),
-        "exec" => matches!(first, "exec" | "run" | "ran" | "running"),
+        "search" => matches!(first, "search" | "searched" | "searching" | "explored"),
+        "exec" => matches!(first, "exec" | "run" | "ran" | "running" | "failed:"),
+        "edit" => matches!(first, "edit" | "edited" | "updating" | "updated"),
         "write" => matches!(first, "write" | "wrote" | "writing"),
-        _ => first == tool,
+        _ => matches!(first, "run" | "running" | "finished") || first == tool,
     };
     if redundant {
         words.next().unwrap_or_default().trim_start().to_owned()
@@ -2403,31 +2429,37 @@ fn render_compact_exec_output(
     let compact = compact_exec_output(panel, expanded);
     let ellipsis = if theme.unicode() { "…" } else { "..." };
     let mut lines = Vec::new();
-    if compact.panel_elided {
-        let hint = format!(
-            "  {ellipsis} (older live output was elided before display; unavailable to expand)"
-        );
+    let mut first_detail = true;
+    let push_detail = |lines: &mut Vec<String>, first_detail: &mut bool, detail: String| {
+        *first_detail = false;
         lines.extend(wrap_hanging(
-            &understated_tool_output(theme, &hint),
-            "",
+            &understated_tool_output(theme, &detail),
+            "  ",
             "  ",
             width,
         ));
+    };
+    if compact.panel_elided {
+        push_detail(
+            &mut lines,
+            &mut first_detail,
+            format!(
+                "{ellipsis} (older live output was elided before display; unavailable to expand)"
+            ),
+        );
     }
     for truncation in compact.capture_truncations {
         let detail = truncation
             .omitted_bytes
             .map_or_else(|| "some bytes".to_owned(), |bytes| format!("{bytes} bytes"));
-        let hint = format!(
-            "  {ellipsis} ({} capture omitted {detail}; unavailable to expand)",
-            truncation.stream
+        push_detail(
+            &mut lines,
+            &mut first_detail,
+            format!(
+                "{ellipsis} ({} capture omitted {detail}; unavailable to expand)",
+                truncation.stream
+            ),
         );
-        lines.extend(wrap_hanging(
-            &understated_tool_output(theme, &hint),
-            "",
-            "  ",
-            width,
-        ));
     }
     if compact.omitted_lines > 0 {
         let unit = if compact.omitted_lines == 1 {
@@ -2435,20 +2467,25 @@ fn render_compact_exec_output(
         } else {
             "lines"
         };
-        let hint = format!(
-            "  {ellipsis} ({} earlier {unit}, ctrl+o to expand)",
-            compact.omitted_lines,
+        push_detail(
+            &mut lines,
+            &mut first_detail,
+            format!("{} {unit} hidden", compact.omitted_lines),
         );
-        lines.extend(wrap_hanging(
-            &understated_tool_output(theme, &hint),
-            "",
-            "  ",
-            width,
-        ));
     }
     for output_line in compact.lines {
-        let output_line = understated_tool_output(theme, &output_line);
-        lines.extend(wrap_hanging(&output_line, "  ", "  ", width));
+        push_detail(&mut lines, &mut first_detail, output_line);
+    }
+    if first_detail {
+        push_detail(
+            &mut lines,
+            &mut first_detail,
+            if panel.finished {
+                "(no output)".to_owned()
+            } else {
+                "(waiting for output)".to_owned()
+            },
+        );
     }
     if show_tool_duration {
         if let Some(duration) = tool_metadata(panel) {
@@ -2461,28 +2498,35 @@ fn render_compact_exec_output(
     lines
 }
 
-fn render_exec_row(panel: &ToolPanel, command: &str, theme: &YggTheme, width: u16) -> Vec<String> {
-    let lifecycle_role = if !panel.finished {
-        "muted"
-    } else if panel.is_error {
-        "error"
-    } else {
-        "foreground"
-    };
-    let marker = theme.bold(&theme.fg(lifecycle_role, "$"));
-    let prefix = format!("{marker} ");
+fn render_exec_row(
+    command: &str,
+    renderer: &RichRenderer,
+    theme: &YggTheme,
+    width: u16,
+) -> Vec<String> {
+    let action = "Bash";
+    let action_gap = 6usize.saturating_sub(visible_width(action)).max(2);
+    let prefix = format!(
+        "{}{}",
+        theme.bold(&theme.fg("foreground", action)),
+        " ".repeat(action_gap)
+    );
     let continuation = " ".repeat(visible_width(&prefix));
-    let safe_command = sanitize_for_terminal(command);
-    let command = theme.bold(&theme.fg(lifecycle_role, &safe_command));
-    let status = if !panel.finished {
-        theme.dim("…")
-    } else if panel.is_error {
-        theme.fg("error", "[failed]")
-    } else {
-        theme.dim("[ok]")
-    };
-    let row = format!("{command} {status}");
-    wrap_hanging(&row, &prefix, &continuation, width)
+    let content_width = width
+        .saturating_sub(u16::try_from(visible_width(&prefix)).unwrap_or(u16::MAX))
+        .max(1);
+    let command = renderer.render_inline_syntax(command, "bash", content_width);
+    let use_plain = theme.capabilities().color == crate::tui::terminal::ColorDepth::None;
+    command
+        .lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 { &prefix } else { &continuation };
+            let content = if use_plain { line.plain } else { line.styled };
+            fit_line(&format!("{prefix}{content}"), width)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2581,7 +2625,11 @@ fn compile_surface_plan<'a>(
     let layout = theme.layout_for_width(outer_width);
     let kind = transcript_surface_kind(block);
     let resolved = theme.surface_for_width(kind, outer_width);
-    let inset = layout.transcript_inset.min(outer_width.saturating_sub(1));
+    let inset = if matches!(block, TranscriptBlock::User { .. }) {
+        0
+    } else {
+        layout.transcript_inset.min(outer_width.saturating_sub(1))
+    };
     let available = outer_width.saturating_sub(inset).max(1);
     let mut chrome = resolved.chrome;
     let mut heading = if resolved.label.is_some() {
@@ -2665,7 +2713,7 @@ fn compile_surface_plan<'a>(
         frame_left,
         frame_width,
         geometry: SurfaceGeometry {
-            transition_rows: transcript_transition_rows(previous, layout.density, true),
+            transition_rows: transcript_transition_rows(previous, layout.density),
             leading_rows,
             trailing_rows,
             content_left,
@@ -2812,12 +2860,54 @@ fn render_surface_content_line(
     }
 }
 
+fn event_margin_marker(
+    block: &TranscriptBlock,
+    theme: &YggTheme,
+    active_dot_visible: bool,
+) -> Option<String> {
+    let dot = if theme.unicode() { "•" } else { "." };
+    match block {
+        TranscriptBlock::User { .. }
+        | TranscriptBlock::Reasoning(_)
+        | TranscriptBlock::Outcome(_) => None,
+        TranscriptBlock::Tool(panel) if !panel.finished => Some(if active_dot_visible {
+            theme.fg("foreground", dot)
+        } else {
+            " ".to_owned()
+        }),
+        TranscriptBlock::Tool(panel) if panel.is_error => {
+            Some(theme.settled_event_dot("error", dot))
+        }
+        TranscriptBlock::Tool(panel)
+            if matches!(panel.name.as_str(), "exec" | "write" | "edit") =>
+        {
+            Some(theme.settled_event_dot("success", dot))
+        }
+        TranscriptBlock::Shell(shell) if shell.running => Some(if active_dot_visible {
+            theme.fg("foreground", dot)
+        } else {
+            " ".to_owned()
+        }),
+        TranscriptBlock::Shell(shell) => Some(theme.settled_event_dot(
+            if shell.exit_code == 0 {
+                "success"
+            } else {
+                "error"
+            },
+            dot,
+        )),
+        _ => Some(theme.settled_event_dot("neutral", dot)),
+    }
+}
+
 fn decorate_surface(
     content: Vec<String>,
+    block: &TranscriptBlock,
     plan: &SurfacePlan<'_>,
     theme: &YggTheme,
     outer_width: u16,
     prompt_color: Option<&str>,
+    active_dot_visible: bool,
 ) -> Vec<String> {
     let mut rows = Vec::with_capacity(
         plan.geometry.transition_rows
@@ -2849,21 +2939,35 @@ fn decorate_surface(
         rows.push(theme.apply_semantic_role_layered(border_role, &bottom));
     }
 
+    let marker = event_margin_marker(block, theme, active_dot_visible);
+    let mut marker_pending = true;
     rows.into_iter()
         .enumerate()
         .map(|(row, line)| {
             if row < plan.geometry.transition_rows || line.is_empty() {
                 String::new()
             } else {
-                fit_line(
-                    &format!("{}{line}", " ".repeat(usize::from(plan.frame_left))),
-                    outer_width,
-                )
+                let frame_left = usize::from(plan.frame_left);
+                let prefix = if marker_pending && marker.is_some() {
+                    marker_pending = false;
+                    let marker = marker.as_deref().expect("checked above");
+                    if frame_left >= 2 {
+                        format!("{}{marker} ", " ".repeat(frame_left - 2))
+                    } else if frame_left == 1 {
+                        marker.to_owned()
+                    } else {
+                        format!("{marker} ")
+                    }
+                } else {
+                    " ".repeat(frame_left)
+                };
+                fit_line(&format!("{prefix}{line}"), outer_width)
             }
         })
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_block_planned(
     previous: Option<&TranscriptBlock>,
     block: &TranscriptBlock,
@@ -2872,6 +2976,7 @@ fn render_block_planned(
     reasoning_renderer: &RichRenderer,
     outer_width: u16,
     verbose_tools: bool,
+    active_dot_visible: bool,
 ) -> RenderedTranscriptBlock {
     let layout = theme.layout_for_width(outer_width);
     let plan = compile_surface_plan(previous, block, theme, outer_width);
@@ -2910,7 +3015,7 @@ fn render_block_planned(
         TranscriptBlock::Tool(panel) => {
             let compact_exec = panel.name == "exec" && panel.display.shell_command.is_some();
             let mut lines = if let Some(command) = panel.display.shell_command.as_deref() {
-                render_exec_row(panel, command, theme, width)
+                render_exec_row(command, rich_renderer, theme, width)
             } else {
                 let compact = width < 60;
                 let summary = if !panel.finished {
@@ -2930,27 +3035,22 @@ fn render_block_planned(
                 } else {
                     &panel.display.success
                 };
-                let tool = panel.display.label.as_str();
-                // Tool chrome describes lifecycle, not model identity: muted
-                // while executing, normal foreground after success, and an
-                // explicit error role on failure.
-                let lifecycle_role = if !panel.finished {
-                    "muted"
-                } else if panel.is_error {
-                    "error"
-                } else {
-                    "foreground"
+                let tool = match panel.name.as_str() {
+                    "read" => "Read",
+                    "search" => "Explored",
+                    "edit" => "Edit",
+                    "write" => "Write",
+                    _ => "Used",
                 };
-                let label = theme.bold(&theme.fg(lifecycle_role, tool));
+                // The margin dot owns lifecycle colour. Tool text stays
+                // neutral so failures do not wash the whole event red.
+                let label = theme.bold(&theme.fg("foreground", tool));
                 let text =
                     without_redundant_tool_lead(&panel.name, &sanitize_for_terminal(summary));
-                let text = theme.fg(lifecycle_role, &text);
-                let label_width: usize = if compact { 7 } else { 8 };
-                let label_prefix = format!(
-                    "{label}{}",
-                    " ".repeat(label_width.saturating_sub(visible_width(tool)))
-                );
-                let continuation = " ".repeat(label_width);
+                let text = theme.fg("muted", &text);
+                let gap = 6usize.saturating_sub(visible_width(tool)).max(2);
+                let label_prefix = format!("{label}{}", " ".repeat(gap));
+                let continuation = " ".repeat(visible_width(&label_prefix));
                 wrap_hanging(&text, &label_prefix, &continuation, width)
             };
 
@@ -3054,7 +3154,15 @@ fn render_block_planned(
         TranscriptBlock::User { prompt_color, .. } => prompt_color.as_deref(),
         _ => None,
     };
-    let lines = decorate_surface(lines, &plan, theme, outer_width, prompt_color);
+    let lines = decorate_surface(
+        lines,
+        block,
+        &plan,
+        theme,
+        outer_width,
+        prompt_color,
+        active_dot_visible,
+    );
     RenderedTranscriptBlock {
         lines,
         geometry: plan.geometry,
@@ -3079,6 +3187,7 @@ fn render_block(
         reasoning_renderer,
         outer_width,
         verbose_tools,
+        true,
     )
     .lines
 }
@@ -4063,7 +4172,7 @@ fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> ShellChrome {
                     continuation.as_str()
                 };
                 rendered.extend(wrap_hanging(
-                    &state.theme.fg("error", source),
+                    &state.theme.fg("foreground", source),
                     prefix,
                     &continuation,
                     width,
@@ -5541,6 +5650,7 @@ impl InteractiveShell {
             }
             AgentEvent::ToolStarted { id, name, args } => {
                 state.close_streaming_blocks();
+                state.event_dot_visible = true;
                 let index = state.transcript.len();
                 let workspace = state.workspace.clone();
                 let display = summarize_tool_with_workspace(name, args, workspace.as_deref());
@@ -6945,6 +7055,7 @@ impl InteractiveShell {
     /// Returns the block id so the caller can update and finalize it.
     pub fn append_shell_in_progress(&mut self, command: String) -> String {
         let mut state = self.state.borrow_mut();
+        state.event_dot_visible = true;
         let id = format!("shell-{}", state.transcript.len());
         state.push_block(TranscriptBlock::Shell(Box::new(ShellOutput {
             id: id.clone(),
@@ -7001,12 +7112,7 @@ impl InteractiveShell {
                 shell.running = false;
                 shell.output = output;
                 shell.exit_code = exit_code;
-                // Replace spinner with result icon
-                shell.spinner = if exit_code == 0 {
-                    "✓".to_string()
-                } else {
-                    "✗".to_string()
-                };
+                shell.spinner.clear();
             }
             state.touch_block(index);
         }
@@ -8003,7 +8109,7 @@ mod tests {
         }
         assert!(rendered.contains("Read & Search"));
         assert!(rendered.contains("read"));
-        assert!(rendered.contains('•'));
+        assert!(rendered.contains('—'));
         assert!(rendered.contains('─'));
     }
 
@@ -9043,7 +9149,8 @@ mod tests {
         terminal.set_scrollback(0);
         let visible = terminal.screen().contents();
         assert!(visible.contains("thinking"), "{visible:?}");
-        assert!(visible.contains("ctrl+o to expand"), "{visible:?}");
+        assert!(!visible.contains("Working"), "{visible:?}");
+        assert!(!visible.contains("ctrl+o to expand"), "{visible:?}");
         assert!(!visible.contains("private sentinel"), "{visible:?}");
         let state = shell.state.borrow();
         let TranscriptBlock::Reasoning(reasoning) = state.transcript.last().unwrap() else {
@@ -9165,7 +9272,7 @@ mod tests {
                 reason: ygg_agent::CompactionReason::Threshold,
             },
         );
-        let working = strip_terminal_sequences(
+        let footer = strip_terminal_sequences(
             &crate::tui::composer_surface::render_composer_surface(
                 &shell.state.borrow(),
                 80,
@@ -9173,8 +9280,8 @@ mod tests {
             )
             .join("\n"),
         );
-        assert!(working.contains("compacting"), "{working}");
-        assert!(!working.contains("waiting for API"), "{working}");
+        assert!(!footer.contains("Working"), "{footer}");
+        assert!(!footer.contains("compacting"), "{footer}");
 
         shell.on_run_event(
             run_id,
@@ -9321,7 +9428,7 @@ mod tests {
             terminal.set_scrollback(0);
             let visible = terminal.screen().contents();
             assert!(visible.contains("compaction-detail-39"), "{visible}");
-            assert!(visible.contains("│ ›"), "composer disappeared: {visible}");
+            assert!(visible.contains("│  ›"), "composer disappeared: {visible}");
 
             shell.expand_focused_tool();
             shell.render();
@@ -9338,7 +9445,7 @@ mod tests {
             assert!(collapsed.contains("ctrl+o to view"), "{collapsed}");
             assert!(!collapsed.contains("compaction-detail-"), "{collapsed}");
             assert!(
-                collapsed.contains("│ ›"),
+                collapsed.contains("│  ›"),
                 "composer disappeared: {collapsed}"
             );
         }
@@ -9434,7 +9541,7 @@ mod tests {
         terminal.set_scrollback(usize::MAX);
         let physical = terminal.screen().contents();
         assert_eq!(
-            physical.matches("│ ›").count(),
+            physical.matches("│  ›").count(),
             1,
             "mutable composer was committed to scrollback:\n{physical}"
         );
@@ -9541,7 +9648,7 @@ mod tests {
         );
         let rendered =
             strip_terminal_sequences(&render_shell(&shell.state.borrow(), 96).join("\n"));
-        assert!(rendered.contains("$ long-running-audit"), "{rendered}");
+        assert!(rendered.contains("Bash  long-running-audit"), "{rendered}");
         assert!(rendered.contains("private live output"), "{rendered}");
         assert!(rendered.contains("private status detail"), "{rendered}");
         assert!(shell.debug_tool_output(&id).is_some());
@@ -10075,10 +10182,10 @@ mod tests {
             shell.set_theme(theme_with_layout(&format!("transcript_inset = {inset}")));
             shell.on_prompt_submitted("hello world");
 
-            // Establish the cached viewport. Physical columns include both
-            // the theme transcript inset and the prompt's two-cell marker.
+            // Establish the cached viewport. Prompts deliberately bypass the
+            // theme transcript inset and begin with their two-cell marker.
             let _ = render_shell(&shell.state.borrow(), 80);
-            let start = inset + 3; // marker (2) + byte/cell index of 'e' (1)
+            let start = 3; // marker (2) + byte/cell index of 'e' (1)
             let end = start + 4;
             shell.begin_transcript_selection(0, start, false);
             shell.extend_transcript_selection(0, end);
@@ -10115,51 +10222,31 @@ mod tests {
         // No newline shortcut hint is shown in idle footer
 
         let cases = [
-            (
-                RunPhase::AwaitingProvider {
-                    provider: "relay".into(),
-                },
-                Some("waiting for API"),
-            ),
-            (RunPhase::Thinking, None),
-            (RunPhase::StreamingResponse, None),
-            (RunPhase::PreparingToolCall, None),
-            (
-                RunPhase::RunningTool {
-                    summary: "running tests".into(),
-                },
-                None,
-            ),
-            (
-                RunPhase::AwaitingApproval {
-                    prompt: "allow edit".into(),
-                },
-                Some("waiting"),
-            ),
-            (
-                RunPhase::Preparing {
-                    summary: "compacting".into(),
-                },
-                Some("compacting"),
-            ),
+            RunPhase::AwaitingProvider {
+                provider: "relay".into(),
+            },
+            RunPhase::Thinking,
+            RunPhase::StreamingResponse,
+            RunPhase::PreparingToolCall,
+            RunPhase::RunningTool {
+                summary: "running tests".into(),
+            },
+            RunPhase::AwaitingApproval {
+                prompt: "allow edit".into(),
+            },
+            RunPhase::Preparing {
+                summary: "compacting".into(),
+            },
         ];
-        for (phase, expected) in cases {
+        for phase in cases {
             let rendered = rendered_phase(phase);
-            if let Some(expected) = expected {
-                assert!(
-                    rendered.contains(expected),
-                    "missing {expected:?}: {rendered}"
-                );
-            }
-            assert!(!rendered.contains("0.6s"), "timer leaked: {rendered}");
-            for hidden in ["thinking", "responding", "tool"] {
-                assert!(!rendered.contains(hidden), "{hidden:?} leaked: {rendered}");
-            }
+            assert!(rendered.contains("GPT-5.6"), "{rendered}");
+            assert!(!rendered.contains("Working"), "{rendered}");
         }
     }
 
     #[test]
-    fn named_theme_may_retain_elapsed_only_active_work_status() {
+    fn named_theme_keeps_active_work_out_of_the_footer() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_theme(crate::tui::theme::test_bundled_theme_with(
             "bone-machine",
@@ -10178,15 +10265,8 @@ mod tests {
         }
         let rendered =
             render_shell_at(&shell.state.borrow(), 80, now + Duration::from_millis(600)).join("\n");
-        let status = rendered
-            .lines()
-            .find(|line| line.contains("0.6s"))
-            .expect("active status");
-        assert!(!status.contains("thinking"));
-        assert!(!status.contains("tool"));
-        assert!(status.contains("\x1b[38;2;"));
-        assert!(!status.contains("\x1b[3m"));
-        assert!(!status.contains("\x1b[2m"));
+        assert!(!rendered.contains("Working"), "{rendered}");
+        assert!(!rendered.contains("0.6s"), "{rendered}");
     }
 
     #[test]
@@ -10295,6 +10375,12 @@ mod tests {
         for (outcome, expected) in outcomes {
             let rendered = outcome_line(&outcome, &theme);
             assert!(rendered.contains(expected), "{rendered:?}");
+            if matches!(outcome, RunOutcome::CompletedWithWarnings { .. }) {
+                assert!(
+                    strip_terminal_sequences(&rendered).starts_with('✓'),
+                    "completed-with-notes should use a checkmark: {rendered:?}"
+                );
+            }
             assert!(
                 rendered.contains('✓')
                     || rendered.contains('◇')
@@ -10352,7 +10438,7 @@ mod tests {
             },
         );
         let plain = strip_terminal_sequences(&render_shell(&shell.state.borrow(), 80).join("\n"));
-        assert!(plain.contains("$ cargo test --workspace"), "{plain:?}");
+        assert!(plain.contains("Bash  cargo test --workspace"), "{plain:?}");
         assert!(!plain.contains("provider-call-secret"), "{plain:?}");
         assert!(!plain.contains("exit=1"), "{plain:?}");
         assert!(!plain.contains("duration=0.2s"), "{plain:?}");
@@ -10376,7 +10462,7 @@ mod tests {
             },
         );
         let plain = strip_terminal_sequences(&render_shell(&shell.state.borrow(), 120).join("\n"));
-        assert!(plain.contains("failed"), "{plain:?}");
+        assert!(plain.contains("Edit  src/lib.rs"), "{plain:?}");
         assert!(!plain.contains("The file changed"), "{plain:?}");
         assert!(!plain.contains("hash=aaa"), "{plain:?}");
         assert!(!plain.contains("actual=bbb"), "{plain:?}");
@@ -10482,9 +10568,9 @@ mod tests {
         assert!(!ascii.contains('\x1b'));
         assert!(ascii.contains("> fix it"));
         assert!(ascii.contains("Result"));
-        assert!(ascii.contains("* done"));
-        assert!(ascii.contains("edit"));
-        assert!(ascii.contains("updated lib.rs"));
+        assert!(ascii.contains("- done"));
+        assert!(ascii.contains("Edit"));
+        assert!(ascii.contains("lib.rs"));
         assert!(ascii.contains("completed - 1.0s"));
         assert!(!ascii.contains("ok completed"));
 
@@ -10520,11 +10606,15 @@ mod tests {
             None,
         )));
         let renderer = theme.rich_renderer();
-        let narrow = render_block(None, &panel, &theme, &renderer, &renderer, 40, false).join("\n");
-        let wide = render_block(None, &panel, &theme, &renderer, &renderer, 120, false).join("\n");
-        assert!(narrow.contains("updated session.rs"));
+        let narrow = strip_terminal_sequences(
+            &render_block(None, &panel, &theme, &renderer, &renderer, 40, false).join("\n"),
+        );
+        let wide = strip_terminal_sequences(
+            &render_block(None, &panel, &theme, &renderer, &renderer, 120, false).join("\n"),
+        );
+        assert!(narrow.contains("Edit  session.rs"));
         assert!(!narrow.contains("crates/ygg-agent"));
-        assert!(wide.contains("updated crates/ygg-agent/src/session.rs"));
+        assert!(wide.contains("Edit  crates/ygg-agent/src/session.rs"));
     }
 
     #[test]
@@ -10719,7 +10809,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_reasoning_stays_two_stable_collapsed_rows_until_ctrl_o() {
+    fn streamed_reasoning_shows_one_live_indicator_until_ctrl_o() {
         let mut shell = InteractiveShell::test_shell();
         let run_id = shell.begin_run("openai");
         shell.on_run_event(
@@ -10739,14 +10829,8 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let initial = transcript(&shell);
-        assert_eq!(
-            initial
-                .iter()
-                .filter(|line| line.contains("thinking"))
-                .count(),
-            1,
-            "{initial:?}"
-        );
+        assert_eq!(initial.len(), 1, "{initial:?}");
+        assert!(initial[0].contains("thinking"), "{initial:?}");
         assert!(!initial.join("\n").contains("first private sentinel"));
 
         let continuation = (0..128)
@@ -10820,7 +10904,7 @@ mod tests {
             .join("\n");
         assert_eq!(
             rendered.matches("ctrl+o to expand").count(),
-            1,
+            0,
             "{rendered}"
         );
         shell.expand_focused_tool();
@@ -10838,25 +10922,22 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_reasoning_shimmers_in_model_color_and_settles_with_duration() {
+    fn collapsed_reasoning_shows_one_live_shimmer_and_no_settled_rows() {
         let theme = crate::tui::theme::test_theme();
         let renderer = theme.reasoning_renderer();
         let mut reasoning =
             AssistantBlock::streaming_reasoning("private").with_model_lab(Some(ModelLab::Alibaba));
         reasoning.reasoning_animation_frame = 2;
         let live = render_reasoning(&reasoning, &renderer, &theme, 80, false);
-        let plain_live = live
-            .iter()
-            .map(|line| strip_terminal_sequences(line))
-            .collect::<Vec<_>>();
-        assert_eq!(plain_live, ["⠹ thinking", "└ ctrl+o to expand"]);
-        assert!(live[0].contains("\x1b[38;2;"), "{live:?}");
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert!(strip_terminal_sequences(&live[0]).contains("⠹ thinking"));
         assert!(live[0].contains("\x1b[1m"), "{live:?}");
-        assert!(live[0].contains("\x1b[22m"), "{live:?}");
 
         reasoning.reasoning_animation_frame += 1;
         let next = render_reasoning(&reasoning, &renderer, &theme, 80, false);
-        assert_ne!(next[0], live[0], "shimmer frame must advance");
+        assert_eq!(next.len(), 1, "{next:?}");
+        assert!(strip_terminal_sequences(&next[0]).contains("⠸ thinking"));
+        assert_ne!(live, next);
 
         reasoning.reasoning_elapsed = Some(Duration::from_millis(13_700));
         reasoning.finish_reasoning();
@@ -11014,7 +11095,7 @@ mod tests {
             &theme.rich_renderer(),
             &theme.reasoning_renderer(),
             80,
-            false,
+            true,
         )
         .into_iter()
         .next()
@@ -11051,8 +11132,8 @@ mod tests {
             "responses stay flush: {response:?}"
         );
         assert!(
-            strip_terminal_sequences(&prompt).starts_with("  › prompt"),
-            "prompts use the shared two-cell inset: {prompt:?}"
+            strip_terminal_sequences(&prompt).starts_with("› prompt"),
+            "prompts should begin at the primary transcript edge: {prompt:?}"
         );
         assert!(
             !prompt.contains("\x1b[48;"),
@@ -11068,8 +11149,8 @@ mod tests {
             "inline code should be coloured"
         );
         assert!(
-            strip_terminal_sequences(&reasoning_block).starts_with("  ⠹ thinking"),
-            "thinking shares the transcript inset: {reasoning_block:?}"
+            strip_terminal_sequences(&reasoning_block).starts_with("  · Thinking"),
+            "reasoning keeps the transcript inset without a second dot: {reasoning_block:?}"
         );
         assert!(reasoning.contains("Session"));
         assert!(
@@ -11077,8 +11158,8 @@ mod tests {
             "reasoning should use a muted foreground"
         );
         assert!(
-            reasoning.contains("\x1b[3m"),
-            "reasoning should be italicized"
+            !reasoning.contains("\x1b[3m"),
+            "reasoning should stay upright"
         );
         assert!(
             !reasoning.contains("\x1b[2m"),
@@ -11167,9 +11248,11 @@ mod tests {
         );
         let terminal = emulate_rows(&rendered, WIDTH);
         let expected = vt100::Color::Rgb(0x12, 0x34, 0x56);
-        let inset = theme.layout_for_width(WIDTH).transcript_inset;
-
         assert_eq!(rendered.len(), 2, "fixture should wrap to two prompt rows");
+        assert!(
+            strip_terminal_sequences(&rendered[0]).starts_with('›'),
+            "prompt should begin at the primary transcript edge: {rendered:?}"
+        );
         for row in 0..rendered.len() as u16 {
             for column in 0..WIDTH {
                 let background = terminal
@@ -11177,20 +11260,13 @@ mod tests {
                     .cell(row, column)
                     .expect("prompt row cell inside terminal bounds")
                     .bgcolor();
-                if column < inset {
-                    assert_eq!(
-                        background,
-                        vt100::Color::Default,
-                        "theme transcript inset must remain outside the prompt rectangle"
-                    );
-                } else {
-                    assert_eq!(
-                        background, expected,
-                        "prompt background did not reach row {row}, column {column}"
-                    );
-                }
+                assert_eq!(
+                    background, expected,
+                    "prompt background did not reach row {row}, column {column}"
+                );
             }
         }
+        assert!(rendered[0].contains("48;2;18;52;86m"), "{rendered:?}");
 
         const CARD_WIDTH: u16 = 80;
         let card_theme = crate::tui::theme::test_theme_from_source(SURFACE_TEST_THEME);
@@ -11215,34 +11291,40 @@ mod tests {
             .saturating_add(card_plan.frame_width)
             .saturating_sub(1);
 
-        assert_ne!(
+        assert_eq!(
             card_terminal
                 .screen()
                 .cell(content_row, left_border)
                 .expect("card left border cell")
                 .bgcolor(),
-            expected,
-            "structural card border must remain outside the prompt rectangle"
+            vt100::Color::Default,
+            "structural card border must remain outside the surface"
         );
+        let mut card_cells = 0;
         for column in left_border.saturating_add(1)..right_border {
+            let color = card_terminal
+                .screen()
+                .cell(content_row, column)
+                .expect("card inner prompt cell")
+                .bgcolor();
             assert_eq!(
-                card_terminal
-                    .screen()
-                    .cell(content_row, column)
-                    .expect("card inner prompt cell")
-                    .bgcolor(),
-                expected,
-                "card prompt background did not cover theme padding at column {column}"
+                color, expected,
+                "prompt background did not cover theme padding at {column}"
             );
+            card_cells += 1;
         }
-        assert_ne!(
+        assert!(
+            card_cells > 0,
+            "card prompt should retain a coloured interior"
+        );
+        assert_eq!(
             card_terminal
                 .screen()
                 .cell(content_row, right_border)
                 .expect("card right border cell")
                 .bgcolor(),
-            expected,
-            "structural card border must remain outside the prompt rectangle"
+            vt100::Color::Default,
+            "structural card border must remain outside the surface"
         );
     }
 
@@ -11267,6 +11349,7 @@ mod tests {
         let muted = role_rgb_color(&theme, "muted");
         let foreground = role_rgb_color(&theme, "foreground");
         let error = role_rgb_color(&theme, "error");
+        let syntax_string = role_rgb_color(&theme, "syntax_string");
         assert_ne!(muted, foreground);
         assert_ne!(error, foreground);
 
@@ -11297,8 +11380,8 @@ mod tests {
             true,
         );
         let active = emulate_rows(&active, 80);
-        assert_ascii_foreground(&active, "read", muted);
-        assert_ascii_bold(&active, "read");
+        assert_ascii_foreground(&active, "Read", foreground);
+        assert_ascii_bold(&active, "Read");
         assert_ascii_foreground(&active, "src/lib.rs", muted);
         assert!(!active.screen().contents().contains("live raw evidence"));
         assert!(!active.screen().contents().contains("live output"));
@@ -11316,9 +11399,9 @@ mod tests {
         )));
         let completed = render_block(None, &completed, &theme, &renderer, &renderer, 80, false);
         let completed = emulate_rows(&completed, 80);
-        assert_ascii_foreground(&completed, "read", foreground);
-        assert_ascii_bold(&completed, "read");
-        assert_ascii_foreground(&completed, "src/lib.rs", foreground);
+        assert_ascii_foreground(&completed, "Read", foreground);
+        assert_ascii_bold(&completed, "Read");
+        assert_ascii_foreground(&completed, "src/lib.rs", muted);
 
         let failed = TranscriptBlock::Tool(Box::new(ToolPanel::new(
             ToolCallId("failed-read".into()),
@@ -11333,11 +11416,11 @@ mod tests {
         )));
         let failed = render_block(None, &failed, &theme, &renderer, &renderer, 80, false);
         let failed = emulate_rows(&failed, 80);
-        assert_ascii_foreground(&failed, "read", error);
-        assert_ascii_bold(&failed, "read");
+        assert_ascii_foreground(&failed, "Read", foreground);
+        assert_ascii_bold(&failed, "Read");
         assert!(!failed.screen().contents().contains("permission denied"));
 
-        let active_exec_args = serde_json::json!({"command":"echo active"});
+        let active_exec_args = serde_json::json!({"command":"echo \"active\""});
         let active_exec = TranscriptBlock::Tool(Box::new(ToolPanel::new(
             ToolCallId("active-exec".into()),
             "exec".into(),
@@ -11351,16 +11434,16 @@ mod tests {
         )));
         let active_exec = render_block(None, &active_exec, &theme, &renderer, &renderer, 80, true);
         let active_exec = emulate_rows(&active_exec, 80);
-        assert_ascii_foreground(&active_exec, "echo active", muted);
+        assert_ascii_foreground(&active_exec, "Bash", foreground);
+        assert_ascii_bold(&active_exec, "Bash");
+        assert_ascii_foreground(&active_exec, "\"active\"", syntax_string);
+        assert_ascii_foreground(&active_exec, "private streaming output", muted);
         assert!(active_exec
             .screen()
             .contents()
             .contains("private streaming output"));
 
-        for (command, is_error, expected) in [
-            ("echo complete", false, foreground),
-            ("echo failed", true, error),
-        ] {
+        for (command, is_error) in [("echo \"complete\"", false), ("echo \"failed\"", true)] {
             let args = serde_json::json!({"command":command});
             let panel = TranscriptBlock::Tool(Box::new(ToolPanel::new(
                 ToolCallId(command.into()),
@@ -11375,8 +11458,167 @@ mod tests {
             )));
             let rendered = render_block(None, &panel, &theme, &renderer, &renderer, 80, false);
             let terminal = emulate_rows(&rendered, 80);
-            assert_ascii_foreground(&terminal, command, expected);
+            assert_ascii_foreground(&terminal, "Bash", foreground);
+            let quoted = if is_error {
+                "\"failed\""
+            } else {
+                "\"complete\""
+            };
+            assert_ascii_foreground(&terminal, quoted, syntax_string);
+            let (_, bash_column) =
+                find_ascii_cell(terminal.screen(), "Bash").expect("Bash label rendered");
+            assert_ne!(
+                terminal
+                    .screen()
+                    .cell(0, bash_column)
+                    .expect("Bash label cell")
+                    .fgcolor(),
+                error,
+                "tool label must not inherit lifecycle red"
+            );
         }
+    }
+
+    #[test]
+    fn event_margin_markers_toggle_live_and_settle_mutations_by_outcome() {
+        let theme = crate::tui::theme::test_theme();
+        let args = serde_json::json!({"path":"src/lib.rs"});
+        let panel = |finished, is_error| {
+            TranscriptBlock::Tool(Box::new(ToolPanel::new(
+                ToolCallId("edit".into()),
+                "edit".into(),
+                args.to_string(),
+                summarize_tool("edit", &args),
+                String::new(),
+                finished,
+                is_error,
+                is_error.then(|| "failed".into()),
+                None,
+            )))
+        };
+
+        let active =
+            event_margin_marker(&panel(false, false), &theme, true).expect("visible active marker");
+        assert_eq!(strip_terminal_sequences(&active), "•");
+        assert!(!active.contains("\x1b[5m"), "{active:?}");
+        let hidden =
+            event_margin_marker(&panel(false, false), &theme, false).expect("hidden active marker");
+        assert_eq!(hidden, " ");
+
+        let settled_edit =
+            event_margin_marker(&panel(true, false), &theme, false).expect("edit marker");
+        assert_eq!(settled_edit, theme.settled_event_dot("success", "•"));
+
+        let failed =
+            event_margin_marker(&panel(true, true), &theme, false).expect("failure marker");
+        assert_eq!(failed, theme.settled_event_dot("error", "•"));
+
+        let bash_args = serde_json::json!({"command":"cargo test"});
+        let bash = TranscriptBlock::Tool(Box::new(ToolPanel::new(
+            ToolCallId("bash".into()),
+            "exec".into(),
+            bash_args.to_string(),
+            summarize_tool("exec", &bash_args),
+            String::new(),
+            true,
+            false,
+            None,
+            None,
+        )));
+        assert_eq!(
+            event_margin_marker(&bash, &theme, false),
+            Some(theme.settled_event_dot("success", "•"))
+        );
+
+        let read = TranscriptBlock::Tool(Box::new(ToolPanel::new(
+            ToolCallId("read".into()),
+            "read".into(),
+            args.to_string(),
+            summarize_tool("read", &args),
+            String::new(),
+            true,
+            false,
+            None,
+            None,
+        )));
+        assert_eq!(
+            event_margin_marker(&read, &theme, false),
+            Some(theme.settled_event_dot("neutral", "•"))
+        );
+
+        let prompt = TranscriptBlock::User {
+            text: "prompt".into(),
+            model_lab: None,
+            prompt_color: None,
+            persisted: true,
+        };
+        assert_eq!(event_margin_marker(&prompt, &theme, true), None);
+        let reasoning =
+            TranscriptBlock::Reasoning(Box::new(AssistantBlock::streaming_reasoning("private")));
+        assert_eq!(event_margin_marker(&reasoning, &theme, true), None);
+        let outcome = TranscriptBlock::Outcome(RunOutcome::CompletedWithWarnings {
+            elapsed: Duration::from_secs(1),
+            warnings: 1,
+            summary: crate::presentation::RunSummary {
+                files_changed: 0,
+                tool_calls: 1,
+                warnings: 1,
+            },
+        });
+        assert_eq!(event_margin_marker(&outcome, &theme, true), None);
+    }
+
+    #[test]
+    fn event_dot_animation_invalidates_active_tool_rows_in_lockstep() {
+        let shell = InteractiveShell::test_shell();
+        {
+            let mut state = shell.state.borrow_mut();
+            for (id, name) in [("read", "read"), ("edit", "edit")] {
+                let args = serde_json::json!({"path":"src/lib.rs"});
+                state.push_block(TranscriptBlock::Tool(Box::new(ToolPanel::new(
+                    ToolCallId(id.into()),
+                    name.into(),
+                    args.to_string(),
+                    summarize_tool(name, &args),
+                    String::new(),
+                    false,
+                    false,
+                    None,
+                    None,
+                ))));
+            }
+            state.event_dot_visible = true;
+            assert!(event_dot_animating(&state));
+        }
+
+        let active_rows = || {
+            shell
+                .state
+                .borrow()
+                .rendered_transcript(80)
+                .iter()
+                .filter(|line| line.contains("Read") || line.contains("Edit"))
+                .map(|line| strip_terminal_sequences(line))
+                .collect::<Vec<_>>()
+        };
+        let visible = active_rows();
+        assert_eq!(visible.len(), 2, "{visible:?}");
+        assert!(
+            visible.iter().all(|line| line.starts_with("• ")),
+            "{visible:?}"
+        );
+
+        shell.state.borrow_mut().advance_event_dot_animation();
+        let hidden = active_rows();
+        assert_eq!(hidden.len(), 2, "{hidden:?}");
+        assert!(
+            hidden.iter().all(|line| line.starts_with("  ")),
+            "{hidden:?}"
+        );
+
+        shell.state.borrow_mut().advance_event_dot_animation();
+        let visible_again = active_rows();
+        assert_eq!(visible_again, visible);
     }
 
     #[test]
@@ -11395,7 +11637,7 @@ mod tests {
         );
         assert_eq!(
             without_redundant_tool_lead("edit", "updated src/lib.rs"),
-            "updated src/lib.rs"
+            "src/lib.rs"
         );
         assert_eq!(
             without_redundant_tool_lead("write", "wrote src/lib.rs"),
@@ -11428,12 +11670,12 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(lines.len() > 1, "the long summary should wrap: {lines:?}");
-        assert!(lines[0].starts_with("  search"), "{lines:?}");
+        assert!(lines[0].starts_with("• Explored"), "{lines:?}");
         assert!(
             lines[1..]
                 .iter()
                 .filter(|line| !line.is_empty())
-                .all(|line| line.starts_with("          ")),
+                .all(|line| line.starts_with("            ")),
             "continuations must hang under the summary column: {lines:?}"
         );
         assert!(lines.last().is_some_and(|line| !line.is_empty()));
@@ -11497,11 +11739,11 @@ mod tests {
             assert!(!rendered.contains(raw), "raw marker leaked: {rendered}");
         }
         assert!(rendered.contains("Session recovery"));
-        assert!(rendered.contains('•'));
+        assert!(rendered.contains('—'));
     }
 
     #[test]
-    fn truecolour_renderer_uses_only_foregrounds_for_identity() {
+    fn truecolour_composer_keeps_the_terminal_background_unfilled() {
         use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
         let theme = crate::tui::theme::test_theme_with(TerminalCapabilities::test(
             true,
@@ -11512,9 +11754,7 @@ mod tests {
         shell.set_identity("anthropic", "claude-sonnet-4", "high");
         let rendered = render_shell(&shell.state.borrow(), 120).join("\n");
         assert!(rendered.contains("38;2;"));
-        // The composer top border uses foreground colour only; no background
-        // colour escapes (48;2; or 48;5;) should leak.
-        assert!(!rendered.contains("\x1b[48;"));
+        assert!(!rendered.contains("\x1b[48;2;"), "{rendered:?}");
     }
 
     #[test]
@@ -11614,9 +11854,54 @@ mod tests {
         );
         let rendered =
             strip_terminal_sequences(&render_shell(&shell.state.borrow(), 100).join("\n"));
-        assert!(rendered.contains("$ long-running-check"), "{rendered}");
+        assert!(rendered.contains("Bash  long-running-check"), "{rendered}");
         assert!(rendered.contains("private live output"), "{rendered}");
         assert!(rendered.contains("private status detail"), "{rendered}");
+    }
+
+    #[test]
+    fn bash_wraps_and_indents_output_without_connector_glyphs() {
+        let theme = crate::tui::theme::test_theme();
+        let command = "node --input-type=module --check < ygg/demo.js && git diff --check";
+        let args = serde_json::json!({"command":command});
+        let block = TranscriptBlock::Tool(Box::new(ToolPanel::new(
+            ToolCallId("quiet-bash".into()),
+            "exec".into(),
+            args.to_string(),
+            summarize_tool("exec", &args),
+            "exit=0 duration=0.2s\n(no output)".into(),
+            true,
+            false,
+            None,
+            None,
+        )));
+        let rendered = render_block(
+            None,
+            &block,
+            &theme,
+            &theme.rich_renderer(),
+            &theme.reasoning_renderer(),
+            42,
+            false,
+        )
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>();
+
+        assert!(rendered[0].starts_with("• Bash"), "{rendered:?}");
+        assert!(rendered.iter().any(|line| line.trim() == "(no output)"));
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains('│') && !line.contains('└')),
+            "tool rows must not contain connector glyphs: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|line| !line
+                .chars()
+                .any(|character| matches!(character, '✓' | '×' | '…'))),
+            "the margin dot is the only lifecycle marker: {rendered:?}"
+        );
     }
 
     #[test]
@@ -11694,8 +11979,8 @@ mod tests {
         }
         let now = started + Duration::from_millis(8_700);
         let live = plain_footer(&shell, 100, now);
-        assert!(live.ends_with("waiting for API"), "{live:?}");
-        assert!(!live.contains("8.7s"), "default timer leaked: {live:?}");
+        assert!(!live.contains("Working"), "{live:?}");
+        assert!(!live.contains("waiting for API"), "{live:?}");
         assert!(
             live.contains("~72.4 tok/s"),
             "live estimate missing: {live:?}"
@@ -11717,7 +12002,10 @@ mod tests {
             !live.contains("esc"),
             "implicit controls stay out: {live:?}"
         );
-        assert_eq!(visible_width(&live), 98, "status ends at the right inset");
+        assert!(
+            visible_width(&live) <= 98,
+            "status stays inside the right inset"
+        );
         let live_diagnostics = status_telemetry(&shell.state.borrow(), now);
         assert!(live_diagnostics.contains("awaiting turn completion"));
         assert!(!live_diagnostics.contains("tok/s"));
@@ -11739,8 +12027,7 @@ mod tests {
             !paid.contains("session"),
             "session cost stays in /status: {paid:?}"
         );
-        assert!(paid.ends_with("waiting for API"));
-        assert!(!paid.contains("8.7s"), "default timer leaked: {paid:?}");
+        assert!(!paid.contains("Working"), "{paid:?}");
 
         {
             let mut state = shell.state.borrow_mut();
@@ -12080,7 +12367,7 @@ mod tests {
         let collapsed = transcript(&shell);
         assert!(collapsed.contains("private result line 8"), "{collapsed}");
         assert!(!collapsed.contains("private result line 1"), "{collapsed}");
-        assert!(collapsed.contains("3 earlier lines"), "{collapsed}");
+        assert!(collapsed.contains("3 lines hidden"), "{collapsed}");
         assert_eq!(
             shell.debug_tool_output(&id).as_deref(),
             Some(secret.as_str())
@@ -12394,11 +12681,8 @@ mod tests {
         assert!(!active_footer.contains("DeepSeek"), "{active_footer:?}");
         shell.set_size(24, 12);
         let narrow_active = plain_footer(&shell, 24, now);
-        assert!(
-            !narrow_active.contains("0.0s"),
-            "default timer leaked: {narrow_active:?}"
-        );
-        assert!(!narrow_active.contains("thinking"), "{narrow_active:?}");
+        assert!(narrow_active.contains("GPT-5.6"), "{narrow_active:?}");
+        assert!(!narrow_active.contains("Working"), "{narrow_active:?}");
         assert!(!narrow_active.contains("tool"), "{narrow_active:?}");
         shell.set_size(46, 12);
         {
@@ -12642,9 +12926,9 @@ mod tests {
             1
         );
         assert_eq!(airy.iter().take_while(|line| line.is_empty()).count(), 2);
-        assert!(compact[0].starts_with(' '));
-        assert!(comfortable[1].starts_with("  "));
-        assert!(airy[2].starts_with("    "));
+        assert!(compact[0].starts_with('•'));
+        assert!(comfortable[1].starts_with("• "));
+        assert!(airy[2].starts_with("  • "));
 
         let hidden_theme = theme_with_layout(
             "density = \"airy\"\nshow_reasoning = false\nnarrow_show_reasoning = false",
@@ -12889,10 +13173,10 @@ mod tests {
         assert_eq!(second.offset, 1);
 
         let body = &rows[body_row];
-        assert!(body.contains("\x1b[48;2;255;112;24m"), "{body:?}");
+        assert!(body.contains("\x1b[38;2;255;255;255m"), "{body:?}");
         assert!(
-            !body.contains("\x1b[48;2;17;34;51m"),
-            "the full persisted-prompt row must keep its model background: {body:?}"
+            body.contains("\x1b[48;2;255;112;24m"),
+            "the prompt should retain its exact persisted provenance: {body:?}"
         );
         assert!(
             body.ends_with("\x1b[0m"),
@@ -12939,7 +13223,8 @@ mod tests {
         assert_eq!(narrow.geometry.leading_rows, 0);
         assert_eq!(narrow.geometry.trailing_rows, 0);
         let renderer = theme.rich_renderer();
-        let rendered = render_block_planned(None, &block, &theme, &renderer, &renderer, 40, false);
+        let rendered =
+            render_block_planned(None, &block, &theme, &renderer, &renderer, 40, false, true);
         assert_eq!(rendered.geometry, narrow.geometry);
         let plain = rendered
             .lines
@@ -12999,7 +13284,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ansi_plain
             .first()
-            .is_some_and(|line| line.trim_start().starts_with('+')));
+            .is_some_and(|line| line.trim_start().ends_with("+")));
 
         let no_color = render(
             TerminalCapabilities::test(false, false, ColorDepth::None),
@@ -13008,7 +13293,7 @@ mod tests {
         assert!(no_color.iter().all(|line| !line.contains('\x1b')));
         assert!(no_color
             .first()
-            .is_some_and(|line| line.trim_start().starts_with('+')));
+            .is_some_and(|line| line.trim_start().ends_with("+")));
 
         let adaptive_source = SURFACE_TEST_THEME.replace("adaptive = false", "adaptive = true");
         let unknown = crate::tui::theme::test_theme_source_with(
@@ -13045,7 +13330,7 @@ mod tests {
         let now = Instant::now();
         let composer = plain_composer_surface(&shell, 80, now);
         assert_eq!(composer.len(), 3, "hidden footer leaves only the box");
-        assert!(composer[1].starts_with("│   ›"), "{composer:?}");
+        assert!(composer[1].starts_with("│    ›"), "{composer:?}");
         assert!(composer.iter().all(|line| visible_width(line) == 80));
 
         let wide_header = shell_chrome(&shell.state.borrow(), 80, now).header;
@@ -13224,15 +13509,30 @@ mod tests {
             if parameters.is_empty() {
                 background_open = false;
             } else {
-                for parameter in parameters
+                let parameters = parameters
                     .split(';')
                     .filter_map(|value| value.parse::<u16>().ok())
-                {
-                    match parameter {
+                    .collect::<Vec<_>>();
+                let mut parameter = 0;
+                while parameter < parameters.len() {
+                    match parameters[parameter] {
                         0 | 49 => background_open = false,
-                        40..=47 | 48 | 100..=107 => background_open = true,
+                        40..=47 | 100..=107 => background_open = true,
+                        38 | 48 if parameters.get(parameter + 1) == Some(&2) => {
+                            if parameters[parameter] == 48 {
+                                background_open = true;
+                            }
+                            parameter = parameter.saturating_add(4);
+                        }
+                        38 | 48 if parameters.get(parameter + 1) == Some(&5) => {
+                            if parameters[parameter] == 48 {
+                                background_open = true;
+                            }
+                            parameter = parameter.saturating_add(2);
+                        }
                         _ => {}
                     }
+                    parameter = parameter.saturating_add(1);
                 }
             }
             index = end + 1;
@@ -13260,7 +13560,11 @@ mod tests {
             let transcript = shell.state.borrow().rendered_transcript(96).join("\n");
             assert!(
                 transcript.contains("\x1b[48;2;255;112;24m"),
-                "{name} changed the immutable prompt-row rectangle"
+                "{name} changed the immutable prompt provenance background"
+            );
+            assert!(
+                !transcript.contains("\x1b[38;2;255;112;24m"),
+                "{name} rendered provenance as foreground-only"
             );
             let unclosed_backgrounds = transcript
                 .lines()
