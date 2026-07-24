@@ -13,9 +13,9 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sexy_tui_rs::{
-    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, Color, Component,
-    DiffRenderOptions, FrameUpdate, RichRenderer, StreamingMarkdown, StreamingRenderCache,
-    UnifiedDiff, CURSOR_MARKER, TUI,
+    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, Block, Color,
+    Component, DiffRenderOptions, FrameUpdate, Inline, RichRenderer, StreamingMarkdown,
+    StreamingRenderCache, UnifiedDiff, CURSOR_MARKER, TUI,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
@@ -324,6 +324,50 @@ fn reasoning_markdown_projection(source: &str) -> String {
         .replace("____", "__\n\n__")
 }
 
+fn append_reasoning_inline_text(inlines: &[Inline], output: &mut String) {
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) | Inline::Code(text) | Inline::Raw(text) => output.push_str(text),
+            Inline::Styled(span) => append_reasoning_inline_text(&span.content, output),
+            Inline::Role { content, .. }
+            | Inline::Status { content, .. }
+            | Inline::Emphasis(content)
+            | Inline::Strong(content)
+            | Inline::Strikethrough(content) => append_reasoning_inline_text(content, output),
+            Inline::Link { label, .. } => append_reasoning_inline_text(label, output),
+            Inline::SoftBreak | Inline::HardBreak => output.push(' '),
+        }
+    }
+}
+
+fn normalized_reasoning_heading(inlines: &[Inline]) -> Option<String> {
+    let mut heading = String::new();
+    append_reasoning_inline_text(inlines, &mut heading);
+    let heading = sanitize_for_terminal(&heading);
+    let heading = heading.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!heading.is_empty()).then_some(heading)
+}
+
+fn reasoning_heading_from_block(block: &Block) -> Option<String> {
+    match block {
+        Block::Heading { content, .. } => normalized_reasoning_heading(content),
+        Block::Paragraph(content) => {
+            let mut meaningful = content.iter().filter(|inline| {
+                !matches!(inline, Inline::Text(text) | Inline::Raw(text) if text.trim().is_empty())
+            });
+            let Inline::Strong(heading) = meaningful.next()? else {
+                return None;
+            };
+            meaningful
+                .next()
+                .is_none()
+                .then(|| normalized_reasoning_heading(heading))
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
 fn reasoning_delimiter_crosses_chunk_boundary(previous: &str, next: &str) -> bool {
     ['*', '_'].into_iter().any(|marker| {
         let trailing = previous
@@ -353,12 +397,15 @@ struct AssistantBlock {
     /// Reasoning is retained verbatim but stays out of the mutable native
     /// scrollback tail until the user explicitly asks to inspect it.
     reasoning_expanded: bool,
-    /// First streamed reasoning delta, used only for the settled compact label.
+    /// First streamed reasoning delta, used to freeze elapsed timing when the
+    /// block closes.
     reasoning_started_at: Option<Instant>,
     /// Frozen reasoning duration after the block closes.
     reasoning_elapsed: Option<Duration>,
-    /// Decorative live-label animation frame; never persisted as content.
-    reasoning_animation_frame: u64,
+    /// Latest explicit ATX or standalone-bold heading emitted by the model.
+    reasoning_heading: Option<String>,
+    /// Committed semantic blocks already inspected for reasoning headings.
+    reasoning_heading_committed_blocks: usize,
     /// Only the newest reasoning block advertises the global disclosure key.
     /// Older repeated hints become noise once a newer thinking event exists.
     show_reasoning_hint: bool,
@@ -377,7 +424,8 @@ impl AssistantBlock {
             reasoning_expanded: false,
             reasoning_started_at: None,
             reasoning_elapsed: None,
-            reasoning_animation_frame: 0,
+            reasoning_heading: None,
+            reasoning_heading_committed_blocks: 0,
             show_reasoning_hint: true,
         }
     }
@@ -394,7 +442,7 @@ impl AssistantBlock {
         let mut block = Self::streaming(&projection);
         block.text = text.to_owned();
         block.reasoning_started_at = Some(Instant::now());
-        block.reasoning_animation_frame = 2;
+        block.refresh_reasoning_heading();
         block
     }
 
@@ -425,6 +473,7 @@ impl AssistantBlock {
             // heading), so repair the cross-delta delimiter only when needed.
             self.markdown =
                 StreamingMarkdown::from_text(&reasoning_markdown_projection(&self.text));
+            self.reasoning_heading_committed_blocks = 0;
             self.invalidate_layout();
         } else {
             // Preserve the parser's committed prefix for ordinary token deltas.
@@ -437,6 +486,33 @@ impl AssistantBlock {
                 self.markdown.push_str(text);
             }
         }
+        self.refresh_reasoning_heading();
+    }
+
+    fn refresh_reasoning_heading(&mut self) {
+        let (committed_blocks, heading) = {
+            let committed = &self.markdown.committed().blocks;
+            let start = self.reasoning_heading_committed_blocks.min(committed.len());
+            let mut heading = committed[start..]
+                .iter()
+                .filter_map(reasoning_heading_from_block)
+                .last();
+            if let Some(preview_heading) = self
+                .markdown
+                .preview()
+                .blocks
+                .iter()
+                .filter_map(reasoning_heading_from_block)
+                .last()
+            {
+                heading = Some(preview_heading);
+            }
+            (committed.len(), heading)
+        };
+        self.reasoning_heading_committed_blocks = committed_blocks;
+        if let Some(heading) = heading {
+            self.reasoning_heading = Some(heading);
+        }
     }
 
     fn finish_reasoning(&mut self) {
@@ -446,12 +522,14 @@ impl AssistantBlock {
         let projection = reasoning_markdown_projection(&self.text);
         if self.markdown.raw_text() != projection {
             self.markdown = StreamingMarkdown::from_text(&projection);
+            self.reasoning_heading_committed_blocks = 0;
             self.invalidate_layout();
         }
         if self.reasoning_elapsed.is_none() {
             self.reasoning_elapsed = self.reasoning_started_at.map(|started| started.elapsed());
         }
         self.finish();
+        self.refresh_reasoning_heading();
     }
 
     fn finish(&mut self) {
@@ -1244,6 +1322,39 @@ impl ShellState {
         Ref::map(self.transcript_cache.borrow(), |cache| &cache.lines)
     }
 
+    fn reasoning_status_enabled(&self) -> bool {
+        let reasoning = self
+            .run_reasoning
+            .as_deref()
+            .unwrap_or(&self.reasoning)
+            .trim()
+            .to_ascii_lowercase();
+        !reasoning.is_empty() && !matches!(reasoning.as_str(), "off" | "none" | "disabled")
+    }
+
+    fn open_reasoning_status(&mut self) {
+        if !self.reasoning_status_enabled() || self.active_reasoning.is_some() {
+            return;
+        }
+        if let Some(previous) = self
+            .transcript
+            .iter()
+            .rposition(|block| matches!(block, TranscriptBlock::Reasoning(_)))
+        {
+            if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(previous) {
+                reasoning.show_reasoning_hint = false;
+            }
+            self.touch_block(previous);
+        }
+        let index = self.transcript.len();
+        let model_lab = self.executing_model_lab();
+        self.event_dot_visible = true;
+        self.push_block(TranscriptBlock::Reasoning(Box::new(
+            AssistantBlock::streaming_reasoning("").with_model_lab(model_lab),
+        )));
+        self.active_reasoning = Some(index);
+    }
+
     fn append_text_block(&mut self, channel: OutputChannel, text: &str) {
         if channel == OutputChannel::Text {
             if let Some(index) = self.active_reasoning.take() {
@@ -1299,6 +1410,9 @@ impl ShellState {
 
         let index = self.transcript.len();
         let model_lab = self.executing_model_lab();
+        if channel == OutputChannel::Reasoning {
+            self.event_dot_visible = true;
+        }
         self.push_block(match channel {
             OutputChannel::Text => TranscriptBlock::Assistant(Box::new(
                 AssistantBlock::streaming(text).with_model_lab(model_lab),
@@ -1363,6 +1477,9 @@ impl ShellState {
 
     fn has_active_event_dot(&self) -> bool {
         self.transcript.iter().rev().any(|block| match block {
+            TranscriptBlock::Reasoning(reasoning) => {
+                !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
+            }
             TranscriptBlock::Tool(panel) => !panel.finished,
             TranscriptBlock::Shell(shell) => shell.running,
             _ => false,
@@ -1375,6 +1492,13 @@ impl ShellState {
             .iter()
             .enumerate()
             .filter_map(|(index, block)| match block {
+                TranscriptBlock::Reasoning(reasoning)
+                    if !self.verbose_tools
+                        && !reasoning.finished
+                        && !reasoning.reasoning_expanded =>
+                {
+                    Some(index)
+                }
                 TranscriptBlock::Tool(panel) if !panel.finished => Some(index),
                 TranscriptBlock::Shell(shell) if shell.running => Some(index),
                 _ => None,
@@ -1385,25 +1509,6 @@ impl ShellState {
         }
         self.event_dot_visible = !self.event_dot_visible;
         for index in active {
-            self.touch_block(index);
-        }
-    }
-
-    fn advance_reasoning_animation(&mut self) {
-        let Some(index) = self.active_reasoning else {
-            return;
-        };
-        let advanced = match self.transcript.get_mut(index) {
-            Some(TranscriptBlock::Reasoning(reasoning))
-                if !reasoning.finished && !reasoning.reasoning_expanded =>
-            {
-                reasoning.reasoning_animation_frame =
-                    reasoning.reasoning_animation_frame.wrapping_add(1);
-                true
-            }
-            _ => false,
-        };
-        if advanced {
             self.touch_block(index);
         }
     }
@@ -1551,7 +1656,7 @@ fn render_loop(
         // the wave stays fluid on high-refresh terminals. Otherwise use a
         // 100 ms status/resize poll; idle timeouts do not render unless the
         // terminal dimensions actually changed.
-        let (animating, shimmer, welcome, event_dot, is_active) = {
+        let (animating, welcome, event_dot, is_active) = {
             let s = state.borrow();
             let active = s.run.is_active();
             let compacting = s.run_label == "compacting";
@@ -1560,7 +1665,6 @@ fn render_loop(
             let event_dot = event_dot_animating(&s);
             (
                 shimmer || welcome,
-                shimmer,
                 welcome,
                 event_dot,
                 active || compacting || welcome || event_dot,
@@ -1629,11 +1733,8 @@ fn render_loop(
 
         let advance_event_dot =
             event_dot && last_event_dot_toggle.elapsed() >= EVENT_DOT_TOGGLE_INTERVAL;
-        if shimmer || welcome || advance_event_dot {
+        if welcome || advance_event_dot {
             let mut shell = state.borrow_mut();
-            if shimmer {
-                shell.advance_reasoning_animation();
-            }
             if welcome {
                 shell.invalidate_transcript_layout();
             }
@@ -1722,65 +1823,42 @@ pub(crate) fn semantic_separator(theme: &YggTheme) -> &str {
     theme.glyph("separator")
 }
 
-fn mix_rgb(base: (u8, u8, u8), accent: (u8, u8, u8), amount: f64) -> (u8, u8, u8) {
-    let channel = |base: u8, accent: u8| {
-        (f64::from(base) + (f64::from(accent) - f64::from(base)) * amount)
-            .round()
-            .clamp(0.0, 255.0) as u8
-    };
-    (
-        channel(base.0, accent.0),
-        channel(base.1, accent.1),
-        channel(base.2, accent.2),
-    )
-}
-
 fn live_reasoning_label(theme: &YggTheme, reasoning: &AssistantBlock) -> String {
-    const UNICODE_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    const ASCII_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
-    let capabilities = theme.capabilities();
-    let frame = reasoning.reasoning_animation_frame as usize;
-    let spinner = if capabilities.unicode {
-        UNICODE_FRAMES[frame % UNICODE_FRAMES.len()]
-    } else {
-        ASCII_FRAMES[frame % ASCII_FRAMES.len()]
-    };
-    let label = format!("{spinner} thinking");
-    let Some(accent) = theme.model_rgb(reasoning.model_lab) else {
-        return label;
-    };
-    if !capabilities.animation
-        || capabilities.color == crate::tui::terminal::ColorDepth::None
-        || !capabilities.interactive
-    {
-        return theme.model_fg(reasoning.model_lab, &label);
-    }
-    let base = theme.composer_idle_rgb(accent);
-    let cells = label.chars().count().max(1);
-    label
-        .chars()
-        .enumerate()
-        .map(|(index, character)| {
-            let distance = (index + cells - (frame % cells)) % cells;
-            let wave = match distance {
-                0 => 1.0,
-                1 | 2 => 0.78,
-                3 | 4 => 0.52,
-                _ => 0.30,
-            };
-            theme.rgb_fg(mix_rgb(base, accent, wave), &character.to_string())
-        })
-        .collect()
+    let label = reasoning.reasoning_heading.as_deref().unwrap_or("Thinking");
+    theme.model_fg(reasoning.model_lab, label)
 }
 
-fn collapsed_reasoning_lines(theme: &YggTheme, reasoning: &AssistantBlock) -> Vec<String> {
-    // Finished reasoning leaves no trace in the collapsed transcript. While
-    // active, one bold shimmering label provides progress without accumulating
-    // transient state rows.
+fn collapsed_reasoning_lines(
+    theme: &YggTheme,
+    reasoning: &AssistantBlock,
+    include_margin_marker: bool,
+) -> Vec<String> {
+    // Finished reasoning leaves no trace in the collapsed transcript. Active
+    // reasoning occupies exactly two rows so heading updates cannot reflow the
+    // transcript around it.
     if reasoning.finished {
         Vec::new()
     } else {
-        vec![theme.bold(&live_reasoning_label(theme, reasoning))]
+        let label = live_reasoning_label(theme, reasoning);
+        let label = if include_margin_marker {
+            format!(
+                "{} {label}",
+                theme.model_fg(reasoning.model_lab, theme.glyph("bullet"))
+            )
+        } else {
+            label
+        };
+        let disclosure_indent = if include_margin_marker { "  " } else { "" };
+        vec![
+            label,
+            subdued_text(
+                theme,
+                &format!(
+                    "{disclosure_indent}{} (ctrl+o to expand)",
+                    theme.glyph("last_branch")
+                ),
+            ),
+        ]
     }
 }
 
@@ -1805,7 +1883,15 @@ fn render_reasoning(
     width: u16,
     show_reasoning: bool,
 ) -> Vec<String> {
-    render_reasoning_on_surface(reasoning, renderer, theme, width, show_reasoning, None)
+    render_reasoning_on_surface(
+        reasoning,
+        renderer,
+        theme,
+        width,
+        show_reasoning,
+        None,
+        false,
+    )
 }
 
 fn render_reasoning_on_surface(
@@ -1815,13 +1901,21 @@ fn render_reasoning_on_surface(
     width: u16,
     show_reasoning: bool,
     background: Option<Color>,
+    use_margin_marker: bool,
 ) -> Vec<String> {
     let marker = theme.glyph("reasoning");
     let prefix_width = visible_width(marker).saturating_add(1);
     if !reasoning.reasoning_expanded && !show_reasoning {
-        return collapsed_reasoning_lines(theme, reasoning)
+        return collapsed_reasoning_lines(theme, reasoning, !use_margin_marker)
             .into_iter()
-            .map(|line| fit_line(&line, width))
+            .map(|line| {
+                let line = fit_line(&line, width);
+                if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
+                    strip_terminal_sequences(&line)
+                } else {
+                    line
+                }
+            })
             .collect();
     }
     let content_width = width.saturating_sub(prefix_width as u16).max(1);
@@ -2474,7 +2568,7 @@ fn render_compact_bash_output(
     let push_output = |lines: &mut Vec<String>, first_detail: &mut bool, output: String| {
         *first_detail = false;
         lines.extend(wrap_hanging(
-            &theme.fg("tool_output", &output),
+            &subdued_text(theme, &output),
             output_indent,
             output_indent,
             width,
@@ -2645,10 +2739,10 @@ fn surface_roles(kind: &str) -> (&'static str, &'static str, &'static str) {
 fn natural_surface_width(block: &TranscriptBlock, theme: &YggTheme) -> u16 {
     let copy = match block {
         TranscriptBlock::Reasoning(reasoning) if !reasoning.reasoning_expanded => {
-            collapsed_reasoning_lines(theme, reasoning).join("\n")
+            collapsed_reasoning_lines(theme, reasoning, false).join("\n")
         }
         TranscriptBlock::Compaction(compaction) if !compaction.expanded => {
-            format!("{} · ctrl+o to view", compaction.label)
+            format!("{} · (ctrl+o to view)", compaction.label)
         }
         _ => block_copy_text(block),
     };
@@ -2912,12 +3006,21 @@ fn event_margin_marker(
     block: &TranscriptBlock,
     theme: &YggTheme,
     active_dot_visible: bool,
+    collapsed_reasoning: bool,
 ) -> Option<String> {
     let dot = if theme.unicode() { "•" } else { "." };
     match block {
-        TranscriptBlock::User { .. }
-        | TranscriptBlock::Reasoning(_)
-        | TranscriptBlock::Outcome(_) => None,
+        TranscriptBlock::User { .. } | TranscriptBlock::Outcome(_) | TranscriptBlock::Notice(_) => {
+            None
+        }
+        TranscriptBlock::Reasoning(reasoning) if collapsed_reasoning => {
+            Some(if active_dot_visible {
+                theme.model_fg(reasoning.model_lab, dot)
+            } else {
+                " ".to_owned()
+            })
+        }
+        TranscriptBlock::Reasoning(_) => None,
         TranscriptBlock::Tool(panel) if !panel.finished => Some(if active_dot_visible {
             theme.fg("foreground", dot)
         } else {
@@ -2954,6 +3057,7 @@ fn decorate_surface(
     outer_width: u16,
     prompt_color: Option<&str>,
     active_dot_visible: bool,
+    collapsed_reasoning: bool,
 ) -> Vec<String> {
     let mut rows = Vec::with_capacity(
         plan.geometry.transition_rows
@@ -2997,7 +3101,7 @@ fn decorate_surface(
         rows.push(theme.apply_semantic_role_layered(border_role, &bottom));
     }
 
-    let marker = event_margin_marker(block, theme, active_dot_visible);
+    let marker = event_margin_marker(block, theme, active_dot_visible, collapsed_reasoning);
     let mut marker_pending = true;
     rows.into_iter()
         .enumerate()
@@ -3045,6 +3149,11 @@ fn render_block_planned(
     )
     .then(|| theme.semantic_style(surface_roles(plan.kind).0).background)
     .filter(|background| *background != Color::Default);
+    let collapsed_reasoning = matches!(
+        block,
+        TranscriptBlock::Reasoning(reasoning)
+            if !reasoning.reasoning_expanded && !verbose_tools
+    );
     let lines = match block {
         TranscriptBlock::User {
             text,
@@ -3069,6 +3178,7 @@ fn render_block_planned(
             width,
             verbose_tools,
             content_background,
+            true,
         ),
         TranscriptBlock::Tool(panel) => {
             let compact_bash = matches!(panel.name.as_str(), "bash" | "exec")
@@ -3168,7 +3278,7 @@ fn render_block_planned(
             } else {
                 "ctrl+o to view"
             };
-            let label = format!("{} · {action}", sanitize_for_terminal(&compaction.label));
+            let label = format!("{} · ({action})", sanitize_for_terminal(&compaction.label));
             let mut lines = wrap_hanging(&label, &prefix, &continuation, width);
             if expanded {
                 let summary = AssistantBlock::finalized(compaction.summary.clone());
@@ -3230,6 +3340,7 @@ fn render_block_planned(
         outer_width,
         prompt_color,
         active_dot_visible,
+        collapsed_reasoning,
     );
     RenderedTranscriptBlock {
         lines,
@@ -3997,7 +4108,8 @@ fn render_welcome_card(
         ),
     ];
 
-    let mut lines = Vec::with_capacity(ROWS + 1);
+    let mut lines = Vec::with_capacity(ROWS + 2);
+    lines.push(String::new());
     for row in 0..ROWS {
         lines.push(fit_line(&format!("  {}   {}", logo[row], text[row]), width));
     }
@@ -5584,6 +5696,7 @@ impl InteractiveShell {
             .begin(&provider_status)
             .expect("a new prompt is accepted only after the previous run terminates");
         state.shimmer_started_at = Some(Instant::now());
+        state.open_reasoning_status();
         id
     }
 
@@ -5674,6 +5787,7 @@ impl InteractiveShell {
             }
             AgentEvent::ProviderRetry { .. } | AgentEvent::CandidateRejected { .. } => {
                 state.discard_streaming_blocks();
+                state.open_reasoning_status();
                 state.turn_generation_started_at = None;
                 state.turn_streamed_output_bytes = 0;
             }
@@ -5694,6 +5808,7 @@ impl InteractiveShell {
                         persisted: true,
                     });
                 }
+                state.open_reasoning_status();
             }
             AgentEvent::CompactionStarted { .. } => {
                 // Overflow recovery can begin after a partial provider
@@ -5717,9 +5832,7 @@ impl InteractiveShell {
                                 state.latest_compaction_summary = Some(info.summary.clone());
                                 state.push_block(TranscriptBlock::Compaction(Box::new(
                                     CompactionBlock {
-                                        label: format!(
-                                            "Context compacted automatically · {reason}"
-                                        ),
+                                        label: "Context compacted automatically".into(),
                                         summary: info.summary.clone(),
                                         expanded: false,
                                     },
@@ -5735,6 +5848,9 @@ impl InteractiveShell {
                     Err(error) => {
                         state.error = Some(format!("automatic compaction failed: {error}"));
                     }
+                }
+                if result.is_ok() {
+                    state.open_reasoning_status();
                 }
             }
             AgentEvent::ToolStarted { id, name, args } => {
@@ -5806,6 +5922,16 @@ impl InteractiveShell {
                 }
             }
             AgentEvent::ToolFinished { id, result } => {
+                let estimated_result_tokens = match result {
+                    Ok(output) => output.media().iter().fold(
+                        crate::compaction::estimate_text_tokens(&output.text),
+                        |tokens, media| {
+                            tokens.saturating_add(crate::compaction::estimate_media_tokens(media))
+                        },
+                    ),
+                    Err(error) => crate::compaction::estimate_text_tokens(&error.message),
+                }
+                .saturating_add(8);
                 let index = state.tool_panels.get(id).copied();
                 if let Some(panel) = state.tool_output_mut(id) {
                     panel.finished = true;
@@ -5821,6 +5947,23 @@ impl InteractiveShell {
                 }
                 if let Some(index) = index {
                     state.touch_block(index);
+                }
+                if let Some((used, _)) = state.run_context_estimate.as_mut() {
+                    *used = used.saturating_add(estimated_result_tokens);
+                }
+                if state.run_model.as_deref() == Some(state.model.as_str()) {
+                    if let Some((used, _)) = state.context_estimate.as_mut() {
+                        *used = used.saturating_add(estimated_result_tokens);
+                    }
+                }
+                let tool_still_running = state.tool_panels.values().any(|index| {
+                    matches!(
+                        state.transcript.get(*index),
+                        Some(TranscriptBlock::Tool(panel)) if !panel.finished
+                    )
+                });
+                if !tool_still_running {
+                    state.open_reasoning_status();
                 }
             }
             AgentEvent::TurnFinished {
@@ -9342,9 +9485,9 @@ mod tests {
         );
         terminal.set_scrollback(0);
         let visible = terminal.screen().contents();
-        assert!(visible.contains("thinking"), "{visible:?}");
+        assert!(visible.contains("Thinking"), "{visible:?}");
         assert!(!visible.contains("Working"), "{visible:?}");
-        assert!(!visible.contains("ctrl+o to expand"), "{visible:?}");
+        assert!(visible.contains("ctrl+o to expand"), "{visible:?}");
         assert!(!visible.contains("private sentinel"), "{visible:?}");
         let state = shell.state.borrow();
         let TranscriptBlock::Reasoning(reasoning) = state.transcript.last().unwrap() else {
@@ -9387,7 +9530,7 @@ mod tests {
         }
         let response_chars = response.chars().collect::<Vec<_>>();
         for chunk in response_chars.chunks(7) {
-            shell.state.borrow_mut().advance_reasoning_animation();
+            shell.state.borrow_mut().advance_event_dot_animation();
             shell.render();
             terminal.process(&drain(&bytes));
             shell.on_run_event(
@@ -9705,7 +9848,7 @@ mod tests {
                 text: "constructing a long boundary regression table".into(),
             },
         );
-        shell.state.borrow_mut().advance_reasoning_animation();
+        shell.state.borrow_mut().advance_event_dot_animation();
         shell.render();
         terminal.process(&drain(&bytes));
 
@@ -11154,6 +11297,171 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_enabled_run_shows_fallback_before_provider_deltas() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
+        shell.begin_run("codex");
+        let rendered = shell
+            .state
+            .borrow()
+            .rendered_transcript(80)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>();
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
+        assert!(rendered[0].contains("• Thinking"), "{rendered:?}");
+        assert!(rendered[1].contains("ctrl+o to expand"), "{rendered:?}");
+    }
+
+    #[test]
+    fn collapsed_reasoning_dot_blinks_without_moving_the_label() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
+        shell.begin_run("codex");
+        let render = |shell: &InteractiveShell| {
+            shell
+                .state
+                .borrow()
+                .rendered_transcript(80)
+                .iter()
+                .map(|line| strip_terminal_sequences(line))
+                .find(|line| line.contains("Thinking"))
+                .expect("reasoning status row")
+        };
+
+        let visible = render(&shell);
+        assert!(visible.contains('•'), "{visible:?}");
+        {
+            let mut state = shell.state.borrow_mut();
+            assert!(event_dot_animating(&state));
+            state.advance_event_dot_animation();
+        }
+        let hidden = render(&shell);
+        assert!(!hidden.contains('•'), "{hidden:?}");
+        let visual_label_column = |line: &str| {
+            let offset = line.find("Thinking").expect("reasoning label");
+            visible_width(&line[..offset])
+        };
+        assert_eq!(
+            visual_label_column(&visible),
+            visual_label_column(&hidden),
+            "blinking the dot must not move the reasoning label"
+        );
+    }
+
+    #[test]
+    fn collapsed_reasoning_aligns_with_tool_event_margin() {
+        let theme = crate::tui::theme::test_theme();
+        let renderer = theme.rich_renderer();
+        let args = serde_json::json!({"path":"README.md"});
+        let tool = TranscriptBlock::Tool(Box::new(ToolPanel::new(
+            ToolCallId("read".into()),
+            "read".into(),
+            args.to_string(),
+            summarize_tool("read", &args),
+            String::new(),
+            true,
+            false,
+            None,
+            None,
+        )));
+        let reasoning = TranscriptBlock::Reasoning(Box::new(
+            AssistantBlock::streaming_reasoning("").with_model_lab(Some(ModelLab::OpenAi)),
+        ));
+        let plain = |lines: Vec<String>| {
+            lines
+                .into_iter()
+                .map(|line| strip_terminal_sequences(&line))
+                .collect::<Vec<_>>()
+        };
+        let tool_lines = plain(render_block(
+            None, &tool, &theme, &renderer, &renderer, 80, false,
+        ));
+        let reasoning_lines = plain(render_block(
+            Some(&tool),
+            &reasoning,
+            &theme,
+            &renderer,
+            &renderer,
+            80,
+            false,
+        ));
+        let tool_line = tool_lines
+            .iter()
+            .find(|line| line.contains("Read"))
+            .expect("read row");
+        let reasoning_line = reasoning_lines
+            .iter()
+            .find(|line| line.contains("Thinking"))
+            .expect("reasoning row");
+        let disclosure_line = reasoning_lines
+            .iter()
+            .find(|line| line.contains("ctrl+o to expand"))
+            .expect("reasoning disclosure row");
+        let visual_column = |line: &str, needle: &str| {
+            line.find(needle)
+                .map(|offset| visible_width(&line[..offset]))
+        };
+        assert_eq!(
+            visual_column(tool_line, "•"),
+            visual_column(reasoning_line, "•"),
+            "event dots must share the margin: {tool_line:?} vs {reasoning_line:?}"
+        );
+        assert_eq!(
+            visual_column(tool_line, "Read"),
+            visual_column(reasoning_line, "Thinking"),
+            "reasoning labels must align with tool labels: {tool_line:?} vs {reasoning_line:?}"
+        );
+        assert_eq!(
+            visual_column(reasoning_line, "Thinking"),
+            visual_column(disclosure_line, "└"),
+            "the disclosure elbow must descend from the first label character: {reasoning_line:?} vs {disclosure_line:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_off_run_does_not_create_a_fallback_status() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_identity("codex", "gpt-5.3-codex-spark", "off");
+        shell.begin_run("codex");
+        assert!(shell.state.borrow().transcript.is_empty());
+    }
+
+    #[test]
+    fn reasoning_status_reopens_after_tools_for_the_next_model_turn() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
+        shell.set_context_estimate(13_000, 128_000);
+        let run_id = shell.begin_run("codex");
+        let id = ToolCallId("tool-1".into());
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolStarted {
+                id: id.clone(),
+                name: "read".into(),
+                args: serde_json::json!({"path": "README.md"}),
+            },
+        );
+        assert!(shell.state.borrow().active_reasoning.is_none());
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolFinished {
+                id,
+                result: Ok(ygg_agent::ToolOutput::new("x".repeat(4_000))),
+            },
+        );
+        let state = shell.state.borrow();
+        let index = state.active_reasoning.expect("next-turn reasoning status");
+        let TranscriptBlock::Reasoning(reasoning) = &state.transcript[index] else {
+            panic!("reasoning status expected")
+        };
+        assert!(reasoning.text.is_empty());
+        assert!(!reasoning.finished);
+        assert_eq!(state.run_context_estimate, Some((14_008, 128_000)));
+        assert_eq!(state.context_estimate, Some((14_008, 128_000)));
+    }
+
+    #[test]
     fn streamed_reasoning_shows_one_live_indicator_until_ctrl_o() {
         let mut shell = InteractiveShell::test_shell();
         let run_id = shell.begin_run("openai");
@@ -11174,8 +11482,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let initial = transcript(&shell);
-        assert_eq!(initial.len(), 1, "{initial:?}");
-        assert!(initial[0].contains("thinking"), "{initial:?}");
+        assert_eq!(initial.len(), 2, "{initial:?}");
+        assert!(initial[0].contains("Thinking"), "{initial:?}");
+        assert!(initial[1].contains("ctrl+o to expand"), "{initial:?}");
         assert!(!initial.join("\n").contains("first private sentinel"));
 
         let continuation = (0..128)
@@ -11249,7 +11558,7 @@ mod tests {
             .join("\n");
         assert_eq!(
             rendered.matches("ctrl+o to expand").count(),
-            0,
+            1,
             "{rendered}"
         );
         shell.expand_focused_tool();
@@ -11267,22 +11576,46 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_reasoning_shows_one_live_shimmer_and_no_settled_rows() {
+    fn collapsed_reasoning_label_is_plain_model_colored_text() {
+        let theme = crate::tui::theme::test_theme();
+        let reasoning = AssistantBlock::streaming_reasoning("## Verifying `implementation`")
+            .with_model_lab(Some(ModelLab::Alibaba));
+        let label = live_reasoning_label(&theme, &reasoning);
+        assert_eq!(strip_terminal_sequences(&label), "Verifying implementation");
+        assert!(!label.contains("\x1b[1m"), "{label:?}");
+        let accent = theme
+            .model_rgb(Some(ModelLab::Alibaba))
+            .expect("Alibaba model accent");
+        assert!(
+            label.contains(&format!(
+                "\x1b[38;2;{};{};{}m",
+                accent.0, accent.1, accent.2
+            )),
+            "reasoning label must retain the block model's accent: {label:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_reasoning_shows_two_live_rows_and_no_settled_rows() {
         let theme = crate::tui::theme::test_theme();
         let renderer = theme.reasoning_renderer();
         let mut reasoning =
             AssistantBlock::streaming_reasoning("private").with_model_lab(Some(ModelLab::Alibaba));
-        reasoning.reasoning_animation_frame = 2;
         let live = render_reasoning(&reasoning, &renderer, &theme, 80, false);
-        assert_eq!(live.len(), 1, "{live:?}");
-        assert!(strip_terminal_sequences(&live[0]).contains("⠹ thinking"));
-        assert!(live[0].contains("\x1b[1m"), "{live:?}");
-
-        reasoning.reasoning_animation_frame += 1;
-        let next = render_reasoning(&reasoning, &renderer, &theme, 80, false);
-        assert_eq!(next.len(), 1, "{next:?}");
-        assert!(strip_terminal_sequences(&next[0]).contains("⠸ thinking"));
-        assert_ne!(live, next);
+        assert_eq!(live.len(), 2, "{live:?}");
+        assert!(strip_terminal_sequences(&live[0]).contains("• Thinking"));
+        assert!(strip_terminal_sequences(&live[1]).contains("└ (ctrl+o to expand)"));
+        assert!(!live[0].contains("\x1b[1m"), "{live:?}");
+        let accent = theme
+            .model_rgb(Some(ModelLab::Alibaba))
+            .expect("Alibaba model accent");
+        assert!(
+            live[0].contains(&format!(
+                "\x1b[38;2;{};{};{}m",
+                accent.0, accent.1, accent.2
+            )),
+            "reasoning label must retain the block model's accent: {live:?}"
+        );
 
         reasoning.reasoning_elapsed = Some(Duration::from_millis(13_700));
         reasoning.finish_reasoning();
@@ -11291,6 +11624,78 @@ mod tests {
             settled.is_empty(),
             "finished reasoning leaves no trace when collapsed"
         );
+    }
+
+    #[test]
+    fn reasoning_heading_tracks_only_explicit_markdown_headings() {
+        let mut reasoning = AssistantBlock::streaming_reasoning(
+            "Body sentence must stay private.\n\n## Plan `carefully`\n\nMore private detail.",
+        );
+        assert_eq!(
+            reasoning.reasoning_heading.as_deref(),
+            Some("Plan carefully")
+        );
+
+        reasoning.append_reasoning("\n\nThis is still ordinary body text.");
+        assert_eq!(
+            reasoning.reasoning_heading.as_deref(),
+            Some("Plan carefully")
+        );
+
+        reasoning.append_reasoning("\n\n**Verify results**");
+        assert_eq!(
+            reasoning.reasoning_heading.as_deref(),
+            Some("Verify results")
+        );
+
+        reasoning.append_reasoning("\n\nPrefix **bold body text** suffix.");
+        assert_eq!(
+            reasoning.reasoning_heading.as_deref(),
+            Some("Verify results")
+        );
+    }
+
+    #[test]
+    fn reasoning_heading_handles_adjacent_bold_sections_split_across_deltas() {
+        let mut reasoning = AssistantBlock::streaming_reasoning("**Plan**");
+        assert_eq!(reasoning.reasoning_heading.as_deref(), Some("Plan"));
+
+        reasoning.append_reasoning("**");
+        assert_eq!(reasoning.reasoning_heading.as_deref(), Some("Plan"));
+        reasoning.append_reasoning("Verify**");
+        assert_eq!(reasoning.reasoning_heading.as_deref(), Some("Verify"));
+        assert_eq!(reasoning.text, "**Plan****Verify**");
+        assert!(!reasoning.markdown.raw_text().contains("****"));
+    }
+
+    #[test]
+    fn collapsed_reasoning_has_ascii_fallback_and_width_bounded_rows() {
+        let theme =
+            crate::tui::theme::test_theme_with(crate::tui::terminal::TerminalCapabilities::test(
+                false,
+                false,
+                crate::tui::terminal::ColorDepth::None,
+            ));
+        let reasoning = AssistantBlock::streaming_reasoning(
+            "## A heading that is intentionally much wider than the viewport\n",
+        );
+        let lines = render_reasoning(&reasoning, &theme.reasoning_renderer(), &theme, 16, false);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("* A heading"), "{lines:?}");
+        assert!(lines[1].starts_with("  `- (ctrl+o to"), "{lines:?}");
+        assert!(lines.iter().all(|line| visible_width(line) <= 16));
+        assert!(lines.iter().all(|line| !line.contains('\x1b')));
+    }
+
+    #[test]
+    fn reasoning_heading_is_terminal_sanitized() {
+        let heading = reasoning_heading_from_block(&Block::Heading {
+            level: 2,
+            content: vec![Inline::Text("Safe\x1b[31m heading\x07".into())],
+        })
+        .expect("heading");
+        assert_eq!(heading, "Safe heading␇");
+        assert!(!heading.contains('\x1b'));
     }
 
     #[test]
@@ -11362,7 +11767,10 @@ mod tests {
         );
         let collapsed = render_shell(&shell.state.borrow(), 80).join("\n");
         let collapsed_plain = strip_terminal_sequences(&collapsed);
-        assert!(collapsed_plain.contains("thinking"), "{collapsed_plain}");
+        assert!(
+            collapsed_plain.contains("Inspecting render.rs"),
+            "{collapsed_plain}"
+        );
         assert!(
             !collapsed_plain.contains("Planning validation"),
             "{collapsed_plain}"
@@ -11842,20 +12250,20 @@ mod tests {
             )))
         };
 
-        let active =
-            event_margin_marker(&panel(false, false), &theme, true).expect("visible active marker");
+        let active = event_margin_marker(&panel(false, false), &theme, true, false)
+            .expect("visible active marker");
         assert_eq!(strip_terminal_sequences(&active), "•");
         assert!(!active.contains("\x1b[5m"), "{active:?}");
-        let hidden =
-            event_margin_marker(&panel(false, false), &theme, false).expect("hidden active marker");
+        let hidden = event_margin_marker(&panel(false, false), &theme, false, false)
+            .expect("hidden active marker");
         assert_eq!(hidden, " ");
 
         let settled_edit =
-            event_margin_marker(&panel(true, false), &theme, false).expect("edit marker");
+            event_margin_marker(&panel(true, false), &theme, false, false).expect("edit marker");
         assert_eq!(settled_edit, theme.settled_event_dot("neutral", "•"));
 
         let failed =
-            event_margin_marker(&panel(true, true), &theme, false).expect("failure marker");
+            event_margin_marker(&panel(true, true), &theme, false, false).expect("failure marker");
         assert_eq!(failed, theme.settled_event_dot("error", "•"));
 
         let bash_args = serde_json::json!({"command":"cargo test"});
@@ -11871,7 +12279,7 @@ mod tests {
             None,
         )));
         assert_eq!(
-            event_margin_marker(&bash, &theme, false),
+            event_margin_marker(&bash, &theme, false, false),
             Some(theme.settled_event_dot("success", "•"))
         );
 
@@ -11887,7 +12295,7 @@ mod tests {
             None,
         )));
         assert_eq!(
-            event_margin_marker(&read, &theme, false),
+            event_margin_marker(&read, &theme, false, false),
             Some(theme.settled_event_dot("neutral", "•"))
         );
 
@@ -11897,10 +12305,19 @@ mod tests {
             prompt_color: None,
             persisted: true,
         };
-        assert_eq!(event_margin_marker(&prompt, &theme, true), None);
+        assert_eq!(event_margin_marker(&prompt, &theme, true, false), None);
         let reasoning =
             TranscriptBlock::Reasoning(Box::new(AssistantBlock::streaming_reasoning("private")));
-        assert_eq!(event_margin_marker(&reasoning, &theme, true), None);
+        assert_eq!(event_margin_marker(&reasoning, &theme, true, false), None);
+        assert_eq!(
+            event_margin_marker(&reasoning, &theme, true, true)
+                .map(|marker| strip_terminal_sequences(&marker)),
+            Some("•".into())
+        );
+        assert_eq!(
+            event_margin_marker(&reasoning, &theme, false, true),
+            Some(" ".into())
+        );
         let outcome = TranscriptBlock::Outcome(RunOutcome::CompletedWithWarnings {
             elapsed: Duration::from_secs(1),
             warnings: 1,
@@ -11910,7 +12327,7 @@ mod tests {
                 warnings: 1,
             },
         });
-        assert_eq!(event_margin_marker(&outcome, &theme, true), None);
+        assert_eq!(event_margin_marker(&outcome, &theme, true, false), None);
     }
 
     #[test]
@@ -12303,8 +12720,8 @@ mod tests {
             "hidden-line metadata should use the muted metadata style: {details:?}"
         );
         assert!(
-            !details[1].contains("\x1b[38;2;"),
-            "raw Bash output should retain the tool-output style: {details:?}"
+            details[1].contains("\x1b[38;2;"),
+            "raw Bash output should use the muted output style: {details:?}"
         );
 
         let block = TranscriptBlock::Tool(Box::new(panel));

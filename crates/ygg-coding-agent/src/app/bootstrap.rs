@@ -142,8 +142,12 @@ const MAX_DISCOVERY_BODY_BYTES: usize = 8 * 1024 * 1024;
 // invalidated sparse local inventories that were incorrectly cached as
 // tool-incompatible by version 3. Version 5 invalidates v4 entries produced by
 // the secondary hlid discovery path before it adopted the same tri-state
-// local-tool fallback.
-const CUSTOM_MODEL_CACHE_VERSION: u8 = 5;
+// local-tool fallback. Version 6 also scopes a cache entry to the configured
+// model metadata, so removing or changing an override immediately re-runs
+// discovery. Version 7 invalidates inventories created before the built-in
+// Apple Foundation Models metadata was applied to sparse model responses.
+// Version 8 gives PCC its distinct 32,768-token context window.
+const CUSTOM_MODEL_CACHE_VERSION: u8 = 8;
 const PROVIDER_INVENTORY_CACHE_VERSION: u8 = 1;
 const MAX_PROVIDER_INVENTORY_CACHE_BYTES: usize = MAX_DISCOVERY_BODY_BYTES + 1024 * 1024;
 const PROVIDER_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -190,12 +194,30 @@ enum CachedProviderInventory {
     Unavailable,
 }
 
-fn credential_fingerprint(credential: &str) -> String {
-    let digest = Sha256::digest(credential.as_bytes());
-    digest
+fn fingerprint_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>()
+}
+
+fn credential_fingerprint(credential: &str) -> String {
+    fingerprint_bytes(credential.as_bytes())
+}
+
+fn custom_model_cache_fingerprint(
+    credential_fingerprint: &str,
+    configured: &[crate::auth::custom::CustomModel],
+) -> String {
+    let configured =
+        serde_json::to_vec(configured).expect("custom model metadata must always be serializable");
+    let mut scoped = Vec::with_capacity(credential_fingerprint.len() + configured.len() + 40);
+    scoped.extend_from_slice(b"ygg-custom-model-cache-config-v1");
+    scoped.extend_from_slice(&(credential_fingerprint.len() as u64).to_be_bytes());
+    scoped.extend_from_slice(credential_fingerprint.as_bytes());
+    scoped.extend_from_slice(&(configured.len() as u64).to_be_bytes());
+    scoped.extend_from_slice(&configured);
+    fingerprint_bytes(&scoped)
 }
 
 fn custom_credential_fingerprint(api_key: &str, headers: &http::HeaderMap) -> String {
@@ -1660,19 +1682,21 @@ fn schedule_custom_model_cache_refresh_for(
     {
         return;
     }
+    let configured = configured_custom_models(&cred);
+    let cache_fingerprint = custom_model_cache_fingerprint(&credential_fingerprint, &configured);
     let _ = std::thread::Builder::new()
         .name(format!("ygg-custom-{provider_id}-catalog-refresh"))
         .spawn(move || {
             let discovered = apply_configured_custom_model_overrides(
-                discover_models_blocking(&cred, false),
-                &configured_custom_models(&cred),
+                apply_known_custom_model_defaults(&cred, discover_models_blocking(&cred, false)),
+                &configured,
             );
             if !discovered.is_empty() {
                 let _ = save_custom_model_cache_for(
                     &store,
                     &provider_id,
                     &cred.base_url,
-                    &credential_fingerprint,
+                    &cache_fingerprint,
                     &discovered,
                 );
             }
@@ -1748,8 +1772,10 @@ fn discover_and_cache_custom_models_with_for<F>(
 where
     F: FnOnce(&crate::auth::custom::CustomCredential) -> Vec<crate::auth::custom::CustomModel>,
 {
-    let discovered =
-        apply_configured_custom_model_overrides(discover(cred), &configured_custom_models(cred));
+    let discovered = apply_configured_custom_model_overrides(
+        apply_known_custom_model_defaults(cred, discover(cred)),
+        &configured_custom_models(cred),
+    );
     if persist_empty || !discovered.is_empty() {
         if let Err(error) = save_custom_model_cache_for(
             store,
@@ -2051,6 +2077,138 @@ fn resolve_custom_provider_auth(
     Ok((Auth::None, String::new()))
 }
 
+const APPLE_FM_PROVIDER_ID: &str = "apple-fm";
+const APPLE_FM_BASE_URL: &str = "http://127.0.0.1:1976/v1/";
+const APPLE_FM_LABEL: &str = "Apple Foundation Models";
+const APPLE_FM_SYSTEM_CONTEXT_WINDOW: u64 = 8_192;
+const APPLE_FM_PCC_CONTEXT_WINDOW: u64 = 32_768;
+const APPLE_FM_MAX_OUTPUT_TOKENS: u64 = 1_024;
+const APPLE_FM_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+fn is_apple_foundation_models_endpoint(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    matches!(url.scheme(), "http")
+        && url.port() == Some(1976)
+        && url
+            .host_str()
+            .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost" | "::1"))
+        && matches!(url.path().trim_end_matches('/'), "/v1")
+}
+
+fn apple_foundation_model_defaults(api_name: &str) -> Option<crate::auth::custom::CustomModel> {
+    let (context_window, reasoning_configurable, reasoning_values, reasoning_default) =
+        match api_name {
+            // The on-device model always thinks and rejects reasoning_effort. Keep
+            // it visible as a fixed `on` capability while emitting no control field.
+            "system" => (
+                APPLE_FM_SYSTEM_CONTEXT_WINDOW,
+                false,
+                Vec::new(),
+                String::new(),
+            ),
+            // fm serve accepts low/medium/high for the PCC route. PCC may be
+            // unavailable on this device, but its wire contract is still stable.
+            "pcc" => (
+                APPLE_FM_PCC_CONTEXT_WINDOW,
+                true,
+                vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+                "medium".to_owned(),
+            ),
+            _ => return None,
+        };
+    Some(crate::auth::custom::CustomModel {
+        api_name: api_name.to_owned(),
+        display_name: api_name.to_owned(),
+        context_window,
+        max_output_tokens: APPLE_FM_MAX_OUTPUT_TOKENS,
+        tools: true,
+        parallel_tool_calls: false,
+        vision: false,
+        structured_output: false,
+        reasoning: true,
+        reasoning_configurable,
+        reasoning_values,
+        reasoning_default,
+        reasoning_uses_system_message: true,
+    })
+}
+
+fn apply_known_custom_model_defaults(
+    cred: &crate::auth::custom::CustomCredential,
+    models: Vec<crate::auth::custom::CustomModel>,
+) -> Vec<crate::auth::custom::CustomModel> {
+    if !is_apple_foundation_models_endpoint(&cred.base_url) {
+        return models;
+    }
+    models
+        .into_iter()
+        .map(|model| apple_foundation_model_defaults(&model.api_name).unwrap_or(model))
+        .collect()
+}
+
+fn apple_foundation_models_health_is_valid(body: &serde_json::Value) -> bool {
+    body.get("status").and_then(serde_json::Value::as_str) == Some("fm serve is running")
+        && body
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|models| {
+                models.iter().any(|model| {
+                    model.get("name").and_then(serde_json::Value::as_str) == Some("system")
+                        && model.get("available").and_then(serde_json::Value::as_bool) == Some(true)
+                })
+            })
+}
+
+fn apple_foundation_models_server_is_running() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    std::thread::spawn(apple_foundation_models_server_is_running_blocking)
+        .join()
+        .unwrap_or(false)
+}
+
+fn apple_foundation_models_server_is_running_blocking() -> bool {
+    let Ok(health_url) = url::Url::parse(APPLE_FM_BASE_URL).and_then(|url| url.join("../health"))
+    else {
+        return false;
+    };
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(APPLE_FM_PROBE_TIMEOUT)
+        .build()
+    else {
+        return false;
+    };
+    let Ok(response) = client.get(health_url).send() else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    bounded_discovery_json(response, "Apple Foundation Models health")
+        .is_ok_and(|body| apple_foundation_models_health_is_valid(&body))
+}
+
+fn default_apple_foundation_models_provider() -> crate::auth::custom::CustomProvider {
+    crate::auth::custom::CustomProvider {
+        label: APPLE_FM_LABEL.to_owned(),
+        credential: crate::auth::custom::CustomCredential {
+            base_url: APPLE_FM_BASE_URL.to_owned(),
+            api_key: String::new(),
+            api_name: String::new(),
+            headers: Vec::new(),
+            models: Vec::new(),
+            auto_discover: true,
+        },
+        auth: Some(crate::auth::custom::CustomAuthConfig::None),
+        api_key_env: None,
+        cache: None,
+        startup_timeout_secs: Some(CUSTOM_ENDPOINT_STARTUP_TIMEOUT.as_secs()),
+    }
+}
+
 fn custom_model_id(
     provider_id: &str,
     legacy_single_endpoint: bool,
@@ -2064,14 +2222,6 @@ fn custom_model_id(
     } else {
         format!("custom/{provider_id}/{}", model.api_name)
     }
-}
-
-fn register_custom_openai_endpoints(
-    catalog: &mut ModelCatalog,
-    offline: bool,
-) -> anyhow::Result<()> {
-    let store = crate::auth::custom::CredentialStore::new(crate::auth::custom::default_path());
-    register_custom_openai_endpoints_from_store(catalog, &store, offline)
 }
 
 fn register_custom_openai_endpoints_from_store(
@@ -2108,6 +2258,34 @@ fn register_custom_openai_endpoints_from_store(
         }
     }
     Ok(())
+}
+
+fn register_default_apple_foundation_models(
+    catalog: &mut ModelCatalog,
+    store: &crate::auth::custom::CredentialStore,
+    offline: bool,
+) -> anyhow::Result<()> {
+    if offline
+        || !cfg!(target_os = "macos")
+        || catalog.has_endpoint(&EndpointId(crate::auth::custom::endpoint_id(
+            APPLE_FM_PROVIDER_ID,
+        )))
+        || !apple_foundation_models_server_is_running()
+    {
+        return Ok(());
+    }
+
+    let provider = default_apple_foundation_models_provider();
+    let mut provider_catalog = ModelCatalog::default();
+    register_custom_openai_provider(
+        &mut provider_catalog,
+        store,
+        APPLE_FM_PROVIDER_ID,
+        &provider,
+        false,
+        false,
+    )?;
+    merge_provider_catalog(catalog, provider_catalog)
 }
 
 fn register_custom_openai_provider(
@@ -2179,13 +2357,10 @@ fn register_custom_openai_provider(
     // one endpoint's inventory from being used by another endpoint.
     let configured = configured_custom_models(&cred);
     let configured_overrides = configured.clone();
+    let cache_fingerprint =
+        custom_model_cache_fingerprint(&custom_credential_fingerprint, &configured);
     let cached = if cred.auto_discover {
-        match load_custom_model_cache_for(
-            store,
-            provider_id,
-            &cred.base_url,
-            &custom_credential_fingerprint,
-        ) {
+        match load_custom_model_cache_for(store, provider_id, &cred.base_url, &cache_fingerprint) {
             Ok(models) => models,
             Err(error) => {
                 eprintln!("warning: custom provider model cache unavailable: {error}");
@@ -2204,7 +2379,7 @@ fn register_custom_openai_provider(
                     store,
                     provider_id,
                     &cred,
-                    &custom_credential_fingerprint,
+                    &cache_fingerprint,
                     models,
                     PROVIDER_INVENTORY_REFRESH_INTERVAL,
                     discover_models,
@@ -2218,7 +2393,7 @@ fn register_custom_openai_provider(
                 store,
                 provider_id,
                 &cred,
-                &custom_credential_fingerprint,
+                &cache_fingerprint,
                 false,
                 discover_models,
             );
@@ -2245,7 +2420,7 @@ fn register_custom_openai_provider(
                 store,
                 provider_id,
                 &cred,
-                &custom_credential_fingerprint,
+                &cache_fingerprint,
                 true,
                 discover_models,
             );
@@ -2257,7 +2432,10 @@ fn register_custom_openai_provider(
         }
         None => configured,
     };
-    let models = apply_configured_custom_model_overrides(models, &configured_overrides);
+    let models = apply_configured_custom_model_overrides(
+        apply_known_custom_model_defaults(&cred, models),
+        &configured_overrides,
+    );
     if models.is_empty() {
         return Ok(());
     }
@@ -2461,7 +2639,7 @@ fn discover_models_blocking(
             reasoning_uses_system_message: true,
         });
     }
-    models
+    apply_known_custom_model_defaults(cred, models)
 }
 
 /// Walk the model metadata looking for a context length. vLLM emits
@@ -3126,8 +3304,15 @@ fn base_model_catalog(offline: bool) -> anyhow::Result<ModelCatalog> {
     // Explicit custom models remain usable offline; only auto-discovery is skipped.
     // Tests never inspect ambient HOME credentials.
     if !cfg!(test) {
-        if let Err(error) = register_custom_openai_endpoints(&mut catalog, offline) {
+        let store = crate::auth::custom::CredentialStore::new(crate::auth::custom::default_path());
+        if let Err(error) =
+            register_custom_openai_endpoints_from_store(&mut catalog, &store, offline)
+        {
             eprintln!("warning: custom provider registry unavailable: {error}");
+        }
+        if let Err(error) = register_default_apple_foundation_models(&mut catalog, &store, offline)
+        {
+            eprintln!("warning: Apple Foundation Models unavailable: {error}");
         }
         // Custom providers may use provider-scoped environment credentials;
         // hide models whose referenced variable is not configured, just as the
@@ -4197,6 +4382,140 @@ mod tests {
     }
 
     #[test]
+    fn apple_foundation_models_fill_sparse_inventory_from_embedded_metadata() {
+        use crate::auth::custom::{CustomCredential, CustomModel};
+
+        let cred = CustomCredential {
+            base_url: APPLE_FM_BASE_URL.into(),
+            api_key: String::new(),
+            api_name: String::new(),
+            headers: Vec::new(),
+            models: Vec::new(),
+            auto_discover: true,
+        };
+        let models = apply_known_custom_model_defaults(
+            &cred,
+            vec![
+                CustomModel {
+                    api_name: "system".into(),
+                    context_window: 262_144,
+                    max_output_tokens: 16_384,
+                    reasoning: false,
+                    ..Default::default()
+                },
+                CustomModel {
+                    api_name: "pcc".into(),
+                    context_window: 262_144,
+                    max_output_tokens: 16_384,
+                    ..Default::default()
+                },
+            ],
+        );
+
+        assert_eq!(models[0].context_window, 8_192);
+        assert_eq!(models[0].max_output_tokens, APPLE_FM_MAX_OUTPUT_TOKENS);
+        assert!(models[0].tools);
+        assert!(models[0].reasoning);
+        assert!(!models[0].reasoning_configurable);
+        assert_eq!(
+            custom_reasoning_capability(&models[0]).unwrap().control,
+            ReasoningControl::AlwaysOn
+        );
+
+        assert_eq!(models[1].context_window, 32_768);
+        assert_eq!(models[1].max_output_tokens, APPLE_FM_MAX_OUTPUT_TOKENS);
+        assert!(models[1].reasoning_configurable);
+        assert_eq!(models[1].reasoning_values, ["low", "medium", "high"]);
+        assert_eq!(models[1].reasoning_default, "medium");
+        assert_eq!(
+            custom_reasoning_capability(&models[1]).unwrap().control,
+            ReasoningControl::Effort
+        );
+    }
+
+    #[test]
+    fn configured_apple_metadata_overrides_embedded_defaults() {
+        use crate::auth::custom::{CustomCredential, CustomModel};
+
+        let cred = CustomCredential {
+            base_url: APPLE_FM_BASE_URL.into(),
+            api_key: String::new(),
+            api_name: String::new(),
+            headers: Vec::new(),
+            models: Vec::new(),
+            auto_discover: true,
+        };
+        let configured = CustomModel {
+            api_name: "system".into(),
+            context_window: 4_096,
+            max_output_tokens: 512,
+            tools: false,
+            reasoning: false,
+            ..Default::default()
+        };
+        let merged = apply_configured_custom_model_overrides(
+            apply_known_custom_model_defaults(
+                &cred,
+                vec![CustomModel {
+                    api_name: "system".into(),
+                    ..Default::default()
+                }],
+            ),
+            &[configured],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].context_window, 4_096);
+        assert_eq!(merged[0].max_output_tokens, 512);
+        assert!(!merged[0].tools);
+        assert!(!merged[0].reasoning);
+    }
+
+    #[test]
+    fn apple_foundation_models_health_requires_the_native_server_shape() {
+        assert!(apple_foundation_models_health_is_valid(
+            &serde_json::json!({
+                "status": "fm serve is running",
+                "models": [{"name": "system", "available": true}]
+            })
+        ));
+        assert!(!apple_foundation_models_health_is_valid(
+            &serde_json::json!({
+                "status": "ok",
+                "models": [{"name": "system", "available": true}]
+            })
+        ));
+        assert!(!apple_foundation_models_health_is_valid(
+            &serde_json::json!({
+                "status": "fm serve is running",
+                "models": [{"name": "system", "available": false}]
+            })
+        ));
+    }
+
+    #[test]
+    fn custom_model_cache_fingerprint_changes_with_configured_metadata() {
+        let credential = custom_credential_fingerprint("key", &http::HeaderMap::new());
+        let empty = custom_model_cache_fingerprint(&credential, &[]);
+        let configured = crate::auth::custom::CustomModel {
+            api_name: "system".into(),
+            context_window: APPLE_FM_SYSTEM_CONTEXT_WINDOW,
+            max_output_tokens: APPLE_FM_MAX_OUTPUT_TOKENS,
+            ..Default::default()
+        };
+        let with_override = custom_model_cache_fingerprint(&credential, &[configured.clone()]);
+        let changed = custom_model_cache_fingerprint(
+            &credential,
+            &[crate::auth::custom::CustomModel {
+                context_window: 4_096,
+                ..configured
+            }],
+        );
+
+        assert_ne!(empty, with_override);
+        assert_ne!(with_override, changed);
+    }
+    #[test]
     fn fixed_custom_reasoning_is_the_only_ygg_thinking_option() {
         use crate::auth::custom::CustomModel;
 
@@ -4940,6 +5259,52 @@ mod tests {
                 Some(CachedCustomInventory::Unavailable)
             ),
             "an empty inventory is a valid negative cache marker"
+        );
+    }
+
+    #[test]
+    fn custom_model_cache_invalidates_when_configured_metadata_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::auth::custom::CredentialStore::new(
+            directory.path().join("credentials/custom.json"),
+        );
+        let base_url = "http://custom.test/v1/";
+        let credential = custom_credential_fingerprint("key", &http::HeaderMap::new());
+        let configured = crate::auth::custom::CustomModel {
+            api_name: "system".into(),
+            context_window: APPLE_FM_SYSTEM_CONTEXT_WINDOW,
+            max_output_tokens: APPLE_FM_MAX_OUTPUT_TOKENS,
+            ..Default::default()
+        };
+        let original = custom_model_cache_fingerprint(&credential, &[configured.clone()]);
+        let changed = custom_model_cache_fingerprint(
+            &credential,
+            &[crate::auth::custom::CustomModel {
+                context_window: 4_096,
+                ..configured
+            }],
+        );
+        save_custom_model_cache_for(
+            &store,
+            "provider",
+            base_url,
+            &original,
+            &[crate::auth::custom::CustomModel {
+                api_name: "system".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load_custom_model_cache_for(&store, "provider", base_url, &original).unwrap(),
+            Some(CachedCustomInventory::Available(_))
+        ));
+        assert!(
+            load_custom_model_cache_for(&store, "provider", base_url, &changed)
+                .unwrap()
+                .is_none(),
+            "changing configured metadata must force fresh discovery"
         );
     }
 

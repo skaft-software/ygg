@@ -26,13 +26,18 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Renamed the primary execution limit to `bash_timeout_secs`,
   `--bash-timeout-secs`, and `YGG_BASH_TIMEOUT_SECS`. The prior configuration,
   CLI, and environment spellings remain compatibility aliases.
-- Reworked the transcript hierarchy around one live reasoning indicator,
-  in-place activity, bold neutral tool names, restrained metadata, quieter
+- Reworked the transcript hierarchy around a fixed two-row live reasoning
+  status that exposes only the model's latest explicit Markdown heading, uses a
+  blinking model-colored dot beside a plain model-colored label, and falls back
+  to `Thinking`, alongside in-place activity, bold neutral tool names, restrained metadata, quieter
   collapsed-output hints, consistent spacing, and model-provenance user prompts.
 - Tool lifecycle dots now blink in lockstep while work is active, settle dimly,
   use green only for successful Bash commands, and reserve red for failures.
 - Completed reasoning disappears by default and remains available through the
   global verbose disclosure mode.
+- Active context telemetry now accounts for newly persisted tool results before
+  the next provider usage report, so an imminent auto-compaction no longer
+  appears to trigger against a stale pre-tool token count.
 - Ported Pi-compatible terminal input, selection, paste, key-repeat, and overlay
   behavior while preserving native terminal selection and scrollback.
 - Long-session rendering now hydrates a bounded tail, caches stable transcript
@@ -94,7 +99,7 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Semantic transcript blocks use one consistent breathing row between actions without separating a tool header from its result or diff.
 - Custom hlid/llama.cpp discovery reads the active nested `meta.n_ctx` context window instead of falling back to training limits or a generic default.
 - Custom endpoint reasoning controls are authoritative: off-only, binary, and level-based metadata produce exactly the corresponding picker choices and wire values.
-- Reasoning is collapsed by default into a stable two-line, model-colored status that settles to an elapsed-time label and expands with `Ctrl+O`.
+- Reasoning is collapsed by default into a stable two-line, model-colored status that surfaces only explicit model-emitted Markdown headings, falls back to `Thinking`, disappears on completion, and expands with `Ctrl+O`.
 - Every bundled theme retains its authored palette, while the compiled default follows the selected model lab and resets cleanly after theme switches.
 - Batched tool results retain independent bounded output allowances so a large early result cannot starve later calls in the same turn.
 

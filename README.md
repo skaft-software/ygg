@@ -178,8 +178,9 @@ Apple Foundation Models advertises sparse model metadata, so keep the explicit
 `system` entry at its documented 8192-token context window. Its on-device model
 thinks by default and exposes `on` as the only ygg thinking option; it does not
 support a configurable `reasoning_effort`, so keep `reasoning` enabled and
-`reasoning_configurable` disabled. Configured model metadata overrides matching
-discovery results.
+`reasoning_configurable` disabled. The `pcc` model has a separate 32768-token
+context window and supports low/medium/high reasoning effort. Configured model
+metadata overrides matching discovery results.
 
 Each provider is independently discovered and selectable. Models use stable,
 provider-qualified IDs such as `custom/apple-fm/<model-id>`, and the configured
@@ -284,14 +285,11 @@ Capability handling is model-specific. ygg validates modalities, tool use, struc
 
 ### Reasoning without transcript noise
 
-Reasoning is collapsed by default while remaining available with `Ctrl+O`. During generation, the compact indicator uses the active model's lab color; when complete it settles into a quiet elapsed-time label.
+Reasoning is collapsed by default while remaining available with `Ctrl+O`. During generation, a fixed two-row status uses the generating model's lab color: its activity dot blinks beside a plain-weight label. It shows only the latest explicit Markdown heading emitted by the model—an ATX heading or standalone bold-heading paragraph—and falls back to `Thinking`; ordinary reasoning body text is never promoted into the collapsed label. Completed reasoning disappears again when collapsed.
 
 ```text
-⠹ thinking
-└ ctrl+o to expand
-
-thought for 14s
-└ ctrl+o to expand
+• Verifying the implementation
+  └ (ctrl+o to expand)
 ```
 
 Select a supported level at launch or while the session is running:
