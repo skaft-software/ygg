@@ -196,8 +196,8 @@ pub fn strip_terminal_sequences(text: &str) -> String {
                 }
                 continue;
             }
-            cursor += 2;
             if next == b'[' {
+                cursor += 2;
                 let mut terminated = false;
                 while cursor < bytes.len() {
                     if (0x40..=0x7e).contains(&bytes[cursor]) {
@@ -212,8 +212,11 @@ pub fn strip_terminal_sequences(text: &str) -> String {
                 }
                 continue;
             }
-            // Fe/charset escape: zero or more intermediate bytes followed by
-            // one final byte. `ESC ( B` is the common ASCII designation.
+            // Fe/charset escape: zero or more ASCII intermediate bytes
+            // followed by one ASCII final byte. Advance past ESC first so an
+            // invalid non-ASCII follower remains on a UTF-8 character
+            // boundary instead of indexing into its continuation bytes.
+            cursor += 1;
             while cursor < bytes.len() && (0x20..=0x2f).contains(&bytes[cursor]) {
                 cursor += 1;
             }
@@ -983,5 +986,12 @@ mod tests {
             logical_lines("first\nsecond\r\nthird\rfourth"),
             vec!["first", "second", "third", "fourth"]
         )
+    }
+
+    #[test]
+    fn sanitizer_keeps_utf8_boundaries_after_malformed_escape() {
+        assert_eq!(strip_terminal_sequences("before\x1b�after"), "before�after");
+        assert_eq!(strip_terminal_sequences("\x1b🙂界"), "🙂界");
+        assert_eq!(strip_terminal_sequences("a\x1b(Bb"), "ab");
     }
 }
