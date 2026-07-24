@@ -83,9 +83,10 @@ impl ChatGptPlan {
         matches!(self, Self::Pro | Self::ProLite)
     }
 
-    /// Consumer ChatGPT Pro variants enable GPT-5.6 pro mode.
+    /// ChatGPT Pro subscriptions enable GPT-5.6 pro mode. Pro Lite has a
+    /// separate entitlement and must not be treated as Pro here.
     pub(crate) fn supports_pro_reasoning_mode(&self) -> bool {
-        matches!(self, Self::Pro | Self::ProLite)
+        matches!(self, Self::Pro)
     }
 }
 
@@ -441,7 +442,7 @@ mod tests {
         assert!(ChatGptPlan::ProLite.uses_max_context_window());
         assert!(!ChatGptPlan::Plus.uses_max_context_window());
         assert!(ChatGptPlan::Pro.supports_pro_reasoning_mode());
-        assert!(ChatGptPlan::ProLite.supports_pro_reasoning_mode());
+        assert!(!ChatGptPlan::ProLite.supports_pro_reasoning_mode());
         assert!(!ChatGptPlan::Plus.supports_pro_reasoning_mode());
         assert_eq!(
             ChatGptPlan::from_raw(" Future_Tier "),

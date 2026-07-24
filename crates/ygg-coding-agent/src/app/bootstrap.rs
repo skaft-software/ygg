@@ -3251,13 +3251,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     };
 
     let reasoning_mode = normalize_reasoning_mode_for_model(launch.reasoning_mode, &model)?;
-    let requested_reasoning =
-        if reasoning_mode == ReasoningMode::Pro && launch.reasoning == ReasoningConfig::Off {
-            ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Medium)
-        } else {
-            launch.reasoning
-        };
-    let reasoning = normalize_reasoning_for_model(&requested_reasoning, &model)?;
+    let reasoning = normalize_reasoning_for_model(&launch.reasoning, &model)?;
     append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
     config.model = Some(model.spec.id.clone());
     config.reasoning = reasoning.clone();
@@ -3393,11 +3387,6 @@ pub fn rebuild_app(
         .or(persisted.reasoning_mode)
         .unwrap_or(reasoning_mode);
     let reasoning_mode = normalize_reasoning_mode_for_model(reasoning_mode, &model)?;
-    let reasoning = if reasoning_mode == ReasoningMode::Pro && reasoning == ReasoningConfig::Off {
-        thinking_to_reasoning(crate::config::ThinkingLevel::Medium, &model)?
-    } else {
-        reasoning
-    };
     let mut session = match selection {
         Some(SessionSelection::CreateNew(path)) => {
             if let Some(parent) = path.parent() {

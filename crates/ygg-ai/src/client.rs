@@ -12,6 +12,7 @@ use crate::error::{
 };
 use crate::stream::{ResponseBuilder, ResponseStream, StreamEvent};
 use crate::types::{Protocol, Request, Response};
+use crate::{ResponsesCompactRequest, ResponsesCompactResponse};
 
 /// Hard cap on a buffered non-streaming response body before JSON decode
 /// (design §20). Crossing it is a [`DecodeError::BodyTooLarge`].
@@ -664,6 +665,88 @@ impl AiClient {
 
             Ok(crate::stream::guard(raw_event_stream))
         }
+    }
+
+    /// Calls OpenAI's native `POST /responses/compact` endpoint.
+    ///
+    /// The returned output is opaque and intentionally unpruned; callers may
+    /// use [`crate::ResponsesCompactResponse::output`] directly as the next
+    /// full replay window.
+    pub async fn compact_responses(
+        &self,
+        model: &Model,
+        request: ResponsesCompactRequest,
+    ) -> Result<ResponsesCompactResponse, AiError> {
+        if model.spec.protocol != Protocol::OpenAiResponses {
+            return Err(crate::error::UnsupportedError::Reasoning.into());
+        }
+        let url = model
+            .endpoint
+            .base_url
+            .join("responses/compact")
+            .map_err(|error| crate::error::ConfigError::Parse(error.to_string()))?;
+        let body = serde_json::to_vec(&request)
+            .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))?;
+        let mut headers = model.endpoint.default_headers.clone();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        let auth_headers = crate::auth::resolve_headers(&model.endpoint.auth)
+            .await
+            .map_err(AiError::Auth)?;
+        let mut current_key = None;
+        for (key, value) in auth_headers {
+            if let Some(key) = key {
+                current_key = Some(key.clone());
+                headers.insert(key, value);
+            } else if let Some(key) = &current_key {
+                headers.append(key.clone(), value);
+            }
+        }
+        let response = tokio::time::timeout(
+            model.endpoint.timeout,
+            self.http.post(url).headers(headers).body(body).send(),
+        )
+        .await
+        .map_err(|_| {
+            AiError::Transport(TransportError {
+                phase: TransportPhase::ConnectOrHeaders,
+                timeout: true,
+                message: "compact request timed out waiting for response headers".to_owned(),
+            })
+        })?
+        .map_err(|error| {
+            reqwest_transport_error(error, TransportPhase::ConnectOrHeaders, "compact request")
+        })?;
+        let status = response.status();
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("request-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.bytes().await.map_err(|error| {
+            reqwest_transport_error(error, TransportPhase::Body, "compact response body")
+        })?;
+        if body.len() > MAX_COMPLETED_BODY_BYTES {
+            return Err(DecodeError::BodyTooLarge.into());
+        }
+        if !status.is_success() {
+            let mut snippet = String::from_utf8_lossy(&body).into_owned();
+            truncate_transport_message(&mut snippet, 4096);
+            return Err(HttpError {
+                status,
+                request_id,
+                retry_after: None,
+                provider_code: None,
+                body_snippet: Some(snippet),
+                retryable: true,
+            }
+            .into());
+        }
+        serde_json::from_slice(&body)
+            .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))
     }
 
     /// Executes a request and drives the stream to completion, returning the final Response.

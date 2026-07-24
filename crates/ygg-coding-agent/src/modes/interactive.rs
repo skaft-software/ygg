@@ -1365,10 +1365,7 @@ fn next_model_id(app: &App) -> anyhow::Result<ModelId> {
 }
 
 fn next_thinking_level(app: &App) -> anyhow::Result<ThinkingLevel> {
-    let mut levels = supported_levels(&app.model);
-    if app.reasoning_mode == ReasoningMode::Pro {
-        levels.retain(|level| *level != ThinkingLevel::Off);
-    }
+    let levels = supported_levels(&app.model);
     let current = level_from_reasoning(&app.reasoning, &app.model)?;
     let index = levels
         .iter()
@@ -1400,10 +1397,7 @@ async fn thinking_configuration_picker(
     } else {
         ReasoningMode::Standard
     };
-    let mut levels = supported_levels(&app.model);
-    if mode == ReasoningMode::Pro {
-        levels.retain(|level| *level != ThinkingLevel::Off);
-    }
+    let levels = supported_levels(&app.model);
     let Some(level) = thinking_picker(shell, input, &levels).await? else {
         return Ok(None);
     };
@@ -1557,24 +1551,7 @@ async fn apply_pending_actions(
                 if let Err(e) = crate::cli::persist_reasoning(&reasoning_label(&reasoning)) {
                     shell.error(format!("failed to save thinking preference: {e}"));
                 }
-                if reasoning == ReasoningConfig::Off && app.reasoning_mode == ReasoningMode::Pro {
-                    if let Err(error) = crate::cli::persist_reasoning_mode(ReasoningMode::Standard)
-                    {
-                        shell.error(format!("failed to save reasoning mode preference: {error}"));
-                    }
-                    app = transition(
-                        app,
-                        shell,
-                        input,
-                        Reconfig::ThinkingMode {
-                            mode: ReasoningMode::Standard,
-                            reasoning,
-                        },
-                    )
-                    .await?;
-                } else {
-                    app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
-                }
+                app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
                 shell.notice("queued thinking change applied");
             }
             PendingIdleAction::ChangeThinkingLevel(level) => {
@@ -2112,23 +2089,7 @@ async fn run_idle_command(
             if let Err(e) = crate::cli::persist_reasoning(level.label()) {
                 shell.error(format!("failed to save thinking preference: {e}"));
             }
-            if level == ThinkingLevel::Off && app.reasoning_mode == ReasoningMode::Pro {
-                if let Err(error) = crate::cli::persist_reasoning_mode(ReasoningMode::Standard) {
-                    shell.error(format!("failed to save reasoning mode preference: {error}"));
-                }
-                app = transition(
-                    app,
-                    shell,
-                    input,
-                    Reconfig::ThinkingMode {
-                        mode: ReasoningMode::Standard,
-                        reasoning,
-                    },
-                )
-                .await?;
-            } else {
-                app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
-            }
+            app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
             shell.notice("thinking changed");
         }
         Command::Model(None) => {

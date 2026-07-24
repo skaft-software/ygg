@@ -257,6 +257,7 @@ async fn compaction_call(
         stop: vec![],
         reasoning: ReasoningConfig::Off,
         reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        responses: None,
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: ygg_ai::CompatibilityMode::Strict,

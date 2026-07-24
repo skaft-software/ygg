@@ -39,6 +39,7 @@ pub mod error;
 mod json_repair;
 pub mod model_metadata;
 pub mod pricing;
+pub mod responses;
 pub mod stream;
 mod transform;
 pub mod types;
@@ -59,6 +60,10 @@ pub use error::{
 };
 pub use mime::Mime;
 pub use pricing::{Cost, Pricing, PricingTier, TokenRate, PICODOLLARS_PER_MICRODOLLAR};
+pub use responses::{
+    ResponsesCompactRequest, ResponsesCompactResponse, ResponsesInput, ResponsesItem,
+    ResponsesItemError, ResponsesOptions, ResponsesOutput,
+};
 pub use stream::{ResponseStream, StreamEvent};
 pub use transform::transform_messages;
 pub use types::{

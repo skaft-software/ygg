@@ -736,6 +736,9 @@ pub struct Request {
     /// Reasoning execution mode. Pro mode is independently capability-gated.
     #[serde(default)]
     pub reasoning_mode: ReasoningMode,
+    /// OpenAI Responses-specific raw replay and continuation options.
+    #[serde(default)]
+    pub responses: Option<crate::responses::ResponsesOptions>,
     /// Requested formatting for model response (text or JSON).
     #[serde(default)]
     pub output_format: OutputFormat,
@@ -1252,6 +1255,7 @@ mod tests {
             stop: vec!["\n".to_string()],
             reasoning: ReasoningConfig::Off,
             reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,

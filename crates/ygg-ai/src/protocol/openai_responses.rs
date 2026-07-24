@@ -19,7 +19,11 @@ use crate::validate::{normalize_request_reasoning, validate_request};
 #[derive(Serialize)]
 struct ResponsesRequest {
     model: String,
-    input: Vec<ResponsesInputItem>,
+    input: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_management: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ResponsesTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,6 +182,16 @@ pub(crate) fn build_request(
         &model.spec.id,
         req.compatibility,
     )?;
+    if req
+        .responses
+        .as_ref()
+        .is_some_and(|options| options.input.is_some() && options.previous_response_id.is_some())
+    {
+        return Err(ConfigError::Parse(
+            "Responses raw input and previous_response_id cannot be used together".to_owned(),
+        )
+        .into());
+    }
 
     // 2. Map system prompt
     let mut input = Vec::new();
@@ -521,9 +535,20 @@ pub(crate) fn build_request(
         req.max_output_tokens
     };
 
+    let wire_input = req
+        .responses
+        .as_ref()
+        .and_then(|options| options.input.as_ref())
+        .map(|input| serde_json::to_value(input).expect("ResponsesInput serializes"))
+        .unwrap_or_else(|| serde_json::to_value(input).expect("Responses input serializes"));
+    let responses_options = req.responses.as_ref();
     let responses_req = ResponsesRequest {
         model: model.spec.api_name.clone(),
-        input,
+        input: wire_input,
+        previous_response_id: responses_options
+            .and_then(|options| options.previous_response_id.clone()),
+        context_management: responses_options
+            .and_then(|options| options.context_management.clone()),
         tools: tools_opt,
         tool_choice: tool_choice_opt,
         // Do not rely on a provider default. A model advertised as sequential
@@ -540,7 +565,7 @@ pub(crate) fn build_request(
             && model.spec.cache.supports_long_retention)
             .then_some("24h"),
         include,
-        store: false,
+        store: responses_options.is_some_and(|options| options.store),
         stream: true,
     };
 
@@ -1389,6 +1414,7 @@ mod tests {
             stop: vec![],
             reasoning: ReasoningConfig::Off,
             reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility,
@@ -1463,6 +1489,7 @@ mod tests {
             stop: vec![],
             reasoning: ReasoningConfig::Off,
             reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -1779,6 +1806,7 @@ mod tests {
             stop: vec![],
             reasoning: ReasoningConfig::Off,
             reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -1884,6 +1912,7 @@ mod tests {
             stop: vec![],
             reasoning: ReasoningConfig::Off,
             reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
