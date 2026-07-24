@@ -1456,6 +1456,9 @@ fn merge_provider_catalog(target: &mut ModelCatalog, source: ModelCatalog) -> an
         if !target.has_endpoint(&resolved.endpoint.id) {
             target.register_endpoint((*resolved.endpoint).clone())?;
         }
+        if let Some(label) = source.endpoint_label(&resolved.endpoint.id) {
+            target.set_endpoint_label(resolved.endpoint.id.clone(), label.to_owned())?;
+        }
         if !has_model_id(target, &spec.id.0) {
             target.register_model(spec)?;
         }
@@ -1517,12 +1520,13 @@ enum CachedCustomInventory {
     Unavailable,
 }
 
-fn load_custom_model_cache(
+fn load_custom_model_cache_for(
     store: &crate::auth::custom::CredentialStore,
+    provider_id: &str,
     base_url: &str,
     credential_fingerprint: &str,
 ) -> anyhow::Result<Option<CachedCustomInventory>> {
-    let Some(bytes) = store.load_model_cache()? else {
+    let Some(bytes) = store.load_model_cache_for(provider_id)? else {
         return Ok(None);
     };
     let cache: CustomModelCache =
@@ -1540,8 +1544,23 @@ fn load_custom_model_cache(
     }))
 }
 
-fn save_custom_model_cache(
+#[cfg(test)]
+fn load_custom_model_cache(
     store: &crate::auth::custom::CredentialStore,
+    base_url: &str,
+    credential_fingerprint: &str,
+) -> anyhow::Result<Option<CachedCustomInventory>> {
+    load_custom_model_cache_for(
+        store,
+        crate::auth::custom::ENDPOINT_ID,
+        base_url,
+        credential_fingerprint,
+    )
+}
+
+fn save_custom_model_cache_for(
+    store: &crate::auth::custom::CredentialStore,
+    provider_id: &str,
     base_url: &str,
     credential_fingerprint: &str,
     models: &[crate::auth::custom::CustomModel],
@@ -1552,25 +1571,50 @@ fn save_custom_model_cache(
         credential_fingerprint: credential_fingerprint.to_owned(),
         models: models.to_vec(),
     };
-    store.save_model_cache(&serde_json::to_vec_pretty(&cache)?)
+    store.save_model_cache_for(provider_id, &serde_json::to_vec_pretty(&cache)?)
 }
 
-fn schedule_custom_model_cache_refresh(
+#[cfg(test)]
+fn save_custom_model_cache(
+    store: &crate::auth::custom::CredentialStore,
+    base_url: &str,
+    credential_fingerprint: &str,
+    models: &[crate::auth::custom::CustomModel],
+) -> anyhow::Result<()> {
+    save_custom_model_cache_for(
+        store,
+        crate::auth::custom::ENDPOINT_ID,
+        base_url,
+        credential_fingerprint,
+        models,
+    )
+}
+
+fn schedule_custom_model_cache_refresh_for(
     store: crate::auth::custom::CredentialStore,
+    provider_id: String,
     cred: crate::auth::custom::CustomCredential,
     credential_fingerprint: String,
     refresh_interval: Duration,
 ) {
-    if cfg!(test) || !store.model_cache_is_stale(refresh_interval).unwrap_or(true) {
+    if cfg!(test)
+        || !store
+            .model_cache_is_stale_for(&provider_id, refresh_interval)
+            .unwrap_or(true)
+    {
         return;
     }
     let _ = std::thread::Builder::new()
-        .name("ygg-custom-catalog-refresh".to_owned())
+        .name(format!("ygg-custom-{provider_id}-catalog-refresh"))
         .spawn(move || {
-            let discovered = discover_models_blocking(&cred, false);
+            let discovered = apply_configured_custom_model_overrides(
+                discover_models_blocking(&cred, false),
+                &configured_custom_models(&cred),
+            );
             if !discovered.is_empty() {
-                let _ = save_custom_model_cache(
+                let _ = save_custom_model_cache_for(
                     &store,
+                    &provider_id,
                     &cred.base_url,
                     &credential_fingerprint,
                     &discovered,
@@ -1579,6 +1623,42 @@ fn schedule_custom_model_cache_refresh(
         });
 }
 
+fn refresh_stale_custom_models_with_for<F>(
+    store: &crate::auth::custom::CredentialStore,
+    provider_id: &str,
+    cred: &crate::auth::custom::CustomCredential,
+    credential_fingerprint: &str,
+    cached: Vec<crate::auth::custom::CustomModel>,
+    refresh_interval: Duration,
+    discover: F,
+) -> Vec<crate::auth::custom::CustomModel>
+where
+    F: FnOnce(&crate::auth::custom::CustomCredential) -> Vec<crate::auth::custom::CustomModel>,
+{
+    if !store
+        .model_cache_is_stale_for(provider_id, refresh_interval)
+        .unwrap_or(true)
+    {
+        return cached;
+    }
+
+    let discovered = discover_and_cache_custom_models_with_for(
+        store,
+        provider_id,
+        cred,
+        credential_fingerprint,
+        false,
+        discover,
+    );
+    if discovered.is_empty() {
+        // A transient discovery failure must not discard a last-good catalog.
+        cached
+    } else {
+        discovered
+    }
+}
+
+#[cfg(test)]
 fn refresh_stale_custom_models_with<F>(
     store: &crate::auth::custom::CredentialStore,
     cred: &crate::auth::custom::CustomCredential,
@@ -1590,20 +1670,45 @@ fn refresh_stale_custom_models_with<F>(
 where
     F: FnOnce(&crate::auth::custom::CustomCredential) -> Vec<crate::auth::custom::CustomModel>,
 {
-    if !store.model_cache_is_stale(refresh_interval).unwrap_or(true) {
-        return cached;
-    }
-
-    let discovered =
-        discover_and_cache_custom_models_with(store, cred, credential_fingerprint, false, discover);
-    if discovered.is_empty() {
-        // A transient discovery failure must not discard a last-good catalog.
-        cached
-    } else {
-        discovered
-    }
+    refresh_stale_custom_models_with_for(
+        store,
+        crate::auth::custom::ENDPOINT_ID,
+        cred,
+        credential_fingerprint,
+        cached,
+        refresh_interval,
+        discover,
+    )
 }
 
+fn discover_and_cache_custom_models_with_for<F>(
+    store: &crate::auth::custom::CredentialStore,
+    provider_id: &str,
+    cred: &crate::auth::custom::CustomCredential,
+    credential_fingerprint: &str,
+    persist_empty: bool,
+    discover: F,
+) -> Vec<crate::auth::custom::CustomModel>
+where
+    F: FnOnce(&crate::auth::custom::CustomCredential) -> Vec<crate::auth::custom::CustomModel>,
+{
+    let discovered =
+        apply_configured_custom_model_overrides(discover(cred), &configured_custom_models(cred));
+    if persist_empty || !discovered.is_empty() {
+        if let Err(error) = save_custom_model_cache_for(
+            store,
+            provider_id,
+            &cred.base_url,
+            credential_fingerprint,
+            &discovered,
+        ) {
+            eprintln!("warning: could not persist custom model metadata: {error}");
+        }
+    }
+    discovered
+}
+
+#[cfg(test)]
 fn discover_and_cache_custom_models_with<F>(
     store: &crate::auth::custom::CredentialStore,
     cred: &crate::auth::custom::CustomCredential,
@@ -1614,15 +1719,14 @@ fn discover_and_cache_custom_models_with<F>(
 where
     F: FnOnce(&crate::auth::custom::CustomCredential) -> Vec<crate::auth::custom::CustomModel>,
 {
-    let discovered = discover(cred);
-    if persist_empty || !discovered.is_empty() {
-        if let Err(error) =
-            save_custom_model_cache(store, &cred.base_url, credential_fingerprint, &discovered)
-        {
-            eprintln!("warning: could not persist custom model metadata: {error}");
-        }
-    }
-    discovered
+    discover_and_cache_custom_models_with_for(
+        store,
+        crate::auth::custom::ENDPOINT_ID,
+        cred,
+        credential_fingerprint,
+        persist_empty,
+        discover,
+    )
 }
 
 fn configured_custom_models(
@@ -1639,6 +1743,35 @@ fn configured_custom_models(
     } else {
         Vec::new()
     }
+}
+
+fn apply_configured_custom_model_overrides(
+    discovered: Vec<crate::auth::custom::CustomModel>,
+    configured: &[crate::auth::custom::CustomModel],
+) -> Vec<crate::auth::custom::CustomModel> {
+    if configured.is_empty() {
+        return discovered;
+    }
+
+    let mut merged = Vec::with_capacity(discovered.len() + configured.len());
+    for model in discovered {
+        merged.push(
+            configured
+                .iter()
+                .find(|override_model| override_model.api_name == model.api_name)
+                .cloned()
+                .unwrap_or(model),
+        );
+    }
+    for model in configured {
+        if !merged
+            .iter()
+            .any(|existing| existing.api_name == model.api_name)
+        {
+            merged.push(model.clone());
+        }
+    }
+    merged
 }
 
 fn resolve_custom_startup_timeout(
@@ -1727,6 +1860,26 @@ fn custom_reasoning_capability(
     if !model.reasoning {
         return None;
     }
+    let fixed_mode = if model.reasoning_uses_system_message {
+        OpenAiChatReasoningMode::SystemMessage
+    } else {
+        OpenAiChatReasoningMode::Standard
+    };
+    if !model.reasoning_configurable {
+        // Some providers think by default but reject every reasoning control
+        // parameter. Keep that fact visible to ygg as a single `on` option while
+        // retaining a parameter-free request path.
+        return Some(ReasoningCapability {
+            control: ReasoningControl::AlwaysOn,
+            exposes_text: true,
+            preserves_state: false,
+            supports_pro_mode: false,
+            effort_budgets: None,
+            openai_chat_mode: fixed_mode,
+            min_effort: ygg_ai::ReasoningEffort::Minimal,
+            max_effort: ygg_ai::ReasoningEffort::High,
+        });
+    }
     let efforts = model
         .reasoning_values
         .iter()
@@ -1758,11 +1911,7 @@ fn custom_reasoning_capability(
         .max()
         .unwrap_or(ygg_ai::ReasoningEffort::High);
     let openai_chat_mode = if model.reasoning_values.is_empty() {
-        if model.reasoning_uses_system_message {
-            OpenAiChatReasoningMode::SystemMessage
-        } else {
-            OpenAiChatReasoningMode::Standard
-        }
+        fixed_mode
     } else {
         OpenAiChatReasoningMode::ProviderValues {
             values: model.reasoning_values.clone(),
@@ -1782,26 +1931,151 @@ fn custom_reasoning_capability(
     })
 }
 
-fn register_custom_openai_endpoint(
+fn validate_custom_provider_id(provider_id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !provider_id.is_empty()
+            && provider_id.len() <= 64
+            && provider_id.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            ),
+        "custom provider id must be 1-64 ASCII letters, digits, '-' or '_': {provider_id:?}"
+    );
+    Ok(())
+}
+
+fn resolve_custom_provider_auth(
+    provider: &crate::auth::custom::CustomProvider,
+    legacy_single_endpoint: bool,
+) -> anyhow::Result<(Auth, String)> {
+    anyhow::ensure!(
+        !(provider.auth.is_some() && provider.api_key_env.is_some()),
+        "custom provider cannot set both auth and api_key_env"
+    );
+
+    let environment_auth = |var: &str| -> anyhow::Result<(Auth, String)> {
+        let var = var.trim();
+        anyhow::ensure!(
+            !var.is_empty()
+                && var
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_'),
+            "custom provider auth environment variable must be a valid name: {var:?}"
+        );
+        let key = std::env::var(var)
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or_default();
+        Ok((Auth::bearer_env(var), key))
+    };
+
+    if let Some(auth) = &provider.auth {
+        return match auth {
+            crate::auth::custom::CustomAuthConfig::None => Ok((Auth::None, String::new())),
+            crate::auth::custom::CustomAuthConfig::BearerEnv { var } => environment_auth(var),
+        };
+    }
+    if let Some(var) = provider.api_key_env.as_deref() {
+        return environment_auth(var);
+    }
+    if !provider.credential.api_key.is_empty() {
+        return Ok((
+            Auth::bearer(provider.credential.api_key.as_str()),
+            provider.credential.api_key.clone(),
+        ));
+    }
+    if legacy_single_endpoint {
+        let Some(key) = std::env::var("YGG_CUSTOM_API_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+        else {
+            return Ok((Auth::None, String::new()));
+        };
+        return Ok((Auth::bearer_env("YGG_CUSTOM_API_KEY"), key));
+    }
+    Ok((Auth::None, String::new()))
+}
+
+fn custom_model_id(
+    provider_id: &str,
+    legacy_single_endpoint: bool,
+    model: &crate::auth::custom::CustomModel,
+) -> String {
+    if legacy_single_endpoint {
+        let configured_display =
+            (!model.display_name.trim().is_empty()).then(|| model.display_name.trim().to_owned());
+        let canonical_label = configured_display.as_deref().unwrap_or(&model.api_name);
+        format!("custom/{canonical_label}")
+    } else {
+        format!("custom/{provider_id}/{}", model.api_name)
+    }
+}
+
+fn register_custom_openai_endpoints(
     catalog: &mut ModelCatalog,
     offline: bool,
 ) -> anyhow::Result<()> {
-    use crate::auth::custom::{self, CustomModel};
+    let store = crate::auth::custom::CredentialStore::new(crate::auth::custom::default_path());
+    register_custom_openai_endpoints_from_store(catalog, &store, offline)
+}
 
-    let store = custom::CredentialStore::new(custom::default_path());
-    let Some(cred) = store.load()? else {
-        return Ok(()); // no custom endpoint configured
+fn register_custom_openai_endpoints_from_store(
+    catalog: &mut ModelCatalog,
+    store: &crate::auth::custom::CredentialStore,
+    offline: bool,
+) -> anyhow::Result<()> {
+    let Some(registry) = store.load_registry()? else {
+        return Ok(());
     };
-    // Optional top-level `cache` controls let gateways opt into Anthropic
-    // markers and affinity headers without changing the legacy credential
-    // struct shape.
-    let cache = store
-        .load_cache_compatibility()?
-        .unwrap_or_else(ygg_ai::CacheCompatibility::default);
+    for (provider_id, provider) in registry.providers {
+        let legacy_single_endpoint =
+            registry.legacy_single_endpoint && provider_id == crate::auth::custom::ENDPOINT_ID;
+        let mut provider_catalog = ModelCatalog::default();
+        if let Err(error) = register_custom_openai_provider(
+            &mut provider_catalog,
+            store,
+            &provider_id,
+            &provider,
+            legacy_single_endpoint,
+            offline,
+        ) {
+            let label = provider.label.trim();
+            let label = if label.is_empty() {
+                &provider_id
+            } else {
+                label
+            };
+            eprintln!("warning: custom provider {label:?} unavailable: {error}");
+            continue;
+        }
+        if let Err(error) = merge_provider_catalog(catalog, provider_catalog) {
+            eprintln!("warning: custom provider {provider_id:?} unavailable: {error}");
+        }
+    }
+    Ok(())
+}
+
+fn register_custom_openai_provider(
+    catalog: &mut ModelCatalog,
+    store: &crate::auth::custom::CredentialStore,
+    provider_id: &str,
+    provider: &crate::auth::custom::CustomProvider,
+    legacy_single_endpoint: bool,
+    offline: bool,
+) -> anyhow::Result<()> {
+    use crate::auth::custom::CustomModel;
+
+    validate_custom_provider_id(provider_id)?;
+    let (auth, effective_key) = resolve_custom_provider_auth(provider, legacy_single_endpoint)?;
+    let mut cred = provider.credential.clone();
+    // Discovery uses the resolved value in memory; it is never written back to
+    // the provider registry. Requests use the redacted Auth strategy below.
+    cred.api_key = effective_key.clone();
+
     let startup_timeout = resolve_custom_startup_timeout(
-        store.load_startup_timeout_secs()?,
-        std::env::var("YGG_CUSTOM_STARTUP_TIMEOUT_SECS")
-            .ok()
+        provider.startup_timeout_secs,
+        legacy_single_endpoint
+            .then(|| std::env::var("YGG_CUSTOM_STARTUP_TIMEOUT_SECS").ok())
+            .flatten()
             .as_deref(),
     )?;
 
@@ -1810,26 +2084,7 @@ fn register_custom_openai_endpoint(
     } else {
         url::Url::parse(&format!("{}/", cred.base_url))
     }
-    .map_err(|e| anyhow::anyhow!("invalid custom endpoint base URL {}: {e}", cred.base_url))?;
-
-    // When the file contains an API key, use it directly via Auth::bearer.
-    // When the file leaves api_key empty, try the YGG_CUSTOM_API_KEY env var.
-    // If neither is available, the endpoint is unauthenticated.
-    let environment_key = std::env::var("YGG_CUSTOM_API_KEY")
-        .ok()
-        .filter(|key| !key.trim().is_empty());
-    let effective_key = if !cred.api_key.is_empty() {
-        cred.api_key.as_str()
-    } else {
-        environment_key.as_deref().unwrap_or_default()
-    };
-    let auth = if !cred.api_key.is_empty() {
-        Auth::bearer(cred.api_key.as_str())
-    } else if environment_key.is_some() {
-        Auth::bearer_env("YGG_CUSTOM_API_KEY")
-    } else {
-        Auth::None
-    };
+    .map_err(|e| anyhow::anyhow!("invalid custom provider base URL {}: {e}", cred.base_url))?;
 
     let mut default_headers = http::HeaderMap::new();
     for header in &cred.headers {
@@ -1840,30 +2095,44 @@ fn register_custom_openai_endpoint(
         default_headers.insert(name, value);
     }
     let custom_credential_fingerprint =
-        custom_credential_fingerprint(effective_key, &default_headers);
+        custom_credential_fingerprint(&effective_key, &default_headers);
+    let endpoint_id = EndpointId(crate::auth::custom::endpoint_id(provider_id));
 
-    let endpoint = Endpoint {
-        id: EndpointId(custom::ENDPOINT_ID.into()),
+    catalog.register_endpoint(Endpoint {
+        id: endpoint_id.clone(),
         base_url,
         auth,
         default_headers,
         transport: ygg_ai::EndpointTransport::Http,
         timeout: startup_timeout,
+    })?;
+    let label = provider.label.trim();
+    let label = if label.is_empty() {
+        if legacy_single_endpoint {
+            "local endpoint"
+        } else {
+            provider_id
+        }
+    } else {
+        label
     };
-    catalog.register_endpoint(endpoint)?;
+    catalog.set_endpoint_label(endpoint_id.clone(), label.to_owned())?;
 
     // A successful inventory is durable startup metadata, not something every
-    // invocation should fetch again. A fresh cache removes a network round trip
-    // from resume/model-picker latency and also keeps discovered local models
-    // available in explicit offline mode. Once stale, refresh it before building
-    // this process's catalog; a background-only refresh leaves a switched local
-    // server displaying the previous model until Ygg is restarted again.
+    // invocation should fetch again. The provider-specific cache path prevents
+    // one endpoint's inventory from being used by another endpoint.
     let configured = configured_custom_models(&cred);
+    let configured_overrides = configured.clone();
     let cached = if cred.auto_discover {
-        match load_custom_model_cache(&store, &cred.base_url, &custom_credential_fingerprint) {
+        match load_custom_model_cache_for(
+            store,
+            provider_id,
+            &cred.base_url,
+            &custom_credential_fingerprint,
+        ) {
             Ok(models) => models,
             Err(error) => {
-                eprintln!("warning: custom model cache unavailable: {error}");
+                eprintln!("warning: custom provider model cache unavailable: {error}");
                 None
             }
         }
@@ -1875,8 +2144,9 @@ fn register_custom_openai_endpoint(
             if offline {
                 models
             } else {
-                refresh_stale_custom_models_with(
-                    &store,
+                refresh_stale_custom_models_with_for(
+                    store,
+                    provider_id,
                     &cred,
                     &custom_credential_fingerprint,
                     models,
@@ -1888,11 +2158,9 @@ fn register_custom_openai_endpoint(
         Some(CachedCustomInventory::Unavailable)
             if cred.auto_discover && !offline && configured.is_empty() =>
         {
-            // With no configured fallback, a background refresh cannot update
-            // this process's catalog. Retry now so recovery is visible in this
-            // launch instead of requiring a third restart.
-            let discovered = discover_and_cache_custom_models_with(
-                &store,
+            let discovered = discover_and_cache_custom_models_with_for(
+                store,
+                provider_id,
                 &cred,
                 &custom_credential_fingerprint,
                 false,
@@ -1906,8 +2174,9 @@ fn register_custom_openai_endpoint(
         }
         Some(CachedCustomInventory::Unavailable) => {
             if !offline {
-                schedule_custom_model_cache_refresh(
+                schedule_custom_model_cache_refresh_for(
                     store.clone(),
+                    provider_id.to_owned(),
                     cred.clone(),
                     custom_credential_fingerprint.clone(),
                     NEGATIVE_INVENTORY_REFRESH_INTERVAL,
@@ -1916,16 +2185,14 @@ fn register_custom_openai_endpoint(
             configured
         }
         None if cred.auto_discover && !offline => {
-            let discovered = discover_and_cache_custom_models_with(
-                &store,
+            let discovered = discover_and_cache_custom_models_with_for(
+                store,
+                provider_id,
                 &cred,
                 &custom_credential_fingerprint,
                 true,
                 discover_models,
             );
-            // A cold empty result is a negative marker, not a positive
-            // inventory. It uses the short refresh policy above and is never
-            // allowed to replace an existing last-good inventory.
             if discovered.is_empty() {
                 configured
             } else {
@@ -1934,38 +2201,41 @@ fn register_custom_openai_endpoint(
         }
         None => configured,
     };
+    let models = apply_configured_custom_model_overrides(models, &configured_overrides);
     if models.is_empty() {
         return Ok(());
     }
 
-    for m in &models {
+    let cache = provider
+        .cache
+        .clone()
+        .unwrap_or_else(ygg_ai::CacheCompatibility::default);
+    for model in &models {
         let configured_display =
-            (!m.display_name.trim().is_empty()).then(|| m.display_name.trim().to_owned());
-        let canonical_label = configured_display.as_deref().unwrap_or(&m.api_name);
-        let model_id = format!("custom/{canonical_label}");
-        let input_mods = if m.vision {
+            (!model.display_name.trim().is_empty()).then(|| model.display_name.trim().to_owned());
+        let input_mods = if model.vision {
             ModalitySet::none().with(ygg_ai::Modality::Image)
         } else {
             ModalitySet::none()
         };
 
         catalog.register_model(ModelSpec {
-            id: ModelId(model_id),
-            endpoint: EndpointId(custom::ENDPOINT_ID.into()),
-            api_name: m.api_name.clone(),
+            id: ModelId(custom_model_id(provider_id, legacy_single_endpoint, model)),
+            endpoint: endpoint_id.clone(),
+            api_name: model.api_name.clone(),
             display_name: configured_display,
             protocol: Protocol::OpenAiChat,
             capabilities: Capabilities {
                 input_modalities: input_mods,
                 output_modalities: ModalitySet::none(),
-                tools: m.tools,
-                parallel_tool_calls: m.tools && m.parallel_tool_calls,
-                reasoning: custom_reasoning_capability(m),
-                structured_output: m.structured_output,
+                tools: model.tools,
+                parallel_tool_calls: model.tools && model.parallel_tool_calls,
+                reasoning: custom_reasoning_capability(model),
+                structured_output: model.structured_output,
             },
             limits: ModelLimits {
-                context_window: m.context_window,
-                max_output_tokens: m.max_output_tokens,
+                context_window: model.context_window,
+                max_output_tokens: model.max_output_tokens,
             },
             pricing: None,
             cache: cache.clone(),
@@ -2026,13 +2296,7 @@ fn discover_models_blocking(
     };
 
     let mut req = client.get(&models_url);
-    let discovery_key = if !cred.api_key.trim().is_empty() {
-        Some(cred.api_key.clone())
-    } else {
-        std::env::var("YGG_CUSTOM_API_KEY")
-            .ok()
-            .filter(|key| !key.trim().is_empty())
-    };
+    let discovery_key = (!cred.api_key.trim().is_empty()).then(|| cred.api_key.clone());
     if let Some(key) = discovery_key {
         req = req.header("Authorization", format!("Bearer {key}"));
     }
@@ -2132,6 +2396,7 @@ fn discover_models_blocking(
             vision,
             structured_output: supports("response_format"),
             reasoning,
+            reasoning_configurable: reasoning,
             reasoning_values,
             reasoning_default,
             // Auto-discovered local models are not guaranteed to implement
@@ -2805,9 +3070,13 @@ fn base_model_catalog(offline: bool) -> anyhow::Result<ModelCatalog> {
     // Explicit custom models remain usable offline; only auto-discovery is skipped.
     // Tests never inspect ambient HOME credentials.
     if !cfg!(test) {
-        if let Err(error) = register_custom_openai_endpoint(&mut catalog, offline) {
-            eprintln!("warning: custom endpoint unavailable: {error}");
+        if let Err(error) = register_custom_openai_endpoints(&mut catalog, offline) {
+            eprintln!("warning: custom provider registry unavailable: {error}");
         }
+        // Custom providers may use provider-scoped environment credentials;
+        // hide models whose referenced variable is not configured, just as the
+        // built-in provider catalog does above.
+        catalog.retain_configured_models();
     }
     Ok(catalog)
 }
@@ -3775,6 +4044,74 @@ mod tests {
     }
 
     #[test]
+    fn configured_custom_model_metadata_overrides_discovered_sparse_inventory() {
+        use crate::auth::custom::CustomModel;
+
+        let mut configured = CustomModel::default();
+        configured.api_name = "system".into();
+        configured.context_window = 4_096;
+        configured.max_output_tokens = 1_024;
+        configured.tools = true;
+        configured.reasoning = true;
+        configured.reasoning_configurable = false;
+
+        let mut discovered_system = CustomModel::default();
+        discovered_system.api_name = "system".into();
+        discovered_system.context_window = 262_144;
+        discovered_system.max_output_tokens = 16_384;
+        discovered_system.tools = true;
+
+        let mut discovered_other = CustomModel::default();
+        discovered_other.api_name = "other".into();
+        discovered_other.context_window = 8_192;
+
+        let configured_missing = CustomModel {
+            api_name: "configured-only".into(),
+            context_window: 12_288,
+            ..Default::default()
+        };
+
+        let merged = apply_configured_custom_model_overrides(
+            vec![discovered_system, discovered_other],
+            &[configured, configured_missing],
+        );
+
+        assert_eq!(merged[0].api_name, "system");
+        assert_eq!(merged[0].context_window, 4_096);
+        assert_eq!(merged[0].max_output_tokens, 1_024);
+        assert!(merged[0].tools);
+        assert!(merged[0].reasoning);
+        assert!(!merged[0].reasoning_configurable);
+        assert_eq!(
+            custom_reasoning_capability(&merged[0]).unwrap().control,
+            ReasoningControl::AlwaysOn
+        );
+        assert_eq!(merged[1].api_name, "other");
+        assert_eq!(merged[1].context_window, 8_192);
+        assert_eq!(merged[2].api_name, "configured-only");
+        assert_eq!(merged[2].context_window, 12_288);
+    }
+
+    #[test]
+    fn fixed_custom_reasoning_is_the_only_ygg_thinking_option() {
+        use crate::auth::custom::CustomModel;
+
+        let fixed = CustomModel {
+            reasoning: true,
+            reasoning_configurable: false,
+            ..Default::default()
+        };
+        let capability = custom_reasoning_capability(&fixed).unwrap();
+        assert_eq!(capability.control, ReasoningControl::AlwaysOn);
+
+        let configurable = CustomModel {
+            reasoning: true,
+            ..Default::default()
+        };
+        assert!(custom_reasoning_capability(&configurable).is_some());
+    }
+
+    #[test]
     fn openrouter_discovery_uses_live_ids_limits_and_capabilities() {
         let response = serde_json::json!({
             "data": [
@@ -4329,6 +4666,99 @@ mod tests {
     }
 
     #[test]
+    fn custom_registry_registers_labeled_providers_with_isolated_auth_and_models() {
+        use crate::auth::custom::{
+            CustomAuthConfig, CustomCredential, CustomModel, CustomProvider, CustomRegistry,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::auth::custom::CredentialStore::new(
+            directory.path().join("credentials/custom.json"),
+        );
+        let provider = |label: &str, base_url: &str, model_id: &str, auth| CustomProvider {
+            label: label.into(),
+            credential: CustomCredential {
+                base_url: base_url.into(),
+                api_key: String::new(),
+                api_name: String::new(),
+                headers: Vec::new(),
+                models: vec![CustomModel {
+                    api_name: model_id.into(),
+                    ..Default::default()
+                }],
+                auto_discover: false,
+            },
+            auth,
+            api_key_env: None,
+            cache: None,
+            startup_timeout_secs: None,
+        };
+        let mut registry = CustomRegistry::single(
+            "apple-fm",
+            provider(
+                "Apple Foundation Models",
+                "http://127.0.0.1:1976/v1/",
+                "shared-model",
+                Some(CustomAuthConfig::None),
+            ),
+        );
+        registry.providers.insert(
+            "home-server".into(),
+            provider(
+                "Home Server",
+                "http://127.0.0.1:8000/v1/",
+                "shared-model",
+                Some(CustomAuthConfig::BearerEnv {
+                    var: "YGG_TEST_HOME_SERVER_KEY".into(),
+                }),
+            ),
+        );
+        registry.providers.insert(
+            "invalid/provider".into(),
+            provider(
+                "Invalid Provider",
+                "http://127.0.0.1:9000/v1/",
+                "invalid-model",
+                Some(CustomAuthConfig::None),
+            ),
+        );
+        store.save_registry(&registry).unwrap();
+
+        let mut catalog = ModelCatalog::default();
+        register_custom_openai_endpoints_from_store(&mut catalog, &store, true).unwrap();
+
+        let apple = catalog
+            .resolve(&ModelId("custom/apple-fm/shared-model".into()))
+            .unwrap();
+        assert_eq!(apple.endpoint.id.0, "custom-apple-fm");
+        assert_eq!(
+            catalog.endpoint_label(&apple.endpoint.id),
+            Some("Apple Foundation Models")
+        );
+        assert_eq!(
+            apple.endpoint.base_url.as_str(),
+            "http://127.0.0.1:1976/v1/"
+        );
+        assert!(matches!(apple.endpoint.auth, Auth::None));
+
+        let home = catalog
+            .resolve(&ModelId("custom/home-server/shared-model".into()))
+            .unwrap();
+        assert_eq!(home.endpoint.id.0, "custom-home-server");
+        assert_eq!(
+            catalog.endpoint_label(&home.endpoint.id),
+            Some("Home Server")
+        );
+        assert!(matches!(
+            home.endpoint.auth,
+            Auth::BearerEnv { ref var } if var == "YGG_TEST_HOME_SERVER_KEY"
+        ));
+        assert!(catalog
+            .resolve(&ModelId("custom/invalid/provider/invalid-model".into()))
+            .is_err());
+    }
+
+    #[test]
     fn custom_model_cache_is_scoped_to_endpoint_and_reuses_discovery() {
         let directory = tempfile::tempdir().unwrap();
         let store = crate::auth::custom::CredentialStore::new(
@@ -4344,6 +4774,7 @@ mod tests {
             vision: false,
             structured_output: false,
             reasoning: true,
+            reasoning_configurable: true,
             reasoning_values: Vec::new(),
             reasoning_default: String::new(),
             reasoning_uses_system_message: true,

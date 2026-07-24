@@ -220,12 +220,7 @@ fn render_composer_box(
     }
 
     let theme = &state.theme;
-    let horizontal_padding = usize::from(
-        theme
-            .layout_for_width(width)
-            .composer_padding
-            .saturating_add(1),
-    );
+    let horizontal_padding = usize::from(theme.layout_for_width(width).composer_padding);
     let inner_width = w.saturating_sub(2 + horizontal_padding.saturating_mul(2));
     if inner_width == 0 {
         return render_plain_content(state, width);
@@ -1123,7 +1118,7 @@ pub fn render_composer_surface(
         width.saturating_sub(padding.saturating_add(2)).max(1)
     } else {
         width
-            .saturating_sub(2 + layout.composer_padding.saturating_add(1).saturating_mul(2))
+            .saturating_sub(2 + layout.composer_padding.saturating_mul(2))
             .max(1)
     };
     let visual_lines = if editor.is_empty() {

@@ -2439,6 +2439,43 @@ mod tests {
     }
 
     #[test]
+    fn always_on_reasoning_uses_provider_default_without_a_control_parameter() {
+        let mut model = make_test_model(false, false, false, true, true, false);
+        let capability = Arc::make_mut(&mut model.spec)
+            .capabilities
+            .reasoning
+            .as_mut()
+            .unwrap();
+        capability.control = crate::types::ReasoningControl::AlwaysOn;
+        capability.openai_chat_mode = OpenAiChatReasoningMode::SystemMessage;
+        let request = Request {
+            system: Some("system prompt".to_string()),
+            messages: vec![Message::User(UserMessage {
+                content: vec![UserPart::Text("hello".to_string())],
+            })],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: None,
+            temperature: None,
+            stop: vec![],
+            reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
+        };
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &request).unwrap().body).unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
     fn provider_reasoning_values_preserve_literals_but_omit_semantic_default() {
         let mut model = make_test_model(false, false, false, true, true, false);
         let capability = Arc::make_mut(&mut model.spec)

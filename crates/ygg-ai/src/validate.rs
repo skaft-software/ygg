@@ -590,11 +590,13 @@ pub(crate) fn validate_request(
         }
         let supported = match (&req.reasoning, &caps.reasoning) {
             (_, None) => false,
-            (ReasoningConfig::On, Some(capability)) => {
-                capability.control == crate::types::ReasoningControl::Toggle
-            }
+            (ReasoningConfig::On, Some(capability)) => matches!(
+                capability.control,
+                crate::types::ReasoningControl::AlwaysOn | crate::types::ReasoningControl::Toggle
+            ),
             (ReasoningConfig::Effort(_), Some(capability)) => {
                 capability.control != crate::types::ReasoningControl::Toggle
+                    && capability.control != crate::types::ReasoningControl::AlwaysOn
             }
             (ReasoningConfig::Budget(budget), Some(capability)) => {
                 capability.control == crate::types::ReasoningControl::TokenBudget
