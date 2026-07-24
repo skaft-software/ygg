@@ -420,6 +420,9 @@ pub struct TUI<'a> {
     inline_committed_rows: usize,
     /// First logical row represented by grid row zero in pinned mode.
     inline_window_top: usize,
+    /// Nested renderer helpers share one synchronized-output transaction so
+    /// cursor placement becomes visible atomically with the frame.
+    synchronized_output_depth: usize,
 }
 
 impl<'a> TUI<'a> {
@@ -440,6 +443,7 @@ impl<'a> TUI<'a> {
             inline_bottom_row: 0,
             inline_committed_rows: 0,
             inline_window_top: 0,
+            synchronized_output_depth: 0,
         }
     }
 
@@ -548,6 +552,7 @@ impl<'a> TUI<'a> {
         // expected to be idempotent.
         if self.capabilities.synchronized_output {
             self.terminal.write("\x1b[?2026l");
+            self.synchronized_output_depth = 0;
         }
         if !self.capabilities.plain {
             self.terminal.write("\x1b[0m\x1b]8;;\x1b\\");
@@ -717,6 +722,11 @@ impl<'a> TUI<'a> {
             rendered
         };
 
+        // Cursor movement caused by frame writes must not become visible before
+        // the final hardware-cursor address. This is especially noticeable as
+        // a transient hollow cursor in the terminal's bottom-right cell.
+        self.begin_synchronized_output();
+
         // A terminal reflows the old frame before delivering its resize event.
         // Cursor-relative differential updates are therefore invalid even when
         // the logical line count did not change; clear and redraw from home.
@@ -818,6 +828,7 @@ impl<'a> TUI<'a> {
         } else if self.capabilities.cursor_addressing {
             self.terminal.hide_cursor();
         }
+        self.end_synchronized_output();
         self.previous_frame = new_lines;
         self.previous_size = Some((width, height));
     }
@@ -1486,13 +1497,21 @@ impl<'a> TUI<'a> {
     }
 
     fn begin_synchronized_output(&mut self) {
-        if self.capabilities.synchronized_output {
+        if !self.capabilities.synchronized_output {
+            return;
+        }
+        if self.synchronized_output_depth == 0 {
             self.terminal.write("\x1b[?2026h");
         }
+        self.synchronized_output_depth = self.synchronized_output_depth.saturating_add(1);
     }
 
     fn end_synchronized_output(&mut self) {
-        if self.capabilities.synchronized_output {
+        if !self.capabilities.synchronized_output || self.synchronized_output_depth == 0 {
+            return;
+        }
+        self.synchronized_output_depth -= 1;
+        if self.synchronized_output_depth == 0 {
             self.terminal.write("\x1b[?2026l");
         }
     }
@@ -2728,11 +2747,18 @@ mod tests {
         let size = Rc::new(Cell::new((20, 8)));
         let (terminal, _, _, _, _, synchronized_writes) = recording_terminal(size, synchronized);
         let mut synchronized_tui = TUI::new(Box::new(terminal));
-        synchronized_tui.add_child(Box::new(OneLine));
+        synchronized_tui.add_child(Box::new(MutableLines(Rc::new(RefCell::new(vec![
+            format!("ab{CURSOR_MARKER}c"),
+        ])))));
         synchronized_tui.start();
         let output = synchronized_writes.borrow().join("");
-        assert!(output.contains("\x1b[?2026h"));
-        assert!(output.contains("\x1b[?2026l"));
+        let begin = output.find("\x1b[?2026h").unwrap();
+        let cursor = output.rfind("\x1b[1;3H").unwrap();
+        let end = output.rfind("\x1b[?2026l").unwrap();
+        assert!(
+            begin < cursor && cursor < end,
+            "cursor placement must be atomic: {output:?}"
+        );
     }
 
     struct StaticOverlay {

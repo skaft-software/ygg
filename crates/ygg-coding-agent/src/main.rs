@@ -18,6 +18,7 @@ mod session_commands;
 mod session_store;
 mod session_tree;
 mod tui;
+mod update;
 
 use clap::Parser;
 

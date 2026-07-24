@@ -19,6 +19,8 @@ pub enum InputAction {
     ShowCompactionSummary,
     /// Toggle verbose transcript mode for all expandable blocks (ctrl+o).
     ExpandFocusedTool,
+    /// Cycle to the next thinking level supported by the active model.
+    CycleThinking,
     Edit(EditAction),
     Resize(u16, u16),
     /// Page-based transcript navigation from PageUp/PageDown.
@@ -247,6 +249,12 @@ pub fn translate_with_popup(
                 && crate::tui::composer::active_mention(editor_text).is_some()
             {
                 return InputAction::CompleteMention;
+            }
+
+            if key.code == KeyCode::BackTab
+                || (key.code == KeyCode::Tab && key.modifiers == KeyModifiers::SHIFT)
+            {
+                return InputAction::CycleThinking;
             }
 
             match (active, key.code, key.modifiers) {
@@ -711,6 +719,30 @@ mod tests {
         assert_eq!(
             translate(Some(Event::Key(repeated_character)), false, "text"),
             InputAction::Edit(EditAction::Char('x'))
+        );
+    }
+
+    #[test]
+    fn shift_tab_cycles_thinking_as_a_one_shot_action() {
+        assert_eq!(
+            translate(
+                Some(key(KeyCode::BackTab, KeyModifiers::SHIFT)),
+                false,
+                "draft",
+            ),
+            InputAction::CycleThinking
+        );
+        assert_eq!(
+            translate(
+                Some(Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::BackTab,
+                    KeyModifiers::SHIFT,
+                    KeyEventKind::Repeat,
+                ))),
+                false,
+                "draft",
+            ),
+            InputAction::Ignore
         );
     }
 

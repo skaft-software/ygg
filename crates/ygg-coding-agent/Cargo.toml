@@ -52,6 +52,7 @@ ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking", "stream"] }
 base64 = "0.22"
 regex = "1"
+semver = "1"
 async-trait = "0.1"
 tempfile = "3"
 signal-hook = "0.3"

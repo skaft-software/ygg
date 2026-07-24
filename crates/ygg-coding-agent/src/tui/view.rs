@@ -356,6 +356,9 @@ struct AssistantBlock {
     reasoning_elapsed: Option<Duration>,
     /// Decorative live-label animation frame; never persisted as content.
     reasoning_animation_frame: u64,
+    /// Only the newest reasoning block advertises the global disclosure key.
+    /// Older repeated hints become noise once a newer thinking event exists.
+    show_reasoning_hint: bool,
 }
 
 impl AssistantBlock {
@@ -372,6 +375,7 @@ impl AssistantBlock {
             reasoning_started_at: None,
             reasoning_elapsed: None,
             reasoning_animation_frame: 0,
+            show_reasoning_hint: true,
         }
     }
 
@@ -914,6 +918,32 @@ impl ShellState {
         cache.dirty = true;
     }
 
+    fn invalidate_disclosure(&mut self) {
+        let indices = self
+            .transcript
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| {
+                matches!(
+                    block,
+                    TranscriptBlock::Reasoning(_)
+                        | TranscriptBlock::Compaction(_)
+                        | TranscriptBlock::Tool(_)
+                        | TranscriptBlock::Shell(_)
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in &indices {
+            if let Some(revision) = self.block_revisions.get_mut(*index) {
+                *revision = revision.saturating_add(1);
+            }
+        }
+        let cache = self.transcript_cache.get_mut();
+        cache.dirty = true;
+        cache.dirty_blocks.extend(indices);
+    }
+
     fn invalidate_rich_text(&mut self) {
         *self.rich_renderer.get_mut() = None;
         *self.reasoning_renderer.get_mut() = None;
@@ -1237,6 +1267,21 @@ impl ShellState {
             }
         }
 
+        if channel == OutputChannel::Reasoning {
+            if let Some(previous) = self
+                .transcript
+                .iter()
+                .rposition(|block| matches!(block, TranscriptBlock::Reasoning(_)))
+            {
+                if let Some(TranscriptBlock::Reasoning(reasoning)) =
+                    self.transcript.get_mut(previous)
+                {
+                    reasoning.show_reasoning_hint = false;
+                }
+                self.touch_block(previous);
+            }
+        }
+
         let index = self.transcript.len();
         let model_lab = self.executing_model_lab();
         self.push_block(match channel {
@@ -1426,10 +1471,10 @@ fn synchronize_terminal_size(state: &SharedState, size: &TerminalSize) -> bool {
 
     let mut shell = state.borrow_mut();
     shell.size = dimensions;
-    let maximum = max_scroll_from_bottom(&shell, dimensions.0);
-    shell
-        .scroll_from_bottom
-        .set(shell.scroll_from_bottom.get().min(maximum));
+    // Do not ask for transcript geometry here: that would synchronously reflow
+    // the complete history and then invalidate it, paying the resize cost
+    // twice. Viewport readers clamp the retained scroll offset after the render
+    // thread performs the single required layout pass.
     shell.invalidate_transcript_layout();
     true
 }
@@ -1677,7 +1722,7 @@ fn live_reasoning_label(theme: &YggTheme, reasoning: &AssistantBlock) -> String 
         .collect()
 }
 
-fn collapsed_reasoning_lines(theme: &YggTheme, reasoning: &AssistantBlock) -> [String; 2] {
+fn collapsed_reasoning_lines(theme: &YggTheme, reasoning: &AssistantBlock) -> Vec<String> {
     let label = if reasoning.finished {
         let text = reasoning.reasoning_elapsed.map_or_else(
             || "thought".to_owned(),
@@ -1692,10 +1737,11 @@ fn collapsed_reasoning_lines(theme: &YggTheme, reasoning: &AssistantBlock) -> [S
     } else {
         "`"
     };
-    [
-        label,
-        subdued_text(theme, &format!("{elbow} ctrl+o to expand")),
-    ]
+    let mut lines = vec![label];
+    if reasoning.show_reasoning_hint {
+        lines.push(subdued_text(theme, &format!("{elbow} ctrl+o to expand")));
+    }
+    lines
 }
 
 /// A low-contrast annotation that remains readable without relying on a
@@ -5867,15 +5913,22 @@ impl InteractiveShell {
             }
             EditAction::Up | EditAction::Down => {
                 let layout = editor_layout(&state.editor, state.editor_cursor, state.size.0);
-                let current = &layout.lines[layout.cursor_row];
-                let target_row = if matches!(action, EditAction::Up) {
-                    layout.cursor_row.saturating_sub(1)
+                let last_row = layout.lines.len().saturating_sub(1);
+                if matches!(action, EditAction::Up) && layout.cursor_row == 0 {
+                    state.editor_cursor = 0;
+                } else if matches!(action, EditAction::Down) && layout.cursor_row == last_row {
+                    state.editor_cursor = state.editor.len();
                 } else {
-                    (layout.cursor_row + 1).min(layout.lines.len().saturating_sub(1))
-                };
-                let column = editor_column(&state.editor, current, state.editor_cursor);
-                state.editor_cursor =
-                    editor_offset_at_column(&state.editor, &layout.lines[target_row], column);
+                    let current = &layout.lines[layout.cursor_row];
+                    let target_row = if matches!(action, EditAction::Up) {
+                        layout.cursor_row - 1
+                    } else {
+                        layout.cursor_row + 1
+                    };
+                    let column = editor_column(&state.editor, current, state.editor_cursor);
+                    state.editor_cursor =
+                        editor_offset_at_column(&state.editor, &layout.lines[target_row], column);
+                }
             }
             EditAction::Home | EditAction::End => {
                 let layout = editor_layout(&state.editor, state.editor_cursor, state.size.0);
@@ -6115,17 +6168,10 @@ impl InteractiveShell {
             return;
         }
         state.verbose_tools = verbose;
-        for block in &mut state.transcript {
-            match block {
-                TranscriptBlock::Reasoning(reasoning) => {
-                    reasoning.reasoning_expanded = verbose;
-                    reasoning.invalidate_layout();
-                }
-                TranscriptBlock::Compaction(compaction) => compaction.expanded = verbose,
-                _ => {}
-            }
-        }
-        state.invalidate_transcript_layout();
+        // Keep the existing width/layout caches and invalidate only blocks
+        // whose disclosure actually changes. The old full-layout reset made
+        // Ctrl+O reparse every assistant answer in long sessions.
+        state.invalidate_disclosure();
     }
 
     pub fn verbose_tools(&self) -> bool {
@@ -6195,10 +6241,9 @@ impl InteractiveShell {
         *self.size.lock().expect("terminal size mutex poisoned") = (columns, rows);
         let mut state = self.state.borrow_mut();
         state.size = (columns, rows);
-        let maximum = max_scroll_from_bottom(&state, columns);
-        state
-            .scroll_from_bottom
-            .set(state.scroll_from_bottom.get().min(maximum));
+        // Reflow belongs exclusively to `ygg-tui-render`. Computing the scroll
+        // maximum here used to rebuild a long transcript on the input thread,
+        // immediately discard that layout, and rebuild it again for paint.
         state.invalidate_transcript_layout();
     }
 
@@ -6921,6 +6966,23 @@ impl InteractiveShell {
             spinner: "⠋".to_string(),
         })));
         id
+    }
+
+    /// Replace the bounded live output shown by an in-progress local shell
+    /// command. The caller coalesces pipe reads, so this updates one retained
+    /// block without rebuilding unrelated transcript history.
+    pub fn update_shell_output(&mut self, id: &str, output: String) {
+        let mut state = self.state.borrow_mut();
+        let index = state
+            .transcript
+            .iter()
+            .rposition(|block| matches!(block, TranscriptBlock::Shell(shell) if shell.id == id));
+        if let Some(index) = index {
+            if let TranscriptBlock::Shell(shell) = &mut state.transcript[index] {
+                shell.output = output;
+            }
+            state.touch_block(index);
+        }
     }
 
     /// Update the spinner character on an in-progress shell block.
@@ -8262,6 +8324,30 @@ mod tests {
     }
 
     #[test]
+    fn running_local_shell_repaints_the_latest_output_tail_before_exit() {
+        let mut shell = InteractiveShell::test_shell();
+        let id = shell.append_shell_in_progress("long command".into());
+        shell.update_shell_output(
+            &id,
+            (1..=8)
+                .map(|line| format!("LIVE OUTPUT {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let rendered = shell
+            .state
+            .borrow()
+            .rendered_transcript(80)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("LIVE OUTPUT 1"), "{rendered}");
+        assert!(rendered.contains("LIVE OUTPUT 4"), "{rendered}");
+        assert!(rendered.contains("LIVE OUTPUT 8"), "{rendered}");
+    }
+
+    #[test]
     fn local_shell_commands_do_not_claim_a_model_prompt_color() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_identity("openai", "gpt-5.6", "high");
@@ -8431,6 +8517,27 @@ mod tests {
                 assert!(rendered.iter().any(|line| line.contains(CURSOR_MARKER)));
             }
         }
+    }
+
+    #[test]
+    fn vertical_editor_navigation_snaps_to_document_boundaries() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(40, 12);
+        for character in "first\nsecond\nthird".chars() {
+            shell.apply_edit(EditAction::Char(character));
+        }
+        shell.apply_edit(EditAction::Home);
+        shell.apply_edit(EditAction::Up);
+        shell.apply_edit(EditAction::Up);
+        shell.apply_edit(EditAction::Up);
+        assert_eq!(shell.state.borrow().editor_cursor, 0);
+
+        shell.apply_edit(EditAction::End);
+        shell.apply_edit(EditAction::Down);
+        shell.apply_edit(EditAction::Down);
+        shell.apply_edit(EditAction::Down);
+        let state = shell.state.borrow();
+        assert_eq!(state.editor_cursor, state.editor.len());
     }
 
     #[test]
@@ -10209,6 +10316,30 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_o_keeps_width_cache_and_invalidates_only_disclosure_blocks() {
+        let mut shell = InteractiveShell::test_shell();
+        {
+            let mut state = shell.state.borrow_mut();
+            for index in 0..256 {
+                state.push_block(TranscriptBlock::Assistant(Box::new(
+                    AssistantBlock::finalized(format!("stable answer {index}")),
+                )));
+            }
+            state.push_block(TranscriptBlock::Reasoning(Box::new(
+                AssistantBlock::finalized_reasoning("expand me".into()),
+            )));
+            let _ = state.rendered_transcript(100);
+            assert_eq!(state.transcript_cache.borrow().width, Some(100));
+        }
+
+        shell.expand_focused_tool();
+        let state = shell.state.borrow();
+        let cache = state.transcript_cache.borrow();
+        assert_eq!(cache.width, Some(100));
+        assert_eq!(cache.dirty_blocks, [256]);
+    }
+
+    #[test]
     fn tool_rendering_hides_failure_evidence_but_keeps_intent() {
         use ygg_agent::{ToolError, ToolOutput};
         let mut shell = InteractiveShell::test_shell();
@@ -10433,9 +10564,10 @@ mod tests {
         let renderer = theme.rich_renderer();
         let rendered =
             render_block(None, &panel, &theme, &renderer, &renderer, 100, false).join("\n");
-        assert!(rendered.contains("-old"), "{rendered}");
-        assert!(rendered.contains("+new"), "{rendered}");
-        assert!(!rendered.contains("hash=abc"), "{rendered}");
+        let plain = strip_terminal_sequences(&rendered);
+        assert!(plain.contains("-old"), "{rendered}");
+        assert!(plain.contains("+new"), "{rendered}");
+        assert!(!plain.contains("hash=abc"), "{rendered}");
     }
 
     #[test]
@@ -10446,10 +10578,11 @@ mod tests {
         );
         let rendered_lines = assistant.render(&theme.rich_renderer(), &theme, 80);
         let rendered = rendered_lines.join("\n");
-        assert!(rendered.contains("@@ -1 +1 @@"));
-        assert!(rendered.contains("-old"));
-        assert!(rendered.contains("+new"));
-        assert!(!rendered.contains("```"));
+        let plain = strip_terminal_sequences(&rendered);
+        assert!(plain.contains("@@ -1 +1 @@"));
+        assert!(plain.contains("-old"));
+        assert!(plain.contains("+new"));
+        assert!(!plain.contains("```"));
 
         let terminal = emulate_rows(&rendered_lines, 80);
         let (removed_row, removed_col) =
@@ -10460,12 +10593,12 @@ mod tests {
             .screen()
             .cell(removed_row, removed_col)
             .expect("removal cell")
-            .bgcolor();
+            .fgcolor();
         let added = terminal
             .screen()
             .cell(added_row, added_col)
             .expect("addition cell")
-            .bgcolor();
+            .fgcolor();
         assert_ne!(removed, vt100::Color::Default);
         assert_ne!(added, vt100::Color::Default);
         assert_ne!(removed, added);
@@ -10661,6 +10794,58 @@ mod tests {
 
         shell.expand_focused_tool();
         assert_eq!(transcript(&shell), initial);
+    }
+
+    #[test]
+    fn a_new_reasoning_event_retires_the_previous_ctrl_o_hint() {
+        let mut shell = InteractiveShell::test_shell();
+        let run_id = shell.begin_run("openai");
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::OutputDelta {
+                channel: OutputChannel::Reasoning,
+                text: "first thought".into(),
+            },
+        );
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::OutputDelta {
+                channel: OutputChannel::Text,
+                text: "answer".into(),
+            },
+        );
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::OutputDelta {
+                channel: OutputChannel::Reasoning,
+                text: "second thought".into(),
+            },
+        );
+        let rendered = shell
+            .state
+            .borrow()
+            .rendered_transcript(80)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered.matches("ctrl+o to expand").count(),
+            1,
+            "{rendered}"
+        );
+        shell.expand_focused_tool();
+        let expanded = shell
+            .state
+            .borrow()
+            .rendered_transcript(80)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded.contains("first thought"), "{expanded}");
+        assert!(expanded.contains("second thought"), "{expanded}");
+        assert!(!expanded.contains("ctrl+o to expand"), "{expanded}");
     }
 
     #[test]
@@ -12304,6 +12489,38 @@ mod tests {
         assert!(composer > 0);
         assert!(lines[composer - 1].is_empty());
         assert!(composer < 2 || !lines[composer - 2].is_empty());
+    }
+
+    #[test]
+    fn resize_defers_exactly_one_transcript_reflow_to_the_render_thread() {
+        let mut shell = InteractiveShell::test_shell();
+        {
+            let mut state = shell.state.borrow_mut();
+            for index in 0..512 {
+                state.push_block(TranscriptBlock::Assistant(Box::new(
+                    AssistantBlock::finalized(format!(
+                        "long stable answer {index} with enough words to wrap across widths"
+                    )),
+                )));
+            }
+            let _ = state.rendered_transcript(100);
+        }
+        let generation = shell.state.borrow().transcript_cache.borrow().generation;
+        shell.set_size(52, 20);
+        {
+            let state = shell.state.borrow();
+            let cache = state.transcript_cache.borrow();
+            assert_eq!(cache.generation, generation, "input thread must not reflow");
+            assert_eq!(cache.width, None);
+        }
+        {
+            let state = shell.state.borrow();
+            let _ = state.rendered_transcript(52);
+        }
+        let state = shell.state.borrow();
+        let cache = state.transcript_cache.borrow();
+        assert_eq!(cache.generation, generation + 1);
+        assert_eq!(cache.width, Some(52));
     }
 
     #[test]

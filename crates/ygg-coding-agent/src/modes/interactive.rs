@@ -20,7 +20,8 @@ use crate::app::bootstrap::{
     build_app, estimate_text_tokens, rebuild_app, resolve_launch_interactive, Bootstrap,
 };
 use crate::app::{
-    apply_reconfig, reasoning_label, supported_levels, thinking_to_reasoning, App, Reconfig,
+    apply_reconfig, level_from_reasoning, reasoning_label, supported_levels, thinking_to_reasoning,
+    App, Reconfig,
 };
 use crate::commands::{self, Command};
 use crate::compaction::{
@@ -117,6 +118,7 @@ pub enum PendingIdleAction {
     CycleModel,
     ChangeThinking(ReasoningConfig),
     ChangeThinkingLevel(ThinkingLevel),
+    CycleThinking,
     PickModel,
     PickThinking,
     NewSession,
@@ -151,6 +153,13 @@ pub fn push_pending_action(queue: &mut VecDeque<PendingIdleAction>, action: Pend
         ) | (
             Some(PendingIdleAction::ChangeThinkingLevel(_)),
             PendingIdleAction::ChangeThinkingLevel(_)
+        ) | (
+            Some(
+                PendingIdleAction::ChangeThinking(_)
+                    | PendingIdleAction::ChangeThinkingLevel(_)
+                    | PendingIdleAction::CycleThinking
+            ),
+            PendingIdleAction::CycleThinking
         )
     );
     if same_kind {
@@ -163,6 +172,7 @@ pub fn push_pending_action(queue: &mut VecDeque<PendingIdleAction>, action: Pend
 enum Idle {
     Submit(ComposedInput),
     Command(String),
+    CycleThinking,
     Quit,
 }
 
@@ -300,6 +310,7 @@ where
                         shell.expand_focused_tool();
                         shell.render();
                     }
+                    InputAction::CycleThinking => return Ok(Idle::CycleThinking),
                     InputAction::Close => {
                         shell.clear_error();
                         shell.render();
@@ -724,6 +735,7 @@ fn handle_active_command(
         Command::Cost | Command::Cache => {
             shell.notice("cost and cache reports are available at the next idle boundary")
         }
+        Command::Update => shell.notice("update checks are available at the next idle boundary"),
         Command::Theme(_) => shell.notice("theme commands are available at the next idle boundary"),
         Command::Tool(_id) => {
             shell.notice("tool details follow transcript verbosity; use Ctrl+O or /verbose")
@@ -999,6 +1011,11 @@ where
                     }
                     InputAction::ExpandFocusedTool => {
                         shell.expand_focused_tool();
+                        shell.render();
+                    }
+                    InputAction::CycleThinking => {
+                        push_pending_action(pending_actions, PendingIdleAction::CycleThinking);
+                        shell.notice("thinking change queued for the next idle boundary");
                         shell.render();
                     }
                     InputAction::Close => {
@@ -1347,6 +1364,19 @@ fn next_model_id(app: &App) -> anyhow::Result<ModelId> {
     next_model_id_in_catalog(&app.catalog, &app.model.spec.id)
 }
 
+fn next_thinking_level(app: &App) -> anyhow::Result<ThinkingLevel> {
+    let levels = supported_levels(&app.model);
+    let current = level_from_reasoning(&app.reasoning, &app.model)?;
+    let index = levels
+        .iter()
+        .position(|level| *level == current)
+        .unwrap_or(0);
+    levels
+        .get((index + 1) % levels.len())
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("no thinking levels are available"))
+}
+
 fn next_model_id_in_catalog(
     catalog: &ygg_ai::ModelCatalog,
     current_model: &ModelId,
@@ -1503,6 +1533,15 @@ async fn apply_pending_actions(
                 let reasoning = thinking_to_reasoning(level, &app.model)?;
                 app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
                 shell.notice("queued thinking change applied");
+            }
+            PendingIdleAction::CycleThinking => {
+                let level = next_thinking_level(&app)?;
+                if let Err(e) = crate::cli::persist_reasoning(level.label()) {
+                    shell.error(format!("failed to save thinking preference: {e}"));
+                }
+                let reasoning = thinking_to_reasoning(level, &app.model)?;
+                app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
+                shell.notice(format!("thinking changed to {}", level.label()));
             }
             PendingIdleAction::NewSession => {
                 app = transition(app, shell, input, Reconfig::NewSession).await?;
@@ -1836,6 +1875,16 @@ async fn run_idle_command(
             shell.show_overlay_text(commands::cost_text(app.agent.session(), &app.model))
         }
         Command::Cache => shell.show_overlay_text(commands::cache_text(app.agent.session())),
+        Command::Update => {
+            match await_lifecycle(shell, input, "checking for updates…", async {
+                crate::update::check().await
+            })
+            .await
+            {
+                Ok(status) => shell.show_overlay_text(status.to_string()),
+                Err(error) => shell.error(format!("update check failed: {error}")),
+            }
+        }
         Command::Name(name) => {
             let id = app
                 .agent
@@ -2228,7 +2277,8 @@ impl BoundedShellOutput {
 
 async fn drain_shell_pipe<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut Option<R>,
-    capture: &mut BoundedShellOutput,
+    capture: &std::sync::Arc<std::sync::Mutex<BoundedShellOutput>>,
+    updates: &tokio::sync::mpsc::UnboundedSender<()>,
 ) {
     use tokio::io::AsyncReadExt as _;
 
@@ -2239,9 +2289,40 @@ async fn drain_shell_pipe<R: tokio::io::AsyncRead + Unpin>(
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) | Err(_) => return,
-            Ok(read) => capture.push(&buffer[..read]),
+            Ok(read) => {
+                capture
+                    .lock()
+                    .expect("shell output mutex poisoned")
+                    .push(&buffer[..read]);
+                let _ = updates.send(());
+            }
         }
     }
+}
+
+fn rendered_shell_captures(
+    stdout: &std::sync::Arc<std::sync::Mutex<BoundedShellOutput>>,
+    stderr: &std::sync::Arc<std::sync::Mutex<BoundedShellOutput>>,
+) -> String {
+    let out = stdout
+        .lock()
+        .expect("shell stdout mutex poisoned")
+        .render("stdout");
+    let err = stderr
+        .lock()
+        .expect("shell stderr mutex poisoned")
+        .render("stderr");
+    let mut combined = String::new();
+    if !out.is_empty() {
+        combined.push_str(out.trim_end());
+    }
+    if !err.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(err.trim_end());
+    }
+    combined
 }
 
 async fn shutdown_for_exit(app: &mut App) {
@@ -2353,6 +2434,17 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 shutdown_for_exit(&mut app).await;
                 break;
             }
+            Idle::CycleThinking => {
+                let level = next_thinking_level(&app)?;
+                if let Err(error) = crate::cli::persist_reasoning(level.label()) {
+                    shell.error(format!("failed to save thinking preference: {error}"));
+                }
+                let reasoning = thinking_to_reasoning(level, &app.model)?;
+                app =
+                    transition(app, &mut shell, &mut input, Reconfig::Thinking(reasoning)).await?;
+                shell.notice(format!("thinking changed to {}", level.label()));
+                shell.render();
+            }
             Idle::Command(command_input) => {
                 match run_idle_command(app, &mut shell, &mut input, commands::parse(&command_input))
                     .await?
@@ -2435,15 +2527,24 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     let output_budget = app.config.sandbox.max_output_bytes;
                     let stdout_budget = output_budget / 2;
                     let stderr_budget = output_budget.saturating_sub(stdout_budget);
-                    let mut stdout = BoundedShellOutput::new(stdout_budget);
-                    let mut stderr = BoundedShellOutput::new(stderr_budget);
+                    let stdout = std::sync::Arc::new(std::sync::Mutex::new(
+                        BoundedShellOutput::new(stdout_budget),
+                    ));
+                    let stderr = std::sync::Arc::new(std::sync::Mutex::new(
+                        BoundedShellOutput::new(stderr_budget),
+                    ));
+                    let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
                     let command_timeout = Duration::from_secs(app.config.sandbox.exec_timeout_secs);
                     #[cfg(unix)]
                     let command_started = tokio::time::Instant::now();
+                    let stdout_capture = stdout.clone();
+                    let stderr_capture = stderr.clone();
+                    let stdout_updates = output_tx.clone();
+                    let stderr_updates = output_tx;
                     let work = async {
                         let (_, _, status) = tokio::join!(
-                            drain_shell_pipe(&mut stdout_pipe, &mut stdout),
-                            drain_shell_pipe(&mut stderr_pipe, &mut stderr),
+                            drain_shell_pipe(&mut stdout_pipe, &stdout_capture, &stdout_updates,),
+                            drain_shell_pipe(&mut stderr_pipe, &stderr_capture, &stderr_updates,),
                             child.wait(),
                         );
                         status
@@ -2482,6 +2583,18 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                                         "command cancelled",
                                     ));
                                 }
+                                Some(Ok(Event::Key(key)))
+                                    if key.kind == KeyEventKind::Press
+                                        && key.code == KeyCode::Char('o')
+                                        && key.modifiers == KeyModifiers::CONTROL =>
+                                {
+                                    shell.expand_focused_tool();
+                                    shell.render();
+                                }
+                                Some(Ok(Event::Resize(columns, rows))) => {
+                                    shell.set_size(columns, rows);
+                                    shell.render();
+                                }
                                 Some(Ok(_)) => {}
                                 Some(Err(_)) | None => input_open = false,
                             },
@@ -2491,6 +2604,19 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                                     std::io::ErrorKind::TimedOut,
                                     "command timed out",
                                 ));
+                            }
+                            update = output_rx.recv() => {
+                                if update.is_some() {
+                                    // Collapse a burst into one bounded tail update. This keeps
+                                    // the latest process lines visible without repainting once
+                                    // per read syscall.
+                                    while output_rx.try_recv().is_ok() {}
+                                    shell.update_shell_output(
+                                        &shell_id,
+                                        rendered_shell_captures(&stdout, &stderr),
+                                    );
+                                    shell.render();
+                                }
                             }
                             _ = spinner_tick.tick() => {
                                 shell.update_shell_spinner(&shell_id, SPINNER[frame]);
@@ -2519,18 +2645,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                             let _ = child.kill().await;
                             let _ = child.wait().await;
                         }
-                        let mut combined = String::new();
-                        let out = stdout.render("stdout");
-                        let err = stderr.render("stderr");
-                        if !out.is_empty() {
-                            combined.push_str(out.trim_end());
-                        }
-                        if !err.is_empty() {
-                            if !combined.is_empty() {
-                                combined.push('\n');
-                            }
-                            combined.push_str(err.trim_end());
-                        }
+                        let mut combined = rendered_shell_captures(&stdout, &stderr);
                         if !combined.is_empty() {
                             combined.push('\n');
                         }
@@ -2569,18 +2684,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     let exit_code = match exit {
                         Ok(status) => status.code().unwrap_or(-1),
                         Err(error) => {
-                            let mut combined = String::new();
-                            let out = stdout.render("stdout");
-                            let err = stderr.render("stderr");
-                            if !out.is_empty() {
-                                combined.push_str(out.trim_end());
-                            }
-                            if !err.is_empty() {
-                                if !combined.is_empty() {
-                                    combined.push('\n');
-                                }
-                                combined.push_str(err.trim_end());
-                            }
+                            let mut combined = rendered_shell_captures(&stdout, &stderr);
                             if !combined.is_empty() {
                                 combined.push('\n');
                             }
@@ -2600,20 +2704,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         }
                     };
 
-                    let stdout = stdout.render("stdout");
-                    let stderr = stderr.render("stderr");
-
-                    let mut combined = String::new();
-                    if !stdout.is_empty() {
-                        combined.push_str(stdout.trim_end());
-                    }
-                    if !stderr.is_empty() {
-                        if !combined.is_empty() {
-                            combined.push('\n');
-                        }
-                        combined.push_str(stderr.trim_end());
-                    }
-
+                    let combined = rendered_shell_captures(&stdout, &stderr);
                     shell.finalize_shell(&shell_id, combined, exit_code);
                     shell.render();
                     continue;
@@ -2836,13 +2927,14 @@ mod tests {
             .unwrap();
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
-        let mut stdout = BoundedShellOutput::new(1024);
-        let mut stderr = BoundedShellOutput::new(1024);
+        let stdout = std::sync::Arc::new(std::sync::Mutex::new(BoundedShellOutput::new(1024)));
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(BoundedShellOutput::new(1024)));
+        let (updates, mut update_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let status = tokio::time::timeout(Duration::from_secs(5), async {
             let (_, _, status) = tokio::join!(
-                drain_shell_pipe(&mut stdout_pipe, &mut stdout),
-                drain_shell_pipe(&mut stderr_pipe, &mut stderr),
+                drain_shell_pipe(&mut stdout_pipe, &stdout, &updates),
+                drain_shell_pipe(&mut stderr_pipe, &stderr, &updates),
                 child.wait(),
             );
             status
@@ -2852,10 +2944,16 @@ mod tests {
         .unwrap();
 
         assert!(status.success());
+        let stdout = stdout.lock().unwrap();
+        let stderr = stderr.lock().unwrap();
         assert_eq!(stdout.total_bytes, 1_048_576);
         assert_eq!(stderr.total_bytes, 1_048_576);
         assert_eq!(stdout.head.len() + stdout.tail.len(), 1024);
         assert_eq!(stderr.head.len() + stderr.tail.len(), 1024);
+        assert!(
+            update_rx.try_recv().is_ok(),
+            "pipe reads must wake live rendering"
+        );
     }
 
     #[test]

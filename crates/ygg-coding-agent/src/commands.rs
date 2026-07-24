@@ -34,6 +34,7 @@ pub enum Command {
     Context,
     Cost,
     Cache,
+    Update,
     Name(Option<String>),
     Sessions,
     Export(Option<String>),
@@ -175,6 +176,7 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
     ),
     slash!("cost", "/cost", "show turn and session cost", false),
     slash!("cache", "/cache", "show prompt-cache diagnostics", false),
+    slash!("update", "/update", "check for a newer Ygg release", false),
     slash!("name", "/name [name]", "show or rename this session", true),
     slash!("sessions", "/sessions", "list local sessions", false),
     slash!(
@@ -346,6 +348,7 @@ pub fn parse(input: &str) -> Command {
         "context" if argument.is_none() => Command::Context,
         "cost" if argument.is_none() => Command::Cost,
         "cache" if argument.is_none() => Command::Cache,
+        "update" if argument.is_none() => Command::Update,
         "sessions" if argument.is_none() => Command::Sessions,
         "quit" if argument.is_none() => Command::Quit,
         _ => Command::Unknown(input.to_owned()),
@@ -829,6 +832,7 @@ mod tests {
         assert_eq!(parse("/context"), Command::Context);
         assert_eq!(parse("/cost"), Command::Cost);
         assert_eq!(parse("/cache"), Command::Cache);
+        assert_eq!(parse("/update"), Command::Update);
         assert_eq!(parse("/prompt"), Command::Prompt(None));
         assert_eq!(
             parse("/prompt review staged changes"),

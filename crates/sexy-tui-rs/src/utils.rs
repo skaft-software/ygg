@@ -161,12 +161,81 @@ pub fn terminal_tokens(text: &str) -> Vec<TerminalToken<'_>> {
     result
 }
 
+/// Remove terminal controls for untrusted/plain-text projections.
+///
+/// Pi's compositor intentionally recognizes only the sequences it emits.
+/// Sanitization is a separate Rust/Ygg compatibility layer and therefore also
+/// consumes generic ECMA-48 CSI, charset designators, and their C1 forms.
 pub fn strip_terminal_sequences(text: &str) -> String {
-    let mut output = String::new();
-    for token in terminal_tokens(text) {
-        if let TerminalToken::Text(value) = token {
-            output.push_str(value);
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == 0x1b {
+            let Some(next) = bytes.get(cursor + 1).copied() else {
+                break;
+            };
+            if matches!(next, b']' | b'_' | b'P' | b'^') {
+                cursor += 2;
+                let mut terminated = false;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == 0x07 {
+                        cursor += 1;
+                        terminated = true;
+                        break;
+                    }
+                    if bytes[cursor] == 0x1b && bytes.get(cursor + 1) == Some(&b'\\') {
+                        cursor += 2;
+                        terminated = true;
+                        break;
+                    }
+                    cursor += 1;
+                }
+                if !terminated {
+                    break;
+                }
+                continue;
+            }
+            cursor += 2;
+            if next == b'[' {
+                let mut terminated = false;
+                while cursor < bytes.len() {
+                    if (0x40..=0x7e).contains(&bytes[cursor]) {
+                        cursor += 1;
+                        terminated = true;
+                        break;
+                    }
+                    cursor += 1;
+                }
+                if !terminated {
+                    break;
+                }
+                continue;
+            }
+            // Fe/charset escape: zero or more intermediate bytes followed by
+            // one final byte. `ESC ( B` is the common ASCII designation.
+            while cursor < bytes.len() && (0x20..=0x2f).contains(&bytes[cursor]) {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && (0x30..=0x7e).contains(&bytes[cursor]) {
+                cursor += 1;
+            }
+            continue;
         }
+        let character = text[cursor..].chars().next().expect("character boundary");
+        if character == '\u{009b}' {
+            cursor += character.len_utf8();
+            while cursor < bytes.len() {
+                if (0x40..=0x7e).contains(&bytes[cursor]) {
+                    cursor += 1;
+                    break;
+                }
+                cursor += 1;
+            }
+            continue;
+        }
+        output.push(character);
+        cursor += character.len_utf8();
     }
     output
 }

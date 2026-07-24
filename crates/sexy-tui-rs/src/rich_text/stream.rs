@@ -127,6 +127,9 @@ impl StreamingMarkdown {
         }
         let had_open_fence = self.scanner.open.is_some();
         self.decoded.push_str(&decoded_chunk);
+        let proven_boundary = self.tail.ends_with("\n\n")
+            || decoded_chunk.contains("\n\n")
+            || (self.tail.ends_with('\n') && decoded_chunk.starts_with('\n'));
         self.tail.push_str(&decoded_chunk);
         if had_open_fence {
             if let [Block::CodeBlock(code)] = self.preview.blocks.as_mut_slice() {
@@ -138,6 +141,7 @@ impl StreamingMarkdown {
             had_open_fence,
             decoded_chunk.contains('\n'),
             completed_fence,
+            proven_boundary,
         );
         self.tail_revision = self.tail_revision.saturating_add(1);
     }
@@ -221,7 +225,13 @@ impl StreamingMarkdown {
         &self.committed
     }
 
-    fn stabilize(&mut self, had_open_fence: bool, saw_newline: bool, completed_fence: bool) {
+    fn stabilize(
+        &mut self,
+        had_open_fence: bool,
+        saw_newline: bool,
+        completed_fence: bool,
+        proven_boundary: bool,
+    ) {
         if let Some(open) = self.scanner.open.clone() {
             if !had_open_fence {
                 if open.start > 0 {
@@ -273,7 +283,6 @@ impl StreamingMarkdown {
             let line = line.trim();
             matches!(line, "---" | "***" | "___") || (line.contains('|') && line.contains("---"))
         });
-        let proven_boundary = self.tail.contains("\n\n");
         if self.tail.len() <= MAX_UNSTABLE_PARSE_BYTES
             && (had_open_fence
                 || completed_fence
@@ -289,9 +298,13 @@ impl StreamingMarkdown {
                 .clamp(1024, MAX_UNSTABLE_PARSE_BYTES);
         } else if self.tail.len() <= MAX_UNSTABLE_PARSE_BYTES {
             self.append_plain_preview();
-        } else if let Some(offset) = lexical_stable_offset(&self.tail) {
-            self.commit_prefix(offset);
-            self.parse_and_commit_stable_tail();
+        } else if proven_boundary {
+            if let Some(offset) = lexical_stable_offset(&self.tail) {
+                self.commit_prefix(offset);
+                self.parse_and_commit_stable_tail();
+            } else {
+                self.append_plain_preview();
+            }
         } else {
             // An enormous single paragraph/list remains mutable. Display it as
             // safe literal text and parse it only once on completion.
@@ -322,6 +335,9 @@ impl StreamingMarkdown {
         self.committed.blocks.append(&mut document.blocks);
         self.tail.drain(..offset);
         self.scanner.drain_prefix(offset);
+        // A drained tail invalidates any literal preview prefix. Callers either
+        // replace it immediately with a semantic render or append afresh.
+        self.preview = Document::default();
         self.next_parse_at = 1024;
         self.tail_semantic_parsed = false;
         self.committed_revision = self.committed_revision.saturating_add(1);
@@ -334,11 +350,10 @@ impl StreamingMarkdown {
 
     fn append_plain_preview(&mut self) {
         match self.preview.blocks.as_mut_slice() {
-            [Block::Plain(text)] if self.tail.starts_with(text.as_str()) => {
-                // This branch is intentionally conservative. In normal token
-                // streaming the preview already contains the complete tail, so
-                // rebuilding below is avoided only when no semantic parse has
-                // happened since the previous chunk.
+            [Block::Plain(text)] if text.len() <= self.tail.len() => {
+                // Literal tails change only by append; `commit_prefix` clears
+                // the preview before draining. Trust that invariant instead of
+                // comparing the complete accumulated paragraph on every token.
                 if text.len() < self.tail.len() {
                     text.push_str(&self.tail[text.len()..]);
                 }
