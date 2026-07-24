@@ -343,6 +343,21 @@ ygg --mouse terminal
 
 Custom themes are local TOML files and can control semantic roles, glyphs, density, responsive breakpoints, transcript surfaces, and terminal capability fallbacks. See [docs/themes.md](docs/themes.md).
 
+## sexy-tui-rs themability
+
+The vendored [`sexy-tui-rs`](crates/sexy-tui-rs) renderer is themeable by design. These recordings show the same terminal experience across four different visual treatments:
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/assets/ygg-theme-demo-1.gif" alt="sexy-tui-rs theme demo 1" width="100%"></td>
+    <td width="50%"><img src="docs/assets/ygg-theme-demo-2.gif" alt="sexy-tui-rs theme demo 2" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/assets/ygg-theme-demo-3.gif" alt="sexy-tui-rs theme demo 3" width="100%"></td>
+    <td width="50%"><img src="docs/assets/ygg-theme-demo-4.gif" alt="sexy-tui-rs theme demo 4" width="100%"></td>
+  </tr>
+</table>
+
 ## Interactive command reference
 
 Type `/` in the composer to open live command discovery.
