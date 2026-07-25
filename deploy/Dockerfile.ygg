@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# Build with: docker build -f deploy/Dockerfile.ygg -t ygg:0.3.0 .
+# Build with: docker build -f deploy/Dockerfile.ygg -t ygg:0.3.0-alpha .
 FROM rust:1.86-bookworm AS build
 WORKDIR /src
 COPY . .

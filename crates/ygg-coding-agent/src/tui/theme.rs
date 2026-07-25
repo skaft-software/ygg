@@ -661,24 +661,6 @@ impl YggTheme {
         (idle.red, idle.green, idle.blue)
     }
 
-    /// Return the copy-safe composer fill for a known terminal profile. An
-    /// unknown profile stays on the terminal's own canvas rather than guessing.
-    pub(crate) fn composer_surface_rgb(&self, accent: (u8, u8, u8)) -> Option<(u8, u8, u8)> {
-        if self.capabilities.color == ColorDepth::None
-            || self.background == TerminalBackground::Unknown
-        {
-            return None;
-        }
-        Some(self.composer_idle_rgb(accent))
-    }
-
-    pub(crate) fn rgb_bg(&self, color: (u8, u8, u8), text: &str) -> String {
-        self.inner.apply_style(
-            TextStyle::plain().background(Color::Rgb(color.0, color.1, color.2)),
-            text,
-        )
-    }
-
     pub(crate) fn rgb_fg(&self, color: (u8, u8, u8), text: &str) -> String {
         self.color_text(
             Rgb {
@@ -1447,7 +1429,7 @@ fn default_theme_for(
     // or color is unavailable. Inline code stays on the terminal canvas.
     theme.override_token(
         "md_code_bg",
-        &standard_surface("#202725", "#f1f5f4", background),
+        &standard_surface("#202630", "#f1f5f4", background),
     );
     theme.override_token("md_code_inline_bg", "default");
     apply_required_surfaces(&mut theme, background);

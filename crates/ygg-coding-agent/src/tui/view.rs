@@ -1568,8 +1568,7 @@ enum RenderCommand {
 /// false we can use a lazy poll interval to save CPU.
 fn shimmer_animating(state: &ShellState) -> bool {
     let capabilities = state.theme.capabilities();
-    if state.theme.is_compiled_default()
-        || !capabilities.animation
+    if !capabilities.animation
         || capabilities.color == crate::tui::terminal::ColorDepth::None
         || state.size.0 < 12
     {

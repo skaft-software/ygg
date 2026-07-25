@@ -2189,7 +2189,7 @@ fn compaction_disclosure_rebuilds_native_presentation() {
         terminal.set_scrollback(0);
         let visible = terminal.screen().contents();
         assert!(visible.contains("compaction-detail-39"), "{visible}");
-        assert!(visible.contains("  › "), "composer disappeared: {visible}");
+        assert!(visible.contains("│ ›"), "composer disappeared: {visible}");
 
         shell.expand_focused_tool();
         shell.render();
@@ -2206,7 +2206,7 @@ fn compaction_disclosure_rebuilds_native_presentation() {
         assert!(collapsed.contains("ctrl+o to view"), "{collapsed}");
         assert!(!collapsed.contains("compaction-detail-"), "{collapsed}");
         assert!(
-            collapsed.contains("  › "),
+            collapsed.contains("│ ›"),
             "composer disappeared: {collapsed}"
         );
     }
@@ -2302,7 +2302,7 @@ fn streamed_table_and_wrapped_lists_never_commit_provisional_duplicates() {
     terminal.set_scrollback(usize::MAX);
     let physical = terminal.screen().contents();
     assert_eq!(
-        physical.matches("  › ").count(),
+        physical.matches("│ ›").count(),
         1,
         "mutable composer was committed to scrollback:\n{physical}"
     );
@@ -4907,7 +4907,7 @@ fn compiled_default_code_surfaces_adapt_and_cover_language_padding() {
 
     let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
     for (background, sequence) in [
-        (TerminalBackground::Dark, "\x1b[48;2;32;39;37m"),
+        (TerminalBackground::Dark, "\x1b[48;2;32;38;48m"),
         (TerminalBackground::Light, "\x1b[48;2;241;245;244m"),
     ] {
         let theme = crate::tui::theme::test_theme_for(background, capabilities);
@@ -4975,18 +4975,81 @@ fn streamed_markdown_settles_into_rich_structure() {
 }
 
 #[test]
-fn unknown_background_keeps_truecolour_composer_unfilled() {
+fn compiled_default_composer_keeps_the_terminal_background_unfilled() {
     use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
-    let theme = crate::tui::theme::test_theme_with(TerminalCapabilities::test(
-        true,
-        true,
-        ColorDepth::TrueColor,
-    ));
+    use crate::tui::theme::TerminalBackground;
+
+    let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
+    for background in [
+        TerminalBackground::Dark,
+        TerminalBackground::Light,
+        TerminalBackground::Unknown,
+    ] {
+        let theme = crate::tui::theme::test_theme_for(background, capabilities);
+        let mut shell = InteractiveShell::test_shell_with_theme(theme);
+        shell.set_identity("anthropic", "claude-sonnet-4", "high");
+        let rendered = crate::tui::composer_surface::render_composer_surface(
+            &shell.state.borrow(),
+            120,
+            Instant::now(),
+        )
+        .join("\n");
+        assert!(rendered.contains("38;2;"), "{background:?}: {rendered:?}");
+        assert!(
+            !rendered.contains("\x1b[48;2;"),
+            "{background:?}: {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn compiled_default_shimmer_moves_only_while_work_is_active() {
+    use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
+    use crate::tui::theme::TerminalBackground;
+
+    let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
+    let theme = crate::tui::theme::test_theme_for(TerminalBackground::Dark, capabilities);
     let mut shell = InteractiveShell::test_shell_with_theme(theme);
-    shell.set_identity("anthropic", "claude-sonnet-4", "high");
-    let rendered = render_shell(&shell.state.borrow(), 120).join("\n");
-    assert!(rendered.contains("38;2;"));
-    assert!(!rendered.contains("\x1b[48;2;"), "{rendered:?}");
+    shell.state.borrow_mut().reasoning = "high".into();
+    let idle_now = Instant::now();
+    assert!(!shimmer_animating(&shell.state.borrow()));
+    let idle_before =
+        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 80, idle_now);
+    let idle_after = crate::tui::composer_surface::render_composer_surface(
+        &shell.state.borrow(),
+        80,
+        idle_now + Duration::from_millis(250),
+    );
+    assert_eq!(idle_before[0], idle_after[0]);
+
+    let run_id = shell.begin_run("anthropic");
+    let started = shell
+        .state
+        .borrow()
+        .shimmer_started_at
+        .expect("active run shimmer anchor");
+    assert!(shimmer_animating(&shell.state.borrow()));
+    let active_before =
+        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 80, started);
+    let active_after = crate::tui::composer_surface::render_composer_surface(
+        &shell.state.borrow(),
+        80,
+        started + Duration::from_millis(250),
+    );
+    assert_ne!(active_before[0], active_after[0]);
+    assert!(active_before[..3]
+        .iter()
+        .chain(&active_after[..3])
+        .all(|line| !line.contains("\x1b[48;2;")));
+
+    shell.interrupt_run(run_id);
+    assert!(!shimmer_animating(&shell.state.borrow()));
+    let rest = crate::tui::composer_surface::render_composer_surface(
+        &shell.state.borrow(),
+        80,
+        started + Duration::from_secs(1),
+    );
+    assert_ne!(active_after[0], rest[0]);
 }
 
 #[test]
@@ -6078,15 +6141,11 @@ fn transcript_and_composer_have_exactly_one_breathing_row() {
         .collect::<Vec<_>>();
     let composer = lines
         .iter()
-        .rposition(|line| line.trim_start().starts_with("› "))
-        .expect("composer prompt row");
-    assert!(composer >= 2);
-    assert!(
-        !lines[composer - 1].is_empty() && lines[composer - 1].trim().is_empty(),
-        "shaded top padding row: {lines:?}"
-    );
-    assert!(lines[composer - 2].is_empty());
-    assert!(composer < 3 || !lines[composer - 3].is_empty());
+        .position(|line| line.starts_with('┌') || line.starts_with('╭') || line.starts_with('+'))
+        .expect("composer top border");
+    assert!(composer > 0);
+    assert!(lines[composer - 1].is_empty());
+    assert!(composer < 2 || !lines[composer - 2].is_empty());
 }
 
 #[test]
@@ -6167,89 +6226,51 @@ fn slash_popup_keeps_selection_visible_across_paging_filtering_and_resize() {
 }
 
 #[test]
-fn compiled_default_composer_uses_adaptive_copy_safe_shading() {
-    use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
-    use crate::tui::theme::TerminalBackground;
-
-    let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
-    for background in [TerminalBackground::Dark, TerminalBackground::Light] {
-        let theme = crate::tui::theme::test_theme_for(background, capabilities);
-        let shell = InteractiveShell::test_shell_with_theme(theme);
-        let expected = {
-            let state = shell.state.borrow();
-            let accent = state.theme.role_rgb("model_accent").expect("model accent");
-            state
-                .theme
-                .composer_surface_rgb(accent)
-                .expect("known-profile composer surface")
-        };
-        let rendered = crate::tui::composer_surface::render_composer_surface(
-            &shell.state.borrow(),
-            60,
-            Instant::now(),
-        );
-        let surface = &rendered[..3];
-        let background_sequence =
-            format!("\x1b[48;2;{};{};{}m", expected.0, expected.1, expected.2);
-
-        assert!(
-            surface
-                .iter()
-                .all(|line| line.contains(&background_sequence)),
-            "{background:?}: {surface:?}"
-        );
-        assert!(surface.iter().all(|line| visible_width(line) == 60));
-        let copied = strip_terminal_sequences(&surface.join("\n"));
-        assert!(
-            !copied.chars().any(|ch| "┌┐└┘╭╮╰╯│─+|".contains(ch)),
-            "{copied:?}"
-        );
-    }
-
-    let theme = crate::tui::theme::test_theme_for(TerminalBackground::Dark, capabilities);
-    let shell = InteractiveShell::test_shell_with_theme(theme);
+fn composer_border_is_restrained_at_rest_and_uses_model_accent_when_focused() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_identity("anthropic", "claude-sonnet-4", "high");
     {
         let mut state = shell.state.borrow_mut();
-        state.editor = (0..20)
-            .map(|index| format!("line-{index:02}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        state.editor_cursor = state.editor.find("line-10").expect("middle editor row") + 4;
+        crate::tui::theme::apply_model_lab(&mut state.theme, ModelLab::Anthropic);
+        state.model_lab = Some(ModelLab::Anthropic);
     }
-    let overflow = crate::tui::composer_surface::render_composer_surface(
-        &shell.state.borrow(),
-        60,
-        Instant::now(),
-    );
-    assert_eq!(overflow.len(), 11, "eight content rows, padding, footer");
-    let overflow_plain = strip_terminal_sequences(&overflow[..10].join("\n"));
+    let now = Instant::now();
+    let idle =
+        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 60, now);
+    shell.apply_edit(EditAction::Char('x'));
+    let focused =
+        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 60, now);
+
+    assert_ne!(idle[0], focused[0]);
+    assert!(!idle[0].contains("38;2;169;99;76"), "{:?}", idle[0]);
+    assert!(focused[0].contains("38;2;169;99;76"), "{:?}", focused[0]);
+    assert_eq!(visible_width(&idle[0]), 60);
+    assert_eq!(visible_width(&focused[0]), 60);
+    let wide =
+        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 120, now);
+    assert_eq!(wide[0].matches("\x1b[38;2;").count(), 1);
     assert!(
-        overflow_plain.contains("above") && overflow_plain.contains("below"),
-        "{overflow_plain:?}"
+        wide[0].len() < 450,
+        "120-column uniform border encoded {} bytes",
+        wide[0].len()
     );
-    assert_eq!(overflow.join("\n").matches(CURSOR_MARKER).count(), 1);
-
-    let unknown = crate::tui::theme::test_theme_for(TerminalBackground::Unknown, capabilities);
-    let shell = InteractiveShell::test_shell_with_theme(unknown);
-    let rendered = crate::tui::composer_surface::render_composer_surface(
-        &shell.state.borrow(),
-        60,
-        Instant::now(),
-    );
-    assert!(rendered[..3].iter().all(|line| !line.contains("\x1b[48;")));
-
-    let plain = crate::tui::theme::test_theme_for(
-        TerminalBackground::Dark,
-        TerminalCapabilities::test(true, true, ColorDepth::None),
-    );
-    let shell = InteractiveShell::test_shell_with_theme(plain);
-    let rendered = crate::tui::composer_surface::render_composer_surface(
-        &shell.state.borrow(),
-        60,
-        Instant::now(),
-    );
-    assert!(rendered.iter().all(|line| !line.contains("\x1b[")));
-    assert!(rendered[..3].iter().all(|line| visible_width(line) == 60));
+    for edge in [
+        &idle[0],
+        &idle[idle.len() - 2],
+        &focused[0],
+        &focused[focused.len() - 2],
+    ] {
+        assert_eq!(
+            edge.matches("\x1b[38;2;").count(),
+            1,
+            "uniform border reopened its RGB style per cell: {edge:?}"
+        );
+        assert!(
+            edge.len() < 240,
+            "uniform border encoded {} bytes",
+            edge.len()
+        );
+    }
 }
 
 #[test]

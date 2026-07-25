@@ -201,175 +201,6 @@ fn vert(state: &super::view::ShellState) -> &str {
     state.theme.glyph("vertical")
 }
 
-fn shade_default_composer_rows(state: &super::view::ShellState, width: u16, rows: &mut [String]) {
-    if !state.theme.is_compiled_default() {
-        return;
-    }
-    let lab = if state.run.is_active() {
-        state.run_model_lab
-    } else {
-        state.model_lab
-    };
-    let accent = state
-        .theme
-        .model_rgb(lab)
-        .or_else(|| state.theme.role_rgb("model_accent"))
-        .unwrap_or((128, 128, 128));
-    let Some(surface) = state.theme.composer_surface_rgb(accent) else {
-        return;
-    };
-    let width = usize::from(width);
-    for row in rows {
-        let row_width = visible_width(row);
-        if row_width < width {
-            row.push_str(&" ".repeat(width - row_width));
-        }
-        *row = state.theme.rgb_bg(surface, row);
-    }
-}
-
-/// Render the compiled default composer as a shaded cell surface. The two
-/// former border columns become painted spaces, preserving editor wrapping
-/// geometry without leaving structural glyphs in native terminal copy.
-fn render_shaded_composer(
-    state: &super::view::ShellState,
-    width: u16,
-    content_rows: usize,
-) -> Vec<String> {
-    let w = usize::from(width);
-    let horizontal_padding = usize::from(state.theme.layout_for_width(width).composer_padding);
-    let inner_width = w.saturating_sub(2 + horizontal_padding.saturating_mul(2));
-    if inner_width == 0 {
-        let mut rows = render_plain_content(state, width);
-        shade_default_composer_rows(state, width, &mut rows);
-        return rows;
-    }
-
-    let padding = " ".repeat(horizontal_padding);
-    let frame_row = |content: &str| {
-        let content_width = visible_width(content);
-        let content = if content_width > inner_width {
-            fit_line(content, inner_width as u16)
-        } else {
-            format!(
-                "{content}{}",
-                " ".repeat(inner_width.saturating_sub(content_width))
-            )
-        };
-        format!(" {padding}{content}{padding} ")
-    };
-    let marker = state.theme.bold(&state.theme.model_fg(
-        if state.run.is_active() {
-            state.run_model_lab
-        } else {
-            state.model_lab
-        },
-        state.theme.glyph("prompt"),
-    ));
-    let cursor_marker = composer_cursor_marker(state);
-    let (editor, editor_cursor) = if let Some(prompt) = &state.tool_input_prompt {
-        (prompt.clone(), prompt.len())
-    } else {
-        super::view::sanitized_editor(&state.editor, state.editor_cursor)
-    };
-
-    let mut rows = Vec::with_capacity(content_rows + 2);
-    // Replace the horizontal outline with shaded blank cells. Keeping these
-    // rows preserves composer height and viewport budgeting without leaving
-    // frame glyphs in copied terminal output.
-    rows.push(" ".repeat(w));
-    if editor.is_empty() {
-        rows.push(frame_row(&format!("{marker} {cursor_marker}")));
-        while rows.len() < content_rows + 1 {
-            rows.push(frame_row(""));
-        }
-        rows.push(" ".repeat(w));
-        shade_default_composer_rows(state, width, &mut rows);
-        return rows;
-    }
-
-    let layout = state.cached_editor_layout(
-        (inner_width as u16).max(2),
-        Some(&editor),
-        Some(editor_cursor),
-    );
-    let total_lines = layout.lines.len();
-    let overflow = total_lines.saturating_sub(content_rows);
-    let visible_rows = if overflow > 0 {
-        (content_rows.saturating_sub(1)).max(1).min(total_lines)
-    } else {
-        content_rows.max(1).min(total_lines)
-    };
-    let mut start = layout
-        .cursor_row
-        .saturating_add(1)
-        .saturating_sub(visible_rows);
-    let end = (start + visible_rows).min(total_lines);
-    if end.saturating_sub(start) < visible_rows {
-        start = end.saturating_sub(visible_rows);
-    }
-    let hidden_above = start;
-    let hidden_below = total_lines.saturating_sub(end);
-
-    let indicator = match (hidden_above, hidden_below) {
-        (0, 0) => None,
-        (above, 0) => Some(format!(
-            "{} {above} more line{} above",
-            state.theme.glyph("ellipsis"),
-            if above == 1 { "" } else { "s" }
-        )),
-        (0, below) => Some(format!(
-            "{} {below} more line{} below",
-            state.theme.glyph("ellipsis"),
-            if below == 1 { "" } else { "s" }
-        )),
-        (above, below) => Some(format!(
-            "{} {above} above, {below} below",
-            state.theme.glyph("ellipsis")
-        )),
-    };
-    let indicator_before = hidden_above > 0;
-    if indicator_before && content_rows > visible_rows {
-        rows.push(frame_row(&state.theme.fg(
-            "model_accent",
-            indicator.as_deref().expect("hidden editor rows"),
-        )));
-    }
-
-    for index in start..end {
-        let visible = &layout.lines[index];
-        let content = if index == layout.cursor_row {
-            let cursor = editor_cursor.clamp(visible.start, visible.visible_end);
-            format!(
-                "{}{cursor_marker}{}",
-                &editor[visible.start..cursor],
-                &editor[cursor..visible.visible_end]
-            )
-        } else {
-            editor[visible.start..visible.visible_end].to_owned()
-        };
-        let prefix = if index == 0 {
-            format!("{marker} ")
-        } else {
-            "  ".to_owned()
-        };
-        rows.push(frame_row(&format!("{prefix}{content}")));
-    }
-
-    if !indicator_before && indicator.is_some() && content_rows > visible_rows {
-        rows.push(frame_row(&state.theme.fg(
-            "model_accent",
-            indicator.as_deref().expect("hidden editor rows"),
-        )));
-    }
-    while rows.len() < content_rows + 1 {
-        rows.push(frame_row(""));
-    }
-    rows.push(" ".repeat(w));
-    shade_default_composer_rows(state, width, &mut rows);
-    rows
-}
-
 // ---------------------------------------------------------------------------
 // Unified composer box with perimeter shimmer
 // ---------------------------------------------------------------------------
@@ -1256,7 +1087,8 @@ fn compact_token_limit(n: u64) -> String {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Render the full composer surface followed by its status footer.
+/// Render the full composer surface: top border, content rows, bottom border,
+/// then a status footer line.
 pub fn render_composer_surface(
     state: &super::view::ShellState,
     width: u16,
@@ -1271,7 +1103,6 @@ pub fn render_composer_surface(
             fit_line(&format!("> {editor}"), width)
         };
         let mut lines = vec![prompt];
-        shade_default_composer_rows(state, width, &mut lines);
         append_status_footer(&mut lines, state, width, now);
         return lines;
     }
@@ -1305,12 +1136,10 @@ pub fn render_composer_surface(
         return render_compact(state, width, now, content_rows);
     }
 
-    let mut lines = Vec::with_capacity(content_rows + 2);
-    if state.theme.is_compiled_default() {
-        lines.append(&mut render_shaded_composer(state, width, content_rows));
-    } else {
-        lines.append(&mut render_composer_box(state, width, now, content_rows));
-    }
+    let mut lines = Vec::with_capacity(content_rows + 4);
+
+    // Unified composer box with perimeter shimmer on all four edges
+    lines.append(&mut render_composer_box(state, width, now, content_rows));
 
     // Stable semantic footer/status surface.
     append_status_footer(&mut lines, state, width, now);
@@ -1350,7 +1179,6 @@ fn render_compact(
             &format!("{padding}{marker_s} {cursor_marker}"),
             width,
         ));
-        shade_default_composer_rows(state, width, &mut lines);
         append_status_footer(&mut lines, state, width, now);
         return lines;
     }
@@ -1386,7 +1214,6 @@ fn render_compact(
         };
         lines.push(fit_line(&format!("{prefix}{content}"), width));
     }
-    shade_default_composer_rows(state, width, &mut lines);
     append_status_footer(&mut lines, state, width, now);
     lines
 }

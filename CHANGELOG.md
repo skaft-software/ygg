@@ -2,7 +2,7 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## 0.3.0 — 2026-07-25
+## 0.3.0-alpha — 2026-07-25
 
 ### Added
 
@@ -11,11 +11,12 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Changed
 
-- Made the default Markdown code and prompt composer surfaces copy-safe with
-  terminal-adaptive shading instead of printable outlines; explicit themes retain
-  their authored chrome.
+- Made fenced Markdown code copy-safe with borderless, terminal-adaptive shading.
+- Kept the default prompt composer unfilled and restrained at rest, with a
+  model-colored perimeter shimmer only while work is active; explicit themes
+  retain their authored chrome.
 - Refreshed the project identity, terminal demo, installation references, and
-  release documentation for the `0.3.0` line.
+  release documentation for the `0.3.0-alpha` line.
 
 ### Security and reliability
 

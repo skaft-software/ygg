@@ -47,6 +47,13 @@ PDFs are not decoded or sent as multimodal payloads: a dropped PDF receives a
 composer chip, but submission resolves that chip to the file path as text so the
 model can inspect it with file tools.
 
+The compiled default composer leaves the terminal canvas unfilled and keeps a
+restrained perimeter at rest; live work animates a model-colored shimmer around
+that perimeter. Fenced Markdown code is borderless and uses `#202630` on known
+dark profiles or `#f1f5f4` on known light profiles, falling back to an unpainted
+surface when the background is unknown. Named and custom themes keep their
+authored chrome.
+
 ## Reasoning presentation
 
 Live reasoning is collapsed into exactly two width-bounded rows: a plain-weight
