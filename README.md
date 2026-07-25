@@ -1,10 +1,12 @@
-
-  <h1 align="center">ygg</h1>
-
+<h1 align="center">
+  <a href="https://skaft.org/ygg">
+    <img src="docs/assets/ygg-braille.svg" alt="ygg — a braille point-cloud tree for the local-first coding agent" width="760">
+  </a>
+</h1>
 
 <p align="center">
-  <a href="http://skaft.org/ygg">
-    <img src="docs/assets/ygg-demo.gif" alt="ygg — a local-first coding agent - terminal demo"  width="80%">
+  <a href="https://skaft.org/ygg">
+    <img src="docs/assets/ygg-demo.gif" alt="ygg — a local-first coding agent — terminal demo" width="80%">
   </a>
 </p>
 
@@ -13,9 +15,9 @@
 </p>
 
 <p align="center">
-  <a href="http://skaft.org/ygg"><strong>Website</strong></a> ·
-  <a href="http://skaft.org/ygg/#install"><strong>Install</strong></a> ·
-  <a href="http://skaft.org/ygg/docs"><strong>Documentation</strong></a> ·
+  <a href="https://skaft.org/ygg"><strong>Website</strong></a> ·
+  <a href="https://skaft.org/ygg/#install"><strong>Install</strong></a> ·
+  <a href="https://skaft.org/ygg/docs"><strong>Documentation</strong></a> ·
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
 
@@ -656,6 +658,6 @@ ygg uses architectural concepts and terminal interaction patterns from [Pi](http
 ---
 
 <p align="center">
-  <a href="http://skaft.org/ygg"><strong>skaft.org/ygg</strong></a><br>
+  <a href="https://skaft.org/ygg"><strong>skaft.org/ygg</strong></a><br>
   <sub>Local models first. Inspectable by default. Built to last.</sub>
 </p>

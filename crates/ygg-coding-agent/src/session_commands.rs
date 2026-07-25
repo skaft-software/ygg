@@ -82,20 +82,25 @@ fn list(store: &SessionStore, query: Option<&str>) -> anyhow::Result<()> {
         .filter(|session| matches_query(session, query.as_deref()))
         .collect::<Vec<_>>();
     if sessions.is_empty() {
-        println!("No matching sessions in {}", store.dir().display());
+        crate::output::stdout_line(format!("No matching sessions in {}", store.dir().display()));
         return Ok(());
     }
-    println!("ID\tNAME\tTAGS\tMODIFIED");
+    let terminal = crate::output::stdout_is_terminal();
+    crate::output::stdout_table_line("ID\tNAME\tTAGS\tMODIFIED");
     for session in sessions {
-        println!(
-            "{}\t{}\t{}\t{}",
-            session.id,
-            session.name.as_deref().unwrap_or(&session.title),
-            session.tags.join(","),
-            relative_time(session.modified, SystemTime::now())
-        );
+        crate::output::stdout_table_line(format_list_row(&session, SystemTime::now(), terminal));
     }
     Ok(())
+}
+
+fn format_list_row(session: &SessionMeta, now: SystemTime, terminal: bool) -> String {
+    let id = crate::output::table_field(&session.id, terminal);
+    let name =
+        crate::output::table_field(session.name.as_deref().unwrap_or(&session.title), terminal);
+    let tags = session.tags.join(",");
+    let tags = crate::output::table_field(&tags, terminal);
+    let modified = relative_time(session.modified, now);
+    format!("{id}\t{name}\t{tags}\t{modified}")
 }
 
 fn matches_query(session: &SessionMeta, query: Option<&str>) -> bool {
@@ -136,52 +141,57 @@ fn inspect(store: &SessionStore, id: &str) -> anyhow::Result<()> {
         .filter(|entry| entry.parent.is_none())
         .count();
 
-    println!("Session: {id}");
-    println!("Title: {}", active_branch_title(&session));
-    println!(
+    crate::output::stdout_line(format!("Session: {id}"));
+    crate::output::stdout_line(format!("Title: {}", active_branch_title(&session)));
+    crate::output::stdout_line(format!(
         "Name: {}",
         metadata
             .name
             .as_deref()
             .unwrap_or("(derived from first prompt)")
-    );
-    println!(
+    ));
+    crate::output::stdout_line(format!(
         "Tags: {}",
         if metadata.tags.is_empty() {
             "(none)".to_owned()
         } else {
             metadata.tags.join(", ")
         }
-    );
-    println!("Path: {}", path.display());
+    ));
+    crate::output::stdout_line(format!("Path: {}", path.display()));
     let modified = file.modified()?;
-    println!(
+    crate::output::stdout_line(format!(
         "Modified: {} (unix {})",
         relative_time(modified, SystemTime::now()),
         unix_seconds(modified)
-    );
-    println!("Size: {}", human_bytes(file.len()));
-    println!("Entries: {}", session.entries().len());
-    println!("Branches: {leaves} leaves from {roots} roots");
-    println!(
+    ));
+    crate::output::stdout_line(format!("Size: {}", human_bytes(file.len())));
+    crate::output::stdout_line(format!("Entries: {}", session.entries().len()));
+    crate::output::stdout_line(format!("Branches: {leaves} leaves from {roots} roots"));
+    crate::output::stdout_line(format!(
         "Head: {}",
         session
             .head()
             .map_or_else(|| "(empty)".into(), |head| head.0)
-    );
-    println!("Checkpoints: {}", session.checkpoints().len());
-    println!("Usage records: {}", session.usage_records().len());
-    println!("Cost: {} microdollars", session.total_cost_microdollars());
-    println!();
-    println!("{}", render_session_tree(&session));
+    ));
+    crate::output::stdout_line(format!("Checkpoints: {}", session.checkpoints().len()));
+    crate::output::stdout_line(format!("Usage records: {}", session.usage_records().len()));
+    crate::output::stdout_line(format!(
+        "Cost: {} microdollars",
+        session.total_cost_microdollars()
+    ));
+    crate::output::stdout_line("");
+    crate::output::stdout_multiline(render_session_tree(&session));
     Ok(())
 }
 
 fn rename(store: &SessionStore, id: &str, name: &str) -> anyhow::Result<()> {
     let metadata = store.rename(id, name)?;
     match metadata.name {
-        Some(name) => println!("Renamed session {id} to {name:?}."),
-        None => println!("Cleared the custom name for session {id}."),
+        Some(name) => {
+            crate::output::stdout_line(format!("Renamed session {id} to {name:?}."));
+        }
+        None => crate::output::stdout_line(format!("Cleared the custom name for session {id}.")),
     }
     Ok(())
 }
@@ -189,9 +199,9 @@ fn rename(store: &SessionStore, id: &str, name: &str) -> anyhow::Result<()> {
 fn tag(store: &SessionStore, id: &str, tags: Vec<String>) -> anyhow::Result<()> {
     let metadata = store.set_tags(id, tags)?;
     if metadata.tags.is_empty() {
-        println!("Cleared tags for session {id}.");
+        crate::output::stdout_line(format!("Cleared tags for session {id}."));
     } else {
-        println!("Session {id} tags: {}", metadata.tags.join(", "));
+        crate::output::stdout_line(format!("Session {id} tags: {}", metadata.tags.join(", ")));
     }
     Ok(())
 }
@@ -287,17 +297,22 @@ fn export_cli(
     force: bool,
 ) -> anyhow::Result<()> {
     let report = export_portable(store, id, output, cwd, include_secrets, force)?;
-    println!("Exported session {id} to {}.", report.destination.display());
+    crate::output::stdout_line(format!(
+        "Exported session {id} to {}.",
+        report.destination.display()
+    ));
     if report.included_secrets {
-        println!("Warning: the export contains raw session values.");
+        crate::output::stdout_line("Warning: the export contains raw session values.");
     } else {
-        println!(
+        crate::output::stdout_line(format!(
             "Redacted {} potentially sensitive values.",
             report.redaction_count
-        );
+        ));
     }
     if report.ignored_torn_tail {
-        println!("Ignored an interrupted final append; run `ygg sessions repair {id}` to normalize the source.");
+        crate::output::stdout_line(format!(
+            "Ignored an interrupted final append; run `ygg sessions repair {id}` to normalize the source."
+        ));
     }
     Ok(())
 }
@@ -703,10 +718,10 @@ fn delete(store: &SessionStore, id: &str) -> anyhow::Result<()> {
             );
         }
     }
-    println!(
+    crate::output::stdout_line(format!(
         "Moved session {id} to {} (recoverable by moving it back).",
         destination.display()
-    );
+    ));
     Ok(())
 }
 
@@ -721,7 +736,9 @@ fn repair(store: &SessionStore, id: &str) -> anyhow::Result<()> {
     let before =
         ygg_agent::secure_fs::read_regular_file_bounded(&opened_path, MAX_SESSION_FILE_BYTES)?;
     if before.is_empty() || before.ends_with(b"\n") {
-        println!("Session {id} is structurally healthy; no repair was needed.");
+        crate::output::stdout_line(format!(
+            "Session {id} is structurally healthy; no repair was needed."
+        ));
         return Ok(());
     }
 
@@ -736,12 +753,12 @@ fn repair(store: &SessionStore, id: &str) -> anyhow::Result<()> {
         )
     })?);
     let after = path.metadata()?.len();
-    println!(
+    crate::output::stdout_line(format!(
         "Repaired session {id}: {} -> {} bytes. Backup: {}",
         before.len(),
         after,
         backup.display()
-    );
+    ));
     Ok(())
 }
 
@@ -782,6 +799,48 @@ mod tests {
         AssistantMessage, AssistantPart, EndpointId, Message, ModelId, Protocol, ResponsesItem,
         ResponsesOutput, ToolCall, ToolCallId, ToolResult, ToolResultPart, UserMessage, UserPart,
     };
+
+    #[test]
+    fn terminal_session_rows_neutralize_persisted_control_text() {
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let session = SessionMeta {
+            id: "hostile".into(),
+            path: PathBuf::from("hostile.jsonl"),
+            title: "provider title\x1b]52;c;YXR0YWNr\x07\nforged\tcolumn".into(),
+            name: None,
+            tags: vec!["safe".into()],
+            modified: now,
+        };
+
+        let row = format_list_row(&session, now, true);
+        assert!(!row.contains('\x1b'), "{row:?}");
+        assert!(!row.contains('\x07'), "{row:?}");
+        assert!(!row.contains('\n'), "{row:?}");
+        assert_eq!(row.matches('\t').count(), 3, "{row:?}");
+        assert!(row.contains('␛'), "{row:?}");
+        assert!(row.contains('␇'), "{row:?}");
+    }
+
+    #[test]
+    fn redirected_session_rows_remain_control_safe() {
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let session = SessionMeta {
+            id: "raw".into(),
+            path: PathBuf::from("raw.jsonl"),
+            title: "provider title\x1b]0;raw\x07\nsecond\tcolumn".into(),
+            name: None,
+            tags: Vec::new(),
+            modified: now,
+        };
+
+        let row = format_list_row(&session, now, false);
+        assert!(!row.contains('\x1b'), "{row:?}");
+        assert!(!row.contains('\x07'), "{row:?}");
+        assert!(!row.contains('\n'), "{row:?}");
+        assert_eq!(row.matches('\t').count(), 3, "{row:?}");
+        assert!(row.contains("^["), "{row:?}");
+        assert!(row.contains("<BEL>"), "{row:?}");
+    }
 
     #[test]
     fn export_redacts_keys_and_recognizable_tokens() {

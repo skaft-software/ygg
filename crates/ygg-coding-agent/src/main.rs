@@ -9,6 +9,7 @@ mod config;
 mod extensions;
 mod hydrate;
 mod modes;
+mod output;
 mod presentation;
 mod prompts;
 mod providers;
@@ -26,7 +27,20 @@ use clap::Parser;
 // bounded filesystem work uses Tokio's blocking pool, and TUI layout/terminal
 // writes run on `ygg-tui-render`.
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // `Result`'s default `Termination` implementation writes errors
+            // directly to stderr. Keep even early startup failures behind the
+            // same control-safe presentation boundary as command output.
+            crate::output::stderr_line(format!("Error: {error:#}"));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
     let top_level_command = cli.command.clone();
 
@@ -82,7 +96,7 @@ async fn run_auth_command(provider: &str, command: AuthCommand) -> anyhow::Resul
             let store = auth::codex::CredentialStore::new(auth::codex::default_path());
             match command {
                 AuthCommand::Login { headless } => auth::codex::login(&store, headless).await,
-                AuthCommand::Logout => auth::codex::logout(&store),
+                AuthCommand::Logout => auth::codex::logout(&store).await,
             }
         }
         "custom" | "openai-custom" => {
@@ -114,16 +128,16 @@ async fn run_auth_command(provider: &str, command: AuthCommand) -> anyhow::Resul
                         startup_timeout_secs: None,
                     };
                     store.save_registry(&CustomRegistry::single("local", provider))?;
-                    println!(
+                    crate::output::stdout_multiline(format!(
                         "Custom provider registry template saved to {}.\n\
                          Edit that file with your provider details and restart ygg.",
                         auth::custom::default_path().display()
-                    );
+                    ));
                     Ok(())
                 }
                 AuthCommand::Logout => {
                     store.delete()?;
-                    println!("Custom provider registry removed.");
+                    crate::output::stdout_line("Custom provider registry removed.");
                     Ok(())
                 }
             }

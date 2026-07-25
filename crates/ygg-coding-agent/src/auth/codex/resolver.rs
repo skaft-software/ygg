@@ -3,7 +3,7 @@
 //! The per-request credential resolver. Fast in the common (unexpired) case;
 //! refreshes under a double-checked lock when the token is near expiry.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::Mutex;
 use ygg_ai::{AuthError, CredentialResolver, CredentialScheme, ResolvedCredential, Secret};
 
@@ -41,9 +41,15 @@ impl CodexResolver {
             return Ok(cred);
         }
 
-        // Near/after expiry: refresh under the lock, re-checking inside in case
-        // another task already refreshed while we waited.
-        let _guard = self.refresh_lock.lock().await;
+        // Near/after expiry: serialize tasks in this resolver, then serialize
+        // refresh-token rotation across Ygg processes using the same store.
+        // Re-check the file after both waits because another owner may already
+        // have persisted a fresh token.
+        let _task_guard = self.refresh_lock.lock().await;
+        let lock_store = self.store.clone();
+        let _process_guard = tokio::task::spawn_blocking(move || lock_store.lock_refresh())
+            .await
+            .context("refresh-lock worker failed")??;
         let cred = self
             .store
             .load()?
@@ -67,7 +73,8 @@ impl CodexResolver {
             },
             expires_at: tokens.expires_at,
         };
-        self.store.save(&refreshed)?;
+        self.store
+            .save_while_refresh_locked(&refreshed, &_process_guard)?;
         Ok(refreshed)
     }
 
@@ -229,5 +236,54 @@ mod tests {
         assert_eq!(persisted.tokens.refresh_token, "rotated-refresh");
         assert_eq!(persisted.tokens.access_token, new_access);
         assert!(persisted.expires_at > now_unix());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_resolvers_serialize_refresh_token_rotation() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let new_access = jwt_with_account("acct_refreshed");
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("refresh_token=old-refresh"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(100))
+                    .set_body_json(serde_json::json!({
+                        "access_token": new_access,
+                        "refresh_token": "rotated-refresh",
+                        "expires_in": 3600,
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("codex.json"));
+        store
+            .save(&CredentialFile {
+                tokens: Tokens {
+                    access_token: "stale-access".into(),
+                    refresh_token: "old-refresh".into(),
+                    account_id: "acct_old".into(),
+                },
+                expires_at: now_unix().saturating_sub(10),
+            })
+            .unwrap();
+        let mut first = CodexResolver::new(store.clone());
+        let mut second = CodexResolver::new(store);
+        first.token_url = format!("{}/token", server.uri());
+        second.token_url = first.token_url.clone();
+
+        let (first, second) = tokio::join!(first.resolve(), second.resolve());
+        if let Err(error) = first {
+            panic!("first resolver failed: {error}");
+        }
+        if let Err(error) = second {
+            panic!("second resolver failed: {error}");
+        }
     }
 }

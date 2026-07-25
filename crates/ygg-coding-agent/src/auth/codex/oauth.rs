@@ -6,6 +6,7 @@
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use futures_util::StreamExt;
 use serde::Deserialize;
 
 use super::{
@@ -104,19 +105,49 @@ struct TokenResponseRaw {
     expires_in: Option<u64>,
 }
 
+const MAX_OAUTH_RESPONSE_BYTES: usize = 64 * 1024;
+
+async fn bounded_response_text(response: reqwest::Response, label: &str) -> Result<String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_OAUTH_RESPONSE_BYTES as u64)
+    {
+        bail!("{label} response exceeded the {MAX_OAUTH_RESPONSE_BYTES}-byte limit");
+    }
+
+    let capacity = response
+        .content_length()
+        .unwrap_or(0)
+        .min(MAX_OAUTH_RESPONSE_BYTES as u64) as usize;
+    let mut body = Vec::with_capacity(capacity);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("reading {label} response failed"))?;
+        if body.len().saturating_add(chunk.len()) > MAX_OAUTH_RESPONSE_BYTES {
+            bail!("{label} response exceeded the {MAX_OAUTH_RESPONSE_BYTES}-byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).with_context(|| format!("{label} response was not valid UTF-8"))
+}
+
+fn valid_oauth_error_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
 fn safe_oauth_error_code(body: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    value
-        .get("error")?
-        .as_str()
-        .filter(|code| {
-            !code.is_empty()
-                && code.len() <= 64
-                && code
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-        })
-        .map(str::to_owned)
+    let error = value.get("error")?;
+    let code = match error {
+        serde_json::Value::String(code) => code.as_str(),
+        serde_json::Value::Object(object) => object.get("code")?.as_str()?,
+        _ => return None,
+    };
+    valid_oauth_error_code(code).then(|| code.to_owned())
 }
 
 async fn post_token(
@@ -131,7 +162,7 @@ async fn post_token(
         .await
         .context("token request failed")?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = bounded_response_text(resp, "token endpoint").await?;
     if !status.is_success() {
         if let Some(code) = safe_oauth_error_code(&body) {
             bail!("token endpoint returned {status} ({code})");
@@ -220,12 +251,15 @@ pub(crate) async fn start_device_auth_with_url(
         .await
         .context("device authorization request failed")?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = bounded_response_text(response, "device authorization endpoint").await?;
     if !status.is_success() {
         if status == reqwest::StatusCode::NOT_FOUND {
             bail!("OpenAI Codex device-code login is unavailable; verify the OpenAI auth endpoint");
         }
-        bail!("device authorization endpoint returned {status}: {body}");
+        if let Some(code) = safe_oauth_error_code(&body) {
+            bail!("device authorization endpoint returned {status} ({code})");
+        }
+        bail!("device authorization endpoint returned {status}");
     }
 
     let value: serde_json::Value =
@@ -277,7 +311,7 @@ pub(crate) async fn poll_device_auth_with_url(
         .await
         .context("device authorization poll failed")?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let body = bounded_response_text(response, "device authorization poll").await?;
 
     // OpenAI uses both statuses for the ordinary not-authorized-yet state.
     if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
@@ -302,21 +336,11 @@ pub(crate) async fn poll_device_auth_with_url(
         });
     }
 
-    let error_code = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|value| value.get("error").cloned())
-        .and_then(|error| match error {
-            serde_json::Value::String(code) => Some(code),
-            serde_json::Value::Object(object) => object
-                .get("code")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
-            _ => None,
-        });
-    match error_code.as_deref() {
+    match safe_oauth_error_code(&body).as_deref() {
         Some("deviceauth_authorization_pending") => Ok(DevicePoll::Pending),
         Some("slow_down") => Ok(DevicePoll::SlowDown),
-        _ => bail!("device authorization failed with status {status}: {body}"),
+        Some(code) => bail!("device authorization failed with status {status} ({code})"),
+        None => bail!("device authorization failed with status {status}"),
     }
 }
 
@@ -597,6 +621,86 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("invalid_grant"), "{message}");
         assert!(!message.contains("leaked-secret-value"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn token_response_rejects_chunked_body_over_limit() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            let chunk = vec![b'x'; 4096];
+            for _ in 0..=(MAX_OAUTH_RESPONSE_BYTES / chunk.len()) {
+                if write!(stream, "{:x}\r\n", chunk.len()).is_err()
+                    || stream.write_all(&chunk).is_err()
+                    || stream.write_all(b"\r\n").is_err()
+                {
+                    return;
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+        });
+
+        let error = match post_token(
+            &reqwest::Client::new(),
+            &format!("http://{address}/token"),
+            &[],
+        )
+        .await
+        {
+            Ok(_) => panic!("oversized token response must fail"),
+            Err(error) => error,
+        };
+        server.join().unwrap();
+        assert!(error.to_string().contains("65536-byte limit"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn oauth_client_does_not_follow_token_redirects() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let origin = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/sink", destination.uri())),
+            )
+            .mount(&origin)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sink"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": 3600
+            })))
+            .mount(&destination)
+            .await;
+
+        let error = match post_token(
+            &super::super::http_client(),
+            &format!("{}/token", origin.uri()),
+            &[("refresh_token", "redirect-secret")],
+        )
+        .await
+        {
+            Ok(_) => panic!("redirect response must be returned to the caller"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("307"), "{error:#}");
+        assert!(destination.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

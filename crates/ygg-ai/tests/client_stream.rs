@@ -378,6 +378,132 @@ async fn test_client_stream_http_error_handling() {
     }
 }
 
+fn assert_secret_and_controls_are_absent(error: &AiError, secrets: &[&str]) {
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    for rendered in [&display, &debug] {
+        for secret in secrets {
+            assert!(
+                !rendered.contains(secret),
+                "credential leaked: {rendered:?}"
+            );
+        }
+        assert!(!rendered.contains('\x1b'), "ESC leaked: {rendered:?}");
+        assert!(!rendered.contains('\x07'), "BEL leaked: {rendered:?}");
+    }
+}
+
+#[tokio::test]
+async fn http_error_diagnostics_redact_request_credentials_and_controls() {
+    const AUTH_SECRET: &str = "AUTH_SECRET_7f3c";
+    const HEADER_SECRET: &str = "HEADER_SECRET_91ab";
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_bytes(format!(
+            "provider echoed {AUTH_SECRET} and {HEADER_SECRET} \x1b]52;c;YXR0YWNr\x07"
+        )))
+        .mount(&mock_server)
+        .await;
+
+    let mut model = make_test_model(&mock_server.uri(), Protocol::OpenAiChat, false);
+    let mut endpoint = (*model.endpoint).clone();
+    endpoint.auth = Auth::bearer(AUTH_SECRET);
+    endpoint.default_headers.insert(
+        "x-gateway-key",
+        http::HeaderValue::from_static(HEADER_SECRET),
+    );
+    model.endpoint = Arc::new(endpoint);
+
+    let error = match AiClient::new().stream(&model, text_request()).await {
+        Err(error) => error,
+        Ok(_) => panic!("400 response unexpectedly opened a stream"),
+    };
+    let AiError::Http(http) = &error else {
+        panic!("expected HTTP error, got {error:?}");
+    };
+    let snippet = http.body_snippet.as_deref().expect("body snippet");
+    assert_eq!(snippet.matches("[REDACTED]").count(), 2, "{snippet:?}");
+    assert!(
+        snippet.contains(r"\u{1b}]52;c;YXR0YWNr\u{7}"),
+        "{snippet:?}"
+    );
+    assert_secret_and_controls_are_absent(&error, &[AUTH_SECRET, HEADER_SECRET]);
+}
+
+#[tokio::test]
+async fn successful_provider_error_diagnostics_redact_credentials_and_controls() {
+    const SECRET: &str = "SUCCESS_SECRET_31de";
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "error": {
+                "message": format!("provider echoed {SECRET} \x1b]0;owned\x07"),
+                "type": "bad_request",
+                "code": "invalid"
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut model = make_test_model(&mock_server.uri(), Protocol::OpenAiChat, false);
+    let mut endpoint = (*model.endpoint).clone();
+    endpoint.auth = Auth::bearer(SECRET);
+    model.endpoint = Arc::new(endpoint);
+
+    let mut stream = AiClient::new()
+        .stream(&model, text_request())
+        .await
+        .expect("HTTP 200 opens the body stream");
+    let error = stream
+        .next()
+        .await
+        .expect("provider error event")
+        .expect_err("JSON error envelope must fail");
+    let AiError::Provider(provider) = &error else {
+        panic!("expected provider error, got {error:?}");
+    };
+    assert_eq!(
+        provider.message,
+        r"provider echoed [REDACTED] \u{1b}]0;owned\u{7}"
+    );
+    assert_secret_and_controls_are_absent(&error, &[SECRET]);
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn authenticated_requests_do_not_follow_cross_origin_redirects() {
+    let origin = MockServer::start().await;
+    let destination = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/sink", destination.uri())),
+        )
+        .mount(&origin)
+        .await;
+
+    let mut model = make_test_model(&origin.uri(), Protocol::OpenAiChat, false);
+    let mut endpoint = (*model.endpoint).clone();
+    endpoint.auth = Auth::bearer("redirect-bearer-secret");
+    endpoint.default_headers.insert(
+        "x-gateway-key",
+        http::HeaderValue::from_static("redirect-custom-secret"),
+    );
+    model.endpoint = Arc::new(endpoint);
+
+    let error = match AiClient::new().stream(&model, text_request()).await {
+        Err(error) => error,
+        Ok(_) => panic!("redirect response was followed"),
+    };
+    assert!(matches!(
+        error,
+        AiError::Http(ref http) if http.status == http::StatusCode::TEMPORARY_REDIRECT
+    ));
+    assert!(destination.received_requests().await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn strict_pending_media_is_rejected_before_network_io() {
     let mock_server = MockServer::start().await;

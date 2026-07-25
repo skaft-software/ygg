@@ -23,10 +23,11 @@ pub async fn login(store: &CredentialStore, headless: bool) -> Result<()> {
     let http = super::http_client();
     let device = oauth::start_device_auth(&http).await?;
 
-    println!(
-        "Open this URL and enter the code shown below:\n\n  {DEVICE_VERIFICATION_URI}\n\n  Code: {}\n\nWaiting for authorization…",
-        device.user_code
-    );
+    let terminal = crate::output::stdout_is_terminal();
+    let user_code = crate::output::table_field(&device.user_code, terminal);
+    crate::output::stdout_multiline(format!(
+        "Open this URL and enter the code shown below:\n\n  {DEVICE_VERIFICATION_URI}\n\n  Code: {user_code}\n\nWaiting for authorization…"
+    ));
     if !headless {
         open_browser(DEVICE_VERIFICATION_URI);
     }
@@ -57,28 +58,32 @@ pub async fn login(store: &CredentialStore, headless: bool) -> Result<()> {
     let account_id = oauth::validate_subscription_token(&tokens.access)
         .context("OpenAI returned a credential that cannot access the ChatGPT model pool")?;
 
-    store.save(&CredentialFile {
+    let credential = CredentialFile {
         tokens: Tokens {
             access_token: tokens.access,
             refresh_token: tokens.refresh,
             account_id,
         },
         expires_at: tokens.expires_at,
-    })?;
+    };
+    let save_store = store.clone();
+    tokio::task::spawn_blocking(move || save_store.save(&credential))
+        .await
+        .context("credential-save worker failed")??;
 
-    println!(
+    crate::output::stdout_multiline(format!(
         "\nSigned in to OpenAI Codex. Your model catalog will be discovered on startup.\nIf discovery is unavailable, the fallback models are: {}.\nSelect one with `ygg --model {}` or set `model = \"{}\"` in ~/.ygg/config.toml.",
         MODELS.join(", "),
         MODELS[0],
         MODELS[0],
-    );
+    ));
     Ok(())
 }
 
 /// Remove the stored credential.
-pub fn logout(store: &CredentialStore) -> Result<()> {
-    store.delete()?;
-    println!("Signed out of OpenAI Codex.");
+pub async fn logout(store: &CredentialStore) -> Result<()> {
+    store.delete_async().await?;
+    crate::output::stdout_line("Signed out of OpenAI Codex.");
     Ok(())
 }
 

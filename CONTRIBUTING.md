@@ -33,6 +33,12 @@ Run the binary without installing it:
 cargo run -p ygg-coding-agent --bin ygg -- --help
 ```
 
+Cargo does not garbage-collect stale fingerprints from old toolchains, feature
+sets, or profiling runs. If `target/` grows unexpectedly, inspect it with
+`du -sh target` and reclaim it with `cargo clean`; use an isolated
+`CARGO_TARGET_DIR` for one-off instrumentation and benchmark builds. Build
+artifacts are excluded from both Git and the Docker context.
+
 ## Change guidelines
 
 - Preserve the canonical request/session types unless the change explicitly
