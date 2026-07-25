@@ -7,7 +7,7 @@
 <h1 align="center">ygg</h1>
 
 <p align="center">
-  <strong>A local-first Rust coding agent with direct model connections and explicit tool control.</strong>
+  <strong>A tiny and fast coding agent written fully in Rust.</strong>
 </p>
 
 <p align="center">
