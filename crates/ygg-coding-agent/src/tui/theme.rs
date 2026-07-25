@@ -661,6 +661,24 @@ impl YggTheme {
         (idle.red, idle.green, idle.blue)
     }
 
+    /// Return the copy-safe composer fill for a known terminal profile. An
+    /// unknown profile stays on the terminal's own canvas rather than guessing.
+    pub(crate) fn composer_surface_rgb(&self, accent: (u8, u8, u8)) -> Option<(u8, u8, u8)> {
+        if self.capabilities.color == ColorDepth::None
+            || self.background == TerminalBackground::Unknown
+        {
+            return None;
+        }
+        Some(self.composer_idle_rgb(accent))
+    }
+
+    pub(crate) fn rgb_bg(&self, color: (u8, u8, u8), text: &str) -> String {
+        self.inner.apply_style(
+            TextStyle::plain().background(Color::Rgb(color.0, color.1, color.2)),
+            text,
+        )
+    }
+
     pub(crate) fn rgb_fg(&self, color: (u8, u8, u8), text: &str) -> String {
         self.color_text(
             Rgb {
@@ -825,7 +843,7 @@ impl YggTheme {
                 // every model-emitted grapheme visible while sexy-tui retains
                 // the original source as semantic copy text.
                 code_overflow: CodeOverflow::Wrap,
-                code_borders: true,
+                code_borders: !self.is_compiled_default(),
                 syntax_highlighting: true,
                 tables: true,
                 unordered_list_marker: UnorderedListMarker::Dash,
@@ -1424,10 +1442,13 @@ fn default_theme_for(
     for &(token, source) in VERBATIM_FOREGROUNDS {
         theme.override_token(token, source);
     }
-    // Code is identified by compact borders, indentation, and syntax roles.
-    // Painting fixed surfaces looks like terminal selection and cannot be
-    // contrast-safe across unknown light/dark profiles. Named themes may opt in.
-    theme.override_token("md_code_bg", "default");
+    // Fenced code uses a quiet, copy-safe surface on known terminal profiles.
+    // Indentation and syntax roles remain sufficient when the profile is unknown
+    // or color is unavailable. Inline code stays on the terminal canvas.
+    theme.override_token(
+        "md_code_bg",
+        &standard_surface("#202725", "#f1f5f4", background),
+    );
     theme.override_token("md_code_inline_bg", "default");
     apply_required_surfaces(&mut theme, background);
     apply_standard_technical_palette(&mut theme, background);
@@ -1462,6 +1483,14 @@ pub(crate) fn test_theme_with(capabilities: TerminalCapabilities) -> YggTheme {
 }
 
 #[cfg(test)]
+pub(crate) fn test_theme_for(
+    background: TerminalBackground,
+    capabilities: TerminalCapabilities,
+) -> YggTheme {
+    default_theme_for(background, capabilities)
+}
+
+#[cfg(test)]
 pub(crate) fn test_theme_from_source(source: &str) -> YggTheme {
     test_theme_source_with(
         source,
@@ -1479,7 +1508,7 @@ pub(crate) fn test_theme_source_with(
     load_theme_source_for(
         source,
         "renderer-test",
-        ThemeSource::CompiledDefault,
+        ThemeSource::File(PathBuf::from("renderer-test.toml")),
         "Renderer test",
         capabilities,
         background,

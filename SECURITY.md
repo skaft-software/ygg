@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Ygg is currently an alpha. Security fixes are made on the latest `0.2.0-alpha` release; older snapshots are not supported.
+Ygg is pre-1.0 software. Security fixes are made on the latest `0.3.0` release; older snapshots are not supported.
 
 ## Boundary and defaults
 

@@ -2,6 +2,32 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## 0.3.0 — 2026-07-25
+
+### Added
+
+- Failed interactive runs now retain the compact lifecycle row and show a
+  bounded, terminal-safe diagnostic that can be copied for troubleshooting.
+
+### Changed
+
+- Made the default Markdown code and prompt composer surfaces copy-safe with
+  terminal-adaptive shading instead of printable outlines; explicit themes retain
+  their authored chrome.
+- Refreshed the project identity, terminal demo, installation references, and
+  release documentation for the `0.3.0` line.
+
+### Security and reliability
+
+- Redacted request credentials and terminal controls from bounded provider and
+  transport diagnostics before they can be persisted or printed.
+- Serialized ChatGPT credential refresh across processes and bounded OAuth
+  responses, update metadata, and other remote discovery inputs.
+- Prevented atomic new-file publication from replacing a concurrently created
+  target and retired extension RPC connections after interrupted framed writes.
+- Centralized terminal-safe human-facing command output and strengthened session
+  export redaction without changing provider-visible conversation context.
+
 ## 0.2.0-alpha — 2026-07-25
 
 ### Added

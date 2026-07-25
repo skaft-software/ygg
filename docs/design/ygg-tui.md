@@ -43,6 +43,9 @@ require a fresh key press.
 The composer supports multiline editing, bracketed paste, large-paste chips,
 media attachments, dropped paths, and gitignore-aware `@` completion. Media is
 capability-gated at attachment time and remains ordered with text when submitted.
+PDFs are not decoded or sent as multimodal payloads: a dropped PDF receives a
+composer chip, but submission resolves that chip to the file path as text so the
+model can inspect it with file tools.
 
 ## Reasoning presentation
 
@@ -54,18 +57,29 @@ infers a label from body prose, sanitizes provider text before display, and uses
 `Thinking` until the model emits a heading. Completed collapsed reasoning has
 no rows. `Ctrl+O` preserves the existing full, verbatim Markdown rendering.
 
+## Run outcomes
+
+A failed run keeps the compact `failed · <duration>` lifecycle row and follows it
+with the actionable error reason. The reason is credential-redacted at the
+inference request boundary, then terminal-sanitized and capped at 4 KiB by the
+TUI. It is included in semantic transcript copy so it can be reported without
+recovering raw provider envelopes or headers.
+
 ## Tool presentation
 
-Tool calls expose only deterministic intent and lifecycle rows. Protocol
-arguments, raw/progress output, failure text, diffs, shell output, and
-extension-rendered tool payloads are internal accountability/provenance data;
-they are never rendered in the TUI, copied from transcript blocks, or revealed
-by a disclosure control. Tool rows may show the sanitized command/intent and a
-generic completion or failure state.
+Tool calls expose deterministic intent and lifecycle rows. Raw protocol
+arguments and envelopes, unsanitized failure evidence, and extension-rendered
+payloads remain internal accountability/provenance data and are excluded from
+transcript copy. For operational feedback, the TUI renders bounded sanitized
+projections: search results and Bash/local-shell output use a muted tail, while
+edit/write results use a bounded unified diff. Omission metadata distinguishes a
+collapsible UI tail from bytes already discarded by the tool capture.
 
-Ctrl+O expands or collapses only the most recent reasoning block or compaction
-summary. `/tool [call-id]` and `/verbose [on|off]` remain accepted for command
-compatibility and report that evidence is internal; neither changes visibility.
+Ctrl+O toggles the global disclosure mode for retained reasoning, compaction,
+search output, Bash/local-shell output, and edit/write diffs. `/verbose [on|off]`
+controls the same mode; `/tool [call-id]` remains accepted for command
+compatibility and reports that evidence is internal. Expansion cannot recover
+capture bytes that the tool already discarded.
 
 Final structured tool results remain provider-visible and persisted when the
 agent protocol requires them to continue a tool turn. This is operational

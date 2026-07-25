@@ -2,7 +2,7 @@
 
 Ygg welcomes focused bug fixes, protocol improvements, terminal-correct UX
 work, provider compatibility updates, tests, and documentation corrections.
-The project is an alpha, so small changes with strong evidence are easier to
+The project is pre-1.0, so small changes with strong evidence are easier to
 review and safer to ship than broad rewrites.
 
 ## Before opening a change

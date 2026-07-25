@@ -7,11 +7,11 @@
 <h1 align="center">ygg</h1>
 
 <p align="center">
-  <strong>A tiny and fast coding agent for local models, cloud models, and everything in between.</strong>
+  <strong>A local-first Rust coding agent with direct model connections and explicit tool control.</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases"><img alt="Release: alpha" src="https://img.shields.io/badge/release-0.2.0--alpha-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.3.0"><img alt="Release: 0.3.0" src="https://img.shields.io/badge/release-0.3.0-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -32,24 +32,23 @@
 
 ---
 
-ygg is a local-first coding agent written in Rust. It combines a polished terminal interface, a provider-agnostic inference layer, durable sessions, explicit tools, omnimodal input, configurable compaction, and a rich, customizable theme engine.
+ygg is a local-first coding agent written in Rust. It combines a provider-independent inference layer, durable branchable sessions, explicit tools, image and audio input, configurable compaction, and a customizable terminal interface.
 
-It works with a local OpenAI-compatible server just as naturally as it works with OpenAI, Anthropic, OpenRouter, or another cloud provider. There is no hosted ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local inspectable JSONL.
+It supports local OpenAI-compatible servers alongside OpenAI, Anthropic, OpenRouter, and other hosted providers. There is no hosted ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local, inspectable JSONL.
 
-
-> **Note:** ygg supports Apple's on-device and private cloud compute models out of the box on MacOS 27. Run `fm serve` in Terminal.app (very important) to allow ygg to communicate with the local openAI-compatible endpoint Apple provides. From there you can set it up as a normal custom/self-hosted endpoint. For more information, see https://skaft.org/ygg/docs.
+> **Apple Foundation Models:** On macOS 27, run `fm serve` from Terminal.app, then configure its OpenAI-compatible endpoint as a custom provider. See the [ygg documentation](https://skaft.org/ygg/docs/) for the current setup.
 
 ## Why ygg
 
-Most coding agents treat local models like an afterthought. Bloated context, high memory usage, inconsiderate compaction techniques, and more. If you want a coding agent that does the least possible to make your agents do the most possible, ygg is a great choice. It's fast, sends the model a tiny system prompt, and contains minimal convenience features that help you observe how local and cloud models perform at all times.
+Local endpoints are a primary path rather than a compatibility mode. Ygg keeps provider capabilities explicit, regression-tests its default base prompt, loads project context only from trusted workspaces, lets users remove tool authority, and stores sessions on disk.
 
 | Principle | What it means in ygg |
 | --- | --- |
-| **Local models first** | First-class custom endpoints, offline startup, cold-start-safe timeouts, live model discovery, and exact endpoint-reported reasoning controls, token metrics, etc. |
-| **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share one typed request, message, tool, usage, and streaming model. Simple by design, adaptable to a rapidly changing industry |
+| **Local models first** | First-class custom endpoints, offline startup, cold-start-aware timeouts, model discovery, endpoint-reported reasoning controls, and token metrics. |
+| **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share typed request, message, tool, usage, and streaming models. |
 | **Durable by construction** | Sessions are append-only, parent-linked, branchable, locked, synced, repairable, and inspectable without ygg running. |
 | **Authority is explicit** | Workspace trust, tool allowlists, mutation controls, command controls, bounded I/O, and extension trust are visible user decisions. |
-| **The terminal handles the heavy lifting** | Native scrollback and selection, semantic rendering, ten bundled themes, responsive narrow layouts, stable streaming, and plain-output fallbacks. Keeps the agent application lean and fast. |
+| **The terminal handles presentation** | Native scrollback and selection, semantic rendering, ten bundled themes, narrow layouts, stable streaming, and plain-output fallbacks share one terminal model. |
 | **Customization is local data** | Prompts, skills, themes, instructions, and extensions are ordinary files with deterministic precedence and reloadable snapshots. |
 
 ## Install
@@ -58,11 +57,11 @@ ygg currently supports macOS and Linux. You need [Rust 1.86 or newer](https://ru
 
 ### Installer
 
-The installer builds the pinned alpha tag and adds Cargo's binary directory to zsh, bash, or POSIX sh when necessary:
+The installer builds the pinned release tag and adds Cargo's binary directory to zsh, bash, or POSIX sh when necessary:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/skaft-software/ygg/v0.2.0-alpha/scripts/install.sh | sh
+  https://raw.githubusercontent.com/skaft-software/ygg/v0.3.0/scripts/install.sh | sh
 ```
 
 Restart the shell, then verify the installation:
@@ -79,7 +78,7 @@ To install without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.2.0-alpha \
+  --tag v0.3.0 \
   --bin ygg \
   ygg-coding-agent
 ```
@@ -104,11 +103,11 @@ The included image builds ygg from the locked workspace, runs as an unprivileged
 user, and expects an explicit workspace mount:
 
 ```sh
-docker build -f deploy/Dockerfile.ygg -t ygg:alpha .
+docker build -f deploy/Dockerfile.ygg -t ygg:0.3.0 .
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:alpha --model claude-sonnet-4-6
+  ygg:0.3.0 --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs.
@@ -369,18 +368,21 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Native scrollback and text selection by default; application-owned mouse behavior is opt-in.
 - Stable-prefix differential rendering, synchronized atomic frames, and bounded repaint regions.
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
-- Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links; raw tool evidence is never rendered.
+- Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
 - Prompt colors tied to model labs in the default theme; named themes retain their own authored palettes.
 - Exact theme replacement: switching back to default does not retain attributes from the previous theme.
 - Ten bundled themes: `bone-machine`, `circuit-garden`, `field-notes`, `oxide-console`, `paper-ledger`, `signal-noir`, `synthwave-relay`, `tidepool`, `violet-hour`, and `zen-mono`.
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 
-Tool arguments, raw/progress output, failure details, diffs, shell output, and
-extension-rendered tool payloads remain internal accountability evidence. Ctrl+O
-only expands reasoning or compaction summaries; `/tool` and `/verbose` never
-disclose tool evidence. Final structured tool results are retained and sent to
-the provider only when required to continue the tool protocol; live progress
-is neither persisted nor sent to the model.
+Raw protocol arguments and envelopes, unsanitized failure payloads, and
+extension-rendered tool payloads remain internal accountability evidence and are
+excluded from transcript copy. Ctrl+O expands retained reasoning, compaction,
+bounded search/shell output, and edit/write diffs; it cannot recover bytes the
+tool capture already discarded. Failed runs retain `failed · <duration>` and
+show a bounded, terminal-safe reason. Provider diagnostics are request-credential
+redacted before reaching the frontend. Final structured tool results are retained
+and sent to the provider only when required to continue the tool protocol; live
+progress is neither persisted nor sent to the model.
 
 ```sh
 ygg --theme violet-hour
@@ -420,8 +422,8 @@ Type `/` in the composer to open live command discovery.
 | `/thinking [level]` | Inspect or change model-supported reasoning. |
 | `/compact` | Compact at the next safe boundary. |
 | `/theme [name\|list\|reload]` | Select, inspect, or reload themes. |
-| `/verbose [on\|off]` | Report that tool evidence is internal and never displayed. |
-| `/tool [call-id]` | Report that tool evidence is internal and never displayed. |
+| `/verbose [on\|off]` | Expand or collapse retained reasoning and bounded tool-output projections. |
+| `/tool [call-id]` | Report that raw tool protocol evidence remains internal. |
 | `/reload` | Reload instructions, themes, prompts, skills, and enabled extensions. |
 | `/login [provider]` | Sign in to a subscription provider. |
 | `/logout [provider]` | Remove its stored credential. |
@@ -581,7 +583,7 @@ ygg is intentionally honest about where its boundary ends.
 - **Crash behavior:** complete records survive; a torn final append is narrowly repairable; unresolved mutation is reported as indeterminate and never replayed.
 - **Cancellation:** provider streams, retry waits, compaction, tools, and descendant process groups observe cancellation.
 - **Network recovery:** non-timeout transport loss retries up to five times with visible diagnostics; provisional TUI output is discarded before replacement. A full timeout is not multiplied automatically.
-- **Secret handling:** credential files are owner-private, sensitive headers are marked, redirects are disabled, debug formatting redacts secrets, and session export applies bounded deterministic redaction.
+- **Secret handling:** credential files are owner-private, sensitive headers are marked, redirects are disabled, provider diagnostics redact request credentials, debug formatting redacts secrets, and session export applies bounded deterministic redaction.
 - **Terminal safety:** untrusted terminal controls are neutralized; terminal capabilities degrade without changing semantic content.
 - **Dependency policy:** `cargo audit` and `cargo deny` cover advisories, licenses, bans, duplicate visibility, and source policy as release gates.
 - **Verification:** protocol fixtures, adversarial streaming tests, filesystem race tests, VT100 rendering, PTY shutdown tests, and full workspace tests cover the release invariants.
@@ -608,7 +610,7 @@ Build the release binary:
 cargo build --release --locked -p ygg-coding-agent --bin ygg
 ```
 
-The declared MSRV is Rust 1.86. The alpha command-execution implementation is Unix-only. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution scope, review expectations, and the release checklist.
+The declared MSRV is Rust 1.86. Command execution is Unix-only. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution scope, review expectations, and the release checklist.
 
 ## Repository map
 
@@ -631,7 +633,7 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.2.0-alpha.md) | Current alpha installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.3.0.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Themes](docs/themes.md) | Theme schema, roles, glyphs, responsive layout, and fallback behavior. |
@@ -644,13 +646,13 @@ third_party/              upstream license texts
 
 ## Built by Achu
 
-Ygg is my hobby project, to use daily for, accelerate building things that are fun and useful, and to share with friends and family. It is early in its development, and currently features **no safety guardrails by default**. 
+Ygg is an independent project I use for daily repository work. It is still early: configuration, session, and extension interfaces may change, and an enabled command tool runs with the authority of the user who launched it. Use an isolated account, container, or VM for untrusted repositories or model endpoints; the full boundary is documented in [SECURITY.md](SECURITY.md).
 
-I live in Toronto and work on AI infrastructure, developer tools, and local-first systems. If you are building in that space and want to connect, please feel free to reach out. I don't bite. 
+I am a software engineer in Toronto building developer tools, local inference systems, and audio software. If you work in those areas and want to compare notes, feel free to reach out.
 
 - [GitHub — @achuthanmukundan00](https://github.com/achuthanmukundan00)
 - [Personal site — achumukundan.dev](https://achumukundan.dev)
-- [Skaft — local-first AI tools](https://skaft.org)
+- [Skaft — local-first developer tools](https://skaft.org)
 
 ## License and acknowledgements
 
@@ -662,5 +664,5 @@ ygg uses architectural concepts and terminal interaction patterns from [Pi](http
 
 <p align="center">
   <a href="https://skaft.org/ygg"><strong>skaft.org/ygg</strong></a><br>
-  <sub>Local models first. Inspectable by default. Built to last.</sub>
+  <sub>Local models first. Explicit control. Open source.</sub>
 </p>

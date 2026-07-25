@@ -5,6 +5,12 @@
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- Markdown fenced code blocks are borderless by default, allowing copy-safe themed background surfaces without printable frame glyphs.
+
 ## [0.2.0] - 2026-07-13
 
 ### Added

@@ -68,7 +68,7 @@ impl Default for RenderOptions {
         Self {
             width: WidthPolicy::default(),
             code_overflow: CodeOverflow::Clip,
-            code_borders: true,
+            code_borders: false,
             syntax_highlighting: cfg!(feature = "syntax-highlighting"),
             tables: true,
             unordered_list_marker: UnorderedListMarker::Bullet,
@@ -661,7 +661,9 @@ impl RichRenderer {
         let required_for_label = if bordered {
             language_width.saturating_add(5)
         } else {
-            language_width.saturating_add(configured_left)
+            language_width
+                .saturating_add(configured_left)
+                .saturating_add(configured_right)
         };
         let minimum_width = if bordered { 3 } else { 1 };
         let block_width = required_for_content
@@ -680,13 +682,21 @@ impl RichRenderer {
         if bordered {
             output.push(self.code_border_line(block_width, language, true, style.border));
         } else if let Some(language) = language {
+            let mut label_style = self.theme.style(TextRole::Muted);
+            if let Some(background) = style.background {
+                label_style.background = background;
+            }
             let mut label = RichLine::default();
-            label.push(" ".repeat(left_padding), TextStyle::plain(), None);
-            label.push(
-                self.sanitize(language),
-                self.theme.style(TextRole::Muted),
-                None,
-            );
+            label.push(" ".repeat(left_padding), padding_style, None);
+            label.push(self.sanitize(language), label_style, None);
+            if style.background.is_some() {
+                let label_width = self.line_width(&label);
+                label.push(
+                    " ".repeat(block_width.saturating_sub(label_width)),
+                    padding_style,
+                    None,
+                );
+            }
             output.push(self.clip_line(label, block_width));
         }
 
@@ -2188,21 +2198,18 @@ mod tests {
             "let answer = 42;\n",
         ))]);
         let rendered = renderer(ColorDepth::TrueColor, true).render(&document, 160);
-        assert_eq!(rendered.lines.len(), 3, "{}", rendered.plain_text());
+        assert_eq!(rendered.lines.len(), 2, "{}", rendered.plain_text());
         assert!(rendered
             .lines
             .iter()
             .all(|line| WidthPolicy::default().line_width(&line.plain) < 40));
         assert!(!rendered.styled_text().contains("\x1b[48;"));
+        assert!(!rendered.plain_text().contains(['┌', '┐', '└', '┘', '│']));
 
         let plain = RichRenderer::plain().render(&document, 160);
-        let widths = plain
-            .lines
-            .iter()
-            .map(|line| WidthPolicy::default().line_width(&line.plain))
-            .collect::<Vec<_>>();
-        assert!(widths.iter().all(|width| *width == widths[0]), "{widths:?}");
         assert!(plain.lines[0].plain.contains("rust"));
+        assert!(plain.lines[1].plain.starts_with("  let answer"));
+        assert!(plain.lines.iter().all(|line| !line.plain.ends_with(' ')));
     }
 
     #[test]
@@ -2246,6 +2253,24 @@ mod tests {
             .render(&document, 40)
             .styled_text()
             .contains("\x1b[48;2;"));
+
+        let labelled = markdown::parse("```rust\nlet answer = 42;\n```");
+        let labelled = themed.render(&labelled, 40);
+        assert_eq!(labelled.lines.len(), 2, "{}", labelled.plain_text());
+        assert!(
+            labelled
+                .lines
+                .iter()
+                .all(|line| line.styled.starts_with("\x1b[48;2;32;32;32m")),
+            "{:?}",
+            labelled.styled_lines()
+        );
+        assert_eq!(
+            WidthPolicy::default().line_width(&labelled.lines[0].plain),
+            WidthPolicy::default().line_width(&labelled.lines[1].plain)
+        );
+        assert!(labelled.lines[0].plain.ends_with(' '));
+
         assert!(themed
             .render_diff(
                 &UnifiedDiff::parse("@@ -0,0 +1 @@\n+value"),

@@ -39,6 +39,7 @@ use crate::tui::theme::{
 };
 
 const MAX_PANEL_BYTES: usize = 64 * 1024;
+const MAX_OUTCOME_DETAIL_BYTES: usize = 4 * 1024;
 const MAX_EXTENSION_TOOL_RENDER_SEGMENTS: usize = 128;
 /// Default render cap — roughly 60 fps. Decorative shimmer uses the separate,
 /// deliberately slower cap below; input and streamed output stay on this path.
@@ -1567,7 +1568,8 @@ enum RenderCommand {
 /// false we can use a lazy poll interval to save CPU.
 fn shimmer_animating(state: &ShellState) -> bool {
     let capabilities = state.theme.capabilities();
-    if !capabilities.animation
+    if state.theme.is_compiled_default()
+        || !capabilities.animation
         || capabilities.color == crate::tui::terminal::ColorDepth::None
         || state.size.0 < 12
     {
@@ -2077,17 +2079,32 @@ fn outcome_line(outcome: &RunOutcome, theme: &YggTheme) -> String {
     }
 }
 
+fn bounded_outcome_detail(raw: &str) -> String {
+    let mut safe = sanitize_for_terminal(raw);
+    if safe.len() <= MAX_OUTCOME_DETAIL_BYTES {
+        return safe;
+    }
+
+    let mut end = MAX_OUTCOME_DETAIL_BYTES - '…'.len_utf8();
+    while end > 0 && !safe.is_char_boundary(end) {
+        end -= 1;
+    }
+    safe.truncate(end);
+    safe.push('…');
+    safe
+}
+
 fn render_outcome(outcome: &RunOutcome, theme: &YggTheme, width: u16) -> Vec<String> {
     let mut lines = vec![fit_line(&outcome_line(outcome, theme), width)];
     let detail = match outcome {
-        // Failure text is internal accountability evidence; expose only the
-        // generic lifecycle row. A needs-input prompt is an actionable UI
-        // request and remains visible.
+        // Inference diagnostics are credential-redacted at the request boundary.
+        // Bound and terminal-sanitize them again at this presentation boundary.
+        RunOutcome::Failed { reason, .. } => Some(("error", reason.as_str())),
         RunOutcome::NeedsInput { prompt } => Some(("warning", prompt.as_str())),
         _ => None,
     };
     if let Some((role, detail)) = detail {
-        let safe = sanitize_for_terminal(detail);
+        let safe = bounded_outcome_detail(detail);
         for source_line in safe.split('\n') {
             if source_line.is_empty() {
                 lines.push(String::new());
@@ -3427,9 +3444,11 @@ fn block_copy_text(block: &TranscriptBlock) -> String {
             RunOutcome::CompletedWithWarnings { elapsed, .. } => {
                 format!("completed with notes · {}", format_duration(*elapsed))
             }
-            RunOutcome::Failed { elapsed, .. } => {
-                format!("failed · {}", format_duration(*elapsed))
-            }
+            RunOutcome::Failed { elapsed, reason } => format!(
+                "failed · {}\n{}",
+                format_duration(*elapsed),
+                bounded_outcome_detail(reason)
+            ),
             RunOutcome::Interrupted { elapsed } => {
                 format!("interrupted · {}", format_duration(*elapsed))
             }
