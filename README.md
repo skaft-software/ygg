@@ -36,19 +36,20 @@ ygg is a local-first coding agent written in Rust. It combines a polished termin
 
 It works with a local OpenAI-compatible server just as naturally as it works with OpenAI, Anthropic, OpenRouter, or another cloud provider. There is no hosted ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local inspectable JSONL.
 
-> **Release status:** `0.2.0-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
+
+> **Note:** ygg supports Apple's on-device and private cloud compute models out of the box on MacOS 27. Run `fm serve` in Terminal.app (very important) to allow ygg to communicate with the local openAI-compatible endpoint Apple provides. From there you can set it up as a normal custom/self-hosted endpoint. For more information, see https://skaft.org/ygg/docs.
 
 ## Why ygg
 
-Most coding agents make you choose between a beautiful product and a system you can actually inspect. ygg is built around the idea that you should get both.
+Most coding agents treat local models like an afterthought. Bloated context, high memory usage, inconsiderate compaction techniques, and more. If you want a coding agent that does the least possible to make your agents do the most possible, ygg is a great choice. It's fast, sends the model a tiny system prompt, and contains minimal convenience features that help you observe how local and cloud models perform at all times.
 
 | Principle | What it means in ygg |
 | --- | --- |
-| **Local models first** | First-class custom endpoints, offline startup, cold-start-safe timeouts, live model discovery, and exact endpoint-reported reasoning controls. |
-| **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share one typed request, message, tool, usage, and streaming model. |
+| **Local models first** | First-class custom endpoints, offline startup, cold-start-safe timeouts, live model discovery, and exact endpoint-reported reasoning controls, token metrics, etc. |
+| **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share one typed request, message, tool, usage, and streaming model. Simple by design, adaptable to a rapidly changing industry |
 | **Durable by construction** | Sessions are append-only, parent-linked, branchable, locked, synced, repairable, and inspectable without ygg running. |
 | **Authority is explicit** | Workspace trust, tool allowlists, mutation controls, command controls, bounded I/O, and extension trust are visible user decisions. |
-| **The terminal is the product** | Native scrollback and selection, semantic rendering, ten bundled themes, responsive narrow layouts, stable streaming, and plain-output fallbacks. |
+| **The terminal handles the heavy lifting** | Native scrollback and selection, semantic rendering, ten bundled themes, responsive narrow layouts, stable streaming, and plain-output fallbacks. Keeps the agent application lean and fast. |
 | **Customization is local data** | Prompts, skills, themes, instructions, and extensions are ordinary files with deterministic precedence and reloadable snapshots. |
 
 ## Install
@@ -643,9 +644,9 @@ third_party/              upstream license texts
 
 ## Built by Achu
 
-I built ygg to demonstrate the kind of engineering I care about: ambitious AI products backed by systems-level rigor—protocol design, streaming state machines, durable data structures, terminal rendering, security boundaries, performance work, and a user experience worth shipping.
+Ygg is my hobby project, to use daily for, accelerate building things that are fun and useful, and to share with friends and family. It is early in its development, and currently features **no safety guardrails by default**. 
 
-I am based in Toronto and work on AI infrastructure, developer tools, and local-first systems. If you are building in that space and want someone who can carry a product from architecture through hardening and release, I would love to talk.
+I live in Toronto and work on AI infrastructure, developer tools, and local-first systems. If you are building in that space and want to connect, please feel free to reach out. I don't bite. 
 
 - [GitHub — @achuthanmukundan00](https://github.com/achuthanmukundan00)
 - [Personal site — achumukundan.dev](https://achumukundan.dev)
