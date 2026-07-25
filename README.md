@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <img alt="Release: alpha" src="https://img.shields.io/badge/release-0.1.1--alpha-536dfe?style=flat-square">
+  <img alt="Release: alpha" src="https://img.shields.io/badge/release-0.2.0--alpha-536dfe?style=flat-square">
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -28,7 +28,7 @@ ygg is a local-first coding agent written in Rust. It combines a polished termin
 
 It works with a local OpenAI-compatible server just as naturally as it works with OpenAI, Anthropic, OpenRouter, or another cloud provider. There is no hosted ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local inspectable JSONL.
 
-> **Release status:** `0.1.1-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
+> **Release status:** `0.2.0-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
 
 <p align="center">
   <img src="docs/assets/ygg-demo.gif" alt="ygg terminal demo" width="100%">
@@ -57,7 +57,7 @@ The installer builds the pinned alpha tag and adds Cargo's binary directory to z
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/skaft-software/ygg/v0.1.1-alpha/scripts/install.sh | sh
+  https://raw.githubusercontent.com/skaft-software/ygg/v0.2.0-alpha/scripts/install.sh | sh
 ```
 
 Restart the shell, then verify the installation:
@@ -74,7 +74,7 @@ To install without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.1.1-alpha \
+  --tag v0.2.0-alpha \
   --bin ygg \
   ygg-coding-agent
 ```
@@ -626,7 +626,7 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.1.1-alpha.md) | Current alpha installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.2.0-alpha.md) | Current alpha installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Themes](docs/themes.md) | Theme schema, roles, glyphs, responsive layout, and fallback behavior. |

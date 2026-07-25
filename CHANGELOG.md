@@ -2,25 +2,35 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## 0.1.2-alpha — 2026-07-25
+## 0.2.0-alpha — 2026-07-25
 
 ### Added
+
 - Added durable Responses replay and multimodal reads.
 - Added persistence for authoritative raw output.
 - Added native compaction transport and pro mode.
-- Added support for labeled custom OpenAI providers.
-  - support for tool calling with macOS 27 Apple Foundation Models: system, and private cloud compute (pcc)
+- Added support for labeled custom OpenAI providers, including tool calling
+  with macOS 27 Apple Foundation Models: system and private cloud compute (PCC).
+- Added PDF attachment handling that resolves to a workspace path for file tools
+  instead of pretending PDFs are supported as multimodal payloads.
 
 ### Changed
-- Refined reasoning status presentation.
-- Hardened native responses integration.
+
+- Refined reasoning status presentation and hardened native Responses integration.
+- Improved bounded, sanitized tool-output projections and edit/write diffs in the
+  TUI while keeping raw evidence out of transcript copy.
+- Updated the startup identity and release metadata for the `0.2.0-alpha` line.
 
 ### Fixed
-- Prevented the shell prompt from overwriting the inline composer or leaving a stale footer after exiting the interactive TUI.
+
+- Prevented the shell prompt from overwriting the inline composer or leaving a
+  stale footer after exiting the interactive TUI.
+- Fixed release-blocking image/audio ingestion and media capability handling.
 
 ### Documentation
-- Showcased sexy-tui-rs themes.
-- Added ygg demo to README.
+
+- Showcased sexy-tui-rs themes and added the ygg demo to the README.
+- Updated installation, security-support, and release references for this alpha.
 
 ## 0.1.1-alpha — 2026-07-24
 
