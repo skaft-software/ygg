@@ -1,13 +1,12 @@
 //! OpenAI Responses private wire protocol codec.
 
-use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, ConfigError, DecodeError, ProviderError};
 use crate::protocol::sse::SseEvent;
 use crate::protocol::{
     cache_session_id, cache_session_id_for, prompt_cache_key, prompt_cache_key_for,
-    HttpRequestParts,
+    HttpRequestParts, WireImageUrl,
 };
 use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{
@@ -100,7 +99,7 @@ enum ResponsesContentPart {
     },
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]
-        image_url: Option<String>,
+        image_url: Option<WireImageUrl>,
         #[serde(skip_serializing_if = "Option::is_none")]
         file_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,7 +115,7 @@ enum ResponsesToolResultBlock {
     },
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]
-        image_url: Option<String>,
+        image_url: Option<WireImageUrl>,
         #[serde(skip_serializing_if = "Option::is_none")]
         file_id: Option<String>,
     },
@@ -402,7 +401,7 @@ fn map_user_input(
                 }
 
                 let (image_url, file_id) = match &image.source {
-                    ImageSource::Url(url) => (Some(url.to_string()), None),
+                    ImageSource::Url(url) => (Some(WireImageUrl::Url(url.to_string())), None),
                     ImageSource::Inline(bytes) => {
                         // No documented default MIME; do not guess a wire field
                         // (design §75). Validation already diagnosed the drop.
@@ -410,11 +409,10 @@ fn map_user_input(
                             continue;
                         };
                         (
-                            Some(format!(
-                                "data:{};base64,{}",
-                                media_type,
-                                BASE64_STANDARD.encode(bytes)
-                            )),
+                            Some(WireImageUrl::Inline {
+                                media_type: media_type.to_string(),
+                                data: bytes.clone(),
+                            }),
                             None,
                         )
                     }
@@ -458,7 +456,7 @@ fn map_user_input(
                         ToolResultPart::Media(Media::Image(image)) => match &image.source {
                             ImageSource::Url(url) => {
                                 outputs.push(ResponsesToolResultBlock::InputImage {
-                                    image_url: Some(url.to_string()),
+                                    image_url: Some(WireImageUrl::Url(url.to_string())),
                                     file_id: None,
                                 });
                             }
@@ -467,11 +465,10 @@ fn map_user_input(
                                 // if absent.
                                 if let Some(media_type) = image.media_type.as_ref() {
                                     outputs.push(ResponsesToolResultBlock::InputImage {
-                                        image_url: Some(format!(
-                                            "data:{};base64,{}",
-                                            media_type,
-                                            BASE64_STANDARD.encode(bytes)
-                                        )),
+                                        image_url: Some(WireImageUrl::Inline {
+                                            media_type: media_type.to_string(),
+                                            data: bytes.clone(),
+                                        }),
                                         file_id: None,
                                     });
                                 }

@@ -1155,8 +1155,8 @@ const STANDARD_DIFF_COLORS: &[(&str, &str, &str)] = &[
 ];
 
 const STANDARD_DIFF_SURFACES: &[(&str, &str, &str)] = &[
-    ("diff_added_bg", "#10261e", "#aaddc0"),
-    ("diff_removed_bg", "#2a171b", "#e1b1b7"),
+    ("diff_added_bg", "#10261e", "#e8f6ee"),
+    ("diff_removed_bg", "#2a171b", "#fcebed"),
 ];
 
 fn standard_foreground(dark: &str, light: &str, background: TerminalBackground) -> String {

@@ -496,14 +496,14 @@ impl AssistantBlock {
             let mut heading = committed[start..]
                 .iter()
                 .filter_map(reasoning_heading_from_block)
-                .last();
+                .next_back();
             if let Some(preview_heading) = self
                 .markdown
                 .preview()
                 .blocks
                 .iter()
                 .filter_map(reasoning_heading_from_block)
-                .last()
+                .next_back()
             {
                 heading = Some(preview_heading);
             }
@@ -3049,6 +3049,7 @@ fn event_margin_marker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decorate_surface(
     content: Vec<String>,
     block: &TranscriptBlock,
@@ -10050,7 +10051,10 @@ mod tests {
             },
         );
         let streamed = render_shell_at(&shell.state.borrow(), 80, now);
-        assert!(composer_row(&streamed) > initial_composer);
+        // Active reasoning occupies two rows; the first answer delta replaces it
+        // with one transition row plus one assistant row, so the composer stays
+        // at the same content-relative position.
+        assert_eq!(composer_row(&streamed), initial_composer);
         assert!(streamed.len() < 40);
 
         shell.on_run_event(
@@ -12190,7 +12194,7 @@ mod tests {
         assert_ascii_foreground(&active_bash, "Bash", foreground);
         assert_ascii_bold(&active_bash, "Bash");
         assert_ascii_foreground(&active_bash, "\"active\"", syntax_string);
-        assert_ascii_foreground(&active_bash, "private streaming output", foreground);
+        assert_ascii_foreground(&active_bash, "private streaming output", muted);
         assert!(active_bash
             .screen()
             .contents()
@@ -13789,9 +13793,10 @@ mod tests {
             1
         );
         assert_eq!(airy.iter().take_while(|line| line.is_empty()).count(), 2);
-        assert!(compact[0].starts_with('•'));
-        assert!(comfortable[1].starts_with("• "));
-        assert!(airy[2].starts_with("  • "));
+        let note = theme_with_layout("").glyph("note").to_owned();
+        assert!(compact[0].starts_with(&format!(" {note} ")));
+        assert!(comfortable[1].starts_with(&format!("  {note} ")));
+        assert!(airy[2].starts_with(&format!("    {note} ")));
 
         let hidden_theme = theme_with_layout(
             "density = \"airy\"\nshow_reasoning = false\nnarrow_show_reasoning = false",

@@ -188,6 +188,59 @@ fn normalize_invalid_tool_call_id(id: &str) -> String {
     format!("{prefix}_{hash_hex}")
 }
 
+pub(crate) struct Base64Bytes(bytes::Bytes);
+
+impl From<&bytes::Bytes> for Base64Bytes {
+    fn from(value: &bytes::Bytes) -> Self {
+        Self(value.clone())
+    }
+}
+
+impl serde::Serialize for Base64Bytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(&base64::display::Base64Display::new(
+            &self.0,
+            &base64::engine::general_purpose::STANDARD,
+        ))
+    }
+}
+
+pub(crate) enum WireImageUrl {
+    Url(String),
+    Inline {
+        media_type: String,
+        data: bytes::Bytes,
+    },
+}
+
+impl std::fmt::Display for WireImageUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Url(url) => formatter.write_str(url),
+            Self::Inline { media_type, data } => write!(
+                formatter,
+                "data:{media_type};base64,{}",
+                base64::display::Base64Display::new(
+                    data,
+                    &base64::engine::general_purpose::STANDARD,
+                )
+            ),
+        }
+    }
+}
+
+impl serde::Serialize for WireImageUrl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
 /// Protocol-agnostic HTTP request components prepared by a codec.
 pub(crate) struct HttpRequestParts {
     /// Target endpoint URL (fully resolved).

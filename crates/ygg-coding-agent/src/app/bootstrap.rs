@@ -2440,10 +2440,7 @@ fn register_custom_openai_provider(
         return Ok(());
     }
 
-    let cache = provider
-        .cache
-        .clone()
-        .unwrap_or_else(ygg_ai::CacheCompatibility::default);
+    let cache = provider.cache.clone().unwrap_or_default();
     for model in &models {
         let configured_display =
             (!model.display_name.trim().is_empty()).then(|| model.display_name.trim().to_owned());
@@ -4336,23 +4333,29 @@ mod tests {
     fn configured_custom_model_metadata_overrides_discovered_sparse_inventory() {
         use crate::auth::custom::CustomModel;
 
-        let mut configured = CustomModel::default();
-        configured.api_name = "system".into();
-        configured.context_window = 4_096;
-        configured.max_output_tokens = 1_024;
-        configured.tools = true;
-        configured.reasoning = true;
-        configured.reasoning_configurable = false;
+        let configured = CustomModel {
+            api_name: "system".into(),
+            context_window: 4_096,
+            max_output_tokens: 1_024,
+            tools: true,
+            reasoning: true,
+            reasoning_configurable: false,
+            ..Default::default()
+        };
 
-        let mut discovered_system = CustomModel::default();
-        discovered_system.api_name = "system".into();
-        discovered_system.context_window = 262_144;
-        discovered_system.max_output_tokens = 16_384;
-        discovered_system.tools = true;
+        let discovered_system = CustomModel {
+            api_name: "system".into(),
+            context_window: 262_144,
+            max_output_tokens: 16_384,
+            tools: true,
+            ..Default::default()
+        };
 
-        let mut discovered_other = CustomModel::default();
-        discovered_other.api_name = "other".into();
-        discovered_other.context_window = 8_192;
+        let discovered_other = CustomModel {
+            api_name: "other".into(),
+            context_window: 8_192,
+            ..Default::default()
+        };
 
         let configured_missing = CustomModel {
             api_name: "configured-only".into(),
@@ -4503,7 +4506,8 @@ mod tests {
             max_output_tokens: APPLE_FM_MAX_OUTPUT_TOKENS,
             ..Default::default()
         };
-        let with_override = custom_model_cache_fingerprint(&credential, &[configured.clone()]);
+        let with_override =
+            custom_model_cache_fingerprint(&credential, std::slice::from_ref(&configured));
         let changed = custom_model_cache_fingerprint(
             &credential,
             &[crate::auth::custom::CustomModel {
@@ -5276,7 +5280,8 @@ mod tests {
             max_output_tokens: APPLE_FM_MAX_OUTPUT_TOKENS,
             ..Default::default()
         };
-        let original = custom_model_cache_fingerprint(&credential, &[configured.clone()]);
+        let original =
+            custom_model_cache_fingerprint(&credential, std::slice::from_ref(&configured));
         let changed = custom_model_cache_fingerprint(
             &credential,
             &[crate::auth::custom::CustomModel {

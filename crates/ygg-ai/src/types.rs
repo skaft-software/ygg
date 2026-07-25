@@ -638,7 +638,7 @@ mod base64_bytes {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&BASE64_STANDARD.encode(data))
+        serializer.collect_str(&base64::display::Base64Display::new(data, &BASE64_STANDARD))
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<bytes::Bytes, D::Error>

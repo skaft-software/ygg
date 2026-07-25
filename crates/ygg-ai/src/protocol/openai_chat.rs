@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AiError, ConfigError, DecodeError};
 use crate::protocol::sse::SseEvent;
 use crate::protocol::{
-    cache_control, cache_session_id, prompt_cache_key, CacheControl, HttpRequestParts,
+    cache_control, cache_session_id, prompt_cache_key, Base64Bytes, CacheControl, HttpRequestParts,
+    WireImageUrl,
 };
 use crate::stream::{
     OpenAiChatCompatibilityState, ResponseBuilder, StreamEvent, MAX_RESPONSE_PARTS,
@@ -129,14 +130,14 @@ enum ChatContentPart {
 
 #[derive(Serialize)]
 struct ChatImageUrl {
-    url: String,
+    url: WireImageUrl,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
 }
 
 #[derive(Serialize)]
 struct ChatInputAudio {
-    data: String,
+    data: Base64Bytes,
     format: String,
 }
 
@@ -474,21 +475,20 @@ pub(crate) fn build_request(
                                 continue;
                             }
 
-                            let url_str = match &image.source {
-                                ImageSource::Url(u) => u.to_string(),
+                            let url = match &image.source {
+                                ImageSource::Url(url) => WireImageUrl::Url(url.to_string()),
                                 ImageSource::Inline(bytes) => {
                                     // No documented default MIME; guessing a wire
                                     // field is forbidden (design §75). Validation
                                     // has already diagnosed the drop, so skip the
                                     // part when the media type is absent.
-                                    let Some(mime_str) = image.media_type.as_ref() else {
+                                    let Some(media_type) = image.media_type.as_ref() else {
                                         continue;
                                     };
-                                    format!(
-                                        "data:{};base64,{}",
-                                        mime_str,
-                                        BASE64_STANDARD.encode(bytes)
-                                    )
+                                    WireImageUrl::Inline {
+                                        media_type: media_type.to_string(),
+                                        data: bytes.clone(),
+                                    }
                                 }
                                 ImageSource::ProviderRef(_) => continue,
                             };
@@ -500,10 +500,7 @@ pub(crate) fn build_request(
                             });
 
                             parts.push(ChatContentPart::ImageUrl {
-                                image_url: ChatImageUrl {
-                                    url: url_str,
-                                    detail,
-                                },
+                                image_url: ChatImageUrl { url, detail },
                             });
                         }
                         UserPart::Media(Media::Audio(ref audio)) => {
@@ -522,17 +519,17 @@ pub(crate) fn build_request(
                                 _ => continue,
                             };
 
-                            let data_str = match &audio.payload {
-                                AudioPayload::Inline(bytes) => BASE64_STANDARD.encode(bytes),
+                            let data = match &audio.payload {
+                                AudioPayload::Inline(bytes) => Base64Bytes::from(bytes),
                                 AudioPayload::InlineWithProviderRef { data, .. } => {
-                                    BASE64_STANDARD.encode(data)
+                                    Base64Bytes::from(data)
                                 }
                                 AudioPayload::ProviderRef(_) => continue,
                             };
 
                             parts.push(ChatContentPart::InputAudio {
                                 input_audio: ChatInputAudio {
-                                    data: data_str,
+                                    data,
                                     format: format_str,
                                 },
                             });

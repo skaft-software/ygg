@@ -14,9 +14,9 @@ use ygg_ai::{AudioFormat, Media, Modality, ModalitySet};
 /// A paste larger than either bound collapses to a placeholder chip.
 pub const LARGE_PASTE_LINES: usize = 10;
 pub const LARGE_PASTE_CHARS: usize = 2048;
-/// Attach-time size caps, aligned with common provider limits.
+/// Attach-time size caps, aligned with the read tool's ingestion limits.
 pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
-pub const MAX_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+pub const MAX_AUDIO_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Media classification of a file path, by extension (no content sniffing).
 #[derive(Clone, Debug, PartialEq)]

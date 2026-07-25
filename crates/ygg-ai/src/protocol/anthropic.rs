@@ -1,11 +1,10 @@
 //! Anthropic Messages private wire protocol codec.
 
-use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, ConfigError, DecodeError, ProviderError};
 use crate::protocol::sse::SseEvent;
-use crate::protocol::{cache_control, CacheControl, HttpRequestParts};
+use crate::protocol::{cache_control, Base64Bytes, CacheControl, HttpRequestParts};
 use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{
     AssistantPart, ImageSource, Media, Message, Protocol, ReasoningConfig, ReasoningState,
@@ -110,8 +109,13 @@ enum AnthropicContentBlock {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicImageSource {
-    Base64 { media_type: String, data: String },
-    Url { url: String },
+    Base64 {
+        media_type: String,
+        data: Base64Bytes,
+    },
+    Url {
+        url: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -351,7 +355,7 @@ pub(crate) fn build_request(
                                     };
                                     AnthropicImageSource::Base64 {
                                         media_type,
-                                        data: BASE64_STANDARD.encode(bytes),
+                                        data: Base64Bytes::from(bytes),
                                     }
                                 }
                                 ImageSource::Url(url) => AnthropicImageSource::Url {
@@ -384,7 +388,7 @@ pub(crate) fn build_request(
                                                 anthropic_image_media_type(image).map(
                                                     |media_type| AnthropicImageSource::Base64 {
                                                         media_type,
-                                                        data: BASE64_STANDARD.encode(bytes),
+                                                        data: Base64Bytes::from(bytes),
                                                     },
                                                 )
                                             }

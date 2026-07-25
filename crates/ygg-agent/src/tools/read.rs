@@ -1,13 +1,15 @@
 //! Bounded text and multimodal file reading.
 
+use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
 use serde::Deserialize;
 use ygg_ai::{AudioFormat, Media, Mime, ToolDef};
 
-use crate::secure_fs::{read_regular_file_bounded, SecureFileError};
+use crate::secure_fs::{read_regular_file_bounded_by, SecureFileError};
 use crate::tool::{content_hash, ReplaySafety, Tool, ToolContext, ToolError, ToolOutput};
 use crate::tools::{clip_line, parse_args, MAX_FILE_BYTES};
 /// Display cap for a single line.
@@ -122,7 +124,14 @@ impl Tool for ReadTool {
         if let Some(url) = parse_url_source(&args.path)? {
             return match url.scheme() {
                 "http" | "https" if ctx.sandbox.allow_remote_read => {
-                    read_remote_media(url, ctx).await
+                    let cancellation = ctx.cancellation.clone();
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            Err(ToolError::new("remote media read cancelled"))
+                        }
+                        result = read_remote_media(url) => result,
+                    }
                 }
                 "http" | "https" => Err(ToolError::new(
                     "remote URL reads are disabled; enable `allow_remote_read` \
@@ -130,6 +139,7 @@ impl Tool for ReadTool {
                 )),
                 "file" => {
                     let path = local_path_from_url(&url)?;
+                    let path = workspace_relative_file_url_path(path, ctx);
                     read_local(&args, &path, ctx).await
                 }
                 scheme => Err(ToolError::new(format!(
@@ -149,22 +159,27 @@ async fn read_local(
     let display_path = ctx.display_path(requested_path);
     let target = ctx.resolve_existing(requested_path)?;
     let hinted_kind = media_kind_for_name(requested_path);
-    let byte_limit = hinted_kind
-        .as_ref()
-        .map_or(MAX_FILE_BYTES, MediaKind::byte_limit);
+    let sniff_hint = hinted_kind.clone();
     let read_path = target.clone();
-    let bytes =
-        tokio::task::spawn_blocking(move || read_regular_file_bounded(&read_path, byte_limit))
-            .await
-            .map_err(|error| {
-                ToolError::new(format!("{display_path}: read worker failed: {error}"))
-            })?
-            .map_err(|error| match error {
-                SecureFileError::NotRegular => ToolError::new(format!(
+    let bytes = tokio::task::spawn_blocking(move || {
+        read_regular_file_bounded_by(&read_path, MAX_FILE_BYTES, |prefix| {
+            let detected = sniff_media_kind(prefix, sniff_hint.as_ref());
+            detected
+                .iter()
+                .chain(sniff_hint.iter())
+                .map(MediaKind::byte_limit)
+                .min()
+                .unwrap_or(MAX_FILE_BYTES)
+        })
+    })
+    .await
+    .map_err(|error| ToolError::new(format!("{display_path}: read worker failed: {error}")))?
+    .map_err(|error| match error {
+        SecureFileError::NotRegular => ToolError::new(format!(
             "{display_path}: is not a regular file (a directory or special file is rejected)"
         )),
-                other => ToolError::new(format!("{display_path}: {other}")),
-            })?;
+        other => ToolError::new(format!("{display_path}: {other}")),
+    })?;
     match validated_media_kind(&bytes, hinted_kind.as_ref(), &display_path)? {
         Some(kind) => media_output(display_path, bytes, kind),
         None => text_output(args, ctx, display_path, &bytes),
@@ -208,6 +223,19 @@ fn local_path_from_url(url: &reqwest::Url) -> Result<String, ToolError> {
         .to_file_path()
         .map(|path| path.to_string_lossy().into_owned())
         .map_err(|_| ToolError::new("file URL does not contain a valid local path"))
+}
+
+fn workspace_relative_file_url_path(path: String, ctx: &ToolContext<'_>) -> String {
+    if ctx.sandbox.allow_external_paths {
+        return path;
+    }
+    Path::new(&path)
+        .strip_prefix(ctx.workspace)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map_or(path.clone(), |relative| {
+            relative.to_string_lossy().into_owned()
+        })
 }
 
 async fn validated_remote_endpoint(
@@ -362,10 +390,64 @@ fn is_public_remote_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-async fn read_remote_media(
-    mut url: reqwest::Url,
-    ctx: &ToolContext<'_>,
-) -> Result<ToolOutput, ToolError> {
+const REMOTE_CLIENT_CACHE_CAPACITY: usize = 16;
+
+#[derive(Clone, PartialEq, Eq)]
+struct RemoteClientKey {
+    host: String,
+    endpoints: Vec<std::net::SocketAddr>,
+    https_only: bool,
+}
+
+fn remote_client(
+    host: &str,
+    endpoints: &[std::net::SocketAddr],
+    https_only: bool,
+) -> Result<reqwest::Client, ToolError> {
+    static CLIENTS: OnceLock<Mutex<VecDeque<(RemoteClientKey, reqwest::Client)>>> = OnceLock::new();
+    let clients = CLIENTS.get_or_init(|| Mutex::new(VecDeque::new()));
+    let key = RemoteClientKey {
+        host: host.to_owned(),
+        endpoints: endpoints.to_vec(),
+        https_only,
+    };
+
+    {
+        let mut cache = clients.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = cache.iter().position(|(cached, _)| cached == &key) {
+            let entry = cache.remove(index).expect("matching client cache entry");
+            let client = entry.1.clone();
+            cache.push_back(entry);
+            return Ok(client);
+        }
+    }
+
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+        .timeout(REMOTE_READ_TIMEOUT)
+        .user_agent(concat!("ygg/", env!("CARGO_PKG_VERSION")))
+        .no_proxy()
+        .resolve_to_addrs(host, endpoints);
+    if https_only {
+        builder = builder.https_only(true);
+    }
+    let client = builder
+        .build()
+        .map_err(|error| ToolError::new(format!("remote media client failed: {error}")))?;
+
+    let mut cache = clients.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some((_, cached)) = cache.iter().find(|(cached, _)| cached == &key) {
+        return Ok(cached.clone());
+    }
+    if cache.len() == REMOTE_CLIENT_CACHE_CAPACITY {
+        cache.pop_front();
+    }
+    cache.push_back((key, client.clone()));
+    Ok(client)
+}
+
+async fn read_remote_media(mut url: reqwest::Url) -> Result<ToolOutput, ToolError> {
     let requested_display = display_remote_url(&url);
     let (host, literal_ip, endpoints) = validated_remote_endpoint(&url, &requested_display).await?;
     // `ClientBuilder::resolve` keys exact host spellings. Normalize the URL to
@@ -378,19 +460,10 @@ async fn read_remote_media(
         url.set_host(Some(&host))
             .map_err(|_| ToolError::new(format!("{requested_display}: invalid normalized host")))?;
     }
-    let mut client_builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(REMOTE_CONNECT_TIMEOUT)
-        .timeout(REMOTE_READ_TIMEOUT)
-        .user_agent(concat!("ygg/", env!("CARGO_PKG_VERSION")))
-        .no_proxy()
-        .resolve_to_addrs(&host, &endpoints);
-    if url.scheme() == "https" {
-        client_builder = client_builder.https_only(true);
-    }
-    let client = client_builder
-        .build()
-        .map_err(|error| ToolError::new(format!("remote media client failed: {error}")))?;
+    // Cache only clients with the same validated hostname-to-address pin. A
+    // DNS change creates a different key rather than reusing an unvalidated
+    // connection pool.
+    let client = remote_client(&host, &endpoints, url.scheme() == "https")?;
     let mut response = client
         .get(url)
         .header(reqwest::header::ACCEPT, "image/*, audio/*")
@@ -446,11 +519,6 @@ async fn read_remote_media(
             error.without_url()
         ))
     })? {
-        if ctx.cancellation.is_cancelled() {
-            return Err(ToolError::new(format!(
-                "{response_display}: read cancelled"
-            )));
-        }
         if bytes.len().saturating_add(chunk.len()) > byte_limit {
             return Err(media_too_large_error(
                 &response_display,
@@ -651,11 +719,31 @@ fn text_output(
 ) -> Result<ToolOutput, ToolError> {
     let hash = content_hash(bytes);
     let text = String::from_utf8_lossy(bytes);
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
-
     let offset = args.offset.unwrap_or(1).max(1);
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT).max(1);
+
+    // Reserve some budget for the header/footer lines. Count and render in one
+    // pass so newline-dense files do not allocate one fat reference per line.
+    let byte_budget = ctx.sandbox.max_output_bytes.saturating_sub(256).max(1024);
+    let requested_end = offset.saturating_add(limit.saturating_sub(1));
+    let mut body = String::new();
+    let mut total = 0usize;
+    let mut end = offset - 1; // last included line
+    let mut truncated = false;
+    for (index, line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        total = line_number;
+        if line_number < offset || line_number > requested_end || truncated {
+            continue;
+        }
+        let rendered = format!("{line_number}: {}\n", clip_line(line, MAX_LINE_CHARS));
+        if !body.is_empty() && body.len() + rendered.len() > byte_budget {
+            truncated = true;
+            continue;
+        }
+        body.push_str(&rendered);
+        end = line_number;
+    }
 
     if total == 0 {
         return Ok(ToolOutput::new(format!(
@@ -666,28 +754,6 @@ fn text_output(
         return Err(ToolError::new(format!(
             "{display_path}: offset {offset} is beyond the end of the file ({total} lines)"
         )));
-    }
-
-    // Reserve some budget for the header/footer lines.
-    let byte_budget = ctx.sandbox.max_output_bytes.saturating_sub(256).max(1024);
-    let requested_end = offset.saturating_add(limit.saturating_sub(1)).min(total);
-
-    let mut body = String::new();
-    let mut end = offset - 1; // last included line
-    let mut truncated = false;
-    for (i, line) in lines
-        .iter()
-        .enumerate()
-        .take(requested_end)
-        .skip(offset - 1)
-    {
-        let rendered = format!("{}: {}\n", i + 1, clip_line(line, MAX_LINE_CHARS));
-        if !body.is_empty() && body.len() + rendered.len() > byte_budget {
-            truncated = true;
-            break;
-        }
-        body.push_str(&rendered);
-        end = i + 1;
     }
 
     let header = format!("{display_path}:{offset}-{end}/{total} hash={hash}");
@@ -837,28 +903,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_url_uses_the_same_local_media_pipeline() {
+    async fn extensionless_media_uses_its_content_cap_before_buffering() {
+        let f = fixture();
+        let path = f.workspace.join("oversized.bin");
+        std::fs::write(&path, PNG_BYTES).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_IMAGE_BYTES as u64 + 1)
+            .unwrap();
+
+        let error = ReadTool
+            .execute(json!({"path": "oversized.bin"}), &f.ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains(&format!("limit {MAX_IMAGE_BYTES}")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_file_url_uses_the_same_local_media_pipeline() {
         let f = fixture();
         let path = f.workspace.join("screen shot.png");
         std::fs::write(&path, PNG_BYTES).unwrap();
         let url = reqwest::Url::from_file_path(&path).unwrap();
-        let mut sandbox = f.sandbox.clone();
-        sandbox.allow_external_paths = true;
-        let ctx = ToolContext {
-            workspace: &f.workspace,
-            sandbox: &sandbox,
-            execution_scope: "read-test",
-            active_skills: &[],
-            registered_tools: &[],
-            progress: ToolProgressSink::null(),
-            cancellation: Default::default(),
-        };
 
         let output = ReadTool
-            .execute(json!({"path": url.as_str()}), &ctx)
+            .execute(json!({"path": url.as_str()}), &f.ctx())
             .await
             .unwrap();
         assert_eq!(output.media_kinds(), &[crate::ToolOutputMediaKind::Image]);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_rejects_external_file_urls() {
+        let f = fixture();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let url = reqwest::Url::from_file_path(outside.path()).unwrap();
+        let error = ReadTool
+            .execute(json!({"path": url.as_str()}), &f.ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains("absolute paths are not allowed"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -879,6 +971,45 @@ mod tests {
             "{error}"
         );
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_read_cancellation_interrupts_header_waits() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/slow.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(PNG_BYTES)
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let f = remote_fixture();
+        let cancellation = crate::CancellationToken::default();
+        let cancel = cancellation.clone();
+        let ctx = ToolContext {
+            workspace: &f.workspace,
+            sandbox: &f.sandbox,
+            execution_scope: "read-test",
+            active_skills: &[],
+            registered_tools: &[],
+            progress: ToolProgressSink::null(),
+            cancellation,
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            cancel.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let error = ReadTool
+            .execute(json!({"path": format!("{}/slow.png", server.uri())}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("cancelled"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
