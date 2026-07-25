@@ -33,6 +33,7 @@ pub enum TranscriptItem {
     CompactionMarker {
         summary: String,
     },
+    NativeCompactionMarker,
 }
 
 fn tool_result_text(parts: &[ToolResultPart]) -> String {
@@ -172,22 +173,32 @@ fn active_branch_tail(
     max_entries: Option<usize>,
 ) -> anyhow::Result<(Vec<&Entry>, bool)> {
     let mut entries = Vec::new();
+    let mut displayable_entries = 0usize;
     let mut cursor = session.head_ref();
     let mut truncated = false;
     while let Some(id) = cursor {
-        if max_entries.is_some_and(|limit| entries.len() >= limit) {
+        if max_entries.is_some_and(|limit| displayable_entries >= limit) {
             truncated = true;
             break;
         }
         let entry = session
             .entry(id)
             .ok_or_else(|| anyhow::anyhow!("dangling session entry {}", id.0))?;
+        if matches!(
+            &entry.value,
+            EntryValue::Message(_)
+                | EntryValue::Compaction { .. }
+                | EntryValue::ResponsesCompaction { .. }
+        ) {
+            displayable_entries = displayable_entries.saturating_add(1);
+        }
         entries.push(entry);
         cursor = entry.parent.as_ref();
     }
-    // A user tool-result entry is normally the direct child of the assistant
-    // tool call it completes. Include that one parent when the bounded cut
-    // lands between the pair so first paint never shows an orphan result row.
+    // A user tool-result entry normally follows the assistant tool call it
+    // completes. ResponsesTurn and other display-invisible records can sit
+    // between that pair, so walk through them and include the next displayable
+    // parent whenever the bounded cut would otherwise show an orphan result.
     if truncated
         && entries.last().is_some_and(|entry| {
             matches!(
@@ -200,11 +211,20 @@ fn active_branch_tail(
             )
         })
     {
-        if let Some(id) = cursor {
+        while let Some(id) = cursor {
             let entry = session
                 .entry(id)
                 .ok_or_else(|| anyhow::anyhow!("dangling session entry {}", id.0))?;
             entries.push(entry);
+            cursor = entry.parent.as_ref();
+            if matches!(
+                &entry.value,
+                EntryValue::Message(_)
+                    | EntryValue::Compaction { .. }
+                    | EntryValue::ResponsesCompaction { .. }
+            ) {
+                break;
+            }
         }
     }
     entries.reverse();
@@ -344,7 +364,11 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
                     summary: summary.clone(),
                 });
             }
-            EntryValue::SkillActivated { .. }
+            EntryValue::ResponsesCompaction { .. } => {
+                items.push(TranscriptItem::NativeCompactionMarker);
+            }
+            EntryValue::ResponsesTurn { .. }
+            | EntryValue::SkillActivated { .. }
             | EntryValue::PromptTemplateSelected { .. }
             | EntryValue::SkillResourceRead { .. }
             | EntryValue::SkillDeactivated { .. } => {}
@@ -469,6 +493,37 @@ mod tests {
     }
 
     #[test]
+    fn resumed_native_compaction_renders_only_a_payload_free_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        let covered_through = session.append(user("kept prompt")).unwrap();
+        session
+            .append(EntryValue::ResponsesCompaction {
+                endpoint: ygg_ai::EndpointId("responses".into()),
+                model: ModelId("gpt-test".into()),
+                covered_through,
+                output: ygg_ai::ResponsesOutput::new(vec![ygg_ai::ResponsesItem::new(
+                    serde_json::json!({
+                        "type": "compaction",
+                        "encrypted_content": "must-never-render"
+                    }),
+                )
+                .unwrap()]),
+            })
+            .unwrap();
+        drop(session);
+
+        let resumed = Session::open(path).unwrap();
+        let items = hydrate_transcript(&resumed).unwrap();
+        assert!(matches!(
+            items.last(),
+            Some(TranscriptItem::NativeCompactionMarker)
+        ));
+        assert!(!format!("{items:?}").contains("must-never-render"));
+    }
+
+    #[test]
     fn user_media_parts_render_as_markers() {
         let directory = tempfile::tempdir().unwrap();
         let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
@@ -549,6 +604,7 @@ mod tests {
                     prompt_model_source: Some("deepseek".into()),
                     prompt_color: Some("#123456".into()),
                     display_text: None,
+                    local_synthetic_assistant: false,
                 }),
             )
             .unwrap();
@@ -567,6 +623,7 @@ mod tests {
                     prompt_model_source: Some("anthropic".into()),
                     prompt_color: Some("#abcdef".into()),
                     display_text: None,
+                    local_synthetic_assistant: false,
                 }),
             )
             .unwrap();
@@ -695,6 +752,63 @@ mod tests {
         assert!(truncated);
         assert!(matches!(tail[0], TranscriptItem::ToolCall { .. }));
         assert!(matches!(tail[1], TranscriptItem::ToolResult { .. }));
+    }
+
+    #[test]
+    fn responses_sidecar_is_transparent_to_tool_pair_tail_hydration() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        session.append(user("read it")).unwrap();
+        let assistant = session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::ToolCall(ToolCall {
+                    id: ToolCallId("call-responses".into()),
+                    name: "read".into(),
+                    arguments_json: r#"{"path":"x"}"#.into(),
+                })],
+                model: ModelId("responses-model".into()),
+                protocol: Protocol::OpenAiResponses,
+            })))
+            .unwrap();
+        session
+            .append_responses_turn(
+                assistant,
+                ygg_ai::EndpointId("responses-endpoint".into()),
+                ModelId("responses-model".into()),
+                ygg_ai::ResponsesOutput::new(vec![ygg_ai::ResponsesItem::new(serde_json::json!({
+                    "type": "function_call",
+                    "id": "fc_responses",
+                    "call_id": "call-responses",
+                    "name": "read",
+                    "arguments": "{\"path\":\"x\"}"
+                }))
+                .unwrap()]),
+            )
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::ToolResult(ToolResult {
+                    tool_call_id: ToolCallId("call-responses".into()),
+                    content: vec![ToolResultPart::Text("contents".into())],
+                    is_error: false,
+                })],
+            })))
+            .unwrap();
+
+        for limit in [1, 2] {
+            let (tail, truncated) = hydrate_transcript_tail(&session, limit).unwrap();
+            assert!(truncated);
+            assert_eq!(tail.len(), 2, "limit {limit}: {tail:?}");
+            assert!(matches!(
+                &tail[0],
+                TranscriptItem::ToolCall { id, .. } if id.0 == "call-responses"
+            ));
+            assert!(matches!(
+                &tail[1],
+                TranscriptItem::ToolResult { id, text, .. }
+                    if id.0 == "call-responses" && text == "contents"
+            ));
+        }
     }
 
     #[test]

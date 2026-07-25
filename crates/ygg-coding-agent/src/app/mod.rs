@@ -46,6 +46,9 @@ pub fn thinking_to_reasoning(
             return Ok(ReasoningConfig::Off);
         }
     };
+    if capability.control == ReasoningControl::AlwaysOn {
+        return Ok(ReasoningConfig::On);
+    }
     if level == ThinkingLevel::Off {
         return Ok(ReasoningConfig::Off);
     }
@@ -93,6 +96,7 @@ pub fn thinking_to_reasoning(
         _ => effort,
     };
     match capability.control {
+        ReasoningControl::AlwaysOn => Ok(ReasoningConfig::On),
         ReasoningControl::Effort => Ok(ReasoningConfig::Effort(effort)),
         ReasoningControl::Toggle => unreachable!("toggle handled above"),
         ReasoningControl::TokenBudget => {
@@ -133,6 +137,15 @@ pub fn normalize_reasoning_for_model(
     reasoning: &ReasoningConfig,
     model: &Model,
 ) -> anyhow::Result<ReasoningConfig> {
+    if model
+        .spec
+        .capabilities
+        .reasoning
+        .as_ref()
+        .is_some_and(|capability| capability.control == ReasoningControl::AlwaysOn)
+    {
+        return Ok(ReasoningConfig::On);
+    }
     match reasoning {
         ReasoningConfig::Off => Ok(ReasoningConfig::Off),
         ReasoningConfig::On => thinking_to_reasoning(ThinkingLevel::On, model),
@@ -187,6 +200,16 @@ pub fn level_from_reasoning(
     model: &Model,
 ) -> anyhow::Result<ThinkingLevel> {
     match reasoning {
+        ReasoningConfig::Off
+            if model
+                .spec
+                .capabilities
+                .reasoning
+                .as_ref()
+                .is_some_and(|capability| capability.control == ReasoningControl::AlwaysOn) =>
+        {
+            Ok(ThinkingLevel::On)
+        }
         ReasoningConfig::Off => Ok(ThinkingLevel::Off),
         ReasoningConfig::On => Ok(ThinkingLevel::On),
         ReasoningConfig::Effort(effort) => Ok(effort_level(*effort)),
@@ -219,6 +242,9 @@ pub fn supported_levels(model: &Model) -> Vec<ThinkingLevel> {
     let Some(capability) = &model.spec.capabilities.reasoning else {
         return vec![ThinkingLevel::Off];
     };
+    if capability.control == ReasoningControl::AlwaysOn {
+        return vec![ThinkingLevel::On];
+    }
     if let OpenAiChatReasoningMode::ProviderValues { values, .. } = &capability.openai_chat_mode {
         let mut levels = Vec::new();
         for value in values {
@@ -582,6 +608,37 @@ mod tests {
         assert_eq!(
             thinking_to_reasoning(ThinkingLevel::Medium, &levels).unwrap(),
             ReasoningConfig::Effort(ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn always_on_reasoning_exposes_only_on_and_normalizes_stale_off() {
+        let model = model_with(Some(ReasoningCapability {
+            control: ReasoningControl::AlwaysOn,
+            exposes_text: true,
+            preserves_state: false,
+            supports_pro_mode: false,
+            effort_budgets: None,
+            openai_chat_mode: OpenAiChatReasoningMode::SystemMessage,
+            min_effort: ReasoningEffort::Minimal,
+            max_effort: ReasoningEffort::High,
+        }));
+        assert_eq!(supported_levels(&model), vec![ThinkingLevel::On]);
+        assert_eq!(
+            thinking_to_reasoning(ThinkingLevel::Off, &model).unwrap(),
+            ReasoningConfig::On
+        );
+        assert_eq!(
+            thinking_to_reasoning(ThinkingLevel::High, &model).unwrap(),
+            ReasoningConfig::On
+        );
+        assert_eq!(
+            normalize_reasoning_for_model(&ReasoningConfig::Off, &model).unwrap(),
+            ReasoningConfig::On
+        );
+        assert_eq!(
+            level_from_reasoning(&ReasoningConfig::Off, &model).unwrap(),
+            ThinkingLevel::On
         );
     }
 

@@ -186,6 +186,10 @@ pub enum UnsupportedError {
     /// Custom stop sequences are not supported by the target protocol.
     #[error("Stop sequences are unsupported")]
     StopSequences,
+    /// Responses continuation/replay options are not supported by other
+    /// protocols.
+    #[error("Responses request options are unsupported")]
+    ResponsesOptions,
 }
 
 /// Configuration loading or resolution error.

@@ -138,6 +138,138 @@ fn openai_text_turn(text: &str) -> String {
     )
 }
 
+fn responses_text_turn(
+    response_id: &str,
+    text: &str,
+    terminal_type: &str,
+    opaque_marker: &str,
+) -> String {
+    let terminal = if terminal_type == "response.incomplete" {
+        serde_json::json!({
+            "type": terminal_type,
+            "response": {
+                "output": [{
+                    "type": "message",
+                    "id": format!("msg_{response_id}"),
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                    "unknown_provider_field": opaque_marker,
+                }],
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            },
+        })
+    } else {
+        serde_json::json!({
+            "type": terminal_type,
+            "response": {
+                "output": [{
+                    "type": "message",
+                    "id": format!("msg_{response_id}"),
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                    "unknown_provider_field": opaque_marker,
+                }],
+                "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            },
+        })
+    };
+    [
+        serde_json::json!({"type": "response.created", "response": {"id": response_id}}),
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": format!("msg_{response_id}"), "type": "message"},
+        }),
+        serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "delta": text,
+        }),
+        serde_json::json!({"type": "response.output_text.done", "output_index": 0}),
+        terminal,
+    ]
+    .into_iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect()
+}
+
+fn responses_tool_turn(response_id: &str, call_id: &str) -> String {
+    let arguments = r#"{"path":"lifecycle.txt"}"#;
+    let terminal_output = serde_json::json!([
+        {
+            "type": "reasoning",
+            "id": format!("rs_{response_id}"),
+            "encrypted_content": "encrypted-reasoning-state",
+            "future_reasoning_field": {"preserved": true}
+        },
+        {
+            "type": "function_call",
+            "id": format!("fc_{response_id}"),
+            "call_id": call_id,
+            "name": "read",
+            "arguments": arguments,
+            "phase": "commentary",
+            "unknown_provider_field": {"preserved": true}
+        }
+    ]);
+    [
+        serde_json::json!({"type": "response.created", "response": {"id": response_id}}),
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": format!("fc_{response_id}"),
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "read"
+            }
+        }),
+        serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "arguments": arguments
+        }),
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "output": terminal_output,
+                "usage": {"input_tokens": 9, "output_tokens": 3, "total_tokens": 12}
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect()
+}
+
+fn openai_tool_turn(calls: &[(&str, &str, serde_json::Value)]) -> String {
+    let mut body = String::new();
+    for (index, (id, name, arguments)) in calls.iter().enumerate() {
+        let chunk = serde_json::json!({
+            "id": "chat-tools",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": index,
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments.to_string(),
+                        },
+                    }],
+                },
+            }],
+        });
+        body += &format!("data: {chunk}\n\n");
+    }
+    body += "data: {\"id\":\"chat-tools\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+    body += "data: [DONE]\n\n";
+    body
+}
+
 /// A syntactically valid stream prefix with visible output but no terminal
 /// message event. Closing the HTTP body after this prefix reproduces the
 /// provider/proxy disconnect that used to fail long Ygg runs.
@@ -447,6 +579,23 @@ fn openai_multimodal_model(uri: &str) -> Model {
     }
 }
 
+fn scripted_responses_model(uri: &str) -> Model {
+    let base = scripted_model(uri);
+    let mut spec = (*base.spec).clone();
+    spec.protocol = Protocol::OpenAiResponses;
+    Model {
+        spec: Arc::new(spec),
+        endpoint: Arc::new(Endpoint {
+            id: base.endpoint.id.clone(),
+            base_url: url::Url::parse(&format!("{uri}/")).unwrap(),
+            auth: Auth::bearer("test-key"),
+            default_headers: http::HeaderMap::new(),
+            transport: ygg_ai::EndpointTransport::Http,
+            timeout: Duration::from_secs(10),
+        }),
+    }
+}
+
 fn scripted_model_with_limits(uri: &str, context_window: u64, max_output_tokens: u64) -> Model {
     let base = scripted_model(uri);
     let mut spec = (*base.spec).clone();
@@ -561,6 +710,36 @@ fn build_agent_with_reasoning(
         reasoning_mode: ygg_ai::ReasoningMode::Standard,
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
+    })
+    .unwrap()
+}
+
+fn build_responses_agent_from_session(
+    model: Model,
+    session: Session,
+    workspace: &Path,
+    max_turns: Option<u64>,
+    system: &str,
+) -> Agent {
+    let mut extensions = ExtensionHost::new();
+    extensions.load(&CoreTools);
+    let mut sandbox = SandboxConfig::new(workspace);
+    sandbox.allow_edit = true;
+    sandbox.allow_write = true;
+    sandbox.allow_process = true;
+    sandbox.allow_shell = true;
+    Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model,
+        session,
+        system: system.to_owned(),
+        sandbox,
+        extensions,
+        max_turns,
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: Some("lifecycle-session".into()),
     })
     .unwrap()
 }
@@ -740,6 +919,245 @@ async fn retryable_initial_stream_open_is_retried_by_the_agent() {
         .count();
     assert_eq!(retries, 1, "the retry must be visible while it happens");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn incomplete_responses_output_survives_continuation_and_restart() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("responses"))
+        .respond_with(Script {
+            bodies: vec![
+                responses_text_turn(
+                    "resp_partial",
+                    "partial",
+                    "response.incomplete",
+                    "partial-opaque",
+                ),
+                responses_text_turn(
+                    "resp_final",
+                    "finished",
+                    "response.completed",
+                    "final-opaque",
+                ),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let session_path = session_dir.path().join("session.jsonl");
+    let model = scripted_responses_model(&server.uri());
+    let endpoint = model.endpoint.id.clone();
+    let model_id = model.spec.id.clone();
+    let mut agent = build_agent_with_reasoning(
+        model,
+        &session_path,
+        &workspace,
+        ReasoningConfig::Off,
+        Some(4),
+    );
+
+    let output = agent.complete("continue exactly").await.unwrap();
+    assert!(
+        output.text.contains("finished"),
+        "the corrective continuation must finish: {}",
+        output.text
+    );
+
+    let requests = wire_requests(&server).await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "max-token output must trigger one continuation"
+    );
+    let replayed = serde_json::to_string(&requests[1]["input"]).unwrap();
+    assert!(
+        replayed.contains("partial-opaque"),
+        "the continuation request lost the incomplete terminal output: {replayed}"
+    );
+    assert!(
+        replayed.contains("previous response was truncated"),
+        "the continuation instruction is missing: {replayed}"
+    );
+    assert_eq!(requests[1]["store"], false);
+    assert!(requests[1].get("previous_response_id").is_none());
+
+    drop(agent);
+    let reopened = Session::open(&session_path).unwrap();
+    let replay = reopened
+        .responses_replay_items(&endpoint, &model_id)
+        .unwrap()
+        .expect("every Responses assistant turn must retain an exact sidecar");
+    let markers: Vec<_> = replay
+        .iter()
+        .filter_map(|item| match item {
+            ygg_ai::responses::ResponsesReplayItem::Output(output) => output
+                .items()
+                .first()
+                .and_then(|item| item.as_json()["unknown_provider_field"].as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(markers, vec!["partial-opaque", "final-opaque"]);
+}
+
+#[tokio::test]
+async fn responses_restart_compact_and_post_checkpoint_replay_stay_exact_end_to_end() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("responses"))
+        .respond_with(Script {
+            bodies: vec![
+                responses_tool_turn("resp_tool", "call_lifecycle"),
+                responses_text_turn(
+                    "resp_before_compact",
+                    "continued after restart",
+                    "response.completed",
+                    "before-compact-opaque",
+                ),
+                responses_text_turn(
+                    "resp_after_compact",
+                    "continued after checkpoint",
+                    "response.completed",
+                    "after-compact-opaque",
+                ),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    let compact_output = serde_json::json!([
+        {
+            "type": "message",
+            "id": "compact-leading",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "retained leading item"}],
+            "future": {"preserved": true}
+        },
+        {
+            "type": "compaction",
+            "id": "compact-checkpoint",
+            "encrypted_content": "encrypted-checkpoint",
+            "future_compaction_field": [1, 2, 3]
+        }
+    ]);
+    Mock::given(method("POST"))
+        .and(path("responses/compact"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": compact_output.clone(),
+            "usage": {"input_tokens": 30, "output_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    std::fs::write(workspace.join("lifecycle.txt"), "exact tool result\n").unwrap();
+    let session_path = session_dir.path().join("responses-lifecycle.jsonl");
+    let mut model = scripted_responses_model(&server.uri());
+    let mut spec = (*model.spec).clone();
+    spec.cache.session_affinity_format = Some(ygg_ai::SessionAffinityFormat::Codex);
+    model.spec = Arc::new(spec);
+
+    let mut first = build_responses_agent_from_session(
+        model.clone(),
+        Session::create(&session_path).unwrap(),
+        &workspace,
+        Some(1),
+        "ORIGINAL LIFECYCLE INSTRUCTIONS",
+    );
+    let mut run = first.prompt("start lifecycle").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::MaxTurns
+    ));
+    drop(first);
+
+    let mut agent = build_responses_agent_from_session(
+        model,
+        Session::open(&session_path).unwrap(),
+        &workspace,
+        Some(4),
+        "ORIGINAL LIFECYCLE INSTRUCTIONS",
+    );
+    let output = agent.complete("continue after restart").await.unwrap();
+    assert_eq!(output.text, "continued after restart");
+
+    let checkpoint = agent.compact_responses_native().await.unwrap();
+    assert!(matches!(
+        checkpoint.kind,
+        ygg_agent::CompactionKind::NativeResponses { .. }
+    ));
+    agent.set_system_prompt("CURRENT POST-CHECKPOINT INSTRUCTIONS");
+    let output = agent.complete("continue after checkpoint").await.unwrap();
+    assert_eq!(output.text, "continued after checkpoint");
+
+    let requests = server.received_requests().await.unwrap();
+    let responses = requests
+        .iter()
+        .filter(|request| request.url.path() == "/responses")
+        .collect::<Vec<_>>();
+    let compact = requests
+        .iter()
+        .find(|request| request.url.path() == "/responses/compact")
+        .unwrap();
+    assert_eq!(responses.len(), 3);
+
+    let request_json = |request: &wiremock::Request| {
+        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()
+    };
+    let restarted_body = request_json(responses[1]);
+    let restarted_input = serde_json::to_string(&restarted_body["input"]).unwrap();
+    assert!(
+        restarted_input.contains("call_lifecycle"),
+        "{restarted_input}"
+    );
+    assert!(
+        restarted_input.contains("unknown_provider_field"),
+        "{restarted_input}"
+    );
+    assert!(
+        restarted_input.contains("encrypted-reasoning-state"),
+        "{restarted_input}"
+    );
+    assert!(
+        restarted_input.contains("exact tool result"),
+        "{restarted_input}"
+    );
+
+    let compact_body = request_json(compact);
+    assert_eq!(
+        compact_body["instructions"],
+        "ORIGINAL LIFECYCLE INSTRUCTIONS"
+    );
+    assert!(compact_body["tools"]
+        .as_array()
+        .is_some_and(|tools| !tools.is_empty()));
+    assert_eq!(compact_body["prompt_cache_key"], "lifecycle-session");
+    assert!(compact.headers.get("content-encoding").is_none());
+    assert_eq!(compact.headers["x-client-request-id"], "lifecycle-session");
+
+    let post_checkpoint_body = request_json(responses[2]);
+    assert_eq!(
+        post_checkpoint_body["instructions"],
+        "CURRENT POST-CHECKPOINT INSTRUCTIONS"
+    );
+    let post_input = post_checkpoint_body["input"].as_array().unwrap();
+    assert_eq!(post_input[0], compact_output[0]);
+    assert_eq!(post_input[1], compact_output[1]);
+    assert_eq!(post_input[1]["encrypted_content"], "encrypted-checkpoint");
+    assert_eq!(
+        post_input[1]["future_compaction_field"],
+        serde_json::json!([1, 2, 3])
+    );
 }
 
 #[tokio::test]
@@ -1929,6 +2347,70 @@ async fn multiple_sequential_tool_calls_execute_in_order_and_coalesce() {
     let last_message = requests[1]["messages"].as_array().unwrap().last().unwrap();
     assert_eq!(last_message["role"], "user");
     assert_eq!(count_tool_results(last_message), 2);
+}
+
+#[tokio::test]
+async fn parallel_media_tool_results_precede_the_adjacent_user_message_on_the_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(Script {
+            bodies: vec![
+                openai_tool_turn(&[
+                    ("call_a", "read", serde_json::json!({"path": "a.png"})),
+                    ("call_b", "read", serde_json::json!({"path": "b.png"})),
+                ]),
+                openai_text_turn("both images received"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("a.png"), b"\x89PNG\r\n\x1a\nfirst").unwrap();
+    std::fs::write(workspace.path().join("b.png"), b"\x89PNG\r\n\x1a\nsecond").unwrap();
+    let mut agent = build_agent_with_reasoning(
+        openai_multimodal_model(&server.uri()),
+        &sessions.path().join("parallel-media.jsonl"),
+        workspace.path(),
+        ReasoningConfig::Off,
+        Some(4),
+    );
+
+    let output = agent.complete("read both images").await.unwrap();
+    assert_eq!(output.text, "both images received");
+
+    let requests = wire_requests(&server).await;
+    assert_eq!(requests.len(), 2);
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let tool_call_turn = messages
+        .iter()
+        .rposition(|message| {
+            message["role"] == "assistant"
+                && message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| calls.len() == 2)
+        })
+        .expect("parallel tool-call turn");
+    let follow_up = &messages[tool_call_turn + 1..];
+    let roles: Vec<_> = follow_up
+        .iter()
+        .map(|message| message["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, vec!["tool", "tool", "user"]);
+    assert_eq!(follow_up[0]["tool_call_id"], "call_a");
+    assert_eq!(follow_up[1]["tool_call_id"], "call_b");
+    assert_eq!(
+        follow_up[2]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|part| part["type"] == "image_url")
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

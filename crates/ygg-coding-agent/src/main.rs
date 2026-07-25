@@ -89,32 +89,41 @@ async fn run_auth_command(provider: &str, command: AuthCommand) -> anyhow::Resul
             let store = auth::custom::CredentialStore::new(auth::custom::default_path());
             match command {
                 AuthCommand::Login { .. } => {
-                    use auth::custom::CustomCredential;
-                    if store.load()?.is_some() {
+                    use auth::custom::{
+                        CustomAuthConfig, CustomCredential, CustomProvider, CustomRegistry,
+                    };
+                    if store.load_registry()?.is_some() {
                         anyhow::bail!(
-                            "custom endpoint already configured at {}; use --logout custom first",
+                            "custom provider registry already configured at {}; use --logout custom first",
                             auth::custom::default_path().display()
                         );
                     }
-                    let cred = CustomCredential {
-                        base_url: "http://localhost:1234/v1/".into(),
-                        api_key: String::new(),
-                        api_name: "local-model".into(),
-                        headers: Vec::new(),
-                        models: Vec::new(),
-                        auto_discover: true,
+                    let provider = CustomProvider {
+                        label: "Local endpoint".into(),
+                        credential: CustomCredential {
+                            base_url: "http://localhost:1234/v1/".into(),
+                            api_key: String::new(),
+                            api_name: "local-model".into(),
+                            headers: Vec::new(),
+                            models: Vec::new(),
+                            auto_discover: true,
+                        },
+                        auth: Some(CustomAuthConfig::None),
+                        api_key_env: None,
+                        cache: None,
+                        startup_timeout_secs: None,
                     };
-                    store.save(&cred)?;
+                    store.save_registry(&CustomRegistry::single("local", provider))?;
                     println!(
-                        "Custom endpoint template saved to {}.\n\
-                         Edit that file with your endpoint details and restart ygg.",
+                        "Custom provider registry template saved to {}.\n\
+                         Edit that file with your provider details and restart ygg.",
                         auth::custom::default_path().display()
                     );
                     Ok(())
                 }
                 AuthCommand::Logout => {
                     store.delete()?;
-                    println!("Custom endpoint removed.");
+                    println!("Custom provider registry removed.");
                     Ok(())
                 }
             }

@@ -8,7 +8,8 @@ use ygg_ai::ModelId;
 
 use crate::app::bootstrap::resolve_model_id;
 use crate::config::{
-    self, ColorMode, CompactionPolicy, Config, Mode, ResumeSelector, SandboxPolicy, ToolPolicy,
+    self, ColorMode, CompactionMode, CompactionPolicy, Config, Mode, ResumeSelector, SandboxPolicy,
+    ToolPolicy,
 };
 use crate::session_commands::SessionCommand;
 
@@ -159,6 +160,9 @@ pub struct Cli {
     /// Explicitly enable command execution (overrides a disabling user setting).
     #[arg(long)]
     pub allow_shell: bool,
+    /// Allow `read` to fetch public HTTPS image/audio URLs.
+    #[arg(long, conflicts_with = "offline")]
+    pub allow_remote_read: bool,
     /// Bash-compatible shell executable used by the `bash` tool.
     #[arg(long, value_name = "PATH")]
     pub shell_path: Option<PathBuf>,
@@ -178,6 +182,9 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct CompactionLayer {
+    #[serde(alias = "policy")]
+    mode: Option<String>,
+    /// Deprecated boolean spelling retained for existing configuration.
     enabled: Option<bool>,
     threshold_fraction: Option<f64>,
     keep_recent_turns: Option<usize>,
@@ -199,6 +206,7 @@ struct ConfigLayer {
     allow_write: Option<bool>,
     allow_process: Option<bool>,
     allow_shell: Option<bool>,
+    allow_remote_read: Option<bool>,
     shell_path: Option<PathBuf>,
     #[serde(alias = "exec_timeout_secs")]
     bash_timeout_secs: Option<u64>,
@@ -237,6 +245,7 @@ impl ConfigLayer {
         override_some!(allow_write);
         override_some!(allow_process);
         override_some!(allow_shell);
+        override_some!(allow_remote_read);
         override_some!(shell_path);
         override_some!(bash_timeout_secs);
         override_some!(max_output_bytes);
@@ -251,8 +260,12 @@ impl ConfigLayer {
         override_some!(trusted_extensions);
         match (self.compaction.as_mut(), newer.compaction) {
             (Some(current), Some(newer)) => {
-                if newer.enabled.is_some() {
+                if newer.mode.is_some() {
+                    current.mode = newer.mode;
+                    current.enabled = None;
+                } else if newer.enabled.is_some() {
                     current.enabled = newer.enabled;
+                    current.mode = None;
                 }
                 if newer.threshold_fraction.is_some() {
                     current.threshold_fraction = newer.threshold_fraction;
@@ -296,6 +309,11 @@ impl ConfigLayer {
         tighten_bool(&mut self.allow_write, project.allow_write.take());
         tighten_bool(&mut self.allow_process, project.allow_process.take());
         tighten_bool(&mut self.allow_shell, project.allow_shell.take());
+        // Remote reads are opt-in. A project may revoke a user grant, but may
+        // never create network authority when the user/global layer omitted it.
+        if project.allow_remote_read.take() == Some(false) {
+            self.allow_remote_read = Some(false);
+        }
         tighten_bool(&mut self.context_files, project.context_files.take());
         lower_u64(
             &mut self.bash_timeout_secs,
@@ -533,6 +551,7 @@ where
 
 #[cfg(not(test))]
 fn environment_layer() -> anyhow::Result<ConfigLayer> {
+    let compaction_mode = env_value("YGG_COMPACTION_MODE");
     let compaction_enabled = env_parse("YGG_AUTO_COMPACT")?;
     let threshold_fraction = env_parse("YGG_COMPACTION_THRESHOLD_FRACTION")?;
     let keep_recent_turns = env_parse("YGG_COMPACTION_KEEP_RECENT_TURNS")?;
@@ -552,6 +571,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         allow_write: env_parse("YGG_ALLOW_WRITE")?,
         allow_process: env_parse("YGG_ALLOW_PROCESS")?,
         allow_shell: env_parse("YGG_ALLOW_SHELL")?,
+        allow_remote_read: env_parse("YGG_ALLOW_REMOTE_READ")?,
         shell_path: env_value("YGG_SHELL_PATH").map(PathBuf::from),
         bash_timeout_secs: env_parse("YGG_BASH_TIMEOUT_SECS")?
             .or(env_parse("YGG_EXEC_TIMEOUT_SECS")?),
@@ -565,11 +585,13 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         offline: env_parse("YGG_OFFLINE")?,
         enabled_extensions: env_value("YGG_EXTENSIONS").map(split_names),
         trusted_extensions: env_value("YGG_TRUSTED_EXTENSIONS").map(split_names),
-        compaction: (compaction_enabled.is_some()
+        compaction: (compaction_mode.is_some()
+            || compaction_enabled.is_some()
             || threshold_fraction.is_some()
             || keep_recent_turns.is_some()
             || compact_model.is_some())
         .then_some(CompactionLayer {
+            mode: compaction_mode,
             enabled: compaction_enabled,
             threshold_fraction,
             keep_recent_turns,
@@ -671,6 +693,9 @@ fn build_config_with_global_path(
     if let Some(value) = values.allow_shell {
         sandbox.allow_shell = value;
     }
+    if let Some(value) = values.allow_remote_read {
+        sandbox.allow_remote_read = value;
+    }
     if let Some(value) = values.shell_path {
         sandbox.shell_path = Some(value);
     }
@@ -697,6 +722,9 @@ fn build_config_with_global_path(
         sandbox.allow_process = true;
         sandbox.allow_shell = true;
     }
+    if cli.allow_remote_read {
+        sandbox.allow_remote_read = true;
+    }
     if let Some(value) = cli.shell_path {
         sandbox.shell_path = Some(value);
     }
@@ -705,6 +733,10 @@ fn build_config_with_global_path(
     }
     if let Some(value) = cli.max_output_bytes {
         sandbox.max_output_bytes = value;
+    }
+    let offline = cli.offline || values.offline.unwrap_or(false);
+    if offline {
+        sandbox.allow_remote_read = false;
     }
     sandbox.bash_timeout_secs = sandbox.bash_timeout_secs.clamp(1, 3_600);
     sandbox.max_output_bytes = sandbox.max_output_bytes.clamp(1_024, 1024 * 1024);
@@ -739,9 +771,12 @@ fn build_config_with_global_path(
 
     let mut compaction = CompactionPolicy::default();
     if let Some(layer) = values.compaction {
-        if let Some(value) = layer.enabled {
-            compaction.enabled = value;
-        }
+        compaction.mode = match (layer.mode, layer.enabled) {
+            (Some(value), _) => CompactionMode::parse(&value)?,
+            (None, Some(true)) => CompactionMode::Local,
+            (None, Some(false)) => CompactionMode::Disabled,
+            (None, None) => compaction.mode,
+        };
         if let Some(value) = layer.threshold_fraction {
             if !value.is_finite() || value <= 0.0 || value > 1.0 {
                 anyhow::bail!("compaction.threshold_fraction must be greater than 0 and at most 1");
@@ -833,7 +868,7 @@ fn build_config_with_global_path(
         invocation_trusted_extensions,
         tools,
         context_files: !cli.no_context_files && values.context_files.unwrap_or(true),
-        offline: cli.offline || values.offline.unwrap_or(false),
+        offline,
         workspace_trusted: cli.workspace_trusted,
     })
 }
@@ -892,6 +927,7 @@ mod tests {
             no_process: false,
             no_shell: false,
             allow_shell: false,
+            allow_remote_read: false,
             shell_path: None,
             no_context_files: false,
             offline: false,
@@ -937,6 +973,52 @@ mod tests {
             Some(PathBuf::from("/opt/homebrew/bin/bash"))
         );
         assert_eq!(config.sandbox.bash_timeout_secs, 45);
+    }
+
+    #[test]
+    fn remote_reads_are_default_off_and_require_user_level_opt_in() {
+        let directory = cwd();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert!(!config.sandbox.allow_remote_read);
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.allow_remote_read = true;
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert!(config.sandbox.allow_remote_read);
+
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "allow_remote_read = true\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert!(config.sandbox.allow_remote_read);
+    }
+
+    #[test]
+    fn project_config_cannot_grant_remote_network_authority_and_offline_revokes_it() {
+        let directory = cwd();
+        std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
+        std::fs::write(
+            directory.path().join(".ygg/config.toml"),
+            "allow_remote_read = true\n",
+        )
+        .unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert!(!config.sandbox.allow_remote_read);
+
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "allow_remote_read = true\noffline = true\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert!(config.offline);
+        assert!(!config.sandbox.allow_remote_read);
     }
 
     #[test]
@@ -1261,6 +1343,29 @@ mod tests {
         assert_eq!(compaction.enabled, Some(false));
         assert_eq!(compaction.compact_model.as_deref(), Some("cheap"));
         assert_eq!(compaction.keep_recent_turns, Some(2));
+    }
+
+    #[test]
+    fn explicit_compaction_mode_and_legacy_enabled_map_without_silent_fallback() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "[compaction]\nmode = 'native-responses'\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.compaction.mode, CompactionMode::NativeResponses);
+
+        std::fs::write(&global, "[compaction]\nenabled = true\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.compaction.mode, CompactionMode::Local);
+
+        std::fs::write(&global, "[compaction]\nenabled = false\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.compaction.mode, CompactionMode::Disabled);
     }
 
     // --- persist_model_to_path ---

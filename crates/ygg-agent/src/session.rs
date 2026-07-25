@@ -69,6 +69,9 @@ pub enum UsageRecordKind {
         /// The assistant entry that received the provider response.
         assistant: EntryId,
     },
+    /// A billable Responses turn rejected before assistant persistence because
+    /// explicit native replay mode did not receive authoritative raw output.
+    RejectedResponsesTurn,
     /// A tool-free call used to produce a context-compaction summary.
     Compaction,
     /// A bounded one-token decision about whether a candidate response may
@@ -134,6 +137,10 @@ pub struct EntryMetadata {
     /// replayable model input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
+    /// Marks a locally generated assistant boundary that intentionally has no
+    /// authoritative provider sidecar.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_synthetic_assistant: bool,
 }
 
 impl EntryMetadata {
@@ -166,8 +173,9 @@ impl EntryMetadata {
         (self.prompt_model.is_some()
             || self.prompt_model_source.is_some()
             || self.prompt_color.is_some()
-            || self.display_text.is_some())
-        .then_some(self)
+            || self.display_text.is_some()
+            || self.local_synthetic_assistant)
+            .then_some(self)
     }
 }
 
@@ -208,6 +216,34 @@ pub enum EntryValue {
         /// Pi-compatible cumulative read/modified file lists for handoff.
         #[serde(default)]
         details: crate::compaction::CompactionDetails,
+    },
+    /// Opaque complete Responses output attached beside its canonical assistant
+    /// message. It is not model-visible canonical context.
+    ResponsesTurn {
+        /// Assistant message entry produced by this provider turn.
+        assistant: EntryId,
+        /// Exact endpoint that produced the opaque output.
+        endpoint: EndpointId,
+        /// Exact model that produced the opaque output.
+        model: ModelId,
+        /// Complete terminal output, preserved without normalization.
+        output: ygg_ai::ResponsesOutput,
+    },
+    /// Opaque output from native `POST /responses/compact`.
+    ///
+    /// This is a provider checkpoint sidecar, not canonical model-visible
+    /// context. The marker is appended directly after `covered_through`, so it
+    /// covers the selected active-branch replay root through that entry and can
+    /// never affect a sibling branch after checkout.
+    ResponsesCompaction {
+        /// Exact endpoint that produced the compact output.
+        endpoint: EndpointId,
+        /// Exact model that produced the compact output.
+        model: ModelId,
+        /// Active-branch head included at the end of the compacted input.
+        covered_through: EntryId,
+        /// Complete, unpruned compact output used as the next replay base.
+        output: ygg_ai::ResponsesOutput,
     },
     /// A configuration marker (not part of model-visible context).
     Config {
@@ -493,6 +529,25 @@ pub enum SessionError {
     /// No durable checkpoint exists for the supplied prompt entry.
     #[error("no checkpoint exists for prompt entry {0:?}")]
     UnknownCheckpoint(EntryId),
+    /// A Responses assistant sidecar belongs to another endpoint/model route.
+    #[error(
+        "Responses replay route mismatch for assistant {assistant:?}: expected {expected_endpoint}/{expected_model}, found {actual_endpoint}/{actual_model}"
+    )]
+    ResponsesRouteMismatch {
+        /// Assistant entry whose sidecar was inspected.
+        assistant: EntryId,
+        /// Endpoint selected for the new request.
+        expected_endpoint: String,
+        /// Model selected for the new request.
+        expected_model: String,
+        /// Endpoint recorded on the sidecar.
+        actual_endpoint: String,
+        /// Model recorded on the sidecar.
+        actual_model: String,
+    },
+    /// A Responses sidecar was not appended at its required branch boundary.
+    #[error("invalid Responses sidecar: {0}")]
+    InvalidResponsesSidecar(String),
 }
 
 /// An append-only JSONL session file.
@@ -714,16 +769,65 @@ impl Session {
                             });
                         }
                     }
-                    if let EntryValue::Compaction { first_kept, .. } = &entry.value {
-                        if !index.contains_key(first_kept) {
+                    match &entry.value {
+                        EntryValue::Compaction { first_kept, .. } => {
+                            if !index.contains_key(first_kept) {
+                                return Err(SessionError::Corrupt {
+                                    line: line_no,
+                                    message: format!(
+                                        "compaction {:?} references unknown first_kept {:?}",
+                                        entry.id.0, first_kept.0
+                                    ),
+                                });
+                            }
+                        }
+                        EntryValue::ResponsesTurn {
+                            assistant,
+                            model,
+                            output,
+                            ..
+                        } => {
+                            let valid_assistant = index
+                                .get(assistant)
+                                .and_then(|position| entries.get(*position))
+                                .is_some_and(|candidate| {
+                                    matches!(
+                                        &candidate.value,
+                                        EntryValue::Message(Message::Assistant(message))
+                                            if message.protocol == ygg_ai::Protocol::OpenAiResponses
+                                                && &message.model == model
+                                    )
+                                });
+                            if !valid_assistant
+                                || entry.parent.as_ref() != Some(assistant)
+                                || output.is_empty()
+                            {
+                                return Err(SessionError::Corrupt {
+                                    line: line_no,
+                                    message: format!(
+                                        "Responses turn {:?} is not a direct sidecar of assistant {:?}",
+                                        entry.id.0, assistant.0
+                                    ),
+                                });
+                            }
+                        }
+                        EntryValue::ResponsesCompaction {
+                            covered_through,
+                            output,
+                            ..
+                        } if !index.contains_key(covered_through)
+                            || entry.parent.as_ref() != Some(covered_through)
+                            || !output.has_valid_compaction() =>
+                        {
                             return Err(SessionError::Corrupt {
                                 line: line_no,
                                 message: format!(
-                                    "compaction {:?} references unknown first_kept {:?}",
-                                    entry.id.0, first_kept.0
+                                    "Responses compaction {:?} is not a direct checkpoint of {:?}",
+                                    entry.id.0, covered_through.0
                                 ),
                             });
                         }
+                        _ => {}
                     }
                     index.insert(entry.id.clone(), entries.len());
                     entries.push(*entry);
@@ -960,6 +1064,41 @@ impl Session {
         value: EntryValue,
         metadata: Option<EntryMetadata>,
     ) -> Result<EntryId, SessionError> {
+        match &value {
+            EntryValue::ResponsesTurn {
+                assistant,
+                model,
+                output,
+                ..
+            } => {
+                let valid_assistant = self.head.as_ref() == Some(assistant)
+                    && self.entry(assistant).is_some_and(|entry| {
+                        matches!(
+                            &entry.value,
+                            EntryValue::Message(Message::Assistant(message))
+                                if message.protocol == ygg_ai::Protocol::OpenAiResponses
+                                    && &message.model == model
+                        )
+                    });
+                if !valid_assistant || output.is_empty() {
+                    return Err(SessionError::InvalidResponsesSidecar(format!(
+                        "Responses turn is not a direct sidecar of a Responses assistant from model {}",
+                        model.0
+                    )));
+                }
+            }
+            EntryValue::ResponsesCompaction {
+                covered_through,
+                output,
+                ..
+            } if self.head.as_ref() != Some(covered_through) || !output.has_valid_compaction() => {
+                return Err(SessionError::InvalidResponsesSidecar(format!(
+                    "Responses compaction is not a direct checkpoint of {:?}",
+                    covered_through.0
+                )));
+            }
+            _ => {}
+        }
         let id = EntryId(format!("{:03}", self.next_id));
         let next_id = self
             .next_id
@@ -998,7 +1137,10 @@ impl Session {
                     append_context_message(messages, message);
                 }
             }
-            EntryValue::Config { .. } | EntryValue::PromptTemplateSelected { .. } => {}
+            EntryValue::Config { .. }
+            | EntryValue::PromptTemplateSelected { .. }
+            | EntryValue::ResponsesTurn { .. }
+            | EntryValue::ResponsesCompaction { .. } => {}
             EntryValue::Compaction { .. }
             | EntryValue::SkillActivated { .. }
             | EntryValue::SkillResourceRead { .. }
@@ -1152,6 +1294,28 @@ impl Session {
     ) -> Result<(), SessionError> {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::Compaction,
+            usage,
+            endpoint: Some(endpoint),
+            model: Some(model),
+            completed_at_unix_ms: Some(now_unix_millis()),
+            cost,
+            cost_microdollars: cost.map(|cost| cost.total),
+            session_cost_microdollars: None,
+            session_cost_picodollars_remainder: None,
+        })
+    }
+
+    /// Persist usage for a Responses turn whose terminal output could not
+    /// satisfy explicit native replay mode.
+    pub fn record_rejected_responses_turn_usage(
+        &mut self,
+        endpoint: EndpointId,
+        model: ModelId,
+        usage: Usage,
+        cost: Option<Cost>,
+    ) -> Result<(), SessionError> {
+        self.record_usage(UsageRecord {
+            kind: UsageRecordKind::RejectedResponsesTurn,
             usage,
             endpoint: Some(endpoint),
             model: Some(model),
@@ -1320,6 +1484,216 @@ impl Session {
         })
     }
 
+    /// Appends an authoritative Responses turn sidecar.
+    ///
+    /// The canonical assistant must be the current head. Requiring the sidecar
+    /// to be its direct child makes association branch-local: checkout to the
+    /// assistant or to another child cannot accidentally inherit this opaque
+    /// provider state.
+    pub fn append_responses_turn(
+        &mut self,
+        assistant: EntryId,
+        endpoint: EndpointId,
+        model: ModelId,
+        output: ygg_ai::ResponsesOutput,
+    ) -> Result<EntryId, SessionError> {
+        if self.head.as_ref() != Some(&assistant) {
+            return Err(SessionError::InvalidResponsesSidecar(format!(
+                "assistant {:?} is not the current head",
+                assistant.0
+            )));
+        }
+        let valid_assistant = self.entry(&assistant).is_some_and(|entry| {
+            matches!(
+                &entry.value,
+                EntryValue::Message(Message::Assistant(message))
+                    if message.protocol == ygg_ai::Protocol::OpenAiResponses
+                        && message.model == model
+            )
+        });
+        if !valid_assistant {
+            return Err(SessionError::InvalidResponsesSidecar(format!(
+                "entry {:?} is not a Responses assistant from model {}",
+                assistant.0, model.0
+            )));
+        }
+        self.append(EntryValue::ResponsesTurn {
+            assistant,
+            endpoint,
+            model,
+            output,
+        })
+    }
+
+    /// Appends a native Responses compaction checkpoint at the current head.
+    ///
+    /// The opaque output covers the selected branch replay root through
+    /// `covered_through`. Because the marker is appended directly after that
+    /// head and remains context-invisible, sibling branches never observe it
+    /// and non-matching routes can always fall back to canonical history.
+    pub fn append_responses_compaction(
+        &mut self,
+        endpoint: EndpointId,
+        model: ModelId,
+        output: ygg_ai::ResponsesOutput,
+    ) -> Result<EntryId, SessionError> {
+        let covered_through = self.head.clone().ok_or(SessionError::EmptySession)?;
+        self.append(EntryValue::ResponsesCompaction {
+            endpoint,
+            model,
+            covered_through,
+            output,
+        })
+    }
+
+    fn active_branch_entries(&self) -> Result<Vec<&Entry>, SessionError> {
+        let mut newest_first = Vec::new();
+        let mut cursor = self.head.as_ref();
+        while let Some(id) = cursor {
+            let entry = self
+                .entry(id)
+                .ok_or_else(|| SessionError::UnknownEntry(id.clone()))?;
+            newest_first.push(entry);
+            cursor = entry.parent.as_ref();
+        }
+        newest_first.reverse();
+        Ok(newest_first)
+    }
+
+    /// Builds the exact active-branch input sequence for durable Responses
+    /// replay on `endpoint`/`model`.
+    ///
+    /// `Some` means every assistant in the selected model-visible window has a
+    /// route-affine authoritative sidecar. `None` is the safe legacy/crash
+    /// fallback when any assistant lacks one. A sidecar that exists but belongs
+    /// to another route is rejected explicitly rather than silently replayed.
+    /// The nearest matching native compaction checkpoint after the latest local
+    /// compaction becomes the opaque base for subsequent user/assistant turns.
+    pub fn responses_replay_items(
+        &self,
+        endpoint: &EndpointId,
+        model: &ModelId,
+    ) -> Result<Option<Vec<ygg_ai::responses::ResponsesReplayItem>>, SessionError> {
+        let branch = self.active_branch_entries()?;
+        if branch.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let local_compaction =
+            branch
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, entry)| match &entry.value {
+                    EntryValue::Compaction {
+                        summary,
+                        first_kept,
+                        ..
+                    } => Some((index, summary, first_kept)),
+                    _ => None,
+                });
+        let local_marker_index = local_compaction.map(|(index, _, _)| index);
+        let native_search_start = local_marker_index.map_or(0, |index| index.saturating_add(1));
+        let native_compaction = branch
+            .iter()
+            .enumerate()
+            .skip(native_search_start)
+            .rev()
+            .find_map(|(index, entry)| match &entry.value {
+                EntryValue::ResponsesCompaction {
+                    endpoint: recorded_endpoint,
+                    model: recorded_model,
+                    output,
+                    ..
+                } if recorded_endpoint == endpoint && recorded_model == model => {
+                    Some((index, output))
+                }
+                _ => None,
+            });
+
+        let mut replay = Vec::new();
+        let start = if let Some((index, output)) = native_compaction {
+            replay.push(ygg_ai::responses::ResponsesReplayItem::Compacted(
+                output.clone(),
+            ));
+            index.saturating_add(1)
+        } else if let Some((_marker_index, summary, first_kept)) = local_compaction {
+            let first_kept_index = branch
+                .iter()
+                .position(|entry| &entry.id == first_kept)
+                .ok_or_else(|| SessionError::UnknownEntry(first_kept.clone()))?;
+            replay.push(ygg_ai::responses::ResponsesReplayItem::User(UserMessage {
+                content: vec![UserPart::Text(format!(
+                    "[summary of earlier conversation]\n{summary}"
+                ))],
+            }));
+            first_kept_index
+        } else {
+            0
+        };
+
+        let mut sidecars =
+            HashMap::<&EntryId, (&EndpointId, &ModelId, &ygg_ai::ResponsesOutput)>::new();
+        for entry in &branch {
+            if let EntryValue::ResponsesTurn {
+                assistant,
+                endpoint,
+                model,
+                output,
+            } = &entry.value
+            {
+                sidecars.insert(assistant, (endpoint, model, output));
+            }
+        }
+
+        for entry in branch.into_iter().skip(start) {
+            match &entry.value {
+                EntryValue::Message(Message::User(user)) => {
+                    replay.push(ygg_ai::responses::ResponsesReplayItem::User(user.clone()));
+                }
+                EntryValue::Message(Message::Assistant(assistant))
+                    if entry.metadata.as_ref().is_some_and(|metadata| {
+                        metadata.local_synthetic_assistant
+                            && assistant.protocol == ygg_ai::Protocol::OpenAiResponses
+                            && assistant.model == *model
+                    }) =>
+                {
+                    replay.push(ygg_ai::responses::ResponsesReplayItem::LocalAssistant(
+                        assistant.clone(),
+                    ));
+                }
+                EntryValue::Message(Message::Assistant(_)) => {
+                    let Some((recorded_endpoint, recorded_model, output)) =
+                        sidecars.get(&entry.id).copied()
+                    else {
+                        return Ok(None);
+                    };
+                    if recorded_endpoint != endpoint || recorded_model != model {
+                        return Err(SessionError::ResponsesRouteMismatch {
+                            assistant: entry.id.clone(),
+                            expected_endpoint: endpoint.0.clone(),
+                            expected_model: model.0.clone(),
+                            actual_endpoint: recorded_endpoint.0.clone(),
+                            actual_model: recorded_model.0.clone(),
+                        });
+                    }
+                    replay.push(ygg_ai::responses::ResponsesReplayItem::Output(
+                        output.clone(),
+                    ));
+                }
+                EntryValue::Compaction { .. }
+                | EntryValue::ResponsesTurn { .. }
+                | EntryValue::ResponsesCompaction { .. }
+                | EntryValue::Config { .. }
+                | EntryValue::PromptTemplateSelected { .. }
+                | EntryValue::SkillActivated { .. }
+                | EntryValue::SkillResourceRead { .. }
+                | EntryValue::SkillDeactivated { .. } => {}
+            }
+        }
+        Ok(Some(replay))
+    }
+
     /// Returns the current head entry ID (`None` for an empty session).
     pub fn head(&self) -> Option<EntryId> {
         self.head.clone()
@@ -1347,11 +1721,12 @@ impl Session {
     /// chronological order. Compaction summaries are injected in front as
     /// synthetic user messages (`ygg-ai` has no system role inside
     /// [`Message`]; the request-level system prompt belongs to the agent).
-    /// Config entries are skipped. Consecutive tool-result messages are
-    /// coalesced into a single user message, matching the provider-required
-    /// shape. Once materialized, the result is incrementally updated for
-    /// ordinary appends and reused until checkout or compaction changes the
-    /// active branch semantics.
+    /// Config entries are skipped. Consecutive tool-result messages (including
+    /// protocol-required adjacent media) are coalesced into a single user
+    /// message with every result before the media, matching provider-required
+    /// wire ordering. Once materialized, the result is incrementally updated
+    /// for ordinary appends and reused until checkout or compaction changes
+    /// the active branch semantics.
     fn reconstruct_context(&self) -> Result<Vec<Message>, SessionError> {
         let mut newest_first: Vec<Message> = Vec::new();
         let mut summary: Option<String> = None;
@@ -1364,7 +1739,10 @@ impl Session {
                 .ok_or_else(|| SessionError::UnknownEntry(id.clone()))?;
             match &entry.value {
                 EntryValue::Message(m) => newest_first.push(m.clone()),
-                EntryValue::Config { .. } | EntryValue::PromptTemplateSelected { .. } => {}
+                EntryValue::Config { .. }
+                | EntryValue::PromptTemplateSelected { .. }
+                | EntryValue::ResponsesTurn { .. }
+                | EntryValue::ResponsesCompaction { .. } => {}
                 EntryValue::Compaction {
                     summary: compaction_summary,
                     first_kept,
@@ -1458,6 +1836,8 @@ impl Session {
                 }
                 EntryValue::Config { .. }
                 | EntryValue::PromptTemplateSelected { .. }
+                | EntryValue::ResponsesTurn { .. }
+                | EntryValue::ResponsesCompaction { .. }
                 | EntryValue::SkillActivated { .. }
                 | EntryValue::SkillResourceRead { .. }
                 | EntryValue::SkillDeactivated { .. } => {}
@@ -1605,20 +1985,48 @@ pub struct ActiveSkillState {
     pub skill_resources: Vec<SkillResourceSnapshot>,
 }
 
-fn is_tool_results(m: &UserMessage) -> bool {
+fn is_tool_result_turn(m: &UserMessage) -> bool {
     !m.content.is_empty()
         && m.content
             .iter()
-            .all(|p| matches!(p, UserPart::ToolResult(_)))
+            .any(|part| matches!(part, UserPart::ToolResult(_)))
+        && m.content
+            .iter()
+            .all(|part| matches!(part, UserPart::ToolResult(_) | UserPart::Media(_)))
+}
+
+/// Adds one persisted tool-result turn to an adjacent one while keeping every
+/// provider-paired result ahead of OpenAI Chat's adjacent media messages.
+fn merge_tool_result_turn(previous: &mut UserMessage, current: &[UserPart]) {
+    let media_start = previous
+        .content
+        .iter()
+        .position(|part| matches!(part, UserPart::Media(_)))
+        .unwrap_or(previous.content.len());
+    let current_results = current
+        .iter()
+        .filter(|part| matches!(part, UserPart::ToolResult(_)))
+        .cloned();
+    drop(
+        previous
+            .content
+            .splice(media_start..media_start, current_results),
+    );
+    previous.content.extend(
+        current
+            .iter()
+            .filter(|part| matches!(part, UserPart::Media(_)))
+            .cloned(),
+    );
 }
 
 /// Appends one newly persisted message to an already materialized context.
 fn append_context_message(messages: &mut Vec<Message>, message: &Message) {
     if let Message::User(current) = message {
-        if is_tool_results(current) {
+        if is_tool_result_turn(current) {
             if let Some(Message::User(previous)) = messages.last_mut() {
-                if is_tool_results(previous) {
-                    previous.content.extend(current.content.iter().cloned());
+                if is_tool_result_turn(previous) {
+                    merge_tool_result_turn(previous, &current.content);
                     return;
                 }
             }
@@ -1627,18 +2035,20 @@ fn append_context_message(messages: &mut Vec<Message>, message: &Message) {
     messages.push(message.clone());
 }
 
-/// Merges consecutive user messages that consist solely of tool results into
-/// one user message, the shape providers require for a tool-result turn.
-/// Individual tool results stay individual *entries* on disk; coalescing
-/// happens only during context reconstruction.
+/// Merges consecutive user messages that contain tool results and their
+/// protocol-required adjacent media into one user message. All tool results
+/// remain ahead of adjacent media so OpenAI Chat serializes every `role:tool`
+/// message before the next `role:user` media message. Individual tool results
+/// stay individual *entries* on disk; coalescing happens only during context
+/// reconstruction.
 fn coalesce_tool_results(messages: Vec<Message>) -> Vec<Message> {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     for message in messages {
         if let Message::User(current) = &message {
-            if is_tool_results(current) {
+            if is_tool_result_turn(current) {
                 if let Some(Message::User(previous)) = out.last_mut() {
-                    if is_tool_results(previous) {
-                        previous.content.extend(current.content.clone());
+                    if is_tool_result_turn(previous) {
+                        merge_tool_result_turn(previous, &current.content);
                         continue;
                     }
                 }
@@ -1666,6 +2076,45 @@ mod tests {
             model: ModelId("m".to_string()),
             protocol: Protocol::AnthropicMessages,
         }))
+    }
+
+    fn responses_assistant(text: &str) -> EntryValue {
+        EntryValue::Message(Message::Assistant(AssistantMessage {
+            content: vec![AssistantPart::Text(text.to_string())],
+            model: ModelId("m".to_string()),
+            protocol: Protocol::OpenAiResponses,
+        }))
+    }
+
+    fn responses_output(id: &str) -> ygg_ai::ResponsesOutput {
+        ygg_ai::ResponsesOutput::new(vec![ygg_ai::ResponsesItem::new(serde_json::json!({
+            "type": "message",
+            "id": id,
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": id,
+                "annotations": []
+            }],
+            "unknown": {"preserved": true}
+        }))
+        .unwrap()])
+    }
+
+    fn responses_compact_output(id: &str) -> ygg_ai::ResponsesOutput {
+        ygg_ai::ResponsesOutput::new(vec![
+            ygg_ai::ResponsesItem::new(serde_json::json!({
+                "type": "message",
+                "id": format!("leading-{id}")
+            }))
+            .unwrap(),
+            ygg_ai::ResponsesItem::new(serde_json::json!({
+                "type": "compaction",
+                "id": id,
+                "encrypted_content": "opaque"
+            }))
+            .unwrap(),
+        ])
     }
 
     fn tool_result(call_id: &str, text: &str) -> EntryValue {
@@ -1732,6 +2181,7 @@ mod tests {
                     prompt_model_source: Some("  deepseek  ".into()),
                     prompt_color: Some("  #22AACC  ".into()),
                     display_text: Some("visible\ndraft".into()),
+                    local_synthetic_assistant: false,
                 }),
             )
             .unwrap();
@@ -1743,6 +2193,7 @@ mod tests {
                     prompt_model_source: Some("#2243e6".into()),
                     prompt_color: Some("rgb(1,2,3)\u{1b}".into()),
                     display_text: Some("bad\u{1b}".into()),
+                    local_synthetic_assistant: false,
                 }),
             )
             .unwrap();
@@ -1756,6 +2207,7 @@ mod tests {
                 prompt_model_source: Some("deepseek".into()),
                 prompt_color: Some("#22aacc".into()),
                 display_text: Some("visible\ndraft".into()),
+                local_synthetic_assistant: false,
             })
         );
         assert_eq!(session.entry(&invalid).unwrap().metadata, None);
@@ -2796,5 +3248,259 @@ mod tests {
         s.append(user("interjection")).unwrap();
         let ctx = s.context().unwrap();
         assert_eq!(ctx.len(), 3);
+    }
+
+    #[test]
+    fn parallel_tool_results_stay_ahead_of_adjacent_media() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut s = Session::create(&path).unwrap();
+        s.append(assistant("calling tools")).unwrap();
+        s.append(EntryValue::Message(Message::User(UserMessage {
+            content: vec![
+                UserPart::ToolResult(ToolResult {
+                    tool_call_id: ToolCallId("call_1".into()),
+                    content: vec![],
+                    is_error: false,
+                }),
+                UserPart::Media(ygg_ai::Media::image_bytes(
+                    bytes::Bytes::from_static(b"first"),
+                    "image/png".parse().unwrap(),
+                )),
+            ],
+        })))
+        .unwrap();
+        s.append(tool_result("call_2", "two")).unwrap();
+
+        let assert_order = |context: Vec<Message>| {
+            let Message::User(turn) = context.last().unwrap() else {
+                panic!("expected a coalesced user turn");
+            };
+            assert_eq!(turn.content.len(), 3);
+            assert!(matches!(
+                &turn.content[0],
+                UserPart::ToolResult(result) if result.tool_call_id.0 == "call_1"
+            ));
+            assert!(matches!(
+                &turn.content[1],
+                UserPart::ToolResult(result) if result.tool_call_id.0 == "call_2"
+            ));
+            assert!(matches!(&turn.content[2], UserPart::Media(_)));
+        };
+        assert_order(s.context().unwrap());
+
+        drop(s);
+        assert_order(Session::open(path).unwrap().context().unwrap());
+    }
+
+    #[test]
+    fn responses_replay_survives_restart_and_uses_only_the_active_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let endpoint = EndpointId("responses".into());
+        let model = ModelId("m".into());
+        let mut session = Session::create(&path).unwrap();
+        let root = session.append(user("root")).unwrap();
+        let abandoned_assistant = session.append(responses_assistant("old")).unwrap();
+        session
+            .append_responses_turn(
+                abandoned_assistant,
+                endpoint.clone(),
+                model.clone(),
+                responses_output("old_raw"),
+            )
+            .unwrap();
+
+        session.checkout(root).unwrap();
+        let active_assistant = session.append(responses_assistant("new")).unwrap();
+        session
+            .append_responses_turn(
+                active_assistant,
+                endpoint.clone(),
+                model.clone(),
+                responses_output("new_raw"),
+            )
+            .unwrap();
+        session.append(user("follow up")).unwrap();
+        drop(session);
+
+        let reopened = Session::open(&path).unwrap();
+        let replay = reopened
+            .responses_replay_items(&endpoint, &model)
+            .unwrap()
+            .expect("the active branch is fully reconstructible");
+        assert_eq!(replay.len(), 3);
+        let ygg_ai::responses::ResponsesReplayItem::Output(output) = &replay[1] else {
+            panic!("assistant must be represented by raw output");
+        };
+        assert_eq!(output.items()[0].as_json()["id"], "new_raw");
+        assert!(serde_json::to_string(&replay_debug_json(&replay))
+            .unwrap()
+            .contains("follow up"));
+        assert!(!serde_json::to_string(&replay_debug_json(&replay))
+            .unwrap()
+            .contains("old_raw"));
+    }
+
+    #[test]
+    fn responses_replay_rejects_route_mismatch_and_legacy_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy = Session::create(dir.path().join("legacy.jsonl")).unwrap();
+        legacy.append(user("prompt")).unwrap();
+        legacy.append(responses_assistant("legacy answer")).unwrap();
+        assert!(legacy
+            .responses_replay_items(&EndpointId("responses".into()), &ModelId("m".into()))
+            .unwrap()
+            .is_none());
+
+        let mut mismatch = Session::create(dir.path().join("mismatch.jsonl")).unwrap();
+        mismatch.append(user("prompt")).unwrap();
+        let assistant = mismatch
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("answer".into())],
+                model: ModelId("other-model".into()),
+                protocol: Protocol::OpenAiResponses,
+            })))
+            .unwrap();
+        mismatch
+            .append_responses_turn(
+                assistant,
+                EndpointId("other-endpoint".into()),
+                ModelId("other-model".into()),
+                responses_output("raw"),
+            )
+            .unwrap();
+        let error = mismatch
+            .responses_replay_items(&EndpointId("responses".into()), &ModelId("m".into()))
+            .unwrap_err();
+        assert!(matches!(error, SessionError::ResponsesRouteMismatch { .. }));
+    }
+
+    #[test]
+    fn responses_sidecars_reject_non_authoritative_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create(temp_path(&dir)).unwrap();
+        session.append(user("prompt")).unwrap();
+        let assistant = session.append(responses_assistant("answer")).unwrap();
+        let error = session
+            .append_responses_turn(
+                assistant,
+                EndpointId("responses".into()),
+                ModelId("m".into()),
+                ygg_ai::ResponsesOutput::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SessionError::InvalidResponsesSidecar(_)));
+
+        let error = session
+            .append_responses_compaction(
+                EndpointId("responses".into()),
+                ModelId("m".into()),
+                responses_output("not-a-compaction"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, SessionError::InvalidResponsesSidecar(_)));
+    }
+
+    #[test]
+    fn reopening_rejects_a_semantically_invalid_compact_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut session = Session::create(&path).unwrap();
+        let covered = session.append(user("prompt")).unwrap();
+        drop(session);
+
+        let malformed = serde_json::json!({
+            "type": "entry",
+            "id": "999",
+            "parent": covered,
+            "value": {
+                "type": "responses_compaction",
+                "endpoint": "responses",
+                "model": "m",
+                "covered_through": covered,
+                "output": [{"type": "message", "id": "not-compacted"}]
+            }
+        });
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        serde_json::to_writer(&mut file, &malformed).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let error = Session::open(&path).unwrap_err();
+        assert!(matches!(error, SessionError::Corrupt { .. }), "{error}");
+        assert!(error.to_string().contains("direct checkpoint"), "{error}");
+    }
+
+    #[test]
+    fn native_responses_compaction_is_a_branch_local_replay_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = EndpointId("responses".into());
+        let model = ModelId("m".into());
+        let mut session = Session::create(temp_path(&dir)).unwrap();
+        session.append(user("old prompt")).unwrap();
+        let assistant = session.append(responses_assistant("old answer")).unwrap();
+        let covered = session
+            .append_responses_turn(
+                assistant,
+                endpoint.clone(),
+                model.clone(),
+                responses_output("old_raw"),
+            )
+            .unwrap();
+        session
+            .append_responses_compaction(
+                endpoint.clone(),
+                model.clone(),
+                responses_compact_output("compact_raw"),
+            )
+            .unwrap();
+        session.append(user("after compact")).unwrap();
+
+        let replay = session
+            .responses_replay_items(&endpoint, &model)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.len(), 2);
+        let ygg_ai::responses::ResponsesReplayItem::Compacted(output) = &replay[0] else {
+            panic!("native compact output must be the replay base");
+        };
+        assert_eq!(output.items()[1].as_json()["id"], "compact_raw");
+
+        // Checking out the covered head abandons the checkpoint. The new
+        // sibling reconstructs from canonical messages plus the turn sidecar.
+        session.checkout(covered).unwrap();
+        session.append(user("sibling")).unwrap();
+        let sibling = session
+            .responses_replay_items(&endpoint, &model)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sibling.len(), 3);
+        let ygg_ai::responses::ResponsesReplayItem::Output(output) = &sibling[1] else {
+            panic!("ordinary turn output must be restored on the sibling");
+        };
+        assert_eq!(output.items()[0].as_json()["id"], "old_raw");
+    }
+
+    fn replay_debug_json(
+        replay: &[ygg_ai::responses::ResponsesReplayItem],
+    ) -> Vec<serde_json::Value> {
+        replay
+            .iter()
+            .map(|item| match item {
+                ygg_ai::responses::ResponsesReplayItem::User(user) => {
+                    serde_json::to_value(user).unwrap()
+                }
+                ygg_ai::responses::ResponsesReplayItem::LocalAssistant(assistant) => {
+                    serde_json::to_value(assistant).unwrap()
+                }
+                ygg_ai::responses::ResponsesReplayItem::Output(output) => {
+                    serde_json::to_value(output).unwrap()
+                }
+                ygg_ai::responses::ResponsesReplayItem::Compacted(output) => {
+                    serde_json::to_value(output).unwrap()
+                }
+            })
+            .collect()
     }
 }

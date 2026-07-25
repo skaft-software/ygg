@@ -44,6 +44,16 @@ The composer supports multiline editing, bracketed paste, large-paste chips,
 media attachments, dropped paths, and gitignore-aware `@` completion. Media is
 capability-gated at attachment time and remains ordered with text when submitted.
 
+## Reasoning presentation
+
+Live reasoning is collapsed into exactly two width-bounded rows: a plain-weight
+row with a blinking model-colored `•` and model-colored `<heading>`, plus a
+subdued `└ (ctrl+o to expand)` disclosure row. The heading cache advances only from
+semantic ATX headings or paragraphs consisting solely of bold text. It never
+infers a label from body prose, sanitizes provider text before display, and uses
+`Thinking` until the model emits a heading. Completed collapsed reasoning has
+no rows. `Ctrl+O` preserves the existing full, verbatim Markdown rendering.
+
 ## Tool presentation
 
 Tool calls expose only deterministic intent and lifecycle rows. Protocol
@@ -81,7 +91,11 @@ Model selection is available through a picker, direct `/model <id>`, and
 
 - Enter queues a follow-up.
 - Ctrl+S steers at the next model boundary.
-- Escape or Ctrl+C interrupts active work.
+- Escape interrupts active work. Ctrl+C first clears a nonempty draft; with an
+  empty draft it interrupts active work and is ignored while idle.
+- Ctrl+D requests a coordinated close from every input owner, including
+  pickers, tool prompts, lifecycle waits, and local shell commands. Active work
+  is aborted and settled before the process exits.
 - Safe presentation commands execute immediately.
 - Model, reasoning, session, compaction, reload, and checkout work is queued in
   order and applied after the active `Run` releases its Agent borrow.

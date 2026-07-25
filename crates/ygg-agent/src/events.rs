@@ -162,10 +162,28 @@ pub enum CompactionReason {
 /// Durable result of one autonomous compaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactionInfo {
+    /// Provider-independent local summary or native Responses checkpoint.
+    pub kind: CompactionKind,
     /// Summary injected at the front of reconstructed provider context.
+    /// Empty for native Responses compaction, whose opaque output is the base.
     pub summary: String,
     /// Oldest entry retained at full fidelity.
+    /// For native Responses compaction this is the covered-through head.
     pub first_kept: EntryId,
+}
+
+/// Durable compaction representation selected by the agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompactionKind {
+    /// A local canonical summary and retained full-fidelity tail.
+    Local,
+    /// A route-affine opaque Responses checkpoint.
+    NativeResponses {
+        /// Session entry containing the opaque compact output.
+        checkpoint: EntryId,
+        /// Active-branch head covered by the compact request.
+        covered_through: EntryId,
+    },
 }
 
 /// Distinguishes normal text from reasoning output in [`AgentEvent::OutputDelta`].

@@ -119,6 +119,7 @@ impl std::fmt::Debug for Model {
 pub struct ModelCatalog {
     endpoints: HashMap<EndpointId, Arc<Endpoint>>,
     models: HashMap<ModelId, Arc<ModelSpec>>,
+    endpoint_labels: HashMap<EndpointId, String>,
 }
 
 impl ModelCatalog {
@@ -176,6 +177,27 @@ impl ModelCatalog {
         self.endpoints
             .insert(endpoint.id.clone(), Arc::new(endpoint));
         Ok(())
+    }
+
+    /// Sets an optional human-facing label for an endpoint.
+    pub fn set_endpoint_label(
+        &mut self,
+        id: EndpointId,
+        label: impl Into<String>,
+    ) -> Result<(), ConfigError> {
+        if !self.endpoints.contains_key(&id) {
+            return Err(ConfigError::UnknownEndpoint(id));
+        }
+        let label = label.into();
+        if !label.trim().is_empty() {
+            self.endpoint_labels.insert(id, label);
+        }
+        Ok(())
+    }
+
+    /// Returns the optional human-facing endpoint label.
+    pub fn endpoint_label(&self, id: &EndpointId) -> Option<&str> {
+        self.endpoint_labels.get(id).map(String::as_str)
     }
 
     /// Registers a new model specification.
@@ -265,7 +287,10 @@ pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
                     && budgets.xhigh <= budgets.max
                     && budgets.max <= spec.limits.max_output_tokens
             }
-            (ReasoningControl::Effort | ReasoningControl::Toggle, None) => true,
+            (
+                ReasoningControl::Effort | ReasoningControl::AlwaysOn | ReasoningControl::Toggle,
+                None,
+            ) => true,
             _ => false,
         };
         let protocol_matches = match spec.protocol {
@@ -274,7 +299,7 @@ pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
             Protocol::AnthropicMessages => true,
             Protocol::OpenAiChat => matches!(
                 reasoning.control,
-                ReasoningControl::Effort | ReasoningControl::Toggle
+                ReasoningControl::Effort | ReasoningControl::AlwaysOn | ReasoningControl::Toggle
             ),
             Protocol::OpenAiResponses => reasoning.control == ReasoningControl::Effort,
         };
@@ -282,7 +307,9 @@ pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
             || (spec.protocol == Protocol::OpenAiChat
                 && matches!(
                     reasoning.control,
-                    ReasoningControl::Effort | ReasoningControl::Toggle
+                    ReasoningControl::Effort
+                        | ReasoningControl::AlwaysOn
+                        | ReasoningControl::Toggle
                 )
                 && reasoning.exposes_text);
         let effort_range_valid = reasoning.min_effort <= reasoning.max_effort;
@@ -409,6 +436,39 @@ mod tests {
             model.spec.cache.session_affinity_format,
             Some(crate::types::SessionAffinityFormat::OpenAi)
         );
+    }
+
+    #[test]
+    fn endpoint_labels_are_presentation_only_and_follow_endpoint_identity() {
+        let mut catalog = ModelCatalog::default();
+        let endpoint_id = EndpointId("custom-apple-fm".into());
+        catalog
+            .register_endpoint(Endpoint {
+                id: endpoint_id.clone(),
+                base_url: url::Url::parse("http://127.0.0.1:1976/v1/").unwrap(),
+                auth: crate::auth::Auth::None,
+                default_headers: http::HeaderMap::new(),
+                transport: crate::types::EndpointTransport::Http,
+                timeout: std::time::Duration::from_secs(300),
+            })
+            .unwrap();
+        catalog
+            .set_endpoint_label(endpoint_id.clone(), "Apple Foundation Models")
+            .unwrap();
+        assert_eq!(
+            catalog.endpoint_label(&endpoint_id),
+            Some("Apple Foundation Models")
+        );
+        catalog
+            .set_endpoint_label(endpoint_id.clone(), "   ")
+            .unwrap();
+        assert_eq!(
+            catalog.endpoint_label(&endpoint_id),
+            Some("Apple Foundation Models")
+        );
+        assert!(catalog
+            .set_endpoint_label(EndpointId("missing".into()), "Missing")
+            .is_err());
     }
 
     #[test]

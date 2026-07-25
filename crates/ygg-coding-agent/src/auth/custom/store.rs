@@ -2,6 +2,7 @@
 
 //! File-backed custom endpoint store at `~/.ygg/credentials/custom.json`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +12,8 @@ use ygg_ai::CacheCompatibility;
 
 const MAX_CREDENTIAL_BYTES: usize = 1024 * 1024;
 const MAX_MODEL_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const REGISTRY_VERSION: u8 = 1;
+const LEGACY_PROVIDER_ID: &str = "custom-openai";
 
 /// Configuration for one custom OpenAI-compatible endpoint.
 #[derive(Clone, Serialize, Deserialize)]
@@ -35,6 +38,107 @@ pub struct CustomCredential {
     /// provide a usable `/v1/models`.
     #[serde(default = "default_auto_discover")]
     pub auto_discover: bool,
+}
+
+/// Authentication configuration for a registry provider.
+///
+/// Static API keys remain accepted in [`CustomCredential`] for compatibility,
+/// but new configurations should reference an environment variable instead.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CustomAuthConfig {
+    /// Do not send an Authorization header.
+    None,
+    /// Read a bearer token from an environment variable at runtime.
+    BearerEnv {
+        /// Environment variable containing the bearer token.
+        var: String,
+    },
+}
+
+/// One named provider in the custom endpoint registry.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CustomProvider {
+    /// Human-facing provider name used in the model picker and status output.
+    #[serde(default)]
+    pub label: String,
+    /// Core OpenAI-compatible endpoint configuration.
+    #[serde(flatten)]
+    pub credential: CustomCredential,
+    /// Optional authentication strategy. When omitted, the compatibility
+    /// `api_key` field is used if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<CustomAuthConfig>,
+    /// Optional provider-specific environment variable for a bearer token.
+    /// This is a compact alternative to the `auth` object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Optional prompt-cache compatibility controls for this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheCompatibility>,
+    /// Maximum time to wait for initial response headers from a cold endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_timeout_secs: Option<u64>,
+}
+
+impl CustomProvider {
+    /// Wrap a compatibility credential as a named provider configuration.
+    #[cfg(test)]
+    pub fn from_credential(credential: CustomCredential) -> Self {
+        Self {
+            label: String::new(),
+            credential,
+            auth: None,
+            api_key_env: None,
+            cache: None,
+            startup_timeout_secs: None,
+        }
+    }
+}
+
+impl fmt::Debug for CustomProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CustomProvider")
+            .field("label", &self.label)
+            .field("credential", &self.credential)
+            .field("auth", &self.auth)
+            .field("api_key_env", &self.api_key_env)
+            .field("cache", &self.cache)
+            .field("startup_timeout_secs", &self.startup_timeout_secs)
+            .finish()
+    }
+}
+
+/// Unified multi-provider custom endpoint configuration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CustomRegistry {
+    /// Schema version of this registry.
+    #[serde(default = "default_registry_version")]
+    pub version: u8,
+    /// Providers keyed by stable machine-readable IDs.
+    pub providers: BTreeMap<String, CustomProvider>,
+    /// True only when this registry was normalized from the original
+    /// single-object credential shape. It is never serialized.
+    #[serde(skip)]
+    pub legacy_single_endpoint: bool,
+}
+
+impl CustomRegistry {
+    /// Construct a registry containing one provider.
+    pub fn single(provider_id: impl Into<String>, provider: CustomProvider) -> Self {
+        let mut providers = BTreeMap::new();
+        providers.insert(provider_id.into(), provider);
+        Self {
+            version: REGISTRY_VERSION,
+            providers,
+            legacy_single_endpoint: false,
+        }
+    }
+}
+
+const fn default_registry_version() -> u8 {
+    REGISTRY_VERSION
 }
 
 /// A single model served by the custom endpoint.
@@ -66,6 +170,10 @@ pub struct CustomModel {
     /// Whether the model supports reasoning/thinking.
     #[serde(default)]
     pub reasoning: bool,
+    /// Whether ygg can configure reasoning. A model may still reason by
+    /// default when this is false.
+    #[serde(default = "default_true")]
+    pub reasoning_configurable: bool,
     /// Exact reasoning selector values advertised by the endpoint. Empty
     /// preserves the legacy effort-range behavior for manual configurations.
     #[serde(default)]
@@ -107,6 +215,7 @@ impl Default for CustomModel {
             vision: false,
             structured_output: false,
             reasoning: false,
+            reasoning_configurable: true,
             reasoning_values: Vec::new(),
             reasoning_default: String::new(),
             reasoning_uses_system_message: false,
@@ -157,40 +266,135 @@ impl CredentialStore {
         Self { path: path.into() }
     }
 
-    fn model_cache_path(&self) -> PathBuf {
+    fn model_cache_path_for(&self, provider_id: &str) -> PathBuf {
         let stem = self
             .path
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or("custom");
-        self.path.with_file_name(format!("{stem}-models.json"))
+        if provider_id == LEGACY_PROVIDER_ID {
+            self.path.with_file_name(format!("{stem}-models.json"))
+        } else {
+            let safe_id = provider_id
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            self.path
+                .with_file_name(format!("{stem}-models-{safe_id}.json"))
+        }
     }
 
-    /// Load the credential, or `None` if the file does not exist.
-    pub fn load(&self) -> Result<Option<CustomCredential>> {
+    fn model_cache_path(&self) -> PathBuf {
+        self.model_cache_path_for(LEGACY_PROVIDER_ID)
+    }
+
+    /// Load the unified provider registry, or `None` if the file does not exist.
+    ///
+    /// The original single-provider object is normalized in memory as the
+    /// `custom-openai` provider. It is never treated as a separate runtime
+    /// abstraction.
+    pub fn load_registry(&self) -> Result<Option<CustomRegistry>> {
         let Some(bytes) = crate::auth::read_bounded_regular(&self.path, MAX_CREDENTIAL_BYTES)
             .with_context(|| format!("reading {}", self.path.display()))?
         else {
             return Ok(None);
         };
-        let cred = serde_json::from_slice(&bytes)
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
             .with_context(|| format!("corrupt credential file {}", self.path.display()))?;
-        Ok(Some(cred))
+
+        if value.get("providers").is_some() {
+            let registry: CustomRegistry = serde_json::from_value(value).with_context(|| {
+                format!("invalid custom provider registry {}", self.path.display())
+            })?;
+            if registry.version != REGISTRY_VERSION {
+                anyhow::bail!(
+                    "unsupported custom provider registry version {} in {}",
+                    registry.version,
+                    self.path.display()
+                );
+            }
+            Ok(Some(registry))
+        } else {
+            let credential: CustomCredential =
+                serde_json::from_value(value.clone()).with_context(|| {
+                    format!("invalid legacy custom credential {}", self.path.display())
+                })?;
+            let cache = value
+                .get("cache")
+                .map(|cache| {
+                    serde_json::from_value(cache.clone()).with_context(|| {
+                        format!("invalid cache compatibility in {}", self.path.display())
+                    })
+                })
+                .transpose()?;
+            let startup_timeout_secs = value
+                .get("startup_timeout_secs")
+                .map(|timeout| {
+                    serde_json::from_value(timeout.clone()).with_context(|| {
+                        format!("invalid startup timeout in {}", self.path.display())
+                    })
+                })
+                .transpose()?;
+            let mut registry = CustomRegistry::single(
+                LEGACY_PROVIDER_ID,
+                CustomProvider {
+                    label: String::new(),
+                    credential,
+                    auth: None,
+                    api_key_env: None,
+                    cache,
+                    startup_timeout_secs,
+                },
+            );
+            registry.legacy_single_endpoint = true;
+            Ok(Some(registry))
+        }
+    }
+
+    /// Compatibility accessor for callers that only support one provider.
+    #[cfg(test)]
+    pub fn load(&self) -> Result<Option<CustomCredential>> {
+        let Some(registry) = self.load_registry()? else {
+            return Ok(None);
+        };
+        if registry.providers.len() > 1 {
+            anyhow::bail!(
+                "{} contains multiple custom providers; use load_registry",
+                self.path.display()
+            );
+        }
+        Ok(registry
+            .providers
+            .into_values()
+            .next()
+            .map(|provider| provider.credential))
     }
 
     /// Load cached model metadata produced by a successful custom-endpoint
-    /// discovery. The cache is deliberately separate from the credential so a
-    /// routine startup never has to rewrite or expose the secret-bearing file.
-    pub(crate) fn load_model_cache(&self) -> Result<Option<Vec<u8>>> {
-        let path = self.model_cache_path();
+    /// discovery for one provider. The cache is deliberately separate from the
+    /// credential so startup never rewrites or exposes the secret-bearing file.
+    pub(crate) fn load_model_cache_for(&self, provider_id: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.model_cache_path_for(provider_id);
         crate::auth::read_bounded_regular(&path, MAX_MODEL_CACHE_BYTES)
             .with_context(|| format!("reading {}", path.display()))
     }
 
+    /// Compatibility cache accessor for the original single endpoint.
+    #[cfg(test)]
+    pub(crate) fn load_model_cache(&self) -> Result<Option<Vec<u8>>> {
+        self.load_model_cache_for(LEGACY_PROVIDER_ID)
+    }
+
     /// Persist discovered model metadata with the same owner-only guarantees as
     /// the credential itself.
-    pub(crate) fn save_model_cache(&self, bytes: &[u8]) -> Result<()> {
-        let path = self.model_cache_path();
+    pub(crate) fn save_model_cache_for(&self, provider_id: &str, bytes: &[u8]) -> Result<()> {
+        let path = self.model_cache_path_for(provider_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -204,8 +408,18 @@ impl CredentialStore {
         write_private(&path, bytes).with_context(|| format!("writing {}", path.display()))
     }
 
-    pub(crate) fn model_cache_is_stale(&self, max_age: std::time::Duration) -> Result<bool> {
-        let path = self.model_cache_path();
+    /// Compatibility cache accessor for the original single endpoint.
+    #[cfg(test)]
+    pub(crate) fn save_model_cache(&self, bytes: &[u8]) -> Result<()> {
+        self.save_model_cache_for(LEGACY_PROVIDER_ID, bytes)
+    }
+
+    pub(crate) fn model_cache_is_stale_for(
+        &self,
+        provider_id: &str,
+        max_age: std::time::Duration,
+    ) -> Result<bool> {
+        let path = self.model_cache_path_for(provider_id);
         let modified = match std::fs::metadata(&path) {
             Ok(metadata) => metadata.modified()?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
@@ -214,50 +428,70 @@ impl CredentialStore {
         Ok(modified.elapsed().is_ok_and(|age| age >= max_age))
     }
 
-    /// Load optional prompt-cache compatibility controls from the credential
-    /// JSON's top-level `cache` object.
-    ///
-    /// This is intentionally separate from [`CustomCredential`] so existing
-    /// callers using struct literals remain source-compatible. The object uses
-    /// ygg-ai's `CacheCompatibility` shape, for example:
-    /// `{ "cache": { "cache_control_format": "anthropic", "send_session_affinity_headers": true } }`.
+    /// Load prompt-cache compatibility controls for the sole configured
+    /// provider. This compatibility accessor is retained for existing callers;
+    /// registry-aware code reads the provider's `cache` field directly.
+    #[cfg(test)]
     pub fn load_cache_compatibility(&self) -> Result<Option<CacheCompatibility>> {
-        let Some(bytes) = crate::auth::read_bounded_regular(&self.path, MAX_CREDENTIAL_BYTES)
-            .with_context(|| format!("reading {}", self.path.display()))?
-        else {
+        let Some(registry) = self.load_registry()? else {
             return Ok(None);
         };
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("corrupt credential file {}", self.path.display()))?;
-        let Some(cache) = value.get("cache") else {
+        if registry.providers.len() != 1 {
             return Ok(None);
-        };
-        serde_json::from_value(cache.clone())
-            .map(Some)
-            .with_context(|| format!("invalid cache compatibility in {}", self.path.display()))
+        }
+        Ok(registry
+            .providers
+            .values()
+            .next()
+            .and_then(|provider| provider.cache.clone()))
     }
 
-    /// Load the optional response-header allowance for a cold-starting custom
-    /// endpoint. This expert setting stays outside [`CustomCredential`] so the
-    /// public credential shape remains source-compatible.
+    /// Load the response-header allowance for the sole configured provider.
+    #[cfg(test)]
     pub fn load_startup_timeout_secs(&self) -> Result<Option<u64>> {
-        let Some(bytes) = crate::auth::read_bounded_regular(&self.path, MAX_CREDENTIAL_BYTES)
-            .with_context(|| format!("reading {}", self.path.display()))?
-        else {
+        let Some(registry) = self.load_registry()? else {
             return Ok(None);
         };
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("corrupt credential file {}", self.path.display()))?;
-        let Some(timeout) = value.get("startup_timeout_secs") else {
+        if registry.providers.len() != 1 {
             return Ok(None);
-        };
-        serde_json::from_value(timeout.clone())
-            .map(Some)
-            .with_context(|| format!("invalid startup timeout in {}", self.path.display()))
+        }
+        Ok(registry
+            .providers
+            .values()
+            .next()
+            .and_then(|provider| provider.startup_timeout_secs))
     }
 
-    /// Persist a credential with owner-only permissions.
+    /// Persist a compatibility credential as a one-provider registry.
+    #[cfg(test)]
     pub fn save(&self, cred: &CustomCredential) -> Result<()> {
+        let mut provider = CustomProvider::from_credential(cred.clone());
+        if let Ok(Some(existing)) = self.load_registry() {
+            if existing.providers.len() > 1 {
+                anyhow::bail!(
+                    "{} contains multiple custom providers; use save_registry",
+                    self.path.display()
+                );
+            }
+            if let Some(previous) = existing.providers.values().next() {
+                provider.label = previous.label.clone();
+                provider.auth = previous.auth.clone();
+                provider.api_key_env = previous.api_key_env.clone();
+                provider.cache = previous.cache.clone();
+                provider.startup_timeout_secs = previous.startup_timeout_secs;
+            }
+        }
+        self.save_registry(&CustomRegistry::single(LEGACY_PROVIDER_ID, provider))
+    }
+
+    /// Persist the complete provider registry with owner-only permissions.
+    pub fn save_registry(&self, registry: &CustomRegistry) -> Result<()> {
+        if registry.version != REGISTRY_VERSION {
+            anyhow::bail!(
+                "unsupported custom provider registry version {}",
+                registry.version
+            );
+        }
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
@@ -268,32 +502,41 @@ impl CredentialStore {
                     .with_context(|| format!("restricting {}", parent.display()))?;
             }
         }
-        let mut value = serde_json::to_value(cred)?;
-        // Expert compatibility extensions stay outside `CustomCredential` for
-        // source compatibility. Preserve them when the endpoint is re-saved
-        // through the normal login/configuration flow.
-        if let Ok(Some(existing)) =
-            crate::auth::read_bounded_regular(&self.path, MAX_CREDENTIAL_BYTES)
-        {
-            if let Ok(existing) = serde_json::from_slice::<serde_json::Value>(&existing) {
-                for extension in ["cache", "startup_timeout_secs"] {
-                    if let Some(extension_value) = existing.get(extension) {
-                        if let Some(object) = value.as_object_mut() {
-                            object.insert(extension.to_string(), extension_value.clone());
-                        }
-                    }
-                }
-            }
-        }
-        let bytes = serde_json::to_vec_pretty(&value)?;
+        let bytes = serde_json::to_vec_pretty(registry)?;
         write_private(&self.path, &bytes)
-            .with_context(|| format!("writing {}", self.path.display()))?;
-        Ok(())
+            .with_context(|| format!("writing {}", self.path.display()))
     }
 
     pub fn delete(&self) -> Result<()> {
         remove_if_present(&self.path)?;
-        remove_if_present(&self.model_cache_path())
+        remove_if_present(&self.model_cache_path())?;
+        let Some(parent) = self.path.parent() else {
+            return Ok(());
+        };
+        let stem = self
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("custom");
+        let prefix = format!("{stem}-models-");
+        let entries = match std::fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", parent.display()))
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json"))
+            {
+                remove_if_present(&entry.path())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -405,6 +648,135 @@ mod tests {
         store.delete().unwrap();
         assert!(!path.exists());
         assert!(!cache_path.exists());
+    }
+
+    #[test]
+    fn unified_registry_round_trips_labels_and_auth_without_secret_debug_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials/custom.json");
+        let store = CredentialStore::new(&path);
+        let provider =
+            |label: &str, base_url: &str, auth: Option<CustomAuthConfig>| CustomProvider {
+                label: label.into(),
+                credential: CustomCredential {
+                    base_url: base_url.into(),
+                    api_key: String::new(),
+                    api_name: String::new(),
+                    headers: Vec::new(),
+                    models: vec![CustomModel {
+                        api_name: "shared-model".into(),
+                        ..Default::default()
+                    }],
+                    auto_discover: false,
+                },
+                auth,
+                api_key_env: None,
+                cache: None,
+                startup_timeout_secs: Some(420),
+            };
+        let mut registry = CustomRegistry::single(
+            "apple-fm",
+            provider(
+                "Apple Foundation Models",
+                "http://127.0.0.1:1976/v1/",
+                Some(CustomAuthConfig::None),
+            ),
+        );
+        registry.providers.insert(
+            "home-server".into(),
+            provider(
+                "Home Server",
+                "http://127.0.0.1:8000/v1/",
+                Some(CustomAuthConfig::BearerEnv {
+                    var: "HOME_SERVER_API_KEY".into(),
+                }),
+            ),
+        );
+        registry
+            .providers
+            .get_mut("apple-fm")
+            .unwrap()
+            .credential
+            .api_key = "sk-apple-secret".into();
+        store.save_registry(&registry).unwrap();
+
+        let loaded = store.load_registry().unwrap().unwrap();
+        assert_eq!(loaded.providers.len(), 2);
+        assert_eq!(
+            loaded.providers["apple-fm"].label,
+            "Apple Foundation Models"
+        );
+        assert!(matches!(
+            loaded.providers["home-server"].auth,
+            Some(CustomAuthConfig::BearerEnv { ref var }) if var == "HOME_SERVER_API_KEY"
+        ));
+        assert!(!format!("{loaded:?}").contains("sk-apple-secret"));
+        assert!(
+            store.load().is_err(),
+            "single-credential access must reject a registry"
+        );
+    }
+
+    #[test]
+    fn legacy_file_normalizes_to_one_provider_and_preserves_legacy_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials/custom.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+                "base_url": "http://localhost:1234/v1/",
+                "api_name": "legacy-model",
+                "cache": { "supports_long_retention": false }
+            }"#,
+        )
+        .unwrap();
+
+        let registry = CredentialStore::new(&path)
+            .load_registry()
+            .unwrap()
+            .unwrap();
+        assert!(registry.legacy_single_endpoint);
+        assert_eq!(registry.providers.len(), 1);
+        assert!(registry.providers.contains_key(LEGACY_PROVIDER_ID));
+        assert_eq!(
+            registry.providers[LEGACY_PROVIDER_ID].credential.api_name,
+            "legacy-model"
+        );
+        assert!(
+            !registry.providers[LEGACY_PROVIDER_ID]
+                .cache
+                .as_ref()
+                .unwrap()
+                .supports_long_retention
+        );
+    }
+
+    #[test]
+    fn provider_model_caches_are_isolated_and_deleted_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("credentials/custom.json"));
+        store
+            .save_model_cache_for("apple-fm", br#"{"provider":"apple"}"#)
+            .unwrap();
+        store
+            .save_model_cache_for("home-server", br#"{"provider":"home"}"#)
+            .unwrap();
+        assert_eq!(
+            store.load_model_cache_for("apple-fm").unwrap().unwrap(),
+            br#"{"provider":"apple"}"#
+        );
+        assert_eq!(
+            store.load_model_cache_for("home-server").unwrap().unwrap(),
+            br#"{"provider":"home"}"#
+        );
+        assert_ne!(
+            store.model_cache_path_for("apple-fm"),
+            store.model_cache_path_for("home-server")
+        );
+        store.delete().unwrap();
+        assert!(store.load_model_cache_for("apple-fm").unwrap().is_none());
+        assert!(store.load_model_cache_for("home-server").unwrap().is_none());
     }
 
     #[test]

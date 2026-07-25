@@ -62,20 +62,46 @@ fn validate_absolute_file_path(path: &Path) -> Result<(), SecureFileError> {
     Ok(())
 }
 
-fn read_open_regular(mut file: std::fs::File, limit: usize) -> Result<Vec<u8>, SecureFileError> {
+const INSPECTION_BYTES: usize = 512;
+
+fn read_open_regular_bounded_by(
+    mut file: std::fs::File,
+    upper_limit: usize,
+    byte_limit: &dyn Fn(&[u8]) -> usize,
+) -> Result<Vec<u8>, SecureFileError> {
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(SecureFileError::NotRegular);
     }
+    if metadata.len() > upper_limit as u64 {
+        return Err(SecureFileError::TooLarge {
+            actual: metadata.len(),
+            limit: upper_limit,
+        });
+    }
+
+    // Inspect a fixed-size prefix before reserving for the complete file. This
+    // lets callers apply a tighter content-derived cap without first buffering
+    // up to the more permissive fallback limit.
+    let prefix_len = (metadata.len() as usize)
+        .min(upper_limit)
+        .min(INSPECTION_BYTES);
+    let mut bytes = Vec::with_capacity(prefix_len);
+    Read::by_ref(&mut file)
+        .take(prefix_len as u64)
+        .read_to_end(&mut bytes)?;
+    let limit = byte_limit(&bytes).min(upper_limit);
     if metadata.len() > limit as u64 {
         return Err(SecureFileError::TooLarge {
             actual: metadata.len(),
             limit,
         });
     }
-    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(limit));
+
+    bytes.reserve((metadata.len() as usize).saturating_sub(bytes.len()));
+    let remaining_limit = limit.saturating_add(1).saturating_sub(bytes.len());
     Read::by_ref(&mut file)
-        .take(limit.saturating_add(1) as u64)
+        .take(remaining_limit as u64)
         .read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         return Err(SecureFileError::TooLarge {
@@ -84,6 +110,10 @@ fn read_open_regular(mut file: std::fs::File, limit: usize) -> Result<Vec<u8>, S
         });
     }
     Ok(bytes)
+}
+
+fn read_open_regular(file: std::fs::File, limit: usize) -> Result<Vec<u8>, SecureFileError> {
+    read_open_regular_bounded_by(file, limit, &|_| limit)
 }
 
 /// Read exactly one regular file, rejecting symlinks and special files and
@@ -95,6 +125,20 @@ fn read_open_regular(mut file: std::fs::File, limit: usize) -> Result<Vec<u8>, S
 pub fn read_regular_file_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, SecureFileError> {
     validate_absolute_file_path(path)?;
     imp::read_regular_file_bounded(path, limit)
+}
+
+/// Read one regular file with a content-derived limit selected from its first
+/// 512 bytes. `upper_limit` remains an unconditional hard cap.
+///
+/// Inspection and reading use the same descriptor, so a path replacement
+/// cannot switch content between classification and buffering.
+pub fn read_regular_file_bounded_by(
+    path: &Path,
+    upper_limit: usize,
+    byte_limit: impl Fn(&[u8]) -> usize,
+) -> Result<Vec<u8>, SecureFileError> {
+    validate_absolute_file_path(path)?;
+    imp::read_regular_file_bounded_by(path, upper_limit, &byte_limit)
 }
 
 /// A target inspected through an already-open parent directory. The original
@@ -230,6 +274,15 @@ mod imp {
     ) -> Result<Vec<u8>, SecureFileError> {
         let (parent, name) = open_parent(path, false)?;
         read_open_regular(open_regular_at(&parent, &name)?, limit)
+    }
+
+    pub(super) fn read_regular_file_bounded_by(
+        path: &Path,
+        upper_limit: usize,
+        byte_limit: &dyn Fn(&[u8]) -> usize,
+    ) -> Result<Vec<u8>, SecureFileError> {
+        let (parent, name) = open_parent(path, false)?;
+        read_open_regular_bounded_by(open_regular_at(&parent, &name)?, upper_limit, byte_limit)
     }
 
     fn read_optional(
@@ -368,6 +421,18 @@ mod imp {
             return Err(SecureFileError::NotRegular);
         }
         read_open_regular(std::fs::File::open(path)?, limit)
+    }
+
+    pub(super) fn read_regular_file_bounded_by(
+        path: &Path,
+        upper_limit: usize,
+        byte_limit: &dyn Fn(&[u8]) -> usize,
+    ) -> Result<Vec<u8>, SecureFileError> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(SecureFileError::NotRegular);
+        }
+        read_open_regular_bounded_by(std::fs::File::open(path)?, upper_limit, byte_limit)
     }
 
     pub(super) struct PreparedMutation {

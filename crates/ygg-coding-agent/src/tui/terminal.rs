@@ -438,7 +438,16 @@ pub fn force_restore() {
             event::DisableBracketedPaste,
             event::DisableMouseCapture,
             cursor::SetCursorStyle::DefaultUserShape,
-            cursor::Show
+            cursor::Show,
+            cursor::MoveToNextLine(1),
+            cursor::MoveToColumn(0)
+        );
+    } else {
+        let _ = execute!(
+            out,
+            cursor::Show,
+            cursor::MoveToNextLine(1),
+            cursor::MoveToColumn(0)
         );
     }
     let _ = out.flush();
@@ -557,7 +566,7 @@ pub struct YggTerminal<W: Write = Stdout> {
     size: TerminalSize,
     last_was_cr: bool,
     pending: Vec<u8>,
-    in_synchronized_frame: bool,
+    in_synchronized_frame_depth: usize,
 }
 
 impl YggTerminal<Stdout> {
@@ -623,7 +632,7 @@ impl YggTerminal<Stdout> {
             size,
             last_was_cr: false,
             pending: Vec::with_capacity(16 * 1024),
-            in_synchronized_frame: false,
+            in_synchronized_frame_depth: 0,
         })
     }
 }
@@ -639,7 +648,7 @@ impl<W: Write> YggTerminal<W> {
     }
 
     fn flush_if_outside_frame(&mut self) {
-        if !self.in_synchronized_frame {
+        if self.in_synchronized_frame_depth == 0 {
             self.flush_pending();
         }
     }
@@ -680,15 +689,15 @@ impl<W: Write> sexy_tui_rs::Terminal for YggTerminal<W> {
         // at this terminal boundary while preserving existing CRLF sequences.
         let normalized = normalize_line_endings(data, &mut self.last_was_cr);
         self.pending.extend_from_slice(normalized.as_bytes());
-        if data.contains(SYNC_OUTPUT_BEGIN) {
-            self.in_synchronized_frame = true;
-        }
-        if data.contains(SYNC_OUTPUT_END) {
-            self.in_synchronized_frame = false;
-            self.flush_pending();
-        } else if !self.in_synchronized_frame {
-            // Defensive fallback for a direct Terminal::write outside a TUI
-            // frame; do not leave it buffered indefinitely.
+
+        let begin_count = data.matches(SYNC_OUTPUT_BEGIN).count();
+        let end_count = data.matches(SYNC_OUTPUT_END).count();
+        self.in_synchronized_frame_depth = self
+            .in_synchronized_frame_depth
+            .saturating_add(begin_count)
+            .saturating_sub(end_count);
+
+        if self.in_synchronized_frame_depth == 0 {
             self.flush_pending();
         }
     }
@@ -912,7 +921,7 @@ mod tests {
             size: Arc::new(Mutex::new((80, 24))),
             last_was_cr: false,
             pending: Vec::new(),
-            in_synchronized_frame: false,
+            in_synchronized_frame_depth: 0,
         };
 
         sexy_tui_rs::Terminal::write(&mut terminal, SYNC_OUTPUT_BEGIN);
@@ -933,6 +942,50 @@ mod tests {
         assert_eq!(
             output,
             format!("{SYNC_OUTPUT_BEGIN}\x1b[4;1H\x1b[0m\x1b[Jreplacement{SYNC_OUTPUT_END}")
+        );
+        assert_eq!(*flushes.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn synchronized_nested_frame_markers_preserve_depth_semantics() {
+        let writer = RecordingWriter::default();
+        let writes = writer.writes.clone();
+        let flushes = writer.flushes.clone();
+        let mut terminal = YggTerminal {
+            out: writer,
+            size: Arc::new(Mutex::new((80, 24))),
+            last_was_cr: false,
+            pending: Vec::new(),
+            in_synchronized_frame_depth: 0,
+        };
+
+        sexy_tui_rs::Terminal::write(&mut terminal, SYNC_OUTPUT_BEGIN);
+        sexy_tui_rs::Terminal::write(&mut terminal, SYNC_OUTPUT_BEGIN);
+        sexy_tui_rs::Terminal::write(&mut terminal, "nested");
+        assert!(writes.lock().unwrap().is_empty());
+        assert_eq!(*flushes.lock().unwrap(), 0);
+
+        // Inner end should not flush while outer synchronized-output frame remains open.
+        sexy_tui_rs::Terminal::write(&mut terminal, SYNC_OUTPUT_END);
+        assert!(writes.lock().unwrap().is_empty());
+        assert_eq!(*flushes.lock().unwrap(), 0);
+
+        sexy_tui_rs::Terminal::write(&mut terminal, "more");
+        assert!(writes.lock().unwrap().is_empty());
+        assert_eq!(*flushes.lock().unwrap(), 0);
+
+        sexy_tui_rs::Terminal::write(&mut terminal, SYNC_OUTPUT_END);
+        let writes = writes.lock().unwrap();
+        assert_eq!(
+            writes.len(),
+            1,
+            "nested frames should flush atomically only when outer depth is fully closed"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&writes[0]),
+            format!(
+                "{SYNC_OUTPUT_BEGIN}{SYNC_OUTPUT_BEGIN}nested{SYNC_OUTPUT_END}more{SYNC_OUTPUT_END}"
+            )
         );
         assert_eq!(*flushes.lock().unwrap(), 1);
     }

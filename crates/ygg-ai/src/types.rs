@@ -291,6 +291,8 @@ pub enum OpenAiChatReasoningMode {
 pub enum ReasoningControl {
     /// Control via effort tags (Minimal, Low, Medium, High).
     Effort,
+    /// Reasoning is always enabled by the provider and accepts no control parameter.
+    AlwaysOn,
     /// Binary off/on control.
     Toggle,
     /// Control via explicit token budget.
@@ -636,7 +638,7 @@ mod base64_bytes {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&BASE64_STANDARD.encode(data))
+        serializer.collect_str(&base64::display::Base64Display::new(data, &BASE64_STANDARD))
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<bytes::Bytes, D::Error>
@@ -736,6 +738,9 @@ pub struct Request {
     /// Reasoning execution mode. Pro mode is independently capability-gated.
     #[serde(default)]
     pub reasoning_mode: ReasoningMode,
+    /// OpenAI Responses-specific raw replay and continuation options.
+    #[serde(default)]
+    pub responses: Option<crate::responses::ResponsesOptions>,
     /// Requested formatting for model response (text or JSON).
     #[serde(default)]
     pub output_format: OutputFormat,
@@ -917,6 +922,9 @@ pub struct Response {
     pub cost: Option<crate::pricing::Cost>,
     /// Provider-assigned response identifier.
     pub response_id: Option<String>,
+    /// Complete opaque Responses output, when the provider supplied an
+    /// authoritative terminal output snapshot.
+    pub responses_output: Option<crate::responses::ResponsesOutput>,
     /// Lossy mode diagnostics. Empty in Strict mode.
     pub diagnostics: Vec<crate::error::Diagnostic>,
 }
@@ -1252,6 +1260,7 @@ mod tests {
             stop: vec!["\n".to_string()],
             reasoning: ReasoningConfig::Off,
             reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,

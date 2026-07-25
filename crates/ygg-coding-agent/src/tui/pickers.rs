@@ -92,6 +92,13 @@ where
                 return Ok(false);
             }
         };
+        if matches!(&event, Event::Key(key) if crate::tui::keymap::is_close_key(key)) {
+            request.cancel();
+            shell.set_tool_input_prompt(None);
+            shell.request_close();
+            shell.render();
+            return Ok(false);
+        }
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 match key.code {
@@ -182,6 +189,12 @@ where
                 return Ok(None);
             }
         };
+        if matches!(&event, Event::Key(key) if crate::tui::keymap::is_close_key(key)) {
+            shell.close_panel();
+            shell.request_close();
+            shell.render();
+            return Ok(None);
+        }
         // Mouse events pass through to the shell for transcript scrolling.
         if matches!(event, Event::Mouse(_)) {
             continue;
@@ -413,12 +426,29 @@ where
 
 /// Build a concise human-facing label from the same cached metadata boundary
 /// used by the footer. Canonical and wire-level IDs remain available in
-/// `/status`; picker descriptions carry provider disambiguation.
+/// `/status`; the endpoint label disambiguates models from different custom
+/// providers.
 fn model_label(model: &ygg_ai::ModelSpec) -> String {
     ModelDisplayMetadata::resolve(model).name
 }
 
+fn model_label_with_endpoint(catalog: &ModelCatalog, model: &ygg_ai::ModelSpec) -> String {
+    let model_name = model_label(model);
+    catalog
+        .endpoint_label(&model.endpoint)
+        .map(|label| format!("{label} · {model_name}"))
+        .unwrap_or(model_name)
+}
+
+#[cfg(test)]
 fn model_description(model: &ygg_ai::ModelSpec) -> String {
+    model_description_with_endpoint(model, None)
+}
+
+fn model_description_with_endpoint(
+    model: &ygg_ai::ModelSpec,
+    endpoint_label: Option<&str>,
+) -> String {
     let context = match model.limits.context_window {
         value if value >= 1_000_000 => format!("{}M", value / 1_000_000),
         value if value >= 1_000 => format!("{}k", value / 1_000),
@@ -436,7 +466,10 @@ fn model_description(model: &ygg_ai::ModelSpec) -> String {
             )
         })
         .unwrap_or_else(|| "pricing unavailable ($?)".to_owned());
-    let mut details = vec![format!("{pricing} · {context} context")];
+    let mut details = vec![format!(
+        "{} · {pricing} · {context} context",
+        endpoint_label.unwrap_or(&model.endpoint.0)
+    )];
     if model.capabilities.tools {
         details.push("tools".into());
     }
@@ -447,7 +480,7 @@ fn model_description(model: &ygg_ai::ModelSpec) -> String {
     {
         details.push("vision".into());
     }
-    format!("{} · {}", model.endpoint.0, details.join(" · "))
+    details.join(" · ")
 }
 
 /// Ask the user to select one model, preserving cancellation for workflows
@@ -461,10 +494,18 @@ pub async fn optional_model_picker(
     let mut models = catalog.models().collect::<Vec<_>>();
     models.sort_by(|left, right| left.id.0.cmp(&right.id.0));
     let model_ids: Vec<ModelId> = models.iter().map(|m| m.id.clone()).collect();
-    let items: Vec<String> = models.iter().map(|m| model_label(m)).collect();
+    let items: Vec<String> = models
+        .iter()
+        .map(|model| model_label_with_endpoint(catalog, model))
+        .collect();
     let descs: Vec<Option<String>> = models
         .iter()
-        .map(|model| Some(model_description(model)))
+        .map(|model| {
+            Some(model_description_with_endpoint(
+                model,
+                catalog.endpoint_label(&model.endpoint),
+            ))
+        })
         .collect();
 
     let Some(index) = pick_list(
@@ -500,6 +541,38 @@ pub async fn model_picker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    #[tokio::test]
+    async fn ctrl_d_closes_a_picker_and_propagates_the_close_request() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            ))))
+            .await
+            .unwrap();
+        drop(sender);
+        let mut input = ReceiverStream::new(receiver);
+        let mut shell = InteractiveShell::test_shell();
+
+        let selected = pick_list(
+            &mut shell,
+            &mut input,
+            "Choose",
+            vec!["one".into()],
+            vec![None],
+            PanelAction::SelectTheme(vec!["one".into()]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selected, None);
+        assert!(!shell.has_panel());
+        assert!(shell.close_requested());
+    }
 
     #[test]
     fn model_label_uses_friendly_metadata_without_wire_id_noise() {
@@ -566,6 +639,26 @@ mod tests {
             cache: ygg_ai::CacheCompatibility::default(),
         };
         assert_eq!(model_label(&spec), "Qwen3.6 27B");
+
+        let mut catalog = ModelCatalog::default();
+        let endpoint_id = ygg_ai::EndpointId("custom-openai".into());
+        catalog
+            .register_endpoint(ygg_ai::Endpoint {
+                id: endpoint_id.clone(),
+                base_url: url::Url::parse("http://127.0.0.1:1234/v1/").unwrap(),
+                auth: ygg_ai::Auth::None,
+                default_headers: http::HeaderMap::new(),
+                transport: ygg_ai::EndpointTransport::Http,
+                timeout: std::time::Duration::from_secs(300),
+            })
+            .unwrap();
+        catalog
+            .set_endpoint_label(endpoint_id, "Apple Foundation Models")
+            .unwrap();
+        assert_eq!(
+            model_label_with_endpoint(&catalog, &spec),
+            "Apple Foundation Models · Qwen3.6 27B"
+        );
     }
 
     #[test]

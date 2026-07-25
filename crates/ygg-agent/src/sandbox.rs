@@ -2,10 +2,11 @@
 //!
 //! Ygg is a trusted local agent, not an OS sandbox. This configuration carries
 //! capability gates, resource limits, and an optional workspace-only path mode
-//! for hosts that want accidental-path protection. There is deliberately no
-//! `allow_network` flag: a boolean checked before spawning a child cannot stop
-//! that child from opening sockets, and this crate does not ship an OS sandbox
-//! backend in v0.1.
+//! for hosts that want accidental-path protection. The narrow
+//! `allow_remote_read` gate controls only direct HTTPS media requests made by
+//! the built-in `read` tool. It is not a process network sandbox: an enabled
+//! child process may still open sockets because this crate does not ship an OS
+//! sandbox backend in v0.1.
 
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -39,6 +40,11 @@ pub struct SandboxConfig {
     /// Second half of the unified command-execution gate. Keeping both fields
     /// preserves configuration compatibility at the authority boundary.
     pub allow_shell: bool,
+    /// Allow the built-in `read` tool to fetch public HTTPS image/audio URLs.
+    ///
+    /// This narrow authority is independent of process execution and defaults
+    /// off so conservative library hosts never gain network access implicitly.
+    pub allow_remote_read: bool,
     /// Explicit Bash-compatible shell executable. When unset on Unix, Ygg
     /// follows Pi's order: `/bin/bash`, `bash` on `PATH`, then `sh`.
     pub shell_path: Option<PathBuf>,
@@ -50,9 +56,10 @@ pub struct SandboxConfig {
 
 impl SandboxConfig {
     /// Creates a conservative library configuration rooted at `workspace`:
-    /// workspace-only paths, no edits, no process or shell execution, a 120s
-    /// execution timeout, and a 16 KiB per-tool output cap. Hosts may enable
-    /// capabilities or trusted-local path access through the public fields.
+    /// workspace-only paths, no edits, no process, shell, or remote-read
+    /// authority, a 120s execution timeout, and a 16 KiB per-tool output cap.
+    /// Hosts may enable capabilities or trusted-local path access through the
+    /// public fields.
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),
@@ -61,6 +68,7 @@ impl SandboxConfig {
             allow_write: false,
             allow_process: false,
             allow_shell: false,
+            allow_remote_read: false,
             shell_path: None,
             bash_timeout: Duration::from_secs(120),
             max_output_bytes: 16 * 1024,

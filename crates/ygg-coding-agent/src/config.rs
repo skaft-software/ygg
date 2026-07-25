@@ -82,6 +82,7 @@ pub struct SandboxPolicy {
     pub allow_write: bool,
     pub allow_process: bool,
     pub allow_shell: bool,
+    pub allow_remote_read: bool,
     pub shell_path: Option<PathBuf>,
     pub bash_timeout_secs: u64,
     pub max_output_bytes: usize,
@@ -98,6 +99,9 @@ impl Default for SandboxPolicy {
             allow_write: true,
             allow_process: true,
             allow_shell: true,
+            // Direct network reads are separate from trusted-local filesystem
+            // and process defaults and require an explicit opt-in.
+            allow_remote_read: false,
             shell_path: None,
             bash_timeout_secs: 120,
             max_output_bytes: 16 * 1024,
@@ -235,6 +239,7 @@ impl SandboxPolicy {
         sandbox.allow_write = self.allow_write;
         sandbox.allow_process = self.allow_process;
         sandbox.allow_shell = self.allow_shell;
+        sandbox.allow_remote_read = self.allow_remote_read;
         sandbox.shell_path = self.shell_path.clone();
         sandbox.bash_timeout = Duration::from_secs(self.bash_timeout_secs);
         sandbox.max_output_bytes = self.max_output_bytes;
@@ -312,10 +317,49 @@ impl ThinkingLevel {
     }
 }
 
+/// Provider-context compaction strategy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompactionMode {
+    /// Never compact automatically.
+    Disabled,
+    /// Summarize older canonical messages into a local durable handoff.
+    #[default]
+    Local,
+    /// Ask an OpenAI Responses route to compact its opaque replay window.
+    NativeResponses,
+}
+
+impl CompactionMode {
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "disabled" | "off" | "false" | "no" => Ok(Self::Disabled),
+            "local" | "on" | "true" | "yes" => Ok(Self::Local),
+            "native" | "native-responses" | "native_responses" | "responses" => {
+                Ok(Self::NativeResponses)
+            }
+            _ => anyhow::bail!(
+                "invalid compaction mode {value:?}; expected disabled, local, or native-responses"
+            ),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Local => "local",
+            Self::NativeResponses => "native-responses",
+        }
+    }
+
+    pub fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
 /// Automatic compaction policy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionPolicy {
-    pub enabled: bool,
+    pub mode: CompactionMode,
     pub threshold_fraction: f64,
     pub keep_recent_turns: usize,
     /// Optional model override for summary calls. When absent, bootstrap uses
@@ -327,7 +371,7 @@ pub struct CompactionPolicy {
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
-            enabled: true,
+            mode: CompactionMode::Local,
             threshold_fraction: 0.85,
             keep_recent_turns: 4,
             compact_model: None,
@@ -537,8 +581,10 @@ mod tests {
         assert!(policy.allow_write);
         assert!(policy.allow_process);
         assert!(policy.allow_shell);
+        assert!(!policy.allow_remote_read);
         let sandbox = policy.to_sandbox_config(directory.path());
         assert!(sandbox.allow_external_paths);
+        assert!(!sandbox.allow_remote_read);
     }
 
     #[test]

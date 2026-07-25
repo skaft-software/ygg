@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <img alt="Release: alpha" src="https://img.shields.io/badge/release-0.1.1--alpha-536dfe?style=flat-square">
+  <img alt="Release: alpha" src="https://img.shields.io/badge/release-0.2.0--alpha-536dfe?style=flat-square">
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -32,7 +32,7 @@ ygg is a local-first coding agent written in Rust. It combines a polished termin
 
 It works with a local OpenAI-compatible server just as naturally as it works with OpenAI, Anthropic, OpenRouter, or another cloud provider. There is no hosted ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local inspectable JSONL.
 
-> **Release status:** `0.1.1-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
+> **Release status:** `0.2.0-alpha`. The safety, persistence, protocol, and terminal invariants are covered by more than 1,000 automated tests, but configuration and public APIs may still change before 1.0. ygg is a trusted local agent, not an operating-system sandbox.
 
 ## Why ygg
 
@@ -57,7 +57,7 @@ The installer builds the pinned alpha tag and adds Cargo's binary directory to z
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/skaft-software/ygg/v0.1.1-alpha/scripts/install.sh | sh
+  https://raw.githubusercontent.com/skaft-software/ygg/v0.2.0-alpha/scripts/install.sh | sh
 ```
 
 Restart the shell, then verify the installation:
@@ -74,7 +74,7 @@ To install without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.1.1-alpha \
+  --tag v0.2.0-alpha \
   --bin ygg \
   ygg-coding-agent
 ```
@@ -136,55 +136,95 @@ ygg --login codex
 ygg --model gpt-5.6
 ```
 
-### Use a local model
+### Use custom OpenAI-compatible providers
 
-Create `~/.ygg/credentials/custom.json`:
-
-```json
-{
-  "base_url": "http://127.0.0.1:8000/v1/",
-  "api_key": "",
-  "auto_discover": true,
-  "startup_timeout_secs": 900
-}
-```
-
-Protect the credential file and start ygg:
-
-```sh
-chmod 600 ~/.ygg/credentials/custom.json
-ygg --model custom/my-model
-```
-
-`startup_timeout_secs` applies to the initial response headers from a cold custom endpoint, so a local server can load model weights without being mistaken for a dead connection. Ordinary connection loss remains bounded, visible, cancellable, and retried up to five times.
-
-If the endpoint cannot provide a useful `GET /models`, configure its inventory explicitly:
+Configure all custom endpoints together in `~/.ygg/credentials/custom.json`:
 
 ```json
 {
-  "base_url": "http://127.0.0.1:8000/v1/",
-  "api_key": "",
-  "auto_discover": false,
-  "startup_timeout_secs": 900,
-  "models": [
-    {
-      "api_name": "Qwen/Qwen3-Coder-Next",
-      "display_name": "Qwen3 Coder Next",
-      "context_window": 131072,
-      "max_output_tokens": 16384,
-      "tools": true,
-      "parallel_tool_calls": false,
-      "vision": false,
-      "structured_output": false,
-      "reasoning": true,
-      "reasoning_values": ["none", "default"],
-      "reasoning_default": "default"
+  "version": 1,
+  "providers": {
+    "apple-fm": {
+      "label": "Apple Foundation Models",
+      "base_url": "http://127.0.0.1:1976/v1/",
+      "auth": { "kind": "none" },
+      "auto_discover": true,
+      "startup_timeout_secs": 300,
+      "models": [
+        {
+          "api_name": "system",
+          "context_window": 8192,
+          "max_output_tokens": 1024,
+          "tools": true,
+          "parallel_tool_calls": false,
+          "vision": false,
+          "structured_output": false,
+          "reasoning": true,
+          "reasoning_configurable": false
+        }
+      ]
+    },
+    "home-server": {
+      "label": "Home Server",
+      "base_url": "http://192.168.1.20:8000/v1/",
+      "auth": { "kind": "bearer_env", "var": "HOME_SERVER_API_KEY" },
+      "auto_discover": true
     }
-  ]
+  }
 }
 ```
 
-Use `--offline` to skip optional model discovery during startup. Inference still reaches the selected endpoint.
+Apple Foundation Models advertises sparse model metadata, so keep the explicit
+`system` entry at its documented 8192-token context window. Its on-device model
+thinks by default and exposes `on` as the only ygg thinking option; it does not
+support a configurable `reasoning_effort`, so keep `reasoning` enabled and
+`reasoning_configurable` disabled. The `pcc` model has a separate 32768-token
+context window and supports low/medium/high reasoning effort. Configured model
+metadata overrides matching discovery results.
+
+Each provider is independently discovered and selectable. Models use stable,
+provider-qualified IDs such as `custom/apple-fm/<model-id>`, and the configured
+labels appear in the picker and `/status`. API keys should be referenced through
+environment variables rather than written to this file.
+
+Existing single-object `custom.json` files are still accepted and normalized to
+the legacy `custom-openai` provider in memory, so their existing model IDs keep
+working. New configurations should use the registry shape above.
+
+If an endpoint cannot provide a useful `GET /v1/models`, set
+`auto_discover` to `false` and configure its inventory under that provider:
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "local": {
+      "label": "Local Qwen",
+      "base_url": "http://127.0.0.1:8000/v1/",
+      "auth": { "kind": "none" },
+      "auto_discover": false,
+      "models": [
+        {
+          "api_name": "Qwen/Qwen3-Coder-Next",
+          "display_name": "Qwen3 Coder Next",
+          "context_window": 131072,
+          "max_output_tokens": 16384,
+          "tools": true,
+          "parallel_tool_calls": false,
+          "vision": false,
+          "structured_output": false,
+          "reasoning": true,
+          "reasoning_values": ["none", "default"],
+          "reasoning_default": "default"
+        }
+      ]
+    }
+  }
+}
+```
+
+Protect the credential file with `chmod 600`. Use `--offline` to skip optional
+model discovery during startup; inference still reaches the selected endpoint.
 
 ## What ships in the binary
 
@@ -245,14 +285,11 @@ Capability handling is model-specific. ygg validates modalities, tool use, struc
 
 ### Reasoning without transcript noise
 
-Reasoning is collapsed by default while remaining available with `Ctrl+O`. During generation, the compact indicator uses the active model's lab color; when complete it settles into a quiet elapsed-time label.
+Reasoning is collapsed by default while remaining available with `Ctrl+O`. During generation, a fixed two-row status uses the generating model's lab color: its activity dot blinks beside a plain-weight label. It shows only the latest explicit Markdown heading emitted by the model—an ATX heading or standalone bold-heading paragraph—and falls back to `Thinking`; ordinary reasoning body text is never promoted into the collapsed label. Completed reasoning disappears again when collapsed.
 
 ```text
-⠹ thinking
-└ ctrl+o to expand
-
-thought for 14s
-└ ctrl+o to expand
+• Verifying the implementation
+  └ (ctrl+o to expand)
 ```
 
 Select a supported level at launch or while the session is running:
@@ -308,16 +345,17 @@ See [docs/sessions.md](docs/sessions.md) for the record schema, branch semantics
 
 ### Context and compaction
 
-ygg estimates the next provider-visible request against the active model's context window. At the configured threshold it creates a bounded summary at a safe completed-turn boundary, preserves recent turns, and keeps active skill state. Compaction can use the active model or a separately configured model.
+ygg estimates the next provider-visible request against the active model's context window. Local compaction creates a bounded summary at a safe completed-turn boundary, preserves recent turns, and keeps active skill state. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
 
 ```toml
 [compaction]
+mode = "local" # disabled, local, or native-responses
 threshold_fraction = 0.85
 keep_recent_turns = 4
 compact_model = "openrouter/anthropic/claude-haiku-4.5"
 ```
 
-Run `/compact` at any time to request a manual compaction. The compact footer uses the latest provider turn's authoritative usage rather than cumulative traffic.
+`native-responses` requires the active OpenAI Responses endpoint and model; it never falls back to a Chat or Anthropic summary. The legacy `enabled = true` and `YGG_AUTO_COMPACT=true` spellings continue to select `local`. Run `/compact` at any time to request a manual compaction. The compact footer uses the latest provider turn's authoritative usage rather than cumulative traffic.
 
 ## Terminal experience
 
@@ -399,7 +437,8 @@ Useful keys:
 | --- | --- |
 | `Enter` | Submit. |
 | `Shift+Enter` | Insert a newline when the terminal reports enhanced key events. |
-| `Ctrl+C` | Abort the active run; close ygg when idle. |
+| `Ctrl+C` | Clear a nonempty draft; with an empty draft, abort active work and do nothing when idle. |
+| `Ctrl+D` | Close ygg from any interactive input surface, settling active work and child-process cleanup first. |
 | `Ctrl+O` | Expand or collapse reasoning, tool evidence, or shell output. |
 | `PageUp` / `PageDown` | Navigate transcript history. |
 | `@` | Complete workspace file mentions. |
@@ -434,6 +473,8 @@ allow_edit = true
 allow_write = true
 allow_process = true
 allow_shell = true
+# Remote HTTPS image/audio reads are default-off network authority.
+allow_remote_read = false
 bash_timeout_secs = 120
 max_output_bytes = 1048576
 context_files = true
@@ -444,12 +485,13 @@ offline = false
 # cost_warning_microdollars = 50000
 
 [compaction]
+mode = "local"
 threshold_fraction = 0.85
 keep_recent_turns = 4
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_REASONING_MODE`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. The previous `YGG_EXEC_TIMEOUT_SECS` name remains a compatibility fallback.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_REASONING_MODE`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
 ### CLI reference
 
@@ -584,7 +626,7 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.1.1-alpha.md) | Current alpha installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.2.0-alpha.md) | Current alpha installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Themes](docs/themes.md) | Theme schema, roles, glyphs, responsive layout, and fallback behavior. |

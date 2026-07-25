@@ -12,7 +12,8 @@ use tokio::time::{Interval, MissedTickBehavior};
 #[cfg(unix)]
 use ygg_agent::extension_process::ProcessGroupGuard;
 use ygg_agent::{
-    analyze_session_cache_stats, AgentError, AgentEvent, EntryId, Run, RunControl, Session,
+    analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId, Run,
+    RunControl, Session,
 };
 use ygg_ai::{ModelId, ReasoningConfig, ReasoningMode, ToolCallId};
 
@@ -27,8 +28,9 @@ use crate::commands::{self, Command};
 use crate::compaction::{
     attempt_compaction, context_window, estimate_next_request_tokens, CompactionOutcome,
 };
-use crate::config::ThinkingLevel;
+use crate::config::{CompactionMode, ThinkingLevel};
 use crate::modes::RunEnded;
+use crate::presentation::RunId;
 use crate::prompts::{render_and_record, RenderedPrompt};
 use crate::resources::{compose_instructions, validate_skill_requirements};
 use crate::session_tree::render_session_tree;
@@ -67,6 +69,10 @@ impl crate::extensions::ExtensionConfirmationHandler for InteractiveExtensionCon
                     event = self.input.next() => event,
                 };
                 match event {
+                    Some(Ok(Event::Key(key))) if keymap::is_close_key(&key) => {
+                        self.shell.request_close();
+                        return Ok(());
+                    }
                     Some(Ok(Event::Key(key)))
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
                             && key.code == KeyCode::Char('c')
@@ -188,6 +194,9 @@ where
 {
     let mut scroll_dirty = false;
     loop {
+        if shell.close_requested() {
+            return Ok(Idle::Quit);
+        }
         tokio::select! {
             biased;
             _ = crate::tui::terminal::wait_for_shutdown_signal() => {
@@ -199,6 +208,10 @@ where
                     Some(Err(error)) => return Err(error.into()),
                     None => return Ok(Idle::Quit),
                 };
+                if matches!(&event, Event::Key(key) if keymap::is_close_key(key)) {
+                    shell.request_close();
+                    return Ok(Idle::Quit);
+                }
                 // Panels are driven by picker functions that own the event
                 // stream. If a panel leaks here (shouldn't happen), Esc closes it.
                 if shell.has_panel() {
@@ -311,6 +324,10 @@ where
                         shell.render();
                     }
                     InputAction::CycleThinking => return Ok(Idle::CycleThinking),
+                    InputAction::ClearEditor => {
+                        shell.clear_editor();
+                        shell.render();
+                    }
                     InputAction::Close => {
                         shell.clear_error();
                         shell.render();
@@ -318,9 +335,7 @@ where
                     InputAction::Submit(_) => return Ok(Idle::Submit(shell.drain_composed())),
                     InputAction::Command(_) => return Ok(Idle::Command(shell.drain_editor())),
                     InputAction::Closed => return Ok(Idle::Quit),
-                    InputAction::Ignore
-                    | InputAction::Abort
-                    | InputAction::Steer(_) => {}
+                    InputAction::Ignore | InputAction::Abort | InputAction::Steer(_) => {}
                 }
             }
             // Mouse/trackpad events arrive in bursts. Apply every delta to
@@ -366,7 +381,11 @@ fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> a
     Ok(())
 }
 
-async fn await_with_ctrl_c<F, S>(future: F, input: &mut S) -> Option<F::Output>
+async fn await_with_ctrl_c<F, S>(
+    future: F,
+    shell: &mut InteractiveShell,
+    input: &mut S,
+) -> Option<F::Output>
 where
     F: std::future::Future,
     S: Stream<Item = std::io::Result<Event>> + Unpin,
@@ -377,6 +396,10 @@ where
         tokio::select! {
             biased;
             event = input.next(), if input_open => match event {
+                Some(Ok(Event::Key(key))) if keymap::is_close_key(&key) => {
+                    shell.request_close();
+                    return None;
+                }
                 Some(Ok(Event::Key(key)))
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
                         && key.code == KeyCode::Char('c')
@@ -403,8 +426,9 @@ fn is_ctrl_c(key: &crossterm::event::KeyEvent) -> bool {
 
 /// Keep raw-terminal input, resize handling, rendering, and termination
 /// signals live while a bounded lifecycle operation runs elsewhere. Ordinary
-/// typing is intentionally ignored at this boundary; Ctrl-C becomes the same
-/// coordinated SIGINT shutdown used by the signal thread.
+/// typing is intentionally ignored at this boundary. Ctrl-C becomes the same
+/// coordinated SIGINT shutdown used by the signal thread; Ctrl-D records a
+/// close request and lets the owned operation settle before its caller exits.
 async fn await_lifecycle<F, T>(
     shell: &mut InteractiveShell,
     input: &mut EventStream,
@@ -441,6 +465,11 @@ where
                     shell.render();
                     let _ = tokio::time::timeout(LIFECYCLE_SHUTDOWN_GRACE, &mut operation).await;
                     anyhow::bail!("Ctrl-C cancelled {label}");
+                }
+                Some(Ok(Event::Key(key))) if keymap::is_close_key(&key) => {
+                    shell.request_close();
+                    shell.set_run_label("closing…");
+                    shell.render();
                 }
                 Some(Ok(Event::Resize(columns, rows))) => {
                     shell.set_size(columns, rows);
@@ -581,33 +610,41 @@ async fn logout_codex(
     Ok(app)
 }
 
-/// Save a default custom endpoint credential and reload the catalog.
+/// Save a default custom provider registry and reload the catalog.
 fn login_custom(shell: &mut InteractiveShell) -> anyhow::Result<()> {
-    use crate::auth::custom::{self, CustomCredential};
+    use crate::auth::custom::{
+        self, CustomAuthConfig, CustomCredential, CustomProvider, CustomRegistry,
+    };
     let store = custom::CredentialStore::new(custom::default_path());
     let path = custom::default_path();
 
-    if store.load()?.is_some() {
+    if store.load_registry()?.is_some() {
         shell.notice(format!(
-            "custom endpoint already configured at {}; use /logout custom first to replace it",
+            "custom provider registry already configured at {}; use /logout custom first to replace it",
             path.display()
         ));
         return Ok(());
     }
 
-    // Save a default credential that the user can edit.
-    let cred = CustomCredential {
-        base_url: "http://localhost:1234/v1/".into(),
-        api_key: String::new(),
-        api_name: "local-model".into(),
-        headers: Vec::new(),
-        models: Vec::new(),
-        auto_discover: true,
+    let provider = CustomProvider {
+        label: "Local endpoint".into(),
+        credential: CustomCredential {
+            base_url: "http://localhost:1234/v1/".into(),
+            api_key: String::new(),
+            api_name: "local-model".into(),
+            headers: Vec::new(),
+            models: Vec::new(),
+            auto_discover: true,
+        },
+        auth: Some(CustomAuthConfig::None),
+        api_key_env: None,
+        cache: None,
+        startup_timeout_secs: None,
     };
-    store.save(&cred)?;
+    store.save_registry(&CustomRegistry::single("local", provider))?;
     shell.notice(format!(
-        "custom endpoint template saved to {}\n\
-         edit it with your endpoint details, then /reload to register the model",
+        "custom provider registry template saved to {}\n\
+         edit it with your provider details, then /reload to register the models",
         path.display()
     ));
     Ok(())
@@ -622,13 +659,14 @@ async fn logout_custom(
     use crate::auth::custom;
 
     let store = custom::CredentialStore::new(custom::default_path());
-    if store.load()?.is_none() {
-        shell.notice("no custom endpoint configured");
+    if store.load_registry()?.is_none() {
+        shell.notice("no custom provider registry configured");
         return Ok(app);
     }
 
-    // Pick a replacement model if the active model is the custom one.
-    let needs_replacement = app.model.endpoint.id.0 == custom::ENDPOINT_ID;
+    // Pick a replacement model if the active model belongs to any custom
+    // provider in the unified registry.
+    let needs_replacement = custom::is_endpoint_id(&app.model.endpoint.id.0);
     if needs_replacement {
         let catalog = crate::app::bootstrap::model_catalog()?;
         // Temporarily remove custom from consideration.
@@ -764,6 +802,28 @@ fn handle_active_command(
     shell.render();
 }
 
+#[allow(clippy::too_many_arguments)]
+fn request_active_close(
+    control: &RunControl,
+    shell: &mut InteractiveShell,
+    run_id: RunId,
+    input_open: &mut bool,
+    aborting: &mut bool,
+    intents: &mut VecDeque<ControlIntent>,
+    in_flight: &mut Option<ControlFuture>,
+    quit_requested: &mut bool,
+) {
+    shell.request_close();
+    *input_open = false;
+    control.abort();
+    *aborting = true;
+    intents.clear();
+    *in_flight = None;
+    *quit_requested = true;
+    shell.set_run_preparing(run_id, "cancelling");
+    shell.render();
+}
+
 /// Drive one active frozen-Agent run. Control sends are queued locally, and
 /// input polling pauses while a bounded send waits so a full control channel
 /// can never starve the run stream that drains it.
@@ -798,6 +858,18 @@ where
         std::collections::HashMap::<ToolCallId, (String, serde_json::Value)>::new();
 
     loop {
+        if shell.close_requested() && !*quit_requested {
+            request_active_close(
+                control,
+                shell,
+                run_id,
+                &mut input_open,
+                &mut aborting,
+                &mut intents,
+                &mut in_flight,
+                quit_requested,
+            );
+        }
         if !aborting && in_flight.is_none() {
             if let Some(intent) = intents.pop_front() {
                 let control = control.clone();
@@ -861,6 +933,19 @@ where
                         continue;
                     }
                 };
+                if matches!(&event, Event::Key(key) if keymap::is_close_key(key)) {
+                    request_active_close(
+                        control,
+                        shell,
+                        run_id,
+                        &mut input_open,
+                        &mut aborting,
+                        &mut intents,
+                        &mut in_flight,
+                        quit_requested,
+                    );
+                    continue;
+                }
                 // Panels are driven by picker functions that own the event
                 // stream. If a panel leaks here (shouldn't happen), Esc closes it.
                 if shell.has_panel() {
@@ -926,6 +1011,10 @@ where
                         intents.clear();
                         in_flight = None;
                         shell.set_run_preparing(run_id, "cancelling");
+                        shell.render();
+                    }
+                    InputAction::ClearEditor => {
+                        shell.clear_editor();
                         shell.render();
                     }
                     InputAction::Steer(_) => {
@@ -1023,14 +1112,16 @@ where
                         shell.render();
                     }
                     InputAction::Closed => {
-                        input_open = false;
-                        control.abort();
-                        aborting = true;
-                        intents.clear();
-                        in_flight = None;
-                        shell.set_run_preparing(run_id, "cancelling");
-                        shell.render();
-                        *quit_requested = true;
+                        request_active_close(
+                            control,
+                            shell,
+                            run_id,
+                            &mut input_open,
+                            &mut aborting,
+                            &mut intents,
+                            &mut in_flight,
+                            quit_requested,
+                        );
                     }
                     InputAction::Ignore | InputAction::Submit(_) => {}
                 }
@@ -1070,6 +1161,18 @@ where
                             }
                         };
                         request.respond(confirmed);
+                        if shell.close_requested() {
+                            request_active_close(
+                                control,
+                                shell,
+                                run_id,
+                                &mut input_open,
+                                &mut aborting,
+                                &mut intents,
+                                &mut in_flight,
+                                quit_requested,
+                            );
+                        }
                         shell.notice(if confirmed {
                             "extension action confirmed"
                         } else {
@@ -1082,6 +1185,18 @@ where
                     } = &event
                     {
                         let answered = tool_input_picker(shell, input, request).await?;
+                        if shell.close_requested() {
+                            request_active_close(
+                                control,
+                                shell,
+                                run_id,
+                                &mut input_open,
+                                &mut aborting,
+                                &mut intents,
+                                &mut in_flight,
+                                quit_requested,
+                            );
+                        }
                         if !answered {
                             shell.notice("interactive command input cancelled");
                         }
@@ -1203,8 +1318,12 @@ fn status_context_estimate(app: &App) -> u64 {
 fn update_status(shell: &mut InteractiveShell, app: &App) {
     let context_estimate = status_context_estimate(app);
     let cache_stats = analyze_session_cache_stats(app.agent.session());
+    let endpoint_label = app
+        .catalog
+        .endpoint_label(&app.model.endpoint.id)
+        .unwrap_or(&app.model.endpoint.id.0);
     shell.set_identity(
-        &app.model.endpoint.id.0,
+        endpoint_label,
         &app.model.spec.id.0,
         &crate::app::reasoning_label(&app.reasoning),
     );
@@ -1300,6 +1419,29 @@ fn report_compaction(shell: &mut InteractiveShell, outcome: &CompactionOutcome, 
                 shell.error("compaction completed without a durable summary marker".to_owned());
             }
         }
+        CompactionOutcome::NativeCompacted => {
+            let usage = session
+                .usage_records()
+                .iter()
+                .rev()
+                .find(|record| matches!(record.kind, ygg_agent::UsageRecordKind::Compaction));
+            let detail = usage.map_or_else(
+                || "opaque Responses state retained".to_owned(),
+                |record| {
+                    let cost = record
+                        .cost_microdollars
+                        .map(commands::format_microdollars)
+                        .unwrap_or_else(|| "cost unavailable".to_owned());
+                    let prompt_tokens = record
+                        .usage
+                        .input_tokens
+                        .saturating_add(record.usage.cache_read_tokens)
+                        .saturating_add(record.usage.cache_write_tokens);
+                    format!("{prompt_tokens} input tokens compacted · {cost} compaction cost")
+                },
+            );
+            shell.native_compaction_marker(format!("Context compacted natively · {detail}"));
+        }
         CompactionOutcome::Skipped { reason } => {
             shell.notice(format!("compaction skipped: {reason}"))
         }
@@ -1311,28 +1453,62 @@ fn configure_auto_compaction(
     shell: &mut InteractiveShell,
     setting: Option<commands::AutoCompactSetting>,
 ) -> anyhow::Result<()> {
+    let mut candidate_mode = app.config.compaction.mode;
+    let mut candidate_threshold = app.config.compaction.threshold_fraction;
     match setting {
-        Some(commands::AutoCompactSetting::Enabled(enabled)) => {
-            app.config.compaction.enabled = enabled;
+        Some(commands::AutoCompactSetting::Mode(mode)) => {
+            if mode == CompactionMode::NativeResponses
+                && app.model.spec.protocol != ygg_ai::Protocol::OpenAiResponses
+            {
+                shell.error(format!(
+                    "native Responses compaction is unavailable for {:?}; select an OpenAI Responses model or use local compaction",
+                    app.model.spec.protocol
+                ));
+                return Ok(());
+            }
+            if mode == CompactionMode::NativeResponses
+                && app
+                    .config
+                    .compaction
+                    .compact_model
+                    .as_ref()
+                    .is_some_and(|model| model != &app.model.spec.id)
+            {
+                shell.error(
+                    "native Responses compaction requires compaction.compact_model to match the active model"
+                        .to_owned(),
+                );
+                return Ok(());
+            }
+            candidate_mode = mode;
         }
         Some(commands::AutoCompactSetting::ThresholdPercent(percent)) => {
-            app.config.compaction.threshold_fraction = f64::from(percent) / 100.0;
+            candidate_threshold = f64::from(percent) / 100.0;
         }
         None => {}
     }
-    app.agent.set_compaction_policy(
-        app.config.compaction.enabled,
-        app.config.compaction.threshold_fraction,
+    let agent_mode = match candidate_mode {
+        CompactionMode::Disabled => AgentCompactionMode::Disabled,
+        CompactionMode::Local => AgentCompactionMode::Local,
+        CompactionMode::NativeResponses => AgentCompactionMode::NativeResponses,
+    };
+    if let Err(error) = app.agent.set_compaction_mode(
+        agent_mode,
+        candidate_threshold,
         app.config.compaction.keep_recent_turns,
-    )?;
+    ) {
+        shell.error(format!("auto-compaction was not changed: {error}"));
+        return Ok(());
+    }
+    // Publish the candidate only after the Agent accepts it. In particular, a
+    // legacy Responses session cannot leave configuration claiming `native`
+    // while the Agent safely remains in its previous mode.
+    app.config.compaction.mode = candidate_mode;
+    app.config.compaction.threshold_fraction = candidate_threshold;
     shell.notice(format!(
         "auto-compaction {} at {:.0}% · keep {} recent turns · this process",
-        if app.config.compaction.enabled {
-            "on"
-        } else {
-            "off"
-        },
-        app.config.compaction.threshold_fraction * 100.0,
+        candidate_mode.label(),
+        candidate_threshold * 100.0,
         app.config.compaction.keep_recent_turns,
     ));
     Ok(())
@@ -1365,10 +1541,7 @@ fn next_model_id(app: &App) -> anyhow::Result<ModelId> {
 }
 
 fn next_thinking_level(app: &App) -> anyhow::Result<ThinkingLevel> {
-    let mut levels = supported_levels(&app.model);
-    if app.reasoning_mode == ReasoningMode::Pro {
-        levels.retain(|level| *level != ThinkingLevel::Off);
-    }
+    let levels = supported_levels(&app.model);
     let current = level_from_reasoning(&app.reasoning, &app.model)?;
     let index = levels
         .iter()
@@ -1400,10 +1573,7 @@ async fn thinking_configuration_picker(
     } else {
         ReasoningMode::Standard
     };
-    let mut levels = supported_levels(&app.model);
-    if mode == ReasoningMode::Pro {
-        levels.retain(|level| *level != ThinkingLevel::Off);
-    }
+    let levels = supported_levels(&app.model);
     let Some(level) = thinking_picker(shell, input, &levels).await? else {
         return Ok(None);
     };
@@ -1557,24 +1727,7 @@ async fn apply_pending_actions(
                 if let Err(e) = crate::cli::persist_reasoning(&reasoning_label(&reasoning)) {
                     shell.error(format!("failed to save thinking preference: {e}"));
                 }
-                if reasoning == ReasoningConfig::Off && app.reasoning_mode == ReasoningMode::Pro {
-                    if let Err(error) = crate::cli::persist_reasoning_mode(ReasoningMode::Standard)
-                    {
-                        shell.error(format!("failed to save reasoning mode preference: {error}"));
-                    }
-                    app = transition(
-                        app,
-                        shell,
-                        input,
-                        Reconfig::ThinkingMode {
-                            mode: ReasoningMode::Standard,
-                            reasoning,
-                        },
-                    )
-                    .await?;
-                } else {
-                    app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
-                }
+                app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
                 shell.notice("queued thinking change applied");
             }
             PendingIdleAction::ChangeThinkingLevel(level) => {
@@ -2112,23 +2265,7 @@ async fn run_idle_command(
             if let Err(e) = crate::cli::persist_reasoning(level.label()) {
                 shell.error(format!("failed to save thinking preference: {e}"));
             }
-            if level == ThinkingLevel::Off && app.reasoning_mode == ReasoningMode::Pro {
-                if let Err(error) = crate::cli::persist_reasoning_mode(ReasoningMode::Standard) {
-                    shell.error(format!("failed to save reasoning mode preference: {error}"));
-                }
-                app = transition(
-                    app,
-                    shell,
-                    input,
-                    Reconfig::ThinkingMode {
-                        mode: ReasoningMode::Standard,
-                        reasoning,
-                    },
-                )
-                .await?;
-            } else {
-                app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
-            }
+            app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
             shell.notice("thinking changed");
         }
         Command::Model(None) => {
@@ -2202,7 +2339,7 @@ async fn run_idle_command(
                 shell.render();
                 let original_keep = app.config.compaction.keep_recent_turns;
                 app.config.compaction.keep_recent_turns = 1;
-                let result = await_with_ctrl_c(attempt_compaction(&mut app), input).await;
+                let result = await_with_ctrl_c(attempt_compaction(&mut app), shell, input).await;
                 app.config.compaction.keep_recent_turns = original_keep;
                 match result {
                     Some(Ok(outcome)) => {
@@ -2452,6 +2589,17 @@ fn apply_detected_terminal_background(
     shell.set_theme(load_theme_for_background(config, background));
 }
 
+fn startup_launch_outcome<T>(
+    shell: &InteractiveShell,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(_) if shell.close_requested() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Run the interactive frontend with explicit idle and active borrow phases.
 pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let initial_prompt = boot.config.initial_prompt.clone();
@@ -2470,7 +2618,11 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let mut extension_tick = tokio::time::interval(Duration::from_millis(50));
     extension_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    let launch = resolve_launch_interactive(&boot, &mut shell, &mut input).await?;
+    let launch_result = resolve_launch_interactive(&boot, &mut shell, &mut input).await;
+    let Some(launch) = startup_launch_outcome(&shell, launch_result)? else {
+        shell.leave();
+        return Ok(());
+    };
     let mut app = run_blocking_lifecycle(
         &mut shell,
         &mut input,
@@ -2499,6 +2651,10 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
 
     let mut pending_actions = VecDeque::new();
     'interactive: loop {
+        if shell.close_requested() {
+            shutdown_for_exit(&mut app).await;
+            break;
+        }
         let idle = match startup_prompt.take() {
             Some(prompt) if !prompt.is_empty() => Idle::Submit(ComposedInput::from_text(prompt)),
             _ => {
@@ -2655,6 +2811,15 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                                 break status;
                             }
                             event = input.next(), if input_open => match event {
+                                Some(Ok(Event::Key(key))) if keymap::is_close_key(&key) => {
+                                    shell.request_close();
+                                    interrupted = true;
+                                    shutting_down = true;
+                                    break Err(std::io::Error::new(
+                                        std::io::ErrorKind::Interrupted,
+                                        "command stopped during close",
+                                    ));
+                                }
                                 Some(Ok(Event::Key(key)))
                                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
                                         && key.code == KeyCode::Char('c')
@@ -2816,6 +2981,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                             &app.system,
                             composed.transcript_text.clone(),
                         ),
+                        &mut shell,
                         &mut input,
                     ) => result,
                 };
@@ -2909,6 +3075,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         }
                         result = await_with_ctrl_c(
                             app.executable_extensions.after_response(&response),
+                            &mut shell,
                             &mut input,
                         ) => result,
                     };
@@ -2930,6 +3097,10 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 // Always publish that complete frame even when no queued idle
                 // action follows to trigger another render.
                 shell.render();
+                if shell.close_requested() {
+                    shutdown_for_exit(&mut app).await;
+                    break 'interactive;
+                }
                 if quit_requested {
                     shutdown_for_exit(&mut app).await;
                     break;
@@ -2964,14 +3135,60 @@ mod tests {
         drop(sender);
         let mut input = ReceiverStream::new(receiver);
 
-        let result = await_with_ctrl_c(std::future::pending::<()>(), &mut input).await;
+        let mut shell = InteractiveShell::test_shell();
+        let result = await_with_ctrl_c(std::future::pending::<()>(), &mut shell, &mut input).await;
         assert!(result.is_none());
+        assert!(!shell.close_requested());
     }
 
     #[tokio::test]
     async fn cancellable_wait_finishes_after_input_stream_closes() {
         let mut input = tokio_stream::empty::<std::io::Result<Event>>();
-        assert_eq!(await_with_ctrl_c(async { 42 }, &mut input).await, Some(42));
+        let mut shell = InteractiveShell::test_shell();
+        assert_eq!(
+            await_with_ctrl_c(async { 42 }, &mut shell, &mut input).await,
+            Some(42)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellable_wait_propagates_ctrl_d_as_a_close_request() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+            ))))
+            .await
+            .unwrap();
+        drop(sender);
+        let mut input = ReceiverStream::new(receiver);
+        let mut shell = InteractiveShell::test_shell();
+
+        let result = await_with_ctrl_c(std::future::pending::<()>(), &mut shell, &mut input).await;
+
+        assert!(result.is_none());
+        assert!(shell.close_requested());
+    }
+
+    #[test]
+    fn startup_picker_close_is_a_graceful_exit_but_other_errors_survive() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.request_close();
+        assert_eq!(
+            startup_launch_outcome::<u8>(&shell, Err(anyhow::anyhow!("selection cancelled")))
+                .unwrap(),
+            None
+        );
+
+        let shell = InteractiveShell::test_shell();
+        let error =
+            startup_launch_outcome::<u8>(&shell, Err(anyhow::anyhow!("selection cancelled")))
+                .unwrap_err();
+        assert_eq!(error.to_string(), "selection cancelled");
     }
 
     #[test]

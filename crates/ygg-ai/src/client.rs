@@ -12,6 +12,7 @@ use crate::error::{
 };
 use crate::stream::{ResponseBuilder, ResponseStream, StreamEvent};
 use crate::types::{Protocol, Request, Response};
+use crate::{ResponsesCompactRequest, ResponsesCompactResponse};
 
 /// Hard cap on a buffered non-streaming response body before JSON decode
 /// (design §20). Crossing it is a [`DecodeError::BodyTooLarge`].
@@ -664,6 +665,192 @@ impl AiClient {
 
             Ok(crate::stream::guard(raw_event_stream))
         }
+    }
+
+    /// Calls OpenAI's native `POST /responses/compact` endpoint.
+    ///
+    /// The returned output is opaque and intentionally unpruned; callers may
+    /// use [`crate::ResponsesCompactResponse::output`] directly as the next
+    /// full replay window.
+    pub async fn compact_responses(
+        &self,
+        model: &Model,
+        mut request: ResponsesCompactRequest,
+    ) -> Result<ResponsesCompactResponse, AiError> {
+        crate::catalog::validate_endpoint(&model.endpoint)?;
+        crate::catalog::validate_model_spec(&model.spec)?;
+        if model.spec.endpoint != model.endpoint.id {
+            return Err(crate::ConfigError::UnknownEndpoint(model.spec.endpoint.clone()).into());
+        }
+        if model.spec.protocol != Protocol::OpenAiResponses {
+            return Err(crate::error::UnsupportedError::ResponsesOptions.into());
+        }
+        if request.model != model.spec.api_name {
+            return Err(crate::ConfigError::Parse(format!(
+                "compact request model {:?} does not match selected model {:?}",
+                request.model, model.spec.api_name
+            ))
+            .into());
+        }
+        let rich_codex_schema = model.endpoint.id.0 == "openai-codex"
+            || model.spec.cache.session_affinity_format
+                == Some(crate::types::SessionAffinityFormat::Codex);
+        if !rich_codex_schema {
+            // Public OpenAI compact has a narrower body than the private Codex
+            // route. Fail closed at the transport boundary even for callers
+            // that constructed the public DTO manually.
+            request.tools = None;
+            request.parallel_tool_calls = None;
+            request.reasoning = None;
+            request.text = None;
+        }
+        let url = model
+            .endpoint
+            .base_url
+            .join("responses/compact")
+            .map_err(|error| crate::error::ConfigError::Parse(error.to_string()))?;
+        let body = serde_json::to_vec(&request)
+            .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))?;
+        let mut headers = model.endpoint.default_headers.clone();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        for (key, value) in crate::protocol::openai_responses::responses_affinity_headers(
+            model,
+            request.session_id.as_deref(),
+        )? {
+            if let Some(key) = key {
+                headers.insert(key, value);
+            }
+        }
+        // Codex compresses ordinary streaming Responses requests, but its
+        // compact endpoint contract is plain JSON. Do not apply the normal
+        // Responses transport compression policy here.
+        let body = bytes::Bytes::from(body);
+        let auth_headers = crate::auth::resolve_headers(&model.endpoint.auth)
+            .await
+            .map_err(AiError::Auth)?;
+        let mut current_key = None;
+        for (key, value) in auth_headers {
+            if let Some(key) = key {
+                current_key = Some(key.clone());
+                headers.insert(key, value);
+            } else if let Some(key) = &current_key {
+                headers.append(key.clone(), value);
+            }
+        }
+        let response = tokio::time::timeout(
+            model.endpoint.timeout,
+            self.http.post(url).headers(headers).body(body).send(),
+        )
+        .await
+        .map_err(|_| {
+            AiError::Transport(TransportError {
+                phase: TransportPhase::ConnectOrHeaders,
+                timeout: true,
+                message: "compact request timed out waiting for response headers".to_owned(),
+            })
+        })?
+        .map_err(|error| {
+            reqwest_transport_error(error, TransportPhase::ConnectOrHeaders, "compact request")
+        })?;
+        let status = response.status();
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("request-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        if !status.is_success() {
+            let mut body = Vec::with_capacity(4096);
+            let mut body_stream = response.bytes_stream();
+            let started_at = Instant::now();
+            while body.len() < 4096 {
+                match next_body_chunk(
+                    &mut body_stream,
+                    self.stream_idle_timeout,
+                    started_at,
+                    self.stream_deadline,
+                    "compact HTTP error response body",
+                )
+                .await
+                {
+                    Ok(Some(chunk)) => {
+                        let remaining = 4096 - body.len();
+                        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            let snippet = String::from_utf8_lossy(&body).into_owned();
+            let provider_code = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(|error| error.get("code"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            let retryable = matches!(
+                status,
+                http::StatusCode::REQUEST_TIMEOUT
+                    | http::StatusCode::TOO_MANY_REQUESTS
+                    | http::StatusCode::BAD_GATEWAY
+                    | http::StatusCode::SERVICE_UNAVAILABLE
+                    | http::StatusCode::GATEWAY_TIMEOUT
+            );
+            return Err(HttpError {
+                status,
+                request_id,
+                retry_after,
+                provider_code,
+                body_snippet: (!snippet.is_empty()).then_some(snippet),
+                retryable,
+            }
+            .into());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_COMPLETED_BODY_BYTES as u64)
+        {
+            return Err(DecodeError::BodyTooLarge.into());
+        }
+        let mut body = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or_default()
+                .min(MAX_COMPLETED_BODY_BYTES as u64) as usize,
+        );
+        let mut body_stream = response.bytes_stream();
+        let started_at = Instant::now();
+        while let Some(chunk) = next_body_chunk(
+            &mut body_stream,
+            self.stream_idle_timeout,
+            started_at,
+            self.stream_deadline,
+            "compact response body",
+        )
+        .await?
+        {
+            if body
+                .len()
+                .checked_add(chunk.len())
+                .is_none_or(|size| size > MAX_COMPLETED_BODY_BYTES)
+            {
+                return Err(DecodeError::BodyTooLarge.into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&body)
+            .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))
     }
 
     /// Executes a request and drives the stream to completion, returning the final Response.

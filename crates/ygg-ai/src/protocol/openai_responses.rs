@@ -1,16 +1,18 @@
 //! OpenAI Responses private wire protocol codec.
 
-use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, ConfigError, DecodeError, ProviderError};
 use crate::protocol::sse::SseEvent;
-use crate::protocol::{cache_session_id, prompt_cache_key, HttpRequestParts};
+use crate::protocol::{
+    cache_session_id, cache_session_id_for, prompt_cache_key, prompt_cache_key_for,
+    HttpRequestParts, WireImageUrl,
+};
 use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{
-    AssistantPart, ImageSource, Media, Message, Protocol, ReasoningConfig, ReasoningState,
-    ReasoningStateKind, Request, StopReason, ToolCallId, ToolChoice, ToolResultPart, Usage,
-    UserPart,
+    AssistantPart, CacheRetention, ImageSource, Media, Message, OutputFormat, Protocol,
+    ReasoningConfig, ReasoningMode, ReasoningState, ReasoningStateKind, Request, StopReason,
+    ToolCallId, ToolChoice, ToolDef, ToolResultPart, Usage, UserPart,
 };
 use crate::validate::{normalize_request_reasoning, validate_request};
 
@@ -19,7 +21,13 @@ use crate::validate::{normalize_request_reasoning, validate_request};
 #[derive(Serialize)]
 struct ResponsesRequest {
     model: String,
-    input: Vec<ResponsesInputItem>,
+    input: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_management: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ResponsesTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,7 +99,7 @@ enum ResponsesContentPart {
     },
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]
-        image_url: Option<String>,
+        image_url: Option<WireImageUrl>,
         #[serde(skip_serializing_if = "Option::is_none")]
         file_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,7 +115,7 @@ enum ResponsesToolResultBlock {
     },
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]
-        image_url: Option<String>,
+        image_url: Option<WireImageUrl>,
         #[serde(skip_serializing_if = "Option::is_none")]
         file_id: Option<String>,
     },
@@ -163,6 +171,491 @@ enum ResponsesFormat {
 
 // --- Request Builder ---
 
+fn opaque_input_item(item: ResponsesInputItem) -> crate::responses::ResponsesItem {
+    crate::responses::ResponsesItem::new(
+        serde_json::to_value(item).expect("private Responses input item serializes to an object"),
+    )
+    .expect("private Responses input item is always an object")
+}
+
+fn map_responses_tools(
+    model: &crate::catalog::Model,
+    tools: &[ToolDef],
+) -> Option<Vec<ResponsesTool>> {
+    if tools.is_empty() || !model.spec.capabilities.tools {
+        return None;
+    }
+    Some(
+        tools
+            .iter()
+            .map(|tool| ResponsesTool {
+                r#type: "function".to_owned(),
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            })
+            .collect(),
+    )
+}
+
+fn map_responses_reasoning(
+    model: &crate::catalog::Model,
+    reasoning: &ReasoningConfig,
+    reasoning_mode: ReasoningMode,
+) -> Option<ResponsesReasoningConfig> {
+    model.spec.capabilities.reasoning.as_ref()?;
+    let effort = match reasoning {
+        ReasoningConfig::Effort(effort) => Some(
+            match effort {
+                crate::types::ReasoningEffort::Minimal => "minimal",
+                crate::types::ReasoningEffort::Low => "low",
+                crate::types::ReasoningEffort::Medium => "medium",
+                crate::types::ReasoningEffort::High => "high",
+                crate::types::ReasoningEffort::Xhigh => "xhigh",
+                crate::types::ReasoningEffort::Max => "max",
+            }
+            .to_owned(),
+        ),
+        ReasoningConfig::Off | ReasoningConfig::On | ReasoningConfig::Budget(_) => None,
+    };
+    let mode = (reasoning_mode == ReasoningMode::Pro
+        && model
+            .spec
+            .capabilities
+            .reasoning
+            .as_ref()
+            .is_some_and(|capability| capability.supports_pro_mode))
+    .then_some("pro");
+    (effort.is_some() || mode.is_some()).then_some(ResponsesReasoningConfig {
+        effort,
+        mode,
+        summary: "auto",
+    })
+}
+
+fn map_responses_text(
+    model: &crate::catalog::Model,
+    output_format: &OutputFormat,
+) -> Option<ResponsesTextConfig> {
+    let text_format = match output_format {
+        OutputFormat::Text => None,
+        _ if !model.spec.capabilities.structured_output => None,
+        OutputFormat::JsonObject => Some(ResponsesFormat::JsonObject),
+        OutputFormat::JsonSchema(schema) => Some(ResponsesFormat::JsonSchema {
+            name: schema.name.clone(),
+            description: schema.description.clone(),
+            schema: schema.schema.clone(),
+            strict: schema.strict,
+        }),
+    };
+    let verbosity = (model.endpoint.id.0 == "openai-codex").then_some("low");
+    (text_format.is_some() || verbosity.is_some()).then_some(ResponsesTextConfig {
+        format: text_format,
+        verbosity,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_compact_request(
+    model: &crate::catalog::Model,
+    input: crate::responses::ResponsesInput,
+    instructions: Option<String>,
+    tools: &[ToolDef],
+    reasoning: &ReasoningConfig,
+    reasoning_mode: ReasoningMode,
+    output_format: &OutputFormat,
+    cache_retention: CacheRetention,
+    session_id: Option<&str>,
+) -> crate::responses::ResponsesCompactRequest {
+    // The private ChatGPT Codex compact route accepts the same active tool and
+    // generation controls as normal Responses calls. Public OpenAI compact
+    // currently exposes a narrower schema and may reject these extra fields.
+    let rich_codex_schema = model.endpoint.id.0 == "openai-codex"
+        || model.spec.cache.session_affinity_format
+            == Some(crate::types::SessionAffinityFormat::Codex);
+    let tools = rich_codex_schema
+        .then(|| map_responses_tools(model, tools))
+        .flatten()
+        .map(|tools| {
+            tools
+                .into_iter()
+                .map(|tool| serde_json::to_value(tool).expect("Responses tool serializes"))
+                .collect()
+        });
+    let reasoning = rich_codex_schema
+        .then(|| map_responses_reasoning(model, reasoning, reasoning_mode))
+        .flatten()
+        .map(|config| serde_json::to_value(config).expect("Responses reasoning serializes"));
+    let text = rich_codex_schema
+        .then(|| map_responses_text(model, output_format))
+        .flatten()
+        .map(|config| serde_json::to_value(config).expect("Responses text serializes"));
+    crate::responses::ResponsesCompactRequest {
+        model: model.spec.api_name.clone(),
+        input,
+        instructions,
+        parallel_tool_calls: tools
+            .as_ref()
+            .map(|_| model.spec.capabilities.parallel_tool_calls),
+        tools,
+        reasoning,
+        text,
+        prompt_cache_key: prompt_cache_key_for(cache_retention, session_id),
+        session_id: cache_session_id_for(cache_retention, session_id).map(str::to_owned),
+    }
+}
+
+pub(crate) fn responses_affinity_headers(
+    model: &crate::catalog::Model,
+    session_id: Option<&str>,
+) -> Result<http::HeaderMap, AiError> {
+    let mut headers = http::HeaderMap::new();
+    let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+        return Ok(headers);
+    };
+    let value = http::HeaderValue::from_str(session_id)
+        .map_err(|_| ConfigError::InvalidHeader("session affinity".into()))?;
+    match model.spec.cache.session_affinity_format {
+        Some(crate::types::SessionAffinityFormat::OpenRouter) => {
+            headers.insert(http::HeaderName::from_static("x-session-id"), value);
+        }
+        Some(crate::types::SessionAffinityFormat::Codex) => {
+            headers.insert(http::HeaderName::from_static("session-id"), value.clone());
+            headers.insert(http::HeaderName::from_static("x-client-request-id"), value);
+        }
+        Some(crate::types::SessionAffinityFormat::OpenAiNoSession) => {
+            headers.insert(
+                http::HeaderName::from_static("x-client-request-id"),
+                value.clone(),
+            );
+            headers.insert(http::HeaderName::from_static("x-session-affinity"), value);
+        }
+        Some(crate::types::SessionAffinityFormat::OpenAi) => {
+            headers.insert(
+                http::HeaderName::from_static("x-client-request-id"),
+                value.clone(),
+            );
+            headers.insert(
+                http::HeaderName::from_static("x-session-affinity"),
+                value.clone(),
+            );
+            if model.spec.cache.send_session_id_header {
+                headers.insert(http::HeaderName::from_static("session_id"), value);
+            }
+        }
+        None => {
+            headers.insert(
+                http::HeaderName::from_static("x-client-request-id"),
+                value.clone(),
+            );
+            if model.spec.cache.send_session_id_header {
+                headers.insert(http::HeaderName::from_static("session_id"), value);
+            }
+        }
+    }
+    Ok(headers)
+}
+
+fn map_system_input(
+    model: &crate::catalog::Model,
+    system: Option<&str>,
+) -> Vec<ResponsesInputItem> {
+    let Some(system) = system else {
+        return Vec::new();
+    };
+    let role = if model.spec.capabilities.reasoning.is_some() {
+        "developer"
+    } else {
+        "system"
+    };
+    vec![ResponsesInputItem::Message {
+        role: role.to_owned(),
+        content: vec![ResponsesContentPart::InputText {
+            text: system.to_owned(),
+        }],
+    }]
+}
+
+fn map_user_input(
+    model: &crate::catalog::Model,
+    user: &crate::types::UserMessage,
+    preserve_tool_call_ids: bool,
+    pending_tool_calls: &mut std::collections::BTreeSet<String>,
+    synthetic_tool_results: &std::collections::HashSet<String>,
+) -> Vec<ResponsesInputItem> {
+    let mut input = Vec::new();
+    let mut content = Vec::new();
+    for part in &user.content {
+        match part {
+            UserPart::Text(text) => {
+                content.push(ResponsesContentPart::InputText { text: text.clone() });
+            }
+            UserPart::Media(Media::Image(image)) => {
+                if !model
+                    .spec
+                    .capabilities
+                    .input_modalities
+                    .contains(crate::types::Modality::Image)
+                {
+                    continue;
+                }
+
+                let (image_url, file_id) = match &image.source {
+                    ImageSource::Url(url) => (Some(WireImageUrl::Url(url.to_string())), None),
+                    ImageSource::Inline(bytes) => {
+                        // No documented default MIME; do not guess a wire field
+                        // (design §75). Validation already diagnosed the drop.
+                        let Some(media_type) = image.media_type.as_ref() else {
+                            continue;
+                        };
+                        (
+                            Some(WireImageUrl::Inline {
+                                media_type: media_type.to_string(),
+                                data: bytes.clone(),
+                            }),
+                            None,
+                        )
+                    }
+                    ImageSource::ProviderRef(reference) => {
+                        // An expired or wrong-protocol provider ref is dropped
+                        // (validation already emitted the diagnostic).
+                        if !crate::validate::provider_ref_is_usable(
+                            reference,
+                            Protocol::OpenAiResponses,
+                        ) {
+                            continue;
+                        }
+                        (None, Some(reference.id.clone()))
+                    }
+                };
+
+                let detail = image.detail.map(|detail| match detail {
+                    crate::types::ImageDetail::Auto => "auto".to_owned(),
+                    crate::types::ImageDetail::Low => "low".to_owned(),
+                    crate::types::ImageDetail::High => "high".to_owned(),
+                });
+                content.push(ResponsesContentPart::InputImage {
+                    image_url,
+                    file_id,
+                    detail,
+                });
+            }
+            UserPart::Media(Media::Audio(_)) => {}
+            UserPart::ToolResult(result) => {
+                if synthetic_tool_results.contains(&result.tool_call_id.0) {
+                    continue;
+                }
+                pending_tool_calls.remove(&result.tool_call_id.0);
+                let mut outputs = Vec::new();
+                for result_part in &result.content {
+                    match result_part {
+                        ToolResultPart::Text(text) => {
+                            outputs
+                                .push(ResponsesToolResultBlock::InputText { text: text.clone() });
+                        }
+                        ToolResultPart::Media(Media::Image(image)) => match &image.source {
+                            ImageSource::Url(url) => {
+                                outputs.push(ResponsesToolResultBlock::InputImage {
+                                    image_url: Some(WireImageUrl::Url(url.to_string())),
+                                    file_id: None,
+                                });
+                            }
+                            ImageSource::Inline(bytes) => {
+                                // Do not guess a wire MIME (§75); drop the part
+                                // if absent.
+                                if let Some(media_type) = image.media_type.as_ref() {
+                                    outputs.push(ResponsesToolResultBlock::InputImage {
+                                        image_url: Some(WireImageUrl::Inline {
+                                            media_type: media_type.to_string(),
+                                            data: bytes.clone(),
+                                        }),
+                                        file_id: None,
+                                    });
+                                }
+                            }
+                            ImageSource::ProviderRef(reference) => {
+                                if crate::validate::provider_ref_is_usable(
+                                    reference,
+                                    Protocol::OpenAiResponses,
+                                ) {
+                                    outputs.push(ResponsesToolResultBlock::InputImage {
+                                        image_url: None,
+                                        file_id: Some(reference.id.clone()),
+                                    });
+                                }
+                            }
+                        },
+                        ToolResultPart::Media(Media::Audio(_)) => {}
+                    }
+                }
+                // Preserve canonical order: emit buffered user content before
+                // this standalone tool-result item.
+                flush_user_content(&mut input, &mut content);
+                let call_id = if preserve_tool_call_ids {
+                    result.tool_call_id.0.clone()
+                } else {
+                    crate::protocol::normalize_tool_call_id(&result.tool_call_id.0)
+                };
+                input.push(ResponsesInputItem::FunctionCallOutput {
+                    call_id,
+                    output: outputs,
+                });
+            }
+        }
+    }
+    flush_user_content(&mut input, &mut content);
+    input
+}
+
+fn map_assistant_input(
+    assistant: &crate::types::AssistantMessage,
+    model: &crate::catalog::Model,
+    pending_tool_calls: &mut std::collections::BTreeSet<String>,
+) -> Vec<ResponsesInputItem> {
+    let mut input = Vec::new();
+    // Preserve canonical part order: buffered assistant text is flushed as a
+    // `message` item immediately before each function/reasoning item.
+    let mut text_parts = Vec::new();
+    for part in &assistant.content {
+        match part {
+            AssistantPart::Text(text) => text_parts.push(text.clone()),
+            AssistantPart::ToolCall(tool_call) => {
+                flush_assistant_text(&mut input, &mut text_parts);
+                pending_tool_calls.insert(tool_call.id.0.clone());
+                input.push(ResponsesInputItem::FunctionCall {
+                    call_id: crate::protocol::normalize_tool_call_id(&tool_call.id.0),
+                    name: tool_call.name.clone(),
+                    arguments: tool_call.arguments_json.clone(),
+                });
+            }
+            AssistantPart::Reasoning(reasoning) => {
+                if let Some(state) = &reasoning.state {
+                    if state.protocol == Protocol::OpenAiResponses && state.model == model.spec.id {
+                        if let ReasoningStateKind::OpenAiReasoning {
+                            item_id,
+                            encrypted_content,
+                        } = &state.kind
+                        {
+                            flush_assistant_text(&mut input, &mut text_parts);
+                            input.push(ResponsesInputItem::Reasoning {
+                                id: item_id.clone(),
+                                summary: reasoning
+                                    .text
+                                    .as_ref()
+                                    .map(|text| {
+                                        vec![ResponsesReasoningSummary {
+                                            r#type: "summary_text".to_owned(),
+                                            text: text.clone(),
+                                        }]
+                                    })
+                                    .unwrap_or_default(),
+                                encrypted_content: encrypted_content.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            AssistantPart::Media(_) => {}
+        }
+    }
+    flush_assistant_text(&mut input, &mut text_parts);
+    input
+}
+
+pub(crate) fn encode_canonical_input(
+    model: &crate::catalog::Model,
+    system: Option<&str>,
+    messages: &[Message],
+    compatibility: crate::CompatibilityMode,
+) -> crate::responses::ResponsesInput {
+    let mut input = map_system_input(model, system);
+    let mut pending_tool_calls = std::collections::BTreeSet::new();
+    let mut synthetic_tool_results = std::collections::HashSet::new();
+    for message in messages {
+        match message {
+            Message::User(user) => input.extend(map_user_input(
+                model,
+                user,
+                false,
+                &mut pending_tool_calls,
+                &synthetic_tool_results,
+            )),
+            Message::Assistant(assistant) => {
+                if compatibility == crate::CompatibilityMode::Lossy {
+                    push_synthetic_tool_results(
+                        &mut input,
+                        &mut pending_tool_calls,
+                        &mut synthetic_tool_results,
+                    );
+                }
+                input.extend(map_assistant_input(
+                    assistant,
+                    model,
+                    &mut pending_tool_calls,
+                ));
+            }
+        }
+    }
+    if compatibility == crate::CompatibilityMode::Lossy {
+        push_synthetic_tool_results(
+            &mut input,
+            &mut pending_tool_calls,
+            &mut synthetic_tool_results,
+        );
+    }
+    crate::responses::ResponsesInput::new(input.into_iter().map(opaque_input_item).collect())
+}
+
+pub(crate) fn encode_replay_input(
+    model: &crate::catalog::Model,
+    system: Option<&str>,
+    replay: &[crate::responses::ResponsesReplayItem],
+) -> crate::responses::ResponsesInput {
+    let compacted_base = matches!(
+        replay.first(),
+        Some(crate::responses::ResponsesReplayItem::Compacted(_))
+    );
+    let mut input: Vec<crate::responses::ResponsesItem> = if compacted_base {
+        Vec::new()
+    } else {
+        map_system_input(model, system)
+            .into_iter()
+            .map(opaque_input_item)
+            .collect()
+    };
+    let mut pending_tool_calls = std::collections::BTreeSet::new();
+    let synthetic_tool_results = std::collections::HashSet::new();
+    for item in replay {
+        match item {
+            crate::responses::ResponsesReplayItem::User(user) => {
+                input.extend(
+                    map_user_input(
+                        model,
+                        user,
+                        true,
+                        &mut pending_tool_calls,
+                        &synthetic_tool_results,
+                    )
+                    .into_iter()
+                    .map(opaque_input_item),
+                );
+            }
+            crate::responses::ResponsesReplayItem::LocalAssistant(assistant) => {
+                input.extend(
+                    map_assistant_input(assistant, model, &mut pending_tool_calls)
+                        .into_iter()
+                        .map(opaque_input_item),
+                );
+            }
+            crate::responses::ResponsesReplayItem::Output(output)
+            | crate::responses::ResponsesReplayItem::Compacted(output) => {
+                input.extend(output.items().iter().cloned());
+            }
+        }
+    }
+    crate::responses::ResponsesInput::new(input)
+}
+
 /// Builds the OpenAI Responses HTTP request parts.
 pub(crate) fn build_request(
     model: &crate::catalog::Model,
@@ -178,253 +671,28 @@ pub(crate) fn build_request(
         &model.spec.id,
         req.compatibility,
     )?;
-
-    // 2. Map system prompt
-    let mut input = Vec::new();
-    let has_reasoning = model.spec.capabilities.reasoning.is_some();
-    if let Some(ref sys) = req.system {
-        let role = if has_reasoning {
-            "developer".to_string()
-        } else {
-            "system".to_string()
-        };
-        input.push(ResponsesInputItem::Message {
-            role,
-            content: vec![ResponsesContentPart::InputText { text: sys.clone() }],
-        });
+    if req
+        .responses
+        .as_ref()
+        .is_some_and(|options| options.input.is_some() && options.previous_response_id.is_some())
+    {
+        return Err(ConfigError::Parse(
+            "Responses raw input and previous_response_id cannot be used together".to_owned(),
+        )
+        .into());
     }
 
-    // 3. Map history
-    let mut pending_tool_calls = std::collections::BTreeSet::new();
-    let mut synthetic_tool_results = std::collections::HashSet::new();
-    for msg in &req.messages {
-        match msg {
-            Message::User(ref user) => {
-                let mut content = Vec::new();
-                for part in &user.content {
-                    match part {
-                        UserPart::Text(ref text) => {
-                            content.push(ResponsesContentPart::InputText { text: text.clone() });
-                        }
-                        UserPart::Media(Media::Image(ref image)) => {
-                            if !model
-                                .spec
-                                .capabilities
-                                .input_modalities
-                                .contains(crate::types::Modality::Image)
-                            {
-                                continue;
-                            }
-
-                            let (image_url, file_id) = match &image.source {
-                                ImageSource::Url(u) => (Some(u.to_string()), None),
-                                ImageSource::Inline(bytes) => {
-                                    // No documented default MIME; do not guess a
-                                    // wire field (design §75). Validation already
-                                    // diagnosed the drop.
-                                    let Some(mime_str) = image.media_type.as_ref() else {
-                                        continue;
-                                    };
-                                    (
-                                        Some(format!(
-                                            "data:{};base64,{}",
-                                            mime_str,
-                                            BASE64_STANDARD.encode(bytes)
-                                        )),
-                                        None,
-                                    )
-                                }
-                                ImageSource::ProviderRef(reference) => {
-                                    // Design §7: an expired or wrong-protocol
-                                    // provider ref is dropped (validation already
-                                    // emitted the diagnostic); never serialize an
-                                    // invalid file ID.
-                                    if !crate::validate::provider_ref_is_usable(
-                                        reference,
-                                        Protocol::OpenAiResponses,
-                                    ) {
-                                        continue;
-                                    }
-                                    (None, Some(reference.id.clone()))
-                                }
-                            };
-
-                            let detail = image.detail.map(|d| match d {
-                                crate::types::ImageDetail::Auto => "auto".to_string(),
-                                crate::types::ImageDetail::Low => "low".to_string(),
-                                crate::types::ImageDetail::High => "high".to_string(),
-                            });
-
-                            content.push(ResponsesContentPart::InputImage {
-                                image_url,
-                                file_id,
-                                detail,
-                            });
-                        }
-                        UserPart::Media(Media::Audio(_)) => {}
-                        UserPart::ToolResult(ref tr) => {
-                            if synthetic_tool_results.contains(&tr.tool_call_id.0) {
-                                continue;
-                            }
-                            pending_tool_calls.remove(&tr.tool_call_id.0);
-                            let mut outputs = Vec::new();
-                            for tr_part in &tr.content {
-                                match tr_part {
-                                    ToolResultPart::Text(ref text) => {
-                                        outputs.push(ResponsesToolResultBlock::InputText {
-                                            text: text.clone(),
-                                        });
-                                    }
-                                    ToolResultPart::Media(Media::Image(ref image)) => {
-                                        match &image.source {
-                                            ImageSource::Url(u) => {
-                                                outputs.push(
-                                                    ResponsesToolResultBlock::InputImage {
-                                                        image_url: Some(u.to_string()),
-                                                        file_id: None,
-                                                    },
-                                                );
-                                            }
-                                            ImageSource::Inline(bytes) => {
-                                                // Do not guess a wire MIME (§75);
-                                                // drop the part if absent.
-                                                if let Some(mime_str) = image.media_type.as_ref() {
-                                                    let url_str = format!(
-                                                        "data:{};base64,{}",
-                                                        mime_str,
-                                                        BASE64_STANDARD.encode(bytes)
-                                                    );
-                                                    outputs.push(
-                                                        ResponsesToolResultBlock::InputImage {
-                                                            image_url: Some(url_str),
-                                                            file_id: None,
-                                                        },
-                                                    );
-                                                }
-                                            }
-                                            ImageSource::ProviderRef(ref p_ref) => {
-                                                // Drop expired/wrong-protocol refs
-                                                // rather than serialize an invalid
-                                                // file ID (design §7).
-                                                if crate::validate::provider_ref_is_usable(
-                                                    p_ref,
-                                                    Protocol::OpenAiResponses,
-                                                ) {
-                                                    outputs.push(
-                                                        ResponsesToolResultBlock::InputImage {
-                                                            image_url: None,
-                                                            file_id: Some(p_ref.id.clone()),
-                                                        },
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    ToolResultPart::Media(Media::Audio(_)) => {}
-                                }
-                            }
-                            // Preserve canonical order: emit any buffered user
-                            // content before this tool-result item (design §11).
-                            flush_user_content(&mut input, &mut content);
-                            input.push(ResponsesInputItem::FunctionCallOutput {
-                                call_id: crate::protocol::normalize_tool_call_id(
-                                    &tr.tool_call_id.0,
-                                ),
-                                output: outputs,
-                            });
-                        }
-                    }
-                }
-                flush_user_content(&mut input, &mut content);
-            }
-            Message::Assistant(ref assistant) => {
-                if req.compatibility == crate::CompatibilityMode::Lossy {
-                    push_synthetic_tool_results(
-                        &mut input,
-                        &mut pending_tool_calls,
-                        &mut synthetic_tool_results,
-                    );
-                }
-                // Preserve canonical part order: buffered assistant text is
-                // flushed as a `message` item immediately before each
-                // `function_call`/`reasoning` item it precedes, rather than all
-                // text being deferred to the end (design §11 immutable replay).
-                let mut text_parts = Vec::new();
-                for part in &assistant.content {
-                    match part {
-                        AssistantPart::Text(ref text) => {
-                            text_parts.push(text.clone());
-                        }
-                        AssistantPart::ToolCall(ref tc) => {
-                            flush_assistant_text(&mut input, &mut text_parts);
-                            pending_tool_calls.insert(tc.id.0.clone());
-                            input.push(ResponsesInputItem::FunctionCall {
-                                call_id: crate::protocol::normalize_tool_call_id(&tc.id.0),
-                                name: tc.name.clone(),
-                                arguments: tc.arguments_json.clone(),
-                            });
-                        }
-                        AssistantPart::Reasoning(ref reasoning) => {
-                            if let Some(ref state) = reasoning.state {
-                                if state.protocol == Protocol::OpenAiResponses
-                                    && state.model == model.spec.id
-                                {
-                                    if let ReasoningStateKind::OpenAiReasoning {
-                                        ref item_id,
-                                        ref encrypted_content,
-                                    } = state.kind
-                                    {
-                                        flush_assistant_text(&mut input, &mut text_parts);
-                                        input.push(ResponsesInputItem::Reasoning {
-                                            id: item_id.clone(),
-                                            summary: reasoning
-                                                .text
-                                                .as_ref()
-                                                .map(|text| {
-                                                    vec![ResponsesReasoningSummary {
-                                                        r#type: "summary_text".to_string(),
-                                                        text: text.clone(),
-                                                    }]
-                                                })
-                                                .unwrap_or_default(),
-                                            encrypted_content: encrypted_content.clone(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        AssistantPart::Media(_) => {}
-                    }
-                }
-                flush_assistant_text(&mut input, &mut text_parts);
-            }
-        }
-    }
-
-    if req.compatibility == crate::CompatibilityMode::Lossy {
-        push_synthetic_tool_results(
-            &mut input,
-            &mut pending_tool_calls,
-            &mut synthetic_tool_results,
-        );
-    }
+    // 2–3. Encode the request prompt and canonical history through the same
+    // mapper used by durable opaque replay.
+    let canonical_input = crate::responses::encode_canonical_responses_input(
+        model,
+        req.system.as_deref(),
+        &req.messages,
+        req.compatibility,
+    );
 
     // 4. Map tools & tool_choice
-    let tools_opt = if req.tools.is_empty() || !model.spec.capabilities.tools {
-        None
-    } else {
-        Some(
-            req.tools
-                .iter()
-                .map(|t| ResponsesTool {
-                    r#type: "function".to_string(),
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    parameters: t.parameters.clone(),
-                })
-                .collect(),
-        )
-    };
+    let tools_opt = map_responses_tools(model, &req.tools);
 
     let tool_choice_opt = if !model.spec.capabilities.tools {
         None
@@ -441,37 +709,7 @@ pub(crate) fn build_request(
     };
 
     // 5. Reasoning Configuration
-    let reasoning_opt = if model.spec.capabilities.reasoning.is_some() {
-        let effort = match req.reasoning {
-            ReasoningConfig::Effort(effort) => Some(
-                match effort {
-                    crate::types::ReasoningEffort::Minimal => "minimal",
-                    crate::types::ReasoningEffort::Low => "low",
-                    crate::types::ReasoningEffort::Medium => "medium",
-                    crate::types::ReasoningEffort::High => "high",
-                    crate::types::ReasoningEffort::Xhigh => "xhigh",
-                    crate::types::ReasoningEffort::Max => "max",
-                }
-                .to_string(),
-            ),
-            ReasoningConfig::Off | ReasoningConfig::On | ReasoningConfig::Budget(_) => None,
-        };
-        let mode = (req.reasoning_mode == crate::types::ReasoningMode::Pro
-            && model
-                .spec
-                .capabilities
-                .reasoning
-                .as_ref()
-                .is_some_and(|capability| capability.supports_pro_mode))
-        .then_some("pro");
-        (effort.is_some() || mode.is_some()).then_some(ResponsesReasoningConfig {
-            effort,
-            mode,
-            summary: "auto",
-        })
-    } else {
-        None
-    };
+    let reasoning_opt = map_responses_reasoning(model, &req.reasoning, req.reasoning_mode);
 
     // 6. Text / Output Format Config
     //
@@ -480,27 +718,7 @@ pub(crate) fn build_request(
     // has already returned `Err` in `validate_request` above, so an unsupported
     // format only reaches here under Lossy — in which case we serialize plain
     // text (`text` omitted) rather than send a `text.format` the model lacks.
-    let structured_supported = model.spec.capabilities.structured_output;
-    let text_format = match &req.output_format {
-        crate::types::OutputFormat::Text => None,
-        _ if !structured_supported => None,
-        crate::types::OutputFormat::JsonObject => Some(ResponsesFormat::JsonObject),
-        crate::types::OutputFormat::JsonSchema(ref s) => Some(ResponsesFormat::JsonSchema {
-            name: s.name.clone(),
-            description: s.description.clone(),
-            schema: s.schema.clone(),
-            strict: s.strict,
-        }),
-    };
-    // Match the ChatGPT Codex client's latency-oriented default. Keep this
-    // private-backend knob scoped to the subscription endpoint: generic
-    // Responses-compatible gateways may reject `text.verbosity`.
-    let text_verbosity = (model.endpoint.id.0 == "openai-codex").then_some("low");
-    let text_opt =
-        (text_format.is_some() || text_verbosity.is_some()).then_some(ResponsesTextConfig {
-            format: text_format,
-            verbosity: text_verbosity,
-        });
+    let text_opt = map_responses_text(model, &req.output_format);
 
     // 7. Request Encrypted Reasoning
     let include = if model.spec.capabilities.reasoning.is_some() {
@@ -521,9 +739,28 @@ pub(crate) fn build_request(
         req.max_output_tokens
     };
 
+    let wire_input = req
+        .responses
+        .as_ref()
+        .and_then(|options| options.input.as_ref())
+        .map(|input| serde_json::to_value(input).expect("ResponsesInput serializes"))
+        .unwrap_or_else(|| {
+            serde_json::to_value(canonical_input).expect("Responses input serializes")
+        });
+    let responses_options = req.responses.as_ref();
+    let instructions = responses_options
+        .and_then(|options| options.input.as_ref())
+        .is_some_and(crate::responses::ResponsesInput::contains_compaction)
+        .then(|| req.system.clone())
+        .flatten();
     let responses_req = ResponsesRequest {
         model: model.spec.api_name.clone(),
-        input,
+        input: wire_input,
+        instructions,
+        previous_response_id: responses_options
+            .and_then(|options| options.previous_response_id.clone()),
+        context_management: responses_options
+            .and_then(|options| options.context_management.clone()),
         tools: tools_opt,
         tool_choice: tool_choice_opt,
         // Do not rely on a provider default. A model advertised as sequential
@@ -540,7 +777,7 @@ pub(crate) fn build_request(
             && model.spec.cache.supports_long_retention)
             .then_some("24h"),
         include,
-        store: false,
+        store: responses_options.is_some_and(|options| options.store),
         stream: true,
     };
 
@@ -553,51 +790,7 @@ pub(crate) fn build_request(
         .join("responses")
         .map_err(|e| ConfigError::Parse(e.to_string()))?;
 
-    let mut headers = http::HeaderMap::new();
-    if let Some(session_id) = cache_session_id(&req) {
-        let value = http::HeaderValue::from_str(session_id)
-            .map_err(|_| ConfigError::InvalidHeader("session affinity".into()))?;
-        match model.spec.cache.session_affinity_format {
-            Some(crate::types::SessionAffinityFormat::OpenRouter) => {
-                headers.insert(http::HeaderName::from_static("x-session-id"), value);
-            }
-            Some(crate::types::SessionAffinityFormat::Codex) => {
-                headers.insert(http::HeaderName::from_static("session-id"), value.clone());
-                headers.insert(http::HeaderName::from_static("x-client-request-id"), value);
-            }
-            Some(crate::types::SessionAffinityFormat::OpenAiNoSession) => {
-                headers.insert(
-                    http::HeaderName::from_static("x-client-request-id"),
-                    value.clone(),
-                );
-                headers.insert(http::HeaderName::from_static("x-session-affinity"), value);
-            }
-            Some(crate::types::SessionAffinityFormat::OpenAi) => {
-                headers.insert(
-                    http::HeaderName::from_static("x-client-request-id"),
-                    value.clone(),
-                );
-                headers.insert(
-                    http::HeaderName::from_static("x-session-affinity"),
-                    value.clone(),
-                );
-                if model.spec.cache.send_session_id_header {
-                    headers.insert(http::HeaderName::from_static("session_id"), value);
-                }
-            }
-            // Preserve the pre-format Responses convention for external
-            // configurations that have not selected an explicit format.
-            None => {
-                headers.insert(
-                    http::HeaderName::from_static("x-client-request-id"),
-                    value.clone(),
-                );
-                if model.spec.cache.send_session_id_header {
-                    headers.insert(http::HeaderName::from_static("session_id"), value);
-                }
-            }
-        }
-    }
+    let headers = responses_affinity_headers(model, cache_session_id(&req))?;
 
     Ok(HttpRequestParts {
         url,
@@ -783,6 +976,10 @@ struct ResponsesResponseItemDone {
 
 #[derive(Deserialize)]
 struct ResponsesResponseCompletedBlock {
+    /// Full terminal output is the only authoritative raw replay source. Added
+    /// events are intentionally not used because some servers send skeletons.
+    #[serde(default)]
+    output: Option<Vec<crate::responses::ResponsesItem>>,
     // `usage` is nullable in the Responses object (apidocs
     // openai-responses/01-responses.md: `usage: null` on non-terminal snapshots,
     // populated on completion). Model it as optional so a documented terminal
@@ -793,6 +990,11 @@ struct ResponsesResponseCompletedBlock {
 
 #[derive(Deserialize)]
 struct ResponsesResponseIncompleteBlock {
+    /// Incomplete terminal responses carry the authoritative output produced
+    /// before the limit/refusal stopped generation. Preserve it for exact
+    /// Responses replay just as we do for completed responses.
+    #[serde(default)]
+    output: Option<Vec<crate::responses::ResponsesItem>>,
     // The documented field is `incomplete_details` (object with `reason`), not
     // `status_details` (apidocs openai-responses/01-responses.md:6013,15394).
     incomplete_details: ResponsesIncompleteDetailsDto,
@@ -1233,6 +1435,9 @@ pub(crate) fn decode_stream_event(
                 StopReason::ToolUse
             };
             builder.set_stop_reason(stop);
+            if let Some(output) = response.output.filter(|output| !output.is_empty()) {
+                builder.responses_output = Some(crate::responses::ResponsesOutput::new(output));
+            }
             close_open_tool_calls(&mut events, builder)?;
             // Usage is optional on the wire; only emit a `Usage` event when the
             // provider reported one so `Finished.usage` is a default rather than a
@@ -1252,6 +1457,9 @@ pub(crate) fn decode_stream_event(
                 other => StopReason::Other(other.to_string()),
             };
             builder.set_stop_reason(stop);
+            if let Some(output) = response.output.filter(|output| !output.is_empty()) {
+                builder.responses_output = Some(crate::responses::ResponsesOutput::new(output));
+            }
             close_open_tool_calls(&mut events, builder)?;
 
             if let Some(usage) = &response.usage {
@@ -1331,28 +1539,14 @@ fn map_usage(usage: &ResponsesUsageDto) -> Result<Usage, AiError> {
         .input_tokens
         .saturating_sub(cache_read)
         .saturating_sub(cache_write);
-    let output = if reasoning > usage.output_tokens {
-        usage
-            .output_tokens
-            .checked_add(reasoning)
-            .ok_or(AiError::Decode(DecodeError::UsageUnderflow))?
-    } else {
-        usage.output_tokens
-    };
-    let total = input
-        .checked_add(cache_read)
-        .and_then(|value| value.checked_add(cache_write))
-        .and_then(|value| value.checked_add(output))
-        .ok_or(AiError::Decode(DecodeError::UsageUnderflow))?;
-    Ok(Usage {
-        input_tokens: input,
-        cache_read_tokens: cache_read,
-        cache_write_tokens: cache_write,
-        cache_write_1h_tokens: 0,
-        output_tokens: output,
-        reasoning_tokens: reasoning,
-        total_tokens: total,
-    })
+    crate::responses::normalize_responses_usage(
+        input,
+        cache_read,
+        cache_write,
+        usage.output_tokens,
+        reasoning,
+    )
+    .ok_or(AiError::Decode(DecodeError::UsageUnderflow))
 }
 
 // --- Tests ---
@@ -1389,6 +1583,7 @@ mod tests {
             stop: vec![],
             reasoning: ReasoningConfig::Off,
             reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility,
@@ -1463,6 +1658,7 @@ mod tests {
             stop: vec![],
             reasoning: ReasoningConfig::Off,
             reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -1492,6 +1688,138 @@ mod tests {
         assert_eq!(body["input"][1]["role"], "user");
         assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][1]["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn public_replay_encoder_keeps_opaque_items_and_verbatim_call_ids() {
+        let model = make_test_model(true);
+        let raw = serde_json::json!({
+            "type": "function_call",
+            "id": "fc_provider_item",
+            "call_id": "call_raw|item_exact",
+            "name": "exec",
+            "arguments": "{\"command\":\"pwd\"}",
+            "phase": "commentary",
+            "encrypted_content": "opaque",
+            "programmatic_tool": {"runtime": "python"},
+            "future_field": {"nested": true}
+        });
+        let output =
+            crate::responses::ResponsesOutput::new(vec![crate::responses::ResponsesItem::new(
+                raw.clone(),
+            )
+            .unwrap()]);
+        let replay = vec![
+            crate::responses::ResponsesReplayItem::User(UserMessage {
+                content: vec![UserPart::Text("run it".to_owned())],
+            }),
+            crate::responses::ResponsesReplayItem::Output(output),
+            crate::responses::ResponsesReplayItem::User(UserMessage {
+                content: vec![UserPart::ToolResult(crate::types::ToolResult {
+                    tool_call_id: crate::types::ToolCallId("call_raw|item_exact".to_owned()),
+                    content: vec![crate::types::ToolResultPart::Text("ok".to_owned())],
+                    is_error: false,
+                })],
+            }),
+        ];
+
+        let input = crate::responses::encode_responses_replay(&model, Some("be precise"), &replay);
+        let value = serde_json::to_value(input).unwrap();
+        assert_eq!(value[0]["role"], "developer");
+        assert_eq!(value[2], raw);
+        assert_eq!(value[3]["type"], "function_call_output");
+        assert_eq!(value[3]["call_id"], "call_raw|item_exact");
+    }
+
+    #[test]
+    fn compacted_replay_base_replaces_prior_system_input_verbatim() {
+        let model = make_test_model(true);
+        let compacted = serde_json::json!({
+            "type": "compaction",
+            "id": "cmp_exact",
+            "encrypted_content": "opaque-instructions-and-history"
+        });
+        let replay = vec![
+            crate::responses::ResponsesReplayItem::Compacted(
+                crate::responses::ResponsesOutput::new(vec![
+                    crate::responses::ResponsesItem::new(serde_json::json!({
+                        "type": "message",
+                        "id": "leading-preserved-output"
+                    }))
+                    .unwrap(),
+                    crate::responses::ResponsesItem::new(compacted.clone()).unwrap(),
+                ]),
+            ),
+            crate::responses::ResponsesReplayItem::User(UserMessage {
+                content: vec![UserPart::Text("after checkpoint".to_owned())],
+            }),
+        ];
+
+        let input = crate::responses::encode_responses_replay(
+            &model,
+            Some("must not be reinserted"),
+            &replay,
+        );
+        let value = serde_json::to_value(input).unwrap();
+        assert_eq!(value[0]["id"], "leading-preserved-output");
+        assert_eq!(value[1], compacted);
+        assert_eq!(value[2]["role"], "user");
+        assert!(!value.to_string().contains("must not be reinserted"));
+
+        let mut req = user_req(
+            vec![UserPart::Text("canonical fallback is unused".to_owned())],
+            CompatibilityMode::Strict,
+        );
+        req.system = Some("current instructions".to_owned());
+        req.responses = Some(crate::responses::ResponsesOptions::full_replay(
+            crate::responses::ResponsesInput::new(
+                value
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .map(crate::responses::ResponsesItem::new)
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+            ),
+        ));
+        let parts = build_request(&model, &req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
+        assert_eq!(body["input"][0]["id"], "leading-preserved-output");
+        assert_eq!(body["input"][1], compacted);
+        assert_eq!(body["instructions"], "current instructions");
+        assert!(!body["input"].to_string().contains("current instructions"));
+    }
+
+    #[test]
+    fn full_replay_request_does_not_mix_previous_response_id_or_storage() {
+        let model = make_test_model(true);
+        let mut req = user_req(
+            vec![UserPart::Text("next".to_owned())],
+            CompatibilityMode::Strict,
+        );
+        req.responses = Some(crate::responses::ResponsesOptions::full_replay(
+            crate::responses::ResponsesInput::new(vec![crate::responses::ResponsesItem::new(
+                serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "next"}]
+                }),
+            )
+            .unwrap()]),
+        ));
+
+        let parts = build_request(&model, &req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["store"], false);
+
+        req.responses.as_mut().unwrap().previous_response_id = Some("resp_server".to_owned());
+        let error = match build_request(&model, &req) {
+            Err(error) => error,
+            Ok(_) => panic!("full input plus previous_response_id must be rejected"),
+        };
+        assert!(error.to_string().contains("cannot be used together"));
     }
 
     #[test]
@@ -1779,6 +2107,7 @@ mod tests {
             stop: vec![],
             reasoning: ReasoningConfig::Off,
             reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -1884,6 +2213,7 @@ mod tests {
             stop: vec![],
             reasoning: ReasoningConfig::Off,
             reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
             output_format: OutputFormat::Text,
             output_modalities: OutputModalities::Text,
             compatibility: CompatibilityMode::Strict,
@@ -2143,6 +2473,29 @@ mod fixture_tests {
     }
 
     #[tokio::test]
+    async fn terminal_output_is_authoritative_over_added_item_skeleton() {
+        let stream = br#"data: {"type":"response.created","response":{"id":"resp_raw"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_skeleton","type":"function_call","call_id":"call_skeleton","name":"exec","arguments":"{}"}}
+
+data: {"type":"response.completed","response":{"output":[{"type":"function_call","id":"fc_terminal","call_id":"call_terminal","name":"exec","arguments":"{\"command\":\"pwd\"}","phase":"commentary","unknown":{"kept":true}}]}}
+
+"#;
+        let events = run(stream, 0).await.unwrap();
+        let response = harness::finished(&events);
+        let output = response
+            .responses_output
+            .as_ref()
+            .expect("terminal response output must be retained");
+        assert_eq!(output.items().len(), 1);
+        assert_eq!(output.items()[0].as_json()["id"], "fc_terminal");
+        assert_eq!(output.items()[0].as_json()["call_id"], "call_terminal");
+        assert_eq!(output.items()[0].as_json()["phase"], "commentary");
+        assert_eq!(output.items()[0].as_json()["unknown"]["kept"], true);
+        assert_ne!(output.items()[0].as_json()["id"], "fc_skeleton");
+    }
+
+    #[tokio::test]
     async fn inline_tool_arguments_close_at_response_completion() {
         let events = run(fx!("inline_tool_arguments.sse"), 0).await.unwrap();
         let resp = harness::finished(&events);
@@ -2210,10 +2563,14 @@ mod fixture_tests {
     #[tokio::test]
     async fn incomplete_maps_to_max_tokens() {
         let events = run(fx!("incomplete_max_tokens.sse"), 0).await.unwrap();
-        assert_eq!(
-            harness::finished(&events).stop_reason,
-            StopReason::MaxTokens
-        );
+        let response = harness::finished(&events);
+        assert_eq!(response.stop_reason, StopReason::MaxTokens);
+        let output = response
+            .responses_output
+            .as_ref()
+            .expect("incomplete terminal output must be retained for exact replay");
+        assert_eq!(output.items()[0].as_json()["id"], "msg_terminal_partial");
+        assert_eq!(output.items()[0].as_json()["unknown"]["kept"], "verbatim");
     }
 
     #[tokio::test]

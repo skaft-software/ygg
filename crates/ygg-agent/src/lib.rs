@@ -80,8 +80,8 @@ pub mod tool;
 pub mod tools;
 
 pub use agent::{
-    Agent, AgentConfig, AgentError, CompletionPolicy, RequestContextEstimate, Run, RunControl,
-    RunOutput,
+    Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy, RequestContextEstimate,
+    Run, RunControl, RunOutput,
 };
 pub use cache::{
     analyze_session_cache, analyze_session_cache_stats, CacheMiss, CacheStats,
@@ -95,7 +95,8 @@ pub use compaction::{
 };
 pub use context::ContextSnapshot;
 pub use events::{
-    AgentEvent, CompactionInfo, CompactionReason, Control, FinishReason, OutputChannel,
+    AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
+    OutputChannel,
 };
 pub use extension::{EventObserver, Extension, ExtensionHost, ToolCallHook};
 pub use extension_process::{
@@ -127,7 +128,7 @@ pub use skills::{
 pub use tool::{
     content_hash, CancellationToken, ErasedTool, ErasedToolAdapter, OutputStream, ReplaySafety,
     Tool, ToolContext, ToolDefinition, ToolDescriptor, ToolError, ToolInputRequest,
-    ToolInputResponse, ToolInputValidationIssue, ToolOutput, ToolProgress, ToolProgressSink,
-    TypedTool, TypedToolAdapter, ValidateToolInput, MAX_PROGRESS_CHUNK_BYTES,
+    ToolInputResponse, ToolInputValidationIssue, ToolOutput, ToolOutputMediaKind, ToolProgress,
+    ToolProgressSink, TypedTool, TypedToolAdapter, ValidateToolInput, MAX_PROGRESS_CHUNK_BYTES,
 };
 pub use tools::{BashTool, CoreTools, EditTool, ReadTool, SearchTool, WriteTool};

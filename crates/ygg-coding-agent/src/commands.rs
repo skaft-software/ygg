@@ -2,6 +2,7 @@
 
 use crate::app::{reasoning_label, App, Reconfig};
 use crate::compaction::{context_window, estimate_next_request_tokens};
+use crate::config::CompactionMode;
 use crate::presentation::{format_token_rate, ModelDisplayMetadata};
 use crate::session_store::active_branch_title;
 use ygg_agent::{
@@ -50,7 +51,7 @@ pub enum Command {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoCompactSetting {
-    Enabled(bool),
+    Mode(CompactionMode),
     ThresholdPercent(u8),
 }
 
@@ -132,7 +133,7 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
     slash!("compact", "/compact", "compact conversation context", false),
     slash!(
         "auto-compact",
-        "/auto-compact [on|off|85%]",
+        "/auto-compact [off|local|native|85%]",
         "show or configure automatic compaction",
         true
     ),
@@ -322,10 +323,18 @@ pub fn parse(input: &str) -> Command {
         "auto-compact" => match argument.as_deref() {
             None => Command::AutoCompact(None),
             Some("on" | "true" | "yes") => {
-                Command::AutoCompact(Some(AutoCompactSetting::Enabled(true)))
+                Command::AutoCompact(Some(AutoCompactSetting::Mode(CompactionMode::Local)))
             }
             Some("off" | "false" | "no") => {
-                Command::AutoCompact(Some(AutoCompactSetting::Enabled(false)))
+                Command::AutoCompact(Some(AutoCompactSetting::Mode(CompactionMode::Disabled)))
+            }
+            Some("local") => {
+                Command::AutoCompact(Some(AutoCompactSetting::Mode(CompactionMode::Local)))
+            }
+            Some("native" | "native-responses" | "native_responses" | "responses") => {
+                Command::AutoCompact(Some(AutoCompactSetting::Mode(
+                    CompactionMode::NativeResponses,
+                )))
             }
             Some(value) => value
                 .strip_suffix('%')
@@ -524,6 +533,7 @@ pub fn cost_text(session: &Session, model: &Model) -> String {
                 assistant_turn.to_string()
             }
             UsageRecordKind::Compaction => "cmp".to_owned(),
+            UsageRecordKind::RejectedResponsesTurn => "rejected".to_owned(),
             UsageRecordKind::TerminalGate { returned } => match returned {
                 Some(true) => "gate:R".to_owned(),
                 Some(false) => "gate:C".to_owned(),
@@ -733,6 +743,10 @@ pub(crate) fn status_text_with_metrics(
     let context = token_count(context_estimate);
     let context_window = token_count(context_window(&app.model));
     let display = ModelDisplayMetadata::resolve(&app.model.spec);
+    let provider = app
+        .catalog
+        .endpoint_label(&app.model.endpoint.id)
+        .unwrap_or(&app.model.endpoint.id.0);
     let pricing = model_pricing_text(&app.model);
     let cache_rate = cache_stats
         .hit_rate_basis_points()
@@ -757,9 +771,9 @@ pub(crate) fn status_text_with_metrics(
          Workspace      {}\nSession        {} — {}\nSession cost   {} ({})\nCost guardrails limit {} · turn warning {}\nCache hit rate  {}\nModel turns    {}\nTool calls     {}\nSkills         {} active / {} discovered\n\n\
          Extensions     {}\n\n\
          Security model: local agent with workspace trust gates\nBuilt-in file paths: {}\nFile edits: {}\nFile write: {}\n\
-         Process execution: {}\nShell execution: {}\nOS isolation: none\n\
+         Remote media reads: {}\nProcess execution: {}\nShell execution: {}\nOS isolation: none\n\
          Process privileges: current user\nRepository trust: {}\nQueued reconfiguration: {}",
-        app.model.endpoint.id.0,
+        provider,
         app.model.spec.id.0,
         display.name,
         app.model.spec.api_name,
@@ -786,6 +800,7 @@ pub(crate) fn status_text_with_metrics(
         path_access(sandbox.allow_external_paths),
         gate(sandbox.allow_edit),
         gate(sandbox.allow_write),
+        gate(sandbox.allow_remote_read),
         gate(sandbox.allow_process && sandbox.allow_shell),
         gate(sandbox.allow_process && sandbox.allow_shell),
         if app.config.workspace_trusted {
@@ -821,7 +836,13 @@ mod tests {
         assert_eq!(parse("/auto-compact"), Command::AutoCompact(None));
         assert_eq!(
             parse("/auto-compact off"),
-            Command::AutoCompact(Some(AutoCompactSetting::Enabled(false)))
+            Command::AutoCompact(Some(AutoCompactSetting::Mode(CompactionMode::Disabled)))
+        );
+        assert_eq!(
+            parse("/auto-compact native"),
+            Command::AutoCompact(Some(AutoCompactSetting::Mode(
+                CompactionMode::NativeResponses
+            )))
         );
         assert_eq!(
             parse("/auto-compact 85%"),

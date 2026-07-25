@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ygg_agent::{AgentEvent, FinishReason, ToolError, ToolOutput};
+use ygg_agent::{AgentEvent, FinishReason, ToolError, ToolOutput, ToolOutputMediaKind};
 use ygg_ai::{AssistantPart, ModelSpec, Pricing, TokenRate};
 
 pub fn provider_status_name(canonical: &str) -> String {
@@ -842,6 +842,46 @@ pub struct ToolDisplay {
     pub changed_path: Option<String>,
 }
 
+impl ToolDisplay {
+    /// Marks a completed read with payload-free vision/audio metadata.
+    ///
+    /// Only successful summaries receive the symbols; active and failed reads
+    /// must never imply that the model ingested media.
+    pub fn mark_media_read(&mut self, kinds: &[ToolOutputMediaKind]) {
+        if self.plain_tag != "read" {
+            return;
+        }
+        let mut suffix = String::new();
+        if kinds.contains(&ToolOutputMediaKind::Image) {
+            suffix.push_str("  ◉");
+        }
+        if kinds.contains(&ToolOutputMediaKind::Audio) {
+            suffix.push_str("  ♪");
+        }
+        self.success.push_str(&suffix);
+        self.compact_success.push_str(&suffix);
+    }
+
+    /// Restores media-read metadata from the durable, payload-free result
+    /// summary. Omission markers win, so a locally loaded but unsupported
+    /// media item never gains a successful ingestion symbol after resume.
+    pub fn mark_media_read_from_result(&mut self, result: &str) {
+        let lines = result.lines().collect::<Vec<_>>();
+        let image_accepted = lines.contains(&"read=vision")
+            && !lines.iter().any(|line| line.contains("image omitted:"));
+        let audio_accepted = lines.contains(&"read=audio")
+            && !lines.iter().any(|line| line.contains("audio omitted:"));
+        let mut kinds = Vec::with_capacity(2);
+        if image_accepted {
+            kinds.push(ToolOutputMediaKind::Image);
+        }
+        if audio_accepted {
+            kinds.push(ToolOutputMediaKind::Audio);
+        }
+        self.mark_media_read(&kinds);
+    }
+}
+
 pub fn summarize_tool(name: &str, args: &serde_json::Value) -> ToolDisplay {
     summarize_tool_with_workspace(name, args, None)
 }
@@ -1485,6 +1525,47 @@ mod tests {
         );
         assert_eq!(tests.active, "running cargo test --workspace");
         assert_eq!(tests.plain_tag, "bash");
+    }
+
+    #[test]
+    fn completed_media_reads_gain_payload_free_symbols() {
+        let mut read = summarize_tool("read", &serde_json::json!({"path":"capture.bin"}));
+        let active = read.active.clone();
+        let failure = read.failure.clone();
+        read.mark_media_read(&[ToolOutputMediaKind::Image, ToolOutputMediaKind::Audio]);
+
+        assert_eq!(read.active, active);
+        assert_eq!(read.failure, failure);
+        assert!(read.success.ends_with("  ◉  ♪"), "{}", read.success);
+        assert!(
+            read.compact_success.ends_with("  ◉  ♪"),
+            "{}",
+            read.compact_success
+        );
+        assert!(!read.success.contains("capture bytes"));
+    }
+
+    #[test]
+    fn non_read_tools_ignore_media_read_metadata() {
+        let mut bash = summarize_tool("bash", &serde_json::json!({"command":"true"}));
+        let success = bash.success.clone();
+        bash.mark_media_read(&[ToolOutputMediaKind::Image]);
+        assert_eq!(bash.success, success);
+    }
+
+    #[test]
+    fn hydrated_media_read_symbols_require_successful_ingestion_metadata() {
+        let mut accepted = summarize_tool("read", &serde_json::json!({"path":"memo.wav"}));
+        accepted
+            .mark_media_read_from_result("memo.wav: media=audio/wav bytes=12 hash=abc\nread=audio");
+        assert!(accepted.success.ends_with("  ♪"), "{}", accepted.success);
+
+        let mut omitted = summarize_tool("read", &serde_json::json!({"path":"memo.wav"}));
+        omitted.mark_media_read_from_result(
+            "memo.wav: media=audio/wav bytes=12 hash=abc\nread=audio\n\
+             [audio omitted: the active model does not accept audio input]",
+        );
+        assert!(!omitted.success.contains('♪'), "{}", omitted.success);
     }
 
     #[test]

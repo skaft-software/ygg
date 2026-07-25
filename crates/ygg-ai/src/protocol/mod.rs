@@ -14,14 +14,28 @@ pub(crate) struct CacheControl {
 }
 
 pub(crate) fn cache_session_id(req: &Request) -> Option<&str> {
-    (req.cache_retention != CacheRetention::None)
-        .then_some(req.session_id.as_deref())
+    cache_session_id_for(req.cache_retention, req.session_id.as_deref())
+}
+
+pub(crate) fn cache_session_id_for(
+    retention: CacheRetention,
+    session_id: Option<&str>,
+) -> Option<&str> {
+    (retention != CacheRetention::None)
+        .then_some(session_id)
         .flatten()
         .filter(|id| !id.is_empty())
 }
 
 pub(crate) fn prompt_cache_key(req: &Request) -> Option<String> {
-    let id = cache_session_id(req)?;
+    prompt_cache_key_for(req.cache_retention, req.session_id.as_deref())
+}
+
+pub(crate) fn prompt_cache_key_for(
+    retention: CacheRetention,
+    session_id: Option<&str>,
+) -> Option<String> {
+    let id = cache_session_id_for(retention, session_id)?;
     let key: String = id.chars().take(64).collect();
     (!key.is_empty()).then_some(key)
 }
@@ -172,6 +186,59 @@ fn normalize_invalid_tool_call_id(id: &str) -> String {
         .map(char::from)
         .collect();
     format!("{prefix}_{hash_hex}")
+}
+
+pub(crate) struct Base64Bytes(bytes::Bytes);
+
+impl From<&bytes::Bytes> for Base64Bytes {
+    fn from(value: &bytes::Bytes) -> Self {
+        Self(value.clone())
+    }
+}
+
+impl serde::Serialize for Base64Bytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(&base64::display::Base64Display::new(
+            &self.0,
+            &base64::engine::general_purpose::STANDARD,
+        ))
+    }
+}
+
+pub(crate) enum WireImageUrl {
+    Url(String),
+    Inline {
+        media_type: String,
+        data: bytes::Bytes,
+    },
+}
+
+impl std::fmt::Display for WireImageUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Url(url) => formatter.write_str(url),
+            Self::Inline { media_type, data } => write!(
+                formatter,
+                "data:{media_type};base64,{}",
+                base64::display::Base64Display::new(
+                    data,
+                    &base64::engine::general_purpose::STANDARD,
+                )
+            ),
+        }
+    }
+}
+
+impl serde::Serialize for WireImageUrl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
 }
 
 /// Protocol-agnostic HTTP request components prepared by a codec.

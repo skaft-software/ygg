@@ -116,6 +116,8 @@ fn entry_kind(entry: &Entry) -> &'static str {
         EntryValue::Message(ygg_ai::Message::User(_)) => "user",
         EntryValue::Message(ygg_ai::Message::Assistant(_)) => "assistant",
         EntryValue::Compaction { .. } => "compaction",
+        EntryValue::ResponsesTurn { .. } => "responses-turn",
+        EntryValue::ResponsesCompaction { .. } => "responses-compaction",
         EntryValue::Config { .. } => "config",
         EntryValue::PromptTemplateSelected { .. } => "prompt-template",
         EntryValue::SkillActivated { .. } => "skill-activated",

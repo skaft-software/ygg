@@ -5,6 +5,7 @@ use crate::compaction::{
     context_window, estimate_messages_tokens, estimate_next_request_tokens,
     estimate_pending_tokens, estimate_text_tokens,
 };
+use crate::config::CompactionMode;
 use crate::tui::theme::YggTheme;
 use crate::tui::view::{fit_line, sanitize_for_terminal};
 
@@ -55,7 +56,7 @@ pub(crate) struct ContextReport {
     context_window: u64,
     estimated_input: u64,
     output_reserve: u64,
-    auto_compact_enabled: bool,
+    compaction_mode: CompactionMode,
     auto_compact_threshold: u64,
     keep_recent_turns: usize,
     slices: Vec<ContextSlice>,
@@ -102,8 +103,10 @@ impl ContextReport {
         let tokenizer_adjustment = categorized_input.saturating_sub(estimated_input);
         let context_window = context_window(&app.model);
         let output_reserve = app.agent.max_output_tokens();
-        let (auto_compact_enabled, threshold_fraction, keep_recent_turns) =
-            app.agent.compaction_policy();
+        let compaction_mode = app.config.compaction.mode;
+        let auto_compact_enabled = compaction_mode.enabled();
+        let threshold_fraction = app.config.compaction.threshold_fraction;
+        let keep_recent_turns = app.config.compaction.keep_recent_turns;
         let auto_compact_threshold = if auto_compact_enabled {
             ((context_window as f64) * threshold_fraction).floor() as u64
         } else {
@@ -193,7 +196,7 @@ impl ContextReport {
             context_window,
             estimated_input,
             output_reserve,
-            auto_compact_enabled,
+            compaction_mode,
             auto_compact_threshold,
             keep_recent_turns,
             slices,
@@ -216,9 +219,10 @@ impl ContextReport {
             ),
             width,
         ));
-        let policy = if self.auto_compact_enabled {
+        let policy = if self.compaction_mode.enabled() {
             format!(
-                "auto-compact at {} ({:.0}%) · keeps {} recent turn{}",
+                "auto-compact {} at {} ({:.0}%) · keeps {} recent turn{}",
+                self.compaction_mode.label(),
                 compact_tokens(self.auto_compact_threshold),
                 if self.context_window == 0 {
                     0.0
@@ -351,7 +355,7 @@ mod tests {
             context_window: 200_000,
             estimated_input: 133_000,
             output_reserve: 32_000,
-            auto_compact_enabled: true,
+            compaction_mode: CompactionMode::Local,
             auto_compact_threshold: 170_000,
             keep_recent_turns: 4,
             slices: vec![

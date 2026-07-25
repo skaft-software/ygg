@@ -5,10 +5,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use serde::de::{IgnoredAny, Visitor};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use ygg_agent::{EntryId, EntryValue, Session};
-use ygg_ai::{Message, UserPart};
+use ygg_ai::{EndpointId, Message, ModelId, Protocol, UserPart};
 
 static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
@@ -69,6 +69,8 @@ struct SummaryEntry {
     kind: SummaryEntryKind,
     title: Option<String>,
     position: u32,
+    assistant_model: Option<ModelId>,
+    assistant_protocol: Option<Protocol>,
 }
 
 fn summary_ancestry_intervals(entries: &HashMap<EntryId, SummaryEntry>) -> (Vec<u32>, Vec<u32>) {
@@ -173,14 +175,288 @@ struct SummaryUserMessage {
 #[derive(Deserialize)]
 enum SummaryMessage {
     User(SummaryUserMessage),
-    Assistant(IgnoredAny),
+    Assistant(SummaryAssistantMessage),
+}
+
+#[derive(Deserialize)]
+struct SummaryAssistantMessage {
+    model: ModelId,
+    protocol: Protocol,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SummaryResponsesField {
+    Type,
+    EncryptedContent,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for SummaryResponsesField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = SummaryResponsesField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Responses item field")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(value)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(match value {
+                    "type" => SummaryResponsesField::Type,
+                    "encrypted_content" => SummaryResponsesField::EncryptedContent,
+                    _ => SummaryResponsesField::Other,
+                })
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IsCompaction(bool);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct IsNonEmptyString(bool);
+
+macro_rules! impl_summary_string_probe {
+    ($name:ident, $predicate:expr, $expected:literal) => {
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct ProbeVisitor;
+
+                impl<'de> Visitor<'de> for ProbeVisitor {
+                    type Value = $name;
+
+                    fn expecting(
+                        &self,
+                        formatter: &mut std::fmt::Formatter<'_>,
+                    ) -> std::fmt::Result {
+                        formatter.write_str($expected)
+                    }
+
+                    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        Ok($name(($predicate)(value)))
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        Ok($name(($predicate)(value)))
+                    }
+
+                    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                        Ok($name(false))
+                    }
+
+                    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                        Ok($name(false))
+                    }
+
+                    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                        Ok($name(false))
+                    }
+
+                    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                        Ok($name(false))
+                    }
+
+                    fn visit_none<E>(self) -> Result<Self::Value, E> {
+                        Ok($name(false))
+                    }
+
+                    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                        Ok($name(false))
+                    }
+
+                    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+                    where
+                        D: Deserializer<'de>,
+                    {
+                        deserializer.deserialize_any(self)
+                    }
+
+                    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: SeqAccess<'de>,
+                    {
+                        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+                        Ok($name(false))
+                    }
+
+                    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+                    where
+                        A: MapAccess<'de>,
+                    {
+                        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                        Ok($name(false))
+                    }
+                }
+
+                deserializer.deserialize_any(ProbeVisitor)
+            }
+        }
+    };
+}
+
+impl_summary_string_probe!(
+    IsCompaction,
+    |value: &str| value == "compaction",
+    "the Responses item type"
+);
+impl_summary_string_probe!(
+    IsNonEmptyString,
+    |value: &str| !value.is_empty(),
+    "opaque encrypted Responses content"
+);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SummaryResponsesItem {
+    is_compaction: bool,
+    has_encrypted_content: bool,
+}
+
+impl<'de> Deserialize<'de> for SummaryResponsesItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ItemVisitor;
+
+        impl<'de> Visitor<'de> for ItemVisitor {
+            type Value = SummaryResponsesItem;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Responses item object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut item = SummaryResponsesItem::default();
+                while let Some(field) = map.next_key::<SummaryResponsesField>()? {
+                    match field {
+                        SummaryResponsesField::Type => {
+                            item.is_compaction = map.next_value::<IsCompaction>()?.0;
+                        }
+                        SummaryResponsesField::EncryptedContent => {
+                            item.has_encrypted_content = map.next_value::<IsNonEmptyString>()?.0;
+                        }
+                        SummaryResponsesField::Other => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(item)
+            }
+        }
+
+        deserializer.deserialize_map(ItemVisitor)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SummaryResponsesOutput {
+    is_empty: bool,
+    has_valid_compaction: bool,
+}
+
+impl SummaryResponsesOutput {
+    fn is_empty(&self) -> bool {
+        self.is_empty
+    }
+
+    fn has_valid_compaction(&self) -> bool {
+        self.has_valid_compaction
+    }
+}
+
+impl<'de> Deserialize<'de> for SummaryResponsesOutput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OutputVisitor;
+
+        impl<'de> Visitor<'de> for OutputVisitor {
+            type Value = SummaryResponsesOutput;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a Responses output array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut item_count = 0usize;
+                let mut compaction_count = 0usize;
+                let mut valid_compaction_count = 0usize;
+                while let Some(item) = sequence.next_element::<SummaryResponsesItem>()? {
+                    item_count = item_count.saturating_add(1);
+                    if item.is_compaction {
+                        compaction_count = compaction_count.saturating_add(1);
+                        if item.has_encrypted_content {
+                            valid_compaction_count = valid_compaction_count.saturating_add(1);
+                        }
+                    }
+                }
+                Ok(SummaryResponsesOutput {
+                    is_empty: item_count == 0,
+                    has_valid_compaction: compaction_count == 1 && valid_compaction_count == 1,
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(OutputVisitor)
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SummaryEntryValue {
     Message(SummaryMessage),
-    Compaction { first_kept: EntryId },
+    Compaction {
+        first_kept: EntryId,
+    },
+    ResponsesTurn {
+        assistant: EntryId,
+        #[serde(rename = "endpoint")]
+        _endpoint: EndpointId,
+        model: ModelId,
+        output: SummaryResponsesOutput,
+    },
+    ResponsesCompaction {
+        covered_through: EntryId,
+        #[serde(rename = "endpoint")]
+        _endpoint: EndpointId,
+        #[serde(rename = "model")]
+        _model: ModelId,
+        output: SummaryResponsesOutput,
+    },
     Config {},
     PromptTemplateSelected {},
     SkillActivated {},
@@ -191,8 +467,15 @@ enum SummaryEntryValue {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SummaryUsageKind {
-    AssistantTurn { assistant: EntryId },
+    AssistantTurn {
+        assistant: EntryId,
+    },
     Compaction,
+    RejectedResponsesTurn,
+    TerminalGate {
+        #[serde(rename = "returned")]
+        _returned: Option<bool>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -416,17 +699,19 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                     }
                 }
 
-                let (kind, title) = match value {
+                let (kind, title, assistant_route) = match value {
                     SummaryEntryValue::Message(SummaryMessage::User(message)) => {
                         let title = message.content.into_iter().find_map(|part| match part {
                             SummaryUserPart::Text(TitleText(title)) => Some(title),
                             SummaryUserPart::Media(_) | SummaryUserPart::ToolResult(_) => None,
                         });
-                        (SummaryEntryKind::User, title)
+                        (SummaryEntryKind::User, title, None)
                     }
-                    SummaryEntryValue::Message(SummaryMessage::Assistant(_)) => {
-                        (SummaryEntryKind::Assistant, None)
-                    }
+                    SummaryEntryValue::Message(SummaryMessage::Assistant(message)) => (
+                        SummaryEntryKind::Assistant,
+                        None,
+                        Some((message.model, message.protocol)),
+                    ),
                     SummaryEntryValue::Compaction { first_kept } => {
                         if !entries.contains_key(&first_kept) {
                             return Err(corrupt_summary(
@@ -437,14 +722,64 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                                 ),
                             ));
                         }
-                        (SummaryEntryKind::Other, None)
+                        (SummaryEntryKind::Other, None, None)
+                    }
+                    SummaryEntryValue::ResponsesTurn {
+                        assistant,
+                        model,
+                        output,
+                        ..
+                    } => {
+                        let valid_assistant = entries.get(&assistant).is_some_and(|candidate| {
+                            candidate.kind == SummaryEntryKind::Assistant
+                                && candidate.assistant_protocol == Some(Protocol::OpenAiResponses)
+                                && candidate.assistant_model.as_ref() == Some(&model)
+                        });
+                        if !valid_assistant
+                            || parent.as_ref() != Some(&assistant)
+                            || output.is_empty()
+                        {
+                            return Err(corrupt_summary(
+                                line_no,
+                                format!(
+                                    "Responses turn {:?} is not a direct sidecar of assistant {:?}",
+                                    id.0, assistant.0
+                                ),
+                            ));
+                        }
+                        (SummaryEntryKind::Other, None, None)
+                    }
+                    SummaryEntryValue::ResponsesCompaction {
+                        covered_through,
+                        output,
+                        ..
+                    } => {
+                        if !entries.contains_key(&covered_through)
+                            || parent.as_ref() != Some(&covered_through)
+                            || !output.has_valid_compaction()
+                        {
+                            return Err(corrupt_summary(
+                                line_no,
+                                format!(
+                                    "Responses compaction {:?} is not a direct checkpoint of {:?}",
+                                    id.0, covered_through.0
+                                ),
+                            ));
+                        }
+                        (SummaryEntryKind::Other, None, None)
                     }
                     SummaryEntryValue::Config {}
                     | SummaryEntryValue::PromptTemplateSelected {}
                     | SummaryEntryValue::SkillActivated {}
                     | SummaryEntryValue::SkillResourceRead {}
-                    | SummaryEntryValue::SkillDeactivated {} => (SummaryEntryKind::Other, None),
+                    | SummaryEntryValue::SkillDeactivated {} => {
+                        (SummaryEntryKind::Other, None, None)
+                    }
                 };
+                let (assistant_model, assistant_protocol) = assistant_route
+                    .map_or((None, None), |(model, protocol)| {
+                        (Some(model), Some(protocol))
+                    });
                 let position = u32::try_from(entries.len()).expect("session record limit fits u32");
                 entries.insert(
                     id,
@@ -453,6 +788,8 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                         kind,
                         title,
                         position,
+                        assistant_model,
+                        assistant_protocol,
                     },
                 );
             }
@@ -981,6 +1318,160 @@ mod tests {
         let error = summarize_session(&path).unwrap_err();
         assert!(error.to_string().contains("line 12"), "{error:#}");
         assert!(error.to_string().contains("not an ancestor"), "{error:#}");
+    }
+
+    #[test]
+    fn lightweight_summary_validates_responses_sidecar_structure() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bad-responses-turn.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("title".into())],
+            })))
+            .unwrap();
+        let assistant = session
+            .append(EntryValue::Message(Message::Assistant(
+                ygg_ai::AssistantMessage {
+                    content: vec![ygg_ai::AssistantPart::Text("answer".into())],
+                    model: ModelId("model-a".into()),
+                    protocol: Protocol::OpenAiResponses,
+                },
+            )))
+            .unwrap();
+        drop(session);
+
+        let malformed = serde_json::json!({
+            "type": "entry",
+            "id": "999",
+            "parent": assistant,
+            "value": {
+                "type": "responses_turn",
+                "assistant": assistant,
+                "endpoint": "responses",
+                "model": "model-b",
+                "output": [{"type": "message"}]
+            }
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        serde_json::to_writer(&mut file, &malformed).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        let error = summarize_session(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is not a direct sidecar of assistant"),
+            "{error:#}"
+        );
+
+        let compact_path = directory.path().join("bad-responses-compact.jsonl");
+        let mut session = Session::create(&compact_path).unwrap();
+        let first = session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("compact title".into())],
+            })))
+            .unwrap();
+        let second = session
+            .append(EntryValue::Config {
+                model: None,
+                reasoning: None,
+                reasoning_mode: None,
+            })
+            .unwrap();
+        drop(session);
+        let malformed = serde_json::json!({
+            "type": "entry",
+            "id": "999",
+            "parent": second,
+            "value": {
+                "type": "responses_compaction",
+                "endpoint": "responses",
+                "model": "model-a",
+                "covered_through": first,
+                "output": [{"type": "compaction"}]
+            }
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&compact_path)
+            .unwrap();
+        serde_json::to_writer(&mut file, &malformed).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+        let error = summarize_session(&compact_path).unwrap_err();
+        assert!(
+            error.to_string().contains("is not a direct checkpoint"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn lightweight_responses_output_matches_full_compaction_validation() {
+        let cases = [
+            serde_json::json!([]),
+            serde_json::json!([{"type": "message", "content": "ignored"}]),
+            serde_json::json!([{"type": "compaction"}]),
+            serde_json::json!([{"type": "compaction", "encrypted_content": ""}]),
+            serde_json::json!([{"type": "compaction", "encrypted_content": 42}]),
+            serde_json::json!([{"type": "compaction", "encrypted_content": "opaque"}]),
+            serde_json::json!([
+                {"type": "message", "future": {"large": [1, 2, 3]}},
+                {"type": "compaction", "encrypted_content": "opaque"}
+            ]),
+            serde_json::json!([
+                {"type": "compaction", "encrypted_content": "one"},
+                {"type": "compaction", "encrypted_content": "two"}
+            ]),
+        ];
+
+        for value in cases {
+            let summary: SummaryResponsesOutput = serde_json::from_value(value.clone()).unwrap();
+            let full: ygg_ai::ResponsesOutput = serde_json::from_value(value).unwrap();
+            assert_eq!(summary.is_empty(), full.is_empty());
+            assert_eq!(summary.has_valid_compaction(), full.has_valid_compaction());
+        }
+    }
+
+    #[test]
+    fn lightweight_summary_accepts_non_assistant_usage_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage-kinds.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("usage title".into())],
+            })))
+            .unwrap();
+        session
+            .record_rejected_responses_turn_usage(
+                ygg_ai::EndpointId("responses".into()),
+                ModelId("model".into()),
+                ygg_ai::Usage::default(),
+                None,
+            )
+            .unwrap();
+        session
+            .record_terminal_gate_usage(
+                ygg_ai::EndpointId("responses".into()),
+                ModelId("model".into()),
+                ygg_ai::Usage::default(),
+                None,
+                None,
+            )
+            .unwrap();
+        drop(session);
+
+        assert_eq!(
+            summarize_session(&path).unwrap().as_deref(),
+            Some("usage title")
+        );
     }
 
     #[test]

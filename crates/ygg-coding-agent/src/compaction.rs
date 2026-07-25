@@ -27,6 +27,7 @@ const AUDIO_TOKENS: u64 = 8_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionOutcome {
     Compacted { elided: usize },
+    NativeCompacted,
     Skipped { reason: String },
 }
 
@@ -121,36 +122,27 @@ pub fn estimate_pending_tokens(pending: &[InputPart]) -> u64 {
 /// Estimate the complete next request rather than calibrating from cumulative
 /// provider usage, which would misrepresent a multi-turn run.
 pub fn estimate_next_request_tokens(app: &App, pending: &[InputPart]) -> u64 {
-    let context = app
+    let current_request = app
         .agent
-        .session()
-        .context_ref()
-        .map(|messages| estimate_messages_tokens(&messages))
-        .unwrap_or_default();
-    let active_skill_tokens = app
-        .agent
-        .session()
-        .head_ref()
-        .and_then(|head| app.agent.session().resolve_active_skills(head).ok())
-        .map(|state| {
-            state
-                .active_skills
-                .iter()
-                .map(|skill| estimate_text_tokens(&skill.instructions))
-                .sum::<u64>()
-        })
-        .unwrap_or_default();
-    context
-        .saturating_add(app.system_tokens)
-        .saturating_add(active_skill_tokens)
-        .saturating_add(app.tool_schema_tokens)
+        .request_context_estimate()
+        .map(|estimate| estimate.input_tokens)
+        .unwrap_or_else(|_| {
+            app.agent
+                .session()
+                .context_ref()
+                .map(|messages| estimate_messages_tokens(&messages))
+                .unwrap_or_default()
+                .saturating_add(app.system_tokens)
+                .saturating_add(app.tool_schema_tokens)
+                .saturating_add(FRAMING_OVERHEAD_TOKENS)
+        });
+    current_request
         .saturating_add(estimate_pending_tokens(pending))
         .saturating_add(if pending.is_empty() {
             0
         } else {
             PER_MESSAGE_OVERHEAD_TOKENS
         })
-        .saturating_add(FRAMING_OVERHEAD_TOKENS)
 }
 
 /// Full model context window used as the denominator in presentation. Output
@@ -207,6 +199,8 @@ fn previous_message_is_user(session: &Session, entry: &ygg_agent::Entry) -> bool
             EntryValue::Message(Message::User(user)) => return !user.content.is_empty(),
             EntryValue::Message(Message::Assistant(_)) => return false,
             EntryValue::Compaction { .. }
+            | EntryValue::ResponsesTurn { .. }
+            | EntryValue::ResponsesCompaction { .. }
             | EntryValue::Config { .. }
             | EntryValue::PromptTemplateSelected { .. }
             | EntryValue::SkillActivated { .. }
@@ -257,6 +251,7 @@ async fn compaction_call(
         stop: vec![],
         reasoning: ReasoningConfig::Off,
         reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        responses: None,
         output_format: OutputFormat::Text,
         output_modalities: OutputModalities::Text,
         compatibility: ygg_ai::CompatibilityMode::Strict,
@@ -320,6 +315,15 @@ pub async fn summarize(
 
 /// Attempt one nonfatal semantic-boundary compaction.
 pub async fn attempt_compaction(app: &mut App) -> anyhow::Result<CompactionOutcome> {
+    if app.config.compaction.mode == crate::config::CompactionMode::NativeResponses {
+        return Ok(match app.agent.compact_responses_native().await {
+            Ok(_) => CompactionOutcome::NativeCompacted,
+            Err(error) => CompactionOutcome::Skipped {
+                reason: error.to_string(),
+            },
+        });
+    }
+
     let first_kept =
         match choose_first_kept(app.agent.session(), app.config.compaction.keep_recent_turns) {
             Some(entry) => entry,
