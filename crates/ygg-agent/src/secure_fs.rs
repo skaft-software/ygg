@@ -393,8 +393,26 @@ mod imp {
                 if cancelled() {
                     return Err(SecureFileError::Cancelled);
                 }
-                rustix::fs::renameat(&self.parent, &temp_name, &self.parent, &self.name)
-                    .map_err(|error| SecureFileError::Io(io_error(error)))?;
+                if self.original.is_none() {
+                    // Publishing a newly created file through a hard link is an
+                    // atomic no-replace operation. A plain rename here would
+                    // overwrite a target created after `unchanged()` returned.
+                    match rustix::fs::linkat(
+                        &self.parent,
+                        &temp_name,
+                        &self.parent,
+                        &self.name,
+                        AtFlags::empty(),
+                    ) {
+                        Ok(()) => rustix::fs::unlinkat(&self.parent, &temp_name, AtFlags::empty())
+                            .map_err(|error| SecureFileError::Io(io_error(error)))?,
+                        Err(Errno::EXIST) => return Err(SecureFileError::Changed),
+                        Err(error) => return Err(SecureFileError::Io(io_error(error))),
+                    }
+                } else {
+                    rustix::fs::renameat(&self.parent, &temp_name, &self.parent, &self.name)
+                        .map_err(|error| SecureFileError::Io(io_error(error)))?;
+                }
                 rustix::fs::fsync(&self.parent)
                     .map_err(|error| SecureFileError::Io(io_error(error)))?;
                 Ok(())
@@ -569,6 +587,30 @@ mod tests {
             Err(SecureFileError::Changed)
         ));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "version two");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_created_immediately_before_publish_is_not_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("target.txt");
+        let prepared = PreparedMutation::prepare(&path, false, 1024).unwrap();
+        let cancellation_checks = std::cell::Cell::new(0);
+
+        let result = prepared.commit_if(b"stale replacement", || {
+            let check = cancellation_checks.get() + 1;
+            cancellation_checks.set(check);
+            // The third check occurs after the final unchanged-state check and
+            // immediately before publication.
+            if check == 3 {
+                std::fs::write(&path, "competing creation").unwrap();
+            }
+            false
+        });
+
+        assert!(matches!(result, Err(SecureFileError::Changed)));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "competing creation");
     }
 
     #[cfg(unix)]

@@ -13,6 +13,8 @@ use tokio::time::MissedTickBehavior;
 use ygg_agent::{AgentEvent, OutputChannel};
 use ygg_ai::ToolCallId;
 
+use sexy_tui_rs::{sanitize_text, ControlPictures, SanitizeOptions};
+
 use crate::app::bootstrap::{build_app, resolve_launch_print, Bootstrap};
 use crate::modes::{timestamp, RunEnded};
 use crate::presentation::{
@@ -83,20 +85,15 @@ fn finish_one_shot(exit: PromptExit) -> anyhow::Result<()> {
 }
 
 fn safe_text(raw: &str) -> String {
-    let mut safe = String::with_capacity(raw.len());
-    let mut characters = raw.chars().peekable();
-    while let Some(character) = characters.next() {
-        match character {
-            '\r' if characters.peek() == Some(&'\n') => {
-                characters.next();
-                safe.push('\n');
-            }
-            '\n' | '\t' => safe.push(character),
-            value if value.is_control() => safe.push('·'),
-            value => safe.push(value),
-        }
-    }
-    safe
+    sanitize_text(
+        raw,
+        SanitizeOptions {
+            controls: ControlPictures::Ascii,
+            preserve_newlines: true,
+            preserve_tabs: true,
+        },
+    )
+    .into_owned()
 }
 
 fn style_log(theme: &YggTheme, line: &str) -> String {
@@ -687,8 +684,9 @@ mod tests {
 
     #[test]
     fn plain_text_neutralizes_terminal_controls() {
-        assert_eq!(safe_text("a\x1b[31m\x07"), "a·[31m·");
-        assert_eq!(safe_text("a\r\nb\rc"), "a\nb·c");
+        assert_eq!(safe_text("a\x1b[31m\x07"), "a^[[31m<BEL>");
+        assert_eq!(safe_text("a\r\nb\rc"), "a\nb\nc");
+        assert_eq!(safe_text("a\u{202e}b"), "a<U+202E>b");
     }
 
     #[test]

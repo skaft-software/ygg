@@ -2203,6 +2203,35 @@ impl Drop for PendingRegistration {
     }
 }
 
+/// Marks a process connection unusable if an in-progress framed write is
+/// cancelled or fails. Retrying on the same pipe could append to a partial JSON
+/// line and desynchronize every later request.
+struct FramedWriteGuard<'a> {
+    closed: &'a AtomicBool,
+    armed: bool,
+}
+
+impl<'a> FramedWriteGuard<'a> {
+    fn new(closed: &'a AtomicBool) -> Self {
+        Self {
+            closed,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FramedWriteGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.closed.store(true, Ordering::Release);
+        }
+    }
+}
+
 impl ProcessConnection {
     async fn request(
         &self,
@@ -2317,6 +2346,12 @@ impl ProcessConnection {
             });
         }
         let mut stdin = self.stdin.lock().await;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ExtensionRuntimeError::Closed(
+                "extension connection is closed".into(),
+            ));
+        }
+        let mut framed_write = FramedWriteGuard::new(&self.closed);
         stdin
             .write_all(&line)
             .await
@@ -2324,7 +2359,9 @@ impl ProcessConnection {
         stdin
             .flush()
             .await
-            .map_err(|error| ExtensionRuntimeError::Closed(error.to_string()))
+            .map_err(|error| ExtensionRuntimeError::Closed(error.to_string()))?;
+        framed_write.disarm();
+        Ok(())
     }
 
     async fn shutdown(&self) -> bool {
@@ -3437,6 +3474,50 @@ sleep 30
         );
         assert!(lock_std_mutex(&connection.pending).is_empty());
         assert!(!process.shutdown().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_framed_write_closes_the_connection() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("blocked-stdin.sh");
+        write_executable_script(
+            &script_path,
+            r#"#!/bin/sh
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"api_version":"0.1","tools":[],"commands":[]}}'
+sleep 30
+"#,
+        );
+        let descriptor = trusted_descriptor(
+            temp.path(),
+            minimal_manifest("blocked-stdin", "blocked-stdin.sh"),
+        );
+        let mut config = ExtensionRuntimeConfig::new(temp.path());
+        config.max_message_bytes = 5 * 1024 * 1024;
+        config.shutdown_timeout = Duration::from_millis(50);
+        let process = ExtensionProcess::start(descriptor, config)
+            .await
+            .expect("start process");
+        let connection = read_std_lock(&process.inner.connection).clone();
+
+        let error = connection
+            .request(
+                "probe/large",
+                serde_json::json!({"payload": "x".repeat(4 * 1024 * 1024)}),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("blocked framed write must time out");
+        assert!(matches!(error, ExtensionRuntimeError::Timeout { .. }));
+        assert!(connection.closed.load(Ordering::Acquire));
+        assert!(matches!(
+            connection
+                .request("probe/after", serde_json::json!({}), Duration::from_secs(1))
+                .await,
+            Err(ExtensionRuntimeError::Closed(_))
+        ));
+        connection.terminate().await;
     }
 
     #[cfg(unix)]

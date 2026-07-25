@@ -181,13 +181,93 @@ pub enum CredentialScheme {
 pub type CredentialResolverRegistry =
     std::collections::HashMap<String, std::sync::Arc<dyn CredentialResolver>>;
 
-/// Resolves authentication settings into a concrete HeaderMap.
-pub(crate) async fn resolve_headers(auth: &Auth) -> Result<http::HeaderMap, AuthError> {
+/// Resolved request headers paired with the credential values that must never
+/// reappear in provider or transport diagnostics.
+pub(crate) struct ResolvedHeaders {
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) redactor: CredentialRedactor,
+}
+
+/// Exact-match redactor for credentials used by one request.
+///
+/// The values remain wrapped in [`Secret`] so accidental `Debug`/`Display`
+/// formatting cannot expose them while the response stream is alive.
+#[derive(Clone, Default)]
+pub(crate) struct CredentialRedactor {
+    values: Vec<Secret>,
+}
+
+impl CredentialRedactor {
+    fn insert(&mut self, value: Secret) {
+        if value.expose().is_empty()
+            || self
+                .values
+                .iter()
+                .any(|existing| existing.expose() == value.expose())
+        {
+            return;
+        }
+        self.values.push(value);
+    }
+
+    /// Treat endpoint-default header values as sensitive configuration. These
+    /// headers are already fully redacted from [`crate::types::Endpoint`]'s
+    /// `Debug` output and commonly carry gateway API keys.
+    pub(crate) fn include_header_values(&mut self, headers: &http::HeaderMap) {
+        for value in headers.values() {
+            // `HeaderValue::to_str` accepts only visible ASCII, while valid
+            // HTTP field values may contain UTF-8 bytes. Preserve every value
+            // that can reappear verbatim in a provider's UTF-8 diagnostic.
+            if let Ok(value) = std::str::from_utf8(value.as_bytes()) {
+                self.insert(Secret::from(value));
+            }
+        }
+    }
+
+    /// Replaces every exact credential occurrence without rescanning the
+    /// replacement marker. Longest matches win when credentials overlap.
+    pub(crate) fn redact(&self, input: &str) -> String {
+        const MARKER: &str = "[REDACTED]";
+
+        let mut output = String::with_capacity(input.len());
+        let mut position = 0usize;
+        while position < input.len() {
+            let next = self
+                .values
+                .iter()
+                .filter_map(|value| {
+                    let value = value.expose();
+                    input[position..]
+                        .find(value)
+                        .map(|offset| (position + offset, value.len()))
+                })
+                .min_by(|(left_start, left_len), (right_start, right_len)| {
+                    left_start
+                        .cmp(right_start)
+                        .then_with(|| right_len.cmp(left_len))
+                });
+            let Some((start, length)) = next else {
+                output.push_str(&input[position..]);
+                break;
+            };
+            output.push_str(&input[position..start]);
+            output.push_str(MARKER);
+            position = start + length;
+        }
+        output
+    }
+}
+
+/// Resolves authentication settings into concrete headers and a request-scoped
+/// credential redactor.
+pub(crate) async fn resolve_headers(auth: &Auth) -> Result<ResolvedHeaders, AuthError> {
     let mut headers = http::HeaderMap::new();
+    let mut redactor = CredentialRedactor::default();
 
     match auth {
         Auth::None => {}
         Auth::Bearer(secret) => {
+            redactor.insert(secret.clone());
             let bearer_str = format!("Bearer {}", secret.expose());
             let mut val = http::HeaderValue::from_str(&bearer_str)
                 .map_err(|_| AuthError::InvalidHeaderValue)?;
@@ -195,6 +275,7 @@ pub(crate) async fn resolve_headers(auth: &Auth) -> Result<http::HeaderMap, Auth
             headers.insert(http::header::AUTHORIZATION, val);
         }
         Auth::Header { name, value } => {
+            redactor.insert(value.clone());
             let mut val = http::HeaderValue::from_str(value.expose())
                 .map_err(|_| AuthError::InvalidHeaderValue)?;
             val.set_sensitive(true);
@@ -203,6 +284,7 @@ pub(crate) async fn resolve_headers(auth: &Auth) -> Result<http::HeaderMap, Auth
         Auth::BearerEnv { var } => {
             let val_str =
                 std::env::var(var).map_err(|_| AuthError::MissingEnvironment(var.clone()))?;
+            redactor.insert(Secret::from(val_str.as_str()));
             let bearer_str = format!("Bearer {}", val_str);
             let mut val = http::HeaderValue::from_str(&bearer_str)
                 .map_err(|_| AuthError::InvalidHeaderValue)?;
@@ -212,6 +294,7 @@ pub(crate) async fn resolve_headers(auth: &Auth) -> Result<http::HeaderMap, Auth
         Auth::HeaderEnv { name, var } => {
             let val_str =
                 std::env::var(var).map_err(|_| AuthError::MissingEnvironment(var.clone()))?;
+            redactor.insert(Secret::from(val_str.as_str()));
             let mut val =
                 http::HeaderValue::from_str(&val_str).map_err(|_| AuthError::InvalidHeaderValue)?;
             val.set_sensitive(true);
@@ -219,6 +302,7 @@ pub(crate) async fn resolve_headers(auth: &Auth) -> Result<http::HeaderMap, Auth
         }
         Auth::Dynamic(resolver) => {
             let cred = resolver.resolve().await?;
+            redactor.insert(cred.value.clone());
 
             // 1. Apply extra headers first
             for (k, v) in cred.extra_headers.iter() {
@@ -244,7 +328,8 @@ pub(crate) async fn resolve_headers(auth: &Auth) -> Result<http::HeaderMap, Auth
         }
     }
 
-    Ok(headers)
+    redactor.include_header_values(&headers);
+    Ok(ResolvedHeaders { headers, redactor })
 }
 
 /// Returns the primary header name that this Auth configuration targets, if statically known.
@@ -285,16 +370,30 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_headers_bearer_and_custom() {
         let auth_bearer = Auth::bearer("my-key");
-        let headers = resolve_headers(&auth_bearer).await.unwrap();
+        let resolved = resolve_headers(&auth_bearer).await.unwrap();
         assert_eq!(
-            headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            resolved
+                .headers
+                .get(AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Bearer my-key"
+        );
+        assert_eq!(
+            resolved.redactor.redact("provider echoed my-key"),
+            "provider echoed [REDACTED]"
         );
 
         let auth_hdr = Auth::header(CONTENT_TYPE, "app-json");
-        let headers_hdr = resolve_headers(&auth_hdr).await.unwrap();
+        let resolved = resolve_headers(&auth_hdr).await.unwrap();
         assert_eq!(
-            headers_hdr.get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            resolved
+                .headers
+                .get(CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "app-json"
         );
     }
@@ -305,9 +404,14 @@ mod tests {
         std::env::set_var(var_name, "env-key");
 
         let auth = Auth::bearer_env(var_name);
-        let headers = resolve_headers(&auth).await.unwrap();
+        let resolved = resolve_headers(&auth).await.unwrap();
         assert_eq!(
-            headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            resolved
+                .headers
+                .get(AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Bearer env-key"
         );
 
@@ -331,17 +435,55 @@ mod tests {
         });
 
         let auth = Auth::dynamic(resolver);
-        let headers = resolve_headers(&auth).await.unwrap();
+        let resolved = resolve_headers(&auth).await.unwrap();
 
         // Check extra header is present
         assert_eq!(
-            headers.get(CONTENT_TYPE).unwrap().to_str().unwrap(),
+            resolved
+                .headers
+                .get(CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "extra-val"
         );
         // Check primary auth header won the collision
         assert_eq!(
-            headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            resolved
+                .headers
+                .get(AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "Bearer dynamic-secret"
+        );
+        let redacted = resolved
+            .redactor
+            .redact("extra-val dynamic-secret Bearer dynamic-secret");
+        assert!(!redacted.contains("extra-val"), "{redacted}");
+        assert!(!redacted.contains("dynamic-secret"), "{redacted}");
+    }
+
+    #[test]
+    fn credential_redaction_prefers_longest_overlapping_value() {
+        let mut redactor = CredentialRedactor::default();
+        redactor.insert(Secret::from("key"));
+        redactor.insert(Secret::from("key-long"));
+        assert_eq!(redactor.redact("key-long/key"), "[REDACTED]/[REDACTED]");
+    }
+
+    #[test]
+    fn credential_redaction_includes_utf8_header_values() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-gateway-key",
+            http::HeaderValue::from_bytes("clé-secrète".as_bytes()).unwrap(),
+        );
+        let mut redactor = CredentialRedactor::default();
+        redactor.include_header_values(&headers);
+        assert_eq!(
+            redactor.redact("provider echoed clé-secrète"),
+            "provider echoed [REDACTED]"
         );
     }
 

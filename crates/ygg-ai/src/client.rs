@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 use std::error::Error as _;
 use std::time::{Duration, Instant};
 
+use crate::auth::CredentialRedactor;
 use crate::catalog::Model;
 use crate::error::{
     AiError, DecodeError, HttpError, ProviderError, StreamProtocolError, TransportError,
@@ -42,6 +43,117 @@ fn truncate_transport_message(message: &mut String, max_bytes: usize) {
         end -= 1;
     }
     message.truncate(end);
+}
+
+const MAX_PROVIDER_DIAGNOSTIC_BYTES: usize = 4096;
+const MAX_DIAGNOSTIC_METADATA_BYTES: usize = 512;
+
+fn is_bidi_format_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Redact request credentials, render control characters inert, and retain a
+/// hard post-sanitization byte bound. Provider diagnostics cross a trust
+/// boundary: they must be safe to persist or print verbatim.
+fn sanitize_diagnostic(redactor: &CredentialRedactor, input: &str, max_bytes: usize) -> String {
+    let redacted = redactor.redact(input);
+    let mut output = String::with_capacity(redacted.len().min(max_bytes));
+    let mut truncated = false;
+
+    for character in redacted.chars() {
+        if character.is_control() || is_bidi_format_control(character) {
+            let escaped = character.escape_default().to_string();
+            if output.len().saturating_add(escaped.len()) > max_bytes {
+                truncated = true;
+                break;
+            }
+            output.push_str(&escaped);
+        } else {
+            if output.len().saturating_add(character.len_utf8()) > max_bytes {
+                truncated = true;
+                break;
+            }
+            output.push(character);
+        }
+    }
+
+    if truncated && max_bytes >= '…'.len_utf8() {
+        let limit = max_bytes - '…'.len_utf8();
+        while output.len() > limit {
+            let _ = output.pop();
+        }
+        output.push('…');
+    }
+    output
+}
+
+fn sanitize_optional_diagnostic(
+    redactor: &CredentialRedactor,
+    value: &mut Option<String>,
+    max_bytes: usize,
+) {
+    if let Some(value) = value {
+        *value = sanitize_diagnostic(redactor, value, max_bytes);
+    }
+}
+
+fn sanitize_ai_error(redactor: &CredentialRedactor, mut error: AiError) -> AiError {
+    match &mut error {
+        AiError::Http(error) => {
+            sanitize_optional_diagnostic(
+                redactor,
+                &mut error.request_id,
+                MAX_DIAGNOSTIC_METADATA_BYTES,
+            );
+            sanitize_optional_diagnostic(
+                redactor,
+                &mut error.provider_code,
+                MAX_DIAGNOSTIC_METADATA_BYTES,
+            );
+            sanitize_optional_diagnostic(
+                redactor,
+                &mut error.body_snippet,
+                MAX_PROVIDER_DIAGNOSTIC_BYTES,
+            );
+        }
+        AiError::Transport(error) => {
+            error.message =
+                sanitize_diagnostic(redactor, &error.message, MAX_DIAGNOSTIC_METADATA_BYTES);
+        }
+        AiError::Provider(error) => {
+            sanitize_optional_diagnostic(redactor, &mut error.code, MAX_DIAGNOSTIC_METADATA_BYTES);
+            sanitize_optional_diagnostic(redactor, &mut error.kind, MAX_DIAGNOSTIC_METADATA_BYTES);
+            error.message =
+                sanitize_diagnostic(redactor, &error.message, MAX_PROVIDER_DIAGNOSTIC_BYTES);
+            sanitize_optional_diagnostic(
+                redactor,
+                &mut error.request_id,
+                MAX_DIAGNOSTIC_METADATA_BYTES,
+            );
+        }
+        AiError::Decode(
+            DecodeError::Json(message) | DecodeError::InvalidProviderField(message),
+        )
+        | AiError::StreamProtocol(StreamProtocolError::UnexpectedEvent(message)) => {
+            *message = sanitize_diagnostic(redactor, message, MAX_PROVIDER_DIAGNOSTIC_BYTES);
+        }
+        AiError::Config(_)
+        | AiError::Auth(_)
+        | AiError::Validation(_)
+        | AiError::Unsupported(_)
+        | AiError::Decode(_)
+        | AiError::Pricing(_)
+        | AiError::StreamProtocol(_)
+        | AiError::Canceled => {}
+    }
+    error
 }
 
 fn reqwest_transport_error(
@@ -323,12 +435,14 @@ impl AiClient {
             parts.body.clone(),
         );
 
-        let auth_headers = crate::auth::resolve_headers(&model.endpoint.auth)
+        let resolved_headers = crate::auth::resolve_headers(&model.endpoint.auth)
             .await
             .map_err(AiError::Auth)?;
+        let mut diagnostic_redactor = resolved_headers.redactor;
+        diagnostic_redactor.include_header_values(&model.endpoint.default_headers);
 
         let mut current_key = None;
-        for (k, v) in auth_headers {
+        for (k, v) in resolved_headers.headers {
             if let Some(key) = k {
                 current_key = Some(key.clone());
                 headers.insert(key, v);
@@ -364,7 +478,8 @@ impl AiClient {
                     TransportPhase::Body
                 };
                 reqwest_transport_error(error, phase, "request")
-            })?;
+            })
+            .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?;
 
         // 4. Handle non-2xx HTTP errors
         let status = res.status();
@@ -432,18 +547,21 @@ impl AiClient {
                     | http::StatusCode::GATEWAY_TIMEOUT
             );
 
-            return Err(AiError::Http(HttpError {
-                status,
-                request_id,
-                retry_after,
-                provider_code: code,
-                body_snippet: if body_bytes.is_empty() {
-                    None
-                } else {
-                    Some(body_bytes)
-                },
-                retryable,
-            }));
+            return Err(sanitize_ai_error(
+                &diagnostic_redactor,
+                AiError::Http(HttpError {
+                    status,
+                    request_id,
+                    retry_after,
+                    provider_code: code,
+                    body_snippet: if body_bytes.is_empty() {
+                        None
+                    } else {
+                        Some(body_bytes)
+                    },
+                    retryable,
+                }),
+            ));
         }
 
         // 5. Decode ResponseStream
@@ -569,7 +687,10 @@ impl AiClient {
                 }
             };
 
-            Ok(crate::stream::guard(raw_event_stream))
+            let sanitized_event_stream = raw_event_stream.map(move |event| {
+                event.map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))
+            });
+            Ok(crate::stream::guard(sanitized_event_stream))
         } else {
             // Non-streaming path (completed response, e.g. Chat Audio output)
             let mut body_bytes = Vec::new();
@@ -583,7 +704,8 @@ impl AiClient {
                 stream_deadline,
                 "completed response body",
             )
-            .await?
+            .await
+            .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?
             {
                 if body_bytes
                     .len()
@@ -608,7 +730,8 @@ impl AiClient {
                 &model_clone,
                 &body_bytes,
                 requested_audio_format,
-            )?;
+            )
+            .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?;
             response.diagnostics.extend(pre_send_diagnostics);
 
             let response_id = response.response_id.clone();
@@ -728,11 +851,13 @@ impl AiClient {
         // compact endpoint contract is plain JSON. Do not apply the normal
         // Responses transport compression policy here.
         let body = bytes::Bytes::from(body);
-        let auth_headers = crate::auth::resolve_headers(&model.endpoint.auth)
+        let resolved_headers = crate::auth::resolve_headers(&model.endpoint.auth)
             .await
             .map_err(AiError::Auth)?;
+        let mut diagnostic_redactor = resolved_headers.redactor;
+        diagnostic_redactor.include_header_values(&model.endpoint.default_headers);
         let mut current_key = None;
-        for (key, value) in auth_headers {
+        for (key, value) in resolved_headers.headers {
             if let Some(key) = key {
                 current_key = Some(key.clone());
                 headers.insert(key, value);
@@ -754,7 +879,8 @@ impl AiClient {
         })?
         .map_err(|error| {
             reqwest_transport_error(error, TransportPhase::ConnectOrHeaders, "compact request")
-        })?;
+        })
+        .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?;
         let status = response.status();
         let request_id = response
             .headers()
@@ -807,15 +933,18 @@ impl AiClient {
                     | http::StatusCode::SERVICE_UNAVAILABLE
                     | http::StatusCode::GATEWAY_TIMEOUT
             );
-            return Err(HttpError {
-                status,
-                request_id,
-                retry_after,
-                provider_code,
-                body_snippet: (!snippet.is_empty()).then_some(snippet),
-                retryable,
-            }
-            .into());
+            return Err(sanitize_ai_error(
+                &diagnostic_redactor,
+                HttpError {
+                    status,
+                    request_id,
+                    retry_after,
+                    provider_code,
+                    body_snippet: (!snippet.is_empty()).then_some(snippet),
+                    retryable,
+                }
+                .into(),
+            ));
         }
         if response
             .content_length()
@@ -838,7 +967,8 @@ impl AiClient {
             self.stream_deadline,
             "compact response body",
         )
-        .await?
+        .await
+        .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?
         {
             if body
                 .len()
@@ -849,8 +979,12 @@ impl AiClient {
             }
             body.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&body)
-            .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))
+        serde_json::from_slice(&body).map_err(|error| {
+            sanitize_ai_error(
+                &diagnostic_redactor,
+                AiError::Decode(DecodeError::Json(error.to_string())),
+            )
+        })
     }
 
     /// Executes a request and drives the stream to completion, returning the final Response.
@@ -925,6 +1059,24 @@ mod tests {
         assert!(!error.message.contains(secret));
         assert!(!error.message.contains("/private/catalog"));
         assert!(!error.message.contains(&address.to_string()));
+    }
+
+    #[test]
+    fn provider_diagnostics_are_control_safe_and_post_sanitize_bounded() {
+        let input = format!("\x1b\x07\u{202e}{}", "é".repeat(3_000));
+        let output = sanitize_diagnostic(
+            &CredentialRedactor::default(),
+            &input,
+            MAX_PROVIDER_DIAGNOSTIC_BYTES,
+        );
+        assert!(output.len() <= MAX_PROVIDER_DIAGNOSTIC_BYTES);
+        assert!(output.is_char_boundary(output.len()));
+        assert!(output.ends_with('…'));
+        assert!(!output.chars().any(char::is_control));
+        assert!(!output.contains('\u{202e}'));
+        assert!(output.contains(r"\u{1b}"));
+        assert!(output.contains(r"\u{7}"));
+        assert!(output.contains(r"\u{202e}"));
     }
 
     #[test]

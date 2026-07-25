@@ -599,7 +599,7 @@ async fn logout_codex(
     }
 
     let store = crate::auth::codex::CredentialStore::new(crate::auth::codex::default_path());
-    if let Err(error) = store.delete() {
+    if let Err(error) = store.delete_async().await {
         shell.error(format!("ChatGPT logout failed: {error:#}"));
         return Ok(app);
     }

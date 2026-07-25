@@ -12,7 +12,7 @@ version = "0.2.0-alpha"
 edition = "2021"
 authors = ["Skaft Software"]
 repository = "https://github.com/skaft-software/ygg"
-homepage = "http://skaft.org/ygg"
+homepage = "https://skaft.org/ygg"
 rust-version = "1.86"
 license = "MIT"
 

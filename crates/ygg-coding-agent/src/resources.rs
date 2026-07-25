@@ -150,7 +150,7 @@ fn compose_instructions_at(config: &Config, global: &Path) -> anyhow::Result<Str
                     MAX_CONTEXT_TOTAL_BYTES
                 );
             }
-            eprintln!("context: loaded {}", path.display());
+            crate::output::stderr_line(format!("context: loaded {}", path.display()));
             context.push(format!(
                 "<project_instructions path=\"{}\">\n{}\n</project_instructions>",
                 xml_attribute(&prompt_path(path)),
@@ -397,19 +397,19 @@ fn scan_skills_dir(
                     Ok(descriptor) => {
                         if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
                             if dir_name != descriptor.id {
-                                eprintln!(
+                                crate::output::stderr_line(format!(
                                     "warning: ignoring skill {}: directory name does not match manifest ID {}",
                                     path.display(), descriptor.id
-                                );
+                                ));
                                 continue;
                             }
                         }
                         map.insert(descriptor.id.clone(), descriptor);
                     }
-                    Err(error) => eprintln!(
+                    Err(error) => crate::output::stderr_line(format!(
                         "warning: ignoring malformed skill {}: {error}",
                         skill_md.display()
-                    ),
+                    )),
                 }
             }
         }
@@ -451,11 +451,11 @@ impl FileSystemSkillRegistry {
             })
             .collect::<Vec<_>>();
         for diagnostic in snapshot.diagnostics() {
-            eprintln!(
+            crate::output::stderr_line(format!(
                 "resource: skill {}: {}",
                 diagnostic.path.display(),
                 diagnostic.message
-            );
+            ));
         }
         let mut descriptors = Vec::new();
         for resource in snapshot.resources() {
@@ -467,10 +467,10 @@ impl FileSystemSkillRegistry {
             let entrypoint = match resource.path.canonicalize() {
                 Ok(path) => path,
                 Err(error) => {
-                    eprintln!(
+                    crate::output::stderr_line(format!(
                         "warning: ignoring unreadable skill {}: {error}",
                         resource.path.display()
-                    );
+                    ));
                     diagnostics.push(SkillDiagnostic {
                         path: resource.path.clone(),
                         message: format!("cannot read skill entrypoint: {error}"),
@@ -479,10 +479,10 @@ impl FileSystemSkillRegistry {
                 }
             };
             let Some(skill_root) = entrypoint.parent() else {
-                eprintln!(
+                crate::output::stderr_line(format!(
                     "warning: ignoring malformed skill path {}",
                     resource.path.display()
-                );
+                ));
                 diagnostics.push(SkillDiagnostic {
                     path: resource.path.clone(),
                     message: "skill entrypoint has no parent directory".into(),
@@ -496,20 +496,20 @@ impl FileSystemSkillRegistry {
                         "manifest ID {} does not match directory name {}",
                         descriptor.id, resource.name
                     );
-                    eprintln!(
+                    crate::output::stderr_line(format!(
                         "warning: ignoring skill {}: {message}",
                         resource.path.display()
-                    );
+                    ));
                     diagnostics.push(SkillDiagnostic {
                         path: resource.path.clone(),
                         message,
                     });
                 }
                 Err(error) => {
-                    eprintln!(
+                    crate::output::stderr_line(format!(
                         "warning: ignoring malformed skill {}: {error}",
                         resource.path.display()
-                    );
+                    ));
                     diagnostics.push(SkillDiagnostic {
                         path: resource.path.clone(),
                         message: error.to_string(),
@@ -537,10 +537,10 @@ impl FileSystemSkillRegistry {
         let mut map = std::collections::HashMap::new();
         let mut scan = |path: &Path, trust| {
             if let Err(error) = scan_skills_dir(path, trust, &mut map) {
-                eprintln!(
+                crate::output::stderr_line(format!(
                     "warning: failed to scan skills directory {}: {error}",
                     path.display()
-                );
+                ));
             }
         };
 

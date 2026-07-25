@@ -17,7 +17,10 @@ pub fn classify_finish(finished: Option<RunEnded>) -> anyhow::Result<()> {
             anyhow::bail!("run hit max turns before completing")
         }
         Some(RunEnded::Aborted) => anyhow::bail!("run aborted before completing"),
-        Some(RunEnded::Failed(error)) => anyhow::bail!("run failed: {error}"),
+        Some(RunEnded::Failed(error)) => {
+            let error = sexy_tui_rs::sanitize_line(&error, true);
+            anyhow::bail!("run failed: {error}")
+        }
         None => anyhow::bail!("run stream ended without RunFinished (invariant violation)"),
     }
 }
@@ -51,7 +54,7 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
     let prompt = match crate::prompts::render_configured(&mut app, &prompt)? {
         Some(rendered) => {
             if app.config.debug_prompt {
-                eprintln!("{}", crate::prompts::debug_expansion(&rendered));
+                crate::output::stderr_multiline(crate::prompts::debug_expansion(&rendered));
             }
             rendered.text
         }
@@ -81,7 +84,7 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
         .await?;
     let pending_context_count = composition.pending_context_count;
     for notification in composition.notifications {
-        eprintln!("extension: {notification}");
+        crate::output::stderr!("extension: {notification}");
     }
     app.agent.set_system_prompt(composition.system);
     app.agent.set_prompt_display_text(Some(prompt));
@@ -162,7 +165,7 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
                     .cost_warning_microdollars
                     .is_some_and(|threshold| turn_cost >= threshold)
                 {
-                    eprintln!(
+                    crate::output::stderr!(
                         "turn cost warning: {} reached the {} threshold",
                         crate::commands::format_microdollars(turn_cost),
                         crate::commands::format_microdollars_cents(
@@ -202,7 +205,7 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
             .after_response(&response_text)
             .await
         {
-            eprintln!("extension: {notification}");
+            crate::output::stderr!("extension: {notification}");
         }
     }
     output.flush()?;
@@ -242,6 +245,20 @@ mod tests {
         assert!(classify_finish(Some(RunEnded::Aborted)).is_err());
         assert!(classify_finish(Some(RunEnded::Failed("nope".into()))).is_err());
         assert!(classify_finish(None).is_err());
+    }
+
+    #[test]
+    fn classify_finish_neutralizes_control_sequences_in_errors() {
+        let error = classify_finish(Some(RunEnded::Failed(
+            "provider\x1b]52;c;YXR0YWNr\x07\nforged".into(),
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains('\x1b'), "{error:?}");
+        assert!(!error.contains('\x07'), "{error:?}");
+        assert!(!error.contains('\n'), "{error:?}");
+        assert!(error.contains("^["), "{error:?}");
+        assert!(error.contains("<BEL>"), "{error:?}");
     }
 
     #[test]

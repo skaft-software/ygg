@@ -63,6 +63,18 @@ pub struct CredentialStore {
     path: PathBuf,
 }
 
+/// Cross-process refresh serialization guard. The lock file intentionally
+/// remains in place so concurrent processes always lock the same inode.
+pub(crate) struct RefreshLock {
+    file: std::fs::File,
+}
+
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 impl CredentialStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -75,6 +87,41 @@ impl CredentialStore {
             .and_then(|value| value.to_str())
             .unwrap_or("codex");
         self.path.with_file_name(format!("{stem}-models.json"))
+    }
+
+    fn refresh_lock_path(&self) -> PathBuf {
+        let stem = self
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("codex");
+        self.path.with_file_name(format!(".{stem}-refresh.lock"))
+    }
+
+    pub(crate) fn lock_refresh(&self) -> Result<RefreshLock> {
+        let path = self.refresh_lock_path();
+        prepare_private_parent(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(&path)
+            .with_context(|| format!("opening refresh lock {}", path.display()))?;
+        if !file.metadata()?.is_file() {
+            anyhow::bail!("refresh lock {} is not a regular file", path.display());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        fs2::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("locking refresh state {}", path.display()))?;
+        Ok(RefreshLock { file })
     }
 
     /// Load the credential, or `None` if the file does not exist.
@@ -117,8 +164,19 @@ impl CredentialStore {
 
     /// Persist a credential with owner-only permissions. The file is created
     /// `0600` *before* the secret bytes are written, so there is never a window
-    /// where the tokens are world-readable.
+    /// where the tokens are world-readable. Credential replacement is
+    /// serialized with refresh-token rotation across Ygg processes.
     pub fn save(&self, cred: &CredentialFile) -> Result<()> {
+        let refresh_lock = self.lock_refresh()?;
+        self.save_while_refresh_locked(cred, &refresh_lock)
+    }
+
+    /// Persist while the caller owns this store's refresh lock.
+    pub(crate) fn save_while_refresh_locked(
+        &self,
+        cred: &CredentialFile,
+        _refresh_lock: &RefreshLock,
+    ) -> Result<()> {
         prepare_private_parent(&self.path)?;
         let bytes = serde_json::to_vec_pretty(cred)?;
         write_private(&self.path, &bytes)
@@ -127,8 +185,16 @@ impl CredentialStore {
     }
 
     pub fn delete(&self) -> Result<()> {
+        let _refresh_lock = self.lock_refresh()?;
         remove_if_present(&self.path)?;
         remove_if_present(&self.model_cache_path())
+    }
+
+    pub(crate) async fn delete_async(&self) -> Result<()> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.delete())
+            .await
+            .context("credential-delete worker failed")?
     }
 }
 
@@ -237,6 +303,8 @@ mod tests {
             br#"{"version":1}"#
         );
         assert!(store.model_cache_path().exists());
+        drop(store.lock_refresh().unwrap());
+        assert!(store.refresh_lock_path().exists());
 
         #[cfg(unix)]
         {
@@ -248,6 +316,11 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(cache_mode & 0o777, 0o600, "model cache must be owner-only");
+            let lock_mode = std::fs::metadata(store.refresh_lock_path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(lock_mode & 0o777, 0o600, "refresh lock must be owner-only");
             let dir_mode = std::fs::metadata(path.parent().unwrap())
                 .unwrap()
                 .permissions()
@@ -264,5 +337,57 @@ mod tests {
         assert!(!store.model_cache_path().exists());
         // Deleting missing files is not an error.
         store.delete().unwrap();
+    }
+
+    #[test]
+    fn credential_save_waits_for_inflight_refresh_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials/codex.json");
+        let store = CredentialStore::new(&path);
+        store.save(&sample()).unwrap();
+        let refresh_lock = store.lock_refresh().unwrap();
+
+        let mut replacement = sample();
+        replacement.tokens.access_token = "new-login".into();
+        let contender = store.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(contender.save(&replacement)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(refresh_lock);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("credential save remained blocked after refresh completed")
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            store.load().unwrap().unwrap().tokens.access_token,
+            "new-login"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_lock_rejects_a_symlinked_lock_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials/codex.json");
+        let store = CredentialStore::new(path);
+        prepare_private_parent(&store.refresh_lock_path()).unwrap();
+        let target = dir.path().join("unrelated");
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, store.refresh_lock_path()).unwrap();
+
+        assert!(store.lock_refresh().is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
     }
 }

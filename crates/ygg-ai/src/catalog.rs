@@ -358,7 +358,13 @@ fn validate_base_url(url: &url::Url) -> Result<(), ConfigError> {
     {
         Ok(())
     } else {
-        Err(ConfigError::InvalidBaseUrl(url.to_string()))
+        // Invalid URLs may contain userinfo or query credentials. Return the
+        // contract, not attacker-controlled URL text, because catalog errors
+        // can be persisted or presented directly by downstream applications.
+        Err(ConfigError::InvalidBaseUrl(
+            "expected an absolute HTTP(S) URL without userinfo, query, or fragment and with a trailing slash"
+                .to_owned(),
+        ))
     }
 }
 
@@ -585,8 +591,12 @@ mod tests {
     fn test_invalid_base_url_fails() {
         let endpoints = vec![EndpointConfig {
             id: EndpointId("invalid".to_string()),
-            // Base URL has query parameter, which is forbidden
-            base_url: url::Url::parse("https://api.openai.com/v1/?query=1").unwrap(),
+            // Userinfo and query parameters are forbidden and must not be
+            // reflected back if they carry credentials.
+            base_url: url::Url::parse(
+                "https://alice:URL_SECRET@example.test/v1/?token=QUERY_SECRET",
+            )
+            .unwrap(),
             auth: AuthConfig::None,
             default_headers: BTreeMap::new(),
             transport: crate::types::EndpointTransport::Http,
@@ -597,10 +607,14 @@ mod tests {
             endpoints,
             models: vec![],
         };
-        assert!(matches!(
-            ModelCatalog::from_config(cfg),
-            Err(ConfigError::InvalidBaseUrl(_))
-        ));
+        let error = match ModelCatalog::from_config(cfg) {
+            Ok(_) => panic!("credential-bearing base URL must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(&error, ConfigError::InvalidBaseUrl(_)));
+        let diagnostic = error.to_string();
+        assert!(!diagnostic.contains("URL_SECRET"), "{diagnostic}");
+        assert!(!diagnostic.contains("QUERY_SECRET"), "{diagnostic}");
 
         // Missing trailing slash
         let endpoints_slash = vec![EndpointConfig {
