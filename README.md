@@ -1,17 +1,20 @@
-<h1 align="center">
-  <a href="https://skaft.org/ygg">
-    <img src="docs/assets/ygg-braille.svg" alt="ygg — a braille point-cloud tree for the local-first coding agent" width="760">
-  </a>
-</h1>
-
 <p align="center">
   <a href="https://skaft.org/ygg">
-    <img src="docs/assets/ygg-demo.gif" alt="ygg — a local-first coding agent — terminal demo" width="80%">
+    <img src="docs/assets/ygg-braille.svg" alt="Ygg braille tree app icon" width="180">
   </a>
 </p>
 
+<h1 align="center">ygg</h1>
+
 <p align="center">
   <strong>A tiny and fast coding agent for local models, cloud models, and everything in between.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/skaft-software/ygg/releases"><img alt="Release: alpha" src="https://img.shields.io/badge/release-0.2.0--alpha-536dfe?style=flat-square"></a>
+  <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
+  <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
 </p>
 
 <p align="center">
@@ -22,10 +25,9 @@
 </p>
 
 <p align="center">
-  <img alt="Release: alpha" src="https://img.shields.io/badge/release-0.2.0--alpha-536dfe?style=flat-square">
-  <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
-  <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
+  <a href="https://skaft.org/ygg">
+    <img src="docs/assets/ygg-demo.gif" alt="ygg — a local-first coding agent — terminal demo" width="800">
+  </a>
 </p>
 
 ---
