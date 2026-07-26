@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use ygg_agent::{
     AgentEvent, Entry, EntryValue, FinishReason, InputPart, OutputChannel, RunControl, Session,
-    ToolOutput, ToolProgress, UserInput,
+    SessionRunOutcome, SessionRunOutcomeStatus, ToolOutput, ToolProgress, UserInput,
 };
 use ygg_ai::{
     AssistantPart, ImageSource, Media, Message, Modality, Model, ModelCatalog, ModelId,
@@ -644,6 +644,7 @@ struct ProjectedToolCall {
 struct ProjectionState {
     known_entries: usize,
     run_counter: u64,
+    user_item_counter: u64,
     request_counter: u64,
     turn_counter: u64,
     provider_attempt: u32,
@@ -656,6 +657,7 @@ struct ProjectionState {
     tool_progress: HashMap<String, (String, u64)>,
     private_requests: HashMap<RequestId, PrivateRequest>,
     pending_attachments: VecDeque<Vec<AttachmentRef>>,
+    pending_user_items: VecDeque<ItemId>,
 }
 
 impl ProjectionState {
@@ -663,6 +665,7 @@ impl ProjectionState {
         Self {
             known_entries,
             run_counter: 0,
+            user_item_counter: 0,
             request_counter: 0,
             turn_counter: 1,
             provider_attempt: 1,
@@ -675,6 +678,7 @@ impl ProjectionState {
             tool_progress: HashMap::new(),
             private_requests: HashMap::new(),
             pending_attachments: VecDeque::new(),
+            pending_user_items: VecDeque::new(),
         }
     }
 
@@ -688,6 +692,7 @@ impl ProjectionState {
     }
 
     fn begin_run(&mut self) {
+        self.user_item_counter = 0;
         self.turn_counter = 1;
         self.provider_attempt = 1;
         self.assistant_item = None;
@@ -698,6 +703,16 @@ impl ProjectionState {
         self.tool_calls.clear();
         self.tool_progress.clear();
         self.private_requests.clear();
+        self.pending_attachments.clear();
+        self.pending_user_items.clear();
+    }
+
+    fn next_user_item_id(&mut self, run_id: &RunId) -> Result<ItemId, ServiceError> {
+        self.user_item_counter = self
+            .user_item_counter
+            .checked_add(1)
+            .ok_or(ServiceError::Internal)?;
+        self.provisional_id(run_id, "user", self.user_item_counter)
     }
 
     fn turn_id(&self, run_id: &RunId) -> Result<TurnId, ServiceError> {
@@ -949,7 +964,6 @@ fn reconfiguration_outcome(
         app.agent.session(),
         projection,
         None,
-        None,
         plan.attachments.as_ref(),
         &plan.session_id,
     )? {
@@ -1186,6 +1200,9 @@ async fn start_and_drive_run(
             .pending_attachments
             .push_back(attachments.clone());
     }
+    projection
+        .pending_user_items
+        .push_back(user_item_id.clone());
     app.executable_extensions
         .commit_prompt_context(pending_context_count);
     let control = run.control();
@@ -1255,12 +1272,21 @@ async fn start_and_drive_run(
     }
     drop(run);
     app.agent.set_system_prompt(app.system.clone());
+    app.agent
+        .record_run_outcome(SessionRunOutcome {
+            status: match terminal.outcome {
+                ygg_serve_backend::RunOutcome::Completed => SessionRunOutcomeStatus::Completed,
+                ygg_serve_backend::RunOutcome::Stopped => SessionRunOutcomeStatus::Stopped,
+                ygg_serve_backend::RunOutcome::Failed => SessionRunOutcomeStatus::Failed,
+            },
+            message: terminal.message.clone(),
+        })
+        .map_err(|_| ServiceError::Internal)?;
 
     let committed = project_new_entries(
         app.agent.session(),
         projection,
         Some(&run_id),
-        Some(&user_item_id),
         plan.attachments.as_ref(),
         &plan.session_id,
     )?;
@@ -1270,6 +1296,17 @@ async fn start_and_drive_run(
             .await
             .map_err(|_| ServiceError::Unavailable)?;
     }
+    for item_id in projection.pending_user_items.drain(..) {
+        events
+            .send(event(EventPayload::ItemRetracted {
+                item_id,
+                provider_attempt: 1,
+                reason: "Input was not delivered before the run ended.".into(),
+            }))
+            .await
+            .map_err(|_| ServiceError::Unavailable)?;
+    }
+    projection.pending_attachments.clear();
     let durable_entry_id = app
         .agent
         .session()
@@ -1284,24 +1321,6 @@ async fn start_and_drive_run(
         .await
         .map_err(|_| ServiceError::Unavailable)?;
     expire_private_requests(projection, events, plan.actor_generation).await?;
-    let outcome_item_id = projection.provisional_id(&run_id, "outcome", 0)?;
-    events
-        .send(event(EventPayload::ItemStarted {
-            item: SessionItem {
-                id: outcome_item_id,
-                run_id: Some(run_id.clone()),
-                turn_id: None,
-                provider_attempt: None,
-                lifecycle: ItemLifecycle::Provisional,
-                durable_entry_id: None,
-                payload: ItemPayload::RunOutcome {
-                    outcome: terminal.outcome,
-                    message: terminal.message,
-                },
-            },
-        }))
-        .await
-        .map_err(|_| ServiceError::Unavailable)?;
     events
         .send(event(EventPayload::SessionStateChanged {
             state: terminal.state,
@@ -1328,14 +1347,15 @@ async fn handle_active_command(
 ) {
     let outcome = match message.command {
         SessionCommand::Steer { input } => {
-            let references = input.attachments;
-            match resolve_control_input(plan, input.text, &references) {
+            let PromptInput {
+                text,
+                attachments: references,
+            } = input;
+            match resolve_control_input(plan, text.clone(), &references) {
                 Ok(input) => match control.steer(input).await {
                     Ok(()) => {
-                        if !references.is_empty() {
-                            projection.pending_attachments.push_back(references);
-                        }
-                        Ok(DriverCommandOutcome::default())
+                        publish_control_user_item(run_id, text, references, projection, events)
+                            .await
                     }
                     Err(_) => Err(ServiceError::InvalidBoundary),
                 },
@@ -1343,14 +1363,15 @@ async fn handle_active_command(
             }
         }
         SessionCommand::FollowUp { input } => {
-            let references = input.attachments;
-            match resolve_control_input(plan, input.text, &references) {
+            let PromptInput {
+                text,
+                attachments: references,
+            } = input;
+            match resolve_control_input(plan, text.clone(), &references) {
                 Ok(input) => match control.follow_up(input).await {
                     Ok(()) => {
-                        if !references.is_empty() {
-                            projection.pending_attachments.push_back(references);
-                        }
-                        Ok(DriverCommandOutcome::default())
+                        publish_control_user_item(run_id, text, references, projection, events)
+                            .await
                     }
                     Err(_) => Err(ServiceError::InvalidBoundary),
                 },
@@ -1455,6 +1476,41 @@ async fn handle_active_command(
         _ => Err(ServiceError::InvalidBoundary),
     };
     let _ = message.response.send(outcome);
+}
+
+async fn publish_control_user_item(
+    run_id: &RunId,
+    text: String,
+    attachments: Vec<AttachmentRef>,
+    projection: &mut ProjectionState,
+    events: &mpsc::Sender<TimestampedEvent>,
+) -> Result<DriverCommandOutcome, ServiceError> {
+    let item_id = projection.next_user_item_id(run_id)?;
+    let turn_id = projection.turn_id(run_id)?;
+    projection.pending_user_items.push_back(item_id.clone());
+    if !attachments.is_empty() {
+        projection
+            .pending_attachments
+            .push_back(attachments.clone());
+    }
+    events
+        .send(event(EventPayload::ItemStarted {
+            item: SessionItem {
+                id: item_id,
+                run_id: Some(run_id.clone()),
+                turn_id: Some(turn_id),
+                provider_attempt: None,
+                lifecycle: ItemLifecycle::Provisional,
+                durable_entry_id: None,
+                payload: ItemPayload::UserMessage {
+                    text: bounded_text(&text, MAX_PROMPT_BYTES),
+                    attachments,
+                },
+            },
+        }))
+        .await
+        .map_err(|_| ServiceError::Unavailable)?;
+    Ok(DriverCommandOutcome::default())
 }
 
 fn projection_actor_generation(run_id: &RunId) -> u64 {
@@ -2203,14 +2259,12 @@ fn project_new_entries(
     session: &Session,
     projection: &mut ProjectionState,
     run_id: Option<&RunId>,
-    user_item_id: Option<&ItemId>,
     attachment_store: Option<&AttachmentStore>,
     session_id: &SessionId,
 ) -> Result<Vec<SessionItem>, ServiceError> {
     let entries = session.entries();
     let start = projection.known_entries.min(entries.len());
     let mut items = Vec::new();
-    let mut ordinary_user_seen = false;
     for entry in &entries[start..] {
         let attachments = attachment_refs_for_entry(
             entry,
@@ -2225,12 +2279,7 @@ fn project_new_entries(
                     .iter()
                     .any(|part| matches!(part, UserPart::Text(_) | UserPart::Media(_))) =>
             {
-                if ordinary_user_seen {
-                    (None, None)
-                } else {
-                    ordinary_user_seen = true;
-                    (user_item_id.cloned(), None)
-                }
+                (projection.pending_user_items.pop_front(), None)
             }
             EntryValue::Message(Message::Assistant(_)) => (
                 projection.completed_assistant_items.pop_front().flatten(),
@@ -2503,9 +2552,33 @@ fn project_entry(
                 },
             ));
         }
+        EntryValue::Config { .. } => {
+            if let Some(outcome) = entry
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.run_outcome.as_ref())
+            {
+                let outcome = match outcome.status {
+                    SessionRunOutcomeStatus::Completed => ygg_serve_backend::RunOutcome::Completed,
+                    SessionRunOutcomeStatus::Stopped => ygg_serve_backend::RunOutcome::Stopped,
+                    SessionRunOutcomeStatus::Failed => ygg_serve_backend::RunOutcome::Failed,
+                };
+                let message = entry
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.run_outcome.as_ref())
+                    .and_then(|outcome| outcome.message.as_deref())
+                    .map(|message| bounded_text(message, 8 * 1024));
+                items.push(committed_item(
+                    item_id_for_entry(entry, 0)?,
+                    run_id,
+                    durable_id,
+                    ItemPayload::RunOutcome { outcome, message },
+                ));
+            }
+        }
         EntryValue::ResponsesTurn { .. }
         | EntryValue::ResponsesCompaction { .. }
-        | EntryValue::Config { .. }
         | EntryValue::PromptTemplateSelected { .. }
         | EntryValue::SkillActivated { .. }
         | EntryValue::SkillResourceRead { .. }
@@ -3229,7 +3302,8 @@ fn system_time_ms(time: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ygg_ai::UserMessage;
+    use ygg_agent::EntryMetadata;
+    use ygg_ai::{AssistantMessage, Protocol, UserMessage};
     use ygg_serve_backend::{CatalogCursor, HostBootstrap, PROTOCOL_VERSION};
 
     fn serve_test_config(directory: &Path) -> Config {
@@ -3564,6 +3638,225 @@ mod tests {
             attachment_refs_for_entry(&entry, Some(&store), &session_id, &mut after_restart)
                 .unwrap();
         assert_eq!(restored, vec![reference]);
+    }
+
+    #[test]
+    fn steered_prompt_attribution_is_exact_live_and_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("steer-attribution.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append_with_metadata(
+                EntryValue::Message(Message::User(UserMessage {
+                    content: vec![UserPart::Text("composed original context".into())],
+                })),
+                Some(EntryMetadata {
+                    display_text: Some("original prompt".into()),
+                    ..EntryMetadata::default()
+                }),
+            )
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("working".into())],
+                model: ModelId("test-model".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+        session
+            .append_with_metadata(
+                EntryValue::Message(Message::User(UserMessage {
+                    content: vec![UserPart::Text("steer exact text".into())],
+                })),
+                Some(EntryMetadata {
+                    prompt_model: Some(ModelId("test-model".into())),
+                    ..EntryMetadata::default()
+                }),
+            )
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("done".into())],
+                model: ModelId("test-model".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+
+        let session_id = SessionId::new("steer-attribution").unwrap();
+        let mut projection = ProjectionState::new(0);
+        projection
+            .pending_user_items
+            .push_back(ItemId::new("live-original").unwrap());
+        projection
+            .pending_user_items
+            .push_back(ItemId::new("live-steer").unwrap());
+        let live = project_new_entries(
+            &session,
+            &mut projection,
+            Some(&RunId::new("run-1-1").unwrap()),
+            None,
+            &session_id,
+        )
+        .unwrap();
+        let live_users = live
+            .iter()
+            .filter_map(|item| match &item.payload {
+                ItemPayload::UserMessage { text, .. } => Some((item.id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            live_users,
+            vec![
+                ("live-original", "original prompt"),
+                ("live-steer", "steer exact text")
+            ]
+        );
+        drop(session);
+
+        let reopened = Session::open_read_only(&path).unwrap();
+        let seed = seed_from_session(
+            &reopened,
+            session_id,
+            SessionSeedOptions {
+                project_id: None,
+                model: ModelSelection {
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    reasoning: "off".into(),
+                },
+                authority: AuthorityProfile::FullAccess,
+                generation: 2,
+                meta: None,
+                attachment_store: None,
+            },
+        )
+        .unwrap();
+        let replayed_users = seed
+            .snapshot
+            .items
+            .iter()
+            .filter_map(|item| match &item.payload {
+                ItemPayload::UserMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replayed_users, vec!["original prompt", "steer exact text"]);
+    }
+
+    #[tokio::test]
+    async fn accepted_steer_is_visible_immediately_with_its_own_identity() {
+        let run_id = RunId::new("run-1-1").unwrap();
+        let mut projection = ProjectionState::new(0);
+        projection.begin_run();
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        publish_control_user_item(
+            &run_id,
+            "steer exact text".into(),
+            Vec::new(),
+            &mut projection,
+            &sender,
+        )
+        .await
+        .unwrap();
+
+        let started = receiver.recv().await.expect("live steer event");
+        let EventPayload::ItemStarted { item } = started.payload else {
+            panic!("accepted steer did not start a visible item");
+        };
+        assert_eq!(item.id.as_str(), "item-run-1-1-user-1-1");
+        assert!(matches!(
+            item.payload,
+            ItemPayload::UserMessage {
+                ref text,
+                ref attachments,
+            } if text == "steer exact text" && attachments.is_empty()
+        ));
+        assert_eq!(
+            projection.pending_user_items.front().map(ItemId::as_str),
+            Some(item.id.as_str())
+        );
+    }
+
+    #[test]
+    fn run_outcome_is_committed_live_and_replayed_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("outcome-replay.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("question".into())],
+            })))
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("answer".into())],
+                model: ModelId("test-model".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+        let known_entries = session.entries().len();
+        let marker_id = session
+            .append_run_outcome(SessionRunOutcome {
+                status: SessionRunOutcomeStatus::Completed,
+                message: None,
+            })
+            .unwrap();
+        let session_id = SessionId::new("outcome-replay").unwrap();
+        let mut projection = ProjectionState::new(known_entries);
+        let live = project_new_entries(
+            &session,
+            &mut projection,
+            Some(&RunId::new("run-1-1").unwrap()),
+            None,
+            &session_id,
+        )
+        .unwrap();
+        let live_outcome = live
+            .iter()
+            .find(|item| matches!(&item.payload, ItemPayload::RunOutcome { .. }))
+            .expect("live committed outcome");
+        assert_eq!(live_outcome.lifecycle, ItemLifecycle::Committed);
+        assert_eq!(
+            live_outcome.durable_entry_id.as_ref().map(|id| id.as_str()),
+            Some(marker_id.0.as_str())
+        );
+        let stable_item_id = live_outcome.id.clone();
+        drop(session);
+
+        let reopened = Session::open_read_only(&path).unwrap();
+        let seed = seed_from_session(
+            &reopened,
+            session_id,
+            SessionSeedOptions {
+                project_id: None,
+                model: ModelSelection {
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    reasoning: "off".into(),
+                },
+                authority: AuthorityProfile::FullAccess,
+                generation: 2,
+                meta: None,
+                attachment_store: None,
+            },
+        )
+        .unwrap();
+        let replayed = seed
+            .snapshot
+            .items
+            .iter()
+            .find(|item| matches!(&item.payload, ItemPayload::RunOutcome { .. }))
+            .expect("replayed committed outcome");
+        assert_eq!(replayed.id, stable_item_id);
+        assert!(matches!(
+            &replayed.payload,
+            ItemPayload::RunOutcome {
+                outcome: ygg_serve_backend::RunOutcome::Completed,
+                message: None,
+            }
+        ));
     }
 
     fn catalog_model(index: usize) -> ModelSummary {

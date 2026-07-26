@@ -2455,6 +2455,7 @@ async fn steering_enters_at_the_next_turn_boundary() {
     .await;
     std::fs::write(h.workspace.join("f.txt"), "data\n").unwrap();
 
+    h.agent.set_prompt_display_text(Some("start".to_owned()));
     let mut run = h.agent.prompt("start").await.unwrap();
     let control = run.control();
     let mut events = Vec::new();
@@ -2495,6 +2496,32 @@ async fn steering_enters_at_the_next_turn_boundary() {
     let session_texts = format!("{:?}", h.agent.session().entries());
     assert!(session_texts.contains("also check the docs"));
     assert!(session_texts.contains("and run the tests"));
+
+    // Only the initial composed prompt owns the initial draft's display
+    // override. Reopening the durable session must reveal each steer under its
+    // own text instead of aliasing all three user entries to "start".
+    let reopened = Session::open_read_only(&h.session_path).unwrap();
+    let display_texts = reopened
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.value {
+            EntryValue::Message(Message::User(message))
+                if message
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, UserPart::Text(_))) =>
+            {
+                Some(
+                    entry
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.display_text.as_deref()),
+                )
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(display_texts, vec![Some("start"), None, None]);
 }
 
 #[tokio::test]

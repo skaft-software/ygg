@@ -137,10 +137,40 @@ pub struct EntryMetadata {
     /// replayable model input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
+    /// Durable terminal state for a completed frontend run.
+    ///
+    /// This is presentation-only metadata attached to a non-model-visible
+    /// marker entry. Keeping it on a known entry variant lets older Ygg
+    /// binaries safely ignore the additional field while newer frontends can
+    /// reconstruct run boundaries after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_outcome: Option<SessionRunOutcome>,
     /// Marks a locally generated assistant boundary that intentionally has no
     /// authoritative provider sidecar.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_synthetic_assistant: bool,
+}
+
+/// Durable terminal state for one frontend-owned agent run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRunOutcome {
+    /// Coarse terminal status shared by graphical and native frontends.
+    pub status: SessionRunOutcomeStatus,
+    /// Optional bounded user-safe explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Coarse terminal status persisted at a frontend run boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRunOutcomeStatus {
+    /// The run completed successfully.
+    Completed,
+    /// The user stopped the run.
+    Stopped,
+    /// The run failed.
+    Failed,
 }
 
 impl EntryMetadata {
@@ -170,10 +200,20 @@ impl EntryMetadata {
                     .any(|character| character.is_control() && !matches!(character, '\n' | '\t')))
             .then_some(text)
         });
+        if let Some(outcome) = self.run_outcome.as_mut() {
+            outcome.message = outcome.message.take().and_then(|message| {
+                (message.len() <= 8 * 1024
+                    && !message.chars().any(|character| {
+                        character.is_control() && !matches!(character, '\n' | '\t')
+                    }))
+                .then_some(message)
+            });
+        }
         (self.prompt_model.is_some()
             || self.prompt_model_source.is_some()
             || self.prompt_color.is_some()
             || self.display_text.is_some()
+            || self.run_outcome.is_some()
             || self.local_synthetic_assistant)
             .then_some(self)
     }
@@ -1052,6 +1092,28 @@ impl Session {
     /// single synced write to the append-only file.
     pub fn append(&mut self, value: EntryValue) -> Result<EntryId, SessionError> {
         self.append_with_metadata(value, None)
+    }
+
+    /// Append a durable, non-model-visible terminal marker for a frontend run.
+    ///
+    /// The marker uses the long-standing configuration entry envelope for
+    /// backwards-compatible replay. Its typed outcome lives in presentation
+    /// metadata and therefore never enters provider-visible context.
+    pub fn append_run_outcome(
+        &mut self,
+        outcome: SessionRunOutcome,
+    ) -> Result<EntryId, SessionError> {
+        self.append_with_metadata(
+            EntryValue::Config {
+                model: None,
+                reasoning: None,
+                reasoning_mode: None,
+            },
+            Some(EntryMetadata {
+                run_outcome: Some(outcome),
+                ..EntryMetadata::default()
+            }),
+        )
     }
 
     /// Appends an entry with stable semantic presentation metadata.
@@ -2181,6 +2243,7 @@ mod tests {
                     prompt_model_source: Some("  deepseek  ".into()),
                     prompt_color: Some("  #22AACC  ".into()),
                     display_text: Some("visible\ndraft".into()),
+                    run_outcome: None,
                     local_synthetic_assistant: false,
                 }),
             )
@@ -2193,6 +2256,7 @@ mod tests {
                     prompt_model_source: Some("#2243e6".into()),
                     prompt_color: Some("rgb(1,2,3)\u{1b}".into()),
                     display_text: Some("bad\u{1b}".into()),
+                    run_outcome: None,
                     local_synthetic_assistant: false,
                 }),
             )
@@ -2207,6 +2271,7 @@ mod tests {
                 prompt_model_source: Some("deepseek".into()),
                 prompt_color: Some("#22aacc".into()),
                 display_text: Some("visible\ndraft".into()),
+                run_outcome: None,
                 local_synthetic_assistant: false,
             })
         );
@@ -2215,6 +2280,44 @@ mod tests {
         assert!(!persisted.contains("#2243e6"));
         assert!(persisted.contains("#22aacc"));
         assert!(!persisted.contains("[31m"));
+    }
+
+    #[test]
+    fn run_outcome_marker_is_durable_and_not_model_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut session = Session::create(&path).unwrap();
+        session.append(user("question")).unwrap();
+        session.append(assistant("answer")).unwrap();
+        let outcome_id = session
+            .append_run_outcome(SessionRunOutcome {
+                status: SessionRunOutcomeStatus::Failed,
+                message: Some("bounded failure".into()),
+            })
+            .unwrap();
+        drop(session);
+
+        let session = Session::open(&path).unwrap();
+        let marker = session.entry(&outcome_id).expect("outcome marker");
+        assert!(matches!(
+            marker.value,
+            EntryValue::Config {
+                model: None,
+                reasoning: None,
+                reasoning_mode: None,
+            }
+        ));
+        assert_eq!(
+            marker
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.run_outcome.as_ref()),
+            Some(&SessionRunOutcome {
+                status: SessionRunOutcomeStatus::Failed,
+                message: Some("bounded failure".into()),
+            })
+        );
+        assert_eq!(session.context().unwrap().len(), 2);
     }
 
     #[test]

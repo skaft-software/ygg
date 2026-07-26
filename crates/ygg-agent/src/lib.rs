@@ -119,7 +119,7 @@ pub use input::{InputPart, UserInput};
 pub use sandbox::SandboxConfig;
 pub use session::{
     Checkpoint, Entry, EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRecord,
-    UsageRecord, UsageRecordKind,
+    SessionRunOutcome, SessionRunOutcomeStatus, UsageRecord, UsageRecordKind,
 };
 pub use skills::{
     ContentHash, LoadedSkill, SkillActivationId, SkillDescriptor, SkillId, SkillLoadError,

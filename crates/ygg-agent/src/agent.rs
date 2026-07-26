@@ -31,7 +31,9 @@ use crate::events::{
 use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
-use crate::session::{EntryId, EntryMetadata, EntryValue, Session, SessionError};
+use crate::session::{
+    EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRunOutcome,
+};
 use crate::tool::{
     CancellationToken, ReplaySafety, Tool, ToolContext, ToolError, ToolOutput, ToolOutputMediaKind,
     ToolProgress, ToolProgressSink, PROGRESS_CHANNEL_CAPACITY,
@@ -2279,6 +2281,17 @@ impl Agent {
         &self.session
     }
 
+    /// Persist a non-model-visible terminal marker for a frontend-owned run.
+    ///
+    /// Callers should record this only after the [`Run`] has been dropped, so
+    /// the run no longer holds the authoritative mutable session borrow.
+    pub fn record_run_outcome(
+        &mut self,
+        outcome: SessionRunOutcome,
+    ) -> Result<EntryId, AgentError> {
+        self.session.append_run_outcome(outcome).map_err(Into::into)
+    }
+
     /// Read-only access to the selected model.
     pub fn model(&self) -> &Model {
         &self.model
@@ -2318,6 +2331,7 @@ impl Agent {
             prompt_model_source: self.prompt_model_source.clone(),
             prompt_color: self.prompt_color.clone(),
             display_text: self.prompt_display_text.take(),
+            run_outcome: None,
             local_synthetic_assistant: false,
         }
     }
@@ -2694,6 +2708,13 @@ impl Agent {
             };
         let initial_request = input.text_summary();
         let prompt_metadata = self.prompt_entry_metadata();
+        // `display_text` belongs only to the draft that started this run.
+        // Steering and follow-up inputs are independent user submissions and
+        // must render their own durable message bodies after replay.
+        let control_prompt_metadata = EntryMetadata {
+            display_text: None,
+            ..prompt_metadata.clone()
+        };
         let first_entry = self
             .session
             .append_with_metadata(user_message(input), Some(prompt_metadata.clone()))?;
@@ -2801,7 +2822,7 @@ impl Agent {
                         terminal_gate_requests.push(summary.clone());
                         if let Err(e) = session.append_with_metadata(
                             user_message(input),
-                            Some(prompt_metadata.clone()),
+                            Some(control_prompt_metadata.clone()),
                         ) {
                             if !delivered.is_empty() {
                                 let ev = AgentEvent::SteeringDelivered {
@@ -3428,7 +3449,7 @@ impl Agent {
                         terminal_gate_requests.push(summary);
                         if let Err(e) = session.append_with_metadata(
                             user_message(input),
-                            Some(prompt_metadata.clone()),
+                            Some(control_prompt_metadata.clone()),
                         ) {
                             break 'run FinishReason::Failed(e.into());
                         }
