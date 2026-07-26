@@ -969,7 +969,7 @@ fn apply_security_headers(headers: &mut HeaderMap) {
     headers.insert(
         CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'",
+            "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'",
         ),
     );
     if !headers.contains_key(CACHE_CONTROL) {
@@ -1529,12 +1529,12 @@ mod tests {
 
         let allowed = request(address, get_request(address, "/")).await;
         assert!(allowed.starts_with("HTTP/1.1 200"));
-        assert!(allowed
-            .to_ascii_lowercase()
-            .contains("content-security-policy:"));
-        assert!(allowed
-            .to_ascii_lowercase()
-            .contains("style-src 'self' 'unsafe-inline'"));
+        assert_eq!(
+            response_header(&allowed, "content-security-policy"),
+            Some(
+                "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+            )
+        );
         assert!(allowed
             .to_ascii_lowercase()
             .contains("cache-control: no-store"));
