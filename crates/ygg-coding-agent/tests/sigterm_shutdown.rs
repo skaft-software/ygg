@@ -304,7 +304,7 @@ fn mouse_modes_apply_expected_terminal_ownership_and_restore() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     for (mode, application_owned) in [
-        ("auto", true),
+        ("auto", false),
         ("app", true),
         ("terminal", false),
         ("off", false),

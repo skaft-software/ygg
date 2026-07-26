@@ -48,7 +48,7 @@ Local endpoints are a primary path rather than a compatibility mode. Ygg keeps p
 | **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share typed request, message, tool, usage, and streaming models. |
 | **Durable by construction** | Sessions are append-only, parent-linked, branchable, locked, synced, repairable, and inspectable without ygg running. |
 | **Authority is explicit** | Workspace trust, tool allowlists, mutation controls, command controls, bounded I/O, and extension trust are visible user decisions. |
-| **The terminal handles presentation** | Stable semantic scrolling by default, explicit terminal-native history, semantic rendering, ten bundled themes, narrow layouts, and plain-output fallbacks share one terminal model. |
+| **The terminal handles presentation** | Native scrollback and selection by default, opt-in semantic scrolling, semantic rendering, ten bundled themes, narrow layouts, and plain-output fallbacks share one terminal model. |
 | **Customization is local data** | Prompts, skills, themes, instructions, and extensions are ordinary files with deterministic precedence and reloadable snapshots. |
 
 ## Install
@@ -236,7 +236,7 @@ model discovery during startup; inference still reaches the selected endpoint.
 
 | Mode | Command | Best for |
 | --- | --- | --- |
-| Interactive TUI | `ygg` | Daily work: stable streaming, semantic scrolling, tools, themes, pickers, branching, and steering. |
+| Interactive TUI | `ygg` | Daily work: streaming, tools, themes, pickers, branching, steering, and native scrollback. |
 | Chronological plain mode | `ygg --plain` | Basic terminals, logs, accessibility tooling, and environments where cursor control is undesirable. |
 | Response-only print mode | `ygg -p "prompt"` | Shell composition and scripts that want the final response on stdout. |
 
@@ -363,11 +363,12 @@ compact_model = "openrouter/anthropic/claude-haiku-4.5"
 
 ## Terminal experience
 
-ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats predictable motion and explicit terminal ownership as product behavior, not implementation detail.
+ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats native terminal behavior as a feature, not an implementation detail.
 
-- Stable application-owned scrolling is the default (`mouse = "auto"`); scrolling above the tail freezes the reading viewport while streamed Markdown grows, reports new output, and lets PageDown return to live output.
-- `--mouse terminal` is the explicit terminal-native compatibility mode for native selection and history. Portable terminal protocols do not expose that history's reading offset, so Ygg cannot promise an anchored viewport there while output streams.
-- `--mouse off` disables application capture and follows the same terminal-owned rendering path, including that streaming limitation.
+- Native scrollback and drag selection are the default (`mouse = "auto"`); Ygg leaves mouse reporting disabled and lets committed transcript rows flow into terminal history.
+- The default renderer follows logical content height instead of pinning the composer and footer inside a fixed full-screen viewport. Ordinary frames reuse the retained stable prefix and render only the mutable/new suffix.
+- A terminal resize reflows the retained semantic transcript at the new width, resets terminal saved lines, and replays Ygg's retained transcript once.
+- `--mouse app` explicitly captures the mouse and uses a bounded semantic viewport. In that mode, scrolling above the tail stays anchored while streamed Markdown grows, reports new output, and lets PageDown return to live output.
 - Stable-prefix differential rendering, synchronized atomic frames, and bounded repaint regions.
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
@@ -377,7 +378,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats pred
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
-Application-owned mode captures mouse events for semantic scrolling and selection. Choose terminal mode when the terminal's own drag selection and long-lived history matter more than read-while-streaming stability; `off` takes the same rendering path without application capture. Keyboard transcript navigation remains available in every mode.
+Default `auto`, explicit `terminal`, and `off` modes all leave mouse events to the terminal and use the native-scrollback renderer. Application-owned `app` mode captures mouse events for semantic scrolling and selection. Portable terminal protocols do not expose the native history's reading offset, so only `app` mode can guarantee an anchored read-while-streaming viewport. Keyboard transcript navigation remains available in every mode.
 
 Raw protocol arguments and envelopes, unsanitized failure payloads, and
 extension-rendered tool payloads remain internal accountability evidence and are
@@ -392,7 +393,7 @@ progress is neither persisted nor sent to the model.
 ```sh
 ygg --theme violet-hour
 ygg --color auto
-ygg --mouse terminal
+ygg --mouse app
 ```
 
 Custom themes are local TOML files and can control semantic roles, glyphs, density, responsive breakpoints, transcript surfaces, and terminal capability fallbacks. See [docs/themes.md](docs/themes.md).
@@ -477,7 +478,7 @@ reasoning_mode = "standard"
 cache_retention = "short"
 theme = "default"
 color = "auto"
-# auto/app: stable semantic viewport; terminal: native selection/history
+# auto/terminal/off: native selection/history; app: semantic viewport
 mouse = "auto"
 plain = false
 

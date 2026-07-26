@@ -7,10 +7,10 @@ The interactive frontend owns terminal setup/restoration and presentation only;
 
 ## Terminal guarantees
 
-- The interactive frontend renders on the primary screen. `auto` and `app`
-  mouse modes keep a bounded, application-owned semantic viewport. Explicit
-  `--mouse terminal` lets committed transcript rows flow into terminal-native
-  scrollback; `--mouse off` disables capture and uses that same renderer.
+- The interactive frontend renders on the primary screen. `auto`, `terminal`,
+  and `off` use a logical-height frame whose committed rows flow into
+  terminal-native scrollback. Explicit `--mouse app` uses a bounded,
+  application-owned semantic viewport instead.
 - A theme swap clears and repaints every cell in the visible viewport.
   Application-owned history is semantic and therefore adopts the current theme
   whenever it becomes visible. Rows already committed by a terminal-owned mode
@@ -18,11 +18,11 @@ The interactive frontend owns terminal setup/restoration and presentation only;
   styling; Ygg preserves that history rather than clearing it implicitly.
 - Raw mode, bracketed paste, keyboard enhancements, synchronized output, and
   mouse reporting are enabled only when supported and restored idempotently.
-- Mouse reporting is enabled by default so Ygg can own scrolling and semantic
-  selection. `--mouse terminal` preserves native drag selection and history;
-  `--mouse off` disables capture and uses the same terminal-owned renderer.
-  Neither mode can provide stable read-while-streaming anchoring because terminal
-  protocols do not report the user's native scrollback offset.
+- Mouse reporting is disabled by default, preserving native drag selection and
+  wheel scrolling. `--mouse app` explicitly enables capture for semantic
+  scrolling and selection. Portable terminal protocols do not report a user's
+  native scrollback offset, so terminal-owned modes cannot guarantee stable
+  read-while-streaming anchoring.
 - Redirected, unknown, or explicitly plain terminals use the chronological
   fallback without cursor-control sequences.
 - Provider, tool, and user text is sanitized before terminal output.
@@ -35,19 +35,25 @@ The interactive frontend owns terminal setup/restoration and presentation only;
 
 The transcript is semantic blocks rather than a terminal framebuffer. Wrapped
 layouts are cached per block and width, and streaming invalidates only changed
-blocks. In the default application-owned path, `follow_tail` and
-`scroll_from_bottom` select one bounded viewport. Scrolling above the tail keeps
-those semantic rows fixed while one Markdown block continues to grow, increments
-the new-output state, and exposes the PageDown return-to-live affordance.
+blocks. The default terminal-owned renderer reuses the retained stable prefix;
+ordinary frames lay out and paint only the mutable or newly appended suffix.
+Chrome follows logical content height rather than occupying a fixed full-screen
+viewport, and committed rows naturally enter terminal history.
 
-Terminal-owned modes instead redraw only a mutable suffix and commit stable rows
-into native history. This preserves terminal-native selection and long-lived
-scrollback, but Ygg cannot observe or freeze a reader's position inside that
-history. Semantic copy and resize retain stable coordinates in either renderer;
-application-owned drag selection is available only while mouse capture is
-enabled. Resume materializes only a bounded tail for first input; older
-active-branch blocks are loaded when semantic navigation or select-all reaches
-beyond that tail.
+A resize reflows the retained semantic transcript at the new width, resets the
+terminal's saved-line presentation, and replays Ygg's transcript once. Deferred
+session history is materialized before that destructive replay. Explicit
+application-owned mode instead uses `follow_tail` and `scroll_from_bottom` to
+select one bounded viewport. Scrolling above its tail keeps semantic rows fixed
+while one Markdown block continues to grow, increments the new-output state,
+and exposes the PageDown return-to-live affordance.
+
+Terminal-owned modes preserve native selection and long-lived scrollback, but
+Ygg cannot observe or freeze a reader's position inside that history. Semantic
+copy retains stable coordinates in either renderer; application-owned drag
+selection is available only while mouse capture is enabled. Resume materializes
+only a bounded tail for first input; older active-branch blocks are loaded when
+semantic navigation, select-all, or resize replay reaches beyond that tail.
 
 Held-key repeats are accepted only for text editing and navigation. One-shot
 actions such as submit, panel confirmation, close, abort, and reasoning/summary expansion

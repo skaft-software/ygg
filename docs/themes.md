@@ -70,16 +70,18 @@ viewport before the next frame. Current rows and rows rendered afterward
 therefore use the new theme, including byte-identical separator rows that a
 normal differential update would otherwise skip.
 
-The default `auto` mode and explicit `--mouse app` use an application-owned
+Default `auto`, explicit `--mouse terminal`, and `--mouse off` use the
+primary-screen native-scrollback renderer. They leave mouse events to the
+terminal for drag selection and history navigation. Rows already committed to
+native history retain the colors with which they were written because portable
+terminal protocols cannot rewrite historical cells; Ygg neither clears nor
+claims to restyle that history during a theme change.
+
+Explicit `--mouse app` captures the mouse and switches to an application-owned
 semantic viewport. Retained rows are restyled whenever they enter that viewport,
 and a reader who scrolls above live output stays anchored while streaming
-continues. `--mouse terminal` deliberately switches to the primary-screen native
-scrollback renderer for terminal-owned selection and history; `--mouse off`
-disables capture and uses the same renderer. Terminal protocols do not expose a
-portable reading offset or a way to rewrite historical cells, so rows already
-committed in either terminal-owned mode retain their old colors after a theme
-change and the reading viewport may move while new output arrives. Ygg neither
-clears nor claims to restyle that terminal-owned history.
+continues. Terminal-owned modes cannot offer that anchoring because terminal
+protocols do not expose a portable native-history reading offset.
 
 ## Schema
 

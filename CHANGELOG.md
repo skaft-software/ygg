@@ -6,10 +6,10 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Changed
 
-- Made the bounded semantic viewport the `auto` scrolling default so readers who
-  move above the live tail remain anchored while one streamed Markdown block
-  grows. `--mouse terminal` remains the explicit native-selection and native-
-  history compatibility mode.
+- Kept `auto` on the terminal-owned renderer so native scrollback, drag
+  selection, logical-height chrome, stable-prefix suffix updates, and full
+  retained-transcript replay on resize remain the defaults. `--mouse app`
+  explicitly opts into the bounded, anchored semantic viewport.
 - Preserved the `0.3.1-alpha` default prompt alignment, event rows, transcript
   surfaces, and composer spacing; this experiment changes terminal behavior,
   not the visual layout.
@@ -27,8 +27,9 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Performance and reliability
 
-- Added PTY coverage proving `auto`/`app` negotiate mouse ownership while
-  `terminal`/`off` leave it to the terminal and all four restore terminal state.
+- Added PTY coverage proving only explicit `app` mode negotiates mouse ownership;
+  `auto`/`terminal`/`off` leave it to the terminal, and all four restore terminal
+  state.
 - Added regressions that grow one live Markdown block while scrolled above the
   tail and reflow cached transcript rows across consecutive wide and narrow
   renders.

@@ -1805,9 +1805,9 @@ struct ShellFrameState {
 struct ShellComponent {
     state: SharedState,
     frame: RefCell<ShellFrameState>,
-    /// Stable semantic scrolling renders one bounded viewport and is the
-    /// default (`--mouse auto`/`app`). Explicit `--mouse terminal`/`off`
-    /// retain the append-only native-scrollback renderer instead.
+    /// Explicit `--mouse app` mode keeps a bounded semantic viewport and pins
+    /// chrome inside it. The default terminal-owned path lets committed rows
+    /// enter native scrollback and leaves selection to the terminal.
     application_viewport: bool,
 }
 
@@ -5034,7 +5034,7 @@ fn wrapped_line_offset(text: &str, n: usize, wrap_width: usize) -> usize {
 }
 
 fn append_viewport_chrome(lines: &mut Vec<String>, chrome: ShellChrome) {
-    // Application-owned mode renders exactly one terminal viewport. Explicit
+    // Application-owned mode renders exactly one terminal viewport. The
     // terminal-owned mode uses `append_chrome` below so committed transcript
     // rows can enter native scrollback instead of being sliced away here.
     lines.truncate(chrome.transcript_rows);
@@ -5127,11 +5127,11 @@ fn render_shell_viewport_update(
 }
 
 fn append_chrome(lines: &mut Vec<String>, chrome: ShellChrome, stable_prefix_rows: usize) {
-    // Terminal-owned compatibility mode follows the logical content height.
-    // Padding a short frame to the terminal height pins the composer to the
-    // bottom and creates a large dead zone below the transcript. Once the frame
-    // naturally grows past the viewport, sexy-tui moves committed rows into
-    // terminal-owned scrollback.
+    // The default terminal-owned mode follows logical content height. Padding
+    // a short frame to terminal height would pin the composer to the bottom and
+    // create a large dead zone below the transcript. Once the frame naturally
+    // grows past the viewport, sexy-tui moves committed rows into native
+    // scrollback.
     // `lines` may be only a lazy suffix, so its retained prefix still decides
     // whether the transcript owns the single breathing row before chrome.
     let complete_transcript_rows = stable_prefix_rows.saturating_add(lines.len());
@@ -5196,10 +5196,9 @@ fn render_native_overlay_suffix(
     (stable_prefix, replacement, total_rows, overlay_prefix_len)
 }
 
-/// Full logical primary-screen frame for explicit terminal-owned scrolling.
-/// The terminal backend paints only its visible tail; committed rows naturally
-/// move into native scrollback and are never sliced into an application-owned
-/// viewport.
+/// Full logical frame for the default terminal-owned renderer. The backend
+/// paints only its visible tail; committed rows naturally move into native
+/// scrollback and are never sliced into an application-owned viewport.
 fn render_shell_at(state: &ShellState, width: u16, now: Instant) -> Vec<String> {
     let chrome = shell_chrome(state, width, now);
     let transcript = transcript_lines(state, width);

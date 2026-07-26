@@ -87,9 +87,8 @@ pub struct Cli {
     /// Use chronological ASCII output without cursor control.
     #[arg(long)]
     pub plain: bool,
-    /// Mouse ownership: auto/app use stable semantic scrolling; terminal
-    /// preserves native scrollback; off uses terminal-owned scrolling without
-    /// capture.
+    /// Mouse ownership: auto/terminal/off preserve native selection and
+    /// scrollback; app captures the mouse for a bounded semantic viewport.
     #[arg(long, value_name = "MODE")]
     pub mouse: Option<String>,
     /// Emit reasoning deltas in print mode.
@@ -960,6 +959,23 @@ mod tests {
         cli.color = Some("never".into());
         let config = config_with_empty_global(cli, directory.path()).unwrap();
         assert_eq!(config.color, ColorMode::Never);
+    }
+
+    #[test]
+    fn mouse_policy_defaults_to_terminal_ownership() {
+        let directory = cwd();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(config.mouse, config::MouseMode::Auto);
+        assert!(!config.mouse.application_owned());
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.mouse = Some("app".into());
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(config.mouse, config::MouseMode::App);
+        assert!(config.mouse.application_owned());
     }
 
     #[test]

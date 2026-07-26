@@ -29,10 +29,9 @@ pub fn resolve_workspace(explicit: Option<&Path>, cwd: &Path) -> std::io::Result
     cwd.canonicalize()
 }
 
-/// Mouse ownership policy. `Auto` selects Ygg's stable semantic viewport and
-/// application-owned selection. `Terminal` preserves native selection and
-/// scrollback; `App` explicitly selects the same semantic behavior as `Auto`,
-/// and `Off` disables capture and uses the terminal-owned renderer.
+/// Mouse ownership policy. `Auto`, `Terminal`, and `Off` preserve the
+/// terminal's native selection and scrollback. `App` explicitly opts into
+/// Ygg's bounded semantic viewport and application-owned selection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MouseMode {
     #[default]
@@ -53,10 +52,10 @@ impl MouseMode {
         }
     }
 
-    /// Stable application-owned scrolling is the default. Native terminal
-    /// history remains available as an explicit compatibility choice.
+    /// Native selection and scrollback are the default. Application mouse
+    /// ownership remains available only through explicit `App` mode.
     pub fn application_owned(self) -> bool {
-        matches!(self, Self::Auto | Self::App)
+        matches!(self, Self::App)
     }
 }
 
@@ -519,11 +518,12 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn mouse_mode_defaults_to_stable_application_scrolling() {
+    fn mouse_mode_defaults_to_native_selection_and_scrollback() {
+        assert_eq!(MouseMode::default(), MouseMode::Auto);
         assert_eq!(MouseMode::parse("app").unwrap(), MouseMode::App);
         assert_eq!(MouseMode::parse("terminal").unwrap(), MouseMode::Terminal);
         assert_eq!(MouseMode::parse("off").unwrap(), MouseMode::Off);
-        assert!(MouseMode::Auto.application_owned());
+        assert!(!MouseMode::Auto.application_owned());
         assert!(MouseMode::App.application_owned());
         assert!(!MouseMode::Terminal.application_owned());
         assert!(!MouseMode::Off.application_owned());
