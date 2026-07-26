@@ -152,4 +152,23 @@ describe("HTTP Ygg transport", () => {
     ]);
     transport.close();
   });
+
+  it("uses relative HTTP routes and derives WebSocket origin from the page", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse(hostBootstrapGolden));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const transport = new HttpTransport("device-browser");
+    await transport.connect();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/bootstrap",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    expect(FakeWebSocket.instances[0]?.url).toBe(
+      `ws://${window.location.host}/api/v1/events`,
+    );
+    transport.close();
+  });
 });
