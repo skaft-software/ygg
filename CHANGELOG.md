@@ -10,9 +10,9 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   move above the live tail remain anchored while one streamed Markdown block
   grows. `--mouse terminal` remains the explicit native-selection and native-
   history compatibility mode.
-- Gave the compiled default a restrained responsive composition: compact
-  right-aligned user bands, readable assistant measure, quiet operational rails,
-  two-cell composer alignment, and plain narrow fallbacks.
+- Preserved the `0.3.1-alpha` default prompt alignment, event rows, transcript
+  surfaces, and composer spacing; this experiment changes terminal behavior,
+  not the visual layout.
 - Reconciled the vendored renderer's `0.3.1` package metadata and provenance with
   the Ygg workspace while keeping its unsynchronized standalone baseline explicit.
 
@@ -22,16 +22,16 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   no content block is dirty, preventing wide rows from leaking into a narrow
   render.
 - Sanitized user input before Markdown parsing so terminal protocols cannot
-  expand differently from the semantic copy projection or destabilize compact
-  prompt geometry.
+  expand differently from the semantic copy projection or destabilize prompt
+  geometry.
 
 ### Performance and reliability
 
 - Added PTY coverage proving `auto`/`app` negotiate mouse ownership while
   `terminal`/`off` leave it to the terminal and all four restore terminal state.
 - Added regressions that grow one live Markdown block while scrolled above the
-  tail and exercise the compiled default through consecutive wide and narrow
-  layouts.
+  tail and reflow cached transcript rows across consecutive wide and narrow
+  renders.
 
 ### Security
 

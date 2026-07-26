@@ -369,8 +369,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats pred
 - `--mouse terminal` is the explicit terminal-native compatibility mode for native selection and history. Portable terminal protocols do not expose that history's reading offset, so Ygg cannot promise an anchored viewport there while output streams.
 - `--mouse off` disables application capture and follows the same terminal-owned rendering path, including that streaming limitation.
 - Stable-prefix differential rendering, synchronized atomic frames, and bounded repaint regions.
-- A restrained compiled default: compact right-aligned user bands, readable assistant measure, quiet operational rails, and chrome-free narrow fallbacks.
-- Responsive Unicode/ASCII and truecolor/256-color/16-color/no-color presentation.
+- Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
 - Prompt colors tied to model labs in the default theme; named themes retain their own authored palettes.
 - Exact theme replacement: switching back to default does not retain attributes from the previous theme.

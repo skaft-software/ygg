@@ -60,21 +60,12 @@ PDFs are not decoded or sent as multimodal payloads: a dropped PDF receives a
 composer chip, but submission resolves that chip to the file path as text so the
 model can inspect it with file tools.
 
-The compiled default uses one calm, responsive composition rather than requiring
-a specialty theme: two-cell transcript inset, compact right-aligned user bands
-capped at 76 columns, plain assistant prose capped at 100 columns, and one muted
-rail for reasoning, tool, shell, notice, and compaction events. It uses a single
-comfortable transition row and no transcript cards. Below 72 columns, bands and
-rails become plain rows, tool duration disappears, and content gets the terminal
-width back. These decisions are block-stable, so token arrival changes prose
-layout only when content itself crosses a wrapping boundary.
-
-The compiled default composer leaves the terminal canvas unfilled, uses two cells
-of horizontal padding, and keeps a restrained perimeter at rest; live work
-animates a model-colored shimmer around that perimeter. Fenced Markdown code is
-borderless and uses `#202630` on known dark profiles or `#f1f5f4` on known light
-profiles, falling back to an unpainted surface when the background is unknown.
-Named and custom themes keep their authored chrome.
+The compiled default composer leaves the terminal canvas unfilled and keeps a
+restrained perimeter at rest; live work animates a model-colored shimmer around
+that perimeter. Fenced Markdown code is borderless and uses `#202630` on known
+dark profiles or `#f1f5f4` on known light profiles, falling back to an unpainted
+surface when the background is unknown. Named and custom themes keep their
+authored chrome.
 
 ## Reasoning presentation
 

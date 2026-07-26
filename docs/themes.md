@@ -20,22 +20,6 @@ Use `/theme` to pick a theme, `/theme list` to inspect the catalog, and
 also refreshes resource discovery. At startup, use `--theme <name>` and add
 repeatable explicit roots with `--theme-dir <directory>`.
 
-## Compiled default
-
-The built-in `default` is a complete responsive composition, not an unstyled
-fallback. At ordinary widths it uses comfortable one-row transitions, a two-cell
-transcript inset, compact right-aligned user bands capped at 76 columns, plain
-assistant prose capped at 100 columns, and low-contrast rails for operational
-events. The composer and footer share two cells of horizontal padding. No
-transcript surface uses a card or decorative heading.
-
-Below 72 columns, user bands and operational rails resolve to plain rows, tool
-durations disappear, and user padding contracts to one cell. Unicode/ASCII and
-color capability fallback happens independently, so reduced-capability terminals
-keep the same hierarchy without broken border fragments. This compiled recipe is
-also covered at wide and narrow widths; users do not need to select a bundled
-theme to get Ygg's default hierarchy.
-
 ## Bundled theme pack
 
 The pack intentionally demonstrates different design philosophies without
