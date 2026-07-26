@@ -27,6 +27,7 @@ for changed_file in $changed_files; do
       | scripts/check-ygg-serve-boundaries.sh \
       | scripts/smoke-ygg-serve-installed.sh \
       | .github/workflows/ci.yml \
+      | .gitattributes \
       | Cargo.toml \
       | Cargo.lock \
       | .gitignore)
