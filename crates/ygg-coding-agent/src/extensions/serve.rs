@@ -43,6 +43,7 @@ use crate::session_store::{SessionMeta, SessionStore};
 
 const DRIVER_MAILBOX_CAPACITY: usize = 64;
 const DRIVER_EVENT_CAPACITY: usize = 512;
+const MAX_GRAPHICAL_MODELS: usize = 256;
 const MAX_PROJECTED_SESSION_ITEMS: usize = 9_000;
 
 static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -74,14 +75,14 @@ pub async fn run(
         // Explicit trusted terminal output: the launch capability is one-use,
         // process-local, and stripped from the browser address bar by an immediate
         // redirect. It is never persisted or included in server errors.
-        crate::output::stdout_line(format!("Open Ygg once: {}", server.launch_url()));
+        crate::output::stdout_line(format!("Open ygg once: {}", server.launch_url()));
     } else {
         if let Err(error) = open_browser(&server.launch_url()) {
             crate::output::stderr_line(format!(
                 "warning: could not open the browser automatically: {error}"
             ));
         }
-        crate::output::stdout_line(format!("Ygg graphical host: {clean_url}"));
+        crate::output::stdout_line(format!("ygg graphical host: {clean_url}"));
     }
     tokio::signal::ctrl_c().await?;
     server.shutdown().await?;
@@ -167,13 +168,7 @@ struct YggHost {
 impl YggHost {
     fn new(config: Config) -> anyhow::Result<Self> {
         let boot = crate::app::bootstrap::bootstrap(config.clone())?;
-        let mut models = graphical_model_catalog(&boot.catalog, &config);
-        models.sort_by(|left, right| {
-            left.provider
-                .cmp(&right.provider)
-                .then_with(|| left.name.cmp(&right.name))
-                .then_with(|| left.id.cmp(&right.id))
-        });
+        let models = graphical_model_catalog(&boot.catalog, &config);
         if models.is_empty() {
             anyhow::bail!("no configured models are available for ygg serve");
         }
@@ -189,7 +184,7 @@ impl YggHost {
         let descriptor = HostDescriptor {
             id: host_id,
             name: ygg_serve_backend::sanitize_public_text(
-                &format!("Ygg — {workspace_name}"),
+                &format!("ygg — {workspace_name}"),
                 256,
                 false,
             ),
@@ -2161,7 +2156,7 @@ fn empty_seed(
 }
 
 fn graphical_model_catalog(catalog: &ModelCatalog, config: &Config) -> Vec<ModelSummary> {
-    catalog
+    let models = catalog
         .models()
         .filter_map(|spec| catalog.resolve(&spec.id).ok())
         .map(|model| {
@@ -2212,7 +2207,38 @@ fn graphical_model_catalog(catalog: &ModelCatalog, config: &Config) -> Vec<Model
                 input_modalities,
             }
         })
-        .collect()
+        .collect();
+    bound_graphical_models(models, config.model.as_ref())
+}
+
+fn bound_graphical_models(
+    mut models: Vec<ModelSummary>,
+    configured_model: Option<&ModelId>,
+) -> Vec<ModelSummary> {
+    let compare = |left: &ModelSummary, right: &ModelSummary| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    };
+    models.sort_by(compare);
+    if models.len() <= MAX_GRAPHICAL_MODELS {
+        return models;
+    }
+
+    let configured = configured_model.and_then(|configured| {
+        models
+            .iter()
+            .position(|summary| summary.id == configured.0)
+            .filter(|index| *index >= MAX_GRAPHICAL_MODELS)
+            .map(|index| models.remove(index))
+    });
+    models.truncate(MAX_GRAPHICAL_MODELS - usize::from(configured.is_some()));
+    if let Some(configured) = configured {
+        models.push(configured);
+        models.sort_by(compare);
+    }
+    models
 }
 
 fn selection_from_summary(summary: &ModelSummary) -> ModelSelection {
@@ -2688,6 +2714,7 @@ fn system_time_ms(time: SystemTime) -> u64 {
 mod tests {
     use super::*;
     use ygg_ai::UserMessage;
+    use ygg_serve_backend::{CatalogCursor, HostBootstrap, PROTOCOL_VERSION};
 
     fn png() -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -2805,5 +2832,84 @@ mod tests {
             attachment_refs_for_entry(&entry, Some(&store), &session_id, &mut after_restart)
                 .unwrap();
         assert_eq!(restored, vec![reference]);
+    }
+
+    fn catalog_model(index: usize) -> ModelSummary {
+        ModelSummary {
+            id: format!("model-{index:03}"),
+            name: format!("Model {index:03}"),
+            provider: "provider".into(),
+            local: false,
+            available: true,
+            reasoning: vec!["off".into()],
+            default_reasoning: Some("off".into()),
+            input_modalities: vec![InputModality::Text],
+        }
+    }
+
+    #[test]
+    fn graphical_catalog_is_stably_bounded_and_retains_the_configured_model() {
+        let forward = (0..300).map(catalog_model).collect::<Vec<_>>();
+        let mut reverse = forward.clone();
+        reverse.reverse();
+        let configured = ModelId("model-299".into());
+
+        let models = bound_graphical_models(forward, Some(&configured));
+        assert_eq!(models, bound_graphical_models(reverse, Some(&configured)));
+        assert_eq!(models.len(), MAX_GRAPHICAL_MODELS);
+        assert!(models.iter().any(|summary| summary.id == configured.0));
+        assert!(!models.iter().any(|summary| summary.id == "model-255"));
+
+        let selected = models
+            .iter()
+            .find(|summary| summary.id == configured.0)
+            .unwrap();
+        let selection = selection_from_summary(selected);
+        let session_id = SessionId::new("catalog-limit-session").unwrap();
+        let seed = empty_seed(
+            session_id.clone(),
+            None,
+            selection,
+            AuthorityProfile::FullAccess,
+            1,
+        );
+        let theme_id = ThemeId::new("catalog-limit-theme").unwrap();
+        let bootstrap = HostBootstrap {
+            protocol: PROTOCOL_VERSION,
+            host: HostDescriptor {
+                id: HostId::new("catalog-limit-host").unwrap(),
+                name: "ygg test".into(),
+            },
+            capabilities: HostCapabilities::default(),
+            catalog_cursor: CatalogCursor(1),
+            models,
+            authority_profiles: vec![AuthorityProfile::FullAccess],
+            authority_ceiling: AuthorityProfile::FullAccess,
+            themes: vec![ThemeOption {
+                id: theme_id.clone(),
+                theme: ThemeDto {
+                    name: "Test".into(),
+                    source: ThemeSourceClass::Bundled,
+                    revision: 1,
+                    scheme: ColorScheme::Dark,
+                    density: ThemeDensity::Comfortable,
+                    motion: ThemeMotion::Full,
+                    typography: ThemeTypography {
+                        body_family: "system-ui".into(),
+                        mono_family: "ui-monospace".into(),
+                        body_size: 17,
+                        display_ratio_milli: 1235,
+                    },
+                    colors: BTreeMap::new(),
+                    roles: BTreeMap::new(),
+                },
+            }],
+            selected_theme_id: theme_id,
+            projects: Vec::new(),
+            sessions: vec![seed.summary],
+            selected_session_id: session_id,
+            selected_session: seed.snapshot,
+        };
+        bootstrap.validate().unwrap();
     }
 }
