@@ -680,6 +680,22 @@ kbd {
   height: 34px;
 }
 
+.fixture-mode-label {
+  position: relative;
+  z-index: 3;
+  flex: 0 0 28px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 12px;
+  color: color-mix(in srgb, var(--warning) 78%, var(--text));
+  background: color-mix(in srgb, var(--warning) 8%, var(--bg-grid));
+  font-size: var(--font-meta);
+  line-height: 1.35;
+  text-align: center;
+}
+
 /* Transcript */
 
 .conversation {

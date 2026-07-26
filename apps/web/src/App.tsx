@@ -36,7 +36,7 @@ import {
   useYggStore,
 } from "./store";
 import { applyStoredTypePreferences, applyTheme } from "./theme";
-import { createTransport } from "./transport";
+import { createTransport, transportModeFromSearch } from "./transport";
 
 type Surface = "session" | "settings" | "devices";
 
@@ -50,7 +50,17 @@ const statusLabel: Record<SessionStatus, string> = {
   disconnected: "Reconnecting",
 };
 
-const store = new YggStore(createTransport());
+const transportMode = transportModeFromSearch(window.location.search);
+const store = new YggStore(createTransport(transportMode));
+
+function FixtureModeLabel() {
+  if (transportMode !== "fixture") return null;
+  return (
+    <div className="fixture-mode-label" role="status">
+      Demo data · responses and actions are simulated
+    </div>
+  );
+}
 
 function LoadingState() {
   return (
@@ -455,6 +465,7 @@ export default function App() {
               })();
             }}
           />
+          <FixtureModeLabel />
           <Conversation
             session={session}
             bootstrap={state.bootstrap}
@@ -483,6 +494,7 @@ export default function App() {
             onOpenSidebar={() => setSidebarOpen(true)}
             sidebarButtonRef={sidebarButtonRef}
           />
+          <FixtureModeLabel />
           {surface === "settings" ? (
             <SettingsView
               themes={state.bootstrap.themes}

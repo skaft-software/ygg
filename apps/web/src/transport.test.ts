@@ -6,6 +6,7 @@ import {
   FixtureTransport,
   HttpTransport,
   resolveClientDeviceId,
+  transportModeFromSearch,
 } from "./transport";
 
 class FakeWebSocket {
@@ -78,10 +79,15 @@ describe("HTTP Ygg transport", () => {
 
   it("uses live HTTP by default and fixtures only when explicitly requested", () => {
     window.history.replaceState(null, "", "/");
+    expect(transportModeFromSearch(window.location.search)).toBe("live");
     expect(createTransport()).toBeInstanceOf(HttpTransport);
 
     window.history.replaceState(null, "", "/?transport=fixture");
+    expect(transportModeFromSearch(window.location.search)).toBe("fixture");
     expect(createTransport()).toBeInstanceOf(FixtureTransport);
+
+    expect(transportModeFromSearch("?transport=Fixture")).toBe("live");
+    expect(transportModeFromSearch("?transport=fixture-preview")).toBe("live");
   });
 
   it("persists a valid non-empty loopback device identity", () => {

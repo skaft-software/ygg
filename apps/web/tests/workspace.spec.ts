@@ -59,6 +59,14 @@ test("runs at the locked acceptance viewport", async ({ page }, testInfo) => {
     .toEqual(expected);
 });
 
+test("labels simulated fixture mode", async ({ page }) => {
+  await expect(
+    page.getByText("Demo data · responses and actions are simulated", {
+      exact: true,
+    }),
+  ).toBeVisible();
+});
+
 test("opens in a fresh, quiet session with the standard composer", async ({
   page,
 }) => {

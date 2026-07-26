@@ -759,6 +759,14 @@ const loopbackDeviceStorageKey = "ygg:loopback-device-id";
 const validDeviceId = /^[A-Za-z0-9_.:-]{1,128}$/;
 let volatileLoopbackDeviceId: string | undefined;
 
+export type TransportMode = "fixture" | "live";
+
+export function transportModeFromSearch(search: string): TransportMode {
+  return new URLSearchParams(search).get("transport") === "fixture"
+    ? "fixture"
+    : "live";
+}
+
 export function resolveClientDeviceId(): string | undefined {
   const injected =
     document
@@ -788,9 +796,10 @@ export function resolveClientDeviceId(): string | undefined {
   return generated;
 }
 
-export function createTransport(): YggTransport {
-  const params = new URLSearchParams(window.location.search);
-  if (params.get("transport") === "fixture") {
+export function createTransport(
+  mode = transportModeFromSearch(window.location.search),
+): YggTransport {
+  if (mode === "fixture") {
     return new FixtureTransport();
   }
   return new HttpTransport(resolveClientDeviceId());
