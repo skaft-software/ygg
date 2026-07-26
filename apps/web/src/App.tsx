@@ -350,7 +350,6 @@ export default function App() {
     const media = window.matchMedia("(max-width: 760px)");
     const onChange = (event: MediaQueryListEvent) => {
       setMobileLayout(event.matches);
-      if (event.matches) setSidebarOpen(false);
     };
     media.addEventListener("change", onChange);
     return () => media.removeEventListener("change", onChange);
