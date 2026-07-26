@@ -10,6 +10,7 @@ import {
   useRef,
 } from "react";
 import type { SessionSummary } from "../protocol";
+import type { TransportConnectionState } from "../transport";
 import { YggGlyph } from "./YggGlyph";
 
 interface SidebarProps {
@@ -18,6 +19,7 @@ interface SidebarProps {
   selectedSessionId: string | null;
   surface: "session" | "settings" | "devices";
   hostName: string;
+  connection: TransportConnectionState;
   onRestoreFocus: () => void;
   onClose: () => void;
   onNewSession: () => void;
@@ -95,6 +97,7 @@ export function Sidebar({
   selectedSessionId,
   surface,
   hostName,
+  connection,
   onRestoreFocus,
   onClose,
   onNewSession,
@@ -235,7 +238,18 @@ export function Sidebar({
             <span className="local-avatar" aria-hidden="true">Y</span>
             <span>
               <strong>{hostName}</strong>
-              <small>Local workspace</small>
+              <small
+                className="connection-label"
+                data-connection={connection}
+                role="status"
+              >
+                <span aria-hidden="true" />
+                {connection === "connected"
+                  ? "Connected to local ygg"
+                  : connection === "reconnecting"
+                    ? "Reconnecting to ygg…"
+                    : "Connecting to ygg…"}
+              </small>
             </span>
           </div>
         </footer>

@@ -433,6 +433,7 @@ export default function App() {
         selectedSessionId={state.selectedSessionId}
         surface={surface}
         hostName={state.bootstrap.host.name}
+        connection={state.connection}
         onRestoreFocus={restoreSidebarFocus}
         onClose={closeSidebar}
         onNewSession={() => {

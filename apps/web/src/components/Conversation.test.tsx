@@ -65,6 +65,40 @@ describe("conversation composer", () => {
     expect(onSubmit).toHaveBeenCalledWith("Queue this", [], "followUp");
   });
 
+  it("uses a themed searchable model picker instead of a native select", async () => {
+    const user = userEvent.setup();
+    const onConfigure = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={onConfigure}
+        onResolveApproval={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    const picker = screen.getByRole("button", { name: "Model" });
+    expect(picker).toHaveAttribute("data-value", "claude-sonnet-4-6");
+    expect(screen.queryByRole("combobox", { name: "Model" })).toBeNull();
+
+    await user.click(picker);
+    expect(
+      screen.getByRole("dialog", { name: "Choose a model" }),
+    ).toBeVisible();
+    await user.type(screen.getByRole("textbox", { name: "Search models" }), "gpt");
+    await user.click(screen.getByRole("option", { name: /GPT-5.4/ }));
+
+    expect(onConfigure).toHaveBeenCalledWith({ modelId: "gpt-5.4" });
+    expect(
+      screen.queryByRole("dialog", { name: "Choose a model" }),
+    ).toBeNull();
+    expect(picker).toHaveFocus();
+  });
+
   it("omits unavailable run timing instead of claiming zero work", () => {
     const session = structuredClone(fixtureSessions["session-fresh"]!);
     session.items.push({

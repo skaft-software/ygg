@@ -21,6 +21,10 @@ import type {
   ThemeOption,
   TranscriptItem,
 } from "./protocol";
+import {
+  deriveSessionTitle,
+  isUntitledSession,
+} from "./session-title";
 
 type JsonObject = Record<string, unknown>;
 
@@ -1036,6 +1040,18 @@ export function projectSessionSnapshot(
       ),
     )
     .filter((item): item is TranscriptItem => item !== null);
+  const summaryTitle = context.summary?.title ?? "Session";
+  const firstUserInput = items.find(
+    (item) => item.kind === "user_message",
+  );
+  const title =
+    isUntitledSession(summaryTitle) &&
+    firstUserInput?.kind === "user_message"
+      ? deriveSessionTitle(
+          firstUserInput.content,
+          firstUserInput.attachments?.at(0)?.name,
+        )
+      : summaryTitle;
 
   const itemSources = rawItems.flatMap((item, index) => {
     const wireItem = object(item, `sessionSnapshot.items[${index}]`);
@@ -1114,7 +1130,7 @@ export function projectSessionSnapshot(
     sessionId,
     actorGeneration,
     sequence: number(cursor.sequence, "sessionSnapshot.cursor.sequence"),
-    title: context.summary?.title ?? "Session",
+    title,
     status: projectStatus(
       snapshot.liveState,
       "sessionSnapshot.liveState",

@@ -14,11 +14,19 @@ import {
   SessionGenerationMismatchError,
   SessionSequenceGapError,
 } from "./reducer";
-import type { YggTransport } from "./transport";
+import {
+  deriveSessionTitle,
+  isUntitledSession,
+} from "./session-title";
+import type {
+  TransportConnectionState,
+  YggTransport,
+} from "./transport";
 
 export interface YggState {
   ready: boolean;
   connecting: boolean;
+  connection: TransportConnectionState;
   error: string | null;
   bootstrap: HostBootstrap | null;
   selectedSessionId: string | null;
@@ -28,6 +36,7 @@ export interface YggState {
 const initialState: YggState = {
   ready: false,
   connecting: true,
+  connection: "connecting",
   error: null,
   bootstrap: null,
   selectedSessionId: null,
@@ -133,6 +142,7 @@ export class YggStore {
   private state: YggState = initialState;
   private listeners = new Set<() => void>();
   private unsubscribeTransport: (() => void) | null = null;
+  private unsubscribeConnection: (() => void) | null = null;
   private queuedEvents: SessionEvent[] = [];
   private animationFrame: number | null = null;
   private selectionGeneration = 0;
@@ -196,6 +206,20 @@ export class YggStore {
           }
           throw error;
         }
+      }
+      if (
+        updated &&
+        isUntitledSession(updated.title) &&
+        (event.type === "item.started" || event.type === "item.committed") &&
+        event.item.kind === "user_message"
+      ) {
+        updated = {
+          ...updated,
+          title: deriveSessionTitle(
+            event.item.content,
+            event.item.attachments?.at(0)?.name,
+          ),
+        };
       }
 
       const summaries = next.bootstrap?.sessions.map((summary) =>
@@ -263,6 +287,10 @@ export class YggStore {
     this.unsubscribeTransport = this.transport.subscribe((event) => {
       this.queueEvent(event);
     });
+    this.unsubscribeConnection =
+      this.transport.subscribeConnection?.((connection) => {
+        this.publish({ ...this.state, connection });
+      }) ?? null;
 
     try {
       const routedSessionId = sessionIdFromPathname(window.location.pathname);
@@ -277,11 +305,17 @@ export class YggStore {
       const selected = await this.transport.getSession(
         bootstrap.selectedSessionId,
       );
+      const summaries = bootstrap.sessions.map((summary) =>
+        summary.id === selected.sessionId
+          ? { ...summary, title: selected.title }
+          : summary,
+      );
       this.publish({
         ready: true,
         connecting: false,
+        connection: this.state.connection,
         error: null,
-        bootstrap,
+        bootstrap: { ...bootstrap, sessions: summaries },
         selectedSessionId: selected.sessionId,
         sessions: { [selected.sessionId]: selected },
       });
@@ -329,6 +363,16 @@ export class YggStore {
       }
       this.publish({
         ...this.state,
+        bootstrap: this.state.bootstrap
+          ? {
+              ...this.state.bootstrap,
+              sessions: this.state.bootstrap.sessions.map((summary) =>
+                summary.id === sessionId
+                  ? { ...summary, title: snapshot.title }
+                  : summary,
+              ),
+            }
+          : this.state.bootstrap,
         selectedSessionId: sessionId,
         sessions: { ...this.state.sessions, [sessionId]: snapshot },
       });
@@ -556,6 +600,7 @@ export class YggStore {
     this.animationFrame = null;
     this.queuedEvents = [];
     this.unsubscribeTransport?.();
+    this.unsubscribeConnection?.();
     this.transport.close();
     this.listeners.clear();
   }

@@ -36,6 +36,7 @@ import type {
   AttachmentRef,
   AuthorityProfile,
   HostBootstrap,
+  ModelSummary,
   ReasoningEffort,
   SessionSnapshot,
   TranscriptItem,
@@ -628,6 +629,222 @@ function ReasoningPowerSlider({
   );
 }
 
+function providerLabel(provider: string): string {
+  const leaf = provider.split("/").filter(Boolean).at(-1) ?? provider;
+  return leaf
+    .replaceAll("-", " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function ModelPicker({
+  models,
+  value,
+  disabled,
+  hasStagedImages,
+  onChange,
+}: {
+  models: ModelSummary[];
+  value: string;
+  disabled: boolean;
+  hasStagedImages: boolean;
+  onChange: (modelId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const activeModel =
+    models.find((model) => model.id === value) ?? models.at(0);
+  const normalizedQuery = query.trim().toLowerCase();
+  const eligibleModels = models.filter(
+    (model) =>
+      model.available &&
+      (!hasStagedImages || model.inputModalities.includes("image")),
+  );
+  const filteredModels = eligibleModels.filter((model) => {
+    if (!normalizedQuery) return true;
+    return [model.name, model.id, model.provider].some((candidate) =>
+      candidate.toLowerCase().includes(normalizedQuery),
+    );
+  });
+  const localModels = filteredModels.filter((model) => model.local);
+  const remoteModels = filteredModels.filter((model) => !model.local);
+
+  const close = (restoreFocus = true) => {
+    setOpen(false);
+    setQuery("");
+    if (restoreFocus) {
+      triggerRef.current?.focus();
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (
+        !popoverRef.current?.contains(target) &&
+        !triggerRef.current?.contains(target)
+      ) {
+        setOpen(false);
+        setQuery("");
+      }
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+      setQuery("");
+      window.requestAnimationFrame(() => triggerRef.current?.focus());
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    window.requestAnimationFrame(() => searchRef.current?.focus());
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  const focusOption = (from: HTMLElement, direction: 1 | -1) => {
+    const options = Array.from(
+      popoverRef.current?.querySelectorAll<HTMLButtonElement>(
+        'button[role="option"]',
+      ) ?? [],
+    );
+    if (!options.length) return;
+    const currentIndex = options.indexOf(from as HTMLButtonElement);
+    const nextIndex =
+      currentIndex < 0
+        ? direction > 0
+          ? 0
+          : options.length - 1
+        : (currentIndex + direction + options.length) % options.length;
+    options[nextIndex]?.focus();
+  };
+
+  const choose = (modelId: string) => {
+    if (modelId !== value) onChange(modelId);
+    close();
+  };
+
+  const renderGroup = (label: string, groupModels: ModelSummary[]) => {
+    if (!groupModels.length) return null;
+    return (
+      <div className="model-picker-group" role="group" aria-label={label}>
+        <span className="model-picker-group-label">{label}</span>
+        {groupModels.map((model) => (
+          <button
+            key={model.id}
+            type="button"
+            role="option"
+            aria-selected={model.id === value}
+            className={model.id === value ? "is-selected" : undefined}
+            onClick={() => choose(model.id)}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                focusOption(event.currentTarget, 1);
+              } else if (event.key === "ArrowUp") {
+                event.preventDefault();
+                focusOption(event.currentTarget, -1);
+              } else if (event.key === "Home" || event.key === "End") {
+                event.preventDefault();
+                const options = Array.from(
+                  popoverRef.current?.querySelectorAll<HTMLButtonElement>(
+                    'button[role="option"]',
+                  ) ?? [],
+                );
+                options[event.key === "Home" ? 0 : options.length - 1]?.focus();
+              }
+            }}
+          >
+            <span className="model-picker-option-mark" aria-hidden="true">
+              {model.local ? <span className="local-model-dot" /> : null}
+            </span>
+            <span className="model-picker-option-copy">
+              <strong>{model.name}</strong>
+              <small>
+                {providerLabel(model.provider)}
+                {model.inputModalities.includes("image") ? " · Images" : ""}
+              </small>
+            </span>
+            {model.id === value ? <Check aria-hidden="true" /> : null}
+          </button>
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <div className="model-picker">
+      <button
+        ref={triggerRef}
+        type="button"
+        className="model-picker-trigger"
+        aria-label="Model"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        data-value={value}
+        disabled={disabled}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {activeModel?.local ? (
+          <span className="local-model-dot" aria-hidden="true" />
+        ) : null}
+        <span>{activeModel?.name ?? value}</span>
+        <ChevronDown aria-hidden="true" />
+      </button>
+      {open ? (
+        <div
+          ref={popoverRef}
+          className="model-picker-popover"
+          role="dialog"
+          aria-label="Choose a model"
+        >
+          <div className="model-picker-heading">
+            <strong>Choose a model</strong>
+            <small>{eligibleModels.length} available</small>
+          </div>
+          <label className="model-picker-search">
+            <Search aria-hidden="true" />
+            <span className="sr-only">Search models</span>
+            <input
+              ref={searchRef}
+              value={query}
+              placeholder="Search models"
+              aria-label="Search models"
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowDown") return;
+                event.preventDefault();
+                const firstOption =
+                  popoverRef.current?.querySelector<HTMLButtonElement>(
+                    'button[role="option"]',
+                  );
+                firstOption?.focus();
+              }}
+            />
+          </label>
+          <div
+            className="model-picker-list"
+            role="listbox"
+            aria-label="Available models"
+          >
+            {renderGroup("On this device", localModels)}
+            {renderGroup("Connected providers", remoteModels)}
+            {!filteredModels.length ? (
+              <p className="model-picker-empty">No matching models</p>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function Composer({
   session,
   bootstrap,
@@ -1039,32 +1256,13 @@ function Composer({
                 </button>
               </>
             ) : null}
-            <label className="composer-select model-select">
-              <span className="sr-only">Model</span>
-              <select
-                value={session.modelId}
-                disabled={isWorking}
-                onChange={(event) =>
-                  void onConfigure({ modelId: event.target.value })
-                }
-              >
-                {bootstrap.models.map((model) => (
-                  <option
-                    key={model.id}
-                    value={model.id}
-                    disabled={
-                      !model.available ||
-                      (hasStagedImages &&
-                        !model.inputModalities.includes("image"))
-                    }
-                  >
-                    {model.local ? "● " : ""}
-                    {model.name}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown aria-hidden="true" />
-            </label>
+            <ModelPicker
+              models={bootstrap.models}
+              value={session.modelId}
+              disabled={isWorking}
+              hasStagedImages={hasStagedImages}
+              onChange={(modelId) => void onConfigure({ modelId })}
+            />
             <ReasoningPowerSlider
               options={reasoningOptions}
               value={session.reasoning}

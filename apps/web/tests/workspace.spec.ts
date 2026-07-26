@@ -89,7 +89,10 @@ test("opens in a fresh, quiet session with the standard composer", async ({
   await expect(page.getByText("Pinned", { exact: true })).toBeVisible();
   await expect(page.getByText("Recents", { exact: true })).toBeVisible();
   await expect(page.getByLabel("Message ygg")).toBeVisible();
-  await expect(page.getByLabel("Model")).toHaveValue("claude-sonnet-4-6");
+  await expect(page.getByLabel("Model")).toHaveAttribute(
+    "data-value",
+    "claude-sonnet-4-6",
+  );
   await expect(page.getByLabel("Session activity")).toBeHidden();
 });
 

@@ -22,6 +22,11 @@ import {
 } from "./wire";
 
 type EventListener = (event: SessionEvent) => void;
+export type TransportConnectionState =
+  | "connecting"
+  | "connected"
+  | "reconnecting";
+type ConnectionListener = (state: TransportConnectionState) => void;
 
 export interface YggTransport {
   connect(selectedSessionId?: string): Promise<HostBootstrap>;
@@ -30,6 +35,7 @@ export interface YggTransport {
   ingestAttachment(file: File): Promise<AttachmentRef>;
   attachmentContentUrl(handle: string): string;
   subscribe(listener: EventListener): () => void;
+  subscribeConnection?(listener: ConnectionListener): () => void;
   close(): void;
 }
 
@@ -69,6 +75,11 @@ export class FixtureTransport implements YggTransport {
   subscribe(listener: EventListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  subscribeConnection(listener: ConnectionListener): () => void {
+    listener("connected");
+    return () => {};
   }
 
   close(): void {
@@ -512,6 +523,8 @@ export class FixtureTransport implements YggTransport {
 
 export class HttpTransport implements YggTransport {
   private listeners = new Set<EventListener>();
+  private connectionListeners = new Set<ConnectionListener>();
+  private connectionState: TransportConnectionState = "connecting";
   private socket: WebSocket | null = null;
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
@@ -684,6 +697,18 @@ export class HttpTransport implements YggTransport {
     return () => this.listeners.delete(listener);
   }
 
+  subscribeConnection(listener: ConnectionListener): () => void {
+    this.connectionListeners.add(listener);
+    listener(this.connectionState);
+    return () => this.connectionListeners.delete(listener);
+  }
+
+  private setConnectionState(state: TransportConnectionState): void {
+    if (this.connectionState === state) return;
+    this.connectionState = state;
+    for (const listener of this.connectionListeners) listener(state);
+  }
+
   close(): void {
     this.closedByClient = true;
     if (this.reconnectTimer !== null) {
@@ -694,6 +719,7 @@ export class HttpTransport implements YggTransport {
     this.socket = null;
     this.bufferedEvents = [];
     this.listeners.clear();
+    this.connectionListeners.clear();
   }
 
   private openSocket(): void {
@@ -708,6 +734,7 @@ export class HttpTransport implements YggTransport {
       const reconnecting = this.hasOpened;
       this.hasOpened = true;
       this.reconnectAttempt = 0;
+      this.setConnectionState("connected");
       if (!reconnecting) return;
       this.replaying = true;
       void this.replayAll().then(
@@ -747,6 +774,7 @@ export class HttpTransport implements YggTransport {
     socket.addEventListener("close", () => {
       if (this.socket === socket) this.socket = null;
       if (this.closedByClient) return;
+      this.setConnectionState("reconnecting");
       const delay = Math.min(5_000, 250 * 2 ** this.reconnectAttempt);
       this.reconnectAttempt += 1;
       this.reconnectTimer = window.setTimeout(() => {
