@@ -2050,13 +2050,29 @@ kbd {
     border-radius: 20px;
   }
 
-  .composer-select:not(.model-select),
-  .composer-select.model-select + .composer-select {
-    display: none;
+  .composer-toolbar {
+    align-items: flex-end;
+  }
+
+  .composer-leading {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+
+  .composer-select.model-select {
+    margin-left: 0;
   }
 
   .composer-select.model-select select {
-    max-width: 132px;
+    max-width: 120px;
+  }
+
+  .composer-select:not(.model-select) select {
+    max-width: 88px;
+  }
+
+  .composer-select.authority-select select {
+    max-width: 104px;
   }
 
   .activity-rail,
@@ -2098,11 +2114,7 @@ kbd {
 }
 
 @media (max-width: 420px) {
-  .composer-select.model-select {
-    display: none;
-  }
-
-  .session-header-actions .icon-button:not(.is-active) {
+  .session-header-actions .menu-anchor {
     display: none;
   }
 
