@@ -168,13 +168,14 @@ fn push_message(
     }
 }
 
-fn active_branch_tail(
-    session: &Session,
+fn active_branch_tail_from<'a>(
+    session: &'a Session,
+    head: Option<&'a ygg_agent::EntryId>,
     max_entries: Option<usize>,
-) -> anyhow::Result<(Vec<&Entry>, bool)> {
+) -> anyhow::Result<(Vec<&'a Entry>, bool)> {
     let mut entries = Vec::new();
     let mut displayable_entries = 0usize;
-    let mut cursor = session.head_ref();
+    let mut cursor = head;
     let mut truncated = false;
     while let Some(id) = cursor {
         if max_entries.is_some_and(|limit| displayable_entries >= limit) {
@@ -379,8 +380,20 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
 
 /// Rebuild the display transcript by walking head-to-root on the active branch
 /// and reversing it into chronological order. Abandoned branches never appear.
+#[cfg(test)]
 pub fn hydrate_transcript(session: &Session) -> anyhow::Result<Vec<TranscriptItem>> {
-    let (entries, _) = active_branch_tail(session, None)?;
+    let (entries, _) = active_branch_tail_from(session, session.head_ref(), None)?;
+    Ok(hydrate_entries(entries))
+}
+
+/// Rebuild the active branch as it existed at a retained immutable head. This
+/// lets a deferred TUI snapshot materialize safely even if the live session has
+/// appended newer entries in the meantime.
+pub fn hydrate_transcript_at(
+    session: &Session,
+    head: &ygg_agent::EntryId,
+) -> anyhow::Result<Vec<TranscriptItem>> {
+    let (entries, _) = active_branch_tail_from(session, Some(head), None)?;
     Ok(hydrate_entries(entries))
 }
 
@@ -391,7 +404,8 @@ pub fn hydrate_transcript_tail(
     session: &Session,
     max_entries: usize,
 ) -> anyhow::Result<(Vec<TranscriptItem>, bool)> {
-    let (entries, truncated) = active_branch_tail(session, Some(max_entries.max(1)))?;
+    let (entries, truncated) =
+        active_branch_tail_from(session, session.head_ref(), Some(max_entries.max(1)))?;
     Ok((hydrate_entries(entries), truncated))
 }
 

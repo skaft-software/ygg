@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use super::*;
 
 struct EmulatedTerminal {
-    size: (u16, u16),
+    size: Arc<Mutex<(u16, u16)>>,
     bytes: Arc<Mutex<Vec<u8>>>,
     synchronized_output: bool,
 }
@@ -43,11 +43,11 @@ impl sexy_tui_rs::Terminal for EmulatedTerminal {
     }
 
     fn columns(&self) -> u16 {
-        self.size.0
+        self.size.lock().expect("terminal size mutex poisoned").0
     }
 
     fn rows(&self) -> u16 {
-        self.size.1
+        self.size.lock().expect("terminal size mutex poisoned").1
     }
 
     fn move_by(&mut self, lines: i16) {
@@ -112,7 +112,7 @@ fn emulated_shell_with_sync(
         ..ShellState::default()
     });
     let mut tui = TUI::new(Box::new(EmulatedTerminal {
-        size: (width, height),
+        size: size.clone(),
         bytes: bytes.clone(),
         synchronized_output,
     }));
@@ -137,6 +137,20 @@ fn emulated_shell_with_sync(
     )
 }
 
+fn session_with_user_prompts(path: &std::path::Path, prefix: &str, count: usize) -> Session {
+    use ygg_ai::{Message, UserMessage, UserPart};
+
+    let mut session = Session::create(path).unwrap();
+    for index in 0..count {
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text(format!("{prefix} {index}"))],
+            })))
+            .unwrap();
+    }
+    session
+}
+
 fn emulate_rows(lines: &[String], width: u16) -> vt100::Parser {
     let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX).max(1);
     let mut terminal = vt100::Parser::new(rows, width, 0);
@@ -147,6 +161,28 @@ fn emulate_rows(lines: &[String], width: u16) -> vt100::Parser {
         }
     }
     terminal
+}
+
+/// `vt100` 0.15 ignores ED 3. Recreate its grid at the final saved-line
+/// clear so protocol tests can model the destructive reset before replay.
+/// This deliberately does not pretend to model modern terminal reflow.
+fn process_vt100_with_saved_line_clear(
+    terminal: &mut vt100::Parser,
+    output: &[u8],
+    rows: u16,
+    columns: u16,
+    scrollback_len: usize,
+) {
+    const CLEAR_SAVED_LINES: &[u8] = b"\x1b[3J";
+    if let Some(clear_at) = output
+        .windows(CLEAR_SAVED_LINES.len())
+        .rposition(|window| window == CLEAR_SAVED_LINES)
+    {
+        *terminal = vt100::Parser::new(rows, columns, scrollback_len);
+        terminal.process(&output[clear_at + CLEAR_SAVED_LINES.len()..]);
+    } else {
+        terminal.process(output);
+    }
 }
 
 fn find_ascii_cell(screen: &vt100::Screen, needle: &str) -> Option<(u16, u16)> {
@@ -1642,20 +1678,28 @@ fn resumed_history_is_tail_first_and_materializes_when_scrolling_past_it() {
     shell.hydrate(&session).unwrap();
     assert!(shell.debug_snapshot().contains("prompt 99"));
     assert!(!shell.debug_snapshot().contains("prompt 0\n"));
-    assert!(shell.state.borrow().deferred_session_path.is_some());
+    assert!(shell.state.borrow().deferred_session_history.is_some());
     shell.on_local_command_submitted("!local-only command");
+    let retained_tail_cursor = {
+        let state = shell.state.borrow();
+        transcript_commit_cursor(
+            &state,
+            state.transcript.len().saturating_sub(1),
+            FINAL_COMMIT_SEGMENT,
+        )
+    };
 
     let page = usize::from(shell.state.borrow().size.1.max(4) / 2);
     let mut crossing_scroll = None;
     for _ in 0..100 {
         let before = shell.state.borrow().scroll_from_bottom.get();
         shell.scroll(-1);
-        if shell.state.borrow().deferred_session_path.is_none() {
+        if shell.state.borrow().deferred_session_history.is_none() {
             crossing_scroll = Some((before, shell.state.borrow().scroll_from_bottom.get()));
             break;
         }
     }
-    assert!(shell.state.borrow().deferred_session_path.is_none());
+    assert!(shell.state.borrow().deferred_session_history.is_none());
     let (before, after) = crossing_scroll.expect("deferred history crossing");
     assert!(
         after <= before.saturating_add(page),
@@ -1664,6 +1708,266 @@ fn resumed_history_is_tail_first_and_materializes_when_scrolling_past_it() {
     let snapshot = shell.debug_snapshot();
     assert!(snapshot.contains("prompt 0\n"));
     assert_eq!(snapshot.matches("!local-only command").count(), 1);
+    let remapped_tail_cursor = {
+        let state = shell.state.borrow();
+        transcript_commit_cursor(
+            &state,
+            state.transcript.len().saturating_sub(1),
+            FINAL_COMMIT_SEGMENT,
+        )
+    };
+    assert_eq!(
+        remapped_tail_cursor, retained_tail_cursor,
+        "prepending deferred history must preserve retained block identity"
+    );
+}
+
+#[test]
+fn deferred_history_keeps_local_outcome_before_a_later_persisted_prompt() {
+    use ygg_agent::EntryValue;
+    use ygg_ai::{Message, UserMessage, UserPart};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("interleaved-session.jsonl");
+    let mut session = Session::create(&path).unwrap();
+    for index in 0..100 {
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text(format!("persisted prompt {index}"))],
+            })))
+            .unwrap();
+    }
+
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 12);
+    shell.hydrate(&session).unwrap();
+    assert!(shell.state.borrow().deferred_session_history.is_some());
+
+    shell
+        .state
+        .borrow_mut()
+        .push_block(TranscriptBlock::Outcome(RunOutcome::Completed {
+            elapsed: Duration::from_secs(1),
+            summary: crate::presentation::RunSummary {
+                files_changed: 0,
+                tool_calls: 0,
+                warnings: 0,
+            },
+        }));
+    session
+        .append(EntryValue::Message(Message::User(UserMessage {
+            content: vec![UserPart::Text("persisted after local outcome".into())],
+        })))
+        .unwrap();
+    shell.on_prompt_submitted("persisted after local outcome");
+    shell.mark_prompt_persisted();
+    drop(session);
+
+    assert!(shell.materialize_deferred_history().unwrap());
+    let state = shell.state.borrow();
+    assert!(
+        state
+            .transcript_commit_ids
+            .windows(2)
+            .all(|ids| ids[0] < ids[1]),
+        "materialized commit identities must remain strictly ordered: {:?}",
+        state.transcript_commit_ids
+    );
+    let outcome = state
+        .transcript
+        .iter()
+        .position(|block| matches!(block, TranscriptBlock::Outcome(_)))
+        .expect("local outcome retained");
+    let later_prompt = state
+        .transcript
+        .iter()
+        .position(|block| {
+            matches!(
+                block,
+                TranscriptBlock::User { text, .. } if text == "persisted after local outcome"
+            )
+        })
+        .expect("later persisted prompt hydrated");
+    assert!(outcome < later_prompt);
+}
+
+#[test]
+fn resize_materializes_deferred_history_during_an_active_stream() {
+    const WIDTH: u16 = 80;
+    const RESIZED_WIDTH: u16 = 96;
+    const HEIGHT: u16 = 12;
+
+    let directory = tempfile::tempdir().unwrap();
+    let session = session_with_user_prompts(
+        &directory.path().join("active-resize-session.jsonl"),
+        "active resize prompt",
+        100,
+    );
+    let (mut shell, bytes) = emulated_shell(crate::tui::theme::test_theme(), WIDTH, HEIGHT);
+    let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+        std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+    };
+    shell.hydrate(&session).unwrap();
+    assert!(shell.state.borrow().deferred_session_history.is_some());
+
+    let run_id = shell.begin_run("openai");
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "active-stream-before-resize".into(),
+        },
+    );
+    shell.render();
+    let _ = drain(&bytes);
+    let (active_index_before, active_commit_id) = {
+        let state = shell.state.borrow();
+        let index = state.active_text.expect("active assistant stream");
+        (index, state.transcript_commit_ids[index])
+    };
+
+    shell.set_size(RESIZED_WIDTH, HEIGHT);
+    let active_index_after = {
+        let state = shell.state.borrow();
+        assert!(state.deferred_session_history.is_none());
+        assert!(state.run.is_active());
+        assert!(
+            state.transcript.iter().any(|block| matches!(
+                block,
+                TranscriptBlock::User { text, .. } if text == "active resize prompt 0"
+            )),
+            "resize must materialize the complete immutable branch"
+        );
+        assert!(state
+            .transcript_commit_ids
+            .windows(2)
+            .all(|ids| ids[0] < ids[1]));
+        let index = state.active_text.expect("remapped assistant stream");
+        assert!(index > active_index_before);
+        assert_eq!(state.transcript_commit_ids[index], active_commit_id);
+        index
+    };
+
+    shell.render();
+    let resize = String::from_utf8_lossy(&drain(&bytes)).into_owned();
+    assert!(resize.contains("\x1b[2J\x1b[H\x1b[3J"), "{resize:?}");
+    assert!(resize.contains("active resize prompt 0"), "{resize:?}");
+    assert!(resize.contains("active-stream-before-resize"), "{resize:?}");
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "-and-after".into(),
+        },
+    );
+    let state = shell.state.borrow();
+    assert_eq!(state.active_text, Some(active_index_after));
+    let TranscriptBlock::Assistant(assistant) = &state.transcript[active_index_after] else {
+        panic!("active stream must remain an assistant block");
+    };
+    assert_eq!(
+        assistant.text, "active-stream-before-resize-and-after",
+        "post-resize deltas must continue the retained live block"
+    );
+}
+
+#[test]
+fn delayed_resize_reconciliation_materializes_deferred_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = session_with_user_prompts(
+        &directory.path().join("reconciled-resize-session.jsonl"),
+        "reconciled resize prompt",
+        100,
+    );
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 12);
+    shell.hydrate(&session).unwrap();
+    assert!(shell.state.borrow().deferred_session_history.is_some());
+    shell.notice("live block before reconciled resize");
+    let live_commit_id = *shell
+        .state
+        .borrow()
+        .transcript_commit_ids
+        .last()
+        .expect("live block identity");
+
+    assert!(reconcile_terminal_size(&shell.state, &shell.size, (91, 17)));
+    let state = shell.state.borrow();
+    assert_eq!(state.size, (91, 17));
+    assert!(state.deferred_session_history.is_none());
+    assert!(state.transcript.iter().any(|block| matches!(
+        block,
+        TranscriptBlock::User { text, .. } if text == "reconciled resize prompt 0"
+    )));
+    assert!(matches!(
+        state.transcript.last(),
+        Some(TranscriptBlock::Notice(text)) if text == "live block before reconciled resize"
+    ));
+    assert_eq!(state.transcript_commit_ids.last(), Some(&live_commit_id));
+}
+
+#[test]
+fn deferred_history_identity_failure_is_transactional() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = session_with_user_prompts(
+        &directory.path().join("transactional-history-session.jsonl"),
+        "transactional prompt",
+        100,
+    );
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 12);
+    shell.hydrate(&session).unwrap();
+    assert!(shell.state.borrow().deferred_session_history.is_some());
+    let run_id = shell.begin_run("openai");
+    let tool_id = ToolCallId("transactional-live-tool".into());
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::ToolStarted {
+            id: tool_id.clone(),
+            name: "read".into(),
+            args: serde_json::json!({"path": "live.rs"}),
+        },
+    );
+    shell.notice("live block survives failed materialization");
+    {
+        let mut state = shell.state.borrow_mut();
+        state
+            .deferred_session_history
+            .as_mut()
+            .expect("deferred history")
+            .retained_id_end = 0;
+    }
+    let before_snapshot = shell.debug_snapshot();
+    let (before_len, before_ids, before_revisions, before_tools, before_deferred, before_next_id) = {
+        let state = shell.state.borrow();
+        (
+            state.transcript.len(),
+            state.transcript_commit_ids.clone(),
+            state.block_revisions.clone(),
+            state.tool_panels.clone(),
+            state.deferred_session_history.clone(),
+            state.next_transcript_commit_id.0,
+        )
+    };
+    assert_eq!(before_tools.get(&tool_id).copied(), Some(before_len - 2));
+
+    let error = shell.materialize_deferred_history().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("deferred history exhausted commit identity space"),
+        "{error:#}"
+    );
+    let state = shell.state.borrow();
+    assert_eq!(state.transcript.len(), before_len);
+    assert_eq!(state.transcript_commit_ids, before_ids);
+    assert_eq!(state.block_revisions, before_revisions);
+    assert_eq!(state.tool_panels, before_tools);
+    assert_eq!(state.deferred_session_history, before_deferred);
+    assert_eq!(state.next_transcript_commit_id.0, before_next_id);
+    drop(state);
+    assert_eq!(shell.debug_snapshot(), before_snapshot);
 }
 
 #[test]
@@ -2132,7 +2436,7 @@ fn resumed_compaction_summary_remains_expandable_after_theme_switch() {
 }
 
 #[test]
-fn compaction_disclosure_rebuilds_native_presentation() {
+fn compaction_disclosure_preserves_native_presentation() {
     const WIDTH: u16 = 88;
     const HEIGHT: u16 = 18;
     for synchronized_output in [false, true] {
@@ -2167,23 +2471,20 @@ fn compaction_disclosure_rebuilds_native_presentation() {
         let expansion = drain(&bytes);
         let expansion_text = String::from_utf8_lossy(&expansion);
         assert!(
-            expansion_text.contains("compaction-detail-00"),
-            "{expansion_text:?}"
+            expansion.len() < 8 * 1024,
+            "compaction expansion replayed an unbounded frame ({} bytes)",
+            expansion.len()
         );
         assert!(
-            expansion
+            !expansion
                 .windows(b"\x1b[3J".len())
                 .any(|bytes| bytes == b"\x1b[3J"),
-            "native presentation was not reset: {expansion_text:?}"
+            "compaction expansion cleared terminal-owned history: {expansion_text:?}"
         );
-        for index in 0..24 {
-            let sentinel = format!("compaction-history-{index:02}");
-            assert_eq!(
-                    expansion_text.matches(&sentinel).count(),
-                    1,
-                    "{sentinel} was not replayed exactly once with synchronized_output={synchronized_output}:\n{expansion_text}"
-                );
-        }
+        assert!(
+            !expansion_text.contains("compaction-history-00"),
+            "compaction expansion replayed committed history: {expansion_text:?}"
+        );
 
         terminal.process(&expansion);
         terminal.set_scrollback(0);
@@ -2195,10 +2496,15 @@ fn compaction_disclosure_rebuilds_native_presentation() {
         shell.render();
         let collapse = drain(&bytes);
         assert!(
-            collapse
+            collapse.len() < 8 * 1024,
+            "compaction collapse replayed an unbounded frame ({} bytes)",
+            collapse.len()
+        );
+        assert!(
+            !collapse
                 .windows(b"\x1b[3J".len())
                 .any(|bytes| bytes == b"\x1b[3J"),
-            "collapsed presentation was not reset"
+            "compaction collapse cleared terminal-owned history"
         );
         terminal.process(&collapse);
         terminal.set_scrollback(0);
@@ -2209,11 +2515,262 @@ fn compaction_disclosure_rebuilds_native_presentation() {
             collapsed.contains("│ ›"),
             "composer disappeared: {collapsed}"
         );
+
+        terminal.set_size(512, WIDTH);
+        terminal.set_scrollback(usize::MAX);
+        let physical = terminal.screen().contents();
+        for index in 0..24 {
+            let sentinel = format!("compaction-history-{index:02}");
+            assert_eq!(
+                physical.matches(&sentinel).count(),
+                1,
+                "{sentinel} was lost or duplicated with synchronized_output={synchronized_output}:\n{physical}"
+            );
+        }
     }
 }
 
 #[test]
-fn streamed_table_and_wrapped_lists_never_commit_provisional_duplicates() {
+fn removed_streaming_tail_keeps_a_tombstoned_commit_seam() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(64, 10);
+    let run_id = shell.begin_run("openai");
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "first finalized paragraph\n\nreplacement remains mutable".into(),
+        },
+    );
+    let _ = render_shell(&shell.state.borrow(), 64);
+
+    let (active_index, retained_cursor) = {
+        let state = shell.state.borrow();
+        let active_index = state.active_text.expect("streaming assistant block");
+        let TranscriptBlock::Assistant(assistant) = &state.transcript[active_index] else {
+            panic!("active text must be an assistant block");
+        };
+        assert!(!assistant.layout.borrow().committed_block_ends().is_empty());
+        (
+            active_index,
+            transcript_commit_cursor(&state, active_index, 0),
+        )
+    };
+
+    shell.state.borrow_mut().discard_streaming_blocks();
+    let _ = render_shell(&shell.state.borrow(), 64);
+    let tombstone = transcript_commit_position(&shell.state.borrow(), retained_cursor)
+        .expect("removed commit cursor should map to its insertion seam");
+    assert_eq!(tombstone.cursor, retained_cursor);
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "retry output\n\nnext block".into(),
+        },
+    );
+    let state = shell.state.borrow();
+    assert_eq!(state.active_text, Some(active_index));
+    let retry_cursor = transcript_commit_cursor(&state, active_index, 0);
+    assert!(retry_cursor > retained_cursor);
+}
+
+#[test]
+fn resize_discards_pre_ygg_history_and_replays_all_owned_rows() {
+    const WIDTH: u16 = 48;
+    const RESIZED_WIDTH: u16 = 64;
+    const HEIGHT: u16 = 10;
+    const SHELL_SENTINEL: &str = "PRE-YGG-SHELL-HISTORY";
+
+    let (mut shell, bytes) =
+        emulated_shell_with_sync(crate::tui::theme::test_theme(), WIDTH, HEIGHT, true);
+    let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+        std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+    };
+    let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+    terminal.process(format!("{SHELL_SENTINEL}\r\n").as_bytes());
+    terminal.process(&drain(&bytes));
+
+    for index in 0..18 {
+        shell.notice(format!("YGG-OWNED-RESIZE-{index:02}"));
+    }
+    shell.render();
+    terminal.process(&drain(&bytes));
+
+    terminal.set_size(256, WIDTH);
+    terminal.set_scrollback(usize::MAX);
+    assert!(terminal.screen().contents().contains(SHELL_SENTINEL));
+    terminal.set_size(HEIGHT, WIDTH);
+    terminal.set_scrollback(0);
+
+    terminal.set_size(HEIGHT, RESIZED_WIDTH);
+    shell.set_size(RESIZED_WIDTH, HEIGHT);
+    shell.render();
+    let resize = drain(&bytes);
+    let resize_text = String::from_utf8_lossy(&resize);
+    assert!(resize_text.contains("\x1b[?2026h"), "{resize_text:?}");
+    assert!(
+        resize_text.contains("\x1b[2J\x1b[H\x1b[3J"),
+        "{resize_text:?}"
+    );
+    assert!(
+        resize_text.contains("YGG-OWNED-RESIZE-00"),
+        "{resize_text:?}"
+    );
+    assert!(
+        resize_text.contains("YGG-OWNED-RESIZE-17"),
+        "{resize_text:?}"
+    );
+    assert!(resize_text.contains("\x1b[?2026l"), "{resize_text:?}");
+    process_vt100_with_saved_line_clear(&mut terminal, &resize, HEIGHT, RESIZED_WIDTH, 512);
+
+    terminal.set_size(256, RESIZED_WIDTH);
+    terminal.set_scrollback(usize::MAX);
+    let physical = terminal.screen().contents();
+    assert!(!physical.contains(SHELL_SENTINEL), "{physical}");
+    for index in 0..18 {
+        let sentinel = format!("YGG-OWNED-RESIZE-{index:02}");
+        assert_eq!(
+            physical.matches(&sentinel).count(),
+            1,
+            "{sentinel} was not replayed exactly once:\n{physical}"
+        );
+    }
+}
+
+#[test]
+fn resize_while_overlayed_replays_owned_transcript_before_repainting_overlay() {
+    const WIDTH: u16 = 48;
+    const RESIZED_WIDTH: u16 = 64;
+    const HEIGHT: u16 = 10;
+
+    let (mut shell, bytes) =
+        emulated_shell_with_sync(crate::tui::theme::test_theme(), WIDTH, HEIGHT, true);
+    let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+        std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+    };
+    let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+    terminal.process(&drain(&bytes));
+
+    for index in 0..18 {
+        shell.notice(format!("YGG-OVERLAY-RESIZE-{index:02}"));
+    }
+    let run_id = shell.begin_run("openai");
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "OVERLAY-ACTIVE-STREAM-BEFORE".into(),
+        },
+    );
+    shell.render();
+    terminal.process(&drain(&bytes));
+
+    shell.show_overlay_text("ACTIVE-OVERLAY-SENTINEL".into());
+    shell.render();
+    terminal.process(&drain(&bytes));
+    assert!(
+        terminal
+            .screen()
+            .contents()
+            .contains("ACTIVE-OVERLAY-SENTINEL"),
+        "{}",
+        terminal.screen().contents()
+    );
+
+    terminal.set_size(HEIGHT, RESIZED_WIDTH);
+    shell.set_size(RESIZED_WIDTH, HEIGHT);
+    shell.render();
+    let resize = drain(&bytes);
+    let resize_text = String::from_utf8_lossy(&resize);
+    assert!(
+        resize_text.contains("\x1b[2J\x1b[H\x1b[3J"),
+        "{resize_text:?}"
+    );
+    assert!(
+        resize_text.contains("ACTIVE-OVERLAY-SENTINEL"),
+        "{resize_text:?}"
+    );
+    assert!(
+        resize_text.contains("OVERLAY-ACTIVE-STREAM-BEFORE"),
+        "{resize_text:?}"
+    );
+    for index in 0..18 {
+        let sentinel = format!("YGG-OVERLAY-RESIZE-{index:02}");
+        assert!(
+            resize_text.contains(&sentinel),
+            "{sentinel} was not replayed beneath the overlay:\n{resize_text:?}"
+        );
+    }
+
+    process_vt100_with_saved_line_clear(&mut terminal, &resize, HEIGHT, RESIZED_WIDTH, 512);
+    assert!(
+        terminal
+            .screen()
+            .contents()
+            .contains("ACTIVE-OVERLAY-SENTINEL"),
+        "{}",
+        terminal.screen().contents()
+    );
+
+    terminal.set_size(256, RESIZED_WIDTH);
+    terminal.set_scrollback(usize::MAX);
+    let physical = terminal.screen().contents();
+    assert!(physical.contains("YGG-OVERLAY-RESIZE-00"), "{physical}");
+    assert!(physical.contains("ACTIVE-OVERLAY-SENTINEL"), "{physical}");
+    terminal.set_size(HEIGHT, RESIZED_WIDTH);
+    terminal.set_scrollback(0);
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: " OVERLAY-ACTIVE-STREAM-AFTER".into(),
+        },
+    );
+    shell.render();
+    terminal.process(&drain(&bytes));
+    assert!(
+        terminal
+            .screen()
+            .contents()
+            .contains("ACTIVE-OVERLAY-SENTINEL"),
+        "{}",
+        terminal.screen().contents()
+    );
+
+    shell.close_overlay();
+    shell.render();
+    let close = drain(&bytes);
+    assert!(
+        !String::from_utf8_lossy(&close).contains("\x1b[3J"),
+        "closing the overlay must use a differential repaint"
+    );
+    terminal.process(&close);
+    terminal.set_size(256, RESIZED_WIDTH);
+    terminal.set_scrollback(usize::MAX);
+    let physical = terminal.screen().contents();
+    assert!(
+        physical.contains("OVERLAY-ACTIVE-STREAM-BEFORE"),
+        "{physical}"
+    );
+    assert!(
+        physical.contains("OVERLAY-ACTIVE-STREAM-AFTER"),
+        "{physical}"
+    );
+    for index in 0..18 {
+        let sentinel = format!("YGG-OVERLAY-RESIZE-{index:02}");
+        assert_eq!(
+            physical.matches(&sentinel).count(),
+            1,
+            "{sentinel} was not retained exactly once after closing the overlay:\n{physical}"
+        );
+    }
+}
+
+#[test]
+fn streamed_table_and_wrapped_lists_survive_shrink_scroll_and_resize() {
     const WIDTH: u16 = 96;
     const HEIGHT: u16 = 22;
     let (mut shell, bytes) =
@@ -2255,6 +2812,7 @@ fn streamed_table_and_wrapped_lists_never_commit_provisional_duplicates() {
     );
     assert!(!initial_probe.reanchor_viewport);
     let mut saw_streaming_row_shrink = false;
+    let mut current_width = WIDTH;
 
     let mut response = String::from(
             "# TABLE HEADING SENTINEL\n\n\
@@ -2270,7 +2828,7 @@ fn streamed_table_and_wrapped_lists_never_commit_provisional_duplicates() {
             "\n## LIST HEADING SENTINEL\n\n\
              - **WRAPPED-LIST-SENTINEL** remains unique while this deliberately long list item wraps across several terminal cells and rows.\n",
         );
-    for chunk in response.as_bytes().chunks(5) {
+    for (chunk_index, chunk) in response.as_bytes().chunks(5).enumerate() {
         shell.on_run_event(
             run_id,
             &AgentEvent::OutputDelta {
@@ -2278,20 +2836,43 @@ fn streamed_table_and_wrapped_lists_never_commit_provisional_duplicates() {
                 text: String::from_utf8(chunk.to_vec()).unwrap(),
             },
         );
+
+        // Change the emulator dimensions before delivering the resize event,
+        // matching terminal event order. `vt100` does not model modern
+        // soft-wrap reflow; the ED 3 helper below models only the reset.
+        // Keep a nonzero scrollback offset while more tokens arrive, then
+        // widen again during the same generation.
+        let resized = match chunk_index {
+            180 => Some(61),
+            360 => Some(WIDTH),
+            _ => None,
+        };
+        if let Some(width) = resized {
+            terminal.set_scrollback(6);
+            terminal.set_size(HEIGHT, width);
+            shell.set_size(width, HEIGHT);
+            current_width = width;
+        }
+
         let previous_rows = update_probe.transcript_len;
         let probe = render_shell_update(
             &shell.state.borrow(),
-            WIDTH,
+            current_width,
             Instant::now(),
             &mut update_probe,
         );
         saw_streaming_row_shrink |= update_probe.transcript_len < previous_rows;
-        assert!(
-            !probe.reanchor_viewport,
-            "streaming Markdown reflow must not reset the physical viewport"
+        assert_eq!(
+            probe.reanchor_viewport,
+            resized.is_some(),
+            "only width reflow should reanchor the streaming viewport"
         );
         shell.render();
-        terminal.process(&drain(&bytes));
+        let output = drain(&bytes);
+        process_vt100_with_saved_line_clear(&mut terminal, &output, HEIGHT, current_width, 512);
+        if chunk_index == 360 {
+            terminal.set_scrollback(0);
+        }
     }
     assert!(
         saw_streaming_row_shrink,
@@ -2772,6 +3353,7 @@ fn new_session_shrink_reanchors_but_picker_growth_does_not() {
         let mut state = shell.state.borrow_mut();
         state.transcript_epoch = state.transcript_epoch.wrapping_add(1);
         state.transcript.clear();
+        state.transcript_commit_ids.clear();
         state.block_revisions.clear();
         state.invalidate_transcript_layout();
         state.push_block(TranscriptBlock::Notice("new session created".into()));

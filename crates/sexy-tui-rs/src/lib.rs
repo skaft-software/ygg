@@ -17,6 +17,7 @@ pub mod live;
 pub mod native_modifiers;
 pub mod rich_text;
 pub mod sanitize;
+mod scrollback;
 pub mod stdin_buffer;
 pub mod style;
 pub mod terminal;
@@ -92,8 +93,9 @@ pub use terminal_image::{
 pub use theme::capability::CapabilityTier;
 pub use theme::Theme;
 pub use tui::{
-    Component, Container, Focusable, FrameUpdate, OverlayAnchor, OverlayHandle, OverlayMargin,
-    OverlayOptions, OverlayUnfocusOptions, SizeValue, CURSOR_MARKER, TUI,
+    CommitCursor, CommitPosition, Component, Container, Focusable, FrameUpdate, OverlayAnchor,
+    OverlayHandle, OverlayMargin, OverlayOptions, OverlayUnfocusOptions, PinnedFrame, SizeValue,
+    CURSOR_MARKER, TUI,
 };
 pub use utils::{
     apply_background_to_line, extract_ansi_code, extract_segments, is_punctuation_char,

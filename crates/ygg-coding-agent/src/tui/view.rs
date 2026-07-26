@@ -14,8 +14,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sexy_tui_rs::{
     parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, Block, Color,
-    Component, DiffRenderOptions, FrameUpdate, Inline, RichRenderer, StreamingMarkdown,
-    StreamingRenderCache, UnifiedDiff, CURSOR_MARKER, TUI,
+    CommitCursor, CommitPosition, Component, DiffRenderOptions, FrameUpdate, Inline, PinnedFrame,
+    RichRenderer, StreamingMarkdown, StreamingRenderCache, UnifiedDiff, CURSOR_MARKER, TUI,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
@@ -24,7 +24,7 @@ use ygg_ai::{ModalitySet, Model, ModelId, ToolCallId, Usage};
 
 use crate::commands;
 use crate::config::Config;
-use crate::hydrate::{hydrate_transcript, hydrate_transcript_tail, TranscriptItem};
+use crate::hydrate::{hydrate_transcript_tail, TranscriptItem};
 use crate::presentation::{
     format_duration, summarize_tool, summarize_tool_with_workspace, tool_failure_reason,
     tool_result_is_failure, ModelDisplayMetadata, PriceDisplay, RunId, RunOutcome, RunPhase,
@@ -36,6 +36,10 @@ use crate::tui::terminal::{force_restore, TerminalSize, YggTerminal};
 use crate::tui::theme::{
     ModelLab, ThemeDensity, ThemeSurfaceAlign, ThemeSurfaceChrome, ThemeSurfaceHeading,
     ThemeSurfaceWidth, YggTheme,
+};
+
+use self::transcript_history::{
+    materialize_deferred_session_history, DeferredSessionHistory, NextTranscriptCommitId,
 };
 
 const MAX_PANEL_BYTES: usize = 64 * 1024;
@@ -815,6 +819,10 @@ pub(crate) struct ShellState {
     /// `/new` or session hydration). Visual row counts may shrink while a
     /// streaming Markdown block reparses and must not look like a new session.
     transcript_epoch: u64,
+    /// Stable width-independent identity parallel to each transcript block.
+    /// IDs survive deferred prepends and are never reused after tail removal.
+    transcript_commit_ids: Vec<u64>,
+    next_transcript_commit_id: NextTranscriptCommitId,
     /// Creator family for the active model. The dedicated model accent is
     /// reapplied whenever a named theme is loaded.
     pub(crate) model_lab: Option<crate::tui::theme::ModelLab>,
@@ -824,10 +832,10 @@ pub(crate) struct ShellState {
     /// Shared phase for every active event marker. This is presentation-only
     /// and toggles at a fixed cadence on the renderer thread.
     event_dot_visible: bool,
-    /// Session backing an intentionally tail-only first paint. The complete
-    /// branch is materialized once, on the first attempt to scroll beyond the
-    /// retained tail, so resume readiness does not scale with old history.
-    deferred_session_path: Option<PathBuf>,
+    /// Snapshot backing an intentionally tail-only first paint. The complete
+    /// branch is materialized on scroll or before a destructive resize replay,
+    /// so resume readiness does not scale with old history.
+    deferred_session_history: Option<DeferredSessionHistory>,
     /// One-shot marker for a cache rebuild caused by prepending deferred
     /// history. Those rows are above the current viewport, not new output
     /// below it, so the normal scroll-anchor rebase must be skipped once.
@@ -1049,7 +1057,12 @@ impl ShellState {
     }
 
     fn push_block(&mut self, block: TranscriptBlock) {
+        let commit_id = self.next_transcript_commit_id.0;
+        self.next_transcript_commit_id.0 = commit_id
+            .checked_add(1)
+            .expect("transcript commit identity space exhausted");
         self.transcript.push(block);
+        self.transcript_commit_ids.push(commit_id);
         self.block_revisions.push(0);
         if !self.follow_tail {
             self.new_output_count = self.new_output_count.saturating_add(1);
@@ -1444,6 +1457,7 @@ impl ShellState {
                 continue;
             }
             self.transcript.remove(index);
+            self.transcript_commit_ids.remove(index);
             self.block_revisions.remove(index);
             for panel_index in self.tool_panels.values_mut() {
                 if *panel_index > index {
@@ -1610,6 +1624,14 @@ fn synchronize_terminal_size(state: &SharedState, size: &TerminalSize) -> bool {
     let Ok(dimensions) = crossterm::terminal::size() else {
         return false;
     };
+    reconcile_terminal_size(state, size, dimensions)
+}
+
+fn reconcile_terminal_size(
+    state: &SharedState,
+    size: &TerminalSize,
+    dimensions: (u16, u16),
+) -> bool {
     let changed = {
         let mut current = size.lock().expect("terminal size mutex poisoned");
         if *current == dimensions {
@@ -1621,6 +1643,13 @@ fn synchronize_terminal_size(state: &SharedState, size: &TerminalSize) -> bool {
     };
     if !changed {
         return false;
+    }
+
+    // This delayed-signal fallback must obey the same transcript contract as
+    // the normal resize path: destructive replay cannot run from a bounded
+    // first-paint tail.
+    if let Err(error) = materialize_deferred_session_history(state) {
+        state.borrow_mut().error = Some(format!("could not load older session history: {error}"));
     }
 
     let mut shell = state.borrow_mut();
@@ -1755,12 +1784,17 @@ fn render_loop(
 struct ShellFrameState {
     initialized: bool,
     width: u16,
+    height: u16,
     theme_epoch: u64,
     transcript_epoch: u64,
     transcript_generation: u64,
     transcript_len: usize,
     verbose_tools: bool,
     overlay_active: bool,
+    /// Rows of the native transcript frame retained above the screen-sized
+    /// overlay surface. This bounds lazy diffs when mutable chrome changes the
+    /// overlay's seam with terminal-owned history.
+    overlay_prefix_len: usize,
 }
 
 /// The retained root component. It reads the shell state at render time, while
@@ -1782,6 +1816,7 @@ impl Component for ShellComponent {
             let mut frame = self.frame.borrow_mut();
             frame.initialized = true;
             frame.width = width;
+            frame.height = state.size.1;
             frame.theme_epoch = state.theme_epoch;
             frame.transcript_epoch = state.transcript_epoch;
             frame.verbose_tools = state.verbose_tools;
@@ -1794,6 +1829,14 @@ impl Component for ShellComponent {
     }
 
     fn render_update(&self, width: u16) -> Option<FrameUpdate> {
+        self.render_update_with_cursor(width, None)
+    }
+
+    fn render_update_with_cursor(
+        &self,
+        width: u16,
+        cursor: Option<CommitCursor>,
+    ) -> Option<FrameUpdate> {
         let state = self.state.borrow();
         Some(if self.application_viewport {
             render_shell_viewport_update(
@@ -1803,7 +1846,13 @@ impl Component for ShellComponent {
                 &mut self.frame.borrow_mut(),
             )
         } else {
-            render_shell_update(&state, width, Instant::now(), &mut self.frame.borrow_mut())
+            render_shell_update_with_cursor(
+                &state,
+                width,
+                Instant::now(),
+                &mut self.frame.borrow_mut(),
+                cursor,
+            )
         })
     }
 
@@ -4140,38 +4189,162 @@ fn transcript_lines(state: &ShellState, width: u16) -> Ref<'_, Vec<String>> {
     state.rendered_transcript(width)
 }
 
-fn transcript_commit_boundary(state: &ShellState, width: u16) -> usize {
-    if welcome_animating(state, Instant::now()) {
-        return 0;
+const FINAL_COMMIT_SEGMENT: u64 = u64::MAX;
+
+fn transcript_block_is_final(block: &TranscriptBlock) -> bool {
+    match block {
+        TranscriptBlock::Assistant(block) | TranscriptBlock::Reasoning(block) => block.finished,
+        TranscriptBlock::Tool(panel) => panel.finished,
+        TranscriptBlock::Shell(shell) => !shell.running,
+        TranscriptBlock::Compaction(_)
+        | TranscriptBlock::User { .. }
+        | TranscriptBlock::Outcome(_)
+        | TranscriptBlock::Notice(_) => true,
     }
-    let transcript_len = transcript_lines(state, width).len();
-    let first_live = state.transcript.iter().position(|block| match block {
-        TranscriptBlock::Assistant(block) | TranscriptBlock::Reasoning(block) => !block.finished,
-        TranscriptBlock::Tool(panel) => !panel.finished,
-        TranscriptBlock::Shell(shell) => shell.running,
-        TranscriptBlock::Compaction(_) => false,
-        TranscriptBlock::User { .. } | TranscriptBlock::Outcome(_) | TranscriptBlock::Notice(_) => {
-            false
-        }
-    });
-    let Some(first_live) = first_live else {
-        return transcript_len;
-    };
+}
+
+fn transcript_commit_cursor(state: &ShellState, block: usize, segment: u64) -> CommitCursor {
+    CommitCursor {
+        generation: state.transcript_epoch,
+        block: *state
+            .transcript_commit_ids
+            .get(block)
+            .expect("transcript block missing commit identity"),
+        segment,
+    }
+}
+
+fn transcript_commit_position(state: &ShellState, cursor: CommitCursor) -> Option<CommitPosition> {
+    if cursor.generation != state.transcript_epoch {
+        return None;
+    }
     let cache = state.transcript_cache.borrow();
-    let block_start = cache.block_starts.get(first_live).copied().unwrap_or(0);
-    let settled_rows = match &state.transcript[first_live] {
-        TranscriptBlock::Assistant(block) => {
-            let geometry = cache.block_geometries.get(first_live).copied();
-            geometry.map_or(0, |geometry| {
-                geometry
-                    .transition_rows
-                    .saturating_add(geometry.leading_rows)
-                    .saturating_add(block.layout.borrow().committed_rows())
-            })
+    let block_index = match state.transcript_commit_ids.binary_search(&cursor.block) {
+        Ok(index) => index,
+        Err(insertion) => {
+            // A cancelled provider attempt can remove a streaming tail after
+            // some of its finalized segments entered native history. Preserve
+            // that tombstoned seam at the removal point; later blocks receive
+            // larger IDs and can continue the append-only tape.
+            let row = cache
+                .block_starts
+                .get(insertion)
+                .copied()
+                .unwrap_or(cache.lines.len());
+            return Some(CommitPosition { cursor, row });
         }
-        _ => 0,
     };
-    block_start.saturating_add(settled_rows).min(transcript_len)
+    let block = state.transcript.get(block_index)?;
+    let block_start = *cache.block_starts.get(block_index)?;
+    let block_len = *cache.block_lengths.get(block_index)?;
+
+    let row = if cursor.segment == FINAL_COMMIT_SEGMENT {
+        transcript_block_is_final(block).then_some(block_start.saturating_add(block_len))?
+    } else {
+        let TranscriptBlock::Assistant(markdown) = block else {
+            return None;
+        };
+        let geometry = *cache.block_geometries.get(block_index)?;
+        let segment = usize::try_from(cursor.segment).ok()?;
+        let layout = markdown.layout.borrow();
+        let content_end = *layout.committed_block_ends().get(segment)?;
+        block_start
+            .saturating_add(geometry.transition_rows)
+            .saturating_add(geometry.leading_rows)
+            .saturating_add(content_end)
+            .min(block_start.saturating_add(block_len))
+    };
+    Some(CommitPosition { cursor, row })
+}
+
+/// Furthest semantic boundary whose current-layout rows fit entirely above the
+/// mutable viewport. Stable block IDs survive deferred prepends and tail
+/// removal while width-dependent row positions are recomputed after reflow.
+fn transcript_commit_target(
+    state: &ShellState,
+    maximum_row: usize,
+    acknowledged: Option<CommitCursor>,
+) -> Option<CommitPosition> {
+    if welcome_animating(state, Instant::now()) {
+        return None;
+    }
+    let cache = state.transcript_cache.borrow();
+    let mut target = None;
+    let start_block = acknowledged
+        .filter(|cursor| cursor.generation == state.transcript_epoch)
+        .map_or(0, |cursor| {
+            state
+                .transcript_commit_ids
+                .binary_search(&cursor.block)
+                .unwrap_or_else(|insertion| insertion)
+        });
+
+    for (index, block) in state.transcript.iter().enumerate().skip(start_block) {
+        let Some(block_start) = cache.block_starts.get(index).copied() else {
+            break;
+        };
+        let Some(block_len) = cache.block_lengths.get(index).copied() else {
+            break;
+        };
+        let Some(geometry) = cache.block_geometries.get(index).copied() else {
+            break;
+        };
+        let block_end = block_start.saturating_add(block_len);
+        let final_block = transcript_block_is_final(block);
+
+        if let TranscriptBlock::Assistant(markdown) = block {
+            // A completed block can be acknowledged as one outer transcript
+            // unit when it fits. If it straddles the viewport, retain the most
+            // recent parser-committed inner Markdown boundary instead.
+            if final_block && block_end <= maximum_row {
+                target = Some(CommitPosition {
+                    cursor: transcript_commit_cursor(state, index, FINAL_COMMIT_SEGMENT),
+                    row: block_end,
+                });
+                continue;
+            }
+
+            let content_start = block_start
+                .saturating_add(geometry.transition_rows)
+                .saturating_add(geometry.leading_rows);
+            let layout = markdown.layout.borrow();
+            for (segment, content_end) in layout.committed_block_ends().iter().enumerate() {
+                let row = content_start.saturating_add(*content_end).min(block_end);
+                if row > maximum_row {
+                    break;
+                }
+                target = Some(CommitPosition {
+                    cursor: transcript_commit_cursor(state, index, segment as u64),
+                    row,
+                });
+            }
+            break;
+        }
+
+        if !final_block || block_end > maximum_row {
+            break;
+        }
+        target = Some(CommitPosition {
+            cursor: transcript_commit_cursor(state, index, FINAL_COMMIT_SEGMENT),
+            row: block_end,
+        });
+    }
+
+    target
+}
+
+fn transcript_pinned_frame(
+    state: &ShellState,
+    total_rows: usize,
+    acknowledged: Option<CommitCursor>,
+) -> PinnedFrame {
+    let maximum_row = total_rows.saturating_sub(usize::from(state.size.1.max(1)));
+    let target = transcript_commit_target(state, maximum_row, acknowledged);
+    PinnedFrame {
+        generation: state.transcript_epoch,
+        acknowledged: acknowledged.and_then(|cursor| transcript_commit_position(state, cursor)),
+        target,
+    }
 }
 
 fn transcript_viewport_capacity(available: usize, scrolled: bool) -> usize {
@@ -4339,6 +4512,7 @@ fn usage_cache_hit_rate_basis_points(usage: Usage) -> Option<u16> {
     Some(((u128::from(usage.cache_read_tokens) * 10_000) / u128::from(prompt_tokens)) as u16)
 }
 
+#[derive(Clone)]
 struct ShellChrome {
     header: Vec<String>,
     composer: Vec<String>,
@@ -4927,16 +5101,18 @@ fn render_shell_viewport_update(
     frame: &mut ShellFrameState,
 ) -> FrameUpdate {
     let repaint_theme = frame.initialized && frame.theme_epoch != state.theme_epoch;
-    let resized = frame.initialized && frame.width != width;
+    let resized = frame.initialized && (frame.width != width || frame.height != state.size.1);
     frame.initialized = true;
     frame.width = width;
+    frame.height = state.size.1;
     frame.theme_epoch = state.theme_epoch;
     frame.transcript_epoch = state.transcript_epoch;
     frame.verbose_tools = state.verbose_tools;
     FrameUpdate {
         stable_prefix: 0,
         replacement: render_shell_viewport_at(state, width, now),
-        commit_boundary: None,
+        pinned: None,
+        resize_replay: None,
         reanchor_viewport: repaint_theme || resized,
         rebuild_scrollback: false,
     }
@@ -4961,136 +5137,218 @@ fn append_chrome(lines: &mut Vec<String>, chrome: ShellChrome, stable_prefix_row
     lines.extend(chrome.composer);
 }
 
+fn shell_chrome_rows(chrome: &ShellChrome) -> usize {
+    chrome
+        .header
+        .len()
+        .saturating_add(chrome.error.len())
+        .saturating_add(chrome.pending.len())
+        .saturating_add(chrome.suggestions.len())
+        .saturating_add(chrome.panel.len())
+        .saturating_add(chrome.composer.len())
+}
+
+fn native_overlay_prefix_len(transcript_len: usize, chrome: &ShellChrome) -> usize {
+    let chrome_rows = shell_chrome_rows(chrome);
+    let normal_rows = transcript_len
+        .saturating_add(usize::from(transcript_len > 0))
+        .saturating_add(chrome_rows);
+    let overlay_rows = chrome.transcript_rows.saturating_add(chrome_rows);
+    normal_rows.saturating_sub(overlay_rows)
+}
+
+/// Build the native overlay as a screen-sized surface over the visible tail of
+/// the normal transcript frame. Rows above that surface remain part of the
+/// logical frame, so a destructive resize can replay terminal-owned history
+/// without copying the overlay itself into scrollback.
+fn render_native_overlay_suffix(
+    state: &ShellState,
+    width: u16,
+    chrome: ShellChrome,
+    transcript: &[String],
+    requested_stable_prefix: usize,
+) -> (usize, Vec<String>, usize, usize) {
+    let overlay_prefix_len = native_overlay_prefix_len(transcript.len(), &chrome);
+    let mut overlay = overlay_lines(state, width);
+    append_viewport_chrome(&mut overlay, chrome);
+
+    let transcript_prefix_len = overlay_prefix_len.min(transcript.len());
+    let stable_prefix = requested_stable_prefix.min(transcript_prefix_len);
+
+    let mut replacement = transcript[stable_prefix..transcript_prefix_len].to_vec();
+    replacement.resize(
+        replacement
+            .len()
+            .saturating_add(overlay_prefix_len.saturating_sub(transcript_prefix_len)),
+        String::new(),
+    );
+    replacement.extend(overlay);
+    let total_rows = stable_prefix.saturating_add(replacement.len());
+    (stable_prefix, replacement, total_rows, overlay_prefix_len)
+}
+
 /// Full logical primary-screen frame. The terminal backend paints only its
 /// visible tail; committed rows naturally move into native scrollback and are
 /// never sliced into an application-owned viewport on the default path.
 fn render_shell_at(state: &ShellState, width: u16, now: Instant) -> Vec<String> {
     let chrome = shell_chrome(state, width, now);
-    let mut lines = if state.overlay.is_some() {
-        overlay_lines(state, width)
+    let transcript = transcript_lines(state, width);
+    if state.overlay.is_some() {
+        let (_, lines, _, _) = render_native_overlay_suffix(state, width, chrome, &transcript, 0);
+        lines
     } else {
-        transcript_lines(state, width).clone()
-    };
-    append_chrome(&mut lines, chrome, 0);
-    lines
+        let mut lines = transcript.clone();
+        drop(transcript);
+        append_chrome(&mut lines, chrome, 0);
+        lines
+    }
 }
 
 fn synchronize_shell_frame(state: &ShellState, width: u16, frame: &mut ShellFrameState) {
-    if state.overlay.is_some() {
-        frame.initialized = true;
-        frame.width = width;
-        frame.theme_epoch = state.theme_epoch;
-        frame.transcript_epoch = state.transcript_epoch;
-        frame.transcript_generation = 0;
-        frame.transcript_len = 0;
-        frame.overlay_active = true;
-        return;
-    }
     let _ = transcript_lines(state, width);
     let cache = state.transcript_cache.borrow();
+    let overlay_prefix_len = state.overlay.as_ref().map_or(0, |_| {
+        native_overlay_prefix_len(
+            cache.lines.len(),
+            &shell_chrome(state, width, Instant::now()),
+        )
+    });
     frame.initialized = true;
     frame.width = width;
+    frame.height = state.size.1;
     frame.theme_epoch = state.theme_epoch;
     frame.transcript_epoch = state.transcript_epoch;
     frame.transcript_generation = cache.generation;
     frame.transcript_len = cache.lines.len();
     frame.verbose_tools = state.verbose_tools;
-    frame.overlay_active = false;
+    frame.overlay_active = state.overlay.is_some();
+    frame.overlay_prefix_len = overlay_prefix_len;
 }
 
 /// Build only the mutable suffix of the native-scrollback frame. Historic
 /// transcript strings are neither cloned nor compared on streaming/status
 /// ticks; sexy-tui reuses the committed prefix already retained in its frame.
-fn render_shell_update(
+fn render_shell_update_with_cursor(
     state: &ShellState,
     width: u16,
     now: Instant,
     frame: &mut ShellFrameState,
+    acknowledged: Option<CommitCursor>,
 ) -> FrameUpdate {
     let repaint_theme = frame.initialized && frame.theme_epoch != state.theme_epoch;
-    let resized = frame.initialized && frame.width != width;
+    let resized = frame.initialized && (frame.width != width || frame.height != state.size.1);
     let presentation_changed = frame.initialized && frame.verbose_tools != state.verbose_tools;
+    let entering_overlay = frame.initialized && !frame.overlay_active && state.overlay.is_some();
+    let leaving_overlay = frame.initialized && frame.overlay_active && state.overlay.is_none();
     let chrome = shell_chrome(state, width, now);
-    if state.overlay.is_some() {
-        let entering_overlay = frame.initialized && !frame.overlay_active;
-        let mut replacement = overlay_lines(state, width);
-        append_chrome(&mut replacement, chrome, 0);
-        frame.initialized = true;
-        frame.width = width;
-        frame.theme_epoch = state.theme_epoch;
-        frame.transcript_epoch = state.transcript_epoch;
-        frame.transcript_generation = 0;
-        frame.transcript_len = 0;
-        frame.overlay_active = true;
-        return FrameUpdate {
-            stable_prefix: 0,
-            replacement,
-            // Overlays temporarily replace the grid but do not replace or
-            // advance the transcript's native-scrollback ledger.
-            commit_boundary: None,
-            reanchor_viewport: repaint_theme || resized || entering_overlay,
-            // Portable terminals cannot restyle rows already owned by native
-            // scrollback. Repaint the visible viewport and preserve history.
-            rebuild_scrollback: false,
-        };
-    }
 
     let transcript_len = {
         let transcript = transcript_lines(state, width);
         transcript.len()
     };
-    let commit_boundary = transcript_commit_boundary(state, width);
     // Hydrating `/new` (or another session) replaces the logical transcript.
     // Visual row counts alone cannot identify that transition: a streaming
     // Markdown table routinely shrinks while incomplete syntax reparses.
-    let leaving_overlay = frame.initialized && frame.overlay_active;
     let cache = state.transcript_cache.borrow();
     let generation = cache.generation;
-    let reanchor_viewport = repaint_theme
-        || resized
-        || leaving_overlay
-        || (frame.initialized
-            && frame.width == width
-            && !frame.overlay_active
-            && frame.transcript_epoch != state.transcript_epoch);
-    let stable_prefix = if !presentation_changed
-        && frame.initialized
+    let transcript_replaced = frame.initialized
         && frame.width == width
         && !frame.overlay_active
-    {
-        if frame.transcript_generation == cache.generation {
-            frame.transcript_len.min(transcript_len)
+        && frame.transcript_epoch != state.transcript_epoch;
+    let mut requested_stable_prefix =
+        if !presentation_changed && frame.initialized && frame.width == width && !leaving_overlay {
+            if frame.transcript_generation == cache.generation {
+                frame.transcript_len.min(transcript_len)
+            } else {
+                cache
+                    .last_update_start
+                    .min(frame.transcript_len)
+                    .min(transcript_len)
+            }
         } else {
-            cache
-                .last_update_start
-                .min(frame.transcript_len)
-                .min(transcript_len)
-        }
-    } else {
-        0
-    };
-    drop(cache);
+            0
+        };
+    if frame.overlay_active {
+        requested_stable_prefix = requested_stable_prefix.min(frame.overlay_prefix_len);
+    }
 
-    let transcript = transcript_lines(state, width);
-    let mut replacement = transcript[stable_prefix..].to_vec();
-    drop(transcript);
+    if state.overlay.is_some() {
+        let resize_replay = resized.then(|| {
+            let mut replay = cache.lines.clone();
+            append_chrome(&mut replay, chrome.clone(), 0);
+            replay
+        });
+        let (stable_prefix, replacement, total_rows, overlay_prefix_len) =
+            render_native_overlay_suffix(
+                state,
+                width,
+                chrome,
+                &cache.lines,
+                requested_stable_prefix,
+            );
+        let pinned = transcript_pinned_frame(state, total_rows, acknowledged);
+        drop(cache);
+
+        frame.initialized = true;
+        frame.width = width;
+        frame.height = state.size.1;
+        frame.theme_epoch = state.theme_epoch;
+        frame.transcript_epoch = state.transcript_epoch;
+        frame.transcript_generation = generation;
+        frame.transcript_len = transcript_len;
+        frame.verbose_tools = state.verbose_tools;
+        frame.overlay_active = true;
+        frame.overlay_prefix_len = overlay_prefix_len;
+        return FrameUpdate {
+            stable_prefix,
+            replacement,
+            pinned: Some(pinned),
+            resize_replay,
+            reanchor_viewport: repaint_theme || resized || entering_overlay,
+            // Overlay rows are a temporary screen surface. Presentation changes
+            // repaint that surface without restyling terminal-owned history.
+            rebuild_scrollback: false,
+        };
+    }
+
+    let stable_prefix = requested_stable_prefix;
+    let mut replacement = cache.lines[stable_prefix..].to_vec();
+    drop(cache);
     append_chrome(&mut replacement, chrome, stable_prefix);
+    let pinned = transcript_pinned_frame(
+        state,
+        stable_prefix.saturating_add(replacement.len()),
+        acknowledged,
+    );
 
     frame.initialized = true;
     frame.width = width;
+    frame.height = state.size.1;
     frame.theme_epoch = state.theme_epoch;
     frame.transcript_epoch = state.transcript_epoch;
     frame.transcript_generation = generation;
     frame.transcript_len = transcript_len;
     frame.verbose_tools = state.verbose_tools;
     frame.overlay_active = false;
+    frame.overlay_prefix_len = 0;
     FrameUpdate {
         stable_prefix,
         replacement,
-        commit_boundary: Some(commit_boundary),
-        reanchor_viewport,
+        pinned: Some(pinned),
+        resize_replay: None,
+        reanchor_viewport: repaint_theme || resized || leaving_overlay || transcript_replaced,
         rebuild_scrollback: presentation_changed,
     }
+}
+
+#[cfg(test)]
+fn render_shell_update(
+    state: &ShellState,
+    width: u16,
+    now: Instant,
+    frame: &mut ShellFrameState,
+) -> FrameUpdate {
+    render_shell_update_with_cursor(state, width, now, frame, None)
 }
 
 fn render_shell(state: &ShellState, width: u16) -> Vec<String> {
@@ -6591,6 +6849,16 @@ impl InteractiveShell {
     }
 
     pub fn set_size(&mut self, columns: u16, rows: u16) {
+        let resized = self.state.borrow().size != (columns, rows);
+        if resized {
+            // A resize discards terminal-owned history. Materialize the exact
+            // deferred branch snapshot first so the destructive replay owns a
+            // complete transcript, even while a new run is active.
+            if let Err(error) = self.materialize_deferred_history() {
+                self.state.borrow_mut().error =
+                    Some(format!("could not load older session history: {error}"));
+            }
+        }
         *self.size.lock().expect("terminal size mutex poisoned") = (columns, rows);
         let mut state = self.state.borrow_mut();
         state.size = (columns, rows);
@@ -6732,45 +7000,7 @@ impl InteractiveShell {
     }
 
     fn materialize_deferred_history(&mut self) -> Result<bool> {
-        let path = {
-            let state = self.state.borrow();
-            if state.run.is_active() {
-                return Ok(false);
-            }
-            state.deferred_session_path.clone()
-        };
-        let Some(path) = path else {
-            return Ok(false);
-        };
-
-        let session = Session::open_read_only(path)?;
-        let items = hydrate_transcript(&session)?;
-        let mut state = self.state.borrow_mut();
-        let local_blocks = std::mem::take(&mut state.transcript)
-            .into_iter()
-            .filter(|block| {
-                matches!(
-                    block,
-                    TranscriptBlock::Outcome(_)
-                        | TranscriptBlock::Notice(_)
-                        | TranscriptBlock::Shell(_)
-                        | TranscriptBlock::User {
-                            persisted: false,
-                            ..
-                        }
-                )
-            })
-            .collect::<Vec<_>>();
-        state.block_revisions.clear();
-        state.tool_panels.clear();
-        state.deferred_session_path = None;
-        append_hydrated_items(&mut state, items);
-        for block in local_blocks {
-            state.push_block(block);
-        }
-        state.history_prepended.set(true);
-        state.invalidate_transcript_layout();
-        Ok(true)
+        materialize_deferred_session_history(&self.state)
     }
 
     pub fn scroll(&mut self, direction: i16) {
@@ -6779,15 +7009,14 @@ impl InteractiveShell {
                 let state = self.state.borrow();
                 let page = usize::from(state.size.1.max(4) / 2);
                 let maximum = max_scroll_from_bottom(&state, state.size.0);
-                state.deferred_session_path.is_some()
+                state.deferred_session_history.is_some()
                     && !state.run.is_active()
                     && state.scroll_from_bottom.get().saturating_add(page) >= maximum
             };
             if should_materialize {
                 if let Err(error) = self.materialize_deferred_history() {
-                    let mut state = self.state.borrow_mut();
-                    state.deferred_session_path = None;
-                    state.error = Some(format!("could not load older session history: {error}"));
+                    self.state.borrow_mut().error =
+                        Some(format!("could not load older session history: {error}"));
                 }
             }
         }
@@ -6815,7 +7044,7 @@ impl InteractiveShell {
             let should_materialize = {
                 let state = self.state.borrow();
                 let maximum = max_scroll_from_bottom(&state, state.size.0);
-                state.deferred_session_path.is_some()
+                state.deferred_session_history.is_some()
                     && !state.run.is_active()
                     && state
                         .scroll_from_bottom
@@ -6825,9 +7054,8 @@ impl InteractiveShell {
             };
             if should_materialize {
                 if let Err(error) = self.materialize_deferred_history() {
-                    let mut state = self.state.borrow_mut();
-                    state.deferred_session_path = None;
-                    state.error = Some(format!("could not load older session history: {error}"));
+                    self.state.borrow_mut().error =
+                        Some(format!("could not load older session history: {error}"));
                 }
             }
         }
@@ -7061,9 +7289,8 @@ impl InteractiveShell {
     /// from editor selection, so pinned chrome can never enter the copy range.
     pub fn select_all_transcript(&mut self) {
         if let Err(error) = self.materialize_deferred_history() {
-            let mut state = self.state.borrow_mut();
-            state.deferred_session_path = None;
-            state.error = Some(format!("could not load older session history: {error}"));
+            self.state.borrow_mut().error =
+                Some(format!("could not load older session history: {error}"));
         }
         let mut state = self.state.borrow_mut();
         let Some(last) = state.transcript.len().checked_sub(1) else {
@@ -7439,9 +7666,9 @@ impl InteractiveShell {
         state.theme = theme;
         state.theme_epoch = state.theme_epoch.wrapping_add(1);
         state.invalidate_rich_text();
-        // Native scrollback cannot be recoloured retroactively. The epoch
-        // forces the terminal to clear saved lines and replay Ygg's retained
-        // logical frame once in the new theme.
+        // Native scrollback cannot be recoloured retroactively. The theme
+        // epoch forces a complete visible-grid repaint while terminal-owned
+        // history keeps its original cells and styles.
     }
 
     /// Rebuild the visible transcript from the session's active branch.
@@ -7450,6 +7677,13 @@ impl InteractiveShell {
             .saturating_mul(4)
             .clamp(64, 256);
         let (items, history_deferred) = hydrate_transcript_tail(session, entry_budget)?;
+        let deferred_snapshot = history_deferred.then(|| DeferredSessionHistory {
+            path: session.path().to_owned(),
+            head: session
+                .head()
+                .expect("a truncated active branch must have a session head"),
+            retained_id_end: 0,
+        });
         let checkpoint = session.latest_active_checkpoint();
         let latest_turn = session.latest_active_assistant_usage();
         let checkpoint_usage = latest_turn
@@ -7463,7 +7697,7 @@ impl InteractiveShell {
             .map(|model| model.0.clone());
         let session_cost = session.total_cost_microdollars();
         let mut state = self.state.borrow_mut();
-        state.deferred_session_path = history_deferred.then(|| session.path().to_owned());
+        state.deferred_session_history = None;
         state.latest_compaction_summary =
             session
                 .entries()
@@ -7474,7 +7708,9 @@ impl InteractiveShell {
                     _ => None,
                 });
         state.transcript_epoch = state.transcript_epoch.wrapping_add(1);
+        state.next_transcript_commit_id = NextTranscriptCommitId::default();
         state.transcript.clear();
+        state.transcript_commit_ids.clear();
         state.block_revisions.clear();
         state.invalidate_transcript_layout();
         state.steering_queue.clear();
@@ -7514,6 +7750,10 @@ impl InteractiveShell {
         state.overlay = None;
         state.error = None;
         append_hydrated_items(&mut state, items);
+        state.deferred_session_history = deferred_snapshot.map(|mut deferred| {
+            deferred.retained_id_end = state.next_transcript_commit_id.0;
+            deferred
+        });
         state.invalidate_transcript();
         Ok(())
     }
@@ -7614,6 +7854,8 @@ impl sexy_tui_rs::Terminal for TestTerminal {
     fn clear_from_cursor(&mut self) {}
     fn clear_screen(&mut self) {}
 }
+
+mod transcript_history;
 
 #[cfg(test)]
 mod tests;

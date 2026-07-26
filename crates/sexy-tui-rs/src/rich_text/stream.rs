@@ -373,6 +373,11 @@ pub struct StreamingRenderCache {
     committed_revision: u64,
     committed_blocks: usize,
     committed_lines: Vec<RenderedLine>,
+    /// Exclusive row boundary after each committed semantic segment. Ordinary
+    /// Markdown blocks contribute one segment; lists and tables contribute
+    /// stable item/row segments so commits can advance through large blocks.
+    /// Positions are recomputed on reflow while indices retain their identity.
+    committed_block_ends: Vec<usize>,
     tail_revision: u64,
     tail_lines: Vec<RenderedLine>,
     /// Pre-built merged result, invalidated when either committed or tail changes.
@@ -389,6 +394,31 @@ impl StreamingRenderCache {
         self.committed_lines.len()
     }
 
+    /// Exclusive visual-row ends for parser-committed semantic segments at the
+    /// current width. Segment indices survive width reflow; lists and tables
+    /// contribute one segment per item or row instead of stalling at the outer
+    /// Markdown block boundary.
+    pub fn committed_block_ends(&self) -> &[usize] {
+        &self.committed_block_ends
+    }
+
+    fn append_committed_blocks(&mut self, blocks: &[Block], renderer: &RichRenderer, width: u16) {
+        for block in blocks {
+            if !self.committed_lines.is_empty() {
+                self.committed_lines.push(RenderedLine::default());
+            }
+            let block_start = self.committed_lines.len();
+            let (lines, ends) = renderer.render_block_with_commit_ends(block, width);
+            self.committed_lines.extend(lines);
+            if ends.is_empty() {
+                self.committed_block_ends.push(self.committed_lines.len());
+            } else {
+                self.committed_block_ends
+                    .extend(ends.into_iter().map(|end| block_start.saturating_add(end)));
+            }
+        }
+    }
+
     pub fn render(
         &mut self,
         stream: &StreamingMarkdown,
@@ -402,17 +432,16 @@ impl StreamingRenderCache {
             || stream.committed().blocks.len() < self.committed_blocks;
 
         if full_reflow {
-            self.committed_lines = renderer.render(stream.committed(), width).lines;
+            self.committed_lines.clear();
+            self.committed_block_ends.clear();
+            self.committed_blocks = 0;
+            self.append_committed_blocks(&stream.committed().blocks, renderer, width);
             self.committed_blocks = stream.committed().blocks.len();
         } else if self.committed_revision != stream.committed_revision()
             && self.committed_blocks < stream.committed().blocks.len()
         {
             let new_blocks = &stream.committed().blocks[self.committed_blocks..];
-            if !self.committed_lines.is_empty() && !new_blocks.is_empty() {
-                self.committed_lines.push(RenderedLine::default());
-            }
-            self.committed_lines
-                .extend(renderer.render_blocks_only(new_blocks, width));
+            self.append_committed_blocks(new_blocks, renderer, width);
             self.committed_blocks = stream.committed().blocks.len();
         }
 
@@ -715,6 +744,34 @@ mod tests {
         stream.push_str("```\n");
         stream.finish();
         assert_eq!(stream.committed(), &markdown::parse(stream.raw_text()));
+    }
+
+    #[test]
+    fn semantic_commit_segments_remap_across_widths() {
+        let renderer = RichRenderer::plain();
+        for (source, expected_segments) in [
+            ("- alpha item\n- beta item\n- gamma item\n", 3),
+            (
+                "| Name | Value |\n|---|---|\n| alpha | one |\n| beta | two |\n| gamma | three |\n",
+                3,
+            ),
+        ] {
+            let mut stream = StreamingMarkdown::from_text(source);
+            stream.finish();
+            let mut cache = StreamingRenderCache::default();
+
+            cache.render(&stream, &renderer, 80);
+            let wide = cache.committed_block_ends().to_vec();
+            assert_eq!(wide.len(), expected_segments);
+            assert_eq!(wide.last().copied(), Some(cache.committed_rows()));
+            assert!(wide.windows(2).all(|ends| ends[0] < ends[1]));
+
+            cache.render(&stream, &renderer, 12);
+            let narrow = cache.committed_block_ends().to_vec();
+            assert_eq!(narrow.len(), expected_segments);
+            assert_eq!(narrow.last().copied(), Some(cache.committed_rows()));
+            assert!(narrow.windows(2).all(|ends| ends[0] < ends[1]));
+        }
     }
 
     #[test]

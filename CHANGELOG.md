@@ -2,6 +2,26 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## 0.3.1-alpha — 2026-07-26
+
+### Fixed
+
+- Prevented finalized streamed output from being duplicated, omitted, or
+  overwritten in native terminal scrollback when Markdown rows shrink, the
+  terminal is resized, or scrolling and resizing overlap with generation.
+- Preserved terminal-owned history across theme and disclosure repaints without
+  clearing scrollback or replaying the committed transcript.
+
+### Performance and reliability
+
+- Replaced width-dependent commit row bookkeeping with stable semantic cursors
+  that remap after reflow, including list-item and table-row boundaries for
+  large streamed Markdown blocks.
+- Kept deferred-history prepends and cancelled streaming retries on the same
+  append-only semantic tape without renumbering retained commit identities.
+- Added terminal-emulator regressions for streaming layout shrink, nonzero
+  scrollback offsets, synchronized output, and width changes during generation.
+
 ## 0.3.0-alpha — 2026-07-25
 
 ### Added

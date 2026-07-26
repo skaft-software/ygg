@@ -2,6 +2,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::scrollback::reset_and_replay;
 use crate::terminal::{key_to_string, Terminal, TerminalInput};
 use crate::terminal_image::{delete_all_kitty_images, is_image_line};
 use crate::utils::visible_width;
@@ -23,6 +24,36 @@ pub type InputListener<'a> = Box<dyn FnMut(&str) -> Option<String> + 'a>;
 // Component Trait
 // =============================================================================
 
+/// Width-independent identity for a finalized semantic transcript boundary.
+/// The renderer retains this cursor after the corresponding rows enter native
+/// scrollback, then asks the component to map it into each new physical layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CommitCursor {
+    pub generation: u64,
+    pub block: u64,
+    pub segment: u64,
+}
+
+/// A semantic commit cursor and its exclusive visual-row boundary in the
+/// current frame layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitPosition {
+    pub cursor: CommitCursor,
+    pub row: usize,
+}
+
+/// Commit handshake for the native-scrollback renderer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedFrame {
+    /// Semantic timeline containing this frame.
+    pub generation: u64,
+    /// Current-layout position of the cursor supplied to
+    /// [`Component::render_update_with_cursor`].
+    pub acknowledged: Option<CommitPosition>,
+    /// Furthest finalized boundary that may enter scrollback this frame.
+    pub target: Option<CommitPosition>,
+}
+
 /// A lazy replacement for the mutable tail of a retained frame. Lines before
 /// `stable_prefix` are guaranteed byte-identical to the previous frame, so the
 /// TUI can reuse them without cloning or comparing a long committed history.
@@ -30,18 +61,23 @@ pub type InputListener<'a> = Box<dyn FnMut(&str) -> Option<String> + 'a>;
 pub struct FrameUpdate {
     pub stable_prefix: usize,
     pub replacement: Vec<String>,
-    /// First logical row that may still change. Rows before this boundary may
-    /// enter native scrollback; rows at or after it remain viewport-local.
-    /// `None` keeps the generic shell-style differential renderer.
-    pub commit_boundary: Option<usize>,
+    /// Semantic commit metadata for the native-scrollback renderer. `None`
+    /// keeps the generic shell-style differential renderer.
+    pub pinned: Option<PinnedFrame>,
+    /// Complete application-owned frame to replay on a destructive resize
+    /// before the visible `replacement` is repainted. This lets a temporary
+    /// screen surface obscure transcript rows without becoming the source of
+    /// truth for rebuilt scrollback. The alternate frame must produce the same
+    /// number of off-screen rows as the displayed frame.
+    pub resize_replay: Option<Vec<String>>,
     /// The component replaced its logical timeline (for example, a resumed
     /// conversation was replaced by a new session). Repaint the visible tail
     /// from the top of the terminal so later fixed-height chrome remains
     /// anchored to the physical bottom row.
     pub reanchor_viewport: bool,
-    /// The presentation of committed rows changed. Clear terminal-owned
-    /// scrollback and replay the retained logical frame once so scrolling
-    /// cannot reveal stale or duplicate renderings from the previous theme.
+    /// The presentation of committed rows changed. Generic inline frames may
+    /// rebuild retained history; pinned frames preserve history and repaint
+    /// only their live suffix.
     pub rebuild_scrollback: bool,
 }
 
@@ -117,6 +153,17 @@ pub trait Component {
         None
     }
 
+    /// Render a lazy update while mapping the native-scrollback commit cursor
+    /// retained by the TUI. Components without semantic commit points can keep
+    /// implementing [`Component::render_update`].
+    fn render_update_with_cursor(
+        &self,
+        width: u16,
+        _cursor: Option<CommitCursor>,
+    ) -> Option<FrameUpdate> {
+        self.render_update(width)
+    }
+
     /// Handle keyboard input when component has focus.
     fn handle_input(&mut self, _data: &str) {}
 
@@ -182,9 +229,9 @@ impl Container {
         self.focused_child.and_then(|i| self.children.get_mut(i))
     }
 
-    fn render_update(&self, width: u16) -> Option<FrameUpdate> {
+    fn render_update(&self, width: u16, cursor: Option<CommitCursor>) -> Option<FrameUpdate> {
         (self.children.len() == 1)
-            .then(|| self.children[0].render_update(width))
+            .then(|| self.children[0].render_update_with_cursor(width, cursor))
             .flatten()
     }
 }
@@ -415,9 +462,21 @@ pub struct TUI<'a> {
     /// can sit above the bottom row; every inline repaint derives its cursor
     /// addressing from this anchor rather than assuming a bottom-aligned tail.
     inline_bottom_row: usize,
-    /// Rows physically appended to native scrollback by the pinned live-region
-    /// renderer. They are immutable and are never painted into the grid again.
+    /// Current-layout prefix already represented in terminal-owned history.
+    /// Normally this equals the semantic commit row. A destructive replay can
+    /// also place provisional rows there, so it is tracked independently to
+    /// prevent a later semantic acknowledgement from appending them twice.
+    inline_history_rows: usize,
+    /// Current-layout row corresponding to `inline_commit_cursor`. This is
+    /// remapped from semantic identity on every update and is never reused
+    /// across a width change.
     inline_committed_rows: usize,
+    /// Last semantic boundary physically appended to native scrollback.
+    inline_commit_cursor: Option<CommitCursor>,
+    /// Semantic timeline owning the current replay/commit ledger. This remains
+    /// known after a destructive replay even though its commit cursor is reset,
+    /// so an immediate session replacement cannot inherit the old row seam.
+    inline_generation: Option<u64>,
     /// First logical row represented by grid row zero in pinned mode.
     inline_window_top: usize,
     /// Nested renderer helpers share one synchronized-output transaction so
@@ -441,7 +500,10 @@ impl<'a> TUI<'a> {
             input_listeners: Vec::new(),
             inline_scrollback: false,
             inline_bottom_row: 0,
+            inline_history_rows: 0,
             inline_committed_rows: 0,
+            inline_commit_cursor: None,
+            inline_generation: None,
             inline_window_top: 0,
             synchronized_output_depth: 0,
         }
@@ -645,6 +707,17 @@ impl<'a> TUI<'a> {
             .previous_size
             .is_some_and(|(previous_width, _)| previous_width != width);
 
+        let reset_scrollback_on_resize = size_changed
+            && self.inline_scrollback
+            && self.capabilities.cursor_addressing
+            && self.capabilities.line_clearing;
+        let render_commit_cursor = if reset_scrollback_on_resize {
+            // The old cursor described history that the resize reset replaces.
+            // Ask the component for a fresh boundary in the new layout.
+            None
+        } else {
+            self.inline_commit_cursor
+        };
         let lazy_update = (self
             .overlays
             .iter()
@@ -653,35 +726,58 @@ impl<'a> TUI<'a> {
                 || (self.inline_scrollback
                     && self.capabilities.cursor_addressing
                     && self.capabilities.line_clearing)))
-            .then(|| self.root.render_update(width))
+            .then(|| self.root.render_update(width, render_commit_cursor))
             .flatten();
         let previous_len = self.previous_frame.len();
+        let previous_frame_has_image = self.previous_frame.iter().any(|line| is_image_line(line));
         // A prefix beyond the retained frame cannot be validated. Fall back to
         // the component's full renderer rather than pairing its replacement
         // with the wrong historic rows. Width reflow likewise requires a full
         // replacement, but retaining a zero-prefix update preserves pinned
         // viewport metadata across both width and height changes.
-        let lazy_update = lazy_update.filter(|update| {
+        let mut lazy_update = lazy_update.filter(|update| {
             update.stable_prefix <= previous_len && (!width_changed || update.stable_prefix == 0)
         });
+        let resize_replay = lazy_update
+            .as_mut()
+            .and_then(|update| update.resize_replay.take())
+            .map(|lines| {
+                let mut lines = lines
+                    .into_iter()
+                    .map(|line| self.prepare_line(line, width))
+                    .collect::<Vec<_>>();
+                let _ = extract_cursor_position(&mut lines, height);
+                if !self.capabilities.plain {
+                    for line in &mut lines {
+                        line.push_str("\x1b[0m\x1b]8;;\x1b\\");
+                    }
+                }
+                lines
+            });
         let reanchor_viewport = lazy_update
             .as_ref()
             .is_some_and(|update| update.reanchor_viewport);
         let rebuild_scrollback = lazy_update
             .as_ref()
             .is_some_and(|update| update.rebuild_scrollback);
-        let commit_boundary = lazy_update
-            .as_ref()
-            .and_then(|update| update.commit_boundary);
+        let pinned = lazy_update.as_ref().and_then(|update| update.pinned);
         // Lazy frame assembly reuses `previous_frame` with `mem::take` below.
         // Preserve only the old physical viewport needed by pinned diffing;
         // cloning the complete retained transcript would defeat lazy updates.
-        let pinned_previous_window = commit_boundary.map_or_else(Vec::new, |_| {
-            self.previous_frame
-                .iter()
-                .skip(self.inline_window_top)
-                .take(usize::from(height.max(1)))
-                .cloned()
+        let pinned_previous_window = pinned.map_or_else(Vec::new, |_| {
+            let rows = usize::from(height.max(1));
+            (0..rows)
+                .map(|screen_row| {
+                    let logical_row = self.inline_window_top.saturating_add(screen_row);
+                    if logical_row < self.inline_history_rows {
+                        String::new()
+                    } else {
+                        self.previous_frame
+                            .get(logical_row)
+                            .cloned()
+                            .unwrap_or_default()
+                    }
+                })
                 .collect()
         });
         let mut first_changed_hint = None;
@@ -748,10 +844,9 @@ impl<'a> TUI<'a> {
         // a transient hollow cursor in the terminal's bottom-right cell.
         self.begin_synchronized_output();
 
-        // A terminal reflows the old frame before delivering its resize event.
-        // Cursor-relative differential updates are therefore invalid even when
-        // the logical line count did not change; re-anchor and repaint the
-        // visible grid without rewriting terminal-owned history.
+        // A terminal reflows the old grid and saved lines before delivering
+        // its resize event. Rebuilding Ygg-owned history below avoids trying to
+        // repair terminal-dependent physical rows after that reflow.
         if self.capabilities.plain {
             self.write_plain_changes(&new_lines, first_changed_hint, previous_len);
             self.first_render = false;
@@ -765,11 +860,13 @@ impl<'a> TUI<'a> {
                 size_changed,
                 reanchor_viewport,
                 rebuild_scrollback,
-                commit_boundary,
+                pinned,
                 &pinned_previous_window,
                 first_changed_hint,
                 previous_len,
+                previous_frame_has_image,
                 lazy_change_hints.as_ref(),
+                resize_replay.as_deref(),
             );
             self.first_render = false;
         } else if self.first_render {
@@ -868,26 +965,65 @@ impl<'a> TUI<'a> {
         size_changed: bool,
         reanchor_viewport: bool,
         rebuild_scrollback: bool,
-        commit_boundary: Option<usize>,
+        pinned: Option<PinnedFrame>,
         pinned_previous_window: &[String],
         first_changed_hint: Option<usize>,
         previous_len: usize,
+        previous_frame_has_image: bool,
         frame_change_hints: Option<&FrameChangeHints>,
+        resize_replay: Option<&[String]>,
     ) {
         let rows = usize::from(height.max(1));
-        if let Some(boundary) = commit_boundary {
-            let boundary = boundary.min(new_lines.len());
-            if rebuild_scrollback {
-                self.rebuild_inline_pinned_scrollback(new_lines, rows, boundary);
-            } else {
-                self.write_inline_pinned(
-                    new_lines,
-                    rows,
-                    boundary,
-                    size_changed || reanchor_viewport,
-                    pinned_previous_window,
-                );
+        if size_changed && !self.first_render {
+            // Modern terminals reflow both the grid and saved lines before the
+            // application observes a resize. Physical-row repair cannot be
+            // made terminal-independent, so discard that presentation and
+            // replay the complete application-owned tape. A temporary screen
+            // surface may provide the unobscured tape, then repaint its visible
+            // frame without scrolling any additional rows.
+            let displayed_window_top = new_lines.len().saturating_sub(rows);
+            let replay = resize_replay.filter(|replay| {
+                replay.len().saturating_sub(rows) == displayed_window_top
+                    && !replay
+                        .iter()
+                        .chain(new_lines)
+                        .any(|line| is_image_line(line))
+            });
+            self.reset_inline_scrollback(
+                replay.unwrap_or(new_lines),
+                rows,
+                previous_frame_has_image,
+            );
+            self.inline_generation = pinned.map(|frame| frame.generation);
+            if replay.is_some() {
+                self.terminal.write("\x1b[H");
+                let visible = &new_lines[displayed_window_top..];
+                for (index, line) in visible.iter().enumerate() {
+                    self.terminal.clear_line();
+                    self.terminal.write(line);
+                    if index + 1 < visible.len() {
+                        self.terminal.write("\n");
+                    }
+                }
+                for row in visible.len()..rows {
+                    self.terminal
+                        .write(&format!("\x1b[{};1H", row.saturating_add(1)));
+                    self.terminal.clear_line();
+                }
+                self.inline_history_rows = displayed_window_top;
+                self.inline_window_top = displayed_window_top;
+                self.inline_bottom_row = visible.len().saturating_sub(1);
             }
+            return;
+        }
+        if let Some(pinned) = pinned {
+            self.write_inline_pinned(
+                new_lines,
+                rows,
+                pinned,
+                reanchor_viewport || rebuild_scrollback,
+                pinned_previous_window,
+            );
             return;
         }
         if self.first_render {
@@ -913,14 +1049,14 @@ impl<'a> TUI<'a> {
             // erase saved lines, then replay the retained frame exactly once.
             // The renderer thread owns this bounded-by-retained-state write;
             // ordinary streaming/status updates continue to use lazy tails.
-            self.rebuild_inline_scrollback(new_lines, rows);
+            self.reset_inline_scrollback(new_lines, rows, previous_frame_has_image);
             return;
         }
 
         let prev_len = previous_len;
         // Frame lines currently on screen span [visible_start, prev_len).
         let visible_start = prev_len.saturating_sub(self.inline_bottom_row + 1);
-        if reanchor_viewport || size_changed || prev_len == 0 || new_lines.len() <= visible_start {
+        if reanchor_viewport || prev_len == 0 || new_lines.len() <= visible_start {
             // Reflow, an explicit logical-timeline replacement, or a frame
             // shrink past the on-screen region invalidates every row
             // assumption. Repaint the visible tail from home; history above
@@ -1122,42 +1258,96 @@ impl<'a> TUI<'a> {
         };
     }
 
-    /// Append-only native-scrollback renderer for a frame with an explicit
-    /// live-region seam. Only finalized rows before `commit_boundary` may
-    /// scroll off the grid. The mutable suffix is always repainted in place,
-    /// so provisional Markdown layouts can never become duplicate history.
+    /// Append-only native-scrollback renderer for a frame with semantic commit
+    /// points. The acknowledged cursor is remapped into the current width, so
+    /// no physical row coordinate survives terminal reflow. The mutable grid
+    /// always starts at or after the committed seam.
     fn write_inline_pinned(
         &mut self,
         new_lines: &[String],
         rows: usize,
-        commit_boundary: usize,
-        reanchor: bool,
+        pinned: PinnedFrame,
+        mut reanchor: bool,
         previous_window: &[String],
     ) {
-        if reanchor
-            && (new_lines.len() <= self.inline_committed_rows
-                || commit_boundary < self.inline_committed_rows)
-        {
-            // A shorter replacement timeline cannot share row coordinates
-            // with the old tape. Preserve old history, but restart the ledger
-            // for the new frame instead of pinning its window beyond EOF.
-            self.inline_committed_rows = 0;
-            self.inline_window_top = 0;
-        }
         let desired_window_top = new_lines.len().saturating_sub(rows);
-        let commit_target = commit_boundary
-            .min(desired_window_top)
-            .max(self.inline_committed_rows);
-        // The commit ledger is monotonic because terminal-owned history cannot
-        // be pulled back onto the grid. The viewport is not: final Markdown
-        // parsing and shrinking chrome can move its logical top backward.
-        // Keeping the two coordinates coupled omits rows from the new viewport,
-        // paints the composer too high, and leaves stale transcript/chrome
-        // beneath it. Repaint the actual bottom-aligned window while retaining
-        // the higher ledger so those historic rows are never committed twice.
+        let same_generation = self
+            .inline_generation
+            .or_else(|| self.inline_commit_cursor.map(|cursor| cursor.generation))
+            .is_none_or(|generation| generation == pinned.generation);
+        if !same_generation {
+            // A replacement timeline starts a new append-only tape after the
+            // old terminal-owned history. Its row zero is unrelated to the old
+            // cursor, but the old history itself remains untouched.
+            self.inline_commit_cursor = None;
+            self.inline_history_rows = 0;
+            reanchor = true;
+        }
+
+        let acknowledged = self.inline_commit_cursor.and_then(|cursor| {
+            pinned
+                .acknowledged
+                .filter(|position| position.cursor == cursor)
+        });
+        let cursor_unmapped = self.inline_commit_cursor.is_some() && acknowledged.is_none();
+        debug_assert!(
+            !cursor_unmapped,
+            "component did not map the retained semantic commit cursor"
+        );
+
+        // Missing acknowledgement is an invalid component response. Freeze the
+        // tape and keep a usable visible tail rather than replaying any prefix.
+        let mut commit_row = acknowledged
+            .map(|position| position.row.min(new_lines.len()))
+            .unwrap_or_else(|| {
+                if self.inline_commit_cursor.is_some() {
+                    reanchor = true;
+                    desired_window_top
+                } else {
+                    0
+                }
+            });
+        let mut commit_cursor = self.inline_commit_cursor;
+        let mut commit_advanced = false;
+        if acknowledged.is_some() || commit_cursor.is_none() {
+            if let Some(target) = pinned.target.filter(|target| {
+                target.cursor.generation == pinned.generation
+                    && target.row >= commit_row
+                    && target.row <= desired_window_top
+                    && commit_cursor.is_none_or(|cursor| target.cursor > cursor)
+            }) {
+                commit_row = target.row;
+                commit_cursor = Some(target.cursor);
+                // A destructive replay can already have placed this boundary
+                // in terminal history. Advance semantic identity without
+                // repainting the unchanged live window in that case.
+                commit_advanced = target.row > self.inline_history_rows;
+            }
+        }
+
+        let commit_start = acknowledged
+            .map_or_else(
+                || if cursor_unmapped { commit_row } else { 0 },
+                |position| position.row,
+            )
+            .max(self.inline_history_rows)
+            .min(commit_row);
+        let committed =
+            &new_lines[commit_start.min(new_lines.len())..commit_row.min(new_lines.len())];
+        let history_rows = self.inline_history_rows.max(commit_row);
+        // A shrinking frame can move its bottom-aligned viewport above the
+        // immutable seam. Keep that physical alignment, but represent rows
+        // before the seam as empty cells instead of repainting terminal-owned
+        // content back into the grid.
         let window_top = desired_window_top;
-        let window = &new_lines[window_top.min(new_lines.len())..];
-        let commit_advanced = commit_target > self.inline_committed_rows;
+        let window_line = |screen_row: usize| {
+            let logical_row = window_top.saturating_add(screen_row);
+            (logical_row >= history_rows)
+                .then(|| new_lines.get(logical_row))
+                .flatten()
+                .map(String::as_str)
+                .unwrap_or("")
+        };
 
         self.begin_synchronized_output();
         if self.first_render {
@@ -1167,92 +1357,59 @@ impl<'a> TUI<'a> {
         }
 
         if self.first_render || reanchor || commit_advanced {
-            // Rebuild only the grid. When the commit boundary advances, write
-            // exactly the newly-final chunk before the next window; natural
-            // scrolling moves that chunk, and only that chunk, into history.
             self.terminal.write("\x1b[H");
             if self.first_render {
                 self.terminal.clear_screen();
                 self.terminal.write("\x1b[H");
             }
-            // Reanchors erase every addressed row below. Avoid ED 2 here:
-            // tmux preserves cells erased by a clear-screen operation in its
-            // native history, which would commit the mutable composer once per
-            // theme or session transition.
-            let committed = &new_lines[self.inline_committed_rows.min(new_lines.len())
-                ..commit_target.min(new_lines.len())];
-            let paint = committed.iter().chain(window.iter()).collect::<Vec<_>>();
-            for (index, line) in paint.iter().enumerate() {
+
+            // Paint the new semantic chunk followed by exactly one complete
+            // grid. The trailing live window and blank padding push every new
+            // committed row into history while no mutable row is appended.
+            let paint_len = committed.len().saturating_add(rows);
+            for index in 0..paint_len {
+                let line = if index < committed.len() {
+                    committed[index].as_str()
+                } else {
+                    window_line(index - committed.len())
+                };
                 self.terminal.clear_line();
                 self.terminal.write(line);
-                if index + 1 < paint.len() {
+                if index + 1 < paint_len {
                     self.terminal.write("\r\n");
                 }
-            }
-            for row in window.len()..rows {
-                self.terminal
-                    .write(&format!("\x1b[{};1H", row.saturating_add(1)));
-                self.terminal.clear_line();
             }
         } else {
             // Ordinary token ticks never scroll. Compare the old and new
             // logical rows occupying each physical screen row. The caller
             // snapshots this small old window before lazy frame reuse.
-            let previous_window_len = previous_window.len().min(rows);
-            for screen_row in 0..window.len().max(previous_window_len) {
-                let previous = previous_window.get(screen_row);
-                let next = window.get(screen_row);
+            for screen_row in 0..rows {
+                let previous = previous_window
+                    .get(screen_row)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let next = window_line(screen_row);
                 if previous == next {
                     continue;
                 }
                 self.terminal
                     .write(&format!("\x1b[{};1H", screen_row.saturating_add(1)));
                 self.terminal.clear_line();
-                if let Some(line) = next {
-                    self.terminal.write(line);
-                }
+                self.terminal.write(next);
             }
         }
         self.end_synchronized_output();
 
-        self.inline_committed_rows = commit_target;
+        self.inline_history_rows = history_rows;
+        self.inline_committed_rows = commit_row;
+        self.inline_commit_cursor = commit_cursor;
+        self.inline_generation = Some(pinned.generation);
         self.inline_window_top = window_top;
-        self.inline_bottom_row = window.len().saturating_sub(1).min(rows.saturating_sub(1));
-    }
-
-    fn rebuild_inline_pinned_scrollback(
-        &mut self,
-        new_lines: &[String],
-        rows: usize,
-        commit_boundary: usize,
-    ) {
-        let window_top = new_lines.len().saturating_sub(rows);
-        let commit_target = commit_boundary.min(window_top);
-        let committed = &new_lines[..commit_target];
-        let window = &new_lines[window_top..];
-
-        self.begin_synchronized_output();
-        if self.previous_frame.iter().any(|line| is_image_line(line))
-            || new_lines.iter().any(|line| is_image_line(line))
-        {
-            self.terminal.write(&delete_all_kitty_images());
-        }
-        self.terminal.write("\x1b[H");
-        self.terminal.clear_screen();
-        self.terminal.write("\x1b[3J");
-        self.terminal.write("\x1b[H");
-        let paint = committed.iter().chain(window.iter()).collect::<Vec<_>>();
-        for (index, line) in paint.iter().enumerate() {
-            self.terminal.write(line);
-            if index + 1 < paint.len() {
-                self.terminal.write("\n");
-            }
-        }
-        self.end_synchronized_output();
-
-        self.inline_committed_rows = commit_target;
-        self.inline_window_top = window_top;
-        self.inline_bottom_row = window.len().saturating_sub(1).min(rows.saturating_sub(1));
+        self.inline_bottom_row = new_lines
+            .len()
+            .saturating_sub(window_top)
+            .saturating_sub(1)
+            .min(rows.saturating_sub(1));
     }
 
     fn repaint_inline_visible_rows(&mut self, new_lines: &[String], rows: usize) {
@@ -1295,25 +1452,39 @@ impl<'a> TUI<'a> {
         self.end_synchronized_output();
     }
 
-    fn rebuild_inline_scrollback(&mut self, new_lines: &[String], rows: usize) {
+    /// Destructively replace terminal-owned history after a resize or an
+    /// explicit generic presentation rebuild.
+    fn reset_inline_scrollback(
+        &mut self,
+        new_lines: &[String],
+        rows: usize,
+        previous_frame_has_image: bool,
+    ) {
+        let window_top = new_lines.len().saturating_sub(rows);
+        let delete_images =
+            previous_frame_has_image || new_lines.iter().any(|line| is_image_line(line));
+
         self.begin_synchronized_output();
-        if self.previous_frame.iter().any(|line| is_image_line(line))
-            || new_lines.iter().any(|line| is_image_line(line))
-        {
-            self.terminal.write(&delete_all_kitty_images());
-        }
-        self.terminal.write("\x1b[H");
-        self.terminal.clear_screen();
-        self.terminal.write("\x1b[3J");
-        self.terminal.write("\x1b[H");
-        for (index, line) in new_lines.iter().enumerate() {
-            self.terminal.write(line);
-            if index + 1 < new_lines.len() {
-                self.terminal.write("\n");
-            }
-        }
+        reset_and_replay(
+            self.terminal.as_mut(),
+            delete_images,
+            new_lines.iter().map(String::as_str),
+        );
         self.end_synchronized_output();
-        self.inline_bottom_row = new_lines.len().min(rows).saturating_sub(1);
+
+        // The old semantic cursor referred to the discarded presentation.
+        // The next frame negotiates a fresh cursor while `inline_history_rows`
+        // prevents that acknowledgement from duplicating replayed rows.
+        self.inline_history_rows = window_top;
+        self.inline_committed_rows = 0;
+        self.inline_commit_cursor = None;
+        self.inline_generation = None;
+        self.inline_window_top = window_top;
+        self.inline_bottom_row = new_lines
+            .len()
+            .saturating_sub(window_top)
+            .saturating_sub(1)
+            .min(rows.saturating_sub(1));
     }
 
     fn redraw_all_from_home(&mut self, lines: &[String]) {
@@ -1713,6 +1884,28 @@ mod tests {
         )
     }
 
+    fn test_commit_position(row: usize) -> CommitPosition {
+        CommitPosition {
+            cursor: CommitCursor {
+                generation: 0,
+                block: row as u64,
+                segment: 0,
+            },
+            row,
+        }
+    }
+
+    fn test_pinned_frame(acknowledged: Option<CommitCursor>, target: Option<usize>) -> PinnedFrame {
+        PinnedFrame {
+            generation: 0,
+            acknowledged: acknowledged.map(|cursor| CommitPosition {
+                row: cursor.block as usize,
+                cursor,
+            }),
+            target: target.map(test_commit_position),
+        }
+    }
+
     struct OneLine;
 
     impl Component for OneLine {
@@ -1751,7 +1944,8 @@ mod tests {
             Some(FrameUpdate {
                 stable_prefix: self.stable_prefix,
                 replacement: vec![self.tail.borrow().clone()],
-                commit_boundary: None,
+                pinned: None,
+                resize_replay: None,
                 reanchor_viewport: false,
                 rebuild_scrollback: false,
             })
@@ -1773,7 +1967,32 @@ mod tests {
             Some(FrameUpdate {
                 stable_prefix: 0,
                 replacement: self.lines.borrow().clone(),
-                commit_boundary: None,
+                pinned: None,
+                resize_replay: None,
+                reanchor_viewport: false,
+                rebuild_scrollback: false,
+            })
+        }
+
+        fn invalidate(&mut self) {}
+    }
+
+    struct LazyObscuredLines {
+        displayed: Rc<RefCell<Vec<String>>>,
+        replay: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Component for LazyObscuredLines {
+        fn render(&self, _width: u16) -> Vec<String> {
+            panic!("lazy obscured updates must not invoke the full renderer")
+        }
+
+        fn render_update(&self, _width: u16) -> Option<FrameUpdate> {
+            Some(FrameUpdate {
+                stable_prefix: 0,
+                replacement: self.displayed.borrow().clone(),
+                pinned: None,
+                resize_replay: Some(self.replay.borrow().clone()),
                 reanchor_viewport: false,
                 rebuild_scrollback: false,
             })
@@ -1792,11 +2011,24 @@ mod tests {
             self.lines.borrow().clone()
         }
 
-        fn render_update(&self, _width: u16) -> Option<FrameUpdate> {
+        fn render_update(&self, width: u16) -> Option<FrameUpdate> {
+            self.render_update_with_cursor(width, None)
+        }
+
+        fn render_update_with_cursor(
+            &self,
+            _width: u16,
+            cursor: Option<CommitCursor>,
+        ) -> Option<FrameUpdate> {
+            let boundary = self.commit_boundary.get();
             Some(FrameUpdate {
                 stable_prefix: 0,
                 replacement: self.lines.borrow().clone(),
-                commit_boundary: Some(self.commit_boundary.get()),
+                pinned: Some(test_pinned_frame(
+                    cursor,
+                    (boundary > 0).then_some(boundary),
+                )),
+                resize_replay: None,
                 reanchor_viewport: false,
                 rebuild_scrollback: false,
             })
@@ -1820,7 +2052,8 @@ mod tests {
             Some(FrameUpdate {
                 stable_prefix: 0,
                 replacement: self.lines.borrow().clone(),
-                commit_boundary: None,
+                pinned: None,
+                resize_replay: None,
                 reanchor_viewport: self.reanchor.replace(false),
                 rebuild_scrollback: self.rebuild_scrollback.replace(false),
             })
@@ -1858,7 +2091,13 @@ mod tests {
         .map(str::to_owned)
         .collect::<Vec<_>>();
         let previous_window = tui.previous_frame[2..].to_vec();
-        tui.write_inline_pinned(&shifted, 3, 0, false, &previous_window);
+        tui.write_inline_pinned(
+            &shifted,
+            3,
+            test_pinned_frame(None, None),
+            false,
+            &previous_window,
+        );
 
         assert!(
             writes.borrow().is_empty(),
@@ -1868,7 +2107,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_window_shrink_repaints_from_the_new_viewport_top() {
+    fn pinned_window_shrink_never_repaints_before_committed_seam() {
         let size = Rc::new(Cell::new((40, 4)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
@@ -1891,13 +2130,14 @@ mod tests {
         .map(str::to_owned)
         .collect();
         tui.inline_committed_rows = 4;
+        tui.inline_commit_cursor = Some(test_commit_position(4).cursor);
         tui.inline_window_top = 4;
         tui.inline_bottom_row = 3;
 
         // Finalizing streamed Markdown can reduce the logical row count after
         // rows above the old viewport have already entered native scrollback.
-        // The new grid must still begin at its actual bottom-aligned viewport
-        // top; the committed-row ledger is not a lower bound for that top.
+        // The new bottom-aligned top would retreat to row three, but that row
+        // is already terminal-owned and must never be painted into the grid.
         let shrunk = [
             "settled 0",
             "settled 1",
@@ -1911,13 +2151,67 @@ mod tests {
         .map(str::to_owned)
         .collect::<Vec<_>>();
         let previous_window = tui.previous_frame[4..].to_vec();
-        tui.write_inline_pinned(&shrunk, 4, 7, false, &previous_window);
+        let cursor = tui.inline_commit_cursor;
+        tui.write_inline_pinned(
+            &shrunk,
+            4,
+            test_pinned_frame(cursor, Some(7)),
+            false,
+            &previous_window,
+        );
 
         let output = writes.borrow().join("");
-        assert!(output.contains("new visible 3"), "{output:?}");
+        assert!(!output.contains("new visible 3"), "{output:?}");
+        assert!(output.contains("new visible 4"), "{output:?}");
         assert_eq!(tui.inline_committed_rows, 4);
         assert_eq!(tui.inline_window_top, 3);
         assert_eq!(tui.inline_bottom_row, 3);
+    }
+
+    #[test]
+    fn generation_change_after_resize_does_not_inherit_the_replayed_row_seam() {
+        let size = Rc::new(Cell::new((40, 3)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            false,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.first_render = false;
+        tui.previous_frame = ["old 0", "old 1", "old 2"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        // A destructive replay knows its timeline even though it deliberately
+        // clears the semantic commit cursor until the next handshake.
+        tui.inline_generation = Some(7);
+        tui.inline_history_rows = 3;
+        tui.inline_commit_cursor = None;
+        tui.inline_window_top = 0;
+        tui.inline_bottom_row = 2;
+
+        let replacement = ["new 0", "new 1", "new 2"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let previous_window = tui.previous_frame.clone();
+        tui.write_inline_pinned(
+            &replacement,
+            3,
+            PinnedFrame {
+                generation: 8,
+                acknowledged: None,
+                target: None,
+            },
+            false,
+            &previous_window,
+        );
+
+        let output = writes.borrow().join("");
+        assert!(output.contains("new 0"), "{output:?}");
+        assert!(output.contains("new 2"), "{output:?}");
+        assert_eq!(tui.inline_history_rows, 0);
+        assert_eq!(tui.inline_generation, Some(8));
     }
 
     #[test]
@@ -1942,7 +2236,13 @@ mod tests {
             .collect::<Vec<_>>();
         let previous_window = tui.previous_frame.clone();
 
-        tui.write_inline_pinned(&shorter, 3, 0, false, &previous_window);
+        tui.write_inline_pinned(
+            &shorter,
+            3,
+            test_pinned_frame(None, None),
+            false,
+            &previous_window,
+        );
 
         let output = writes.borrow().join("");
         assert!(
@@ -1974,7 +2274,13 @@ mod tests {
             .collect::<Vec<_>>();
         let previous_window = tui.previous_frame.clone();
 
-        tui.write_inline_pinned(&replacement, 3, 0, true, &previous_window);
+        tui.write_inline_pinned(
+            &replacement,
+            3,
+            test_pinned_frame(None, None),
+            true,
+            &previous_window,
+        );
 
         assert_eq!(
             clears.get(),
@@ -1988,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_presentation_rebuild_commits_only_rows_before_the_boundary() {
+    fn pinned_presentation_reset_preserves_history_without_replay() {
         let size = Rc::new(Cell::new((40, 4)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
@@ -1998,6 +2304,9 @@ mod tests {
         let mut tui = TUI::new(Box::new(terminal));
         tui.first_render = false;
         tui.previous_frame = vec!["old presentation".to_owned()];
+        tui.inline_commit_cursor = Some(test_commit_position(2).cursor);
+        tui.inline_committed_rows = 2;
+        tui.inline_window_top = 4;
         let replacement = [
             "settled 0",
             "settled 1",
@@ -2011,15 +2320,17 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+        let cursor = tui.inline_commit_cursor;
 
-        tui.rebuild_inline_pinned_scrollback(&replacement, 4, 2);
+        tui.write_inline_pinned(&replacement, 4, test_pinned_frame(cursor, None), true, &[]);
 
         let output = writes.borrow().join("");
-        assert!(output.contains("\x1b[3J"), "{output:?}");
-        assert!(output.contains("settled 0"), "{output:?}");
-        assert!(output.contains("settled 1"), "{output:?}");
+        assert!(!output.contains("\x1b[3J"), "{output:?}");
+        assert!(!output.contains("settled 0"), "{output:?}");
+        assert!(!output.contains("settled 1"), "{output:?}");
         assert!(!output.contains("mutable omitted 2"), "{output:?}");
         assert!(!output.contains("mutable omitted 3"), "{output:?}");
+        assert!(output.contains("mutable visible 4"), "{output:?}");
         assert!(output.contains("composer"), "{output:?}");
         assert_eq!(tui.inline_committed_rows, 2);
         assert_eq!(tui.inline_window_top, 4);
@@ -2167,7 +2478,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_resize_deletes_kitty_placements_before_repainting_plain_rows() {
+    fn inline_resize_deletes_kitty_placements_before_destructive_replay() {
         const RESET: &str = "\x1b[0m\x1b]8;;\x1b\\";
         const KITTY_IMAGE: &str = "\x1b_Ga=T,f=100,i=2,s=1,v=1,c=1,r=1;AAAA\x1b\\";
         let size = Rc::new(Cell::new((41, 4)));
@@ -2204,14 +2515,10 @@ mod tests {
             .find("resized plain row")
             .expect("resized replacement row was painted");
         assert!(delete_at < replacement_at, "{output:?}");
-        assert_eq!(
-            clears.get(),
-            0,
-            "inline resize must not clear the grid or native history"
-        );
+        assert_eq!(clears.get(), 1, "resize must clear the reflowed grid");
         assert!(
-            !output.contains("\x1b[3J"),
-            "inline resize must preserve saved scrollback: {output:?}"
+            output.contains("\x1b[H\x1b[3J"),
+            "resize must discard terminal-owned saved lines: {output:?}"
         );
     }
 
@@ -2700,7 +3007,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_scrollback_resize_repaints_only_the_visible_tail() {
+    fn inline_scrollback_resize_destructively_replays_the_complete_frame() {
         let size = Rc::new(Cell::new((20, 3)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
@@ -2725,29 +3032,86 @@ mod tests {
             .borrow()
             .join("")
             .replace("\u{1b}[0m\u{1b}]8;;\u{1b}\\", "");
-        assert_eq!(
-            clears.get(),
-            clears_before,
-            "inline resize must preserve terminal-owned history"
-        );
+        assert_eq!(clears.get(), clears_before + 1);
         assert!(
-            !repaint.contains("\x1b[3J"),
-            "ordinary resize must never clear saved scrollback: {repaint:?}"
+            repaint.contains("\x1b[H\x1b[3J"),
+            "resize did not clear saved lines: {repaint:?}"
         );
-        assert!(
-            repaint.contains("row 2\nrow 3\nrow 4\nrow 5"),
-            "{repaint:?}"
-        );
-        assert!(!repaint.contains("row 1"), "{repaint:?}");
+        for index in 0..6 {
+            assert_eq!(
+                repaint.matches(&format!("row {index}")).count(),
+                1,
+                "row {index} was not replayed exactly once: {repaint:?}"
+            );
+        }
+        assert_eq!(tui.inline_window_top, 2);
     }
 
     #[test]
-    fn pinned_resize_updates_the_window_origin_before_the_next_diff() {
-        let size = Rc::new(Cell::new((30, 4)));
+    fn resize_replays_an_unobscured_frame_before_repainting_its_screen_surface() {
+        let size = Rc::new(Cell::new((20, 3)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
             true,
         );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size.clone(), capabilities);
+        let displayed = Rc::new(RefCell::new(
+            ["owned 0", "owned 1", "overlay 0", "overlay 1", "overlay 2"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        ));
+        let replay = Rc::new(RefCell::new(
+            ["owned 0", "owned 1", "owned 2", "owned 3", "owned 4"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        ));
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.set_inline_scrollback(true);
+        tui.add_child(Box::new(LazyObscuredLines { displayed, replay }));
+        tui.start();
+
+        writes.borrow_mut().clear();
+        size.set((30, 3));
+        tui.request_render();
+        let output = writes.borrow().join("");
+        let clear_saved = output.find("\x1b[3J").expect("saved-line clear");
+        let owned_tail = output.find("owned 4").expect("unobscured replay tail");
+        let overlay = output.rfind("overlay 0").expect("screen-surface repaint");
+        assert!(
+            clear_saved < owned_tail && owned_tail < overlay,
+            "{output:?}"
+        );
+        for index in 0..5 {
+            assert_eq!(
+                output.matches(&format!("owned {index}")).count(),
+                1,
+                "owned row {index} was not replayed exactly once: {output:?}"
+            );
+        }
+        for index in 0..3 {
+            assert_eq!(
+                output.matches(&format!("overlay {index}")).count(),
+                1,
+                "overlay row {index} was not repainted exactly once: {output:?}"
+            );
+        }
+        assert_eq!(tui.inline_window_top, 2);
+    }
+
+    #[test]
+    fn pinned_resize_resets_scrollback_and_updates_the_next_diff_origin() {
+        const KITTY_IMAGE: &str = "\x1b_Ga=T,f=100,i=9,s=1,v=1,c=1,r=1;AAAA\x1b\\";
+        let size = Rc::new(Cell::new((30, 4)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        )
+        .with_overrides(&crate::capabilities::CapabilityOverrides {
+            synchronized_output: Some(true),
+            ..crate::capabilities::CapabilityOverrides::default()
+        });
         let (terminal, clears, _, _, _, writes) = recording_terminal(size.clone(), capabilities);
         let mut initial_lines = [
             "history 0",
@@ -2762,39 +3126,58 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+        initial_lines[1].push_str(KITTY_IMAGE);
         initial_lines[6].push_str(CURSOR_MARKER);
         let lines = Rc::new(RefCell::new(initial_lines));
         let mut tui = TUI::new(Box::new(terminal));
         tui.set_inline_scrollback(true);
         tui.add_child(Box::new(LazyPinnedLines {
             lines: lines.clone(),
-            commit_boundary: Rc::new(Cell::new(8)),
+            commit_boundary: Rc::new(Cell::new(2)),
         }));
         tui.start();
         assert_eq!(tui.inline_window_top, 4);
         let clears_after_start = clears.get();
 
-        // Growing and widening the terminal pulls two logical rows into the
-        // viewport and invalidates wrapping. Losing pinned metadata on this
-        // repaint leaves `inline_window_top` at four, so the next composer
-        // diff is addressed two rows too high.
+        // Growing and widening the terminal invalidates both grid and saved
+        // row coordinates. The reset must replay every owned row, then retain
+        // the new window origin for the next composer-only update.
         writes.borrow_mut().clear();
         size.set((50, 6));
         tui.request_render();
         let resized = writes.borrow().join("");
         assert_eq!(tui.inline_window_top, 2);
         assert_eq!(tui.inline_bottom_row, 5);
-        assert_eq!(
-            clears.get(),
-            clears_after_start,
-            "pinned resize must preserve the grid and terminal history"
-        );
+        assert_eq!(clears.get(), clears_after_start + 1);
         assert!(
-            !resized.contains("\x1b[3J"),
-            "pinned resize must not erase saved scrollback: {resized:?}"
+            resized.contains("\x1b[H\x1b[3J"),
+            "pinned resize did not erase saved lines: {resized:?}"
         );
-        assert!(resized.contains("history 2"), "{resized:?}");
-        assert!(!resized.contains("history 1"), "{resized:?}");
+        for index in 0..=3 {
+            assert!(resized.contains(&format!("history {index}")), "{resized:?}");
+        }
+        assert!(resized.contains("visible 4"), "{resized:?}");
+        assert!(resized.contains("visible 5"), "{resized:?}");
+        let delete_at = resized
+            .find(&delete_all_kitty_images())
+            .expect("pinned resize did not delete Kitty placements");
+        let image_at = resized
+            .find(KITTY_IMAGE)
+            .expect("pinned resize did not retransmit the image");
+        let begin_at = resized
+            .find("\x1b[?2026h")
+            .expect("resize replay did not begin synchronized output");
+        let clear_saved_at = resized.find("\x1b[3J").expect("saved-line clear");
+        let end_at = resized
+            .rfind("\x1b[?2026l")
+            .expect("resize replay did not end synchronized output");
+        assert!(
+            begin_at < delete_at
+                && delete_at < clear_saved_at
+                && clear_saved_at < image_at
+                && image_at < end_at,
+            "resize replay was not one ordered synchronized transaction: {resized:?}"
+        );
         assert!(
             resized.contains("\x1b[5;15H"),
             "composer cursor must follow the resized pinned window: {resized:?}"

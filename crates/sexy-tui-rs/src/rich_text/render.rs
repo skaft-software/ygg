@@ -316,6 +316,52 @@ impl RichRenderer {
             .collect()
     }
 
+    /// Render one parser-committed block and return exclusive row boundaries
+    /// for stable semantic units within it. Lists expose item boundaries and
+    /// tables expose completed row boundaries; other blocks commit atomically.
+    pub fn render_block_with_commit_ends(
+        &self,
+        block: &Block,
+        width: u16,
+    ) -> (Vec<RenderedLine>, Vec<usize>) {
+        let width = usize::from(width);
+        let (mut rich_lines, mut ends) = match block {
+            Block::List(list) => {
+                self.render_list_with_commit_ends(list, width, self.options.syntax_highlighting)
+            }
+            Block::Table(table) if self.options.tables => {
+                self.render_table_with_commit_ends(table, width)
+            }
+            Block::Table(table) => self.render_table_fallback_with_commit_ends(table, width),
+            _ => {
+                let lines = self.render_block(block, width, self.options.syntax_highlighting);
+                let end = (!lines.is_empty())
+                    .then_some(lines.len())
+                    .into_iter()
+                    .collect();
+                (lines, end)
+            }
+        };
+        while rich_lines.last().is_some_and(RichLine::is_empty) {
+            rich_lines.pop();
+        }
+        if rich_lines.is_empty() {
+            rich_lines.push(RichLine::default());
+        }
+        for end in &mut ends {
+            *end = (*end).min(rich_lines.len());
+        }
+        ends.dedup();
+        if ends.last().copied() != Some(rich_lines.len()) {
+            ends.push(rich_lines.len());
+        }
+        let lines = rich_lines
+            .into_iter()
+            .map(|line| self.encode_line(line, width))
+            .collect();
+        (lines, ends)
+    }
+
     pub fn render_diff(
         &self,
         diff: &UnifiedDiff,
@@ -495,7 +541,18 @@ impl RichRenderer {
     }
 
     fn render_list(&self, list: &List, width: usize, syntax_highlighting: bool) -> Vec<RichLine> {
+        self.render_list_with_commit_ends(list, width, syntax_highlighting)
+            .0
+    }
+
+    fn render_list_with_commit_ends(
+        &self,
+        list: &List,
+        width: usize,
+        syntax_highlighting: bool,
+    ) -> (Vec<RichLine>, Vec<usize>) {
         let mut output = Vec::new();
+        let mut ends = Vec::with_capacity(list.items.len());
         for (index, item) in list.items.iter().enumerate() {
             if index > 0 && (item.blocks.len() > 1 || list.items[index - 1].blocks.len() > 1) {
                 push_blank(&mut output);
@@ -513,8 +570,9 @@ impl RichRenderer {
                 None => marker,
             };
             self.render_list_item(item, &marker, width, syntax_highlighting, &mut output);
+            ends.push(output.len());
         }
-        output
+        (output, ends)
     }
 
     fn render_list_item(
@@ -936,18 +994,26 @@ impl RichRenderer {
     }
 
     fn render_table(&self, table: &Table, width: usize) -> Vec<RichLine> {
+        self.render_table_with_commit_ends(table, width).0
+    }
+
+    fn render_table_with_commit_ends(
+        &self,
+        table: &Table,
+        width: usize,
+    ) -> (Vec<RichLine>, Vec<usize>) {
         let columns = table
             .header
             .len()
             .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
         if columns == 0 {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let overhead = columns.saturating_mul(3).saturating_add(1);
         // One-cell columns are technically drawable but not readable. Prefer
         // the labeled-list fallback until each column can hold a short token.
         if width < overhead.saturating_add(columns.saturating_mul(3)) {
-            return self.render_table_fallback(table, width);
+            return self.render_table_fallback_with_commit_ends(table, width);
         }
 
         let mut natural = vec![1usize; columns];
@@ -1021,17 +1087,25 @@ impl RichRenderer {
             true,
         ));
         output.push(border(left, middle, right));
+        let mut ends = Vec::with_capacity(table.rows.len().max(1));
         for (index, row) in table.rows.iter().enumerate() {
             output.extend(self.render_table_row(row, &widths, &table.alignments, vertical, false));
             if index + 1 < table.rows.len() {
                 output.push(border(left, middle, right));
             }
+            ends.push(output.len());
         }
         output.push(border(bottom_left, bottom_mid, bottom_right));
-        output
-            .into_iter()
-            .map(|line| self.clip_line(line, width))
-            .collect()
+        if let Some(end) = ends.last_mut() {
+            *end = output.len();
+        }
+        (
+            output
+                .into_iter()
+                .map(|line| self.clip_line(line, width))
+                .collect(),
+            ends,
+        )
     }
 
     fn render_table_row(
@@ -1094,7 +1168,16 @@ impl RichRenderer {
     }
 
     fn render_table_fallback(&self, table: &Table, width: usize) -> Vec<RichLine> {
+        self.render_table_fallback_with_commit_ends(table, width).0
+    }
+
+    fn render_table_fallback_with_commit_ends(
+        &self,
+        table: &Table,
+        width: usize,
+    ) -> (Vec<RichLine>, Vec<usize>) {
         let mut output = Vec::new();
+        let mut ends = Vec::with_capacity(table.rows.len().max(1));
         for (row_index, row) in table.rows.iter().enumerate() {
             if row_index > 0 {
                 push_blank(&mut output);
@@ -1118,6 +1201,7 @@ impl RichRenderer {
                 runs.extend(self.inline_runs(value, table_style.text));
                 output.extend(self.wrap_runs(&runs, width));
             }
+            ends.push(output.len());
         }
         if table.rows.is_empty() {
             for cell in &table.header {
@@ -1134,8 +1218,9 @@ impl RichRenderer {
                     ),
                 );
             }
+            ends.push(output.len());
         }
-        output
+        (output, ends)
     }
 
     fn inline_runs(&self, content: &[Inline], base: TextStyle) -> Vec<RichRun> {

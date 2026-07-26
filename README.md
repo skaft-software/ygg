@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.3.0-alpha"><img alt="Release: 0.3.0-alpha" src="https://img.shields.io/badge/release-0.3.0--alpha-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.3.1-alpha"><img alt="Release: 0.3.1-alpha" src="https://img.shields.io/badge/release-0.3.1--alpha-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -61,7 +61,7 @@ The installer builds the pinned release tag and adds Cargo's binary directory to
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/skaft-software/ygg/v0.3.0-alpha/scripts/install.sh | sh
+  https://raw.githubusercontent.com/skaft-software/ygg/v0.3.1-alpha/scripts/install.sh | sh
 ```
 
 Restart the shell, then verify the installation:
@@ -78,7 +78,7 @@ To install without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.3.0-alpha \
+  --tag v0.3.1-alpha \
   --bin ygg \
   ygg-coding-agent
 ```
@@ -103,11 +103,11 @@ The included image builds ygg from the locked workspace, runs as an unprivileged
 user, and expects an explicit workspace mount:
 
 ```sh
-docker build -f deploy/Dockerfile.ygg -t ygg:0.3.0-alpha .
+docker build -f deploy/Dockerfile.ygg -t ygg:0.3.1-alpha .
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.3.0-alpha --model claude-sonnet-4-6
+  ygg:0.3.1-alpha --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs.
@@ -366,6 +366,7 @@ compact_model = "openrouter/anthropic/claude-haiku-4.5"
 ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats native terminal behavior as a feature, not an implementation detail.
 
 - Native scrollback and text selection by default; application-owned mouse behavior is opt-in.
+- A terminal resize atomically rebuilds Ygg's transcript and clears saved lines from before Ygg started.
 - Stable-prefix differential rendering, synchronized atomic frames, and bounded repaint regions.
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
@@ -633,7 +634,7 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.3.0-alpha.md) | Current installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.3.1-alpha.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Themes](docs/themes.md) | Theme schema, roles, glyphs, responsive layout, and fallback behavior. |
