@@ -6,13 +6,18 @@ import {
   Check,
   ChevronDown,
   CircleStop,
+  Copy,
+  Download,
   ExternalLink,
   File,
   FileDiff,
   FileText,
   Globe2,
   LoaderCircle,
+  Maximize2,
+  Minus,
   Paperclip,
+  Plus,
   RefreshCw,
   Search,
   ScanSearch,
@@ -28,6 +33,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
   lazy,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -102,25 +108,90 @@ function AttachmentPreviewDialog({
   name: string;
   onClose: () => void;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
+  const dragRef = useRef<{
+    pointerId: number;
+    clientX: number;
+    clientY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+  const movedRef = useRef(false);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+
+  const clampedPan = useCallback(
+    (x: number, y: number, nextZoom: number) => {
+      const image = imageRef.current;
+      if (!image || nextZoom <= 1) return { x: 0, y: 0 };
+      const maxX = Math.max(0, (image.offsetWidth * (nextZoom - 1)) / 2);
+      const maxY = Math.max(0, (image.offsetHeight * (nextZoom - 1)) / 2);
+      return {
+        x: Math.max(-maxX, Math.min(maxX, x)),
+        y: Math.max(-maxY, Math.min(maxY, y)),
+      };
+    },
+    [],
+  );
+
+  const changeZoom = useCallback(
+    (nextZoom: number) => {
+      const value = Math.max(1, Math.min(4, nextZoom));
+      setZoom(value);
+      setPan((current) => clampedPan(current.x, current.y, value));
+    },
+    [clampedPan],
+  );
+
+  const fitImage = useCallback(() => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }, []);
+
   useEffect(() => {
     if (!source) return;
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
         onClose();
+      } else if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        changeZoom(zoom + 0.5);
+      } else if (event.key === "-") {
+        event.preventDefault();
+        changeZoom(zoom - 0.5);
+      } else if (event.key === "0") {
+        event.preventDefault();
+        fitImage();
       }
       if (event.key === "Tab") {
-        event.preventDefault();
-        closeRef.current?.focus();
+        const controls = Array.from(
+          dialogRef.current?.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), a[href]',
+          ) ?? [],
+        );
+        if (!controls.length) return;
+        const first = controls[0]!;
+        const last = controls.at(-1)!;
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
       }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [onClose, source]);
+  }, [changeZoom, fitImage, onClose, source, zoom]);
   if (!source) return null;
   return (
     <div
+      ref={dialogRef}
       className="attachment-preview-backdrop"
       role="dialog"
       aria-modal="true"
@@ -129,16 +200,116 @@ function AttachmentPreviewDialog({
         if (event.currentTarget === event.target) onClose();
       }}
     >
-      <button
-        ref={closeRef}
-        className="attachment-preview-close"
-        onClick={onClose}
-        aria-label="Close image preview"
-        autoFocus
+      <div
+        className={`attachment-preview-stage ${dragging ? "is-dragging" : ""}`}
+        data-zoomed={zoom > 1 || undefined}
+        onWheel={(event) => {
+          event.preventDefault();
+          changeZoom(zoom + (event.deltaY < 0 ? 0.25 : -0.25));
+        }}
+        onPointerDown={(event) => {
+          if (zoom <= 1 || event.button !== 0) return;
+          event.currentTarget.setPointerCapture(event.pointerId);
+          dragRef.current = {
+            pointerId: event.pointerId,
+            clientX: event.clientX,
+            clientY: event.clientY,
+            originX: pan.x,
+            originY: pan.y,
+          };
+          movedRef.current = false;
+          setDragging(true);
+        }}
+        onPointerMove={(event) => {
+          const drag = dragRef.current;
+          if (!drag || drag.pointerId !== event.pointerId) return;
+          const deltaX = event.clientX - drag.clientX;
+          const deltaY = event.clientY - drag.clientY;
+          if (Math.abs(deltaX) + Math.abs(deltaY) > 3) {
+            movedRef.current = true;
+          }
+          setPan(
+            clampedPan(drag.originX + deltaX, drag.originY + deltaY, zoom),
+          );
+        }}
+        onPointerUp={(event) => {
+          if (dragRef.current?.pointerId !== event.pointerId) return;
+          dragRef.current = null;
+          setDragging(false);
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        onPointerCancel={() => {
+          dragRef.current = null;
+          setDragging(false);
+        }}
+        onClick={(event) => {
+          if (event.target !== imageRef.current) return;
+          if (movedRef.current) {
+            movedRef.current = false;
+            return;
+          }
+          changeZoom(zoom > 1 ? 1 : 2);
+        }}
       >
-        <X aria-hidden="true" />
-      </button>
-      <img src={source} alt={name} />
+        <img
+          ref={imageRef}
+          src={source}
+          alt={name}
+          draggable={false}
+          style={{
+            transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+          }}
+        />
+      </div>
+      <div className="attachment-preview-toolbar" aria-label="Image controls">
+        <button
+          type="button"
+          onClick={() => changeZoom(zoom - 0.5)}
+          disabled={zoom <= 1}
+          aria-label="Zoom out"
+          title="Zoom out (−)"
+        >
+          <Minus aria-hidden="true" />
+        </button>
+        <output aria-live="polite">{Math.round(zoom * 100)}%</output>
+        <button
+          type="button"
+          onClick={() => changeZoom(zoom + 0.5)}
+          disabled={zoom >= 4}
+          aria-label="Zoom in"
+          title="Zoom in (+)"
+        >
+          <Plus aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          onClick={fitImage}
+          disabled={zoom === 1 && pan.x === 0 && pan.y === 0}
+          aria-label="Fit image"
+          title="Fit image (0)"
+        >
+          <Maximize2 aria-hidden="true" />
+        </button>
+        <a
+          href={source}
+          download={name}
+          aria-label={`Download ${name}`}
+          title="Download image"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <Download aria-hidden="true" />
+        </a>
+        <button
+          ref={closeRef}
+          type="button"
+          onClick={onClose}
+          aria-label="Close image preview"
+          title="Close (Esc)"
+          autoFocus
+        >
+          <X aria-hidden="true" />
+        </button>
+      </div>
     </div>
   );
 }
@@ -429,6 +600,93 @@ function UserInputCard({
   );
 }
 
+function AssistantMessage({
+  item,
+  animate,
+}: {
+  item: Extract<TranscriptItem, { kind: "assistant_message" }>;
+  animate: boolean;
+}) {
+  const [copyState, setCopyState] = useState<
+    "idle" | "copied" | "failed"
+  >("idle");
+  const resetTimerRef = useRef<number | null>(null);
+
+  useEffect(
+    () => () => {
+      if (resetTimerRef.current !== null) {
+        window.clearTimeout(resetTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  const copyResponse = async () => {
+    if (resetTimerRef.current !== null) {
+      window.clearTimeout(resetTimerRef.current);
+    }
+    try {
+      await navigator.clipboard.writeText(item.content);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+    }
+    resetTimerRef.current = window.setTimeout(() => {
+      setCopyState("idle");
+      resetTimerRef.current = null;
+    }, 1_500);
+  };
+
+  return (
+    <article
+      className={`assistant-message ${item.state === "streaming" ? "is-streaming" : ""} ${animate ? "is-entering" : ""}`}
+      aria-live={item.state === "streaming" ? "polite" : undefined}
+    >
+      {item.content ? (
+        <Suspense fallback={<div className="message-copy">{item.content}</div>}>
+          <MarkdownMessage content={item.content} />
+        </Suspense>
+      ) : (
+        <div className="message-copy">
+          <LoaderCircle
+            className="spin assistant-waiting"
+            aria-label="ygg is responding"
+          />
+        </div>
+      )}
+      {item.state !== "streaming" && item.content ? (
+        <div className="message-actions">
+          <button
+            type="button"
+            onClick={() => void copyResponse()}
+            aria-label={
+              copyState === "copied"
+                ? "Response copied"
+                : copyState === "failed"
+                  ? "Copy failed"
+                  : "Copy response"
+            }
+            title={copyState === "failed" ? "Copy failed" : "Copy response"}
+          >
+            {copyState === "copied" ? (
+              <Check aria-hidden="true" />
+            ) : (
+              <Copy aria-hidden="true" />
+            )}
+          </button>
+          <span className="sr-only" role="status" aria-live="polite">
+            {copyState === "copied"
+              ? "Response copied"
+              : copyState === "failed"
+                ? "Could not copy response"
+                : ""}
+          </span>
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
 function TranscriptItemView({
   item,
   animate,
@@ -518,25 +776,7 @@ function TranscriptItemView({
     }
 
     case "assistant_message":
-      return (
-        <article
-          className={`assistant-message ${item.state === "streaming" ? "is-streaming" : ""} ${animate ? "is-entering" : ""}`}
-          aria-live={item.state === "streaming" ? "polite" : undefined}
-        >
-          {item.content ? (
-            <Suspense fallback={<div className="message-copy">{item.content}</div>}>
-              <MarkdownMessage content={item.content} />
-            </Suspense>
-          ) : (
-            <div className="message-copy">
-              <LoaderCircle
-                className="spin assistant-waiting"
-                aria-label="ygg is responding"
-              />
-            </div>
-          )}
-        </article>
-      );
+      return <AssistantMessage item={item} animate={animate} />;
 
     case "reasoning":
       return (
@@ -764,46 +1004,57 @@ function WorkGroup({
     : duration > 0
       ? `Worked for ${formatDuration(duration)}`
       : "Work details";
+  const open = live || userOpen;
 
   return (
-    <details
-      className={`work-group ${live ? "is-live" : ""}`}
-      open={live || userOpen}
-      onToggle={(event) => {
-        if (!live) setUserOpen(event.currentTarget.open);
-      }}
+    <section
+      className={`work-group ${live ? "is-live" : "is-complete"} ${open ? "is-open" : "is-collapsed"}`}
+      aria-label={label}
     >
-      <summary>
+      <button
+        type="button"
+        className="work-group-summary"
+        aria-expanded={open}
+        aria-disabled={live}
+        onClick={() => {
+          if (!live) setUserOpen((current) => !current);
+        }}
+      >
         <span className="work-group-glyph">
-          {live ? (
+          <span className="work-group-status is-working">
             <LoaderCircle className="spin" aria-hidden="true" />
-          ) : row.outcome?.outcome === "failed" ? (
-            <AlertTriangle aria-hidden="true" />
-          ) : (
-            <Check aria-hidden="true" />
-          )}
+          </span>
+          <span className="work-group-status is-finished">
+            {row.outcome?.outcome === "failed" ? (
+              <AlertTriangle aria-hidden="true" />
+            ) : (
+              <Check aria-hidden="true" />
+            )}
+          </span>
         </span>
         <span>{label}</span>
         <ChevronDown aria-hidden="true" />
-      </summary>
-      <div className="work-group-content">
-        {row.items.map((item) => (
-          <TranscriptItemView
-            key={item.id}
-            item={item}
-            animate={!initialItemIds.has(item.id)}
-            onResolveApproval={onResolveApproval}
-            onResolveUserInput={onResolveUserInput}
-            onOpenOutput={onOpenOutput}
-            onOpenSource={onOpenSource}
-            availableOutputIds={availableOutputIds}
-            availableSourceIds={availableSourceIds}
-            attachmentContentUrl={attachmentContentUrl}
-            onPreviewAttachment={onPreviewAttachment}
-          />
-        ))}
+      </button>
+      <div className="work-group-content-clip" aria-hidden={!open}>
+        <div className="work-group-content">
+          {row.items.map((item) => (
+            <TranscriptItemView
+              key={item.id}
+              item={item}
+              animate={!initialItemIds.has(item.id)}
+              onResolveApproval={onResolveApproval}
+              onResolveUserInput={onResolveUserInput}
+              onOpenOutput={onOpenOutput}
+              onOpenSource={onOpenSource}
+              availableOutputIds={availableOutputIds}
+              availableSourceIds={availableSourceIds}
+              attachmentContentUrl={attachmentContentUrl}
+              onPreviewAttachment={onPreviewAttachment}
+            />
+          ))}
+        </div>
       </div>
-    </details>
+    </section>
   );
 }
 
@@ -1144,6 +1395,164 @@ function ModelPicker({
   );
 }
 
+function ComposerMenu<T extends string>({
+  label,
+  value,
+  options,
+  disabled,
+  icon,
+  className,
+  onChange,
+}: {
+  label: string;
+  value: T;
+  options: Array<{ value: T; label: string; description?: string }>;
+  disabled?: boolean;
+  icon: ReactNode;
+  className?: string;
+  onChange: (value: T) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const activeOption =
+    options.find((option) => option.value === value) ?? options[0];
+
+  const close = (restoreFocus: boolean) => {
+    setOpen(false);
+    if (restoreFocus) {
+      window.requestAnimationFrame(() => triggerRef.current?.focus());
+    }
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (
+        !popoverRef.current?.contains(target) &&
+        !triggerRef.current?.contains(target)
+      ) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      close(true);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    window.requestAnimationFrame(() => {
+      popoverRef.current
+        ?.querySelector<HTMLButtonElement>('[aria-checked="true"]')
+        ?.focus();
+    });
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!disabled || !open) return;
+    const frame = window.requestAnimationFrame(() => setOpen(false));
+    return () => window.cancelAnimationFrame(frame);
+  }, [disabled, open]);
+
+  const focusMenuItem = (
+    current: HTMLButtonElement,
+    direction: 1 | -1,
+  ) => {
+    const items = Array.from(
+      popoverRef.current?.querySelectorAll<HTMLButtonElement>(
+        '[role="menuitemradio"]',
+      ) ?? [],
+    );
+    if (!items.length) return;
+    const index = items.indexOf(current);
+    items[(index + direction + items.length) % items.length]?.focus();
+  };
+
+  if (!activeOption) return null;
+
+  return (
+    <div className={`composer-menu ${className ?? ""}`}>
+      <button
+        ref={triggerRef}
+        type="button"
+        className="composer-menu-trigger"
+        aria-label={`${label}: ${activeOption.label}`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        disabled={disabled}
+        onClick={() => setOpen((current) => !current)}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+          event.preventDefault();
+          setOpen(true);
+        }}
+      >
+        <span className="composer-menu-trigger-icon" aria-hidden="true">
+          {icon}
+        </span>
+        <span className="composer-menu-trigger-label">
+          {activeOption.label}
+        </span>
+        <ChevronDown aria-hidden="true" />
+      </button>
+      {open ? (
+        <div
+          ref={popoverRef}
+          className="composer-menu-popover"
+          role="menu"
+          aria-label={label}
+        >
+          <span className="composer-menu-heading">{label}</span>
+          {options.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="menuitemradio"
+              aria-checked={option.value === value}
+              onClick={() => {
+                onChange(option.value);
+                close(true);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                  event.preventDefault();
+                  focusMenuItem(
+                    event.currentTarget,
+                    event.key === "ArrowDown" ? 1 : -1,
+                  );
+                } else if (event.key === "Home" || event.key === "End") {
+                  event.preventDefault();
+                  const items = Array.from(
+                    popoverRef.current?.querySelectorAll<HTMLButtonElement>(
+                      '[role="menuitemradio"]',
+                    ) ?? [],
+                  );
+                  items[event.key === "Home" ? 0 : items.length - 1]?.focus();
+                }
+              }}
+            >
+              <span>
+                <strong>{option.label}</strong>
+                {option.description ? (
+                  <small>{option.description}</small>
+                ) : null}
+              </span>
+              {option.value === value ? <Check aria-hidden="true" /> : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function Composer({
   session,
   bootstrap,
@@ -1173,7 +1582,7 @@ function Composer({
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [activeDelivery, setActiveDelivery] = useState<
     "steer" | "followUp"
-  >("followUp");
+  >(bootstrap.capabilities.followUp ? "followUp" : "steer");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1229,6 +1638,31 @@ function Composer({
     (Boolean(prompt.trim()) || uploadedAttachments.length > 0) &&
     !attachmentsPending &&
     !attachmentsFailed;
+
+  useEffect(() => {
+    if (!isWorking) {
+      setActiveDelivery(
+        bootstrap.capabilities.followUp ? "followUp" : "steer",
+      );
+    } else if (
+      activeDelivery === "followUp" &&
+      !bootstrap.capabilities.followUp &&
+      bootstrap.capabilities.steer
+    ) {
+      setActiveDelivery("steer");
+    } else if (
+      activeDelivery === "steer" &&
+      !bootstrap.capabilities.steer &&
+      bootstrap.capabilities.followUp
+    ) {
+      setActiveDelivery("followUp");
+    }
+  }, [
+    activeDelivery,
+    bootstrap.capabilities.followUp,
+    bootstrap.capabilities.steer,
+    isWorking,
+  ]);
 
   useEffect(() => {
     attachmentsRef.current = attachments;
@@ -1571,46 +2005,58 @@ function Composer({
               disabled={isWorking}
               onChange={(reasoning) => void onConfigure({ reasoning })}
             />
-            <label className="composer-select authority-select">
-              <ShieldCheck aria-hidden="true" />
-              <span className="sr-only">Authority</span>
-              <select
-                value={session.authority}
-                disabled={isWorking}
-                onChange={(event) =>
-                  void onConfigure({
-                    authority: event.target.value as AuthorityProfile,
-                  })
-                }
-              >
-                {bootstrap.authorityProfiles.map((authority) => (
-                  <option key={authority} value={authority}>
-                    {authorityLabels[authority]}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown aria-hidden="true" />
-            </label>
+            <ComposerMenu
+              label="Authority"
+              className="authority-menu"
+              value={session.authority}
+              disabled={isWorking}
+              icon={<ShieldCheck />}
+              options={bootstrap.authorityProfiles.map((authority) => ({
+                value: authority,
+                label: authorityLabels[authority],
+                description:
+                  authority === "readOnly"
+                    ? "Inspect without changing files"
+                    : authority === "workspace"
+                      ? "Work inside the selected project"
+                      : "Use tools across this device",
+              }))}
+              onChange={(authority) => void onConfigure({ authority })}
+            />
             {isWorking ? (
-              <label className="composer-select delivery-select">
-                <span className="sr-only">Active run delivery</span>
-                <select
-                  value={activeDelivery}
-                  onChange={(event) =>
-                    setActiveDelivery(
-                      event.target.value as "steer" | "followUp",
-                    )
-                  }
-                >
-                  {bootstrap.capabilities.steer ? (
-                    <option value="steer">Steer now</option>
-                  ) : null}
-                  {bootstrap.capabilities.followUp ? (
-                    <option value="followUp">Follow up</option>
-                  ) : null}
-                </select>
-                <ChevronDown aria-hidden="true" />
-              </label>
+              <ComposerMenu
+                label="While ygg is working"
+                className="delivery-menu"
+                value={activeDelivery}
+                icon={
+                  activeDelivery === "steer" ? (
+                    <BrainCircuit />
+                  ) : (
+                    <ArrowDown />
+                  )
+                }
+                options={[
+                  ...(bootstrap.capabilities.followUp
+                    ? [
+                        {
+                          value: "followUp" as const,
+                          label: "Follow up",
+                          description: "Queue after the current response",
+                        },
+                      ]
+                    : []),
+                  ...(bootstrap.capabilities.steer
+                    ? [
+                        {
+                          value: "steer" as const,
+                          label: "Steer now",
+                          description: "Guide the response in progress",
+                        },
+                      ]
+                    : []),
+                ]}
+                onChange={setActiveDelivery}
+              />
             ) : null}
           </div>
           <div className="composer-actions">
@@ -1804,11 +2250,14 @@ export function Conversation({
           setAttachmentPreview({ source, name, trigger })
         }
       />
-      <AttachmentPreviewDialog
-        source={attachmentPreview?.source ?? null}
-        name={attachmentPreview?.name ?? ""}
-        onClose={closeAttachmentPreview}
-      />
+      {attachmentPreview ? (
+        <AttachmentPreviewDialog
+          key={attachmentPreview.source}
+          source={attachmentPreview.source}
+          name={attachmentPreview.name}
+          onClose={closeAttachmentPreview}
+        />
+      ) : null}
     </section>
   );
 }

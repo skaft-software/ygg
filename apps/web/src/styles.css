@@ -945,6 +945,44 @@ kbd {
   line-height: 20px;
 }
 
+.message-actions {
+  min-height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 5px;
+  margin-left: -5px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.assistant-message:hover .message-actions,
+.assistant-message:focus-within .message-actions {
+  opacity: 1;
+}
+
+.message-actions button {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 8px;
+  color: var(--text-faint);
+  background: transparent;
+}
+
+.message-actions button:hover,
+.message-actions button:focus-visible {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.message-actions svg {
+  width: 14px;
+  height: 14px;
+}
+
 .markdown-body {
   overflow-wrap: anywhere;
   line-height: 1.62;
@@ -1169,9 +1207,13 @@ kbd {
   overflow: hidden;
   border-radius: 11px;
   background: color-mix(in srgb, var(--surface) 76%, transparent);
+  transition:
+    background 180ms ease,
+    box-shadow 180ms ease;
 }
 
-.work-group > summary {
+.work-group-summary {
+  width: 100%;
   min-height: 42px;
   display: grid;
   grid-template-columns: 25px minmax(0, 1fr) auto;
@@ -1180,29 +1222,34 @@ kbd {
   padding: 7px 10px;
   list-style: none;
   color: var(--text-soft);
+  background: transparent;
   font-weight: 560;
+  text-align: left;
 }
 
-.work-group > summary::-webkit-details-marker {
-  display: none;
-}
-
-.work-group > summary:hover {
+.work-group-summary:hover,
+.work-group-summary:focus-visible {
   color: var(--text);
   background: var(--surface-hover);
 }
 
-.work-group > summary > svg {
-  width: 15px;
-  height: 15px;
-  transition: transform 120ms ease;
+.work-group-summary[aria-disabled="true"] {
+  cursor: default;
+  opacity: 1;
 }
 
-.work-group[open] > summary > svg {
+.work-group-summary > svg {
+  width: 15px;
+  height: 15px;
+  transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.work-group.is-open .work-group-summary > svg {
   transform: rotate(180deg);
 }
 
 .work-group-glyph {
+  position: relative;
   width: 25px;
   height: 25px;
   display: grid;
@@ -1222,7 +1269,57 @@ kbd {
   height: 14px;
 }
 
+.work-group-status {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  transition:
+    opacity 180ms ease,
+    transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.work-group-status.is-working {
+  opacity: 0;
+  transform: scale(0.72);
+}
+
+.work-group-status.is-finished {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.work-group.is-live .work-group-status.is-working {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.work-group.is-live .work-group-status.is-finished {
+  opacity: 0;
+  transform: scale(0.72);
+}
+
+.work-group.is-complete .work-group-glyph {
+  animation: completion-pulse 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.work-group-content-clip {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 150ms ease;
+}
+
+.work-group.is-open .work-group-content-clip {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
 .work-group-content {
+  min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 7px;
@@ -1753,31 +1850,99 @@ kbd {
   inset: 0;
   display: grid;
   place-items: center;
-  padding: 64px;
+  padding: 64px 24px 24px;
+  overflow: hidden;
   background: rgba(0, 0, 0, 0.72);
   backdrop-filter: blur(12px);
 }
 
-.attachment-preview-backdrop > img {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-  border-radius: 10px;
-  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.38);
+.attachment-preview-stage {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 14px;
+  cursor: zoom-in;
+  touch-action: none;
 }
 
-.attachment-preview-close {
+.attachment-preview-stage[data-zoomed] {
+  cursor: grab;
+}
+
+.attachment-preview-stage.is-dragging {
+  cursor: grabbing;
+}
+
+.attachment-preview-stage img {
+  max-width: 100%;
+  max-height: 100%;
+  display: block;
+  object-fit: contain;
+  border-radius: 10px;
+  user-select: none;
+  will-change: transform;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.38);
+  transition: transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.attachment-preview-stage.is-dragging img {
+  transition: none;
+}
+
+.attachment-preview-toolbar {
   position: fixed;
   top: 16px;
   right: 16px;
-  width: 34px;
-  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 38px;
+  padding: 3px;
+  border-radius: 12px;
+  color: white;
+  background: rgba(36, 36, 34, 0.84);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.24);
+  backdrop-filter: blur(14px);
+}
+
+.attachment-preview-toolbar button,
+.attachment-preview-toolbar a {
+  width: 32px;
+  height: 32px;
   display: grid;
   place-items: center;
   padding: 0;
-  border-radius: 50%;
-  color: white;
-  background: rgba(36, 36, 34, 0.84);
+  border-radius: 9px;
+  color: inherit;
+  background: transparent;
+}
+
+.attachment-preview-toolbar button:hover,
+.attachment-preview-toolbar button:focus-visible,
+.attachment-preview-toolbar a:hover,
+.attachment-preview-toolbar a:focus-visible {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.attachment-preview-toolbar button:disabled {
+  opacity: 0.34;
+}
+
+.attachment-preview-toolbar svg {
+  width: 15px;
+  height: 15px;
+}
+
+.attachment-preview-toolbar output {
+  min-width: 44px;
+  color: rgba(255, 255, 255, 0.72);
+  font-family: var(--mono-family);
+  font-size: var(--font-meta);
+  text-align: center;
 }
 
 .composer-toolbar,
@@ -2004,6 +2169,124 @@ kbd {
   padding: 28px 12px;
   color: var(--text-faint);
   text-align: center;
+}
+
+.composer-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.composer-menu-trigger {
+  min-width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px;
+  border-radius: 9px;
+  color: var(--text-soft);
+  background: transparent;
+  white-space: nowrap;
+}
+
+.composer-menu-trigger:hover,
+.composer-menu-trigger[aria-expanded="true"] {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.composer-menu-trigger:disabled {
+  color: var(--text-faint);
+  opacity: 0.62;
+}
+
+.composer-menu-trigger-icon {
+  display: grid;
+  place-items: center;
+  color: var(--composer-accent, var(--accent));
+}
+
+.composer-menu-trigger-icon svg,
+.composer-menu-trigger > svg {
+  width: 13px;
+  height: 13px;
+}
+
+.composer-menu-trigger-label {
+  line-height: 1;
+}
+
+.composer-menu-popover {
+  position: absolute;
+  z-index: 31;
+  left: 0;
+  bottom: calc(100% + 10px);
+  width: 268px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px;
+  border-radius: 14px;
+  color: var(--text);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-float);
+  transform-origin: 26px 100%;
+  animation: model-picker-enter 140ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.delivery-menu .composer-menu-popover {
+  right: 0;
+  left: auto;
+  transform-origin: calc(100% - 26px) 100%;
+}
+
+.composer-menu-heading {
+  padding: 5px 8px 6px;
+  color: var(--text-faint);
+  font-size: var(--font-meta);
+  font-weight: 520;
+}
+
+.composer-menu-popover > button {
+  width: 100%;
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 10px;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+}
+
+.composer-menu-popover > button:hover,
+.composer-menu-popover > button:focus-visible,
+.composer-menu-popover > button[aria-checked="true"] {
+  background: var(--surface-hover);
+}
+
+.composer-menu-popover > button > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.composer-menu-popover strong {
+  font-weight: 570;
+}
+
+.composer-menu-popover small {
+  color: var(--text-faint);
+  line-height: 1.3;
+}
+
+.composer-menu-popover > button > svg {
+  width: 15px;
+  height: 15px;
+  color: var(--composer-accent, var(--accent));
 }
 
 .composer-select > svg {
@@ -3264,8 +3547,28 @@ kbd {
 }
 
 @media (hover: none), (pointer: coarse) {
-  .attachment-remove {
+  .attachment-remove,
+  .message-actions {
     opacity: 1;
+  }
+}
+
+@media (max-width: 900px) {
+  .composer-toolbar {
+    align-items: flex-end;
+  }
+
+  .composer-leading {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+
+  .model-picker {
+    margin-left: 0;
+  }
+
+  .model-picker-trigger {
+    max-width: none;
   }
 }
 
@@ -3396,24 +3699,9 @@ kbd {
     border-radius: 20px;
   }
 
-  .composer-toolbar {
-    align-items: flex-end;
-  }
-
-  .composer-leading {
-    flex-wrap: wrap;
-    row-gap: 2px;
-  }
-
-  .model-picker {
-    margin-left: 0;
-  }
-
-  .model-picker-trigger {
-    max-width: 120px;
-  }
-
-  .model-picker-popover {
+  .model-picker-popover,
+  .composer-menu-popover,
+  .delivery-menu .composer-menu-popover {
     position: fixed;
     right: 8px;
     bottom: max(8px, env(safe-area-inset-bottom));
@@ -3422,6 +3710,7 @@ kbd {
     max-height: min(72svh, 560px);
     border-radius: 18px;
     box-shadow: 0 -18px 56px rgba(0, 0, 0, 0.28);
+    transform-origin: 50% 100%;
   }
 
   .composer-select:not(.model-select) select {
@@ -3475,7 +3764,30 @@ kbd {
   }
 
   .attachment-preview-backdrop {
-    padding: 18px;
+    padding: 58px 10px 10px;
+  }
+
+  .attachment-preview-toolbar {
+    top: max(8px, env(safe-area-inset-top));
+    right: max(8px, env(safe-area-inset-right));
+  }
+}
+
+@media (max-width: 540px) {
+  .reasoning-power-label,
+  .authority-menu .composer-menu-trigger-label,
+  .authority-menu .composer-menu-trigger > svg {
+    display: none;
+  }
+
+  .authority-menu .composer-menu-trigger {
+    width: 32px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .power-slider-container {
+    width: 82px;
   }
 }
 

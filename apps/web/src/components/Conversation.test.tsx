@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fixtureBootstrap, fixtureSessions } from "../fixtures";
@@ -40,7 +40,7 @@ describe("conversation composer", () => {
     expect(composer).toHaveValue("Keep this draft");
   });
 
-  it("offers Follow up and Steer alongside Stop during an active run", async () => {
+  it("queues by default and keeps Steer in a themed secondary menu", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     render(
@@ -58,13 +58,65 @@ describe("conversation composer", () => {
     );
 
     expect(screen.getByRole("button", { name: "Stop ygg" })).toBeVisible();
-    const delivery = screen.getByLabelText("Active run delivery");
-    expect(delivery).toHaveValue("followUp");
-    expect(delivery).toHaveTextContent("Steer now");
+    const delivery = screen.getByRole("button", {
+      name: "While ygg is working: Follow up",
+    });
+    expect(
+      screen.queryByRole("combobox", { name: "Active run delivery" }),
+    ).toBeNull();
     await user.type(screen.getByLabelText("Message ygg"), "Queue this");
     await user.click(screen.getByRole("button", { name: "Queue follow-up" }));
 
     expect(onSubmit).toHaveBeenCalledWith("Queue this", [], "followUp");
+
+    await user.click(delivery);
+    expect(
+      screen.getByRole("menu", { name: "While ygg is working" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("menuitemradio", { name: /Steer now/ }),
+    ).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(
+      screen.queryByRole("menu", { name: "While ygg is working" }),
+    ).toBeNull();
+    expect(delivery).toHaveFocus();
+  });
+
+  it("uses a themed authority menu with keyboard focus restoration", async () => {
+    const user = userEvent.setup();
+    const onConfigure = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={onConfigure}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    const authority = screen.getByRole("button", {
+      name: "Authority: Full access",
+    });
+    expect(
+      screen.queryByRole("combobox", { name: "Authority" }),
+    ).toBeNull();
+    await user.click(authority);
+    expect(screen.getByRole("menu", { name: "Authority" })).toBeVisible();
+    await user.click(screen.getByLabelText("Message ygg"));
+    expect(screen.queryByRole("menu", { name: "Authority" })).toBeNull();
+    await user.click(authority);
+    await user.click(
+      screen.getByRole("menuitemradio", { name: /Workspace/ }),
+    );
+
+    expect(onConfigure).toHaveBeenCalledWith({ authority: "workspace" });
+    await waitFor(() => expect(authority).toHaveFocus());
   });
 
   it("uses a themed searchable model picker instead of a native select", async () => {
@@ -166,6 +218,148 @@ describe("conversation composer", () => {
     expect(screen.getByText("<script>alert('no')</script>")).toBeVisible();
   });
 
+  it("copies a completed assistant response and confirms it quietly", async () => {
+    const user = userEvent.setup();
+    const writeText = vi
+      .spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+    const session = structuredClone(fixtureSessions["session-recent"]!);
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    const copy = await screen.findByRole("button", {
+      name: "Copy response",
+    });
+    await user.click(copy);
+
+    const answer = session.items.find(
+      (item) => item.kind === "assistant_message",
+    );
+    expect(writeText).toHaveBeenCalledWith(
+      answer?.kind === "assistant_message" ? answer.content : "",
+    );
+    expect(
+      screen.getByRole("button", { name: "Response copied" }),
+    ).toBeVisible();
+  });
+
+  it("smoothly collapses completed work and lets the user reopen it", async () => {
+    const user = userEvent.setup();
+    const session = structuredClone(fixtureSessions["session-live"]!);
+    const props = {
+      bootstrap: structuredClone(fixtureBootstrap),
+      onSubmit: noOp,
+      onInterrupt: noOp,
+      onConfigure: noOp,
+      onResolveApproval: noOp,
+      onResolveUserInput: noOp,
+      onOpenOutput: () => {},
+      onOpenSource: () => {},
+    };
+    const { rerender, container } = render(
+      <Conversation session={session} {...props} />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: /Working/ }),
+    ).toHaveAttribute("aria-expanded", "true");
+
+    const completed = structuredClone(session);
+    completed.status = "done";
+    completed.activeRunId = undefined;
+    completed.items = completed.items.map((item) =>
+      item.kind === "reasoning"
+        ? { ...item, state: "committed" as const }
+        : item,
+    );
+    completed.items.push({
+      id: "live-outcome",
+      turnId: "live-turn",
+      kind: "run_outcome",
+      outcome: "done",
+      durationMs: 4_500,
+      summary: "Work completed",
+      state: "committed",
+      createdAt: new Date().toISOString(),
+    });
+    rerender(<Conversation session={completed} {...props} />);
+
+    const summary = screen.getByRole("button", { name: /Worked for/ });
+    expect(summary).toHaveAttribute("aria-expanded", "false");
+    expect(
+      container.querySelector(".work-group-content-clip"),
+    ).toHaveAttribute("aria-hidden", "true");
+    await user.click(summary);
+    expect(summary).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("zooms, resets, downloads, and closes an attached image preview", async () => {
+    const user = userEvent.setup();
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    session.items.push({
+      id: "image-message",
+      turnId: "image-turn",
+      kind: "user_message",
+      content: "Use this image.",
+      attachments: [
+        {
+          id: "image-ref",
+          handle: "image-handle",
+          name: "photo.png",
+          mediaType: "image/png",
+          size: 4,
+        },
+      ],
+      state: "committed",
+      createdAt: new Date().toISOString(),
+    });
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+        attachmentContentUrl={() => "/photo.png"}
+      />,
+    );
+
+    const thumbnail = screen.getByRole("button", {
+      name: "View attached image 1",
+    });
+    await user.click(thumbnail);
+    expect(
+      screen.getByRole("dialog", { name: "Preview photo.png" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("link", { name: "Download photo.png" }),
+    ).toHaveAttribute("download", "photo.png");
+    await user.keyboard("+");
+    expect(screen.getByText("150%")).toBeVisible();
+    await user.keyboard("0");
+    expect(screen.getByText("100%")).toBeVisible();
+    await user.keyboard("{Escape}");
+    expect(
+      screen.queryByRole("dialog", { name: "Preview photo.png" }),
+    ).toBeNull();
+    await waitFor(() => expect(thumbnail).toHaveFocus());
+  });
+
   it("answers a private tool-input request without adding it to prose", async () => {
     const user = userEvent.setup();
     const onResolveUserInput = vi.fn().mockResolvedValue(undefined);
@@ -205,6 +399,33 @@ describe("conversation composer", () => {
       text: "secret-value",
     });
     expect(field).toHaveValue("");
+  });
+
+  it("keeps approvals one-shot while the wire only supports one-shot approval", async () => {
+    const user = userEvent.setup();
+    const onResolveApproval = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-attention"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={onResolveApproval}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Allow for this session" }),
+    ).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Allow once" }));
+    expect(onResolveApproval).toHaveBeenCalledWith(
+      "approval-keychain",
+      "allowed_once",
+    );
   });
 
   it("retains a failed image upload with retry and remove controls", async () => {
