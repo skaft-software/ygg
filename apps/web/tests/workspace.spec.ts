@@ -25,6 +25,19 @@ async function selectSession(page: Page, title: string) {
   await page.getByRole("button", { name: new RegExp(title) }).click();
 }
 
+async function ensureActivityOpen(page: Page) {
+  const rail = page.getByLabel("Session activity");
+  const opener = page.getByRole("button", { name: "Open activity" });
+  await expect
+    .poll(async () => (await rail.isVisible()) || (await opener.isVisible()))
+    .toBe(true);
+  if (!(await rail.isVisible())) {
+    await opener.click();
+  }
+  await expect(rail).toBeVisible();
+  return rail;
+}
+
 async function expectNoViewportOverflow(page: Page) {
   await expect
     .poll(() =>
@@ -83,7 +96,7 @@ test("opens in a fresh, quiet session with the standard composer", async ({
 test("keeps composer controls keyboard focusable with a visible focus ring", async ({
   page,
 }) => {
-  const attach = page.getByRole("button", { name: "Attach files" });
+  const attach = page.getByRole("button", { name: "Add files or photos" });
   const model = page.getByLabel("Model");
   const reasoning = page.getByLabel("Reasoning effort");
   const authority = page.getByLabel("Authority");
@@ -107,12 +120,75 @@ test("keeps composer controls keyboard focusable with a visible focus ring", asy
   await expect(authority).toBeFocused();
 });
 
+test("uploads an image, sends it without text, and restores thumbnail focus", async (
+  { page },
+  testInfo,
+) => {
+  test.skip(testInfo.project.name !== "desktop");
+  const picker = page.locator('input[type="file"]');
+  await expect(picker).toHaveAttribute("accept", /image\/\*/);
+  await picker.setInputFiles({
+    name: "tiny.png",
+    mimeType: "image/png",
+    buffer: Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=",
+      "base64",
+    ),
+  });
+
+  const staged = page.getByRole("button", {
+    name: "Click to preview tiny.png",
+  });
+  await expect(staged).toBeVisible();
+  await expect(
+    page.getByLabel("Attached files").getByText("Ready", { exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Send message" }).click();
+
+  const thumbnail = page.getByRole("button", {
+    name: "View attached image 1",
+  });
+  await expect(thumbnail).toBeVisible();
+  await thumbnail.focus();
+  await thumbnail.press("Enter");
+  await expect(page.getByRole("dialog", { name: "Preview tiny.png" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Preview tiny.png" })).toHaveCount(0);
+  await expect(thumbnail).toBeFocused();
+});
+
+test("uses one keyboard-operable reasoning slider with static reduced motion", async (
+  { page },
+  testInfo,
+) => {
+  test.skip(testInfo.project.name !== "desktop");
+  const slider = page.getByRole("slider", { name: "Reasoning effort" });
+  await expect(slider).toHaveAttribute("aria-valuetext", "high");
+  await slider.press("ArrowLeft");
+  await expect(slider).toHaveAttribute("aria-valuetext", "medium");
+  await slider.press("ArrowRight");
+  await expect(slider).toHaveAttribute("aria-valuetext", "high");
+  await expect(page.locator(".power-slider-max-fill")).toBeVisible();
+  await expect(page.locator(".power-slider-burst")).toBeVisible();
+
+  await page.evaluate(() => {
+    document.documentElement.dataset.motion = "none";
+  });
+  await expect
+    .poll(() =>
+      page
+        .locator(".power-slider-burst i")
+        .first()
+        .evaluate((element) => getComputedStyle(element).animationDuration),
+    )
+    .toBe("1e-06s");
+});
+
 test("shows typed work and a conditional activity rail", async ({ page }) => {
   await selectSession(page, "Refine onboarding preview");
   await expect(page.getByText("Read onboarding flow")).toBeVisible();
   await expect(page.getByText("Checking the narrow layout")).toBeVisible();
-  await page.getByRole("button", { name: "Open activity" }).click();
-  await expect(page.getByLabel("Session activity")).toBeVisible();
+  await ensureActivityOpen(page);
   await expect(page.getByText("Verifying keyboard and touch behavior")).toBeVisible();
   await expect(page.getByRole("button", { name: /Onboarding preview/ })).toBeVisible();
 });
@@ -155,7 +231,7 @@ test("opens an output into the dominant preview inspector", async (
   testInfo,
 ) => {
   await selectSession(page, "Review release readiness");
-  await page.getByRole("button", { name: "Open activity" }).click();
+  await ensureActivityOpen(page);
   await page
     .getByLabel("Session activity")
     .getByRole("button", { name: /Release pulse/ })
@@ -177,9 +253,7 @@ test("keeps the activity rail and dominant viewer usable at 1024px", async (
 ) => {
   test.skip(testInfo.project.name !== "tablet-landscape");
   await selectSession(page, "Review release readiness");
-  await page.getByRole("button", { name: "Open activity" }).click();
-  const rail = page.getByLabel("Session activity");
-  await expect(rail).toBeVisible();
+  const rail = await ensureActivityOpen(page);
   await expect
     .poll(() =>
       page.evaluate(() => ({
@@ -211,13 +285,13 @@ test("returns focus to a visible activity trigger after closing an inspector", a
 ) => {
   test.skip(testInfo.project.name !== "desktop");
   await selectSession(page, "Review release readiness");
-  const activityTrigger = page.getByRole("button", { name: "Open activity" });
-  await activityTrigger.click();
+  await ensureActivityOpen(page);
   const output = page
     .getByLabel("Session activity")
     .getByRole("button", { name: /Release pulse/ });
   await output.focus();
   await output.press("Enter");
+  const activityTrigger = page.getByRole("button", { name: "Open activity" });
 
   const inspector = page.getByLabel("Release pulse inspector");
   await expect
@@ -329,7 +403,7 @@ test("preserves core flows at a 200-percent equivalent reflow", async (
   await expect(
     page.getByText("The candidate is ready for review.", { exact: false }),
   ).toBeVisible();
-  await page.getByRole("button", { name: "Open activity" }).click();
+  await ensureActivityOpen(page);
   await page
     .getByLabel("Session activity")
     .getByRole("button", { name: /Release pulse/ })
@@ -369,7 +443,7 @@ test("does not make outbound requests or overflow the viewport", async ({
   });
   await page.reload();
   await selectSession(page, "Review release readiness");
-  await page.getByRole("button", { name: "Open activity" }).click();
+  await ensureActivityOpen(page);
   await page
     .getByLabel("Session activity")
     .getByRole("button", { name: /Release pulse/ })

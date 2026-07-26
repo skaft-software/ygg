@@ -290,9 +290,14 @@ export default function App() {
   const [mobileLayout, setMobileLayout] = useState(
     () => window.matchMedia("(max-width: 760px)").matches,
   );
+  const [wideLayout, setWideLayout] = useState(
+    () => window.matchMedia("(min-width: 1280px)").matches,
+  );
   const [activityOpen, setActivityOpen] = useState(false);
   const [inspector, setInspector] = useState<InspectorSelection | null>(null);
   const [surface, setSurface] = useState<Surface>("session");
+  const activitySeenRef = useRef(new Map<string, boolean>());
+  const activityDismissedRef = useRef(new Set<string>());
   const activityButtonRef = useRef<HTMLButtonElement>(null);
   const sidebarButtonRef = useRef<HTMLButtonElement>(null);
   const restoreActivityFocus = useCallback(() => {
@@ -306,9 +311,12 @@ export default function App() {
     window.requestAnimationFrame(restore);
   }, []);
   const closeActivity = useCallback(() => {
+    if (state.selectedSessionId) {
+      activityDismissedRef.current.add(state.selectedSessionId);
+    }
     setActivityOpen(false);
     restoreActivityFocus();
-  }, [restoreActivityFocus]);
+  }, [restoreActivityFocus, state.selectedSessionId]);
   const closeInspector = useCallback(() => {
     setInspector(null);
     restoreActivityFocus();
@@ -354,6 +362,21 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (!session) return;
+    const alreadySeen = activitySeenRef.current.get(session.sessionId) ?? false;
+    activitySeenRef.current.set(session.sessionId, activityAvailable);
+    if (
+      activityAvailable &&
+      !alreadySeen &&
+      wideLayout &&
+      !inspector &&
+      !activityDismissedRef.current.has(session.sessionId)
+    ) {
+      setActivityOpen(true);
+    }
+  }, [activityAvailable, inspector, session, wideLayout]);
+
+  useEffect(() => {
     if (selectedTheme) applyTheme(selectedTheme.theme);
   }, [selectedTheme]);
 
@@ -361,6 +384,15 @@ export default function App() {
     const media = window.matchMedia("(max-width: 760px)");
     const onChange = (event: MediaQueryListEvent) => {
       setMobileLayout(event.matches);
+    };
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 1280px)");
+    const onChange = (event: MediaQueryListEvent) => {
+      setWideLayout(event.matches);
     };
     media.addEventListener("change", onChange);
     return () => media.removeEventListener("change", onChange);
@@ -451,7 +483,12 @@ export default function App() {
             onOpenSidebar={() => setSidebarOpen(true)}
             onToggleActivity={() => {
               setInspector(null);
-              setActivityOpen((open) => !open);
+              setActivityOpen((open) => {
+                if (open) {
+                  activityDismissedRef.current.add(session.sessionId);
+                }
+                return !open;
+              });
             }}
             onRename={(title) => void store.rename(title)}
             onPin={(pinned) => {
@@ -467,6 +504,7 @@ export default function App() {
           />
           <FixtureModeLabel />
           <Conversation
+            key={session.sessionId}
             session={session}
             bootstrap={state.bootstrap}
             onSubmit={(prompt, attachments, activeDelivery) =>
@@ -479,6 +517,10 @@ export default function App() {
             }
             onOpenOutput={openOutput}
             onOpenSource={openSource}
+            onIngestAttachment={(file) => store.ingestAttachment(file)}
+            attachmentContentUrl={(handle) =>
+              store.attachmentContentUrl(handle)
+            }
           />
         </div>
       ) : (

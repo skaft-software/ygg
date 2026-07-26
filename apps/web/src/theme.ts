@@ -47,9 +47,9 @@ export function applyStoredTypePreferences(): void {
   root.style.setProperty("--mono-family", stack.mono);
   root.style.setProperty("--font-body", `${size}px`);
   root.style.setProperty("--font-meta", `${Math.max(11, size - 1)}px`);
-  root.style.setProperty("--font-chat", `${size + 2}px`);
-  root.style.setProperty("--font-prompt", `${size + 2}px`);
-  root.style.setProperty("--font-display", `${size + 7}px`);
+  root.style.setProperty("--font-chat", `${size + 1}px`);
+  root.style.setProperty("--font-prompt", `${size + 3}px`);
+  root.style.setProperty("--font-display", `${size + 3}px`);
   localStorage.setItem("ygg.ui.font", stackId);
 }
 

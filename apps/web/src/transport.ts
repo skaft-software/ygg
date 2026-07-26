@@ -3,6 +3,7 @@ import {
   fixtureSessions,
 } from "./fixtures";
 import type {
+  AttachmentRef,
   ClientCommand,
   CommandAck,
   HostBootstrap,
@@ -26,6 +27,8 @@ export interface YggTransport {
   connect(selectedSessionId?: string): Promise<HostBootstrap>;
   getSession(sessionId: string, signal?: AbortSignal): Promise<SessionSnapshot>;
   send(command: ClientCommand): Promise<CommandAck>;
+  ingestAttachment(file: File): Promise<AttachmentRef>;
+  attachmentContentUrl(handle: string): string;
   subscribe(listener: EventListener): () => void;
   close(): void;
 }
@@ -38,6 +41,8 @@ export class FixtureTransport implements YggTransport {
   private listeners = new Set<EventListener>();
   private timers = new Set<number>();
   private createdCount = 0;
+  private attachmentFiles = new Map<string, File>();
+  private attachmentUrls = new Map<string, string>();
 
   async connect(selectedSessionId?: string): Promise<HostBootstrap> {
     if (selectedSessionId) {
@@ -72,6 +77,37 @@ export class FixtureTransport implements YggTransport {
     }
     this.timers.clear();
     this.listeners.clear();
+    for (const url of this.attachmentUrls.values()) URL.revokeObjectURL(url);
+    this.attachmentFiles.clear();
+    this.attachmentUrls.clear();
+  }
+
+  async ingestAttachment(file: File): Promise<AttachmentRef> {
+    const identity = `${file.name}\0${file.type}\0${file.size}`;
+    let hash = 2_166_136_261;
+    for (let index = 0; index < identity.length; index += 1) {
+      hash ^= identity.charCodeAt(index);
+      hash = Math.imul(hash, 16_777_619);
+    }
+    const handle = `fixture-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+    this.attachmentFiles.set(handle, file);
+    return {
+      id: handle,
+      handle,
+      name: file.name,
+      mediaType: file.type || "application/octet-stream",
+      size: file.size,
+    };
+  }
+
+  attachmentContentUrl(handle: string): string {
+    const existing = this.attachmentUrls.get(handle);
+    if (existing) return existing;
+    const file = this.attachmentFiles.get(handle);
+    if (!file) return "";
+    const url = URL.createObjectURL(file);
+    this.attachmentUrls.set(handle, url);
+    return url;
   }
 
   private emit(event: SessionEvent): void {
@@ -226,7 +262,9 @@ export class FixtureTransport implements YggTransport {
           status: "working",
           title:
             snapshot.items.length === 0
-              ? command.prompt.slice(0, 52)
+              ? command.prompt.slice(0, 52) ||
+                command.attachments[0]?.name ||
+                "New session"
               : snapshot.title,
         },
       });
@@ -401,9 +439,9 @@ export class FixtureTransport implements YggTransport {
         sessionId: command.sessionId,
         sequence: snapshot.sequence + 1,
         patch: {
-          modelId: command.modelId,
-          reasoning: command.reasoning,
-          authority: command.authority,
+          ...(command.modelId ? { modelId: command.modelId } : {}),
+          ...(command.reasoning ? { reasoning: command.reasoning } : {}),
+          ...(command.authority ? { authority: command.authority } : {}),
         },
       });
       return { commandId: command.id, accepted: true };
@@ -597,6 +635,48 @@ export class HttpTransport implements YggTransport {
     }
     this.encodedCommands.delete(command.id);
     return ack;
+  }
+
+  async ingestAttachment(file: File): Promise<AttachmentRef> {
+    const response = await fetch(
+      `/api/v1/attachments?displayName=${encodeURIComponent(file.name)}`,
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": file.type || "application/octet-stream",
+        },
+        body: file,
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Attachment upload failed with ${response.status}`);
+    }
+    const value: unknown = await response.json();
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Attachment upload returned an invalid response.");
+    }
+    const result = value as Record<string, unknown>;
+    if (
+      typeof result.handle !== "string" ||
+      typeof result.displayName !== "string" ||
+      typeof result.mediaType !== "string" ||
+      typeof result.byteLen !== "number"
+    ) {
+      throw new Error("Attachment upload returned an invalid response.");
+    }
+    return {
+      id: result.handle,
+      handle: result.handle,
+      name: result.displayName,
+      mediaType: result.mediaType,
+      size: result.byteLen,
+    };
+  }
+
+  attachmentContentUrl(handle: string): string {
+    return `/api/v1/attachments/${encodeURIComponent(handle)}`;
   }
 
   subscribe(listener: EventListener): () => void {

@@ -254,6 +254,12 @@ export const fixtureBootstrap: HostBootstrap = {
   devices: devicesCatalog,
   capabilities: {
     attachments: true,
+    attachmentPolicy: {
+      acceptedMediaTypes: ["image/*", "text/*", "application/pdf"],
+      maxCount: 8,
+      maxFileBytes: 5_242_880,
+      maxTotalBytes: 20_971_520,
+    },
     previews: true,
     resources: true,
     connectedDevices: true,

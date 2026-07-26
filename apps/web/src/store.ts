@@ -296,6 +296,14 @@ export class YggStore {
     }
   }
 
+  ingestAttachment(file: File): Promise<AttachmentRef> {
+    return this.transport.ingestAttachment(file);
+  }
+
+  attachmentContentUrl(handle: string): string {
+    return this.transport.attachmentContentUrl(handle);
+  }
+
   async selectSession(
     sessionId: string,
     routeMode: SessionRouteMode = "push",
@@ -383,7 +391,7 @@ export class YggStore {
     attachments: AttachmentRef[],
   ): Promise<void> {
     const session = this.selectedSession;
-    if (!session || !prompt.trim()) return;
+    if (!session || (!prompt.trim() && attachments.length === 0)) return;
     const ack = await this.sendCommand({
       id: commandId(),
       type,
@@ -410,7 +418,7 @@ export class YggStore {
     activeDelivery: "steer" | "followUp" = "followUp",
   ): Promise<void> {
     const session = this.selectedSession;
-    if (!session || !prompt.trim()) return;
+    if (!session || (!prompt.trim() && attachments.length === 0)) return;
     if (session.status !== "working") {
       await this.sendInput("session.submit", prompt, attachments);
     } else if (activeDelivery === "steer") {

@@ -3,6 +3,7 @@ import { fixtureBootstrap, fixtureSessions } from "./fixtures";
 import type {
   ClientCommand,
   CommandAck,
+  AttachmentRef,
   HostBootstrap,
   SessionEvent,
   SessionSnapshot,
@@ -43,6 +44,20 @@ class TestTransport implements YggTransport {
   async send(command: ClientCommand): Promise<CommandAck> {
     this.commands.push(clone(command));
     return this.commandHandler(command);
+  }
+
+  async ingestAttachment(file: File): Promise<AttachmentRef> {
+    return {
+      id: "test-attachment",
+      handle: "test-attachment",
+      name: file.name,
+      mediaType: file.type,
+      size: file.size,
+    };
+  }
+
+  attachmentContentUrl(handle: string): string {
+    return `/api/v1/attachments/${encodeURIComponent(handle)}`;
   }
 
   subscribe(listener: (event: SessionEvent) => void): () => void {

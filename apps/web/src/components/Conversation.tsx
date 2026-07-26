@@ -8,13 +8,12 @@ import {
   CircleStop,
   ExternalLink,
   File,
-  FileCode2,
   FileDiff,
   FileText,
   Globe2,
   LoaderCircle,
   Paperclip,
-  Plus,
+  RefreshCw,
   Search,
   ScanSearch,
   ShieldAlert,
@@ -63,6 +62,74 @@ interface ConversationProps {
   ) => Promise<void>;
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
+  onIngestAttachment?: (file: File) => Promise<AttachmentRef>;
+  attachmentContentUrl?: (handle: string) => string;
+}
+
+type DraftAttachment = {
+  localId: string;
+  file: File;
+  previewUrl?: string;
+  status: "uploading" | "uploaded" | "failed";
+  reference?: AttachmentRef;
+  error?: string;
+};
+
+function extensionLabel(name: string): string {
+  const extension = name.split(".").at(-1);
+  return extension && extension !== name
+    ? extension.slice(0, 4).toUpperCase()
+    : "FILE";
+}
+
+function AttachmentPreviewDialog({
+  source,
+  name,
+  onClose,
+}: {
+  source: string | null;
+  name: string;
+  onClose: () => void;
+}) {
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!source) return;
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      }
+      if (event.key === "Tab") {
+        event.preventDefault();
+        closeRef.current?.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose, source]);
+  if (!source) return null;
+  return (
+    <div
+      className="attachment-preview-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Preview ${name}`}
+      onMouseDown={(event) => {
+        if (event.currentTarget === event.target) onClose();
+      }}
+    >
+      <button
+        ref={closeRef}
+        className="attachment-preview-close"
+        onClick={onClose}
+        aria-label="Close image preview"
+        autoFocus
+      >
+        <X aria-hidden="true" />
+      </button>
+      <img src={source} alt={name} />
+    </div>
+  );
 }
 
 const actionIcons: Record<ActionItem["actionKind"], ReactNode> = {
@@ -247,6 +314,8 @@ function TranscriptItemView({
   onOpenSource,
   availableOutputIds,
   availableSourceIds,
+  attachmentContentUrl,
+  onPreviewAttachment,
 }: {
   item: TranscriptItem;
   onResolveApproval: ConversationProps["onResolveApproval"];
@@ -254,24 +323,73 @@ function TranscriptItemView({
   onOpenSource: (sourceId: string) => void;
   availableOutputIds: ReadonlySet<string>;
   availableSourceIds: ReadonlySet<string>;
+  attachmentContentUrl?: (handle: string) => string;
+  onPreviewAttachment: (
+    source: string,
+    name: string,
+    trigger: HTMLElement,
+  ) => void;
 }) {
   switch (item.kind) {
-    case "user_message":
+    case "user_message": {
       return (
         <article className="user-message">
           <div className="message-copy">{item.content}</div>
           {item.attachments?.length ? (
-            <div className="message-attachments">
-              {item.attachments.map((attachment) => (
-                <span key={attachment.id}>
-                  <Paperclip aria-hidden="true" />
-                  {attachment.name}
-                </span>
-              ))}
+            <div
+              className="message-attachments"
+              role="list"
+              aria-label={
+                item.attachments.some((attachment) =>
+                  attachment.mediaType.startsWith("image/"),
+                )
+                  ? "Attached images"
+                  : "Attached files"
+              }
+            >
+              {item.attachments.map((attachment, attachmentIndex) => {
+                const numberedImage = attachment.mediaType.startsWith("image/")
+                  ? item.attachments!
+                      .slice(0, attachmentIndex + 1)
+                      .filter((candidate) =>
+                        candidate.mediaType.startsWith("image/"),
+                      ).length
+                  : 0;
+                return (
+                  <span role="listitem" key={attachment.id}>
+                    {attachment.mediaType.startsWith("image/") &&
+                    attachment.handle &&
+                    attachmentContentUrl?.(attachment.handle) ? (
+                      <button
+                        className="message-image-attachment"
+                        onClick={(event) =>
+                          onPreviewAttachment(
+                            attachmentContentUrl(attachment.handle!),
+                            attachment.name,
+                            event.currentTarget,
+                          )
+                        }
+                        aria-label={`View attached image ${numberedImage}`}
+                      >
+                        <img
+                          src={attachmentContentUrl(attachment.handle)}
+                          alt={attachment.name}
+                        />
+                      </button>
+                    ) : (
+                      <span className="message-file-attachment">
+                        <b>{extensionLabel(attachment.name)}</b>
+                        <em>{attachment.name}</em>
+                      </span>
+                    )}
+                  </span>
+                );
+              })}
             </div>
           ) : null}
         </article>
       );
+    }
 
     case "assistant_message":
       return (
@@ -396,9 +514,114 @@ function EmptySession({ attachments }: { attachments: boolean }) {
       <h1>What can I take off your plate?</h1>
       <p>
         {attachments
-          ? "Describe a task, from a quick fix to a multi-step job. You can attach files and folders."
+          ? "Describe a task, from a quick fix to a multi-step job. You can attach images."
           : "Describe a task, from a quick fix to a multi-step job."}
       </p>
+    </div>
+  );
+}
+
+function ReasoningPowerSlider({
+  options,
+  value,
+  disabled,
+  onChange,
+}: {
+  options: ReasoningEffort[];
+  value: ReasoningEffort;
+  disabled: boolean;
+  onChange: (value: ReasoningEffort) => void;
+}) {
+  const selectedIndex = Math.max(0, options.indexOf(value));
+  const lastIndex = Math.max(0, options.length - 1);
+  const position = lastIndex ? (selectedIndex / lastIndex) * 100 : 0;
+  const [burst, setBurst] = useState(0);
+  const wheelDeltaRef = useRef(0);
+  const isMax = selectedIndex === lastIndex && lastIndex > 0;
+  const isFast =
+    !isMax &&
+    /fast|high|xhigh/i.test(options[selectedIndex] ?? "") &&
+    selectedIndex > 0;
+
+  const selectIndex = (index: number) => {
+    const nextIndex = Math.max(0, Math.min(lastIndex, index));
+    const next = options[nextIndex];
+    if (!next || next === value || disabled) return;
+    if (nextIndex === lastIndex) setBurst((current) => current + 1);
+    onChange(next);
+  };
+
+  return (
+    <div className="reasoning-power-control">
+      <span className="reasoning-power-label" aria-hidden="true">
+        {value}
+      </span>
+      <div className="power-slider-container">
+        <div
+          className="power-slider-root"
+          data-max={isMax}
+          data-fast={isFast}
+          data-disabled={disabled || undefined}
+          style={{ "--power-position": `${position}%` } as CSSProperties}
+        >
+          <div className="power-slider-track" aria-hidden="true">
+            <span className="power-slider-range" />
+            {isMax ? <span className="power-slider-max-fill" /> : null}
+            {isFast ? (
+              <span className="power-slider-fast-particles">
+                {Array.from({ length: 14 }, (_, index) => (
+                  <i key={index} />
+                ))}
+              </span>
+            ) : null}
+            <span className="power-slider-ticks">
+              {options.map((option, index) => (
+                <i
+                  key={option}
+                  data-selected={index <= selectedIndex}
+                  style={
+                    {
+                      "--tick-position": `${lastIndex ? (index / lastIndex) * 100 : 50}%`,
+                    } as CSSProperties
+                  }
+                />
+              ))}
+            </span>
+          </div>
+          <span className="power-slider-thumb-rail" aria-hidden="true">
+            <span className="power-slider-thumb" />
+            {burst ? (
+              <span className="power-slider-burst" key={burst}>
+                {Array.from({ length: 16 }, (_, index) => (
+                  <i key={index} />
+                ))}
+              </span>
+            ) : null}
+          </span>
+          <input
+            className="power-slider-input"
+            type="range"
+            min={0}
+            max={lastIndex}
+            step={1}
+            value={selectedIndex}
+            disabled={disabled || lastIndex === 0}
+            aria-label="Reasoning effort"
+            aria-valuetext={value}
+            onChange={(event) => selectIndex(Number(event.target.value))}
+            onWheel={(event) => {
+              if (disabled) return;
+              wheelDeltaRef.current += event.deltaY;
+              if (Math.abs(wheelDeltaRef.current) < 30) return;
+              event.preventDefault();
+              selectIndex(
+                selectedIndex + (wheelDeltaRef.current > 0 ? -1 : 1),
+              );
+              wheelDeltaRef.current = 0;
+            }}
+          />
+        </div>
+      </div>
     </div>
   );
 }
@@ -409,12 +632,27 @@ function Composer({
   onSubmit,
   onInterrupt,
   onConfigure,
+  onIngestAttachment,
+  onPreviewAttachment,
 }: Pick<
   ConversationProps,
-  "session" | "bootstrap" | "onSubmit" | "onInterrupt" | "onConfigure"
->) {
+  | "session"
+  | "bootstrap"
+  | "onSubmit"
+  | "onInterrupt"
+  | "onConfigure"
+  | "onIngestAttachment"
+> & {
+  onPreviewAttachment: (
+    source: string,
+    name: string,
+    trigger: HTMLElement,
+  ) => void;
+}) {
   const [prompt, setPrompt] = useState("");
-  const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
+  const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [draggingFiles, setDraggingFiles] = useState(false);
   const [activeDelivery, setActiveDelivery] = useState<
     "steer" | "followUp"
   >("followUp");
@@ -422,6 +660,9 @@ function Composer({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragDepthRef = useRef(0);
+  const attachmentsRef = useRef<DraftAttachment[]>([]);
+  const mountedRef = useRef(true);
   const isWorking = session.status === "working";
   const activeModel = bootstrap.models.find(
     (model) => model.id === session.modelId,
@@ -432,12 +673,55 @@ function Composer({
     providerAccents.find(([provider]) => providerKey.includes(provider))?.[1] ??
     "var(--theme-pigment)";
   const intensity = thinkingIntensity[session.reasoning] ?? 0.5;
+  const reasoningOptions =
+    bootstrap.models.find((model) => model.id === session.modelId)?.reasoning ??
+    [session.reasoning];
   const composerStyle = {
     "--model-accent-light": balancedAccent(modelAccent, 0.11),
     "--model-accent-dark": balancedAccent(modelAccent, 0.27),
     "--thinking-intensity": intensity,
     "--thinking-opacity": 0.4 + intensity * 0.55,
   } as CSSProperties;
+  const attachmentPolicy = bootstrap.capabilities.attachmentPolicy;
+  const modelAcceptsAttachments =
+    activeModel?.inputModalities.includes("image") ?? false;
+  const attachmentsAvailable = Boolean(
+    bootstrap.capabilities.attachments &&
+      bootstrap.capabilities.attachmentIngest &&
+      attachmentPolicy &&
+      onIngestAttachment &&
+      modelAcceptsAttachments,
+  );
+  const hasStagedImages = attachments.some((attachment) =>
+    (attachment.file.type || "application/octet-stream").startsWith("image/"),
+  );
+  const attachmentsPending = attachments.some(
+    (attachment) => attachment.status === "uploading",
+  );
+  const attachmentsFailed = attachments.some(
+    (attachment) => attachment.status === "failed",
+  );
+  const uploadedAttachments = attachments.flatMap((attachment) =>
+    attachment.reference ? [attachment.reference] : [],
+  );
+  const canSubmit =
+    (Boolean(prompt.trim()) || uploadedAttachments.length > 0) &&
+    !attachmentsPending &&
+    !attachmentsFailed;
+
+  useEffect(() => {
+    attachmentsRef.current = attachments;
+  }, [attachments]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      for (const attachment of attachmentsRef.current) {
+        if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+      }
+    };
+  }, []);
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
@@ -447,7 +731,7 @@ function Composer({
   }, [prompt]);
 
   const submit = async () => {
-    if (!prompt.trim() || submitting) return;
+    if (!canSubmit || submitting) return;
     if (
       isWorking &&
       ((activeDelivery === "steer" && !bootstrap.capabilities.steer) ||
@@ -457,17 +741,24 @@ function Composer({
     }
     const value = prompt;
     const submittedAttachments = attachments;
+    const submittedReferences = uploadedAttachments;
     setSubmitting(true);
     setSubmitError(null);
     try {
       await onSubmit(
         value,
-        submittedAttachments,
+        submittedReferences,
         isWorking ? activeDelivery : undefined,
       );
       setPrompt((current) => (current === value ? "" : current));
+      const submittedIds = new Set(
+        submittedAttachments.map((attachment) => attachment.localId),
+      );
+      for (const attachment of submittedAttachments) {
+        if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+      }
       setAttachments((current) =>
-        current === submittedAttachments ? [] : current,
+        current.filter((attachment) => !submittedIds.has(attachment.localId)),
       );
     } catch (error) {
       setSubmitError(
@@ -487,43 +778,215 @@ function Composer({
     }
   };
 
+  const uploadAttachment = async (attachment: DraftAttachment) => {
+    if (!onIngestAttachment) return;
+    try {
+      const reference = await onIngestAttachment(attachment.file);
+      if (!mountedRef.current) return;
+      setAttachments((current) =>
+        current.map((candidate) =>
+          candidate.localId === attachment.localId
+            ? { ...candidate, status: "uploaded", reference, error: undefined }
+            : candidate,
+        ),
+      );
+    } catch (error) {
+      if (!mountedRef.current) return;
+      setAttachments((current) =>
+        current.map((candidate) =>
+          candidate.localId === attachment.localId
+            ? {
+                ...candidate,
+                status: "failed",
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : "Upload failed. Try again.",
+              }
+            : candidate,
+        ),
+      );
+    }
+  };
+
+  const stageFiles = (files: File[]) => {
+    if (!attachmentsAvailable || !attachmentPolicy || !files.length) return;
+    setAttachmentError(null);
+    const accepted: DraftAttachment[] = [];
+    let totalBytes = attachments.reduce(
+      (total, attachment) => total + attachment.file.size,
+      0,
+    );
+    for (const file of files) {
+      if (attachments.length + accepted.length >= attachmentPolicy.maxCount) {
+        setAttachmentError(
+          `You can attach up to ${attachmentPolicy.maxCount} files.`,
+        );
+        break;
+      }
+      if (file.size > attachmentPolicy.maxFileBytes) {
+        setAttachmentError(`${file.name} is too large to attach.`);
+        continue;
+      }
+      if (totalBytes + file.size > attachmentPolicy.maxTotalBytes) {
+        setAttachmentError("These files exceed the total attachment limit.");
+        break;
+      }
+      const mediaType = file.type || "application/octet-stream";
+      const acceptedType =
+        attachmentPolicy.acceptedMediaTypes.length === 0 ||
+        attachmentPolicy.acceptedMediaTypes.some((pattern) =>
+          pattern.endsWith("/*")
+            ? mediaType.startsWith(pattern.slice(0, -1))
+            : mediaType === pattern,
+        );
+      if (!acceptedType) {
+        setAttachmentError(`${file.name} is not a supported file type.`);
+        continue;
+      }
+      totalBytes += file.size;
+      accepted.push({
+        localId: crypto.randomUUID(),
+        file,
+        previewUrl:
+          mediaType.startsWith("image/") && URL.createObjectURL
+            ? URL.createObjectURL(file)
+            : undefined,
+        status: "uploading",
+      });
+    }
+    if (!accepted.length) return;
+    setAttachments((current) => [...current, ...accepted]);
+    for (const attachment of accepted) void uploadAttachment(attachment);
+  };
+
   const addAttachments = (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.target.files ?? []);
-    setAttachments((current) => [
-      ...current,
-      ...files.map((file) => ({
-        id: crypto.randomUUID(),
-        name: file.name,
-        mediaType: file.type || "application/octet-stream",
-        size: file.size,
-      })),
-    ]);
+    stageFiles(Array.from(event.target.files ?? []));
     event.target.value = "";
   };
 
+  const removeAttachment = (localId: string) => {
+    setAttachments((current) => {
+      const removed = current.find(
+        (attachment) => attachment.localId === localId,
+      );
+      if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+      return current.filter((attachment) => attachment.localId !== localId);
+    });
+  };
+
   return (
-    <div className="composer-wrap">
+    <div
+      className={`composer-wrap ${draggingFiles ? "is-dragging-files" : ""}`}
+      onDragEnter={(event) => {
+        if (
+          !attachmentsAvailable ||
+          !Array.from(event.dataTransfer.types).includes("Files")
+        ) {
+          return;
+        }
+        event.preventDefault();
+        dragDepthRef.current += 1;
+        setDraggingFiles(true);
+      }}
+      onDragOver={(event) => {
+        if (!attachmentsAvailable) {
+          event.dataTransfer.dropEffect = "none";
+          return;
+        }
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "copy";
+      }}
+      onDragLeave={(event) => {
+        if (!attachmentsAvailable) return;
+        event.preventDefault();
+        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+        if (dragDepthRef.current === 0) setDraggingFiles(false);
+      }}
+      onDrop={(event) => {
+        if (!attachmentsAvailable) return;
+        event.preventDefault();
+        dragDepthRef.current = 0;
+        setDraggingFiles(false);
+        stageFiles(Array.from(event.dataTransfer.files));
+      }}
+    >
       <div
         className={`composer ${isWorking ? "is-working" : ""}`}
         style={composerStyle}
       >
+        {draggingFiles ? (
+          <div className="attachment-drop-overlay" aria-hidden="true">
+            <Paperclip />
+            <strong>Drop files to attach</strong>
+          </div>
+        ) : null}
         {attachments.length ? (
-          <div className="composer-attachments">
+          <div className="composer-attachments" aria-label="Attached files">
             {attachments.map((attachment) => (
-              <span key={attachment.id}>
-                <FileCode2 aria-hidden="true" />
-                {attachment.name}
+              <div
+                className={`composer-attachment is-${attachment.status}`}
+                key={attachment.localId}
+              >
+                {attachment.previewUrl ? (
+                  <button
+                    className="composer-attachment-preview"
+                    onClick={(event) =>
+                      onPreviewAttachment(
+                        attachment.previewUrl!,
+                        attachment.file.name,
+                        event.currentTarget,
+                      )
+                    }
+                    aria-label={`Click to preview ${attachment.file.name}`}
+                  >
+                    <img src={attachment.previewUrl} alt="" />
+                  </button>
+                ) : (
+                  <span className="attachment-extension" aria-hidden="true">
+                    {extensionLabel(attachment.file.name)}
+                  </span>
+                )}
+                <span className="composer-attachment-copy">
+                  <strong>{attachment.file.name}</strong>
+                  <small>
+                    {attachment.status === "uploading"
+                      ? "Uploading…"
+                      : attachment.status === "failed"
+                        ? attachment.error ?? "Upload failed"
+                        : "Ready"}
+                  </small>
+                </span>
+                {attachment.status === "failed" ? (
+                  <button
+                    className="attachment-retry"
+                    onClick={() => {
+                      setAttachments((current) =>
+                        current.map((candidate) =>
+                          candidate.localId === attachment.localId
+                            ? {
+                                ...candidate,
+                                status: "uploading",
+                                error: undefined,
+                              }
+                            : candidate,
+                        ),
+                      );
+                      void uploadAttachment(attachment);
+                    }}
+                    aria-label={`Retry ${attachment.file.name}`}
+                  >
+                    <RefreshCw aria-hidden="true" />
+                  </button>
+                ) : null}
                 <button
-                  onClick={() =>
-                    setAttachments((current) =>
-                      current.filter((item) => item.id !== attachment.id),
-                    )
-                  }
-                  aria-label={`Remove ${attachment.name}`}
+                  className="attachment-remove"
+                  onClick={() => removeAttachment(attachment.localId)}
+                  aria-label={`Remove ${attachment.file.name}`}
                 >
                   <X aria-hidden="true" />
                 </button>
-              </span>
+              </div>
             ))}
           </div>
         ) : null}
@@ -532,6 +995,13 @@ function Composer({
           value={prompt}
           onChange={(event) => setPrompt(event.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={(event) => {
+            if (!attachmentsAvailable) return;
+            const files = Array.from(event.clipboardData.files);
+            if (!files.length) return;
+            event.preventDefault();
+            stageFiles(files);
+          }}
           placeholder={
             isWorking
               ? activeDelivery === "steer"
@@ -547,23 +1017,23 @@ function Composer({
         />
         <div className="composer-toolbar">
           <div className="composer-leading">
-            {bootstrap.capabilities.attachments &&
-            bootstrap.capabilities.attachmentIngest ? (
+            {attachmentsAvailable ? (
               <>
                 <input
                   ref={fileInputRef}
                   type="file"
                   multiple
                   hidden
+                  accept={attachmentPolicy?.acceptedMediaTypes.join(",")}
                   onChange={addAttachments}
                 />
                 <button
                   className="composer-icon-button"
                   onClick={() => fileInputRef.current?.click()}
-                  aria-label="Attach files"
-                  title="Attach files"
+                  aria-label="Add files or photos"
+                  title="Add files or photos"
                 >
-                  <Plus aria-hidden="true" />
+                  <Paperclip aria-hidden="true" />
                 </button>
               </>
             ) : null}
@@ -580,7 +1050,11 @@ function Composer({
                   <option
                     key={model.id}
                     value={model.id}
-                    disabled={!model.available}
+                    disabled={
+                      !model.available ||
+                      (hasStagedImages &&
+                        !model.inputModalities.includes("image"))
+                    }
                   >
                     {model.local ? "● " : ""}
                     {model.name}
@@ -589,29 +1063,12 @@ function Composer({
               </select>
               <ChevronDown aria-hidden="true" />
             </label>
-            <label className="composer-select">
-              <span className="sr-only">Reasoning effort</span>
-              <select
-                value={session.reasoning}
-                disabled={isWorking}
-                onChange={(event) =>
-                  void onConfigure({
-                    reasoning: event.target.value as ReasoningEffort,
-                  })
-                }
-              >
-                {(
-                  bootstrap.models.find(
-                    (model) => model.id === session.modelId,
-                  )?.reasoning ?? [session.reasoning]
-                ).map((reasoning) => (
-                  <option key={reasoning} value={reasoning}>
-                    {reasoning}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown aria-hidden="true" />
-            </label>
+            <ReasoningPowerSlider
+              options={reasoningOptions}
+              value={session.reasoning}
+              disabled={isWorking}
+              onChange={(reasoning) => void onConfigure({ reasoning })}
+            />
             <label className="composer-select authority-select">
               <ShieldCheck aria-hidden="true" />
               <span className="sr-only">Authority</span>
@@ -667,8 +1124,8 @@ function Composer({
             <button
               className="submit-button"
               onClick={() => void submit()}
-              disabled={submitting || !prompt.trim()}
-              aria-disabled={submitting || !prompt.trim()}
+              disabled={submitting || !canSubmit}
+              aria-disabled={submitting || !canSubmit}
               aria-label={
                 isWorking
                   ? activeDelivery === "steer"
@@ -686,6 +1143,11 @@ function Composer({
             {submitError}
           </p>
         ) : null}
+        {attachmentError ? (
+          <p className="composer-error" role="alert">
+            {attachmentError}
+          </p>
+        ) : null}
       </div>
     </div>
   );
@@ -700,9 +1162,16 @@ export function Conversation({
   onResolveApproval,
   onOpenOutput,
   onOpenSource,
+  onIngestAttachment,
+  attachmentContentUrl,
 }: ConversationProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showJump, setShowJump] = useState(false);
+  const [attachmentPreview, setAttachmentPreview] = useState<{
+    source: string;
+    name: string;
+    trigger: HTMLElement;
+  } | null>(null);
   const shouldStickRef = useRef(true);
   const resourcesAvailable = bootstrap.capabilities.resources;
   const availableOutputIds = new Set(
@@ -744,6 +1213,14 @@ export function Conversation({
     });
   };
 
+  const closeAttachmentPreview = () => {
+    const trigger = attachmentPreview?.trigger;
+    setAttachmentPreview(null);
+    window.requestAnimationFrame(() => {
+      if (trigger?.isConnected) trigger.focus();
+    });
+  };
+
   return (
     <section className="conversation" aria-label="Conversation">
       <div className="transcript-scroll" ref={scrollRef}>
@@ -754,7 +1231,13 @@ export function Conversation({
             <EmptySession
               attachments={
                 bootstrap.capabilities.attachments &&
-                bootstrap.capabilities.attachmentIngest
+                bootstrap.capabilities.attachmentIngest &&
+                Boolean(bootstrap.capabilities.attachmentPolicy) &&
+                Boolean(
+                  bootstrap.models
+                    .find((model) => model.id === session.modelId)
+                    ?.inputModalities.includes("image"),
+                )
               }
             />
           ) : (
@@ -767,6 +1250,10 @@ export function Conversation({
                 onOpenSource={onOpenSource}
                 availableOutputIds={availableOutputIds}
                 availableSourceIds={availableSourceIds}
+                attachmentContentUrl={attachmentContentUrl}
+                onPreviewAttachment={(source, name, trigger) =>
+                  setAttachmentPreview({ source, name, trigger })
+                }
               />
             ))
           )}
@@ -779,11 +1266,21 @@ export function Conversation({
         </button>
       ) : null}
       <Composer
+        key={session.sessionId}
         session={session}
         bootstrap={bootstrap}
         onSubmit={onSubmit}
         onInterrupt={onInterrupt}
         onConfigure={onConfigure}
+        onIngestAttachment={onIngestAttachment}
+        onPreviewAttachment={(source, name, trigger) =>
+          setAttachmentPreview({ source, name, trigger })
+        }
+      />
+      <AttachmentPreviewDialog
+        source={attachmentPreview?.source ?? null}
+        name={attachmentPreview?.name ?? ""}
+        onClose={closeAttachmentPreview}
       />
     </section>
   );

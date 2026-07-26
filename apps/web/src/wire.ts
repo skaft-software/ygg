@@ -1170,6 +1170,7 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
       "concurrentSessions",
       "opaqueResources",
       "attachments",
+      "attachmentPolicy",
       "previews",
       "connectedDevices",
       "lanClients",
@@ -1187,6 +1188,49 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
   );
   boolean(capabilities.terminal, "hostBootstrap.capabilities.terminal");
   boolean(capabilities.childAgents, "hostBootstrap.capabilities.childAgents");
+  const attachments = boolean(
+    capabilities.attachments,
+    "hostBootstrap.capabilities.attachments",
+  );
+  const attachmentPolicy =
+    capabilities.attachmentPolicy === undefined
+      ? undefined
+      : (() => {
+          const policy = object(
+            capabilities.attachmentPolicy,
+            "hostBootstrap.capabilities.attachmentPolicy",
+            [
+              "acceptedMediaTypes",
+              "maxCount",
+              "maxFileBytes",
+              "maxTotalBytes",
+            ],
+          );
+          return {
+            acceptedMediaTypes: array(
+              policy.acceptedMediaTypes,
+              "hostBootstrap.capabilities.attachmentPolicy.acceptedMediaTypes",
+            ).map((mediaType, index) =>
+              boundedString(
+                mediaType,
+                `hostBootstrap.capabilities.attachmentPolicy.acceptedMediaTypes[${index}]`,
+                256,
+              ),
+            ),
+            maxCount: number(
+              policy.maxCount,
+              "hostBootstrap.capabilities.attachmentPolicy.maxCount",
+            ),
+            maxFileBytes: number(
+              policy.maxFileBytes,
+              "hostBootstrap.capabilities.attachmentPolicy.maxFileBytes",
+            ),
+            maxTotalBytes: number(
+              policy.maxTotalBytes,
+              "hostBootstrap.capabilities.attachmentPolicy.maxTotalBytes",
+            ),
+          };
+        })();
   const projects = array(wire.projects, "hostBootstrap.projects").map(
     (project, index) => {
       const entry = object(project, `hostBootstrap.projects[${index}]`, [
@@ -1295,10 +1339,8 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
     selectedThemeId,
     devices: [],
     capabilities: {
-      attachments: boolean(
-        capabilities.attachments,
-        "hostBootstrap.capabilities.attachments",
-      ),
+      attachments,
+      attachmentPolicy,
       previews: boolean(
         capabilities.previews,
         "hostBootstrap.capabilities.previews",
@@ -1318,7 +1360,7 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
       // These describe UI paths that require more than a host capability bit.
       // The HTTP service currently has no ingest, pairing, metadata, or theme
       // mutation endpoint, so live mode must not advertise fixture behavior.
-      attachmentIngest: false,
+      attachmentIngest: attachments && attachmentPolicy !== undefined,
       pairDevices: false,
       sessionMetadata: false,
       themeSelection: themes.length > 1,

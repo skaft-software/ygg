@@ -107,6 +107,7 @@ export interface HostBootstrap {
   devices: ConnectedDevice[];
   capabilities: {
     attachments: boolean;
+    attachmentPolicy?: AttachmentPolicy;
     previews: boolean;
     resources: boolean;
     connectedDevices: boolean;
@@ -118,6 +119,13 @@ export interface HostBootstrap {
     steer: boolean;
     followUp: boolean;
   };
+}
+
+export interface AttachmentPolicy {
+  acceptedMediaTypes: string[];
+  maxCount: number;
+  maxFileBytes: number;
+  maxTotalBytes: number;
 }
 
 interface ItemBase {

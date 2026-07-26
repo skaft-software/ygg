@@ -64,4 +64,54 @@ describe("conversation composer", () => {
 
     expect(onSubmit).toHaveBeenCalledWith("Queue this", [], "followUp");
   });
+
+  it("retains a failed image upload with retry and remove controls", async () => {
+    const user = userEvent.setup();
+    const onIngestAttachment = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Upload failed"))
+      .mockResolvedValue({
+        id: "image-handle",
+        handle: "image-handle",
+        name: "photo.png",
+        mediaType: "image/png",
+        size: 4,
+      });
+    const { container } = render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+        onIngestAttachment={onIngestAttachment}
+        attachmentContentUrl={(handle) => `/api/v1/attachments/${handle}`}
+      />,
+    );
+
+    const picker = container.querySelector<HTMLInputElement>(
+      'input[type="file"]',
+    );
+    expect(picker).not.toBeNull();
+    await user.upload(
+      picker!,
+      new File(["tiny"], "photo.png", { type: "image/png" }),
+    );
+
+    const retry = await screen.findByRole("button", {
+      name: "Retry photo.png",
+    });
+    expect(screen.getByText("Upload failed")).toBeVisible();
+    await user.click(retry);
+    expect(await screen.findByText("Ready")).toBeVisible();
+    await user.click(
+      screen.getByRole("button", { name: "Remove photo.png" }),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Remove photo.png" }),
+    ).toBeNull();
+  });
 });

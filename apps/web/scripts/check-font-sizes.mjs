@@ -5,9 +5,9 @@ const root = new URL("../src/", import.meta.url);
 const expectedTokens = new Map([
   ["--font-body", "13px"],
   ["--font-meta", "12px"],
-  ["--font-chat", "15px"],
-  ["--font-prompt", "15px"],
-  ["--font-display", "20px"],
+  ["--font-chat", "14px"],
+  ["--font-prompt", "16px"],
+  ["--font-display", "16px"],
 ]);
 const allowedUses = new Set(
   [...expectedTokens.keys()].map((token) => `var(${token})`),

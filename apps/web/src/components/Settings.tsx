@@ -95,9 +95,9 @@ export function SettingsView({
     const root = document.documentElement;
     root.style.setProperty("--font-body", `${normalized}px`);
     root.style.setProperty("--font-meta", `${Math.max(11, normalized - 1)}px`);
-    root.style.setProperty("--font-chat", `${normalized + 2}px`);
-    root.style.setProperty("--font-prompt", `${normalized + 2}px`);
-    root.style.setProperty("--font-display", `${normalized + 7}px`);
+    root.style.setProperty("--font-chat", `${normalized + 1}px`);
+    root.style.setProperty("--font-prompt", `${normalized + 3}px`);
+    root.style.setProperty("--font-display", `${normalized + 3}px`);
     localStorage.setItem("ygg.ui.size", String(normalized));
   }, [uiSize]);
 
