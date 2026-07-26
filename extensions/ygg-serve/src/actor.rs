@@ -4,7 +4,8 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot, watch};
+use sha2::{Digest as _, Sha256};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::{
     ActorOwnerState, AttentionState, AuthorityProfile, CommandAck, CommandId, DeviceId,
@@ -12,11 +13,12 @@ use crate::{
     ItemLifecycle, ItemPayload, JournalConfig, JournalError, ProtocolValidation, ReplayResponse,
     RequestAnswer, RequestState, SanitizedError, ServiceError, SessionCommand,
     SessionCommandEnvelope, SessionCursor, SessionDriver, SessionLiveState, SessionSeed,
-    SessionSnapshot, SessionSummary, TimestampedEvent, ValidationError,
+    SessionSnapshot, SessionSummary, TimestampedEvent, ValidationError, MAX_DRIVER_OUTCOME_EVENTS,
 };
 
 const MAX_COMMAND_CACHE_CAPACITY: usize = 65_536;
 const MAX_MAILBOX_CAPACITY: usize = 4_096;
+const EVENT_BROADCAST_CAPACITY: usize = 2_048;
 
 /// Actor bounds and authority ceiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,13 +93,23 @@ struct CachedCommand {
     ack: CommandAck,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum CachedCommandIdentity {
     Exact(Box<SessionCommandEnvelope>),
-    /// Free-form one-shot answers are deliberately not retained after the
-    /// driver consumes them. Reuse of the same device-scoped ID returns the
-    /// original acknowledgement regardless of the retransmitted body.
-    ConsumedSecret,
+    /// Free-form one-shot answer body retained only as a non-reversible
+    /// digest, alongside its nonsecret command shape.
+    ConsumedSecret(ConsumedSecretIdentity),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ConsumedSecretIdentity {
+    protocol: u16,
+    host_id: HostId,
+    session_id: crate::SessionId,
+    issued_at_ms: u64,
+    expected_actor_generation: Option<u64>,
+    request_id: crate::RequestId,
+    answer_digest: [u8; 32],
 }
 
 type CommandCacheKey = (DeviceId, CommandId);
@@ -203,7 +215,9 @@ impl SessionActorCore {
         if let Some(cached) = self.command_cache.get(&cache_key) {
             let is_duplicate = match &cached.identity {
                 CachedCommandIdentity::Exact(original) => original.as_ref() == &command,
-                CachedCommandIdentity::ConsumedSecret => true,
+                CachedCommandIdentity::ConsumedSecret(original) => {
+                    secret_answer_identity(&command).as_ref() == Some(original)
+                }
             };
             if is_duplicate {
                 return CommandAdmission {
@@ -246,6 +260,16 @@ impl SessionActorCore {
 
         let result = dispatch(command.command.clone()).await;
         let (ack, published) = match result {
+            Ok(outcome) if outcome.events.len() > MAX_DRIVER_OUTCOME_EVENTS => (
+                CommandAck::rejected(
+                    self.session_id.clone(),
+                    command.command_id.clone(),
+                    acknowledged_at_ms,
+                    self.view.snapshot.cursor,
+                    SanitizedError::internal(),
+                ),
+                Vec::new(),
+            ),
             Ok(outcome) => match self.publish_batch(outcome.events) {
                 Ok(published) => (
                     CommandAck::accepted(
@@ -380,25 +404,33 @@ impl SessionActorCore {
                 self.command_cache.remove(&oldest);
             }
         }
-        let identity = if is_secret_answer(&command.command) {
-            CachedCommandIdentity::ConsumedSecret
-        } else {
-            CachedCommandIdentity::Exact(Box::new(command))
-        };
+        let identity = secret_answer_identity(&command)
+            .map(CachedCommandIdentity::ConsumedSecret)
+            .unwrap_or_else(|| CachedCommandIdentity::Exact(Box::new(command)));
         self.command_order.push_back(key.clone());
         self.command_cache
             .insert(key, CachedCommand { identity, ack });
     }
 }
 
-fn is_secret_answer(command: &SessionCommand) -> bool {
-    matches!(
-        command,
-        SessionCommand::AnswerRequest {
-            answer: RequestAnswer::Text { .. },
-            ..
-        }
-    )
+fn secret_answer_identity(command: &SessionCommandEnvelope) -> Option<ConsumedSecretIdentity> {
+    let SessionCommand::AnswerRequest {
+        request_id,
+        answer: RequestAnswer::Text { text },
+    } = &command.command
+    else {
+        return None;
+    };
+    let answer_digest = Sha256::digest(text.as_bytes()).into();
+    Some(ConsumedSecretIdentity {
+        protocol: command.protocol,
+        host_id: command.host_id.clone(),
+        session_id: command.session_id.clone(),
+        issued_at_ms: command.issued_at_ms,
+        expected_actor_generation: command.expected_actor_generation,
+        request_id: request_id.clone(),
+        answer_digest,
+    })
 }
 
 fn authority_rank(authority: AuthorityProfile) -> u8 {
@@ -442,6 +474,9 @@ fn reduce_snapshot(snapshot: &mut SessionSnapshot, event: &EventPayload) -> Resu
         EventPayload::SessionSettingsChanged { model, authority } => {
             snapshot.model = model.clone();
             snapshot.authority = *authority;
+        }
+        EventPayload::SessionDurableHeadChanged { durable_entry_id } => {
+            snapshot.durable_head = durable_entry_id.clone();
         }
         EventPayload::ItemStarted { item } => {
             if let Some(existing) = snapshot.items.iter().position(|entry| entry.id == item.id) {
@@ -591,6 +626,7 @@ pub struct SessionActorHandle {
     session_id: crate::SessionId,
     sender: mpsc::Sender<ActorMessage>,
     view: watch::Receiver<Arc<ActorView>>,
+    events: broadcast::Sender<EventEnvelope>,
 }
 
 impl SessionActorHandle {
@@ -607,6 +643,14 @@ impl SessionActorHandle {
     /// Subscribes to complete view replacements.
     pub fn subscribe(&self) -> watch::Receiver<Arc<ActorView>> {
         self.view.clone()
+    }
+
+    /// Subscribes to newly published typed events.
+    ///
+    /// Lag is explicit in [`broadcast::error::RecvError::Lagged`]; clients
+    /// recover through the cursor-bound replay endpoint.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope> {
+        self.events.subscribe()
     }
 
     /// Routes one command to the exclusive driver.
@@ -653,6 +697,8 @@ impl SessionActor {
         let session_id = core.session_id().clone();
         let (sender, mut receiver) = mpsc::channel(config.mailbox_capacity);
         let (view_sender, view) = watch::channel(Arc::new(core.view()));
+        let (event_sender, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let task_event_sender = event_sender.clone();
 
         tokio::spawn(async move {
             let mut core = core;
@@ -684,6 +730,9 @@ impl SessionActor {
                                 driver.dispatch(command)
                             })
                             .await;
+                        for event in &admission.published {
+                            let _ = task_event_sender.send(event.clone());
+                        }
                         let _ = response.send(admission);
                         let _ = view_sender.send(Arc::new(core.view()));
                     }
@@ -692,7 +741,8 @@ impl SessionActor {
                     }
                     Input::Message(None) => break,
                     Input::DriverEvent(Some(event)) => {
-                        if core.publish(event).is_ok() {
+                        if let Ok(event) = core.publish(event) {
+                            let _ = task_event_sender.send(event);
                             let _ = view_sender.send(Arc::new(core.view()));
                         }
                     }
@@ -707,6 +757,7 @@ impl SessionActor {
             session_id,
             sender,
             view,
+            events: event_sender,
         })
     }
 }
@@ -870,17 +921,69 @@ mod tests {
         );
         assert!(matches!(
             core.command_cache.get(&key).map(|entry| &entry.identity),
-            Some(CachedCommandIdentity::ConsumedSecret)
+            Some(CachedCommandIdentity::ConsumedSecret(_))
         ));
 
         let retransmit = core
-            .admit_command(
-                make_command("different retransmitted body"),
-                99,
-                |_| async { panic!("a consumed device-scoped command must never dispatch twice") },
-            )
+            .admit_command(make_command("first secret"), 99, |_| async {
+                panic!("a consumed device-scoped command must never dispatch twice")
+            })
             .await;
         assert!(retransmit.cached);
         assert_eq!(first.ack, retransmit.ack);
+
+        let altered = core
+            .admit_command(
+                make_command("different retransmitted body"),
+                100,
+                |_| async { panic!("a conflicting device-scoped command must never dispatch") },
+            )
+            .await;
+        assert!(!altered.cached);
+        assert_eq!(
+            altered.ack.error().map(|error| error.code),
+            Some(ErrorCode::CommandIdConflict)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_immediate_driver_batch_is_rejected_before_projection() {
+        let mut core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            seed(),
+            ActorConfig::default(),
+        )
+        .unwrap();
+        let command = SessionCommandEnvelope::new(
+            HostId::new("host-test").unwrap(),
+            DeviceId::new("device-test").unwrap(),
+            SessionId::new("session-actor").unwrap(),
+            CommandId::new("command-event-flood").unwrap(),
+            1,
+            Some(1),
+            SessionCommand::Abort { run_id: None },
+        );
+        let admission = core
+            .admit_command(command, 10, |_| async {
+                Ok(DriverCommandOutcome::with_events(
+                    (0..=MAX_DRIVER_OUTCOME_EVENTS)
+                        .map(|timestamp| {
+                            TimestampedEvent::new(
+                                timestamp as u64,
+                                EventPayload::UsageUpdated {
+                                    usage: Default::default(),
+                                },
+                            )
+                        })
+                        .collect(),
+                ))
+            })
+            .await;
+        assert!(matches!(
+            admission.ack.disposition,
+            AckDisposition::Rejected { .. }
+        ));
+        assert!(admission.published.is_empty());
+        assert_eq!(core.snapshot().cursor, SessionCursor::zero(1));
     }
 }

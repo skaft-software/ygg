@@ -20,6 +20,19 @@ pub enum TopLevelCommand {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Run the experimental local graphical host.
+    #[cfg(feature = "serve")]
+    Serve {
+        /// Do not open the graphical client in the default browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Loopback TCP port. Zero asks the operating system for a free port.
+        #[arg(long, default_value_t = 31415)]
+        port: u16,
+        /// Directory containing the built graphical shell.
+        #[arg(long, value_name = "DIR")]
+        web_root: Option<PathBuf>,
+    },
 }
 
 /// Command-line launcher for `ygg`.
@@ -1483,6 +1496,21 @@ mod tests {
             Some(TopLevelCommand::Sessions {
                 command: SessionCommand::Inspect { ref id }
             }) if id == "abc-123"
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_accepts_ephemeral_port_without_consuming_a_prompt() {
+        let cli = Cli::try_parse_from(["ygg", "serve", "--no-open", "--port", "0"]).unwrap();
+        assert!(cli.message.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Serve {
+                no_open: true,
+                port: 0,
+                web_root: None,
+            })
         ));
     }
 

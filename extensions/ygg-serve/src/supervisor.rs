@@ -4,17 +4,22 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex};
 
 use crate::{
     ActorConfig, ActorError, ActorView, AuthorityProfile, CatalogCursor, CommandAdmission,
     CommandId, CreateSessionRequest, DeviceId, ErrorCode, HostBootstrap, HostCommand,
-    HostCommandAck, HostCommandEnvelope, HostService, ModelSelection, ProtocolValidation,
-    ReplayResponse, SanitizedError, ServiceError, SessionActor, SessionActorHandle,
-    SessionCommandEnvelope, SessionCursor, SessionDriver, SessionId, PROTOCOL_VERSION,
+    HostCommandAck, HostCommandEnvelope, HostService, HostStreamEvent, ModelSelection,
+    ProtocolValidation, ReplayResponse, SanitizedError, ServiceError, SessionActor,
+    SessionActorHandle, SessionCommandEnvelope, SessionCursor, SessionDriver, SessionId,
+    PROTOCOL_VERSION,
 };
 
 const HOST_COMMAND_CACHE_CAPACITY: usize = 2_048;
+const HOST_EVENT_BROADCAST_CAPACITY: usize = 4_096;
+const MAX_FRESH_PROVISIONAL_OWNERS: usize = 64;
+const MAX_ACTIVE_SESSION_OWNERS: usize = 512;
+const MAX_BOOTSTRAP_SESSION_SUMMARIES: usize = 2_000;
 
 /// Supervisor configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +85,8 @@ enum HostCommandCacheEntry {
 
 struct SupervisorState {
     actors: BTreeMap<SessionId, SessionActorHandle>,
+    session_openings:
+        BTreeMap<SessionId, Vec<oneshot::Sender<Result<SessionActorHandle, SupervisorError>>>>,
     host_commands: BTreeMap<HostCommandKey, HostCommandCacheEntry>,
     host_command_order: VecDeque<HostCommandKey>,
 }
@@ -88,8 +95,23 @@ struct SupervisorState {
 pub struct SessionSupervisor<H: HostService> {
     host: Arc<H>,
     config: SupervisorConfig,
-    state: Mutex<SupervisorState>,
+    state: Arc<Mutex<SupervisorState>>,
     catalog_cursor: Arc<AtomicU64>,
+    host_event_order: Arc<std::sync::Mutex<u64>>,
+    host_events: broadcast::Sender<HostStreamEvent>,
+}
+
+impl<H: HostService> Clone for SessionSupervisor<H> {
+    fn clone(&self) -> Self {
+        Self {
+            host: Arc::clone(&self.host),
+            config: self.config,
+            state: Arc::clone(&self.state),
+            catalog_cursor: Arc::clone(&self.catalog_cursor),
+            host_event_order: Arc::clone(&self.host_event_order),
+            host_events: self.host_events.clone(),
+        }
+    }
 }
 
 impl<H: HostService> SessionSupervisor<H> {
@@ -98,15 +120,19 @@ impl<H: HostService> SessionSupervisor<H> {
         config.actor.authority_ceiling = host.authority_ceiling();
         config.fresh_session_authority =
             clamp_authority(config.fresh_session_authority, host.authority_ceiling());
+        let (host_events, _) = broadcast::channel(HOST_EVENT_BROADCAST_CAPACITY);
         Self {
             host,
             config,
-            state: Mutex::new(SupervisorState {
+            state: Arc::new(Mutex::new(SupervisorState {
                 actors: BTreeMap::new(),
+                session_openings: BTreeMap::new(),
                 host_commands: BTreeMap::new(),
                 host_command_order: VecDeque::new(),
-            }),
+            })),
             catalog_cursor: Arc::new(AtomicU64::new(1)),
+            host_event_order: Arc::new(std::sync::Mutex::new(0)),
+            host_events,
         }
     }
 
@@ -139,35 +165,50 @@ impl<H: HostService> SessionSupervisor<H> {
         &self,
         session_id: &SessionId,
     ) -> Result<SessionActorHandle, SupervisorError> {
-        {
-            let state = self.state.lock().await;
+        enum Begin {
+            Lead,
+            Wait(oneshot::Receiver<Result<SessionActorHandle, SupervisorError>>),
+            Return(SessionActorHandle),
+        }
+
+        let begin = {
+            let mut state = self.state.lock().await;
             if let Some(existing) = state.actors.get(session_id) {
-                return Ok(existing.clone());
+                Begin::Return(existing.clone())
+            } else if let Some(waiters) = state.session_openings.get_mut(session_id) {
+                let (sender, receiver) = oneshot::channel();
+                waiters.push(sender);
+                Begin::Wait(receiver)
+            } else {
+                state
+                    .session_openings
+                    .insert(session_id.clone(), Vec::new());
+                Begin::Lead
             }
+        };
+        match begin {
+            Begin::Return(handle) => return Ok(handle),
+            Begin::Wait(receiver) => {
+                return receiver
+                    .await
+                    .map_err(|_| SupervisorError::Service(ServiceError::Unavailable))?
+            }
+            Begin::Lead => {}
         }
 
-        // Driver construction may perform filesystem/provider work. It stays
-        // outside the registry lock so unrelated sessions can open in
-        // parallel. A concurrent winner is reused and this losing RAII driver
-        // is dropped before it ever receives a command.
-        let driver = self.host.open_session(session_id).await?;
-        if driver.seed().summary.id != *session_id {
-            return Err(SupervisorError::IdentityMismatch);
-        }
-
-        let mut state = self.state.lock().await;
-        if let Some(existing) = state.actors.get(session_id) {
-            return Ok(existing.clone());
-        }
-        let handle = self.spawn_driver(driver)?;
-        if handle.session_id() != session_id {
-            return Err(SupervisorError::IdentityMismatch);
-        }
-        state.actors.insert(session_id.clone(), handle.clone());
-        drop(state);
-        self.observe_actor(&handle);
-        self.bump_catalog();
-        Ok(handle)
+        // The owned task survives cancellation of the initiating request, so
+        // the per-session reservation cannot strand later waiters.
+        let supervisor = self.clone();
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            let result = supervisor.open_session_factory(&session_id).await;
+            supervisor
+                .complete_session_open(session_id, result.clone())
+                .await;
+            result
+        })
+        .await
+        .map_err(|_| SupervisorError::Service(ServiceError::Unavailable))?
     }
 
     /// Builds a fresh catalog/bootstrap around an already hosted session.
@@ -212,6 +253,17 @@ impl<H: HostService> SessionSupervisor<H> {
                 .then_with(|| right.modified_at_ms.cmp(&left.modified_at_ms))
                 .then_with(|| left.id.cmp(&right.id))
         });
+        if sessions.len() > MAX_BOOTSTRAP_SESSION_SUMMARIES {
+            if let Some(selected_index) = sessions
+                .iter()
+                .position(|summary| &summary.id == selected_session_id)
+            {
+                if selected_index >= MAX_BOOTSTRAP_SESSION_SUMMARIES {
+                    sessions.swap(selected_index, MAX_BOOTSTRAP_SESSION_SUMMARIES - 1);
+                }
+            }
+            sessions.truncate(MAX_BOOTSTRAP_SESSION_SUMMARIES);
+        }
 
         let selected_view = selected.view();
         let bootstrap = HostBootstrap {
@@ -303,10 +355,22 @@ impl<H: HostService> SessionSupervisor<H> {
             Begin::Lead => {}
         }
 
-        let ack = self
-            .execute_host_command(&envelope, acknowledged_at_ms)
-            .await;
-        self.complete_host_command(key, envelope, ack.clone()).await;
+        // Creation owns its own task so dropping the initiating HTTP request
+        // cannot leave a permanent InFlight reservation.
+        let supervisor = self.clone();
+        let task_envelope = envelope.clone();
+        let task_key = key;
+        let ack = tokio::spawn(async move {
+            let ack = supervisor
+                .execute_host_command(&task_envelope, acknowledged_at_ms)
+                .await;
+            supervisor
+                .complete_host_command(task_key, task_envelope, ack.clone())
+                .await;
+            ack
+        })
+        .await
+        .map_err(|_| SupervisorError::Service(ServiceError::Unavailable))?;
         Ok(HostCommandAdmission { ack, cached: false })
     }
 
@@ -345,6 +409,14 @@ impl<H: HostService> SessionSupervisor<H> {
         CatalogCursor(self.catalog_cursor.load(Ordering::Acquire))
     }
 
+    /// Subscribes to the ordered live stream across all hosted sessions.
+    ///
+    /// A lagged subscriber must recover each affected session through replay
+    /// or a fresh bootstrap snapshot.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<HostStreamEvent> {
+        self.host_events.subscribe()
+    }
+
     async fn create_owned_session(
         &self,
         request: CreateSessionRequest,
@@ -354,18 +426,78 @@ impl<H: HostService> SessionSupervisor<H> {
         let driver = self.host.create_session(request).await?;
         let session_id = driver.seed().summary.id;
         let mut state = self.state.lock().await;
-        if state.actors.contains_key(&session_id) {
+        let provisional_owners = state
+            .actors
+            .values()
+            .filter(|handle| handle.view().summary.provisional)
+            .count();
+        if state.actors.len() >= MAX_ACTIVE_SESSION_OWNERS
+            || provisional_owners >= MAX_FRESH_PROVISIONAL_OWNERS
+        {
+            return Err(SupervisorError::Service(ServiceError::Unavailable));
+        }
+        if state.actors.contains_key(&session_id)
+            || state.session_openings.contains_key(&session_id)
+        {
             return Err(SupervisorError::DuplicateOwner);
         }
         let handle = self.spawn_driver(driver)?;
         if handle.session_id() != &session_id {
             return Err(SupervisorError::IdentityMismatch);
         }
+        self.observe_actor(&handle);
         state.actors.insert(session_id, handle.clone());
         drop(state);
-        self.observe_actor(&handle);
         self.bump_catalog();
         Ok(handle)
+    }
+
+    async fn open_session_factory(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionActorHandle, SupervisorError> {
+        // Driver construction may perform filesystem/provider work. It stays
+        // outside the registry lock so unrelated sessions can open in
+        // parallel. The reservation ensures exactly one factory runs for this
+        // session ID.
+        let driver = self.host.open_session(session_id).await?;
+        if driver.seed().summary.id != *session_id {
+            return Err(SupervisorError::IdentityMismatch);
+        }
+
+        let mut state = self.state.lock().await;
+        if let Some(existing) = state.actors.get(session_id) {
+            return Ok(existing.clone());
+        }
+        if state.actors.len() >= MAX_ACTIVE_SESSION_OWNERS {
+            return Err(SupervisorError::Service(ServiceError::Unavailable));
+        }
+        let handle = self.spawn_driver(driver)?;
+        if handle.session_id() != session_id {
+            return Err(SupervisorError::IdentityMismatch);
+        }
+        self.observe_actor(&handle);
+        state.actors.insert(session_id.clone(), handle.clone());
+        drop(state);
+        self.bump_catalog();
+        Ok(handle)
+    }
+
+    async fn complete_session_open(
+        &self,
+        session_id: SessionId,
+        result: Result<SessionActorHandle, SupervisorError>,
+    ) {
+        let waiters = self
+            .state
+            .lock()
+            .await
+            .session_openings
+            .remove(&session_id)
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
     }
 
     async fn execute_host_command(
@@ -496,6 +628,11 @@ impl<H: HostService> SessionSupervisor<H> {
                 });
             }
         });
+
+        let mut events = handle.subscribe_events();
+        let sender = self.host_events.clone();
+        let order = Arc::clone(&self.host_event_order);
+        tokio::spawn(async move { forward_actor_events(&mut events, &sender, &order).await });
     }
 
     fn bump_catalog(&self) {
@@ -504,6 +641,33 @@ impl<H: HostService> SessionSupervisor<H> {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1)
             });
+    }
+}
+
+async fn forward_actor_events(
+    events: &mut broadcast::Receiver<crate::EventEnvelope>,
+    sender: &broadcast::Sender<HostStreamEvent>,
+    order: &std::sync::Mutex<u64>,
+) {
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                let streamed = {
+                    let mut sequence = order.lock().expect("host event order poisoned");
+                    let Some(next) = sequence.checked_add(1) else {
+                        break;
+                    };
+                    *sequence = next;
+                    HostStreamEvent::new(next, event)
+                };
+                let _ = sender.send(streamed);
+            }
+            // Do not synthesize continuity. The next retained event keeps its
+            // original per-session cursor, exposing the gap so clients can
+            // recover with replay or a snapshot.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
     }
 }
 
@@ -586,7 +750,10 @@ mod tests {
         next_session: Arc<AtomicUsize>,
         seeds: Arc<StdMutex<BTreeMap<SessionId, SessionSeed>>>,
         dispatches: Arc<StdMutex<BTreeMap<SessionId, usize>>>,
+        opens: Arc<AtomicUsize>,
         create_barrier: Option<Arc<tokio::sync::Barrier>>,
+        create_entered: Option<Arc<tokio::sync::Barrier>>,
+        create_release: Option<Arc<tokio::sync::Barrier>>,
     }
 
     impl MockHost {
@@ -595,7 +762,10 @@ mod tests {
                 next_session: Arc::new(AtomicUsize::new(1)),
                 seeds: Arc::new(StdMutex::new(BTreeMap::new())),
                 dispatches: Arc::new(StdMutex::new(BTreeMap::new())),
+                opens: Arc::new(AtomicUsize::new(0)),
                 create_barrier: None,
+                create_entered: None,
+                create_release: None,
             }
         }
 
@@ -604,6 +774,20 @@ mod tests {
                 create_barrier: Some(Arc::new(tokio::sync::Barrier::new(parties))),
                 ..Self::new()
             }
+        }
+
+        fn with_gated_create() -> (Self, Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>) {
+            let entered = Arc::new(tokio::sync::Barrier::new(2));
+            let release = Arc::new(tokio::sync::Barrier::new(2));
+            (
+                Self {
+                    create_entered: Some(Arc::clone(&entered)),
+                    create_release: Some(Arc::clone(&release)),
+                    ..Self::new()
+                },
+                entered,
+                release,
+            )
         }
 
         fn dispatch_count(&self, session_id: &SessionId) -> usize {
@@ -806,6 +990,12 @@ mod tests {
             if let Some(barrier) = &self.create_barrier {
                 barrier.wait().await;
             }
+            if let Some(entered) = &self.create_entered {
+                entered.wait().await;
+            }
+            if let Some(release) = &self.create_release {
+                release.wait().await;
+            }
             let seed = self.make_seed(&request);
             self.seeds
                 .lock()
@@ -818,6 +1008,7 @@ mod tests {
         }
 
         async fn open_session(&self, session_id: &SessionId) -> Result<Self::Driver, ServiceError> {
+            self.opens.fetch_add(1, Ordering::Relaxed);
             let seed = self
                 .seeds
                 .lock()
@@ -865,6 +1056,73 @@ mod tests {
                 }),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn actor_fan_in_preserves_a_detectable_session_cursor_gap_after_lag() {
+        let session_id = SessionId::new("session-lag").unwrap();
+        let (actor_sender, _) = broadcast::channel(2);
+        let mut actor_receiver = actor_sender.subscribe();
+        for sequence in 1..=3 {
+            actor_sender
+                .send(crate::EventEnvelope::new(
+                    session_id.clone(),
+                    SessionCursor {
+                        actor_generation: 1,
+                        sequence,
+                    },
+                    sequence,
+                    EventPayload::SessionStateChanged {
+                        state: SessionLiveState::Idle,
+                        active_run_id: None,
+                    },
+                ))
+                .unwrap();
+        }
+        drop(actor_sender);
+
+        let (host_sender, mut host_receiver) = broadcast::channel(4);
+        let order = std::sync::Mutex::new(0);
+        forward_actor_events(&mut actor_receiver, &host_sender, &order).await;
+        let first = host_receiver.recv().await.unwrap();
+        let second = host_receiver.recv().await.unwrap();
+        assert_eq!(first.event.cursor.sequence, 2);
+        assert_eq!(second.event.cursor.sequence, 3);
+        assert_eq!(first.host_sequence, 1);
+        assert_eq!(second.host_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn fresh_owner_cap_still_allows_an_explicit_durable_restore() {
+        let host = Arc::new(MockHost::new());
+        let existing = host.make_seed(&CreateSessionRequest {
+            project_id: None,
+            provisional: false,
+            authority: AuthorityProfile::FullAccess,
+            model: None,
+        });
+        let existing_id = existing.summary.id.clone();
+        host.seeds
+            .lock()
+            .unwrap()
+            .insert(existing_id.clone(), existing);
+        let supervisor = SessionSupervisor::new(host, SupervisorConfig::default());
+
+        for _ in 0..MAX_FRESH_PROVISIONAL_OWNERS {
+            supervisor.create_fresh_session(None).await.unwrap();
+        }
+        assert!(matches!(
+            supervisor.create_fresh_session(None).await,
+            Err(SupervisorError::Service(ServiceError::Unavailable))
+        ));
+        assert_eq!(
+            supervisor
+                .open_session(&existing_id)
+                .await
+                .unwrap()
+                .session_id(),
+            &existing_id
+        );
     }
 
     #[tokio::test]
@@ -970,6 +1228,62 @@ mod tests {
             .unwrap();
         assert!(!other_device.cached);
         assert_eq!(supervisor.active_session_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_host_create_finishes_and_retry_reuses_the_result() {
+        let (host, entered, release) = MockHost::with_gated_create();
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::new(host),
+            SupervisorConfig::default(),
+        ));
+        let envelope = create_command("device-mock", "command-cancelled-create");
+        let initiating = {
+            let supervisor = Arc::clone(&supervisor);
+            let envelope = envelope.clone();
+            tokio::spawn(async move { supervisor.host_command(envelope, 20).await })
+        };
+
+        entered.wait().await;
+        initiating.abort();
+        release.wait().await;
+        let retry = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            supervisor.host_command(envelope, 99),
+        )
+        .await
+        .expect("retry must not wait on an abandoned InFlight reservation")
+        .unwrap();
+        assert!(retry.cached);
+        assert!(matches!(
+            retry.ack.disposition,
+            crate::HostAckDisposition::Accepted { .. }
+        ));
+        assert_eq!(supervisor.active_session_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_open_of_one_session_constructs_one_driver() {
+        let host = Arc::new(MockHost::new());
+        let request = CreateSessionRequest {
+            project_id: None,
+            provisional: false,
+            authority: AuthorityProfile::FullAccess,
+            model: None,
+        };
+        let seed = host.create_session(request).await.unwrap().seed();
+        let session_id = seed.summary.id;
+        let supervisor = SessionSupervisor::new(host.clone(), SupervisorConfig::default());
+
+        let (first, second) = tokio::join!(
+            supervisor.open_session(&session_id),
+            supervisor.open_session(&session_id)
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.session_id(), second.session_id());
+        assert_eq!(host.opens.load(Ordering::Relaxed), 1);
+        assert_eq!(supervisor.active_session_count().await, 1);
     }
 
     #[tokio::test]

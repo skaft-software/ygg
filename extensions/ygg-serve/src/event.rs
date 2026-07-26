@@ -7,9 +7,9 @@ use crate::bounds::{
     MAX_EVENT_BYTES, MAX_PUBLIC_TEXT_BYTES,
 };
 use crate::{
-    ArtifactRef, AuthorityProfile, ItemId, ItemLifecycle, ModelSelection, PendingRequest, RunId,
-    SessionCursor, SessionId, SessionItem, SessionLiveState, SessionSnapshot, SourceRef,
-    UsageSnapshot, PROTOCOL_VERSION,
+    ArtifactRef, AuthorityProfile, DurableEntryId, ItemId, ItemLifecycle, ModelSelection,
+    PendingRequest, RunId, SessionCursor, SessionId, SessionItem, SessionLiveState,
+    SessionSnapshot, SourceRef, UsageSnapshot, PROTOCOL_VERSION,
 };
 
 /// Typed provisional item delta.
@@ -60,6 +60,14 @@ pub enum EventPayload {
         model: ModelSelection,
         /// Effective authority after host clamping.
         authority: AuthorityProfile,
+    },
+    /// The authoritative append-only head changed, including invisible config
+    /// or provider sidecar entries.
+    #[serde(rename = "session.durableHeadChanged")]
+    SessionDurableHeadChanged {
+        /// Exact current head, or none for an empty provisional session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        durable_entry_id: Option<DurableEntryId>,
     },
     /// A provisional item began.
     #[serde(rename = "item.started")]
@@ -170,6 +178,33 @@ impl EventEnvelope {
     }
 }
 
+/// One event in the host-global live stream.
+///
+/// Session cursors remain the authority for replay. `host_sequence` only
+/// provides deterministic ordering across concurrently running session
+/// actors on one live connection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostStreamEvent {
+    /// Protocol major.
+    pub protocol: u16,
+    /// Monotonic sequence for this running host process.
+    pub host_sequence: u64,
+    /// Exact session event.
+    pub event: EventEnvelope,
+}
+
+impl HostStreamEvent {
+    /// Wraps one session event with a live host sequence.
+    pub fn new(host_sequence: u64, event: EventEnvelope) -> Self {
+        Self {
+            protocol: PROTOCOL_VERSION,
+            host_sequence,
+            event,
+        }
+    }
+}
+
 /// Explicit cursor gap requiring snapshot replacement.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -248,6 +283,7 @@ impl ProtocolValidation for EventPayload {
                 }
             }
             Self::SessionSettingsChanged { model, .. } => model.validate()?,
+            Self::SessionDurableHeadChanged { .. } => {}
             Self::ItemStarted { item } => {
                 item.validate()?;
                 if item.lifecycle != ItemLifecycle::Provisional {
@@ -295,6 +331,25 @@ impl ProtocolValidation for EventEnvelope {
         }
         self.event.validate()?;
         validate_serialized_size("event", self, MAX_EVENT_BYTES)
+    }
+}
+
+impl ProtocolValidation for HostStreamEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.protocol != PROTOCOL_VERSION {
+            return Err(ValidationError::new(
+                "host_stream.protocol",
+                format!("must equal protocol major {PROTOCOL_VERSION}"),
+            ));
+        }
+        if self.host_sequence == 0 {
+            return Err(ValidationError::new(
+                "host_stream.host_sequence",
+                "must be non-zero",
+            ));
+        }
+        self.event.validate()?;
+        validate_serialized_size("host_stream", self, MAX_EVENT_BYTES)
     }
 }
 

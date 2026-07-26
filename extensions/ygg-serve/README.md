@@ -15,14 +15,16 @@ The package contains:
 - a serialized `SessionActor`;
 - a `SessionSupervisor` that prevents duplicate mutable owners without holding
   its actor-map lock across slow session factories; and
+- a loopback-only HTTP/WebSocket transport with one-use launch authentication,
+  strict same-origin checks, bounded requests, and safe static assets; and
 - `HostService` / `SessionDriver` adapter traits for the real Ygg application.
 
-It does **not** contain a TUI, web layout, HTTP server, provider client, Agent,
-authenticated LAN pairing, upload/content route, or a second session format. A
-future first-party adapter should own one existing
-`ygg_coding_agent::app::App` inside each `SessionDriver`, translate real
-`AgentEvent` values into `TimestampedEvent`, and hydrate committed
-`SessionItem` values from Ygg's append-only JSONL.
+It does **not** contain a TUI, web layout, provider client, Agent, authenticated
+LAN pairing, upload/content route, or a second session format. The
+feature-gated first-party adapter in `ygg-coding-agent` owns one existing
+`App` inside each driver, translates real `AgentEvent` values into
+`TimestampedEvent`, and hydrates committed `SessionItem` values from Ygg's
+append-only JSONL.
 
 Golden JSON contracts for the browser/native client boundary live in
 `fixtures/`. They use camel-case fields and explicit dotted command/event
@@ -42,17 +44,9 @@ The eventual Ygg adapter must:
    public request IDs.
 8. Never infer tool activity, sources, changes, or artifacts from model prose.
 9. Scope idempotency keys by authenticated device identity.
-10. Never retain free-form one-shot answers in acknowledgement caches after
-    dispatch; retransmission of the same device/command identity receives the
-    original acknowledgement.
-
-The current `ygg-coding-agent` package is binary-only and its bootstrap modules
-are private, so integrating a real driver today would require widening that
-boundary. This experiment intentionally leaves core code untouched. The
-smallest future seam is a feature-gated public adapter module that exports a
-graphical bootstrap configuration and an `AppSessionDriver` implementing the
-traits in this crate; it should not expose TUI types or move session ownership
-into a global mutex.
+10. Retain free-form one-shot answers only as non-reversible digests plus their
+    nonsecret command shape, preserving exact idempotency without retaining
+    plaintext.
 
 Run focused checks with:
 

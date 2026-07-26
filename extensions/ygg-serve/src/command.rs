@@ -446,28 +446,26 @@ impl ProtocolValidation for SessionCommandEnvelope {
                 format!("must equal protocol major {PROTOCOL_VERSION}"),
             ));
         }
+        if self.expected_actor_generation.is_none() {
+            return Err(ValidationError::new(
+                "command.expected_actor_generation",
+                "is required for every remote session mutation",
+            ));
+        }
         match &self.command {
             SessionCommand::SubmitPrompt { input }
             | SessionCommand::Steer { input }
             | SessionCommand::FollowUp { input } => input.validate()?,
             SessionCommand::Abort { .. } => {}
-            SessionCommand::AnswerRequest { answer, .. } => {
-                if self.expected_actor_generation.is_none() {
-                    return Err(ValidationError::new(
-                        "command.expected_actor_generation",
-                        "is required when answering a one-shot request",
-                    ));
+            SessionCommand::AnswerRequest { answer, .. } => match answer {
+                RequestAnswer::Approval { .. } => {}
+                RequestAnswer::Text { text } => {
+                    validate_public_text("command.answer.text", text, 64 * 1024, true)?;
                 }
-                match answer {
-                    RequestAnswer::Approval { .. } => {}
-                    RequestAnswer::Text { text } => {
-                        validate_public_text("command.answer.text", text, 64 * 1024, true)?;
-                    }
-                    RequestAnswer::Choice { choice } => {
-                        validate_public_text("command.answer.choice", choice, 1024, false)?;
-                    }
+                RequestAnswer::Choice { choice } => {
+                    validate_public_text("command.answer.choice", choice, 1024, false)?;
                 }
-            }
+            },
             SessionCommand::ChangeModel { provider, model } => {
                 validate_public_text("command.provider", provider, 128, false)?;
                 validate_public_text("command.model", model, 256, false)?;

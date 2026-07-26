@@ -71,6 +71,30 @@ fixtures. It includes:
 
 Fixtures remain a development and test input only.
 
+## Experimental build and test gates
+
+The shipping binary keeps this surface disabled by default. Build or install
+the experimental distribution explicitly with:
+
+```console
+cargo build --release -p ygg-coding-agent --features serve
+cargo install --locked --path crates/ygg-coding-agent --bin ygg --features serve
+```
+
+Because `extensions/ygg-serve` is deliberately workspace-excluded, its focused
+gate is mandatory in addition to the ordinary workspace gates:
+
+```console
+cargo test --manifest-path extensions/ygg-serve/Cargo.toml
+cargo test -p ygg-coding-agent --features serve
+```
+
+`ygg serve` binds IPv4 loopback only in this cut. A one-use launch capability
+is exchanged for an ephemeral, HttpOnly, same-site browser cookie before any
+API or event-stream access. This transport authentication is distinct from
+Ygg's agent authority and from the future LAN device identity described in the
+pairing plan.
+
 ## Explicit exclusions
 
 The first web release does not include skills, MCP, plugins, extension

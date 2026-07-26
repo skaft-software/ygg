@@ -17,6 +17,7 @@ mod model;
 mod service;
 mod supervisor;
 mod theme;
+mod transport;
 
 pub use actor::{
     ActorConfig, ActorError, ActorView, CommandAdmission, SessionActor, SessionActorCore,
@@ -33,7 +34,8 @@ pub use command::{
 };
 pub use error::{ErrorCode, SanitizedError};
 pub use event::{
-    EventEnvelope, EventPayload, ItemDelta, ReplayGap, ReplayResponse, TimestampedEvent,
+    EventEnvelope, EventPayload, HostStreamEvent, ItemDelta, ReplayGap, ReplayResponse,
+    TimestampedEvent,
 };
 pub use ids::{
     ArtifactId, CommandId, DeviceId, DurableEntryId, HostId, ItemId, ProjectId, RequestId, RunId,
@@ -50,13 +52,14 @@ pub use model::{
 };
 pub use service::{
     CreateSessionRequest, DriverCommandOutcome, HostService, ServiceError, SessionDriver,
-    SessionSeed,
+    SessionSeed, MAX_DRIVER_OUTCOME_EVENTS,
 };
 pub use supervisor::{HostCommandAdmission, SessionSupervisor, SupervisorConfig, SupervisorError};
 pub use theme::{
     ColorScheme, SemanticRole, ThemeColor, ThemeDensity, ThemeDto, ThemeMotion, ThemeOption,
     ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
 };
+pub use transport::{LoopbackConfig, LoopbackServer, TransportError};
 
 /// Current experimental wire-protocol major.
 pub const PROTOCOL_VERSION: u16 = 1;

@@ -10,6 +10,13 @@ use crate::{
     ThemeId, ThemeOption, TimestampedEvent,
 };
 
+/// Maximum immediate events one driver dispatch may return.
+///
+/// Long-running output must flow through [`SessionDriver::next_event`] so a
+/// single command acknowledgement cannot allocate an unbounded projection
+/// batch.
+pub const MAX_DRIVER_OUTCOME_EVENTS: usize = 256;
+
 /// Host-scoped fresh-session operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateSessionRequest {

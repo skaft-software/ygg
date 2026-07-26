@@ -7,6 +7,9 @@
 //! trust, startup diagnostics, host-state refresh, slash commands, context
 //! composition, semantic status collection, and reload.
 
+#[cfg(feature = "serve")]
+pub mod serve;
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;

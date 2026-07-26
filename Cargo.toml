@@ -6,6 +6,7 @@ members = [
     "crates/ygg-agent",
     "crates/ygg-coding-agent",
 ]
+exclude = ["extensions/ygg-serve"]
 
 [workspace.package]
 version = "0.3.2-alpha"

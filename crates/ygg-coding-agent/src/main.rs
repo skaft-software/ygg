@@ -60,11 +60,28 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let cwd = std::env::current_dir()?;
-    tui::terminal::install_panic_hook();
-    tui::terminal::install_signal_restore()?;
+    #[cfg(feature = "serve")]
+    let is_serve = matches!(&top_level_command, Some(cli::TopLevelCommand::Serve { .. }));
+    #[cfg(not(feature = "serve"))]
+    let is_serve = false;
+    if !is_serve {
+        // Preserve the original startup/error boundary for every terminal and
+        // non-Serve invocation.
+        tui::terminal::install_panic_hook();
+        tui::terminal::install_signal_restore()?;
+    }
     let config = cli::build_config(cli, &cwd)?;
-    if let Some(cli::TopLevelCommand::Sessions { command }) = top_level_command {
+    if let Some(cli::TopLevelCommand::Sessions { command }) = top_level_command.clone() {
         return session_commands::run(command, &config);
+    }
+    #[cfg(feature = "serve")]
+    if let Some(cli::TopLevelCommand::Serve {
+        no_open,
+        port,
+        web_root,
+    }) = top_level_command
+    {
+        return extensions::serve::run(config, port, no_open, web_root).await;
     }
     let mode = config.mode.clone();
     let initial_prompt = config.initial_prompt.clone();

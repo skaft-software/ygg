@@ -60,11 +60,20 @@ pub fn validate_public_text(
         ));
     }
     if value.chars().any(|character| {
-        character.is_control() && !(multiline && matches!(character, '\n' | '\r' | '\t'))
+        let unsafe_directional = matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        );
+        unsafe_directional
+            || (character.is_control() && !(multiline && matches!(character, '\n' | '\r' | '\t')))
     }) {
         return Err(ValidationError::new(
             field,
-            "contains a disallowed control character",
+            "contains a disallowed control or directional character",
         ));
     }
     Ok(())
@@ -185,5 +194,11 @@ mod tests {
             value = serde_json::json!([value]);
         }
         assert!(validate_json("payload", &value, 4096).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_bidi_formatting_controls() {
+        assert!(validate_public_text("text", "safe\u{202e}spoofed", 128, true).is_err());
+        assert!(validate_public_text("text", "safe\u{2066}isolated", 128, true).is_err());
     }
 }
