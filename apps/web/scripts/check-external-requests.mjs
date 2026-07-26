@@ -52,6 +52,7 @@ function assertCsp(scope, file, source) {
 
   const exact = new Map([
     ["connect-src", ["'self'"]],
+    ["img-src", ["'self'", "data:", "blob:"]],
     ["object-src", ["'none'"]],
     ["base-uri", ["'none'"]],
     ["form-action", ["'none'"]],

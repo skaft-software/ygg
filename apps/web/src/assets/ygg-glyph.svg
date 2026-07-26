@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="80 28 264 258" role="img" aria-labelledby="title description">
-  <title id="title">Ygg braille tree</title>
-  <description id="description">The unboxed Ygg braille point-cloud tree.</description>
+  <title id="title">ygg braille tree</title>
+  <description id="description">The unboxed ygg braille point-cloud tree.</description>
   <defs>
     <linearGradient id="tree" x1="0" y1="37.7" x2="0" y2="273.1" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#35c759"/>

@@ -143,6 +143,19 @@ test("uploads an image, sends it without text, and restores thumbnail focus", as
   await expect(
     page.getByLabel("Attached files").getByText("Ready", { exact: true }),
   ).toBeVisible();
+  await expect
+    .poll(() =>
+      staged.locator("img").evaluate((image) => ({
+        complete: image.complete,
+        naturalWidth: image.naturalWidth,
+        source: image.currentSrc,
+      })),
+    )
+    .toEqual({
+      complete: true,
+      naturalWidth: 1,
+      source: expect.stringMatching(/^blob:/),
+    });
   await page.getByRole("button", { name: "Send message" }).click();
 
   const thumbnail = page.getByRole("button", {
