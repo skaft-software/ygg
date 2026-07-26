@@ -1,0 +1,14 @@
+{
+  "id": "item-live-steer",
+  "runId": "run-3-1",
+  "turnId": "turn-1",
+  "lifecycle": "provisional",
+  "payload": {
+    "type": "userMessage",
+    "data": {
+      "text": "Change direction",
+      "attachments": [],
+      "delivery": "steer"
+    }
+  }
+}

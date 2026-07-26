@@ -511,6 +511,18 @@ pub enum RunOutcome {
     Failed,
 }
 
+/// How a live user message was delivered to the running agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UserMessageDelivery {
+    /// Began a new run.
+    Submit,
+    /// Redirected the active run immediately.
+    Steer,
+    /// Queued input for the next turn of the active run.
+    FollowUp,
+}
+
 /// Typed transcript payload. The model never supplies component schemas.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -527,6 +539,9 @@ pub enum ItemPayload {
         /// Host-ingested attachments.
         #[serde(default)]
         attachments: Vec<crate::AttachmentRef>,
+        /// Live delivery semantics, omitted when durable history cannot prove them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery: Option<UserMessageDelivery>,
     },
     /// Visible assistant response.
     AssistantMessage {
@@ -920,7 +935,9 @@ impl ProtocolValidation for PreviewRef {
 impl ProtocolValidation for ItemPayload {
     fn validate(&self) -> Result<(), ValidationError> {
         match self {
-            Self::UserMessage { text, attachments } => {
+            Self::UserMessage {
+                text, attachments, ..
+            } => {
                 validate_public_text("item.user.text", text, MAX_PROMPT_BYTES, true)?;
                 if attachments.len() > 32 {
                     return Err(ValidationError::new(
@@ -1277,5 +1294,41 @@ fn authority_rank(authority: AuthorityProfile) -> u8 {
         AuthorityProfile::ReadOnly => 0,
         AuthorityProfile::Workspace => 1,
         AuthorityProfile::FullAccess => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_message_delivery_is_additive_and_legacy_safe() {
+        let legacy = serde_json::json!({
+            "type": "userMessage",
+            "data": {
+                "text": "hello",
+                "attachments": []
+            }
+        });
+        let decoded: ItemPayload = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            decoded,
+            ItemPayload::UserMessage { delivery: None, .. }
+        ));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+
+        for (delivery, expected) in [
+            (UserMessageDelivery::Submit, "submit"),
+            (UserMessageDelivery::Steer, "steer"),
+            (UserMessageDelivery::FollowUp, "followUp"),
+        ] {
+            let encoded = serde_json::to_value(ItemPayload::UserMessage {
+                text: "hello".into(),
+                attachments: Vec::new(),
+                delivery: Some(delivery),
+            })
+            .unwrap();
+            assert_eq!(encoded["data"]["delivery"], expected);
+        }
     }
 }

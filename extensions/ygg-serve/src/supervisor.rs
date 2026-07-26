@@ -986,6 +986,7 @@ mod tests {
                 payload: ItemPayload::UserMessage {
                     text: input.text,
                     attachments: input.attachments,
+                    delivery: None,
                 },
             };
             Ok(DriverCommandOutcome::run(

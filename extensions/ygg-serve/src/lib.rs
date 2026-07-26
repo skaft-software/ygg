@@ -54,7 +54,7 @@ pub use model::{
     InputModality, ItemLifecycle, ItemPayload, ModelSelection, ModelSummary, PendingRequest,
     PlanStep, PlanStepState, PreviewRef, ProjectSummary, RequestKind, RequestState, RunOutcome,
     SessionCursor, SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, SourceKind,
-    SourceRef, UsageSnapshot,
+    SourceRef, UsageSnapshot, UserMessageDelivery,
 };
 pub use service::{
     CreateSessionRequest, DriverCommandOutcome, HostService, ServiceError, SessionDriver,

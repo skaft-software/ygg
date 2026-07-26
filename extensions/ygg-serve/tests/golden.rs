@@ -12,10 +12,10 @@ use ygg_serve_backend::{
     HostAckDisposition, HostBootstrap, HostCapabilities, HostCommand, HostCommandAck,
     HostCommandEnvelope, HostDescriptor, HostId, InputModality, ItemDelta, ItemId, ItemLifecycle,
     ItemPayload, ModelSelection, ModelSummary, ProjectId, ProjectSummary, PromptInput,
-    ProtocolValidation, SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId,
+    ProtocolValidation, RunId, SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId,
     SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity,
     ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
-    TurnId, UsageSnapshot,
+    TurnId, UsageSnapshot, UserMessageDelivery,
 };
 
 fn model_selection() -> ModelSelection {
@@ -36,6 +36,22 @@ fn session_item() -> SessionItem {
         durable_entry_id: Some(DurableEntryId::new("entry-42").unwrap()),
         payload: ItemPayload::AssistantMessage {
             text: "Ready.".into(),
+        },
+    }
+}
+
+fn live_control_item() -> SessionItem {
+    SessionItem {
+        id: ItemId::new("item-live-steer").unwrap(),
+        run_id: Some(RunId::new("run-3-1").unwrap()),
+        turn_id: Some(TurnId::new("turn-1").unwrap()),
+        provider_attempt: None,
+        lifecycle: ItemLifecycle::Provisional,
+        durable_entry_id: None,
+        payload: ItemPayload::UserMessage {
+            text: "Change direction".into(),
+            attachments: Vec::new(),
+            delivery: Some(UserMessageDelivery::Steer),
         },
     }
 }
@@ -265,6 +281,14 @@ fn session_snapshot_golden_contract() {
     assert_golden(
         snapshot(),
         include_str!("../fixtures/session-snapshot.json"),
+    );
+}
+
+#[test]
+fn live_user_delivery_golden_contract() {
+    assert_golden(
+        live_control_item(),
+        include_str!("../fixtures/live-user-delivery.json"),
     );
 }
 

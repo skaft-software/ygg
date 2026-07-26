@@ -33,7 +33,8 @@ use ygg_serve_backend::{
     SessionSeed, SessionSnapshot, SessionSummary, SessionSupervisor, SourceId, SourceKind,
     SourceRef, StoredAttachment, StoredResource, SupervisorConfig, ThemeColor, ThemeDensity,
     ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
-    TimestampedEvent, TurnId, UsageSnapshot, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
+    TimestampedEvent, TurnId, UsageSnapshot, UserMessageDelivery, MAX_ITEM_TEXT_BYTES,
+    MAX_PROMPT_BYTES,
 };
 
 use crate::app::bootstrap::{build_app, LaunchSelection, SessionSelection};
@@ -645,6 +646,11 @@ struct ProjectedToolCall {
     arguments: serde_json::Value,
 }
 
+struct PendingUserItem {
+    id: ItemId,
+    delivery: UserMessageDelivery,
+}
+
 struct ProjectionState {
     known_entries: usize,
     run_counter: u64,
@@ -661,7 +667,7 @@ struct ProjectionState {
     tool_progress: HashMap<String, (String, u64)>,
     private_requests: HashMap<RequestId, PrivateRequest>,
     pending_attachments: VecDeque<Vec<AttachmentRef>>,
-    pending_user_items: VecDeque<ItemId>,
+    pending_user_items: VecDeque<PendingUserItem>,
 }
 
 impl ProjectionState {
@@ -1271,9 +1277,10 @@ async fn start_and_drive_run(
             .pending_attachments
             .push_back(attachments.clone());
     }
-    projection
-        .pending_user_items
-        .push_back(user_item_id.clone());
+    projection.pending_user_items.push_back(PendingUserItem {
+        id: user_item_id.clone(),
+        delivery: UserMessageDelivery::Submit,
+    });
     app.executable_extensions
         .commit_prompt_context(pending_context_count);
     let control = run.control();
@@ -1290,6 +1297,7 @@ async fn start_and_drive_run(
                 payload: ItemPayload::UserMessage {
                     text: bounded_text(&prompt, MAX_PROMPT_BYTES),
                     attachments: attachments.clone(),
+                    delivery: Some(UserMessageDelivery::Submit),
                 },
             },
         }),
@@ -1367,10 +1375,10 @@ async fn start_and_drive_run(
             .await
             .map_err(|_| ServiceError::Unavailable)?;
     }
-    for item_id in projection.pending_user_items.drain(..) {
+    for pending in projection.pending_user_items.drain(..) {
         events
             .send(event(EventPayload::ItemRetracted {
-                item_id,
+                item_id: pending.id,
                 provider_attempt: 1,
                 reason: "Input was not delivered before the run ended.".into(),
             }))
@@ -1425,8 +1433,15 @@ async fn handle_active_command(
             match resolve_control_input(plan, text.clone(), &references) {
                 Ok(input) => match control.steer(input).await {
                     Ok(()) => {
-                        publish_control_user_item(run_id, text, references, projection, events)
-                            .await
+                        publish_control_user_item(
+                            run_id,
+                            text,
+                            references,
+                            UserMessageDelivery::Steer,
+                            projection,
+                            events,
+                        )
+                        .await
                     }
                     Err(_) => Err(ServiceError::InvalidBoundary),
                 },
@@ -1441,8 +1456,15 @@ async fn handle_active_command(
             match resolve_control_input(plan, text.clone(), &references) {
                 Ok(input) => match control.follow_up(input).await {
                     Ok(()) => {
-                        publish_control_user_item(run_id, text, references, projection, events)
-                            .await
+                        publish_control_user_item(
+                            run_id,
+                            text,
+                            references,
+                            UserMessageDelivery::FollowUp,
+                            projection,
+                            events,
+                        )
+                        .await
                     }
                     Err(_) => Err(ServiceError::InvalidBoundary),
                 },
@@ -1556,12 +1578,16 @@ async fn publish_control_user_item(
     run_id: &RunId,
     text: String,
     attachments: Vec<AttachmentRef>,
+    delivery: UserMessageDelivery,
     projection: &mut ProjectionState,
     events: &mpsc::Sender<TimestampedEvent>,
 ) -> Result<DriverCommandOutcome, ServiceError> {
     let item_id = projection.next_user_item_id(run_id)?;
     let turn_id = projection.turn_id(run_id)?;
-    projection.pending_user_items.push_back(item_id.clone());
+    projection.pending_user_items.push_back(PendingUserItem {
+        id: item_id.clone(),
+        delivery,
+    });
     if !attachments.is_empty() {
         projection
             .pending_attachments
@@ -1579,6 +1605,7 @@ async fn publish_control_user_item(
                 payload: ItemPayload::UserMessage {
                     text: bounded_text(&text, MAX_PROMPT_BYTES),
                     attachments,
+                    delivery: Some(delivery),
                 },
             },
         }))
@@ -2346,25 +2373,30 @@ fn project_new_entries(
             session_id,
             &mut projection.pending_attachments,
         )?;
-        let (preferred, preferred_reasoning) = match &entry.value {
+        let (preferred, user_delivery, preferred_reasoning) = match &entry.value {
             EntryValue::Message(Message::User(message))
                 if message
                     .content
                     .iter()
                     .any(|part| matches!(part, UserPart::Text(_) | UserPart::Media(_))) =>
             {
-                (projection.pending_user_items.pop_front(), None)
+                match projection.pending_user_items.pop_front() {
+                    Some(pending) => (Some(pending.id), Some(pending.delivery), None),
+                    None => (None, None, None),
+                }
             }
             EntryValue::Message(Message::Assistant(_)) => (
                 projection.completed_assistant_items.pop_front().flatten(),
+                None,
                 projection.completed_reasoning_items.pop_front().flatten(),
             ),
-            _ => (None, None),
+            _ => (None, None, None),
         };
         items.extend(project_entry(
             entry,
             run_id.cloned(),
             preferred,
+            user_delivery,
             preferred_reasoning,
             &mut projection.tool_items,
             attachments,
@@ -2466,6 +2498,7 @@ fn project_entry(
     entry: &Entry,
     run_id: Option<RunId>,
     preferred: Option<ItemId>,
+    user_delivery: Option<UserMessageDelivery>,
     preferred_reasoning: Option<ItemId>,
     tool_items: &mut HashMap<String, ItemId>,
     attachments: Vec<AttachmentRef>,
@@ -2538,6 +2571,7 @@ fn project_entry(
                         ItemPayload::UserMessage {
                             text: bounded_text(&text, MAX_PROMPT_BYTES),
                             attachments,
+                            delivery: user_delivery,
                         },
                     ),
                 );
@@ -2723,7 +2757,7 @@ fn seed_from_session(
             &session_id,
             &mut pending_attachments,
         )?;
-        let projected = project_entry(entry, None, None, None, &mut tool_items, attachments)?;
+        let projected = project_entry(entry, None, None, None, None, &mut tool_items, attachments)?;
         items.extend(projected);
     }
     if items.len() > MAX_PROJECTED_SESSION_ITEMS {
@@ -3845,12 +3879,14 @@ mod tests {
 
         let session_id = SessionId::new("steer-attribution").unwrap();
         let mut projection = ProjectionState::new(0);
-        projection
-            .pending_user_items
-            .push_back(ItemId::new("live-original").unwrap());
-        projection
-            .pending_user_items
-            .push_back(ItemId::new("live-steer").unwrap());
+        projection.pending_user_items.push_back(PendingUserItem {
+            id: ItemId::new("live-original").unwrap(),
+            delivery: UserMessageDelivery::Submit,
+        });
+        projection.pending_user_items.push_back(PendingUserItem {
+            id: ItemId::new("live-steer").unwrap(),
+            delivery: UserMessageDelivery::Steer,
+        });
         let live = project_new_entries(
             &session,
             &mut projection,
@@ -3862,15 +3898,25 @@ mod tests {
         let live_users = live
             .iter()
             .filter_map(|item| match &item.payload {
-                ItemPayload::UserMessage { text, .. } => Some((item.id.as_str(), text.as_str())),
+                ItemPayload::UserMessage { text, delivery, .. } => {
+                    Some((item.id.as_str(), text.as_str(), *delivery))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
             live_users,
             vec![
-                ("live-original", "original prompt"),
-                ("live-steer", "steer exact text")
+                (
+                    "live-original",
+                    "original prompt",
+                    Some(UserMessageDelivery::Submit)
+                ),
+                (
+                    "live-steer",
+                    "steer exact text",
+                    Some(UserMessageDelivery::Steer)
+                )
             ]
         );
         drop(session);
@@ -3898,7 +3944,10 @@ mod tests {
             .items
             .iter()
             .filter_map(|item| match &item.payload {
-                ItemPayload::UserMessage { text, .. } => Some(text.as_str()),
+                ItemPayload::UserMessage { text, delivery, .. } => {
+                    assert_eq!(*delivery, None);
+                    Some(text.as_str())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -3906,37 +3955,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_steer_is_visible_immediately_with_its_own_identity() {
+    async fn accepted_controls_have_exact_live_delivery_and_identity() {
         let run_id = RunId::new("run-1-1").unwrap();
         let mut projection = ProjectionState::new(0);
         projection.begin_run();
-        let (sender, mut receiver) = mpsc::channel(1);
+        let (sender, mut receiver) = mpsc::channel(2);
 
-        publish_control_user_item(
-            &run_id,
-            "steer exact text".into(),
-            Vec::new(),
-            &mut projection,
-            &sender,
-        )
-        .await
-        .unwrap();
+        for (text, delivery) in [
+            ("steer exact text", UserMessageDelivery::Steer),
+            ("follow up exact text", UserMessageDelivery::FollowUp),
+        ] {
+            publish_control_user_item(
+                &run_id,
+                text.into(),
+                Vec::new(),
+                delivery,
+                &mut projection,
+                &sender,
+            )
+            .await
+            .unwrap();
+        }
 
-        let started = receiver.recv().await.expect("live steer event");
-        let EventPayload::ItemStarted { item } = started.payload else {
-            panic!("accepted steer did not start a visible item");
-        };
-        assert_eq!(item.id.as_str(), "item-run-1-1-user-1-1");
-        assert!(matches!(
-            item.payload,
-            ItemPayload::UserMessage {
-                ref text,
-                ref attachments,
-            } if text == "steer exact text" && attachments.is_empty()
-        ));
+        for (index, (text, delivery)) in [
+            ("steer exact text", UserMessageDelivery::Steer),
+            ("follow up exact text", UserMessageDelivery::FollowUp),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let started = receiver.recv().await.expect("live control event");
+            let EventPayload::ItemStarted { item } = started.payload else {
+                panic!("accepted control did not start a visible item");
+            };
+            assert_eq!(
+                item.id.as_str(),
+                format!("item-run-1-1-user-1-{}", index + 1)
+            );
+            assert!(matches!(
+                item.payload,
+                ItemPayload::UserMessage {
+                    text: ref actual,
+                    ref attachments,
+                    delivery: Some(actual_delivery),
+                } if actual == text
+                    && attachments.is_empty()
+                    && actual_delivery == delivery
+            ));
+        }
         assert_eq!(
-            projection.pending_user_items.front().map(ItemId::as_str),
-            Some(item.id.as_str())
+            projection
+                .pending_user_items
+                .iter()
+                .map(|pending| pending.delivery)
+                .collect::<Vec<_>>(),
+            [UserMessageDelivery::Steer, UserMessageDelivery::FollowUp]
         );
     }
 
