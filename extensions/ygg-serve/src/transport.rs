@@ -1212,7 +1212,7 @@ mod tests {
                 display_name: "evidence.txt".into(),
                 media_type: "text/plain".into(),
                 bytes: bytes::Bytes::from_static(b"structured evidence"),
-                sha256: "d76769453d19211b99f8107a34ac8f2a94ff6bdb5cc6a41b9e5086f189391e83".into(),
+                sha256: "eea41f02aac250f283eb2f77556760364cfcce0e4522b126fdbe21469aaa756e".into(),
             })
         }
 
@@ -1856,6 +1856,10 @@ mod tests {
         assert_eq!(
             response_header(&content, "cache-control"),
             Some("private, max-age=31536000, immutable")
+        );
+        assert_eq!(
+            response_header(&content, "etag"),
+            Some("\"eea41f02aac250f283eb2f77556760364cfcce0e4522b126fdbe21469aaa756e\"")
         );
         assert_eq!(
             content.split_once("\r\n\r\n").unwrap().1,
