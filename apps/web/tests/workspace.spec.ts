@@ -383,6 +383,17 @@ test("uses the projected ten-theme catalog and changes pigment", async (
   }
 });
 
+test("opens connected devices only when the host advertises them", async ({
+  page,
+}) => {
+  await ensureSidebar(page);
+  await page.getByRole("button", { name: "Connected devices" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Connected devices" }),
+  ).toBeVisible();
+  await expect(page.getByText("Secure local network")).toBeVisible();
+});
+
 test("honors reduced motion for live status animation", async (
   { page },
   testInfo,

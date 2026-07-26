@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   Circle,
+  Laptop,
   LoaderCircle,
   Menu,
   MessageSquarePlus,
@@ -26,10 +27,12 @@ interface SidebarProps {
   surface: "session" | "settings" | "devices";
   hostName: string;
   connection: TransportConnectionState;
+  devicesAvailable: boolean;
   onRestoreFocus: () => void;
   onClose: () => void;
   onNewSession: () => void;
   onSelectSession: (sessionId: string) => void;
+  onOpenDevices: () => void;
   onOpenSettings: () => void;
 }
 
@@ -128,10 +131,12 @@ export function Sidebar({
   surface,
   hostName,
   connection,
+  devicesAvailable,
   onRestoreFocus,
   onClose,
   onNewSession,
   onSelectSession,
+  onOpenDevices,
   onOpenSettings,
 }: SidebarProps) {
   const sidebarRef = useRef<HTMLElement>(null);
@@ -287,6 +292,15 @@ export function Sidebar({
         </div>
 
         <footer className="sidebar-footer">
+          {devicesAvailable ? (
+            <button
+              className={`sidebar-destination ${surface === "devices" ? "is-selected" : ""}`}
+              onClick={onOpenDevices}
+            >
+              <Laptop aria-hidden="true" />
+              <strong>Connected devices</strong>
+            </button>
+          ) : null}
           <button
             className={`sidebar-destination ${surface === "settings" ? "is-selected" : ""}`}
             onClick={onOpenSettings}

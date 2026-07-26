@@ -456,6 +456,7 @@ export default function App() {
         surface={surface}
         hostName={state.bootstrap.host.name}
         connection={state.connection}
+        devicesAvailable={state.bootstrap.capabilities.connectedDevices}
         onRestoreFocus={restoreSidebarFocus}
         onClose={closeSidebar}
         onNewSession={() => {
@@ -475,6 +476,13 @@ export default function App() {
         }}
         onOpenSettings={() => {
           setSurface("settings");
+          setInspector(null);
+          if (window.matchMedia("(max-width: 760px)").matches) {
+            setSidebarOpen(false);
+          }
+        }}
+        onOpenDevices={() => {
+          setSurface("devices");
           setInspector(null);
           if (window.matchMedia("(max-width: 760px)").matches) {
             setSidebarOpen(false);
