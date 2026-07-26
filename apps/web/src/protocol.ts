@@ -249,6 +249,7 @@ export interface SessionSnapshot {
   sequence: number;
   title: string;
   status: SessionStatus;
+  activeRunId?: string;
   projectId: string;
   modelId: string;
   reasoning: ReasoningEffort;
@@ -278,7 +279,13 @@ export type SessionEvent =
       patch: Partial<
         Pick<
           SessionSnapshot,
-          "title" | "status" | "modelId" | "reasoning" | "authority" | "contextPercent"
+          | "title"
+          | "status"
+          | "activeRunId"
+          | "modelId"
+          | "reasoning"
+          | "authority"
+          | "contextPercent"
         >
       >;
     }

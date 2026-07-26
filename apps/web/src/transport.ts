@@ -528,7 +528,6 @@ export class HttpTransport implements YggTransport {
   private socket: WebSocket | null = null;
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
-  private hasOpened = false;
   private closedByClient = false;
   private replaying = false;
   private bufferedEvents: Array<{
@@ -647,7 +646,34 @@ export class HttpTransport implements YggTransport {
       throw new Error("The host acknowledged a different command.");
     }
     this.encodedCommands.delete(command.id);
+    if (
+      command.type === "session.create" &&
+      ack.accepted &&
+      ack.createdSessionId
+    ) {
+      this.rememberCreatedSession(command, ack.createdSessionId);
+    }
     return ack;
+  }
+
+  private rememberCreatedSession(
+    command: Extract<ClientCommand, { type: "session.create" }>,
+    sessionId: string,
+  ): void {
+    this.summaries.set(sessionId, {
+      id: sessionId,
+      projectId: command.projectId,
+      title: "New session",
+      preview: "Ready when you are",
+      status: "idle",
+      updatedAt: new Date().toISOString(),
+      pinned: false,
+      archived: false,
+      unread: false,
+      modelId: command.modelId,
+      attentionCount: 0,
+    });
+    this.modelIdBySession[sessionId] = command.modelId;
   }
 
   async ingestAttachment(file: File): Promise<AttachmentRef> {
@@ -731,11 +757,8 @@ export class HttpTransport implements YggTransport {
     this.socket = socket;
 
     socket.addEventListener("open", () => {
-      const reconnecting = this.hasOpened;
-      this.hasOpened = true;
       this.reconnectAttempt = 0;
       this.setConnectionState("connected");
-      if (!reconnecting) return;
       this.replaying = true;
       void this.replayAll().then(
         () => {

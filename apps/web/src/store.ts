@@ -463,7 +463,11 @@ export class YggStore {
   ): Promise<void> {
     const session = this.selectedSession;
     if (!session || (!prompt.trim() && attachments.length === 0)) return;
-    if (session.status !== "working") {
+    const activeRun =
+      session.activeRunId !== undefined ||
+      session.status === "working" ||
+      session.status === "needs_attention";
+    if (!activeRun) {
       await this.sendInput("session.submit", prompt, attachments);
     } else if (activeDelivery === "steer") {
       await this.steer(prompt, attachments);

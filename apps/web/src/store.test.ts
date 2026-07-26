@@ -177,6 +177,30 @@ describe("YggStore", () => {
     unsubscribe();
     store.dispose();
   });
+
+  it("keeps needs-attention input on the active run", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    transport.emit({
+      type: "session.updated",
+      sessionId: "session-fresh",
+      sequence: 2,
+      patch: {
+        status: "needs_attention",
+        activeRunId: "run-live",
+      },
+    });
+    await nextFrame();
+    await store.submit("Here is the requested input", [], "followUp");
+
+    expect(transport.commands.at(-1)).toMatchObject({
+      type: "session.followUp",
+      sessionId: "session-fresh",
+    });
+    store.dispose();
+  });
 });
 
 describe("session routes", () => {

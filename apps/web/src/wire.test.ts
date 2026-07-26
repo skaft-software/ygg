@@ -97,6 +97,49 @@ describe("authoritative Rust wire contract", () => {
     ).toEqual({ hostSequence: 12, event });
   });
 
+  it("advances durable-head cursors without inventing a UI mutation", () => {
+    const durable = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    durable.cursor.sequence = 44;
+    durable.event = {
+      type: "session.durableHeadChanged",
+      data: { durableEntryId: "entry-44" },
+    };
+
+    expect(projectEventEnvelope(durable)).toEqual({
+      type: "session.updated",
+      sessionId: "session-demo",
+      actorGeneration: 3,
+      sequence: 44,
+      patch: {},
+    });
+  });
+
+  it("preserves active-run identity while a session needs attention", () => {
+    const waiting = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    waiting.cursor.sequence = 44;
+    waiting.event = {
+      type: "session.stateChanged",
+      data: { state: "needsInput", activeRunId: "run-live" },
+    };
+
+    expect(projectEventEnvelope(waiting)).toEqual({
+      type: "session.updated",
+      sessionId: "session-demo",
+      actorGeneration: 3,
+      sequence: 44,
+      patch: {
+        status: "needs_attention",
+        activeRunId: "run-live",
+      },
+    });
+  });
+
   it("encodes the exact host command golden", () => {
     const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
     const encoded = encodeClientCommand(

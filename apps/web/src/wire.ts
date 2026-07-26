@@ -989,7 +989,10 @@ export function projectSessionSnapshot(
     );
   }
   optionalString(snapshot.durableHead, "sessionSnapshot.durableHead");
-  optionalString(snapshot.activeRunId, "sessionSnapshot.activeRunId");
+  const activeRunId = optionalString(
+    snapshot.activeRunId,
+    "sessionSnapshot.activeRunId",
+  );
   const model = projectModelSelection(
     snapshot.model,
     "sessionSnapshot.model",
@@ -1135,6 +1138,7 @@ export function projectSessionSnapshot(
       snapshot.liveState,
       "sessionSnapshot.liveState",
     ),
+    activeRunId,
     projectId:
       context.summary?.projectId ?? context.projectIdFallback ?? "",
     modelId: model.model,
@@ -1504,7 +1508,10 @@ export function projectEventEnvelope(
         "state",
         "activeRunId",
       ]);
-      optionalString(data.activeRunId, "event.event.data.activeRunId");
+      const activeRunId = optionalString(
+        data.activeRunId,
+        "event.event.data.activeRunId",
+      );
       return {
         type: "session.updated",
         sessionId,
@@ -1515,6 +1522,7 @@ export function projectEventEnvelope(
             data.state,
             "event.event.data.state",
           ),
+          activeRunId,
         },
       };
     }
@@ -1541,6 +1549,22 @@ export function projectEventEnvelope(
             "event.event.data.authority",
           ),
         },
+      };
+    }
+    case "session.durableHeadChanged": {
+      const data = object(event.data, "event.event.data", [
+        "durableEntryId",
+      ]);
+      optionalString(
+        data.durableEntryId,
+        "event.event.data.durableEntryId",
+      );
+      return {
+        type: "session.updated",
+        sessionId,
+        actorGeneration,
+        sequence,
+        patch: {},
       };
     }
     case "item.started": {

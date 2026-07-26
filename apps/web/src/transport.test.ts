@@ -239,6 +239,87 @@ describe("HTTP Ygg transport", () => {
     transport.close();
   });
 
+  it("replays the bootstrap cursor on the first WebSocket open", async () => {
+    const replay = {
+      type: "events",
+      after: { actorGeneration: 3, sequence: 42 },
+      through: { actorGeneration: 3, sequence: 43 },
+      events: [eventEnvelopeGolden],
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(hostBootstrapGolden))
+      .mockResolvedValueOnce(jsonResponse(replay));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+    const received: unknown[] = [];
+    transport.subscribe((event) => received.push(event));
+    await transport.connect();
+
+    FakeWebSocket.instances[0]?.emit("open", new Event("open"));
+
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "/api/v1/sessions/session-demo/replay?actorGeneration=3&sequence=42",
+    );
+    expect(received[0]).toMatchObject({
+      type: "item.delta",
+      sessionId: "session-demo",
+      sequence: 43,
+    });
+    transport.close();
+  });
+
+  it("retains new-session summary context before loading its snapshot", async () => {
+    const createdSnapshot = structuredClone(
+      hostBootstrapGolden.selectedSession,
+    ) as unknown as Record<string, unknown>;
+    createdSnapshot.sessionId = "session-created";
+    createdSnapshot.actorGeneration = 4;
+    createdSnapshot.cursor = { actorGeneration: 4, sequence: 0 };
+    delete createdSnapshot.durableHead;
+    createdSnapshot.items = [];
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(hostBootstrapGolden))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          protocol: 1,
+          hostId: "host-demo",
+          commandId: "command-create-live",
+          acknowledgedAtMs: 1_721_000_000_060,
+          catalogCursor: 8,
+          disposition: {
+            status: "accepted",
+            createdSessionId: "session-created",
+          },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(createdSnapshot));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+    await transport.connect();
+
+    const ack = await transport.send({
+      id: "command-create-live",
+      type: "session.create",
+      projectId: "project-ygg",
+      modelId: "gpt-5.6",
+      reasoning: "high",
+      authority: "fullAccess",
+    });
+    const snapshot = await transport.getSession(ack.createdSessionId!);
+
+    expect(snapshot).toMatchObject({
+      sessionId: "session-created",
+      projectId: "project-ygg",
+      title: "New session",
+      modelId: "gpt-5.6",
+      actorGeneration: 4,
+    });
+    transport.close();
+  });
+
   it("uses relative HTTP routes and derives WebSocket origin from the page", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
