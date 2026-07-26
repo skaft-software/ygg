@@ -35,10 +35,7 @@ for changed_file in $changed_files; do
       | crates/ygg-coding-agent/src/extensions.rs \
       | crates/ygg-coding-agent/src/extensions/serve.rs)
       ;;
-    crates/ygg-ai/* \
-      | crates/ygg-agent/* \
-      | crates/sexy-tui-rs/* \
-      | crates/ygg-coding-agent/*)
+    *)
       violations="${violations}${changed_file}
 "
       ;;
