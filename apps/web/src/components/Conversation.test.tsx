@@ -55,7 +55,7 @@ describe("conversation composer", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: "Stop Ygg" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Stop ygg" })).toBeVisible();
     const delivery = screen.getByLabelText("Active run delivery");
     expect(delivery).toHaveValue("followUp");
     expect(delivery).toHaveTextContent("Steer now");

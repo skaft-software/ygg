@@ -41,7 +41,9 @@ async function expectNoViewportOverflow(page: Page) {
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/?transport=fixture");
-  await expect(page.getByRole("heading", { name: "What should we work on?" })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "What can I take off your plate?" }),
+  ).toBeVisible();
 });
 
 test("runs at the locked acceptance viewport", async ({ page }, testInfo) => {
@@ -63,7 +65,6 @@ test("opens in a fresh, quiet session with the standard composer", async ({
   await expect(
     page.getByRole("button", { name: "New session", exact: true }),
   ).toBeVisible();
-  await expect(page.getByText("Live", { exact: true })).toBeVisible();
   await expect(page.getByText("Pinned", { exact: true })).toBeVisible();
   await expect(page.getByText("Recents", { exact: true })).toBeVisible();
   await expect(page.getByLabel("Message ygg")).toBeVisible();
@@ -160,6 +161,40 @@ test("opens an output into the dominant preview inspector", async (
   });
   await page.getByRole("button", { name: "Close inspector" }).click();
   await expect(page.getByLabel("Release pulse inspector")).toHaveCount(0);
+});
+
+test("keeps the activity rail and dominant viewer usable at 1024px", async (
+  { page },
+  testInfo,
+) => {
+  test.skip(testInfo.project.name !== "tablet-landscape");
+  await selectSession(page, "Review release readiness");
+  await page.getByRole("button", { name: "Open activity" }).click();
+  const rail = page.getByLabel("Session activity");
+  await expect(rail).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() => ({
+        composerUsable:
+          (document.querySelector(".composer")?.getBoundingClientRect().width ??
+            0) >= 640,
+        railExact:
+          Math.abs(
+            (document.querySelector(".activity-rail")?.getBoundingClientRect()
+              .width ?? 0) - 320,
+          ) <= 1,
+      })),
+    )
+    .toEqual({ composerUsable: true, railExact: true });
+
+  await rail.getByRole("button", { name: /Release pulse/ }).click();
+  const inspector = page.getByLabel("Release pulse inspector");
+  await expect(inspector).toBeVisible();
+  await expect
+    .poll(() =>
+      inspector.evaluate((element) => element.getBoundingClientRect().width),
+    )
+    .toBeGreaterThanOrEqual(689);
 });
 
 test("returns focus to a visible activity trigger after closing an inspector", async (

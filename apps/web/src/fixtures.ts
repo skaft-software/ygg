@@ -114,7 +114,7 @@ const previewMarkup = `<!doctype html>
   </head>
   <body>
     <main class="page">
-      <div class="eyebrow">Ygg release pulse</div>
+      <div class="eyebrow">ygg release pulse</div>
       <h1>Everything important, ready for review.</h1>
       <p>A live summary of the release candidate, grounded in the checks and files consulted during this session.</p>
       <section class="grid">
@@ -481,7 +481,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
         requestId: "approval-keychain",
         title: "Allow signing identity access?",
         description:
-          "Ygg wants to use “Developer ID Application” from this Mac’s Keychain to sign the build.",
+          "ygg wants to use “Developer ID Application” from this Mac’s Keychain to sign the build.",
         scopeLabel: "This signing step only",
         state: "streaming",
         createdAt: at(48),

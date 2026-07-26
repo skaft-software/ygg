@@ -1,22 +1,16 @@
 import {
-  CircleUserRound,
-  Laptop,
   Menu,
   MessageSquarePlus,
   PanelLeftClose,
-  Search,
   Settings,
-  Smartphone,
   X,
 } from "lucide-react";
 import {
   useEffect,
-  useMemo,
   useRef,
-  useState,
 } from "react";
-import yggIconUrl from "../../../../docs/assets/ygg-braille.svg";
-import type { SessionStatus, SessionSummary } from "../protocol";
+import type { SessionSummary } from "../protocol";
+import { YggGlyph } from "./YggGlyph";
 
 interface SidebarProps {
   open: boolean;
@@ -24,24 +18,12 @@ interface SidebarProps {
   selectedSessionId: string | null;
   surface: "session" | "settings" | "devices";
   hostName: string;
-  devicesAvailable: boolean;
   onRestoreFocus: () => void;
   onClose: () => void;
   onNewSession: () => void;
   onSelectSession: (sessionId: string) => void;
   onOpenSettings: () => void;
-  onOpenDevices: () => void;
 }
-
-const statusLabels: Record<SessionStatus, string> = {
-  idle: "Ready",
-  working: "Working",
-  needs_attention: "Needs attention",
-  done: "Done",
-  failed: "Failed",
-  stopped: "Stopped",
-  disconnected: "Disconnected",
-};
 
 function SessionRow({
   session,
@@ -57,12 +39,12 @@ function SessionRow({
       className={`session-row ${selected ? "is-selected" : ""}`}
       onClick={onSelect}
       aria-current={selected ? "page" : undefined}
+      aria-label={`Open session ${session.title}`}
       data-status={session.status}
     >
       <span className="session-status" aria-hidden="true" />
       <span className="session-row-copy">
         <span className="session-row-title">{session.title}</span>
-        <span className="session-row-preview">{session.preview}</span>
       </span>
       {session.attentionCount > 0 ? (
         <span
@@ -71,11 +53,7 @@ function SessionRow({
         >
           {session.attentionCount}
         </span>
-      ) : (
-        <span className="session-status-label">
-          {statusLabels[session.status]}
-        </span>
-      )}
+      ) : null}
     </button>
   );
 }
@@ -96,7 +74,6 @@ function SessionSection({
     <section className="sidebar-section" aria-labelledby={`section-${title}`}>
       <div className="sidebar-section-heading">
         <h2 id={`section-${title}`}>{title}</h2>
-        <span>{sessions.length}</span>
       </div>
       <div className="session-list">
         {sessions.map((session) => (
@@ -118,15 +95,12 @@ export function Sidebar({
   selectedSessionId,
   surface,
   hostName,
-  devicesAvailable,
   onRestoreFocus,
   onClose,
   onNewSession,
   onSelectSession,
   onOpenSettings,
-  onOpenDevices,
 }: SidebarProps) {
-  const [query, setQuery] = useState("");
   const sidebarRef = useRef<HTMLElement>(null);
   const onCloseRef = useRef(onClose);
   useEffect(() => {
@@ -182,31 +156,10 @@ export function Sidebar({
       }
     };
   }, [onRestoreFocus, open]);
-  const normalizedQuery = query.trim().toLocaleLowerCase();
-  const visibleSessions = useMemo(
-    () =>
-      sessions.filter(
-        (session) =>
-          !session.archived &&
-          (!normalizedQuery ||
-            session.title.toLocaleLowerCase().includes(normalizedQuery) ||
-            session.preview.toLocaleLowerCase().includes(normalizedQuery)),
-      ),
-    [normalizedQuery, sessions],
-  );
-
-  const live = visibleSessions.filter(
-    (session) =>
-      session.status === "working" ||
-      session.status === "needs_attention" ||
-      session.status === "disconnected",
-  );
-  const liveIds = new Set(live.map((session) => session.id));
-  const pinned = visibleSessions.filter(
-    (session) => session.pinned && !liveIds.has(session.id),
-  );
-  const shown = new Set([...live, ...pinned].map((session) => session.id));
-  const recent = visibleSessions.filter((session) => !shown.has(session.id));
+  const visibleSessions = sessions.filter((session) => !session.archived);
+  const pinned = visibleSessions.filter((session) => session.pinned);
+  const pinnedIds = new Set(pinned.map((session) => session.id));
+  const recent = visibleSessions.filter((session) => !pinnedIds.has(session.id));
 
   return (
     <>
@@ -219,11 +172,14 @@ export function Sidebar({
       <aside
         ref={sidebarRef}
         className={`sidebar ${open ? "is-open" : ""}`}
-        aria-label="Ygg"
+        aria-label="ygg"
         inert={!open}
       >
         <header className="sidebar-header">
-          <span />
+          <div className="brand-row">
+            <YggGlyph />
+            <strong>ygg</strong>
+          </div>
           <button className="icon-button sidebar-close" onClick={onClose}>
             <PanelLeftClose aria-hidden="true" />
             <span className="sr-only">Close sidebar</span>
@@ -234,46 +190,23 @@ export function Sidebar({
           </button>
         </header>
 
-        <div className="brand-row">
-          <div className="brand-mark" aria-hidden="true">
-            <img src={yggIconUrl} alt="" />
-          </div>
-          <div>
-            <strong>ygg</strong>
-            <span>Local agent</span>
-          </div>
-        </div>
-
         <nav className="primary-navigation" aria-label="Primary">
           <button className="primary-action" onClick={onNewSession}>
-            <MessageSquarePlus aria-hidden="true" />
+            <span className="primary-action-glyph" aria-hidden="true">
+              <MessageSquarePlus />
+            </span>
             <span>New session</span>
           </button>
-          <label className="sidebar-search">
-            <Search aria-hidden="true" />
-            <span className="sr-only">Search sessions</span>
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search"
-            />
-          </label>
         </nav>
 
         <div className="sidebar-scroll">
           {visibleSessions.length === 0 ? (
             <div className="sidebar-empty">
               <Menu aria-hidden="true" />
-              <span>No matching sessions</span>
+              <span>No sessions yet</span>
             </div>
           ) : (
             <>
-              <SessionSection
-                title="Live"
-                sessions={live}
-                selectedSessionId={selectedSessionId}
-                onSelectSession={onSelectSession}
-              />
               <SessionSection
                 title="Pinned"
                 sessions={pinned}
@@ -291,36 +224,18 @@ export function Sidebar({
         </div>
 
         <footer className="sidebar-footer">
-          {devicesAvailable ? (
-            <button
-              className={`sidebar-destination ${surface === "devices" ? "is-selected" : ""}`}
-              onClick={onOpenDevices}
-            >
-              <span className="destination-icons" aria-hidden="true">
-                <Laptop />
-                <Smartphone />
-              </span>
-              <span>
-                <strong>Connected devices</strong>
-                <small>Manage local connections</small>
-              </span>
-            </button>
-          ) : null}
           <button
             className={`sidebar-destination ${surface === "settings" ? "is-selected" : ""}`}
             onClick={onOpenSettings}
           >
             <Settings aria-hidden="true" />
-            <span>
-              <strong>Settings</strong>
-              <small>Local preferences</small>
-            </span>
+            <strong>Settings</strong>
           </button>
           <div className="local-identity">
-            <CircleUserRound aria-hidden="true" />
+            <span className="local-avatar" aria-hidden="true">Y</span>
             <span>
               <strong>{hostName}</strong>
-              <small>No account · local only</small>
+              <small>Local workspace</small>
             </span>
           </div>
         </footer>

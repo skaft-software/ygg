@@ -111,22 +111,10 @@ export function ActivityRail({
       role={modal ? "dialog" : undefined}
       inert={!open}
     >
-      <header className="rail-header">
-        <div>
-          <span>Session activity</span>
-          <strong>
-            {session.status === "working"
-              ? "Working"
-              : session.status === "needs_attention"
-                ? "Needs attention"
-                : "Up to date"}
-          </strong>
-        </div>
-        <button className="icon-button" onClick={onClose}>
-          <PanelRightClose aria-hidden="true" />
-          <span className="sr-only">Close activity</span>
-        </button>
-      </header>
+      <button className="rail-close icon-button" onClick={onClose}>
+        <PanelRightClose aria-hidden="true" />
+        <span className="sr-only">Close activity</span>
+      </button>
 
       <div className="rail-scroll">
         {session.progress.length ? (
@@ -134,9 +122,7 @@ export function ActivityRail({
             <details open>
               <summary>
                 <span id="progress-heading">Progress</span>
-                <em>
-                  {completeCount}/{session.progress.length}
-                </em>
+                <em>{completeCount} of {session.progress.length}</em>
                 <ChevronDown aria-hidden="true" />
               </summary>
               <ol className="progress-list">
@@ -159,47 +145,54 @@ export function ActivityRail({
 
         {resourcesAvailable && session.outputs.length ? (
           <section className="rail-section" aria-labelledby="outputs-heading">
-            <div className="rail-section-title">
-              <span id="outputs-heading">Outputs</span>
-              <em>{session.outputs.length}</em>
-            </div>
-            <div className="resource-list">
-              {session.outputs.map((output) => (
-                <button
-                  key={output.id}
-                  onClick={() => onOpenOutput(output.id)}
-                >
-                  <span className="resource-icon">{outputIcon(output)}</span>
-                  <span>
-                    <strong>{output.title}</strong>
-                    <small>{output.subtitle}</small>
-                  </span>
-                </button>
-              ))}
-            </div>
+            <details open>
+              <summary>
+                <span id="outputs-heading">Artifacts</span>
+                <em>{session.outputs.length}</em>
+                <ChevronDown aria-hidden="true" />
+              </summary>
+              <div className="resource-list">
+                {session.outputs.map((output) => (
+                  <button
+                    key={output.id}
+                    onClick={() => onOpenOutput(output.id)}
+                  >
+                    <span className="resource-icon">{outputIcon(output)}</span>
+                    <span>
+                      <strong>{output.title}</strong>
+                      <small>{output.subtitle}</small>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </details>
           </section>
         ) : null}
 
         {resourcesAvailable && session.sources.length ? (
           <section className="rail-section" aria-labelledby="sources-heading">
-            <div className="rail-section-title">
-              <span id="sources-heading">Sources</span>
-              <em>{session.sources.length}</em>
-            </div>
-            <div className="resource-list">
-              {session.sources.map((source) => (
-                <button
-                  key={source.id}
-                  onClick={() => onOpenSource(source.id)}
-                >
-                  <span className="resource-icon">{sourceIcon(source)}</span>
-                  <span>
-                    <strong>{source.title}</strong>
-                    <small>{source.subtitle}</small>
-                  </span>
-                </button>
-              ))}
-            </div>
+            <details open>
+              <summary>
+                <span id="sources-heading">Context</span>
+                <em>{session.sources.length}</em>
+                <ChevronDown aria-hidden="true" />
+              </summary>
+              <div className="context-label">Sources consulted</div>
+              <div className="resource-list">
+                {session.sources.map((source) => (
+                  <button
+                    key={source.id}
+                    onClick={() => onOpenSource(source.id)}
+                  >
+                    <span className="resource-icon">{sourceIcon(source)}</span>
+                    <span>
+                      <strong>{source.title}</strong>
+                      <small>{source.subtitle}</small>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </details>
           </section>
         ) : null}
       </div>

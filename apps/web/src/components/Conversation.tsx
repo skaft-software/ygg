@@ -6,7 +6,6 @@ import {
   Check,
   ChevronDown,
   CircleStop,
-  Code2,
   ExternalLink,
   File,
   FileCode2,
@@ -24,6 +23,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  type CSSProperties,
   type ChangeEvent,
   type KeyboardEvent,
   type ReactNode,
@@ -32,7 +32,6 @@ import {
   useRef,
   useState,
 } from "react";
-import yggIconUrl from "../../../../docs/assets/ygg-braille.svg";
 import type {
   ActionItem,
   AttachmentRef,
@@ -42,6 +41,7 @@ import type {
   SessionSnapshot,
   TranscriptItem,
 } from "../protocol";
+import { YggGlyph } from "./YggGlyph";
 
 interface ConversationProps {
   session: SessionSnapshot;
@@ -79,6 +79,84 @@ const authorityLabels: Record<AuthorityProfile, string> = {
   workspace: "Workspace",
   fullAccess: "Full access",
 };
+
+const providerAccents: Array<[string, string]> = [
+  ["openai", "#1f1f1f"],
+  ["anthropic", "#cc785c"],
+  ["google", "#34a853"],
+  ["xai", "#736cd3"],
+  ["meta", "#0089f4"],
+  ["mistral", "#fd6f00"],
+  ["deepseek", "#2243e6"],
+  ["alibaba", "#ff7018"],
+  ["minimax", "#eb3568"],
+  ["kimi", "#047afe"],
+  ["z.ai", "#1c7ff8"],
+  ["nvidia", "#86b737"],
+  ["xiaomi", "#ff6900"],
+  ["cohere", "#d18ee2"],
+  ["amazon", "#ff9900"],
+  ["microsoft", "#0078d5"],
+  ["ai21", "#d63864"],
+  ["bytedance", "#3c8bff"],
+  ["perplexity", "#1b818e"],
+  ["ibm", "#0f62fe"],
+  ["baidu", "#2436d8"],
+  ["tencent", "#5cb9ff"],
+  ["allenai", "#f0529c"],
+];
+
+const thinkingIntensity: Record<string, number> = {
+  off: 0,
+  minimal: 0.2,
+  low: 0.35,
+  medium: 0.5,
+  high: 0.7,
+  xhigh: 0.85,
+  max: 1,
+};
+
+function balancedAccent(source: string, targetLuminance: number): string {
+  const match = /^#([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(source);
+  if (!match) return source;
+  const rgb = match.slice(1).map((channel) => Number.parseInt(channel, 16));
+  const luminance = (channels: number[]) =>
+    channels
+      .map((channel) => channel / 255)
+      .map((channel) =>
+        channel <= 0.04045
+          ? channel / 12.92
+          : ((channel + 0.055) / 1.055) ** 2.4,
+      )
+      .reduce(
+        (sum, channel, index) =>
+          sum + channel * ([0.2126, 0.7152, 0.0722][index] ?? 0),
+        0,
+      );
+  const sourceLuminance = luminance(rgb);
+  if (Math.abs(sourceLuminance - targetLuminance) < 0.01) return source;
+  const destination = sourceLuminance < targetLuminance ? 255 : 0;
+  let low = 0;
+  let high = 1;
+  let result = rgb;
+  for (let iteration = 0; iteration < 18; iteration += 1) {
+    const amount = (low + high) / 2;
+    const candidate = rgb.map((channel) =>
+      Math.round(channel + (destination - channel) * amount),
+    );
+    const candidateLuminance = luminance(candidate);
+    result = candidate;
+    if (
+      (destination === 255 && candidateLuminance < targetLuminance) ||
+      (destination === 0 && candidateLuminance > targetLuminance)
+    ) {
+      low = amount;
+    } else {
+      high = amount;
+    }
+  }
+  return `rgb(${result.join(" ")})`;
+}
 
 function formatDuration(durationMs: number): string {
   if (durationMs < 1_000) return `${durationMs}ms`;
@@ -205,7 +283,7 @@ function TranscriptItemView({
             {item.content || (
               <LoaderCircle
                 className="spin assistant-waiting"
-                aria-label="Ygg is responding"
+                aria-label="ygg is responding"
               />
             )}
           </div>
@@ -313,14 +391,13 @@ function EmptySession({ attachments }: { attachments: boolean }) {
   return (
     <div className="empty-session">
       <div className="empty-session-mark" aria-hidden="true">
-        <img src={yggIconUrl} alt="" />
+        <YggGlyph />
       </div>
-      <h1>What should we work on?</h1>
+      <h1>What can I take off your plate?</h1>
       <p>
         {attachments
-          ? "Ask a question, attach a file, or describe the result you want."
-          : "Ask a question or describe the result you want."}{" "}
-        Ygg keeps this session local and inspectable.
+          ? "Describe a task, from a quick fix to a multi-step job. You can attach files and folders."
+          : "Describe a task, from a quick fix to a multi-step job."}
       </p>
     </div>
   );
@@ -346,6 +423,21 @@ function Composer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isWorking = session.status === "working";
+  const activeModel = bootstrap.models.find(
+    (model) => model.id === session.modelId,
+  );
+  const providerKey =
+    `${activeModel?.provider ?? ""} ${activeModel?.id ?? ""}`.toLowerCase();
+  const modelAccent =
+    providerAccents.find(([provider]) => providerKey.includes(provider))?.[1] ??
+    "var(--theme-pigment)";
+  const intensity = thinkingIntensity[session.reasoning] ?? 0.5;
+  const composerStyle = {
+    "--model-accent-light": balancedAccent(modelAccent, 0.11),
+    "--model-accent-dark": balancedAccent(modelAccent, 0.27),
+    "--thinking-intensity": intensity,
+    "--thinking-opacity": 0.4 + intensity * 0.55,
+  } as CSSProperties;
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
@@ -381,7 +473,7 @@ function Composer({
       setSubmitError(
         error instanceof Error
           ? error.message
-          : "Ygg could not send this message.",
+          : "ygg could not send this message.",
       );
     } finally {
       setSubmitting(false);
@@ -411,7 +503,10 @@ function Composer({
 
   return (
     <div className="composer-wrap">
-      <div className={`composer ${isWorking ? "is-working" : ""}`}>
+      <div
+        className={`composer ${isWorking ? "is-working" : ""}`}
+        style={composerStyle}
+      >
         {attachments.length ? (
           <div className="composer-attachments">
             {attachments.map((attachment) => (
@@ -442,7 +537,9 @@ function Composer({
               ? activeDelivery === "steer"
                 ? "Steer the active run…"
                 : "Queue a follow-up…"
-              : "Message ygg"
+              : session.items.length
+                ? "Reply…"
+                : "Describe a task…"
           }
           rows={1}
           aria-label="Message ygg"
@@ -562,7 +659,7 @@ function Composer({
               <button
                 className="submit-button stop-button"
                 onClick={() => void onInterrupt()}
-                aria-label="Stop Ygg"
+                aria-label="Stop ygg"
               >
                 <CircleStop aria-hidden="true" />
               </button>
@@ -589,17 +686,6 @@ function Composer({
             {submitError}
           </p>
         ) : null}
-      </div>
-      <div className="composer-note">
-        <span>
-          <Code2 aria-hidden="true" />
-          {session.authority === "fullAccess"
-            ? "Broad Ygg authority"
-            : session.authority === "workspace"
-              ? "Mutations stay in this workspace"
-              : "Read only — no mutations"}
-        </span>
-        <span>{session.contextPercent}% context</span>
       </div>
     </div>
   );

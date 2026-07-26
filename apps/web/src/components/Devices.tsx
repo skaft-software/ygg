@@ -109,7 +109,7 @@ export function DevicesView({
           <span>Connected devices</span>
           <h1 id="devices-title">Not available on this host</h1>
           <p>
-            Start Ygg with local-network clients enabled to pair another
+            Start ygg with local-network clients enabled to pair another
             device.
           </p>
         </header>
@@ -124,8 +124,8 @@ export function DevicesView({
           <span>Secure local network</span>
           <h1 id="devices-title">Connected devices</h1>
           <p>
-            Ygg devices pair directly. There is no account, cloud sign-in, or
-            hosted Ygg control plane.
+            ygg devices pair directly. There is no account, cloud sign-in, or
+            hosted ygg control plane.
           </p>
         </div>
         <button
@@ -146,7 +146,7 @@ export function DevicesView({
           <span>Available on this LAN</span>
           <strong>{hostName}</strong>
           <p>
-            Paired devices can open and control the same Ygg sessions while
+            Paired devices can open and control the same ygg sessions while
             they are on this network.
           </p>
         </div>
@@ -226,9 +226,9 @@ export function DevicesView({
                 <span className="sr-only">Close</span>
               </button>
             </header>
-            <h2>Pair a Ygg device</h2>
+            <h2>Pair a ygg device</h2>
             <p>
-              On another Ygg app, choose “Add device” and scan this one-time
+              On another ygg app, choose “Add device” and scan this one-time
               code. Keep both devices on the same local network.
             </p>
             <PairingCode />

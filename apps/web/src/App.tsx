@@ -19,7 +19,6 @@ import {
   useRef,
   useState,
 } from "react";
-import yggIconUrl from "../../../docs/assets/ygg-braille.svg";
 import { ActivityRail } from "./components/ActivityRail";
 import { Conversation } from "./components/Conversation";
 import { DevicesView } from "./components/Devices";
@@ -29,13 +28,14 @@ import {
 } from "./components/Inspector";
 import { SettingsView } from "./components/Settings";
 import { Sidebar } from "./components/Sidebar";
+import { YggGlyph } from "./components/YggGlyph";
 import type { SessionStatus } from "./protocol";
 import {
   sessionIdFromPathname,
   YggStore,
   useYggStore,
 } from "./store";
-import { applyTheme } from "./theme";
+import { applyStoredTypePreferences, applyTheme } from "./theme";
 import { createTransport } from "./transport";
 
 type Surface = "session" | "settings" | "devices";
@@ -55,7 +55,7 @@ const store = new YggStore(createTransport());
 function LoadingState() {
   return (
     <div className="app-loading" aria-live="polite">
-      <img src={yggIconUrl} alt="" />
+      <YggGlyph />
       <span className="loading-pulse" />
       <strong>Opening a new session</strong>
     </div>
@@ -68,7 +68,7 @@ function ErrorState({ message }: { message: string }) {
       <div className="error-mark">
         <X aria-hidden="true" />
       </div>
-      <h1>Ygg could not connect</h1>
+      <h1>ygg could not connect</h1>
       <p>{message}</p>
       <button className="primary-button" onClick={() => window.location.reload()}>
         <RefreshCw aria-hidden="true" />
@@ -266,7 +266,7 @@ function UtilityTopbar({
         <Menu aria-hidden="true" />
         <span className="sr-only">Open sidebar</span>
       </button>
-      <img src={yggIconUrl} alt="" />
+      <YggGlyph />
       <strong>{title}</strong>
     </header>
   );
@@ -309,6 +309,7 @@ export default function App() {
   }, [restoreSidebarFocus]);
 
   useEffect(() => {
+    applyStoredTypePreferences();
     void store.initialize();
     return () => store.dispose();
   }, []);
@@ -390,11 +391,6 @@ export default function App() {
         selectedSessionId={state.selectedSessionId}
         surface={surface}
         hostName={state.bootstrap.host.name}
-        devicesAvailable={
-          state.bootstrap.capabilities.connectedDevices &&
-          state.bootstrap.capabilities.lanClients &&
-          state.bootstrap.capabilities.pairDevices
-        }
         onRestoreFocus={restoreSidebarFocus}
         onClose={closeSidebar}
         onNewSession={() => {
@@ -414,13 +410,6 @@ export default function App() {
         }}
         onOpenSettings={() => {
           setSurface("settings");
-          setInspector(null);
-          if (window.matchMedia("(max-width: 760px)").matches) {
-            setSidebarOpen(false);
-          }
-        }}
-        onOpenDevices={() => {
-          setSurface("devices");
           setInspector(null);
           if (window.matchMedia("(max-width: 760px)").matches) {
             setSidebarOpen(false);

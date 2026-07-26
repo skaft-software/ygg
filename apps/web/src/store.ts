@@ -291,7 +291,7 @@ export class YggStore {
         ...this.state,
         connecting: false,
         error:
-          error instanceof Error ? error.message : "Ygg could not connect.",
+          error instanceof Error ? error.message : "ygg could not connect.",
       });
     }
   }
@@ -392,7 +392,7 @@ export class YggStore {
       attachments,
     });
     if (!ack.accepted) {
-      throw new Error(ack.error ?? "The Ygg host rejected this message.");
+      throw new Error(ack.error ?? "The ygg host rejected this message.");
     }
   }
 

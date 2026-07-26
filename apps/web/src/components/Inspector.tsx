@@ -61,7 +61,7 @@ function DocumentPreview({ output }: { output: OutputRef }) {
   return (
     <div className="document-preview">
       <article>
-        <span className="document-kicker">Ygg output</span>
+        <span className="document-kicker">ygg output</span>
         <div className="document-content">
           {(output.content ?? "This output is ready to inspect.")
             .split("\n")
@@ -105,7 +105,7 @@ function SourceInspector({ source }: { source: SourceRef }) {
       <section className="source-excerpt">
         <span>Why it appears here</span>
         <p>
-          Ygg consulted this source while working in the selected session. It is
+          ygg consulted this source while working in the selected session. It is
           shown here from structured tool evidence, not inferred from the final
           response.
         </p>
@@ -223,7 +223,11 @@ export function Inspector({
             </span>
           </div>
         </div>
+        <div className="inspector-pagination" aria-label="Viewer position">
+          <span>{preview ? "Live" : "1 / 1"}</span>
+        </div>
         <div className="inspector-actions">
+          <span className="inspector-zoom">100%</span>
           <button aria-label="Close inspector" onClick={onClose}>
             <X aria-hidden="true" />
           </button>
