@@ -12,6 +12,19 @@ use crate::{
     TimestampedEvent,
 };
 
+/// Immutable, path-free content behind one host-minted opaque resource handle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredResource {
+    /// Safe basename used for inline content disposition.
+    pub display_name: String,
+    /// Validated media type.
+    pub media_type: String,
+    /// Exact bounded bytes snapshotted by the host.
+    pub bytes: Bytes,
+    /// Lowercase SHA-256 digest of [`Self::bytes`].
+    pub sha256: String,
+}
+
 /// Maximum immediate events one driver dispatch may return.
 ///
 /// Long-running output must flow through [`SessionDriver::next_event`] so a
@@ -202,6 +215,14 @@ pub trait HostService: Send + Sync + 'static {
     /// Returns one authoritative attachment for an authenticated content request.
     async fn attachment_content(&self, _handle: &str) -> Result<StoredAttachment, AttachmentError> {
         Err(AttachmentError::Unavailable)
+    }
+
+    /// Returns one immutable opaque resource for an authenticated content request.
+    ///
+    /// Handles are minted and registered by the trusted host. Transports must
+    /// never reinterpret the handle as a path or URL.
+    async fn resource_content(&self, _handle: &str) -> Result<StoredResource, ServiceError> {
+        Err(ServiceError::Unavailable)
     }
 
     /// Maximum authority remote commands may select.

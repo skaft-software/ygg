@@ -29,8 +29,8 @@ use tokio::task::JoinHandle;
 use crate::embedded_web::WebBundle;
 use crate::{
     AttachmentError, HostCommandEnvelope, HostService, ProtocolValidation, SanitizedError,
-    SessionCommandEnvelope, SessionCursor, SessionId, SessionSupervisor, SupervisorError,
-    MAX_ATTACHMENT_FILE_BYTES, MAX_COMMAND_BYTES, PROTOCOL_VERSION,
+    ServiceError, SessionCommandEnvelope, SessionCursor, SessionId, SessionSupervisor,
+    SupervisorError, MAX_ATTACHMENT_FILE_BYTES, MAX_COMMAND_BYTES, PROTOCOL_VERSION,
 };
 
 const MAX_QUERY_BYTES: usize = 4 * 1024;
@@ -323,6 +323,7 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_FILE_BYTES + 1)),
         )
         .route("/api/v1/attachments/{handle}", get(attachment_content::<H>))
+        .route("/api/v1/resources/{handle}", get(resource_content::<H>))
         .route("/api/v1/events", any(events_socket::<H>))
         .route("/{*asset}", get(static_asset::<H>))
         .fallback(not_found)
@@ -442,6 +443,92 @@ async fn attachment_content<H: HostService>(
                 .into_response()
         }
         Err(error) => attachment_error_response(error),
+    }
+}
+
+async fn resource_content<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(handle): Path<String>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    match state.supervisor.resource_content(&handle).await {
+        Ok(resource) => {
+            let content_type = match HeaderValue::from_str(&resource.media_type) {
+                Ok(value) => value,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        SanitizedError::internal(),
+                    )
+                }
+            };
+            let content_length = match HeaderValue::from_str(&resource.bytes.len().to_string()) {
+                Ok(value) => value,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        SanitizedError::internal(),
+                    )
+                }
+            };
+            let disposition = match inline_content_disposition(&resource.display_name) {
+                Ok(value) => value,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        SanitizedError::internal(),
+                    )
+                }
+            };
+            let etag = match HeaderValue::from_str(&format!("\"{}\"", resource.sha256)) {
+                Ok(value) => value,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        SanitizedError::internal(),
+                    )
+                }
+            };
+            (
+                [
+                    (CONTENT_TYPE, content_type),
+                    (CONTENT_LENGTH, content_length),
+                    (CONTENT_DISPOSITION, disposition),
+                    (ETAG, etag),
+                    (
+                        CACHE_CONTROL,
+                        HeaderValue::from_static("private, max-age=31536000, immutable"),
+                    ),
+                ],
+                resource.bytes,
+            )
+                .into_response()
+        }
+        Err(ServiceError::NotFound) => error_response(
+            StatusCode::NOT_FOUND,
+            SanitizedError::public(crate::ErrorCode::NotFound, "The resource was not found."),
+        ),
+        Err(ServiceError::Unauthorized) => error_response(
+            StatusCode::FORBIDDEN,
+            SanitizedError::public(
+                crate::ErrorCode::Unauthorized,
+                "This resource is not authorized.",
+            ),
+        ),
+        Err(ServiceError::Unavailable) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            SanitizedError::public(
+                crate::ErrorCode::Unavailable,
+                "Opaque resources are temporarily unavailable.",
+            )
+            .with_retryable(true),
+        ),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SanitizedError::internal(),
+        ),
     }
 }
 
@@ -969,7 +1056,7 @@ fn apply_security_headers(headers: &mut HeaderMap) {
     headers.insert(
         CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'",
+            "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'",
         ),
     );
     if !headers.contains_key(CACHE_CONTROL) {
@@ -1023,8 +1110,9 @@ mod tests {
         AuthorityProfile, ColorScheme, ContextUsage, CreateSessionRequest, DriverCommandOutcome,
         HostCapabilities, HostDescriptor, HostId, InputModality, ModelSelection, ModelSummary,
         ServiceError, SessionCommand, SessionCursor, SessionDriver, SessionLiveState, SessionSeed,
-        SessionSnapshot, SessionSummary, StoredAttachment, SupervisorConfig, ThemeDensity,
-        ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeSourceClass, ThemeTypography,
+        SessionSnapshot, SessionSummary, StoredAttachment, StoredResource, SupervisorConfig,
+        ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeSourceClass,
+        ThemeTypography,
     };
 
     use super::*;
@@ -1114,6 +1202,18 @@ mod tests {
             handle: &str,
         ) -> Result<StoredAttachment, AttachmentError> {
             self.attachments.content(handle)
+        }
+
+        async fn resource_content(&self, handle: &str) -> Result<StoredResource, ServiceError> {
+            if handle != "opaque-resource-test" {
+                return Err(ServiceError::NotFound);
+            }
+            Ok(StoredResource {
+                display_name: "evidence.txt".into(),
+                media_type: "text/plain".into(),
+                bytes: bytes::Bytes::from_static(b"structured evidence"),
+                sha256: "d76769453d19211b99f8107a34ac8f2a94ff6bdb5cc6a41b9e5086f189391e83".into(),
+            })
         }
 
         fn authority_profiles(&self) -> Vec<AuthorityProfile> {
@@ -1532,7 +1632,7 @@ mod tests {
         assert_eq!(
             response_header(&allowed, "content-security-policy"),
             Some(
-                "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+                "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
             )
         );
         assert!(allowed
@@ -1715,6 +1815,59 @@ mod tests {
         chunked.extend_from_slice(b"\r\n0\r\n\r\n");
         let chunked_oversize = request_bytes(address, chunked).await;
         assert!(chunked_oversize.starts_with(b"HTTP/1.1 413"));
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn opaque_resource_transport_requires_auth_and_never_interprets_handles() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let server = LoopbackServer::start(
+            supervisor,
+            LoopbackConfig {
+                port: 0,
+                web_root: None,
+            },
+        )
+        .await
+        .unwrap();
+        let address = server.address();
+        let path = "/api/v1/resources/opaque-resource-test";
+
+        let unauthenticated = request(address, get_request(address, path)).await;
+        assert!(unauthenticated.starts_with("HTTP/1.1 401"));
+
+        let exchanged = request(address, exchange_request(address, &server.launch_token)).await;
+        let cookie = response_header(&exchanged, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let content = request(address, authenticated_get_request(address, path, cookie)).await;
+        assert!(content.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            response_header(&content, "content-type"),
+            Some("text/plain")
+        );
+        assert_eq!(
+            response_header(&content, "content-disposition"),
+            Some("inline; filename=\"evidence.txt\"")
+        );
+        assert_eq!(
+            response_header(&content, "cache-control"),
+            Some("private, max-age=31536000, immutable")
+        );
+        assert_eq!(
+            content.split_once("\r\n\r\n").unwrap().1,
+            "structured evidence"
+        );
+
+        let traversal = request(
+            address,
+            authenticated_get_request(address, "/api/v1/resources/..%2Fsecret", cookie),
+        )
+        .await;
+        assert!(traversal.starts_with("HTTP/1.1 404"));
         server.shutdown().await.unwrap();
     }
 }

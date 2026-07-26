@@ -58,7 +58,7 @@ pub use model::{
 };
 pub use service::{
     CreateSessionRequest, DriverCommandOutcome, HostService, ServiceError, SessionDriver,
-    SessionSeed, MAX_DRIVER_OUTCOME_EVENTS,
+    SessionSeed, StoredResource, MAX_DRIVER_OUTCOME_EVENTS,
 };
 pub use supervisor::{HostCommandAdmission, SessionSupervisor, SupervisorConfig, SupervisorError};
 pub use theme::{

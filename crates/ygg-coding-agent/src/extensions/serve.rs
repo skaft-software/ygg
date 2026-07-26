@@ -3,9 +3,10 @@
 //! Default-off adapter from the graphical host contracts to the real Ygg App.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -14,25 +15,25 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use ygg_agent::{
     AgentEvent, Entry, EntryValue, FinishReason, InputPart, OutputChannel, RunControl, Session,
-    ToolProgress, UserInput,
+    ToolOutput, ToolProgress, UserInput,
 };
 use ygg_ai::{
     AssistantPart, ImageSource, Media, Message, Modality, Model, ModelCatalog, ModelId,
     ReasoningConfig, ToolCallId, ToolResultPart, UserPart,
 };
 use ygg_serve_backend::{
-    ActorOwnerState, AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef,
-    AttachmentStore, AttentionState, AuthorityProfile, ColorScheme, ContextUsage,
-    CreateSessionRequest, DriverCommandOutcome, DurableEntryId, EventPayload, HostCapabilities,
-    HostDescriptor, HostId, HostService, InputModality, ItemDelta, ItemId, ItemLifecycle,
-    ItemPayload, LoopbackConfig, LoopbackServer, ModelSelection, ModelSummary, PendingRequest,
-    ProjectId, ProjectSummary, PromptInput, ProtocolValidation, RequestAnswer, RequestId,
-    RequestKind, RequestState, RunId, SemanticRole, ServiceError, SessionCommand, SessionCursor,
-    SessionDriver, SessionId, SessionItem, SessionLiveState, SessionSeed, SessionSnapshot,
-    SessionSummary, SessionSupervisor, StoredAttachment, SupervisorConfig, ThemeColor,
-    ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass,
-    ThemeTypography, TimestampedEvent, TurnId, UsageSnapshot, MAX_ITEM_TEXT_BYTES,
-    MAX_PROMPT_BYTES,
+    ActorOwnerState, ArtifactId, ArtifactKind, ArtifactRef, AttachmentError, AttachmentFingerprint,
+    AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState, AuthorityProfile,
+    ColorScheme, ContextUsage, CreateSessionRequest, DriverCommandOutcome, DurableEntryId,
+    EventPayload, FileChange, HostCapabilities, HostDescriptor, HostId, HostService, InputModality,
+    ItemDelta, ItemId, ItemLifecycle, ItemPayload, LoopbackConfig, LoopbackServer, ModelSelection,
+    ModelSummary, PendingRequest, ProjectId, ProjectSummary, PromptInput, ProtocolValidation,
+    RequestAnswer, RequestId, RequestKind, RequestState, RunId, SemanticRole, ServiceError,
+    SessionCommand, SessionCursor, SessionDriver, SessionId, SessionItem, SessionLiveState,
+    SessionSeed, SessionSnapshot, SessionSummary, SessionSupervisor, SourceId, SourceKind,
+    SourceRef, StoredAttachment, StoredResource, SupervisorConfig, ThemeColor, ThemeDensity,
+    ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
+    TimestampedEvent, TurnId, UsageSnapshot, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
 };
 
 use crate::app::bootstrap::{build_app, LaunchSelection, SessionSelection};
@@ -45,8 +46,110 @@ const DRIVER_MAILBOX_CAPACITY: usize = 64;
 const DRIVER_EVENT_CAPACITY: usize = 512;
 const MAX_GRAPHICAL_MODELS: usize = 256;
 const MAX_PROJECTED_SESSION_ITEMS: usize = 9_000;
+const MAX_OPAQUE_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OPAQUE_RESOURCE_COUNT: usize = 2_048;
+const MAX_OPAQUE_RESOURCE_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+const OPAQUE_RESOURCE_HANDLE_BYTES: usize = 32;
 
 static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Default)]
+struct OpaqueResourceIndex {
+    resources: HashMap<String, StoredResource>,
+    total_bytes: usize,
+}
+
+/// Process-local immutable resource snapshots.
+///
+/// A client can only dereference a random host-minted handle through the
+/// authenticated loopback route. Paths and URLs are never accepted by that
+/// route, and every registered snapshot is independently bounded.
+#[derive(Clone, Default)]
+struct OpaqueResourceRegistry {
+    index: Arc<Mutex<OpaqueResourceIndex>>,
+}
+
+impl OpaqueResourceRegistry {
+    fn register(
+        &self,
+        display_name: &str,
+        media_type: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<(String, StoredResource), ServiceError> {
+        if bytes.len() > MAX_OPAQUE_RESOURCE_BYTES || !safe_media_type(media_type) {
+            return Err(ServiceError::InvalidBoundary);
+        }
+        let display_name = safe_resource_name(display_name)?;
+        let sha256 = stable_hash(&bytes);
+        let mut index = self.index.lock().map_err(|_| ServiceError::Internal)?;
+        if index.resources.len() >= MAX_OPAQUE_RESOURCE_COUNT
+            || index
+                .total_bytes
+                .checked_add(bytes.len())
+                .is_none_or(|total| total > MAX_OPAQUE_RESOURCE_TOTAL_BYTES)
+        {
+            return Err(ServiceError::Unavailable);
+        }
+        let handle = loop {
+            let mut random = [0u8; OPAQUE_RESOURCE_HANDLE_BYTES];
+            getrandom::fill(&mut random).map_err(|_| ServiceError::Internal)?;
+            let candidate = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if !index.resources.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let resource = StoredResource {
+            display_name,
+            media_type: media_type.to_owned(),
+            bytes,
+            sha256,
+        };
+        index.total_bytes = index.total_bytes.saturating_add(resource.bytes.len());
+        index.resources.insert(handle.clone(), resource.clone());
+        Ok((handle, resource))
+    }
+
+    fn content(&self, handle: &str) -> Result<StoredResource, ServiceError> {
+        if handle.len() != OPAQUE_RESOURCE_HANDLE_BYTES * 2
+            || !handle
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ServiceError::NotFound);
+        }
+        self.index
+            .lock()
+            .map_err(|_| ServiceError::Internal)?
+            .resources
+            .get(handle)
+            .cloned()
+            .ok_or(ServiceError::NotFound)
+    }
+}
+
+fn safe_media_type(value: &str) -> bool {
+    value.contains('/')
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'+' | b'-' | b'.'))
+}
+
+fn safe_resource_name(value: &str) -> Result<String, ServiceError> {
+    let normalized = value.replace('\\', "/");
+    let basename = normalized.rsplit('/').next().unwrap_or_default().trim();
+    if basename.is_empty() || matches!(basename, "." | "..") {
+        return Err(ServiceError::InvalidBoundary);
+    }
+    let basename = ygg_serve_backend::sanitize_public_text(basename, 512, false);
+    if basename.is_empty() {
+        return Err(ServiceError::InvalidBoundary);
+    }
+    Ok(basename)
+}
 
 pub async fn run(
     config: Config,
@@ -163,6 +266,7 @@ struct YggHost {
     themes: Vec<ThemeOption>,
     selected_theme_id: ThemeId,
     attachments: Option<AttachmentStore>,
+    resources: OpaqueResourceRegistry,
 }
 
 impl YggHost {
@@ -210,6 +314,7 @@ impl YggHost {
             themes,
             selected_theme_id,
             attachments,
+            resources: OpaqueResourceRegistry::default(),
         })
     }
 
@@ -283,6 +388,7 @@ impl YggHost {
             actor_generation: generation,
             session_id: seed.summary.id.clone(),
             attachments: self.attachments.clone(),
+            resources: self.resources.clone(),
         };
         Ok(YggSessionDriver::spawn(seed, plan, 0))
     }
@@ -326,6 +432,7 @@ impl YggHost {
             actor_generation: generation,
             session_id: session_id.clone(),
             attachments: self.attachments.clone(),
+            resources: self.resources.clone(),
         };
         let known_entries = session.entries().len();
         Ok(YggSessionDriver::spawn(seed, plan, known_entries))
@@ -344,7 +451,7 @@ impl HostService for YggHost {
         let attachment_policy = self.attachments.as_ref().map(AttachmentStore::policy);
         HostCapabilities {
             concurrent_sessions: true,
-            opaque_resources: false,
+            opaque_resources: true,
             attachments: attachment_policy.is_some(),
             attachment_policy,
             previews: false,
@@ -376,6 +483,10 @@ impl HostService for YggHost {
             .as_ref()
             .ok_or(AttachmentError::Unavailable)?
             .content(handle)
+    }
+
+    async fn resource_content(&self, handle: &str) -> Result<StoredResource, ServiceError> {
+        self.resources.content(handle)
     }
 
     fn authority_ceiling(&self) -> AuthorityProfile {
@@ -511,6 +622,7 @@ struct WorkerPlan {
     actor_generation: u64,
     session_id: SessionId,
     attachments: Option<AttachmentStore>,
+    resources: OpaqueResourceRegistry,
 }
 
 enum PrivateResponse {
@@ -521,6 +633,12 @@ enum PrivateResponse {
 struct PrivateRequest {
     kind: RequestKind,
     response: PrivateResponse,
+}
+
+#[derive(Clone)]
+struct ProjectedToolCall {
+    name: String,
+    arguments: serde_json::Value,
 }
 
 struct ProjectionState {
@@ -534,6 +652,7 @@ struct ProjectionState {
     completed_assistant_items: VecDeque<Option<ItemId>>,
     completed_reasoning_items: VecDeque<Option<ItemId>>,
     tool_items: HashMap<String, ItemId>,
+    tool_calls: HashMap<String, ProjectedToolCall>,
     tool_progress: HashMap<String, (String, u64)>,
     private_requests: HashMap<RequestId, PrivateRequest>,
     pending_attachments: VecDeque<Vec<AttachmentRef>>,
@@ -552,6 +671,7 @@ impl ProjectionState {
             completed_assistant_items: VecDeque::new(),
             completed_reasoning_items: VecDeque::new(),
             tool_items: HashMap::new(),
+            tool_calls: HashMap::new(),
             tool_progress: HashMap::new(),
             private_requests: HashMap::new(),
             pending_attachments: VecDeque::new(),
@@ -575,6 +695,7 @@ impl ProjectionState {
         self.completed_assistant_items.clear();
         self.completed_reasoning_items.clear();
         self.tool_items.clear();
+        self.tool_calls.clear();
         self.tool_progress.clear();
         self.private_requests.clear();
     }
@@ -703,18 +824,23 @@ async fn run_worker(
                         .unwrap_or_else(|| "off".into());
                     let next_reasoning = config::parse_reasoning(&next_reasoning_label)
                         .unwrap_or(ReasoningConfig::Off);
+                    let previous_model = plan.launch.model.clone();
+                    let previous_reasoning = plan.launch.reasoning.clone();
                     plan.launch.model = ModelId(model);
                     plan.launch.reasoning = next_reasoning;
-                    Ok(DriverCommandOutcome::with_events(vec![event(
-                        EventPayload::SessionSettingsChanged {
-                            model: ModelSelection {
-                                provider,
-                                model: plan.launch.model.0.clone(),
-                                reasoning: next_reasoning_label,
-                            },
-                            authority: plan.authority,
-                        },
-                    )]))
+                    let selection = ModelSelection {
+                        provider,
+                        model: plan.launch.model.0.clone(),
+                        reasoning: next_reasoning_label,
+                    };
+                    match persist_idle_selection(&mut plan, &mut projection, selection) {
+                        Ok(outcome) => Ok(outcome),
+                        Err(error) => {
+                            plan.launch.model = previous_model;
+                            plan.launch.reasoning = previous_reasoning;
+                            Err(error)
+                        }
+                    }
                 };
                 let _ = message.response.send(outcome);
             }
@@ -770,17 +896,20 @@ async fn run_worker(
                         }
                     }
                 } else {
+                    let previous_reasoning = plan.launch.reasoning.clone();
                     plan.launch.reasoning = parsed;
-                    Ok(DriverCommandOutcome::with_events(vec![event(
-                        EventPayload::SessionSettingsChanged {
-                            model: ModelSelection {
-                                provider,
-                                model: plan.launch.model.0.clone(),
-                                reasoning,
-                            },
-                            authority: plan.authority,
-                        },
-                    )]))
+                    let selection = ModelSelection {
+                        provider,
+                        model: plan.launch.model.0.clone(),
+                        reasoning,
+                    };
+                    match persist_idle_selection(&mut plan, &mut projection, selection) {
+                        Ok(outcome) => Ok(outcome),
+                        Err(error) => {
+                            plan.launch.reasoning = previous_reasoning;
+                            Err(error)
+                        }
+                    }
                 };
                 let _ = message.response.send(outcome);
             }
@@ -837,6 +966,58 @@ fn reconfiguration_outcome(
         durable_entry_id,
     }));
     Ok(DriverCommandOutcome::with_events(events))
+}
+
+fn persist_idle_selection(
+    plan: &mut WorkerPlan,
+    projection: &mut ProjectionState,
+    selection: ModelSelection,
+) -> Result<DriverCommandOutcome, ServiceError> {
+    let (path, session, newly_created) = match &plan.launch.session {
+        SessionSelection::CreateNew(path) => (
+            path.clone(),
+            Session::create(path).map_err(|_| ServiceError::Internal)?,
+            true,
+        ),
+        SessionSelection::OpenExisting(path) => (
+            path.clone(),
+            Session::open(path).map_err(|_| ServiceError::Internal)?,
+            false,
+        ),
+    };
+    let mut session = session;
+    let append = session.append(EntryValue::Config {
+        model: Some(plan.launch.model.0.clone()),
+        reasoning: Some(reasoning_label(&plan.launch.reasoning)),
+        reasoning_mode: Some(
+            match plan.launch.reasoning_mode {
+                ygg_ai::ReasoningMode::Standard => "standard",
+                ygg_ai::ReasoningMode::Pro => "pro",
+            }
+            .to_owned(),
+        ),
+    });
+    if append.is_err() {
+        drop(session);
+        if newly_created {
+            let _ = std::fs::remove_file(&path);
+        }
+        return Err(ServiceError::Internal);
+    }
+    projection.known_entries = session.entries().len();
+    let durable_entry_id = session
+        .head()
+        .map(|head| DurableEntryId::new(head.0))
+        .transpose()
+        .map_err(|_| ServiceError::Internal)?;
+    plan.launch.session = SessionSelection::OpenExisting(path);
+    Ok(DriverCommandOutcome::with_events(vec![
+        event(EventPayload::SessionSettingsChanged {
+            model: selection,
+            authority: plan.authority,
+        }),
+        event(EventPayload::SessionDurableHeadChanged { durable_entry_id }),
+    ]))
 }
 
 async fn shutdown_worker_app(app: &mut Option<App>) {
@@ -1050,6 +1231,7 @@ async fn start_and_drive_run(
                     agent_event,
                     &run_id,
                     context_limit,
+                    plan,
                     projection,
                     events,
                     &mut response_text,
@@ -1288,6 +1470,7 @@ async fn project_agent_event(
     agent_event: AgentEvent,
     run_id: &RunId,
     context_limit: u64,
+    plan: &WorkerPlan,
     projection: &mut ProjectionState,
     events: &mpsc::Sender<TimestampedEvent>,
     response_text: &mut String,
@@ -1368,6 +1551,13 @@ async fn project_agent_event(
             } else {
                 serde_json::json!({"unavailable": "arguments exceeded the graphical projection limit"})
             };
+            projection.tool_calls.insert(
+                id.0.clone(),
+                ProjectedToolCall {
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                },
+            );
             events
                 .send(event(EventPayload::ItemStarted {
                     item: SessionItem {
@@ -1391,7 +1581,7 @@ async fn project_agent_event(
         AgentEvent::ToolProgress { id, progress } => {
             project_tool_progress(id, progress, run_id, projection, events).await?;
         }
-        AgentEvent::ToolFinished { id, .. } => {
+        AgentEvent::ToolFinished { id, result } => {
             if let Some(item_id) = projection.tool_items.get(&id.0).cloned() {
                 events
                     .send(event(EventPayload::ItemDelta {
@@ -1407,6 +1597,28 @@ async fn project_agent_event(
                     }))
                     .await
                     .map_err(|_| ServiceError::Unavailable)?;
+            }
+            if let (Some(tool), Some(tool_item_id), Ok(output)) = (
+                projection.tool_calls.get(&id.0),
+                projection.tool_items.get(&id.0),
+                result.as_ref(),
+            ) {
+                for payload in project_tool_evidence(
+                    &plan.config.workspace,
+                    &plan.resources,
+                    &plan.session_id,
+                    run_id,
+                    &projection.turn_id(run_id)?,
+                    &id.0,
+                    tool_item_id,
+                    tool,
+                    output,
+                ) {
+                    events
+                        .send(event(payload))
+                        .await
+                        .map_err(|_| ServiceError::Unavailable)?;
+                }
             }
         }
         AgentEvent::TurnFinished {
@@ -1448,6 +1660,309 @@ async fn project_agent_event(
         | AgentEvent::CompactionFinished { .. } => {}
     }
     Ok(None)
+}
+
+struct WorkspaceFileSnapshot {
+    display_path: String,
+    display_name: String,
+    bytes: bytes::Bytes,
+    media_type: &'static str,
+    artifact_kind: ArtifactKind,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_tool_evidence(
+    workspace: &Path,
+    resources: &OpaqueResourceRegistry,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turn_id: &TurnId,
+    tool_call_id: &str,
+    tool_item_id: &ItemId,
+    tool: &ProjectedToolCall,
+    output: &ToolOutput,
+) -> Vec<EventPayload> {
+    let identity =
+        stable_hash(format!("{}\0{}\0{}", session_id.as_str(), tool_call_id, tool.name).as_bytes());
+    let Some(short_identity) = identity.get(..24) else {
+        return Vec::new();
+    };
+
+    match tool.name.as_str() {
+        "read" => {
+            let Some(path) = tool
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return Vec::new();
+            };
+            let Some(snapshot) = snapshot_workspace_file(workspace, path) else {
+                return Vec::new();
+            };
+            let Ok((handle, _)) =
+                resources.register(&snapshot.display_name, snapshot.media_type, snapshot.bytes)
+            else {
+                return Vec::new();
+            };
+            let Ok(id) = SourceId::new(format!("source-{short_identity}")) else {
+                return Vec::new();
+            };
+            let source = SourceRef {
+                id,
+                kind: SourceKind::File,
+                title: snapshot.display_path,
+                handle,
+                origin_item_id: Some(tool_item_id.clone()),
+                consulted_at_ms: now_ms(),
+                cited: false,
+                available: true,
+            };
+            let Some(item) = provisional_evidence_item(
+                format!("item-source-{short_identity}"),
+                run_id,
+                turn_id,
+                ItemPayload::Source(source.clone()),
+            ) else {
+                return Vec::new();
+            };
+            vec![
+                EventPayload::SourceUpserted {
+                    source: source.clone(),
+                },
+                EventPayload::ItemStarted { item },
+            ]
+        }
+        "read_skill_resource" => {
+            let title = tool
+                .arguments
+                .get("resource_path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("skill resource");
+            let Ok((handle, _)) = resources.register(
+                title,
+                "text/plain",
+                bytes::Bytes::copy_from_slice(output.text.as_bytes()),
+            ) else {
+                return Vec::new();
+            };
+            let Ok(id) = SourceId::new(format!("source-{short_identity}")) else {
+                return Vec::new();
+            };
+            let source = SourceRef {
+                id,
+                kind: SourceKind::Resource,
+                title: bounded_text(title, 512),
+                handle,
+                origin_item_id: Some(tool_item_id.clone()),
+                consulted_at_ms: now_ms(),
+                cited: false,
+                available: true,
+            };
+            let Some(item) = provisional_evidence_item(
+                format!("item-source-{short_identity}"),
+                run_id,
+                turn_id,
+                ItemPayload::Source(source.clone()),
+            ) else {
+                return Vec::new();
+            };
+            vec![
+                EventPayload::SourceUpserted {
+                    source: source.clone(),
+                },
+                EventPayload::ItemStarted { item },
+            ]
+        }
+        "edit" | "write" => {
+            let Some(path) = tool
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return Vec::new();
+            };
+            let Some(snapshot) = snapshot_workspace_file(workspace, path) else {
+                return Vec::new();
+            };
+            let byte_len = snapshot.bytes.len() as u64;
+            let Ok((handle, stored)) =
+                resources.register(&snapshot.display_name, snapshot.media_type, snapshot.bytes)
+            else {
+                return Vec::new();
+            };
+            let Ok(id) = ArtifactId::new(format!("artifact-{short_identity}")) else {
+                return Vec::new();
+            };
+            let artifact = ArtifactRef {
+                id,
+                kind: snapshot.artifact_kind,
+                name: snapshot.display_name,
+                media_type: snapshot.media_type.to_owned(),
+                handle: handle.clone(),
+                byte_len,
+                content_hash: Some(stored.sha256),
+                origin_item_id: Some(tool_item_id.clone()),
+                available: true,
+            };
+            let (additions, deletions) = if tool.name == "edit" {
+                (
+                    line_count(
+                        tool.arguments
+                            .get("new")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                    line_count(
+                        tool.arguments
+                            .get("old")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                )
+            } else {
+                // A write may create or replace. The structured event does not
+                // retain the pre-write file, so claiming a diff would be false.
+                (0, 0)
+            };
+            let file_change = FileChange {
+                handle,
+                display_path: snapshot.display_path,
+                additions,
+                deletions,
+            };
+            let Some(change_item) = provisional_evidence_item(
+                format!("item-file-change-{short_identity}"),
+                run_id,
+                turn_id,
+                ItemPayload::FileChange(file_change),
+            ) else {
+                return Vec::new();
+            };
+            let Some(artifact_item) = provisional_evidence_item(
+                format!("item-artifact-{short_identity}"),
+                run_id,
+                turn_id,
+                ItemPayload::Artifact(artifact.clone()),
+            ) else {
+                return Vec::new();
+            };
+            vec![
+                EventPayload::ItemStarted { item: change_item },
+                EventPayload::ArtifactUpserted {
+                    artifact: artifact.clone(),
+                },
+                EventPayload::ItemStarted {
+                    item: artifact_item,
+                },
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn provisional_evidence_item(
+    id: String,
+    run_id: &RunId,
+    turn_id: &TurnId,
+    payload: ItemPayload,
+) -> Option<SessionItem> {
+    Some(SessionItem {
+        id: ItemId::new(id).ok()?,
+        run_id: Some(run_id.clone()),
+        turn_id: Some(turn_id.clone()),
+        provider_attempt: None,
+        lifecycle: ItemLifecycle::Provisional,
+        durable_entry_id: None,
+        payload,
+    })
+}
+
+fn snapshot_workspace_file(workspace: &Path, requested: &str) -> Option<WorkspaceFileSnapshot> {
+    let workspace = workspace.canonicalize().ok()?;
+    let requested_path = if requested.contains("://") || requested.starts_with("file:") {
+        let url = url::Url::parse(requested).ok()?;
+        if url.scheme() != "file"
+            || url.fragment().is_some()
+            || (!url.username().is_empty() || url.password().is_some())
+            || !matches!(url.host_str(), None | Some("") | Some("localhost"))
+        {
+            return None;
+        }
+        url.to_file_path().ok()?
+    } else {
+        PathBuf::from(requested)
+    };
+    let candidate = if requested_path.is_absolute() {
+        requested_path
+    } else {
+        workspace.join(requested_path)
+    };
+    let link_metadata = candidate.symlink_metadata().ok()?;
+    if link_metadata.file_type().is_symlink() {
+        return None;
+    }
+    let canonical = candidate.canonicalize().ok()?;
+    if canonical == workspace || !canonical.starts_with(&workspace) {
+        return None;
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&canonical).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_OPAQUE_RESOURCE_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_OPAQUE_RESOURCE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > MAX_OPAQUE_RESOURCE_BYTES {
+        return None;
+    }
+    let relative = canonical.strip_prefix(&workspace).ok()?;
+    let display_path = bounded_text(&relative.to_string_lossy().replace('\\', "/"), 512);
+    let display_name = canonical.file_name()?.to_str()?.to_owned();
+    let extension = canonical
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    Some(WorkspaceFileSnapshot {
+        display_path,
+        display_name,
+        media_type: if std::str::from_utf8(&bytes).is_ok() {
+            "text/plain"
+        } else {
+            "application/octet-stream"
+        },
+        artifact_kind: artifact_kind_for_extension(&extension),
+        bytes: bytes::Bytes::from(bytes),
+    })
+}
+
+fn artifact_kind_for_extension(extension: &str) -> ArtifactKind {
+    match extension {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" => ArtifactKind::Image,
+        "pdf" | "doc" | "docx" | "md" | "txt" => ArtifactKind::Document,
+        "csv" | "tsv" | "xls" | "xlsx" => ArtifactKind::Spreadsheet,
+        "ppt" | "pptx" | "key" => ArtifactKind::Presentation,
+        "html" | "htm" => ArtifactKind::Site,
+        "rs" | "js" | "jsx" | "ts" | "tsx" | "css" | "json" | "toml" | "yaml" | "yml" | "py"
+        | "go" | "java" | "kt" | "swift" | "c" | "h" | "cpp" | "hpp" | "sh" => ArtifactKind::File,
+        _ => ArtifactKind::Other,
+    }
+}
+
+fn line_count(value: &str) -> u32 {
+    value.lines().count().min(u32::MAX as usize) as u32
 }
 
 struct TerminalProjection {
@@ -1505,6 +2020,7 @@ async fn expire_private_requests(
             .map_err(|_| ServiceError::Unavailable)?;
     }
     projection.tool_items.clear();
+    projection.tool_calls.clear();
     projection.tool_progress.clear();
     Ok(())
 }
@@ -2716,6 +3232,50 @@ mod tests {
     use ygg_ai::UserMessage;
     use ygg_serve_backend::{CatalogCursor, HostBootstrap, PROTOCOL_VERSION};
 
+    fn serve_test_config(directory: &Path) -> Config {
+        Config {
+            workspace: directory.to_path_buf(),
+            invocation_cwd: directory.to_path_buf(),
+            model: None,
+            model_explicit: false,
+            reasoning: ReasoningConfig::Off,
+            reasoning_explicit: false,
+            reasoning_mode: ygg_ai::ReasoningMode::Standard,
+            reasoning_mode_explicit: false,
+            cache_retention: ygg_ai::CacheRetention::Short,
+            sandbox: crate::config::SandboxPolicy::default(),
+            theme: None,
+            theme_paths: Vec::new(),
+            color: crate::config::ColorMode::Auto,
+            mouse: crate::config::MouseMode::Auto,
+            plain: false,
+            session_dir: directory.join("sessions"),
+            compaction: crate::config::CompactionPolicy::default(),
+            max_cost_microdollars: None,
+            cost_warning_microdollars: None,
+            show_turn_cost: false,
+            max_turns: Some(40),
+            show_reasoning_in_print: false,
+            initial_prompt: None,
+            prompt_template: None,
+            debug_prompt: false,
+            prompt_paths: Vec::new(),
+            mode: crate::config::Mode::Print {
+                prompt: "test".into(),
+            },
+            resume: crate::config::ResumeSelector::New,
+            skill_paths: Vec::new(),
+            extension_paths: Vec::new(),
+            enabled_extensions: Vec::new(),
+            trusted_extensions: Vec::new(),
+            invocation_trusted_extensions: Vec::new(),
+            tools: crate::config::ToolPolicy::default(),
+            context_files: false,
+            offline: true,
+            workspace_trusted: true,
+        }
+    }
+
     fn png() -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
         bytes.extend_from_slice(&13u32.to_be_bytes());
@@ -2794,6 +3354,178 @@ mod tests {
             resolve_stored_media(true, Some(&store), &[tampered]).unwrap_err(),
             ServiceError::InvalidBoundary
         );
+    }
+
+    #[test]
+    fn successful_read_mints_openable_path_free_source_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/lib.rs"), b"pub fn ygg() {}\n").unwrap();
+        let registry = OpaqueResourceRegistry::default();
+        let session_id = SessionId::new("session-evidence").unwrap();
+        let run_id = RunId::new("run-evidence").unwrap();
+        let turn_id = TurnId::new("turn-evidence").unwrap();
+        let tool_item_id = ItemId::new("item-tool-read").unwrap();
+        let tool = ProjectedToolCall {
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        };
+
+        let events = project_tool_evidence(
+            workspace.path(),
+            &registry,
+            &session_id,
+            &run_id,
+            &turn_id,
+            "call-read",
+            &tool_item_id,
+            &tool,
+            &ToolOutput::new("1: pub fn ygg() {}"),
+        );
+        assert_eq!(events.len(), 2);
+        let EventPayload::SourceUpserted { source } = &events[0] else {
+            panic!("first event was not source evidence");
+        };
+        assert_eq!(source.title, "src/lib.rs");
+        assert_eq!(source.kind, SourceKind::File);
+        assert_eq!(source.origin_item_id.as_ref(), Some(&tool_item_id));
+        assert_eq!(
+            registry.content(&source.handle).unwrap().bytes,
+            bytes::Bytes::from_static(b"pub fn ygg() {}\n")
+        );
+        assert!(!source.handle.contains("src"));
+    }
+
+    #[test]
+    fn resource_projection_rejects_outside_workspace_and_snapshots_successful_edits() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let registry = OpaqueResourceRegistry::default();
+        let session_id = SessionId::new("session-evidence").unwrap();
+        let run_id = RunId::new("run-evidence").unwrap();
+        let turn_id = TurnId::new("turn-evidence").unwrap();
+        let tool_item_id = ItemId::new("item-tool").unwrap();
+        let outside_tool = ProjectedToolCall {
+            name: "read".into(),
+            arguments: serde_json::json!({"path": outside.path()}),
+        };
+        assert!(project_tool_evidence(
+            workspace.path(),
+            &registry,
+            &session_id,
+            &run_id,
+            &turn_id,
+            "call-outside",
+            &tool_item_id,
+            &outside_tool,
+            &ToolOutput::new("secret"),
+        )
+        .is_empty());
+
+        std::fs::write(workspace.path().join("notes.md"), b"after\nsecond\n").unwrap();
+        let edit = ProjectedToolCall {
+            name: "edit".into(),
+            arguments: serde_json::json!({
+                "path": "notes.md",
+                "old": "before\n",
+                "new": "after\nsecond\n"
+            }),
+        };
+        let events = project_tool_evidence(
+            workspace.path(),
+            &registry,
+            &session_id,
+            &run_id,
+            &turn_id,
+            "call-edit",
+            &tool_item_id,
+            &edit,
+            &ToolOutput::new("ok modified=1"),
+        );
+        assert_eq!(events.len(), 3);
+        let EventPayload::ItemStarted { item } = &events[0] else {
+            panic!("first edit event was not a file change");
+        };
+        let ItemPayload::FileChange(change) = &item.payload else {
+            panic!("edit item was not a file change");
+        };
+        assert_eq!(change.display_path, "notes.md");
+        assert_eq!((change.additions, change.deletions), (2, 1));
+        let EventPayload::ArtifactUpserted { artifact } = &events[1] else {
+            panic!("second edit event was not an artifact");
+        };
+        assert_eq!(artifact.kind, ArtifactKind::Document);
+        assert_eq!(
+            registry.content(&artifact.handle).unwrap().bytes,
+            bytes::Bytes::from_static(b"after\nsecond\n")
+        );
+    }
+
+    #[test]
+    fn pre_prompt_selection_is_durable_across_session_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_dir = directory.path().join("sessions");
+        std::fs::create_dir(&session_dir).unwrap();
+        let session_path = session_dir.join("selection.jsonl");
+        let session_id = SessionId::new("selection").unwrap();
+        let mut plan = WorkerPlan {
+            config: serve_test_config(directory.path()),
+            launch: LaunchSelection {
+                model: ModelId("selected-model".into()),
+                session: SessionSelection::CreateNew(session_path.clone()),
+                reasoning: ReasoningConfig::Effort(ygg_ai::ReasoningEffort::High),
+                reasoning_mode: ygg_ai::ReasoningMode::Standard,
+            },
+            authority: AuthorityProfile::FullAccess,
+            available_models: Vec::new(),
+            actor_generation: 1,
+            session_id,
+            attachments: None,
+            resources: OpaqueResourceRegistry::default(),
+        };
+        let mut projection = ProjectionState::new(0);
+
+        let first = persist_idle_selection(
+            &mut plan,
+            &mut projection,
+            ModelSelection {
+                provider: "test".into(),
+                model: "selected-model".into(),
+                reasoning: "high".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(first.events.len(), 2);
+        assert!(matches!(
+            plan.launch.session,
+            SessionSelection::OpenExisting(ref path) if path == &session_path
+        ));
+
+        plan.launch.reasoning = ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Low);
+        persist_idle_selection(
+            &mut plan,
+            &mut projection,
+            ModelSelection {
+                provider: "test".into(),
+                model: "selected-model".into(),
+                reasoning: "low".into(),
+            },
+        )
+        .unwrap();
+        drop(plan);
+
+        let reopened = Session::open_read_only(&session_path).unwrap();
+        let latest = reopened.entries().last().expect("persisted config");
+        assert!(matches!(
+            &latest.value,
+            EntryValue::Config {
+                model: Some(model),
+                reasoning: Some(reasoning),
+                reasoning_mode: Some(reasoning_mode),
+            } if model == "selected-model"
+                && reasoning == "low"
+                && reasoning_mode == "standard"
+        ));
     }
 
     #[test]

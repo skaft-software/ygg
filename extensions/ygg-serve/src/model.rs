@@ -143,7 +143,7 @@ impl Default for HostCapabilities {
     fn default() -> Self {
         Self {
             concurrent_sessions: true,
-            opaque_resources: true,
+            opaque_resources: false,
             attachments: false,
             attachment_policy: None,
             previews: false,

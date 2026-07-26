@@ -434,6 +434,14 @@ impl<H: HostService> SessionSupervisor<H> {
         self.host.attachment_content(handle).await
     }
 
+    /// Reads one authenticated opaque resource without interpreting its handle.
+    pub async fn resource_content(
+        &self,
+        handle: &str,
+    ) -> Result<crate::StoredResource, crate::ServiceError> {
+        self.host.resource_content(handle).await
+    }
+
     /// Subscribes to the ordered live stream across all hosted sessions.
     ///
     /// A lagged subscriber must recover each affected session through replay
