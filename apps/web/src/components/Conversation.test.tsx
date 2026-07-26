@@ -65,6 +65,35 @@ describe("conversation composer", () => {
     expect(onSubmit).toHaveBeenCalledWith("Queue this", [], "followUp");
   });
 
+  it("omits unavailable run timing instead of claiming zero work", () => {
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    session.items.push({
+      id: "run-outcome",
+      turnId: "turn-outcome",
+      kind: "run_outcome",
+      outcome: "done",
+      durationMs: 0,
+      summary: "Run completed",
+      state: "committed",
+      createdAt: new Date().toISOString(),
+    });
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    expect(screen.getByText("Run completed")).toBeVisible();
+    expect(screen.queryByText(/Worked for/)).toBeNull();
+  });
+
   it("retains a failed image upload with retry and remove controls", async () => {
     const user = userEvent.setup();
     const onIngestAttachment = vi

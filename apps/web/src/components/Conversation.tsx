@@ -499,7 +499,9 @@ function TranscriptItemView({
             )}
           </span>
           <strong>{item.summary}</strong>
-          <em>Worked for {formatDuration(item.durationMs)}</em>
+          {item.durationMs > 0 ? (
+            <em>Worked for {formatDuration(item.durationMs)}</em>
+          ) : null}
         </div>
       );
   }
