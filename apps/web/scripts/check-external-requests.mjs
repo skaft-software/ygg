@@ -14,6 +14,22 @@ function fail(scope, path, source, offset, message) {
   );
 }
 
+function isAuditedRootRelativeFetch(source, argument) {
+  const expression = argument.match(
+    /^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)/,
+  )?.[1];
+  if (expression !== "encoded.endpoint") return false;
+
+  const initializer = source.match(
+    /encoded\s*=\s*\{\s*endpoint:\s*([\s\S]*?),\s*\n\s*body:\s*JSON\.stringify/,
+  )?.[1];
+  if (!initializer) return false;
+
+  return /^command\.type\s*===\s*["']session\.create["']\s*\?\s*["']\/[^"'`]+["']\s*:\s*["']\/[^"'`]+["']$/.test(
+    initializer.trim(),
+  );
+}
+
 function assertCsp(scope, file, source) {
   const meta = source.match(
     /http-equiv=(["'])Content-Security-Policy\1[^>]*content=(["'])(.*?)\2/i,
@@ -110,7 +126,10 @@ function inspectRuntimeFile(scope, scopeRoot, file) {
   if (scope !== "built") {
     for (const match of source.matchAll(/\bfetch\s*\(\s*/g)) {
       const argument = source.slice(match.index + match[0].length);
-      if (!/^(?:["'`]\/)/.test(argument)) {
+      if (
+        !/^(?:["'`]\/)/.test(argument) &&
+        !isAuditedRootRelativeFetch(source, argument)
+      ) {
         fail(
           scope,
           path,
