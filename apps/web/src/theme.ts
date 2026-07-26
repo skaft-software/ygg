@@ -85,7 +85,62 @@ export function themeColorToCss(
   if (color.kind === "rgb") {
     return `rgb(${color.red} ${color.green} ${color.blue})`;
   }
+  if (color.kind === "ansi") {
+    const index = Math.max(0, Math.min(255, Math.trunc(color.index)));
+    const ansi16 = [
+      [0, 0, 0],
+      [205, 49, 49],
+      [13, 188, 121],
+      [229, 229, 16],
+      [36, 114, 200],
+      [188, 63, 188],
+      [17, 168, 205],
+      [229, 229, 229],
+      [102, 102, 102],
+      [241, 76, 76],
+      [35, 209, 139],
+      [245, 245, 67],
+      [59, 142, 234],
+      [214, 112, 214],
+      [41, 184, 219],
+      [255, 255, 255],
+    ] as const;
+    let red: number;
+    let green: number;
+    let blue: number;
+    if (index < ansi16.length) {
+      [red, green, blue] = ansi16[index];
+    } else if (index < 232) {
+      const cube = index - 16;
+      const levels = [0, 95, 135, 175, 215, 255];
+      red = levels[Math.floor(cube / 36) % 6];
+      green = levels[Math.floor(cube / 6) % 6];
+      blue = levels[cube % 6];
+    } else {
+      red = green = blue = 8 + (index - 232) * 10;
+    }
+    return `rgb(${red} ${green} ${blue})`;
+  }
   return fallback;
+}
+
+export function themeRoleColorToCss(
+  theme: ThemeDto,
+  roles: string[],
+  fallback: string,
+  legacyColorKey?: string,
+): string {
+  for (const role of roles) {
+    const token = theme.roles[role]?.foreground;
+    if (token) {
+      const resolved = theme.colors[token];
+      if (resolved) return themeColorToCss(resolved, fallback);
+    }
+  }
+  return themeColorToCss(
+    legacyColorKey ? theme.colors[legacyColorKey] : undefined,
+    fallback,
+  );
 }
 
 export function applyTheme(theme: ThemeDto): void {
@@ -95,14 +150,14 @@ export function applyTheme(theme: ThemeDto): void {
   root.dataset.motion = theme.motion;
   root.style.setProperty(
     "--theme-pigment",
-    themeColorToCss(theme.colors.accent, "#168f91"),
+    themeRoleColorToCss(theme, ["accent", "link"], "#168f91", "accent"),
   );
   root.style.setProperty(
     "--theme-foreground",
-    themeColorToCss(theme.colors.foreground, "#edf3f2"),
+    themeRoleColorToCss(theme, ["text"], "#edf3f2", "foreground"),
   );
   root.style.setProperty(
     "--theme-muted",
-    themeColorToCss(theme.colors.muted, "#778384"),
+    themeRoleColorToCss(theme, ["muted", "subtle"], "#778384", "muted"),
   );
 }

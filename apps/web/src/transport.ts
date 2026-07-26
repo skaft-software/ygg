@@ -35,6 +35,7 @@ export interface YggTransport {
   send(command: ClientCommand): Promise<CommandAck>;
   ingestAttachment(file: File): Promise<AttachmentRef>;
   attachmentContentUrl(handle: string): string;
+  resourceContentUrl(handle: string): string;
   subscribe(listener: EventListener): () => void;
   subscribeConnection?(listener: ConnectionListener): () => void;
   close(): void;
@@ -120,6 +121,10 @@ export class FixtureTransport implements YggTransport {
     const url = URL.createObjectURL(file);
     this.attachmentUrls.set(handle, url);
     return url;
+  }
+
+  resourceContentUrl(handle: string): string {
+    return `/api/v1/resources/${encodeURIComponent(handle)}`;
   }
 
   private emit(event: SessionEvent): void {
@@ -762,6 +767,10 @@ export class HttpTransport implements YggTransport {
 
   attachmentContentUrl(handle: string): string {
     return `/api/v1/attachments/${encodeURIComponent(handle)}`;
+  }
+
+  resourceContentUrl(handle: string): string {
+    return `/api/v1/resources/${encodeURIComponent(handle)}`;
   }
 
   subscribe(listener: EventListener): () => void {

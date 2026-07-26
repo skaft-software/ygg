@@ -1,13 +1,18 @@
 import {
+  AlertCircle,
+  Circle,
+  LoaderCircle,
   Menu,
   MessageSquarePlus,
   PanelLeftClose,
+  Search,
   Settings,
   X,
 } from "lucide-react";
 import {
   useEffect,
   useRef,
+  useState,
 } from "react";
 import type { SessionSummary } from "../protocol";
 import type { TransportConnectionState } from "../transport";
@@ -15,6 +20,7 @@ import { YggGlyph } from "./YggGlyph";
 
 interface SidebarProps {
   open: boolean;
+  blocked: boolean;
   sessions: SessionSummary[];
   selectedSessionId: string | null;
   surface: "session" | "settings" | "devices";
@@ -25,6 +31,26 @@ interface SidebarProps {
   onNewSession: () => void;
   onSelectSession: (sessionId: string) => void;
   onOpenSettings: () => void;
+}
+
+const sessionStatusLabel: Record<SessionSummary["status"], string> = {
+  idle: "Ready",
+  working: "Working",
+  needs_attention: "Needs attention",
+  done: "Done",
+  failed: "Failed",
+  stopped: "Stopped",
+  disconnected: "Reconnecting",
+};
+
+function SessionStatusGlyph({ status }: { status: SessionSummary["status"] }) {
+  if (status === "working" || status === "disconnected") {
+    return <LoaderCircle className="spin" aria-hidden="true" />;
+  }
+  if (status === "needs_attention" || status === "failed") {
+    return <AlertCircle aria-hidden="true" />;
+  }
+  return <Circle aria-hidden="true" />;
 }
 
 function SessionRow({
@@ -41,10 +67,13 @@ function SessionRow({
       className={`session-row ${selected ? "is-selected" : ""}`}
       onClick={onSelect}
       aria-current={selected ? "page" : undefined}
-      aria-label={`Open session ${session.title}`}
+      aria-label={`Open session ${session.title}, ${sessionStatusLabel[session.status]}`}
       data-status={session.status}
     >
-      <span className="session-status" aria-hidden="true" />
+      <span className="session-status">
+        <SessionStatusGlyph status={session.status} />
+        <span className="sr-only">{sessionStatusLabel[session.status]}</span>
+      </span>
       <span className="session-row-copy">
         <span className="session-row-title">{session.title}</span>
       </span>
@@ -93,6 +122,7 @@ function SessionSection({
 
 export function Sidebar({
   open,
+  blocked,
   sessions,
   selectedSessionId,
   surface,
@@ -111,7 +141,13 @@ export function Sidebar({
   }, [onClose]);
 
   useEffect(() => {
-    if (!open || !window.matchMedia("(max-width: 760px)").matches) return;
+    if (
+      !open ||
+      blocked ||
+      !window.matchMedia("(max-width: 760px)").matches
+    ) {
+      return;
+    }
     const sidebar = sidebarRef.current;
     const originalTarget =
       document.activeElement instanceof HTMLElement
@@ -158,8 +194,16 @@ export function Sidebar({
         originalTarget.focus();
       }
     };
-  }, [onRestoreFocus, open]);
-  const visibleSessions = sessions.filter((session) => !session.archived);
+  }, [blocked, onRestoreFocus, open]);
+  const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const visibleSessions = sessions.filter(
+    (session) =>
+      !session.archived &&
+      (!normalizedQuery ||
+        session.title.toLocaleLowerCase().includes(normalizedQuery) ||
+        session.preview.toLocaleLowerCase().includes(normalizedQuery)),
+  );
   const pinned = visibleSessions.filter((session) => session.pinned);
   const pinnedIds = new Set(pinned.map((session) => session.id));
   const recent = visibleSessions.filter((session) => !pinnedIds.has(session.id));
@@ -176,7 +220,7 @@ export function Sidebar({
         ref={sidebarRef}
         className={`sidebar ${open ? "is-open" : ""}`}
         aria-label="ygg"
-        inert={!open}
+        inert={!open || blocked}
       >
         <header className="sidebar-header">
           <div className="brand-row">
@@ -200,13 +244,29 @@ export function Sidebar({
             </span>
             <span>New session</span>
           </button>
+          <label className="sidebar-search">
+            <Search aria-hidden="true" />
+            <span className="sr-only">Search sessions</span>
+            <input
+              type="search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search sessions"
+            />
+          </label>
         </nav>
 
         <div className="sidebar-scroll">
           {visibleSessions.length === 0 ? (
             <div className="sidebar-empty">
-              <Menu aria-hidden="true" />
-              <span>No sessions yet</span>
+              {normalizedQuery ? (
+                <Search aria-hidden="true" />
+              ) : (
+                <Menu aria-hidden="true" />
+              )}
+              <span>
+                {normalizedQuery ? "No matching sessions" : "No sessions yet"}
+              </span>
             </div>
           ) : (
             <>

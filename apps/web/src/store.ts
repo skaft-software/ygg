@@ -402,6 +402,10 @@ export class YggStore {
     return this.transport.attachmentContentUrl(handle);
   }
 
+  resourceContentUrl(handle: string): string {
+    return this.transport.resourceContentUrl(handle);
+  }
+
   async selectSession(
     sessionId: string,
     routeMode: SessionRouteMode = "push",

@@ -202,8 +202,13 @@ test("uses one keyboard-operable reasoning slider with static reduced motion", a
 
 test("shows typed work and a conditional activity rail", async ({ page }) => {
   await selectSession(page, "Refine onboarding preview");
-  await expect(page.getByText("Read onboarding flow")).toBeVisible();
-  await expect(page.getByText("Checking the narrow layout")).toBeVisible();
+  const conversation = page.getByRole("region", { name: "Conversation" });
+  await expect(
+    conversation.getByText("Read onboarding flow"),
+  ).toBeVisible();
+  await expect(
+    conversation.getByText("Checking the narrow layout"),
+  ).toBeVisible();
   await ensureActivityOpen(page);
   await expect(page.getByText("Verifying keyboard and touch behavior")).toBeVisible();
   await expect(page.getByRole("button", { name: /Onboarding preview/ })).toBeVisible();

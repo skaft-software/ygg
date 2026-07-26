@@ -22,10 +22,12 @@ import {
   X,
 } from "lucide-react";
 import {
+  Suspense,
   type CSSProperties,
   type ChangeEvent,
   type KeyboardEvent,
   type ReactNode,
+  lazy,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -42,6 +44,8 @@ import type {
   TranscriptItem,
 } from "../protocol";
 import { YggGlyph } from "./YggGlyph";
+
+const MarkdownMessage = lazy(() => import("./MarkdownMessage"));
 
 interface ConversationProps {
   session: SessionSnapshot;
@@ -60,6 +64,12 @@ interface ConversationProps {
   onResolveApproval: (
     requestId: string,
     decision: "allowed_once" | "allowed_session" | "denied",
+  ) => Promise<void>;
+  onResolveUserInput: (
+    requestId: string,
+    answer:
+      | { type: "text"; text: string }
+      | { type: "choice"; choice: string },
   ) => Promise<void>;
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
@@ -236,12 +246,14 @@ function formatDuration(durationMs: number): string {
 
 function ActionCell({
   item,
+  animate,
   onOpenOutput,
   onOpenSource,
   availableOutputIds,
   availableSourceIds,
 }: {
   item: ActionItem;
+  animate: boolean;
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
   availableOutputIds: ReadonlySet<string>;
@@ -255,7 +267,10 @@ function ActionCell({
     availableOutputIds.has(id),
   );
   return (
-    <details className="action-cell" open={isStreaming}>
+    <details
+      className={`action-cell ${animate ? "is-entering" : ""}`}
+      open={isStreaming}
+    >
       <summary>
         <span className={`action-glyph ${isStreaming ? "is-live" : ""}`}>
           {isStreaming ? (
@@ -308,9 +323,117 @@ function ActionCell({
   );
 }
 
+function UserInputCard({
+  item,
+  onResolve,
+}: {
+  item: Extract<TranscriptItem, { kind: "user_input_request" }>;
+  onResolve: ConversationProps["onResolveUserInput"];
+}) {
+  const [answer, setAnswer] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const resolve = async (
+    value:
+      | { type: "text"; text: string }
+      | { type: "choice"; choice: string },
+  ) => {
+    if (item.resolved || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      await onResolve(item.requestId, value);
+      setAnswer("");
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "ygg could not send this answer.",
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <section className="user-input-card" aria-label="Input requested">
+      <span className="user-input-icon">
+        {item.resolved ? (
+          <ShieldCheck aria-hidden="true" />
+        ) : (
+          <ShieldAlert aria-hidden="true" />
+        )}
+      </span>
+      <div>
+        <span className="user-input-eyebrow">
+          {item.resolved ? "Answer sent" : "ygg needs private input"}
+        </span>
+        <h3>{item.prompt}</h3>
+        {item.resolved ? (
+          <p className="user-input-resolved">
+            The answer was delivered directly to the running tool and was not
+            added to the transcript.
+          </p>
+        ) : (
+          <>
+            {item.choices.length ? (
+              <div className="user-input-choices">
+                {item.choices.map((choice) => (
+                  <button
+                    key={choice}
+                    type="button"
+                    disabled={submitting}
+                    onClick={() => void resolve({ type: "choice", choice })}
+                  >
+                    {choice}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <form
+                className="user-input-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (answer) void resolve({ type: "text", text: answer });
+                }}
+              >
+                <label>
+                  <span className="sr-only">Private answer</span>
+                  <input
+                    type="password"
+                    value={answer}
+                    onChange={(event) => setAnswer(event.target.value)}
+                    placeholder="Enter private answer"
+                    autoComplete="off"
+                    disabled={submitting}
+                  />
+                </label>
+                <button
+                  className="primary-button"
+                  type="submit"
+                  disabled={!answer || submitting}
+                >
+                  Send securely
+                </button>
+              </form>
+            )}
+            <p className="user-input-privacy">
+              This value goes only to the waiting tool. It is not stored in
+              conversation history.
+            </p>
+          </>
+        )}
+        {error ? <p role="alert">{error}</p> : null}
+      </div>
+    </section>
+  );
+}
+
 function TranscriptItemView({
   item,
+  animate,
   onResolveApproval,
+  onResolveUserInput,
   onOpenOutput,
   onOpenSource,
   availableOutputIds,
@@ -319,7 +442,9 @@ function TranscriptItemView({
   onPreviewAttachment,
 }: {
   item: TranscriptItem;
+  animate: boolean;
   onResolveApproval: ConversationProps["onResolveApproval"];
+  onResolveUserInput: ConversationProps["onResolveUserInput"];
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
   availableOutputIds: ReadonlySet<string>;
@@ -334,7 +459,7 @@ function TranscriptItemView({
   switch (item.kind) {
     case "user_message": {
       return (
-        <article className="user-message">
+        <article className={`user-message ${animate ? "is-entering" : ""}`}>
           <div className="message-copy">{item.content}</div>
           {item.attachments?.length ? (
             <div
@@ -395,24 +520,28 @@ function TranscriptItemView({
     case "assistant_message":
       return (
         <article
-          className={`assistant-message ${item.state === "streaming" ? "is-streaming" : ""}`}
+          className={`assistant-message ${item.state === "streaming" ? "is-streaming" : ""} ${animate ? "is-entering" : ""}`}
           aria-live={item.state === "streaming" ? "polite" : undefined}
         >
-          <div className="message-copy">
-            {item.content || (
+          {item.content ? (
+            <Suspense fallback={<div className="message-copy">{item.content}</div>}>
+              <MarkdownMessage content={item.content} />
+            </Suspense>
+          ) : (
+            <div className="message-copy">
               <LoaderCircle
                 className="spin assistant-waiting"
                 aria-label="ygg is responding"
               />
-            )}
-          </div>
+            </div>
+          )}
         </article>
       );
 
     case "reasoning":
       return (
         <details
-          className={`reasoning-block ${item.state === "streaming" ? "is-live" : ""}`}
+          className={`reasoning-block ${item.state === "streaming" ? "is-live" : ""} ${animate ? "is-entering" : ""}`}
           open={item.state === "streaming"}
         >
           <summary>
@@ -432,6 +561,7 @@ function TranscriptItemView({
       return (
         <ActionCell
           item={item}
+          animate={animate}
           onOpenOutput={onOpenOutput}
           onOpenSource={onOpenSource}
           availableOutputIds={availableOutputIds}
@@ -441,7 +571,10 @@ function TranscriptItemView({
 
     case "approval":
       return (
-        <section className="approval-card" aria-label="Approval needed">
+        <section
+          className={`approval-card ${animate ? "is-entering" : ""}`}
+          aria-label="Approval needed"
+        >
           <div className="approval-icon">
             {item.resolved ? (
               <ShieldCheck aria-hidden="true" />
@@ -487,9 +620,19 @@ function TranscriptItemView({
         </section>
       );
 
+    case "user_input_request":
+      return (
+        <UserInputCard
+          item={item}
+          onResolve={onResolveUserInput}
+        />
+      );
+
     case "run_outcome":
       return (
-        <div className={`run-outcome is-${item.outcome}`}>
+        <div
+          className={`run-outcome is-${item.outcome} ${animate ? "is-entering" : ""}`}
+        >
           <span>
             {item.outcome === "done" ? (
               <Check aria-hidden="true" />
@@ -506,6 +649,162 @@ function TranscriptItemView({
         </div>
       );
   }
+}
+
+type WorkItem = Extract<
+  TranscriptItem,
+  { kind: "action" | "reasoning" }
+>;
+
+type TranscriptRow =
+  | { kind: "item"; item: TranscriptItem }
+  | {
+      kind: "work";
+      id: string;
+      items: WorkItem[];
+      outcome?: Extract<TranscriptItem, { kind: "run_outcome" }>;
+    };
+
+function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
+  const lastWorkIndexByTurn = new Map<string, number>();
+  const outcomeByTurn = new Map<
+    string,
+    Extract<TranscriptItem, { kind: "run_outcome" }>
+  >();
+  items.forEach((item, index) => {
+    if (item.kind === "action" || item.kind === "reasoning") {
+      lastWorkIndexByTurn.set(item.turnId, index);
+    } else if (item.kind === "run_outcome") {
+      outcomeByTurn.set(item.turnId, item);
+    }
+  });
+
+  const rows: TranscriptRow[] = [];
+  let index = 0;
+  while (index < items.length) {
+    const item = items[index]!;
+    if (item.kind === "action" || item.kind === "reasoning") {
+      const workItems: WorkItem[] = [];
+      const turnId = item.turnId;
+      let lastIndex = index;
+      while (lastIndex < items.length) {
+        const candidate = items[lastIndex]!;
+        if (
+          candidate.turnId !== turnId ||
+          (candidate.kind !== "action" && candidate.kind !== "reasoning")
+        ) {
+          break;
+        }
+        workItems.push(candidate);
+        lastIndex += 1;
+      }
+      const ownsOutcome =
+        lastWorkIndexByTurn.get(turnId) === lastIndex - 1;
+      rows.push({
+        kind: "work",
+        id: `work-${workItems[0]!.id}`,
+        items: workItems,
+        outcome: ownsOutcome ? outcomeByTurn.get(turnId) : undefined,
+      });
+      index = lastIndex;
+      continue;
+    }
+    if (
+      item.kind === "run_outcome" &&
+      lastWorkIndexByTurn.has(item.turnId)
+    ) {
+      index += 1;
+      continue;
+    }
+    rows.push({ kind: "item", item });
+    index += 1;
+  }
+  return rows;
+}
+
+interface WorkGroupProps {
+  row: Extract<TranscriptRow, { kind: "work" }>;
+  initialItemIds: ReadonlySet<string>;
+  onResolveApproval: ConversationProps["onResolveApproval"];
+  onResolveUserInput: ConversationProps["onResolveUserInput"];
+  onOpenOutput: (outputId: string) => void;
+  onOpenSource: (sourceId: string) => void;
+  availableOutputIds: ReadonlySet<string>;
+  availableSourceIds: ReadonlySet<string>;
+  attachmentContentUrl?: (handle: string) => string;
+  onPreviewAttachment: (
+    source: string,
+    name: string,
+    trigger: HTMLElement,
+  ) => void;
+}
+
+function WorkGroup({
+  row,
+  initialItemIds,
+  onResolveApproval,
+  onResolveUserInput,
+  onOpenOutput,
+  onOpenSource,
+  availableOutputIds,
+  availableSourceIds,
+  attachmentContentUrl,
+  onPreviewAttachment,
+}: WorkGroupProps) {
+  const live = row.items.some((item) => item.state === "streaming");
+  const [userOpen, setUserOpen] = useState(false);
+  const itemDuration = row.items.reduce(
+    (total, item) =>
+      total + (item.kind === "action" ? item.durationMs ?? 0 : 0),
+    0,
+  );
+  const duration = row.outcome?.durationMs || itemDuration;
+  const label = live
+    ? "Working…"
+    : duration > 0
+      ? `Worked for ${formatDuration(duration)}`
+      : "Work details";
+
+  return (
+    <details
+      className={`work-group ${live ? "is-live" : ""}`}
+      open={live || userOpen}
+      onToggle={(event) => {
+        if (!live) setUserOpen(event.currentTarget.open);
+      }}
+    >
+      <summary>
+        <span className="work-group-glyph">
+          {live ? (
+            <LoaderCircle className="spin" aria-hidden="true" />
+          ) : row.outcome?.outcome === "failed" ? (
+            <AlertTriangle aria-hidden="true" />
+          ) : (
+            <Check aria-hidden="true" />
+          )}
+        </span>
+        <span>{label}</span>
+        <ChevronDown aria-hidden="true" />
+      </summary>
+      <div className="work-group-content">
+        {row.items.map((item) => (
+          <TranscriptItemView
+            key={item.id}
+            item={item}
+            animate={!initialItemIds.has(item.id)}
+            onResolveApproval={onResolveApproval}
+            onResolveUserInput={onResolveUserInput}
+            onOpenOutput={onOpenOutput}
+            onOpenSource={onOpenSource}
+            availableOutputIds={availableOutputIds}
+            availableSourceIds={availableSourceIds}
+            attachmentContentUrl={attachmentContentUrl}
+            onPreviewAttachment={onPreviewAttachment}
+          />
+        ))}
+      </div>
+    </details>
+  );
 }
 
 function EmptySession({ attachments }: { attachments: boolean }) {
@@ -882,7 +1181,10 @@ function Composer({
   const dragDepthRef = useRef(0);
   const attachmentsRef = useRef<DraftAttachment[]>([]);
   const mountedRef = useRef(true);
-  const isWorking = session.status === "working";
+  const isWorking =
+    Boolean(session.activeRunId) ||
+    session.status === "working" ||
+    session.status === "needs_attention";
   const activeModel = bootstrap.models.find(
     (model) => model.id === session.modelId,
   );
@@ -1168,7 +1470,7 @@ function Composer({
                 )}
                 <span className="composer-attachment-copy">
                   <strong>{attachment.file.name}</strong>
-                  <small>
+                  <small aria-live="polite" aria-atomic="true">
                     {attachment.status === "uploading"
                       ? "Uploading…"
                       : attachment.status === "failed"
@@ -1360,6 +1662,7 @@ export function Conversation({
   onInterrupt,
   onConfigure,
   onResolveApproval,
+  onResolveUserInput,
   onOpenOutput,
   onOpenSource,
   onIngestAttachment,
@@ -1372,6 +1675,9 @@ export function Conversation({
     name: string;
     trigger: HTMLElement;
   } | null>(null);
+  const [initialItemIds] = useState(
+    () => new Set(session.items.map((item) => item.id)),
+  );
   const shouldStickRef = useRef(true);
   const resourcesAvailable = bootstrap.capabilities.resources;
   const availableOutputIds = new Set(
@@ -1380,6 +1686,7 @@ export function Conversation({
   const availableSourceIds = new Set(
     resourcesAvailable ? session.sources.map((source) => source.id) : [],
   );
+  const rows = transcriptRows(session.items);
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -1441,21 +1748,41 @@ export function Conversation({
               }
             />
           ) : (
-            session.items.map((item) => (
-              <TranscriptItemView
-                key={item.id}
-                item={item}
-                onResolveApproval={onResolveApproval}
-                onOpenOutput={onOpenOutput}
-                onOpenSource={onOpenSource}
-                availableOutputIds={availableOutputIds}
-                availableSourceIds={availableSourceIds}
-                attachmentContentUrl={attachmentContentUrl}
-                onPreviewAttachment={(source, name, trigger) =>
-                  setAttachmentPreview({ source, name, trigger })
-                }
-              />
-            ))
+            rows.map((row) =>
+              row.kind === "work" ? (
+                <WorkGroup
+                  key={row.id}
+                  row={row}
+                  initialItemIds={initialItemIds}
+                  onResolveApproval={onResolveApproval}
+                  onResolveUserInput={onResolveUserInput}
+                  onOpenOutput={onOpenOutput}
+                  onOpenSource={onOpenSource}
+                  availableOutputIds={availableOutputIds}
+                  availableSourceIds={availableSourceIds}
+                  attachmentContentUrl={attachmentContentUrl}
+                  onPreviewAttachment={(source, name, trigger) =>
+                    setAttachmentPreview({ source, name, trigger })
+                  }
+                />
+              ) : (
+                <TranscriptItemView
+                  key={row.item.id}
+                  item={row.item}
+                  animate={!initialItemIds.has(row.item.id)}
+                  onResolveApproval={onResolveApproval}
+                  onResolveUserInput={onResolveUserInput}
+                  onOpenOutput={onOpenOutput}
+                  onOpenSource={onOpenSource}
+                  availableOutputIds={availableOutputIds}
+                  availableSourceIds={availableSourceIds}
+                  attachmentContentUrl={attachmentContentUrl}
+                  onPreviewAttachment={(source, name, trigger) =>
+                    setAttachmentPreview({ source, name, trigger })
+                  }
+                />
+              ),
+            )
           )}
         </div>
       </div>

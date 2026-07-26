@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { type CSSProperties, useEffect, useState } from "react";
 import type { ThemeOption } from "../protocol";
-import { themeColorToCss } from "../theme";
+import { themeRoleColorToCss } from "../theme";
 
 interface SettingsViewProps {
   themes: ThemeOption[];
@@ -60,9 +60,7 @@ const fontStacks = [
 const uiSizes = [12, 13, 14, 15] as const;
 
 function themeDescription(option: ThemeOption): string {
-  const { scheme, density, source } = option.theme;
-  const palette = scheme === "unknown" ? "Adaptive" : scheme;
-  return `${palette} · ${density} · ${source}`;
+  return `Follows system appearance · ${option.theme.source}`;
 }
 
 export function SettingsView({
@@ -131,9 +129,11 @@ export function SettingsView({
             )
             .map((option) => {
             const selected = selectedThemeId === option.id;
-            const pigment = themeColorToCss(
-              option.theme.colors.accent,
+            const pigment = themeRoleColorToCss(
+              option.theme,
+              ["accent", "link"],
               "#168f91",
+              "accent",
             );
             return (
               <button

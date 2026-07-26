@@ -1,5 +1,6 @@
 import {
   Check,
+  Download,
   File,
   FileText,
   Globe2,
@@ -16,7 +17,9 @@ export type InspectorSelection =
 interface InspectorProps {
   session: SessionSnapshot;
   selection: InspectorSelection | null;
+  modal: boolean;
   previewsAvailable: boolean;
+  resourceContentUrl: (handle: string) => string;
   onRestoreFocus: () => void;
   onClose: () => void;
 }
@@ -83,7 +86,57 @@ function DocumentPreview({ output }: { output: OutputRef }) {
   );
 }
 
-function SourceInspector({ source }: { source: SourceRef }) {
+function ResourceContent({
+  title,
+  mediaType,
+  url,
+  image,
+}: {
+  title: string;
+  mediaType?: string;
+  url: string;
+  image?: boolean;
+}) {
+  return (
+    <section className="opaque-resource">
+      <div className="opaque-resource-heading">
+        <div>
+          <span>Content</span>
+          <small>{mediaType ?? "Sandboxed workspace resource"}</small>
+        </div>
+        <a
+          href={url}
+          download={title}
+          rel="noreferrer noopener"
+          aria-label={`Download ${title}`}
+        >
+          <Download aria-hidden="true" />
+          <span>Download</span>
+        </a>
+      </div>
+      {image ? (
+        <div className="opaque-resource-image">
+          <img src={url} alt={title} />
+        </div>
+      ) : (
+        <iframe
+          title={`${title} content`}
+          src={url}
+          sandbox=""
+          referrerPolicy="no-referrer"
+        />
+      )}
+    </section>
+  );
+}
+
+function SourceInspector({
+  source,
+  resourceUrl,
+}: {
+  source: SourceRef;
+  resourceUrl?: string;
+}) {
   return (
     <div className="source-inspector">
       <div className="source-hero">
@@ -116,6 +169,9 @@ function SourceInspector({ source }: { source: SourceRef }) {
           <pre>{source.excerpt}</pre>
         </section>
       ) : null}
+      {resourceUrl ? (
+        <ResourceContent title={source.title} url={resourceUrl} />
+      ) : null}
     </div>
   );
 }
@@ -123,7 +179,9 @@ function SourceInspector({ source }: { source: SourceRef }) {
 export function Inspector({
   session,
   selection,
+  modal,
   previewsAvailable,
+  resourceContentUrl,
   onRestoreFocus,
   onClose,
 }: InspectorProps) {
@@ -143,17 +201,19 @@ export function Inspector({
     const focusable = () =>
       Array.from(
         inspector?.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+          'button:not([disabled]), iframe, [href], [tabindex]:not([tabindex="-1"])',
         ) ?? [],
       );
-    window.requestAnimationFrame(() => focusable().at(-1)?.focus());
+    if (modal || originalTarget?.closest("[inert]")) {
+      window.requestAnimationFrame(() => focusable()[0]?.focus());
+    }
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
         onCloseRef.current();
         return;
       }
-      if (event.key !== "Tab") return;
+      if (!modal || event.key !== "Tab") return;
       const targets = focusable();
       if (!targets.length) return;
       const first = targets[0];
@@ -169,8 +229,9 @@ export function Inspector({
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
-      onRestoreFocus();
+      if (modal) onRestoreFocus();
       if (
+        modal &&
         document.activeElement === document.body &&
         originalTarget &&
         !originalTarget.closest("[inert]")
@@ -178,7 +239,7 @@ export function Inspector({
         originalTarget.focus();
       }
     };
-  }, [onRestoreFocus, selection]);
+  }, [modal, onRestoreFocus, selection]);
 
   if (!selection) return null;
 
@@ -194,12 +255,20 @@ export function Inspector({
     ? session.previews.find((candidate) => candidate.id === output.previewId)
     : undefined;
   const title = output?.title ?? source?.title ?? "Inspector";
+  const resourceHandle = output?.handle ?? source?.handle;
+  const resourceAvailable = (output?.available ?? source?.available) !== false;
+  const resourceUrl =
+    resourceHandle && resourceAvailable
+      ? resourceContentUrl(resourceHandle)
+      : undefined;
 
   return (
     <aside
       ref={inspectorRef}
       className="inspector"
       aria-label={`${title} inspector`}
+      aria-modal={modal ? true : undefined}
+      role={modal ? "dialog" : undefined}
     >
       <header className="inspector-header">
         <div className="inspector-title">
@@ -223,11 +292,7 @@ export function Inspector({
             </span>
           </div>
         </div>
-        <div className="inspector-pagination" aria-label="Viewer position">
-          <span>{preview ? "Live" : "1 / 1"}</span>
-        </div>
         <div className="inspector-actions">
-          <span className="inspector-zoom">100%</span>
           <button aria-label="Close inspector" onClick={onClose}>
             <X aria-hidden="true" />
           </button>
@@ -236,10 +301,19 @@ export function Inspector({
       <div className="inspector-body">
         {preview ? (
           <WebPreview preview={preview} />
+        ) : output && resourceUrl ? (
+          <div className="resource-preview">
+            <ResourceContent
+              title={output.title}
+              mediaType={output.mimeType}
+              url={resourceUrl}
+              image={output.kind === "image"}
+            />
+          </div>
         ) : output ? (
           <DocumentPreview output={output} />
         ) : source ? (
-          <SourceInspector source={source} />
+          <SourceInspector source={source} resourceUrl={resourceUrl} />
         ) : (
           <div className="preview-unavailable">
             <File aria-hidden="true" />

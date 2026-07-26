@@ -215,16 +215,19 @@ export interface ProgressStep {
 
 export interface SourceRef {
   id: string;
+  handle?: string;
   kind: "file" | "web" | "attachment" | "documentation";
   title: string;
   subtitle: string;
   consultedAt: string;
   iconLabel: string;
   excerpt?: string;
+  available?: boolean;
 }
 
 export interface OutputRef {
   id: string;
+  handle?: string;
   kind: "file" | "image" | "site" | "document";
   title: string;
   subtitle: string;
@@ -232,6 +235,7 @@ export interface OutputRef {
   updatedAt: string;
   previewId?: string;
   content?: string;
+  available?: boolean;
 }
 
 export interface PreviewRef {

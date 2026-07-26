@@ -127,6 +127,7 @@ function SessionHeader({
   const [renaming, setRenaming] = useState(false);
   const [draftTitle, setDraftTitle] = useState(sessionTitle);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
+  const renameFinishedRef = useRef(false);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -140,10 +141,15 @@ function SessionHeader({
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [menuOpen]);
 
-  const submitRename = () => {
-    if (draftTitle.trim()) onRename(draftTitle);
+  const finishRename = (commit: boolean, restoreFocus: boolean) => {
+    if (renameFinishedRef.current) return;
+    renameFinishedRef.current = true;
+    if (commit && draftTitle.trim()) onRename(draftTitle);
     setRenaming(false);
     setMenuOpen(false);
+    if (restoreFocus) {
+      window.requestAnimationFrame(() => menuTriggerRef.current?.focus());
+    }
   };
 
   return (
@@ -170,10 +176,16 @@ function SessionHeader({
               autoFocus
               value={draftTitle}
               onChange={(event) => setDraftTitle(event.target.value)}
-              onBlur={submitRename}
+              onBlur={() => finishRename(true, false)}
               onKeyDown={(event) => {
-                if (event.key === "Enter") submitRename();
-                if (event.key === "Escape") setRenaming(false);
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  finishRename(true, true);
+                }
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  finishRename(false, true);
+                }
               }}
               aria-label="Session title"
             />
@@ -224,6 +236,7 @@ function SessionHeader({
                     role="menuitem"
                     onClick={() => {
                       setDraftTitle(sessionTitle);
+                      renameFinishedRef.current = false;
                       setRenaming(true);
                       setMenuOpen(false);
                     }}
@@ -259,24 +272,27 @@ function SessionHeader({
 
 function UtilityTopbar({
   title,
+  sidebarOpen,
   onOpenSidebar,
   sidebarButtonRef,
 }: {
   title: string;
+  sidebarOpen: boolean;
   onOpenSidebar: () => void;
   sidebarButtonRef: RefObject<HTMLButtonElement | null>;
 }) {
   return (
     <header className="utility-topbar">
-      <button
-        ref={sidebarButtonRef}
-        className="icon-button"
-        onClick={onOpenSidebar}
-      >
-        <Menu aria-hidden="true" />
-        <span className="sr-only">Open sidebar</span>
-      </button>
-      <YggGlyph />
+      {!sidebarOpen ? (
+        <button
+          ref={sidebarButtonRef}
+          className="icon-button"
+          onClick={onOpenSidebar}
+        >
+          <Menu aria-hidden="true" />
+          <span className="sr-only">Open sidebar</span>
+        </button>
+      ) : null}
       <strong>{title}</strong>
     </header>
   );
@@ -325,6 +341,8 @@ export default function App() {
     setSidebarOpen(false);
     restoreSidebarFocus();
   }, [restoreSidebarFocus]);
+  const modalWorkspaceOpen =
+    !wideLayout && (activityOpen || Boolean(inspector));
 
   useEffect(() => {
     applyStoredTypePreferences();
@@ -357,6 +375,9 @@ export default function App() {
   const activityAvailable = Boolean(
     session &&
       (session.progress.length ||
+        session.items.some(
+          (item) => item.kind === "action" || item.kind === "reasoning",
+        ) ||
         (state.bootstrap?.capabilities.resources &&
           (session.outputs.length || session.sources.length))),
   );
@@ -429,6 +450,7 @@ export default function App() {
     <div className={appClass}>
       <Sidebar
         open={sidebarOpen}
+        blocked={modalWorkspaceOpen}
         sessions={state.bootstrap.sessions}
         selectedSessionId={state.selectedSessionId}
         surface={surface}
@@ -464,8 +486,7 @@ export default function App() {
         <div
           className="session-column"
           inert={
-            mobileLayout &&
-            (sidebarOpen || activityOpen || Boolean(inspector))
+            (mobileLayout && sidebarOpen) || modalWorkspaceOpen
           }
         >
           <SessionHeader
@@ -516,6 +537,9 @@ export default function App() {
             onResolveApproval={(requestId, decision) =>
               store.resolveApproval(requestId, decision)
             }
+            onResolveUserInput={(requestId, answer) =>
+              store.resolveUserInput(requestId, answer)
+            }
             onOpenOutput={openOutput}
             onOpenSource={openSource}
             onIngestAttachment={(file) => store.ingestAttachment(file)}
@@ -528,12 +552,12 @@ export default function App() {
         <div
           className="utility-column"
           inert={
-            mobileLayout &&
-            (sidebarOpen || activityOpen || Boolean(inspector))
+            (mobileLayout && sidebarOpen) || modalWorkspaceOpen
           }
         >
           <UtilityTopbar
             title={surface === "settings" ? "Settings" : "Connected devices"}
+            sidebarOpen={sidebarOpen}
             onOpenSidebar={() => setSidebarOpen(true)}
             sidebarButtonRef={sidebarButtonRef}
           />
@@ -573,14 +597,16 @@ export default function App() {
             onClose={closeActivity}
             onOpenOutput={openOutput}
             onOpenSource={openSource}
-            modal={mobileLayout}
+            modal={!wideLayout}
             onRestoreFocus={restoreActivityFocus}
             resourcesAvailable={state.bootstrap.capabilities.resources}
           />
           <Inspector
             session={session}
             selection={inspector}
+            modal={!wideLayout}
             previewsAvailable={state.bootstrap.capabilities.previews}
+            resourceContentUrl={(handle) => store.resourceContentUrl(handle)}
             onRestoreFocus={restoreActivityFocus}
             onClose={closeInspector}
           />

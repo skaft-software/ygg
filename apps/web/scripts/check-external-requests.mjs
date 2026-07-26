@@ -52,6 +52,7 @@ function assertCsp(scope, file, source) {
 
   const exact = new Map([
     ["connect-src", ["'self'"]],
+    ["font-src", ["'self'", "data:"]],
     ["img-src", ["'self'", "data:", "blob:"]],
     ["object-src", ["'none'"]],
     ["base-uri", ["'none'"]],
@@ -113,6 +114,8 @@ function inspectRuntimeFile(scope, scopeRoot, file) {
   const builtAbsoluteAllowlist = [
     /^http:\/\/www\.w3\.org\//,
     /^https:\/\/react\.dev\/errors\//,
+    // Bundled parser diagnostics are inert message text, not request targets.
+    /^https:\/\/github\.com\/syntax-tree\/hast-util-to-jsx-runtime#/,
   ];
   for (const match of source.matchAll(/\b(?:https?|wss?):\/\/[^\s"'`)]+/gi)) {
     if (

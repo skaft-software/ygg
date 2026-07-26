@@ -24,6 +24,7 @@ describe("conversation composer", () => {
         onInterrupt={noOp}
         onConfigure={noOp}
         onResolveApproval={noOp}
+        onResolveUserInput={noOp}
         onOpenOutput={() => {}}
         onOpenSource={() => {}}
       />,
@@ -50,6 +51,7 @@ describe("conversation composer", () => {
         onInterrupt={noOp}
         onConfigure={noOp}
         onResolveApproval={noOp}
+        onResolveUserInput={noOp}
         onOpenOutput={() => {}}
         onOpenSource={() => {}}
       />,
@@ -76,6 +78,7 @@ describe("conversation composer", () => {
         onInterrupt={noOp}
         onConfigure={onConfigure}
         onResolveApproval={noOp}
+        onResolveUserInput={noOp}
         onOpenOutput={() => {}}
         onOpenSource={() => {}}
       />,
@@ -119,6 +122,7 @@ describe("conversation composer", () => {
         onInterrupt={noOp}
         onConfigure={noOp}
         onResolveApproval={noOp}
+        onResolveUserInput={noOp}
         onOpenOutput={() => {}}
         onOpenSource={() => {}}
       />,
@@ -126,6 +130,81 @@ describe("conversation composer", () => {
 
     expect(screen.getByText("Run completed")).toBeVisible();
     expect(screen.queryByText(/Worked for/)).toBeNull();
+  });
+
+  it("renders assistant markdown as readable, safe rich content", () => {
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    session.items.push({
+      id: "assistant-markdown",
+      turnId: "turn-markdown",
+      kind: "assistant_message",
+      content:
+        "## Result\n\n- One\n- Two\n\n```ts\nconst answer = 42;\n```\n\n<script>alert('no')</script>",
+      state: "committed",
+      createdAt: new Date().toISOString(),
+    });
+    const { container } = render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { name: "Result" }),
+    ).toBeVisible();
+    expect(screen.getByRole("list")).toHaveTextContent(/One\s+Two/);
+    expect(screen.getByRole("button", { name: "Copy code" })).toBeVisible();
+    expect(container.querySelector("script")).toBeNull();
+    expect(screen.getByText("<script>alert('no')</script>")).toBeVisible();
+  });
+
+  it("answers a private tool-input request without adding it to prose", async () => {
+    const user = userEvent.setup();
+    const onResolveUserInput = vi.fn().mockResolvedValue(undefined);
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    session.status = "needs_attention";
+    session.activeRunId = "run-private-input";
+    session.items.push({
+      id: "request-private-input",
+      turnId: "turn-private-input",
+      kind: "user_input_request",
+      requestId: "private-input",
+      prompt: "Enter the deployment token",
+      choices: [],
+      state: "streaming",
+      createdAt: new Date().toISOString(),
+    });
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={onResolveUserInput}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    const field = screen.getByLabelText("Private answer");
+    expect(field).toHaveAttribute("type", "password");
+    await user.type(field, "secret-value");
+    await user.click(screen.getByRole("button", { name: "Send securely" }));
+    expect(onResolveUserInput).toHaveBeenCalledWith("private-input", {
+      type: "text",
+      text: "secret-value",
+    });
+    expect(field).toHaveValue("");
   });
 
   it("retains a failed image upload with retry and remove controls", async () => {
@@ -148,6 +227,7 @@ describe("conversation composer", () => {
         onInterrupt={noOp}
         onConfigure={noOp}
         onResolveApproval={noOp}
+        onResolveUserInput={noOp}
         onOpenOutput={() => {}}
         onOpenSource={() => {}}
         onIngestAttachment={onIngestAttachment}

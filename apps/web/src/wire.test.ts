@@ -130,6 +130,69 @@ describe("authoritative Rust wire contract", () => {
     });
   });
 
+  it("preserves opaque resource handles for safe source and artifact viewers", () => {
+    const source = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    source.cursor.sequence = 44;
+    source.event = {
+      type: "source.upserted",
+      data: {
+        source: {
+          id: "source-theme",
+          kind: "file",
+          title: "theme.ts",
+          handle: "resource-source-theme",
+          consultedAtMs: 1_721_000_000_044,
+          cited: false,
+          available: true,
+        },
+      },
+    };
+    expect(projectEventEnvelope(source)).toMatchObject({
+      type: "session.resources",
+      sources: [
+        {
+          id: "source-theme",
+          handle: "resource-source-theme",
+          available: true,
+        },
+      ],
+    });
+
+    const artifact = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    artifact.cursor.sequence = 45;
+    artifact.event = {
+      type: "artifact.upserted",
+      data: {
+        artifact: {
+          id: "artifact-report",
+          kind: "document",
+          name: "report.md",
+          mediaType: "text/markdown",
+          handle: "resource-artifact-report",
+          byteLen: 128,
+          available: true,
+        },
+      },
+    };
+    expect(projectEventEnvelope(artifact)).toMatchObject({
+      type: "session.resources",
+      outputs: [
+        {
+          id: "artifact-report",
+          handle: "resource-artifact-report",
+          mimeType: "text/markdown",
+          available: true,
+        },
+      ],
+    });
+  });
+
   it("advances durable-head cursors without inventing a UI mutation", () => {
     const durable = clone(eventEnvelopeGolden) as unknown as {
       cursor: { sequence: number };

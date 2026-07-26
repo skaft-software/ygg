@@ -60,6 +60,10 @@ class TestTransport implements YggTransport {
     return `/api/v1/attachments/${encodeURIComponent(handle)}`;
   }
 
+  resourceContentUrl(handle: string): string {
+    return `/api/v1/resources/${encodeURIComponent(handle)}`;
+  }
+
   subscribe(listener: (event: HostEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

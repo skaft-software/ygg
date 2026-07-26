@@ -1,4 +1,5 @@
 import {
+  BrainCircuit,
   Check,
   ChevronDown,
   Circle,
@@ -7,8 +8,9 @@ import {
   Globe2,
   LoaderCircle,
   PanelRightClose,
+  TerminalSquare,
 } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   OutputRef,
   ProgressStep,
@@ -58,6 +60,12 @@ export function ActivityRail({
   resourcesAvailable,
 }: ActivityRailProps) {
   const railRef = useRef<HTMLElement>(null);
+  const [openSections, setOpenSections] = useState({
+    progress: true,
+    activity: true,
+    artifacts: true,
+    context: true,
+  });
   const onCloseRef = useRef(onClose);
   useEffect(() => {
     onCloseRef.current = onClose;
@@ -100,6 +108,9 @@ export function ActivityRail({
   const completeCount = session.progress.filter(
     (step) => step.status === "completed",
   ).length;
+  const liveWork = session.items
+    .filter((item) => item.kind === "action" || item.kind === "reasoning")
+    .slice(-8);
 
   return (
     <aside
@@ -119,7 +130,16 @@ export function ActivityRail({
       <div className="rail-scroll">
         {session.progress.length ? (
           <section className="rail-section" aria-labelledby="progress-heading">
-            <details open>
+            <details
+              open={openSections.progress}
+              onToggle={(event) => {
+                const open = event.currentTarget.open;
+                setOpenSections((current) => ({
+                  ...current,
+                  progress: open,
+                }));
+              }}
+            >
               <summary>
                 <span id="progress-heading">Progress</span>
                 <em>{completeCount} of {session.progress.length}</em>
@@ -143,9 +163,68 @@ export function ActivityRail({
           </section>
         ) : null}
 
+        {liveWork.length ? (
+          <section className="rail-section" aria-labelledby="activity-heading">
+            <details
+              open={openSections.activity}
+              onToggle={(event) => {
+                const open = event.currentTarget.open;
+                setOpenSections((current) => ({
+                  ...current,
+                  activity: open,
+                }));
+              }}
+            >
+              <summary>
+                <span id="activity-heading">Activity</span>
+                <em>
+                  {liveWork.some((item) => item.state === "streaming")
+                    ? "Live"
+                    : liveWork.length}
+                </em>
+                <ChevronDown aria-hidden="true" />
+              </summary>
+              <ol className="live-activity-list">
+                {liveWork.map((item) => (
+                  <li key={item.id} data-state={item.state}>
+                    <span>
+                      {item.state === "streaming" ? (
+                        <LoaderCircle className="spin" aria-hidden="true" />
+                      ) : item.kind === "reasoning" ? (
+                        <BrainCircuit aria-hidden="true" />
+                      ) : (
+                        <TerminalSquare aria-hidden="true" />
+                      )}
+                    </span>
+                    <span>
+                      <strong>
+                        {item.kind === "reasoning"
+                          ? item.summary
+                          : item.label}
+                      </strong>
+                      {item.kind === "action" && item.target ? (
+                        <code>{item.target}</code>
+                      ) : null}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+            </details>
+          </section>
+        ) : null}
+
         {resourcesAvailable && session.outputs.length ? (
           <section className="rail-section" aria-labelledby="outputs-heading">
-            <details open>
+            <details
+              open={openSections.artifacts}
+              onToggle={(event) => {
+                const open = event.currentTarget.open;
+                setOpenSections((current) => ({
+                  ...current,
+                  artifacts: open,
+                }));
+              }}
+            >
               <summary>
                 <span id="outputs-heading">Artifacts</span>
                 <em>{session.outputs.length}</em>
@@ -171,7 +250,16 @@ export function ActivityRail({
 
         {resourcesAvailable && session.sources.length ? (
           <section className="rail-section" aria-labelledby="sources-heading">
-            <details open>
+            <details
+              open={openSections.context}
+              onToggle={(event) => {
+                const open = event.currentTarget.open;
+                setOpenSections((current) => ({
+                  ...current,
+                  context: open,
+                }));
+              }}
+            >
               <summary>
                 <span id="sources-heading">Context</span>
                 <em>{session.sources.length}</em>

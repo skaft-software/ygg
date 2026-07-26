@@ -569,6 +569,7 @@ function projectSource(value: unknown, path: string): SourceRef {
   const consultedAt = number(source.consultedAtMs, `${path}.consultedAtMs`);
   return {
     id: string(source.id, `${path}.id`),
+    handle: string(source.handle, `${path}.handle`),
     kind:
       kind === "resource"
         ? "documentation"
@@ -580,6 +581,7 @@ function projectSource(value: unknown, path: string): SourceRef {
     consultedAt: iso(consultedAt),
     iconLabel:
       kind === "web" ? "WEB" : kind === "attachment" ? "FILE" : "SRC",
+    available: boolean(source.available, `${path}.available`),
   };
 }
 
@@ -611,6 +613,7 @@ function projectArtifact(value: unknown, path: string): OutputRef {
   const byteLen = number(artifact.byteLen, `${path}.byteLen`);
   return {
     id: string(artifact.id, `${path}.id`),
+    handle: string(artifact.handle, `${path}.handle`),
     kind:
       kind === "image" || kind === "document" || kind === "site"
         ? kind
@@ -619,6 +622,7 @@ function projectArtifact(value: unknown, path: string): OutputRef {
     subtitle: `${byteLen.toLocaleString()} bytes`,
     mimeType: string(artifact.mediaType, `${path}.mediaType`),
     updatedAt: iso(0),
+    available: boolean(artifact.available, `${path}.available`),
   };
 }
 
