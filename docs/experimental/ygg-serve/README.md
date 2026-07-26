@@ -95,6 +95,12 @@ API or event-stream access. This transport authentication is distinct from
 Ygg's agent authority and from the future LAN device identity described in the
 pairing plan.
 
+The public installer remains pinned to the current published release and must
+not request the `serve` feature from a tag that predates it. Enabling `serve` in
+that installer is a release gate: the installer pin, `--features serve`, signed
+artifacts, and the installed-binary web-bundle smoke check must ship atomically
+with a future `v0.3.2-alpha` or later tag.
+
 ## Explicit exclusions
 
 The first web release does not include skills, MCP, plugins, extension

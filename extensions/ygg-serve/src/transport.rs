@@ -13,9 +13,9 @@ use axum::http::header::{
     CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST, LOCATION,
     ORIGIN, REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
 };
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
@@ -24,6 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::embedded_web::WebBundle;
 use crate::{
     HostCommandEnvelope, HostService, ProtocolValidation, SanitizedError, SessionCommandEnvelope,
     SessionCursor, SessionId, SessionSupervisor, SupervisorError, MAX_COMMAND_BYTES,
@@ -34,10 +35,7 @@ const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 8 * 1024;
 const RATE_LIMIT_REQUESTS: usize = 240;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
-
-const PLACEHOLDER_SHELL: &str = r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ygg</title></head><body><main><h1>Ygg</h1><p>The graphical shell is not bundled in this experimental build.</p></main></body></html>"#;
+const X_YGG_WEB_BUNDLE: HeaderName = HeaderName::from_static("x-ygg-web-bundle");
 
 /// Loopback listener configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -80,15 +78,10 @@ impl LoopbackServer {
         supervisor: Arc<SessionSupervisor<H>>,
         config: LoopbackConfig,
     ) -> Result<Self, TransportError> {
-        let web_root = config.web_root.map(std::fs::canonicalize).transpose()?;
-        if let Some(root) = &web_root {
-            if !std::fs::metadata(root.join("index.html"))?.is_file() {
-                return Err(TransportError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "web root must contain a regular index.html",
-                )));
-            }
-        }
+        let web_bundle = match config.web_root.as_deref() {
+            Some(root) => WebBundle::from_root(root)?,
+            None => WebBundle::embedded()?,
+        };
         let listener = TcpListener::bind(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             config.port,
@@ -108,7 +101,7 @@ impl LoopbackServer {
             auth,
             allowed_authorities: AllowedAuthorities::new(address),
             rate_limiter: RateLimiter::default(),
-            web_root,
+            web_bundle,
         });
         let router = build_router(state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
@@ -177,7 +170,7 @@ struct TransportState<H: HostService> {
     auth: TransportAuth,
     allowed_authorities: AllowedAuthorities,
     rate_limiter: RateLimiter,
-    web_root: Option<PathBuf>,
+    web_bundle: WebBundle,
 }
 
 struct TransportAuth {
@@ -343,10 +336,7 @@ async fn exchange_launch_token<H: HostService>(
 }
 
 async fn index<H: HostService>(State(state): State<Arc<TransportState<H>>>) -> Response {
-    match &state.web_root {
-        Some(root) => static_file(root, FilePath::new("index.html")).await,
-        None => Html(PLACEHOLDER_SHELL).into_response(),
-    }
+    web_asset_response(&state.web_bundle, "index.html")
 }
 
 async fn static_asset<H: HostService>(
@@ -356,9 +346,6 @@ async fn static_asset<H: HostService>(
     if asset.starts_with("api/") || asset.starts_with("__ygg/") {
         return not_found().await;
     }
-    let Some(root) = &state.web_root else {
-        return not_found().await;
-    };
     let relative = FilePath::new(&asset);
     if !safe_relative_path(relative) {
         return not_found().await;
@@ -367,41 +354,27 @@ async fn static_asset<H: HostService>(
         return if asset.contains('.') || asset == "assets" {
             not_found().await
         } else {
-            static_file(root, FilePath::new("index.html")).await
+            web_asset_response(&state.web_bundle, "index.html")
         };
     }
-    if static_media_type(relative).is_none() {
-        return not_found().await;
-    }
-    let candidate = root.join(relative);
-    match tokio::fs::canonicalize(candidate).await {
-        Ok(canonical) if canonical.starts_with(root) && canonical.is_file() => {
-            static_file(root, relative).await
-        }
-        _ => not_found().await,
+    match state.web_bundle.asset(&asset) {
+        Some(_) => web_asset_response(&state.web_bundle, &asset),
+        None => not_found().await,
     }
 }
 
-async fn static_file(root: &FilePath, relative: &FilePath) -> Response {
-    const MAX_STATIC_ASSET_BYTES: u64 = 32 * 1024 * 1024;
-    let canonical = match tokio::fs::canonicalize(root.join(relative)).await {
-        Ok(canonical) if canonical.starts_with(root) => canonical,
-        _ => return not_found().await,
+fn web_asset_response(bundle: &WebBundle, path: &str) -> Response {
+    let Some(asset) = bundle.asset(path) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-    match tokio::fs::metadata(&canonical).await {
-        Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_STATIC_ASSET_BYTES => {}
-        _ => return not_found().await,
-    }
-    let bytes = match tokio::fs::read(&canonical).await {
-        Ok(bytes) => bytes,
-        Err(_) => return not_found().await,
-    };
-    let Some(media_type) = static_media_type(relative) else {
-        return not_found().await;
-    };
+    let bundle_sha256 = HeaderValue::from_str(bundle.bundle_sha256())
+        .expect("validated web bundle digest must be a valid header value");
     (
-        [(CONTENT_TYPE, HeaderValue::from_static(media_type))],
-        bytes,
+        [
+            (CONTENT_TYPE, HeaderValue::from_static(asset.media_type)),
+            (X_YGG_WEB_BUNDLE, bundle_sha256),
+        ],
+        asset.bytes,
     )
         .into_response()
 }
@@ -413,23 +386,6 @@ fn safe_relative_path(path: &FilePath) -> bool {
             .is_some_and(|value| !value.starts_with('.') && !value.is_empty()),
         _ => false,
     })
-}
-
-fn static_media_type(path: &FilePath) -> Option<&'static str> {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("html") if path == FilePath::new("index.html") => Some("text/html; charset=utf-8"),
-        Some("css") => Some("text/css; charset=utf-8"),
-        Some("js" | "mjs") => Some("text/javascript; charset=utf-8"),
-        Some("json") => Some("application/json"),
-        Some("svg") => Some("image/svg+xml"),
-        Some("png") => Some("image/png"),
-        Some("jpg" | "jpeg") => Some("image/jpeg"),
-        Some("webp") => Some("image/webp"),
-        Some("ico") => Some("image/x-icon"),
-        Some("woff") => Some("font/woff"),
-        Some("woff2") => Some("font/woff2"),
-        _ => None,
-    }
 }
 
 async fn not_found() -> Response {
@@ -1104,14 +1060,15 @@ mod tests {
     #[test]
     fn static_asset_allowlist_excludes_dotfiles_and_source_maps() {
         assert!(safe_relative_path(FilePath::new("assets/app.js")));
+        let bundle = WebBundle::embedded().unwrap();
         assert_eq!(
-            static_media_type(FilePath::new("assets/app.js")),
-            Some("text/javascript; charset=utf-8")
+            bundle.asset("assets/app.js").unwrap().media_type,
+            "text/javascript; charset=utf-8"
         );
         assert!(!safe_relative_path(FilePath::new(".git/config")));
         assert!(!safe_relative_path(FilePath::new("assets/.secret")));
-        assert_eq!(static_media_type(FilePath::new("assets/app.js.map")), None);
-        assert_eq!(static_media_type(FilePath::new("private.txt")), None);
+        assert!(bundle.asset("assets/app.js.map").is_none());
+        assert!(bundle.asset("private.txt").is_none());
     }
 
     #[tokio::test]
@@ -1264,6 +1221,27 @@ mod tests {
         assert!(allowed
             .to_ascii_lowercase()
             .contains("x-content-type-options: nosniff"));
+        assert_eq!(
+            response_header(&allowed, "x-ygg-web-bundle"),
+            Some(include_str!("../web/bundle.sha256"))
+        );
+        assert_eq!(
+            allowed.split_once("\r\n\r\n").unwrap().1.as_bytes(),
+            include_bytes!("../web/index.html")
+        );
+
+        let javascript = request(address, get_request(address, "/assets/app.js")).await;
+        assert!(javascript.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            response_header(&javascript, "content-type"),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            javascript.split_once("\r\n\r\n").unwrap().1.as_bytes(),
+            include_bytes!("../web/assets/app.js")
+        );
+        let source_map = request(address, get_request(address, "/assets/app.js.map")).await;
+        assert!(source_map.starts_with("HTTP/1.1 404"));
         server.shutdown().await.unwrap();
     }
 }

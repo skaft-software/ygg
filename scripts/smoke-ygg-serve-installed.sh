@@ -1,0 +1,121 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: scripts/smoke-ygg-serve-installed.sh /absolute/path/to/ygg" >&2
+    exit 2
+fi
+
+binary=$1
+case "$binary" in
+    /*) ;;
+    *)
+        binary_directory=$(cd "$(dirname "$binary")" && pwd)
+        binary="$binary_directory/$(basename "$binary")"
+        ;;
+esac
+if [ ! -x "$binary" ]; then
+    echo "installed Ygg binary is not executable: $binary" >&2
+    exit 2
+fi
+
+script_directory=$(cd "$(dirname "$0")" && pwd)
+repository_directory=$(cd "$script_directory/.." && pwd)
+expected_directory="$repository_directory/extensions/ygg-serve/web"
+work_directory=$(mktemp -d "${TMPDIR:-/tmp}/ygg-serve-smoke.XXXXXX")
+server_pid=
+
+cleanup() {
+    if [ -n "$server_pid" ]; then
+        kill "$server_pid" >/dev/null 2>&1 || true
+        wait "$server_pid" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$work_directory"
+}
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p "$work_directory/run" "$work_directory/download/assets"
+server_log="$work_directory/server.log"
+cookie_jar="$work_directory/cookies"
+: >"$cookie_jar"
+
+(
+    cd "$work_directory/run"
+    exec env YGG_SESSION_DIR="$work_directory/sessions" \
+        "$binary" serve --no-open --port 0
+) >"$server_log" 2>&1 &
+server_pid=$!
+
+launch_url=
+attempt=0
+while [ "$attempt" -lt 100 ]; do
+    launch_url=$(sed -n 's/^Open Ygg once: //p' "$server_log" | sed -n '1p')
+    if [ -n "$launch_url" ]; then
+        break
+    fi
+    if ! kill -0 "$server_pid" >/dev/null 2>&1; then
+        echo "installed Ygg exited before publishing its launch URL" >&2
+        sed -E 's#(/__ygg/launch/)[0-9a-f]{64}#\1<redacted>#g' "$server_log" >&2
+        exit 1
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+if [ -z "$launch_url" ]; then
+    echo "installed Ygg did not publish a launch URL in time" >&2
+    exit 1
+fi
+
+origin=${launch_url%%/__ygg/launch/*}
+curl -fsS -L \
+    --cookie "$cookie_jar" \
+    --cookie-jar "$cookie_jar" \
+    --dump-header "$work_directory/index.headers" \
+    --output "$work_directory/download/index.html" \
+    "$launch_url"
+curl -fsS \
+    --cookie "$cookie_jar" \
+    --dump-header "$work_directory/app-js.headers" \
+    --output "$work_directory/download/assets/app.js" \
+    "$origin/assets/app.js"
+curl -fsS \
+    --cookie "$cookie_jar" \
+    --dump-header "$work_directory/app-css.headers" \
+    --output "$work_directory/download/assets/app.css" \
+    "$origin/assets/app.css"
+
+cmp "$work_directory/download/index.html" "$expected_directory/index.html"
+cmp "$work_directory/download/assets/app.js" "$expected_directory/assets/app.js"
+cmp "$work_directory/download/assets/app.css" "$expected_directory/assets/app.css"
+
+(
+    cd "$work_directory/download"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c "$expected_directory/SHA256SUMS"
+    else
+        shasum -a 256 -c "$expected_directory/SHA256SUMS"
+    fi
+)
+
+tr -d '\r' <"$work_directory/index.headers" >"$work_directory/index.headers.clean"
+tr -d '\r' <"$work_directory/app-js.headers" >"$work_directory/app-js.headers.clean"
+tr -d '\r' <"$work_directory/app-css.headers" >"$work_directory/app-css.headers.clean"
+bundle_sha256=$(cat "$expected_directory/bundle.sha256")
+
+grep -Fxi "content-type: text/html; charset=utf-8" "$work_directory/index.headers.clean" >/dev/null
+grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/app-js.headers.clean" >/dev/null
+grep -Fxi "content-type: text/css; charset=utf-8" "$work_directory/app-css.headers.clean" >/dev/null
+grep -Fxi "cache-control: no-store" "$work_directory/index.headers.clean" >/dev/null
+grep -Fxi "x-content-type-options: nosniff" "$work_directory/index.headers.clean" >/dev/null
+grep -Fxi "referrer-policy: no-referrer" "$work_directory/index.headers.clean" >/dev/null
+grep -Fi "content-security-policy: default-src 'self';" "$work_directory/index.headers.clean" >/dev/null
+grep -Fxi "x-ygg-web-bundle: $bundle_sha256" "$work_directory/index.headers.clean" >/dev/null
+grep -Fxi "x-ygg-web-bundle: $bundle_sha256" "$work_directory/app-js.headers.clean" >/dev/null
+grep -Fxi "x-ygg-web-bundle: $bundle_sha256" "$work_directory/app-css.headers.clean" >/dev/null
+
+if grep -Fq "graphical shell is not bundled" "$work_directory/download/index.html"; then
+    echo "installed Ygg served the retired placeholder shell" >&2
+    exit 1
+fi
+
+printf 'installed Ygg served the checked web bundle %s\n' "$bundle_sha256"

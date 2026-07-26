@@ -54,7 +54,7 @@ function assertCsp(scope, file, source) {
     ["connect-src", ["'self'"]],
     ["object-src", ["'none'"]],
     ["base-uri", ["'none'"]],
-    ["form-action", ["'self'"]],
+    ["form-action", ["'none'"]],
   ]);
   for (const [name, expected] of exact) {
     const actual = directives.get(name);

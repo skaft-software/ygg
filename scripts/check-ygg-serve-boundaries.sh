@@ -21,10 +21,12 @@ violations=""
 
 for changed_file in $changed_files; do
   case "$changed_file" in
-    apps/* \
+    apps/web/* \
       | extensions/ygg-serve/* \
       | docs/experimental/ygg-serve/* \
       | scripts/check-ygg-serve-boundaries.sh \
+      | scripts/smoke-ygg-serve-installed.sh \
+      | .github/workflows/ci.yml \
       | Cargo.toml \
       | Cargo.lock \
       | .gitignore)

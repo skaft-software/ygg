@@ -50,7 +50,6 @@ pub async fn run(
     no_open: bool,
     web_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let web_root = resolve_web_root(web_root);
     let _host_lock = ServeHostLock::acquire(&config)?;
     let host = Arc::new(YggHost::new(config)?);
     let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
@@ -66,9 +65,7 @@ pub async fn run(
     if let Some(root) = web_root {
         crate::output::stdout_line(format!("Web app: {}", root.display()));
     } else {
-        crate::output::stderr_line(
-            "warning: no built web app was found; serving the experimental host placeholder",
-        );
+        crate::output::stdout_line("Web app: embedded");
     }
     if no_open {
         // Explicit trusted terminal output: the launch capability is one-use,
@@ -131,17 +128,6 @@ impl ServeHostLock {
         })?;
         Ok(Self { _file: file })
     }
-}
-
-fn resolve_web_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
-    explicit
-        .or_else(|| std::env::var_os("YGG_SERVE_WEB_ROOT").map(PathBuf::from))
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|cwd| cwd.join("apps/web/dist"))
-                .filter(|root| root.join("index.html").is_file())
-        })
 }
 
 fn open_browser(url: &str) -> std::io::Result<()> {

@@ -9,6 +9,7 @@
 mod actor;
 mod bounds;
 mod command;
+mod embedded_web;
 mod error;
 mod event;
 mod ids;
