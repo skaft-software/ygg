@@ -3,6 +3,7 @@ import type {
   AttachmentRef,
   AuthorityProfile,
   ClientCommand,
+  HostEvent,
   HostBootstrap,
   ReasoningEffort,
   SessionEvent,
@@ -95,6 +96,7 @@ function updateSummary(
   summary: SessionSummary,
   event: SessionEvent,
   snapshot?: SessionSnapshot,
+  selected = false,
 ): SessionSummary {
   if (event.type === "session.snapshot") {
     return {
@@ -104,15 +106,41 @@ function updateSummary(
       modelId: event.snapshot.modelId,
       preview: latestAssistant(event.snapshot) || summary.preview,
       updatedAt: new Date().toISOString(),
+      unread:
+        selected ||
+        event.snapshot.status === "working" ||
+        event.snapshot.status === "needs_attention" ||
+        event.snapshot.status === "failed"
+          ? false
+          : event.snapshot.status === "done"
+            ? true
+            : summary.unread,
+      attentionCount:
+        event.snapshot.status === "needs_attention" ||
+        event.snapshot.status === "failed"
+          ? 1
+          : 0,
     };
   }
   if (event.type === "session.updated") {
+    const status = event.patch.status ?? summary.status;
     return {
       ...summary,
       title: event.patch.title ?? summary.title,
-      status: event.patch.status ?? summary.status,
+      status,
       modelId: event.patch.modelId ?? summary.modelId,
       updatedAt: new Date().toISOString(),
+      unread:
+        selected ||
+        status === "working" ||
+        status === "needs_attention" ||
+        status === "failed"
+          ? false
+          : status === "done"
+            ? true
+            : summary.unread,
+      attentionCount:
+        status === "needs_attention" || status === "failed" ? 1 : 0,
     };
   }
   if (
@@ -143,11 +171,12 @@ export class YggStore {
   private listeners = new Set<() => void>();
   private unsubscribeTransport: (() => void) | null = null;
   private unsubscribeConnection: (() => void) | null = null;
-  private queuedEvents: SessionEvent[] = [];
+  private queuedEvents: HostEvent[] = [];
   private animationFrame: number | null = null;
   private selectionGeneration = 0;
   private selectionAbort: AbortController | null = null;
   private resyncing = new Set<string>();
+  private createSessionTail: Promise<void> = Promise.resolve();
   private disposed = false;
 
   constructor(private readonly transport: YggTransport) {}
@@ -165,7 +194,7 @@ export class YggStore {
     for (const listener of this.listeners) listener();
   }
 
-  private queueEvent(event: SessionEvent): void {
+  private queueEvent(event: HostEvent): void {
     this.queuedEvents.push(event);
     if (this.animationFrame !== null) return;
     this.animationFrame = window.requestAnimationFrame(() => {
@@ -183,6 +212,36 @@ export class YggStore {
     let changed = false;
 
     for (const event of events) {
+      if (event.type === "catalog.summary") {
+        const bootstrap = next.bootstrap;
+        if (
+          !bootstrap ||
+          event.catalogRevision < bootstrap.catalogRevision
+        ) {
+          continue;
+        }
+        const summary =
+          event.summary.id === next.selectedSessionId
+            ? { ...event.summary, unread: false }
+            : event.summary;
+        const exists = bootstrap.sessions.some(
+          (candidate) => candidate.id === summary.id,
+        );
+        next = {
+          ...next,
+          bootstrap: {
+            ...bootstrap,
+            catalogRevision: event.catalogRevision,
+            sessions: exists
+              ? bootstrap.sessions.map((candidate) =>
+                  candidate.id === summary.id ? summary : candidate,
+                )
+              : [summary, ...bootstrap.sessions],
+          },
+        };
+        changed = true;
+        continue;
+      }
       const current = next.sessions[event.sessionId];
       let updated = current;
 
@@ -224,7 +283,12 @@ export class YggStore {
 
       const summaries = next.bootstrap?.sessions.map((summary) =>
         summary.id === event.sessionId
-          ? updateSummary(summary, event, updated)
+          ? updateSummary(
+              summary,
+              event,
+              updated,
+              event.sessionId === next.selectedSessionId,
+            )
           : summary,
       );
       next = {
@@ -368,7 +432,7 @@ export class YggStore {
               ...this.state.bootstrap,
               sessions: this.state.bootstrap.sessions.map((summary) =>
                 summary.id === sessionId
-                  ? { ...summary, title: snapshot.title }
+                  ? { ...summary, title: snapshot.title, unread: false }
                   : summary,
               ),
             }
@@ -384,7 +448,15 @@ export class YggStore {
     }
   }
 
-  async createSession(): Promise<void> {
+  createSession(): Promise<void> {
+    const operation = this.createSessionTail.then(() =>
+      this.createSessionNow(),
+    );
+    this.createSessionTail = operation.catch(() => {});
+    return operation;
+  }
+
+  private async createSessionNow(): Promise<void> {
     const bootstrap = this.state.bootstrap;
     if (!bootstrap) return;
     const selected = this.selectedSession;
@@ -416,12 +488,18 @@ export class YggStore {
       modelId: snapshot.modelId,
       attentionCount: 0,
     };
+    const currentBootstrap = this.state.bootstrap ?? bootstrap;
     this.publish({
       ...this.state,
       bootstrap: {
-        ...bootstrap,
+        ...currentBootstrap,
         selectedSessionId: snapshot.sessionId,
-        sessions: [summary, ...bootstrap.sessions],
+        sessions: [
+          summary,
+          ...currentBootstrap.sessions.filter(
+            (candidate) => candidate.id !== summary.id,
+          ),
+        ],
       },
       selectedSessionId: snapshot.sessionId,
       sessions: { ...this.state.sessions, [snapshot.sessionId]: snapshot },
@@ -571,6 +649,23 @@ export class YggStore {
       sessionId: session.sessionId,
       requestId,
       decision,
+    });
+  }
+
+  async resolveUserInput(
+    requestId: string,
+    answer:
+      | { type: "text"; text: string }
+      | { type: "choice"; choice: string },
+  ): Promise<void> {
+    const session = this.selectedSession;
+    if (!session) return;
+    await this.sendCommand({
+      id: commandId(),
+      type: "userInput.resolve",
+      sessionId: session.sessionId,
+      requestId,
+      answer,
     });
   }
 

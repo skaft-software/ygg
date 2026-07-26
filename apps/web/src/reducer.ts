@@ -146,6 +146,21 @@ export function reduceSessionEvent(
         items: snapshot.items.filter((item) => item.id !== event.itemId),
       };
 
+    case "item.tool_result":
+      return {
+        ...snapshot,
+        sequence: event.sequence,
+        items: snapshot.items.map((item) =>
+          item.id === event.itemId && item.kind === "action"
+            ? {
+                ...item,
+                detail: event.detail,
+                state: event.state,
+              }
+            : item,
+        ),
+      };
+
     case "session.resources":
       if (event.merge) {
         const mergeById = <T extends { id: string }>(

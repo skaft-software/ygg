@@ -4,8 +4,8 @@ import type {
   ClientCommand,
   CommandAck,
   AttachmentRef,
+  HostEvent,
   HostBootstrap,
-  SessionEvent,
   SessionSnapshot,
 } from "./protocol";
 import { sessionIdFromPathname, YggStore } from "./store";
@@ -20,7 +20,7 @@ const clone = <T,>(value: T): T => structuredClone(value);
 
 class TestTransport implements YggTransport {
   readonly commands: ClientCommand[] = [];
-  readonly listeners = new Set<(event: SessionEvent) => void>();
+  readonly listeners = new Set<(event: HostEvent) => void>();
   sessionLoader: SessionLoader = async (sessionId) => {
     const snapshot = fixtureSessions[sessionId];
     if (!snapshot) throw new Error(`Unknown session ${sessionId}`);
@@ -60,12 +60,12 @@ class TestTransport implements YggTransport {
     return `/api/v1/attachments/${encodeURIComponent(handle)}`;
   }
 
-  subscribe(listener: (event: SessionEvent) => void): () => void {
+  subscribe(listener: (event: HostEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
 
-  emit(event: SessionEvent): void {
+  emit(event: HostEvent): void {
     for (const listener of this.listeners) listener(clone(event));
   }
 
@@ -178,6 +178,111 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("inserts and refreshes background summaries from other clients", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    transport.emit({
+      type: "catalog.summary",
+      catalogRevision: fixtureBootstrap.catalogRevision + 1,
+      summary: {
+        id: "session-phone",
+        projectId: "project-ygg",
+        title: "Started on the phone",
+        preview: "Completed",
+        status: "done",
+        updatedAt: new Date().toISOString(),
+        pinned: false,
+        archived: false,
+        unread: true,
+        modelId: "gpt-5.6",
+        attentionCount: 0,
+      },
+    });
+    await nextFrame();
+
+    expect(store.getSnapshot().bootstrap).toMatchObject({
+      catalogRevision: fixtureBootstrap.catalogRevision + 1,
+      sessions: expect.arrayContaining([
+        expect.objectContaining({
+          id: "session-phone",
+          unread: true,
+          status: "done",
+        }),
+      ]),
+    });
+
+    transport.emit({
+      type: "catalog.summary",
+      catalogRevision: fixtureBootstrap.catalogRevision + 2,
+      summary: {
+        id: "session-phone",
+        projectId: "project-ygg",
+        title: "Started on the phone",
+        preview: "Needs your input",
+        status: "needs_attention",
+        updatedAt: new Date().toISOString(),
+        pinned: false,
+        archived: false,
+        unread: false,
+        modelId: "gpt-5.6",
+        attentionCount: 1,
+      },
+    });
+    await nextFrame();
+
+    expect(
+      store
+        .getSnapshot()
+        .bootstrap?.sessions.find((summary) => summary.id === "session-phone"),
+    ).toMatchObject({
+      status: "needs_attention",
+      attentionCount: 1,
+      unread: false,
+    });
+    store.dispose();
+  });
+
+  it("marks a background completion unread and attention states actionable", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    transport.emit({
+      type: "session.updated",
+      sessionId: "session-live",
+      sequence: 19,
+      patch: { status: "done" },
+    });
+    await nextFrame();
+    expect(
+      store
+        .getSnapshot()
+        .bootstrap?.sessions.find((summary) => summary.id === "session-live"),
+    ).toMatchObject({ status: "done", unread: true, attentionCount: 0 });
+
+    transport.emit({
+      type: "session.updated",
+      sessionId: "session-attention",
+      sequence: 17,
+      patch: { status: "needs_attention" },
+    });
+    await nextFrame();
+    expect(
+      store
+        .getSnapshot()
+        .bootstrap?.sessions.find(
+          (summary) => summary.id === "session-attention",
+        ),
+    ).toMatchObject({
+      status: "needs_attention",
+      unread: false,
+      attentionCount: 1,
+    });
+    store.dispose();
+  });
+
   it("keeps needs-attention input on the active run", async () => {
     const transport = new TestTransport();
     const store = new YggStore(transport);
@@ -199,6 +304,86 @@ describe("YggStore", () => {
       type: "session.followUp",
       sessionId: "session-fresh",
     });
+    store.dispose();
+  });
+
+  it("answers a typed user-input request through its owning session", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    await store.resolveUserInput("request-layout", {
+      type: "choice",
+      choice: "Compact",
+    });
+
+    expect(transport.commands.at(-1)).toMatchObject({
+      type: "userInput.resolve",
+      sessionId: "session-fresh",
+      requestId: "request-layout",
+      answer: { type: "choice", choice: "Compact" },
+    });
+    store.dispose();
+  });
+
+  it("serializes concurrent new-session requests without dropping either", async () => {
+    const transport = new TestTransport();
+    const firstAck = deferred<CommandAck>();
+    let createCount = 0;
+    transport.commandHandler = async (command) => {
+      if (command.type !== "session.create") {
+        return { commandId: command.id, accepted: true };
+      }
+      createCount += 1;
+      if (createCount === 1) return firstAck.promise;
+      return {
+        commandId: command.id,
+        accepted: true,
+        createdSessionId: `session-created-${createCount}`,
+      };
+    };
+    transport.sessionLoader = async (sessionId) => {
+      if (!sessionId.startsWith("session-created-")) {
+        return clone(fixtureSessions[sessionId]);
+      }
+      const selected = clone(fixtureSessions["session-fresh"]);
+      return {
+        ...selected,
+        sessionId,
+        title: "New session",
+        projectId: "project-ygg",
+        sequence: 0,
+        items: [],
+      };
+    };
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    const first = store.createSession();
+    const second = store.createSession();
+    await nextFrame();
+    expect(
+      transport.commands.filter((command) => command.type === "session.create"),
+    ).toHaveLength(1);
+
+    firstAck.resolve({
+      commandId: transport.commands[0]!.id,
+      accepted: true,
+      createdSessionId: "session-created-1",
+    });
+    await first;
+    await second;
+
+    expect(
+      transport.commands.filter((command) => command.type === "session.create"),
+    ).toHaveLength(2);
+    expect(store.getSnapshot().bootstrap?.sessions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "session-created-1" }),
+        expect.objectContaining({ id: "session-created-2" }),
+      ]),
+    );
+    expect(store.getSnapshot().selectedSessionId).toBe("session-created-2");
     store.dispose();
   });
 });

@@ -7,6 +7,7 @@ import type {
   ClientCommand,
   CommandAck,
   HostBootstrap,
+  HostEvent,
   ModelSummary,
   SessionEvent,
   SessionSnapshot,
@@ -21,7 +22,7 @@ import {
   projectSessionSnapshot,
 } from "./wire";
 
-type EventListener = (event: SessionEvent) => void;
+type EventListener = (event: HostEvent) => void;
 export type TransportConnectionState =
   | "connecting"
   | "connected"
@@ -166,6 +167,20 @@ export class FixtureTransport implements YggTransport {
           ...current,
           sequence: event.sequence,
           items: current.items.filter((item) => item.id !== event.itemId),
+        };
+      } else if (event.type === "item.tool_result") {
+        this.sessions[event.sessionId] = {
+          ...current,
+          sequence: event.sequence,
+          items: current.items.map((item) =>
+            item.id === event.itemId && item.kind === "action"
+              ? {
+                  ...item,
+                  detail: event.detail,
+                  state: event.state,
+                }
+              : item,
+          ),
         };
       } else if (event.type === "session.resources") {
         this.sessions[event.sessionId] = {
@@ -517,6 +532,33 @@ export class FixtureTransport implements YggTransport {
       return { commandId: command.id, accepted: true };
     }
 
+    if (command.type === "userInput.resolve") {
+      const item = snapshot.items.find(
+        (candidate) =>
+          candidate.kind === "user_input_request" &&
+          candidate.requestId === command.requestId,
+      );
+      if (item?.kind === "user_input_request") {
+        this.emit({
+          type: "item.committed",
+          sessionId: command.sessionId,
+          sequence: snapshot.sequence + 1,
+          item: {
+            ...item,
+            resolved: "answered",
+            state: "committed",
+          },
+        });
+        this.emit({
+          type: "session.updated",
+          sessionId: command.sessionId,
+          sequence: snapshot.sequence + 2,
+          patch: { status: "working" },
+        });
+      }
+      return { commandId: command.id, accepted: true };
+    }
+
     throw new Error("Unsupported fixture command.");
   }
 }
@@ -532,9 +574,11 @@ export class HttpTransport implements YggTransport {
   private replaying = false;
   private bufferedEvents: Array<{
     hostSequence: number;
-    event: SessionEvent;
+    event: HostEvent;
   }> = [];
   private hostId: string | null = null;
+  private catalogRevision = 0;
+  private catalogAnchorSessionId: string | null = null;
   private models: ModelSummary[] = [];
   private summaries = new Map<string, SessionSummary>();
   private actorGenerationBySession: Record<string, number> = {};
@@ -570,6 +614,8 @@ export class HttpTransport implements YggTransport {
       await response.json(),
     );
     this.hostId = bootstrap.host.id;
+    this.catalogRevision = bootstrap.catalogRevision;
+    this.catalogAnchorSessionId = bootstrap.selectedSessionId;
     this.models = bootstrap.models;
     this.summaries = new Map(
       bootstrap.sessions.map((summary) => [summary.id, summary]),
@@ -760,7 +806,7 @@ export class HttpTransport implements YggTransport {
       this.reconnectAttempt = 0;
       this.setConnectionState("connected");
       this.replaying = true;
-      void this.replayAll().then(
+      void Promise.all([this.replayAll(), this.refreshCatalog()]).then(
         () => {
           if (this.socket !== socket) return;
           this.replaying = false;
@@ -807,7 +853,7 @@ export class HttpTransport implements YggTransport {
     });
   }
 
-  private dispatch(event: SessionEvent): void {
+  private dispatch(event: HostEvent): void {
     for (const listener of this.listeners) listener(event);
   }
 
@@ -821,7 +867,16 @@ export class HttpTransport implements YggTransport {
     });
   }
 
-  private rememberEvent(event: SessionEvent): void {
+  private rememberEvent(event: HostEvent): void {
+    if (event.type === "catalog.summary") {
+      this.catalogRevision = Math.max(
+        this.catalogRevision,
+        event.catalogRevision,
+      );
+      this.summaries.set(event.summary.id, event.summary);
+      this.modelIdBySession[event.summary.id] = event.summary.modelId;
+      return;
+    }
     const generation = event.actorGeneration;
     if (generation !== undefined) {
       this.actorGenerationBySession[event.sessionId] = generation;
@@ -834,6 +889,42 @@ export class HttpTransport implements YggTransport {
       this.rememberSnapshot(event.snapshot);
     } else if (event.type === "session.updated" && event.patch.modelId) {
       this.modelIdBySession[event.sessionId] = event.patch.modelId;
+    }
+  }
+
+  private async refreshCatalog(): Promise<void> {
+    const anchor =
+      this.catalogAnchorSessionId ?? this.cursorBySession.keys().next().value;
+    if (!anchor) return;
+    const response = await fetch(
+      `/api/v1/bootstrap?selectedSessionId=${encodeURIComponent(anchor)}`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Catalog refresh failed with ${response.status}`);
+    }
+    const { bootstrap } = projectHostBootstrap(await response.json());
+    if (bootstrap.catalogRevision <= this.catalogRevision) return;
+
+    const previous = this.summaries;
+    this.catalogRevision = bootstrap.catalogRevision;
+    this.models = bootstrap.models;
+    this.summaries = new Map(
+      bootstrap.sessions.map((summary) => [summary.id, summary]),
+    );
+    for (const summary of bootstrap.sessions) {
+      const prior = previous.get(summary.id);
+      if (prior && JSON.stringify(prior) === JSON.stringify(summary)) {
+        continue;
+      }
+      this.dispatch({
+        type: "catalog.summary",
+        catalogRevision: bootstrap.catalogRevision,
+        summary,
+      });
     }
   }
 

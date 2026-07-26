@@ -239,6 +239,48 @@ describe("HTTP Ygg transport", () => {
     transport.close();
   });
 
+  it("publishes cross-client catalog summaries from the host stream", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(
+        jsonResponse(hostBootstrapGolden),
+      ),
+    );
+    const transport = new HttpTransport("device-browser");
+    const received: unknown[] = [];
+    transport.subscribe((event) => received.push(event));
+    await transport.connect();
+    const summary = structuredClone(hostBootstrapGolden.sessions[0]);
+    summary.id = "session-from-phone";
+    summary.title = "Created from phone";
+
+    FakeWebSocket.instances[0]?.emit(
+      "message",
+      new MessageEvent("message", {
+        data: JSON.stringify({
+          protocol: 1,
+          hostSequence: 10,
+          catalog: {
+            catalogCursor: 9,
+            summary,
+          },
+        }),
+      }),
+    );
+
+    expect(received).toEqual([
+      expect.objectContaining({
+        type: "catalog.summary",
+        catalogRevision: 9,
+        summary: expect.objectContaining({
+          id: "session-from-phone",
+          title: "Created from phone",
+        }),
+      }),
+    ]);
+    transport.close();
+  });
+
   it("replays the bootstrap cursor on the first WebSocket open", async () => {
     const replay = {
       type: "events",
@@ -249,7 +291,8 @@ describe("HTTP Ygg transport", () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(jsonResponse(hostBootstrapGolden))
-      .mockResolvedValueOnce(jsonResponse(replay));
+      .mockResolvedValueOnce(jsonResponse(replay))
+      .mockResolvedValueOnce(jsonResponse(hostBootstrapGolden));
     vi.stubGlobal("fetch", fetchMock);
     const transport = new HttpTransport("device-browser");
     const received: unknown[] = [];
@@ -267,6 +310,50 @@ describe("HTTP Ygg transport", () => {
       sessionId: "session-demo",
       sequence: 43,
     });
+    transport.close();
+  });
+
+  it("refreshes catalog changes missed while the socket was closed", async () => {
+    const replay = {
+      type: "events",
+      after: { actorGeneration: 3, sequence: 42 },
+      through: { actorGeneration: 3, sequence: 42 },
+      events: [],
+    };
+    const refreshed = structuredClone(hostBootstrapGolden);
+    refreshed.catalogCursor = 9;
+    const remoteSummary = structuredClone(hostBootstrapGolden.sessions[0]);
+    remoteSummary.id = "session-created-remotely";
+    remoteSummary.title = "Created while disconnected";
+    refreshed.sessions.unshift(remoteSummary);
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(hostBootstrapGolden))
+      .mockResolvedValueOnce(jsonResponse(replay))
+      .mockResolvedValueOnce(jsonResponse(refreshed));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+    const received: unknown[] = [];
+    transport.subscribe((event) => received.push(event));
+    await transport.connect();
+
+    FakeWebSocket.instances[0]?.emit("open", new Event("open"));
+
+    await vi.waitFor(() =>
+      expect(received).toContainEqual(
+        expect.objectContaining({
+          type: "catalog.summary",
+          catalogRevision: 9,
+          summary: expect.objectContaining({
+            id: "session-created-remotely",
+            title: "Created while disconnected",
+          }),
+        }),
+      ),
+    );
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      "/api/v1/bootstrap?selectedSessionId=session-demo",
+    );
     transport.close();
   });
 

@@ -182,6 +182,14 @@ export interface ApprovalItem extends ItemBase {
   resolved?: "allowed_once" | "allowed_session" | "denied";
 }
 
+export interface UserInputRequestItem extends ItemBase {
+  kind: "user_input_request";
+  requestId: string;
+  prompt: string;
+  choices: string[];
+  resolved?: "answered" | "denied";
+}
+
 export interface RunOutcomeItem extends ItemBase {
   kind: "run_outcome";
   outcome: "done" | "failed" | "stopped";
@@ -195,6 +203,7 @@ export type TranscriptItem =
   | ReasoningItem
   | ActionItem
   | ApprovalItem
+  | UserInputRequestItem
   | RunOutcomeItem;
 
 export interface ProgressStep {
@@ -321,6 +330,16 @@ export type SessionEvent =
       itemId: string;
     }
   | {
+      type: "item.tool_result";
+      sessionId: string;
+      actorGeneration?: number;
+      sequence: number;
+      itemId: string;
+      resultItemId: string;
+      detail: string;
+      state: ItemState;
+    }
+  | {
       type: "session.resources";
       sessionId: string;
       actorGeneration?: number;
@@ -330,6 +349,14 @@ export type SessionEvent =
       sources?: SourceRef[];
       outputs?: OutputRef[];
       previews?: PreviewRef[];
+    };
+
+export type HostEvent =
+  | SessionEvent
+  | {
+      type: "catalog.summary";
+      catalogRevision: number;
+      summary: SessionSummary;
     };
 
 export type ClientCommand =
@@ -399,6 +426,15 @@ export type ClientCommand =
       sessionId: string;
       requestId: string;
       decision: "allowed_once" | "allowed_session" | "denied";
+    }
+  | {
+      id: string;
+      type: "userInput.resolve";
+      sessionId: string;
+      requestId: string;
+      answer:
+        | { type: "text"; text: string }
+        | { type: "choice"; choice: string };
     }
   | {
       id: string;

@@ -6,6 +6,7 @@ import type {
   ClientCommand,
   CommandAck,
   HostBootstrap,
+  HostEvent,
   ModelSummary,
   OutputRef,
   PreviewRef,
@@ -640,6 +641,31 @@ function taggedPayload(value: unknown, path: string) {
   };
 }
 
+interface ToolResultProjection {
+  toolCallItemId: string;
+  content: string;
+  failed: boolean;
+}
+
+function projectToolResult(
+  value: unknown,
+  path: string,
+): ToolResultProjection {
+  const data = object(value, path, [
+    "toolCallItemId",
+    "content",
+    "isError",
+  ]);
+  return {
+    toolCallItemId: string(
+      data.toolCallItemId,
+      `${path}.toolCallItemId`,
+    ),
+    content: string(data.content, `${path}.content`),
+    failed: boolean(data.isError, `${path}.isError`),
+  };
+}
+
 function projectItem(
   value: unknown,
   path: string,
@@ -742,33 +768,8 @@ function projectItem(
       };
     }
     case "toolResult": {
-      const data = object(payload.data, `${path}.payload.data`, [
-        "toolCallItemId",
-        "content",
-        "isError",
-      ]);
-      string(
-        data.toolCallItemId,
-        `${path}.payload.data.toolCallItemId`,
-      );
-      return {
-        ...base,
-        kind: "action",
-        actionKind: "analysis",
-        label: boolean(
-          data.isError,
-          `${path}.payload.data.isError`,
-        )
-          ? "Tool failed"
-          : "Tool completed",
-        detail: string(data.content, `${path}.payload.data.content`),
-        state: boolean(
-          data.isError,
-          `${path}.payload.data.isError`,
-        )
-          ? "failed"
-          : state,
-      };
+      projectToolResult(payload.data, `${path}.payload.data`);
+      return null;
     }
     case "fileChange": {
       const data = object(payload.data, `${path}.payload.data`, [
@@ -884,7 +885,7 @@ function projectPendingRequest(
   value: unknown,
   path: string,
   timestampMs: number,
-): TranscriptItem | null {
+): TranscriptItem {
   const request = object(value, path, [
     "id",
     "actorGeneration",
@@ -908,12 +909,28 @@ function projectPendingRequest(
       "prompt",
       "choices",
     ]);
-    string(data.prompt, `${path}.kind.data.prompt`);
-    array(data.choices ?? [], `${path}.kind.data.choices`).forEach(
-      (choice, index) =>
-        string(choice, `${path}.kind.data.choices[${index}]`),
+    const choices = array(
+      data.choices ?? [],
+      `${path}.kind.data.choices`,
+    ).map((choice, index) =>
+      string(choice, `${path}.kind.data.choices[${index}]`),
     );
-    return null;
+    return {
+      id: `request-${id}`,
+      turnId: `request-${id}`,
+      kind: "user_input_request",
+      requestId: id,
+      prompt: string(data.prompt, `${path}.kind.data.prompt`),
+      choices,
+      resolved:
+        state === "resolved"
+          ? "answered"
+          : state === "denied" || state === "expired"
+            ? "denied"
+            : undefined,
+      state: state === "pending" ? "streaming" : "committed",
+      createdAt: iso(timestampMs),
+    };
   }
   if (kind.type !== "approval") {
     throw new WireContractError(
@@ -1026,11 +1043,35 @@ export function projectSessionSnapshot(
     context.timestampMs ??
     (context.summary ? Date.parse(context.summary.updatedAt) : 0);
   const rawItems = array(snapshot.items, "sessionSnapshot.items");
-  const items = rawItems
-    .map((item, index) =>
-      projectItem(item, `sessionSnapshot.items[${index}]`, { timestampMs }),
-    )
-    .filter((item): item is TranscriptItem => item !== null);
+  const items: TranscriptItem[] = [];
+  rawItems.forEach((item, index) => {
+    const path = `sessionSnapshot.items[${index}]`;
+    const wireItem = object(item, path);
+    const payload = taggedPayload(wireItem.payload, `${path}.payload`);
+    if (payload.type === "toolResult") {
+      const result = projectToolResult(payload.data, `${path}.payload.data`);
+      const targetIndex = items.findIndex(
+        (candidate) =>
+          candidate.id === result.toolCallItemId &&
+          candidate.kind === "action",
+      );
+      if (targetIndex !== -1) {
+        const target = items[targetIndex];
+        if (target?.kind === "action") {
+          items[targetIndex] = {
+            ...target,
+            detail: result.content,
+            state: result.failed
+              ? "failed"
+              : itemState(wireItem.lifecycle, `${path}.lifecycle`),
+          };
+        }
+      }
+      return;
+    }
+    const projected = projectItem(item, path, { timestampMs });
+    if (projected) items.push(projected);
+  });
   const requests = array(
     snapshot.pendingRequests ?? [],
     "sessionSnapshot.pendingRequests",
@@ -1459,6 +1500,30 @@ function resourceEventFromItem(
       ],
     };
   }
+  if (payload.type === "toolResult") {
+    const result = projectToolResult(
+      payload.data,
+      "event.event.data.item.payload.data",
+    );
+    const itemId = string(
+      item.id,
+      "event.event.data.item.id",
+    );
+    return {
+      type: "item.tool_result",
+      sessionId,
+      actorGeneration,
+      sequence,
+      itemId: result.toolCallItemId,
+      resultItemId: itemId,
+      detail: result.content,
+      state: result.failed
+        ? "failed"
+        : committed
+          ? "committed"
+          : "streaming",
+    };
+  }
   const projected = projectItem(itemValue, "event.event.data.item", {
     timestampMs,
   });
@@ -1673,12 +1738,6 @@ export function projectEventEnvelope(
         "event.event.data.request",
         timestampMs,
       );
-      if (!item) {
-        throw new WireContractError(
-          "event.event.data.request.kind",
-          "is not yet representable by the approval UI",
-        );
-      }
       return {
         type: "item.committed",
         sessionId,
@@ -1757,7 +1816,7 @@ export function projectEventEnvelope(
 
 export interface HostStreamProjection {
   hostSequence: number;
-  event: SessionEvent;
+  event: HostEvent;
 }
 
 export function projectHostStreamEvent(
@@ -1768,15 +1827,44 @@ export function projectHostStreamEvent(
     "protocol",
     "hostSequence",
     "event",
+    "catalog",
   ]);
   protocol(stream.protocol, "hostStreamEvent.protocol");
-  return {
-    hostSequence: number(
-      stream.hostSequence,
-      "hostStreamEvent.hostSequence",
-    ),
-    event: projectEventEnvelope(stream.event, context),
-  };
+  const hostSequence = number(
+    stream.hostSequence,
+    "hostStreamEvent.hostSequence",
+  );
+  if (stream.event !== undefined && stream.catalog === undefined) {
+    return {
+      hostSequence,
+      event: projectEventEnvelope(stream.event, context),
+    };
+  }
+  if (stream.catalog !== undefined && stream.event === undefined) {
+    const catalog = object(stream.catalog, "hostStreamEvent.catalog", [
+      "catalogCursor",
+      "summary",
+    ]);
+    return {
+      hostSequence,
+      event: {
+        type: "catalog.summary",
+        catalogRevision: number(
+          catalog.catalogCursor,
+          "hostStreamEvent.catalog.catalogCursor",
+        ),
+        summary: projectSummary(
+          catalog.summary,
+          "hostStreamEvent.catalog.summary",
+          context.models,
+        ),
+      },
+    };
+  }
+  throw new WireContractError(
+    "hostStreamEvent",
+    "requires exactly one event or catalog change",
+  );
 }
 
 export type ReplayProjection =
@@ -2147,6 +2235,28 @@ export function encodeClientCommand(
             type: "approval",
             data: { allowed: command.decision === "allowed_once" },
           },
+        },
+      },
+      context,
+    );
+  }
+  if (command.type === "userInput.resolve") {
+    return sessionEnvelope(
+      command,
+      {
+        type: "session.answerRequest",
+        data: {
+          requestId: command.requestId,
+          answer:
+            command.answer.type === "text"
+              ? {
+                  type: "text",
+                  data: { text: command.answer.text },
+                }
+              : {
+                  type: "choice",
+                  data: { choice: command.answer.choice },
+                },
         },
       },
       context,

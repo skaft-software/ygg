@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type {
+  ActionItem,
   AssistantMessageItem,
   SessionSnapshot,
 } from "./protocol";
@@ -116,6 +117,40 @@ describe("reduceSessionEvent", () => {
     });
 
     expect(next.items).toEqual([]);
+  });
+
+  it("coalesces a tool result without losing its event sequence", () => {
+    const action: ActionItem = {
+      id: "tool-call-1",
+      turnId: "turn-tool",
+      kind: "action",
+      actionKind: "command",
+      label: "shell",
+      detail: "Running tests",
+      state: "streaming",
+      createdAt: "2026-07-26T12:00:01.000Z",
+    };
+    const snapshot = { ...base, items: [action] };
+
+    const next = reduceSessionEvent(snapshot, {
+      type: "item.tool_result",
+      sessionId: "session-1",
+      sequence: 5,
+      itemId: "tool-call-1",
+      resultItemId: "tool-result-1",
+      detail: "43 tests passed",
+      state: "committed",
+    });
+
+    expect(next.sequence).toBe(5);
+    expect(next.items).toEqual([
+      expect.objectContaining({
+        id: "tool-call-1",
+        label: "shell",
+        detail: "43 tests passed",
+        state: "committed",
+      }),
+    ]);
   });
 
   it("detects a missing sequence so the store can replace from snapshot", () => {

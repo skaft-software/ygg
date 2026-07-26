@@ -97,6 +97,39 @@ describe("authoritative Rust wire contract", () => {
     ).toEqual({ hostSequence: 12, event });
   });
 
+  it("projects complete cross-client catalog summary changes", () => {
+    const summary = clone(hostBootstrapGolden.sessions[0]);
+    summary.id = "session-from-other-client";
+    summary.title = "Created on Achu’s phone";
+    summary.attention = "unreadCompletion";
+
+    expect(
+      projectHostStreamEvent(
+        {
+          protocol: 1,
+          hostSequence: 13,
+          catalog: {
+            catalogCursor: 9,
+            summary,
+          },
+        },
+        { models: projectHostBootstrap(hostBootstrapGolden).bootstrap.models },
+      ),
+    ).toMatchObject({
+      hostSequence: 13,
+      event: {
+        type: "catalog.summary",
+        catalogRevision: 9,
+        summary: {
+          id: "session-from-other-client",
+          title: "Created on Achu’s phone",
+          unread: true,
+          attentionCount: 0,
+        },
+      },
+    });
+  });
+
   it("advances durable-head cursors without inventing a UI mutation", () => {
     const durable = clone(eventEnvelopeGolden) as unknown as {
       cursor: { sequence: number };
@@ -137,6 +170,175 @@ describe("authoritative Rust wire contract", () => {
         status: "needs_attention",
         activeRunId: "run-live",
       },
+    });
+  });
+
+  it("projects and answers typed user-input requests", () => {
+    const request = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      timestampMs: number;
+      event: unknown;
+    };
+    request.cursor.sequence = 44;
+    request.timestampMs = 1_721_000_000_044;
+    request.event = {
+      type: "request.changed",
+      data: {
+        request: {
+          id: "request-input",
+          actorGeneration: 3,
+          kind: {
+            type: "userInput",
+            data: {
+              prompt: "Which layout should I keep?",
+              choices: ["Compact", "Comfortable"],
+            },
+          },
+          state: "pending",
+        },
+      },
+    };
+
+    expect(projectEventEnvelope(request)).toMatchObject({
+      type: "item.committed",
+      sessionId: "session-demo",
+      actorGeneration: 3,
+      sequence: 44,
+      item: {
+        id: "request-request-input",
+        kind: "user_input_request",
+        requestId: "request-input",
+        prompt: "Which layout should I keep?",
+        choices: ["Compact", "Comfortable"],
+        state: "streaming",
+      },
+    });
+
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const context = {
+      hostId: "host-demo",
+      deviceId: "device-browser",
+      issuedAtMs: 1_721_000_000_060,
+      actorGenerationBySession: { "session-demo": 3 },
+      modelIdBySession: { "session-demo": "gpt-5.6" },
+      models: bootstrap.models,
+    };
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-input-choice",
+          type: "userInput.resolve",
+          sessionId: "session-demo",
+          requestId: "request-input",
+          answer: { type: "choice", choice: "Compact" },
+        },
+        context,
+      ),
+    ).toMatchObject({
+      expectedActorGeneration: 3,
+      command: {
+        type: "session.answerRequest",
+        data: {
+          requestId: "request-input",
+          answer: {
+            type: "choice",
+            data: { choice: "Compact" },
+          },
+        },
+      },
+    });
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-input-text",
+          type: "userInput.resolve",
+          sessionId: "session-demo",
+          requestId: "request-input",
+          answer: { type: "text", text: "Use the denser option." },
+        },
+        context,
+      ),
+    ).toMatchObject({
+      command: {
+        type: "session.answerRequest",
+        data: {
+          answer: {
+            type: "text",
+            data: { text: "Use the denser option." },
+          },
+        },
+      },
+    });
+  });
+
+  it("coalesces linked tool results into their action cell", () => {
+    const toolCall = {
+      id: "tool-call-1",
+      turnId: "turn-tool",
+      lifecycle: "committed",
+      durableEntryId: "entry-tool-call",
+      payload: {
+        type: "toolCall",
+        data: {
+          name: "shell",
+          arguments: { command: "npm test" },
+          progress: "Running tests",
+          droppedProgressBytes: 0,
+        },
+      },
+    };
+    const toolResult = {
+      id: "tool-result-1",
+      turnId: "turn-tool",
+      lifecycle: "committed",
+      durableEntryId: "entry-tool-result",
+      payload: {
+        type: "toolResult",
+        data: {
+          toolCallItemId: "tool-call-1",
+          content: "43 tests passed",
+          isError: false,
+        },
+      },
+    };
+    const snapshot = {
+      ...sessionSnapshotGolden,
+      items: [toolCall, toolResult],
+    };
+
+    expect(
+      projectSessionSnapshot(snapshot, {
+        summary: projectHostBootstrap(hostBootstrapGolden).bootstrap.sessions[0],
+        models: projectHostBootstrap(hostBootstrapGolden).bootstrap.models,
+      }).items,
+    ).toEqual([
+      expect.objectContaining({
+        id: "tool-call-1",
+        kind: "action",
+        label: "shell",
+        detail: "43 tests passed",
+        state: "committed",
+      }),
+    ]);
+
+    const resultEvent = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    resultEvent.cursor.sequence = 44;
+    resultEvent.event = {
+      type: "item.committed",
+      data: { item: toolResult },
+    };
+    expect(projectEventEnvelope(resultEvent)).toMatchObject({
+      type: "item.tool_result",
+      sessionId: "session-demo",
+      actorGeneration: 3,
+      sequence: 44,
+      itemId: "tool-call-1",
+      resultItemId: "tool-result-1",
+      detail: "43 tests passed",
+      state: "committed",
     });
   });
 
