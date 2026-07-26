@@ -69,6 +69,9 @@ inspection evidence.
 - Existing TUI, print, and plain modes work without the serve feature, browser,
   Node.js, daemon, discovery, or native client.
 - Ygg's existing default authority remains unchanged.
+- `scripts/check-ygg-serve-boundaries.sh` accepts the integration diff and
+  rejects changes outside the approved app, extension, documentation, manifest,
+  and feature-gated coding-agent seam.
 - Generated server assets exactly match the tested frontend source.
 - Focused Rust and web tests pass before full workspace tests.
 - The main checkout remains untouched.
