@@ -442,6 +442,22 @@ fn authority_rank(authority: AuthorityProfile) -> u8 {
 }
 
 fn reduce_summary(summary: &mut SessionSummary, snapshot: &SessionSnapshot, event: &EventEnvelope) {
+    if let EventPayload::SessionMetadataChanged {
+        title,
+        pinned,
+        archived,
+    } = &event.event
+    {
+        if let Some(title) = title {
+            summary.title = title.clone();
+        }
+        if let Some(pinned) = pinned {
+            summary.pinned = *pinned;
+        }
+        if let Some(archived) = archived {
+            summary.archived = *archived;
+        }
+    }
     summary.live_state = snapshot.live_state;
     summary.model = snapshot.model.clone();
     summary.modified_at_ms = summary.modified_at_ms.max(event.timestamp_ms);
@@ -475,6 +491,7 @@ fn reduce_snapshot(snapshot: &mut SessionSnapshot, event: &EventPayload) -> Resu
             snapshot.model = model.clone();
             snapshot.authority = *authority;
         }
+        EventPayload::SessionMetadataChanged { .. } => {}
         EventPayload::SessionDurableHeadChanged { durable_entry_id } => {
             snapshot.durable_head = durable_entry_id.clone();
         }
@@ -864,6 +881,35 @@ mod tests {
             Some(DurableEntryId::new("entry-1").unwrap())
         );
         assert!(!core.view().summary.provisional);
+    }
+
+    #[test]
+    fn session_metadata_event_updates_only_the_catalog_projection() {
+        let mut core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            seed(),
+            ActorConfig::default(),
+        )
+        .unwrap();
+        let original_snapshot = core.snapshot();
+
+        core.publish(TimestampedEvent::new(
+            7,
+            EventPayload::SessionMetadataChanged {
+                title: Some("Renamed session".into()),
+                pinned: Some(true),
+                archived: Some(true),
+            },
+        ))
+        .unwrap();
+
+        let view = core.view();
+        assert_eq!(view.summary.title, "Renamed session");
+        assert!(view.summary.pinned);
+        assert!(view.summary.archived);
+        assert_eq!(view.snapshot.durable_head, original_snapshot.durable_head);
+        assert_eq!(view.snapshot.items, original_snapshot.items);
+        assert_eq!(view.snapshot.cursor.sequence, 1);
     }
 
     #[test]

@@ -21,6 +21,7 @@
     },
     "previews": true,
     "connectedDevices": false,
+    "sessionMetadata": true,
     "lanClients": false,
     "terminal": false,
     "childAgents": false

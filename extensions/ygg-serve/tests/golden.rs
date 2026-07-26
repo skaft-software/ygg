@@ -126,6 +126,7 @@ fn bootstrap() -> HostBootstrap {
             attachment_policy: Some(AttachmentPolicy::image_defaults()),
             previews: true,
             connected_devices: false,
+            session_metadata: true,
             lan_clients: false,
             terminal: false,
             child_agents: false,

@@ -809,6 +809,8 @@ mod tests {
             title: "provider title\x1b]52;c;YXR0YWNr\x07\nforged\tcolumn".into(),
             name: None,
             tags: vec!["safe".into()],
+            pinned: false,
+            archived: false,
             modified: now,
         };
 
@@ -830,6 +832,8 @@ mod tests {
             title: "provider title\x1b]0;raw\x07\nsecond\tcolumn".into(),
             name: None,
             tags: Vec::new(),
+            pinned: false,
+            archived: false,
             modified: now,
         };
 
@@ -1428,6 +1432,8 @@ mod tests {
             title: "Compiler investigation".into(),
             name: Some("Compiler investigation".into()),
             tags: vec!["rust".into(), "local-model".into()],
+            pinned: false,
+            archived: false,
             modified: UNIX_EPOCH,
         };
         for query in ["compiler", "local-model", "2026-07", "project"] {

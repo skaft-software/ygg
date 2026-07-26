@@ -923,8 +923,45 @@ mod tests {
             &mut self,
             command: SessionCommand,
         ) -> Result<DriverCommandOutcome, ServiceError> {
-            let SessionCommand::SubmitPrompt { input } = command else {
-                return Ok(DriverCommandOutcome::default());
+            let input = match command {
+                SessionCommand::SubmitPrompt { input } => input,
+                SessionCommand::Rename { title } => {
+                    return Ok(DriverCommandOutcome::with_events(vec![
+                        TimestampedEvent::new(
+                            1,
+                            EventPayload::SessionMetadataChanged {
+                                title: Some(title),
+                                pinned: None,
+                                archived: None,
+                            },
+                        ),
+                    ]));
+                }
+                SessionCommand::SetPinned { pinned } => {
+                    return Ok(DriverCommandOutcome::with_events(vec![
+                        TimestampedEvent::new(
+                            1,
+                            EventPayload::SessionMetadataChanged {
+                                title: None,
+                                pinned: Some(pinned),
+                                archived: None,
+                            },
+                        ),
+                    ]));
+                }
+                SessionCommand::SetArchived { archived } => {
+                    return Ok(DriverCommandOutcome::with_events(vec![
+                        TimestampedEvent::new(
+                            1,
+                            EventPayload::SessionMetadataChanged {
+                                title: None,
+                                pinned: None,
+                                archived: Some(archived),
+                            },
+                        ),
+                    ]));
+                }
+                _ => return Ok(DriverCommandOutcome::default()),
             };
             let count = {
                 let mut counts = self.dispatches.lock().unwrap();
@@ -1106,6 +1143,22 @@ mod tests {
         )
     }
 
+    fn metadata_command(
+        session_id: SessionId,
+        command_id: &str,
+        command: SessionCommand,
+    ) -> SessionCommandEnvelope {
+        SessionCommandEnvelope::new(
+            HostId::new("host-mock").unwrap(),
+            DeviceId::new("device-mock").unwrap(),
+            session_id,
+            CommandId::new(command_id).unwrap(),
+            1,
+            Some(1),
+            command,
+        )
+    }
+
     fn create_command(device_id: &str, command_id: &str) -> HostCommandEnvelope {
         HostCommandEnvelope::new(
             HostId::new("host-mock").unwrap(),
@@ -1139,6 +1192,76 @@ mod tests {
         assert_eq!(catalog.summary.id, *handle.session_id());
         assert!(catalog.summary.provisional);
         streamed.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_metadata_changes_reach_the_live_event_and_catalog_streams() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = SessionSupervisor::new(host, SupervisorConfig::default());
+        let mut events = supervisor.subscribe_events();
+        let handle = supervisor.create_fresh_session(None).await.unwrap();
+        events.recv().await.unwrap();
+        let session_id = handle.session_id().clone();
+
+        for (command_id, command) in [
+            (
+                "command-rename",
+                SessionCommand::Rename {
+                    title: "Renamed session".into(),
+                },
+            ),
+            ("command-pin", SessionCommand::SetPinned { pinned: true }),
+            (
+                "command-archive",
+                SessionCommand::SetArchived { archived: true },
+            ),
+        ] {
+            let admission = supervisor
+                .command(
+                    metadata_command(session_id.clone(), command_id, command),
+                    20,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                admission.ack.disposition,
+                AckDisposition::Accepted { .. }
+            ));
+        }
+
+        let view = supervisor.session_view(&session_id).await.unwrap();
+        assert_eq!(view.summary.title, "Renamed session");
+        assert!(view.summary.pinned);
+        assert!(view.summary.archived);
+
+        let mut metadata_event_count = 0;
+        let mut final_catalog = None;
+        for _ in 0..12 {
+            let streamed = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                .await
+                .expect("metadata change must reach the host stream")
+                .unwrap();
+            if matches!(
+                streamed.event.as_ref().map(|event| &event.event),
+                Some(EventPayload::SessionMetadataChanged { .. })
+            ) {
+                metadata_event_count += 1;
+            }
+            if let Some(catalog) = streamed.catalog {
+                if catalog.summary.title == "Renamed session"
+                    && catalog.summary.pinned
+                    && catalog.summary.archived
+                {
+                    final_catalog = Some(catalog);
+                    break;
+                }
+            }
+        }
+        assert_eq!(metadata_event_count, 3);
+        assert_eq!(
+            final_catalog.unwrap().catalog_cursor,
+            supervisor.catalog_cursor()
+        );
     }
 
     #[tokio::test]

@@ -100,6 +100,8 @@ pub struct HostCapabilities {
     pub previews: bool,
     /// A connected-device/pairing surface is available.
     pub connected_devices: bool,
+    /// Durable session rename, pin, and archive mutations are available.
+    pub session_metadata: bool,
     /// LAN connected clients are supported.
     pub lan_clients: bool,
     /// Interactive PTY support; false for the first web release.
@@ -148,6 +150,7 @@ impl Default for HostCapabilities {
             attachment_policy: None,
             previews: false,
             connected_devices: false,
+            session_metadata: false,
             // Capability advertisements describe the transport that is
             // actually running. The transport-neutral backend does not imply
             // an authenticated LAN listener.

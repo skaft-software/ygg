@@ -61,6 +61,19 @@ pub enum EventPayload {
         /// Effective authority after host clamping.
         authority: AuthorityProfile,
     },
+    /// User-owned session catalog metadata changed.
+    #[serde(rename = "session.metadataChanged")]
+    SessionMetadataChanged {
+        /// Replacement title when changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Replacement pinned state when changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+        /// Replacement archived state when changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived: Option<bool>,
+    },
     /// The authoritative append-only head changed, including invisible config
     /// or provider sidecar entries.
     #[serde(rename = "session.durableHeadChanged")]
@@ -315,6 +328,21 @@ impl ProtocolValidation for EventPayload {
                 }
             }
             Self::SessionSettingsChanged { model, .. } => model.validate()?,
+            Self::SessionMetadataChanged {
+                title,
+                pinned,
+                archived,
+            } => {
+                if title.is_none() && pinned.is_none() && archived.is_none() {
+                    return Err(ValidationError::new(
+                        "event.session_metadata",
+                        "requires at least one changed field",
+                    ));
+                }
+                if let Some(title) = title {
+                    validate_public_text("event.session_metadata.title", title, 512, false)?;
+                }
+            }
             Self::SessionDurableHeadChanged { .. } => {}
             Self::ItemStarted { item } => {
                 item.validate()?;

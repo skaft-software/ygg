@@ -256,6 +256,24 @@ pub enum SessionCommand {
         /// Requested authority.
         authority: AuthorityProfile,
     },
+    /// Replace the user-owned session title.
+    #[serde(rename = "session.rename")]
+    Rename {
+        /// Trimmed, bounded display title.
+        title: String,
+    },
+    /// Change whether the session is pinned.
+    #[serde(rename = "session.pin")]
+    SetPinned {
+        /// New pinned state.
+        pinned: bool,
+    },
+    /// Change whether the session is archived.
+    #[serde(rename = "session.archive")]
+    SetArchived {
+        /// New archived state.
+        archived: bool,
+    },
 }
 
 /// Idempotent session command envelope.
@@ -512,6 +530,10 @@ impl ProtocolValidation for SessionCommandEnvelope {
                 validate_public_text("command.reasoning", reasoning, 128, false)?;
             }
             SessionCommand::SetAuthority { .. } => {}
+            SessionCommand::Rename { title } => {
+                validate_public_text("command.title", title, 512, false)?;
+            }
+            SessionCommand::SetPinned { .. } | SessionCommand::SetArchived { .. } => {}
         }
         validate_serialized_size("command", self, MAX_COMMAND_BYTES)
     }
@@ -575,6 +597,18 @@ impl From<ValidationError> for SanitizedError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session_command(command_id: &str, command: SessionCommand) -> SessionCommandEnvelope {
+        SessionCommandEnvelope::new(
+            HostId::new("host-test").unwrap(),
+            DeviceId::new("device-test").unwrap(),
+            SessionId::new("session-test").unwrap(),
+            CommandId::new(command_id).unwrap(),
+            1,
+            Some(1),
+            command,
+        )
+    }
 
     fn attachment(index: usize, byte_len: u64) -> AttachmentRef {
         AttachmentRef {
@@ -643,5 +677,50 @@ mod tests {
             attachments: vec![duplicate.clone(), duplicate],
         };
         assert!(duplicates.validate().is_err());
+    }
+
+    #[test]
+    fn session_metadata_commands_have_exact_validated_wire_names() {
+        let commands = [
+            (
+                session_command(
+                    "command-rename",
+                    SessionCommand::Rename {
+                        title: "Renamed session".into(),
+                    },
+                ),
+                "session.rename",
+            ),
+            (
+                session_command("command-pin", SessionCommand::SetPinned { pinned: true }),
+                "session.pin",
+            ),
+            (
+                session_command(
+                    "command-archive",
+                    SessionCommand::SetArchived { archived: true },
+                ),
+                "session.archive",
+            ),
+        ];
+
+        for (envelope, expected_type) in commands {
+            envelope.validate().unwrap();
+            let value = serde_json::to_value(&envelope).unwrap();
+            assert_eq!(value["command"]["type"], expected_type);
+            assert_eq!(
+                serde_json::from_value::<SessionCommandEnvelope>(value).unwrap(),
+                envelope
+            );
+        }
+
+        assert!(session_command(
+            "command-blank-title",
+            SessionCommand::Rename {
+                title: " \n ".into(),
+            },
+        )
+        .validate()
+        .is_err());
     }
 }

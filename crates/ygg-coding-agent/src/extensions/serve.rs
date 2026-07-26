@@ -377,6 +377,7 @@ impl YggHost {
         );
         let plan = WorkerPlan {
             config: self.config.clone(),
+            sessions: self.sessions.clone(),
             launch: LaunchSelection {
                 model: resolved.spec.id.clone(),
                 session: SessionSelection::CreateNew(session_path),
@@ -421,6 +422,7 @@ impl YggHost {
             config::parse_reasoning(&selection.reasoning).map_err(|_| ServiceError::InvalidSeed)?;
         let plan = WorkerPlan {
             config: self.config.clone(),
+            sessions: self.sessions.clone(),
             launch: LaunchSelection {
                 model: ModelId(selection.model),
                 session: SessionSelection::OpenExisting(path),
@@ -456,6 +458,7 @@ impl HostService for YggHost {
             attachment_policy,
             previews: false,
             connected_devices: false,
+            session_metadata: true,
             lan_clients: false,
             terminal: false,
             child_agents: false,
@@ -616,6 +619,7 @@ struct WorkerCommand {
 
 struct WorkerPlan {
     config: Config,
+    sessions: SessionStore,
     launch: LaunchSelection,
     authority: AuthorityProfile,
     available_models: Vec<ModelSummary>,
@@ -941,6 +945,17 @@ async fn run_worker(
                         },
                     )])));
             }
+            SessionCommand::Rename { title } => {
+                let _ = message.response.send(rename_session_outcome(&plan, &title));
+            }
+            SessionCommand::SetPinned { pinned } => {
+                let _ = message.response.send(pin_session_outcome(&plan, pinned));
+            }
+            SessionCommand::SetArchived { archived } => {
+                let _ = message
+                    .response
+                    .send(archive_session_outcome(&plan, archived));
+            }
             _ => {
                 let _ = message.response.send(Err(ServiceError::InvalidBoundary));
             }
@@ -1032,6 +1047,62 @@ fn persist_idle_selection(
         }),
         event(EventPayload::SessionDurableHeadChanged { durable_entry_id }),
     ]))
+}
+
+fn rename_session_outcome(
+    plan: &WorkerPlan,
+    title: &str,
+) -> Result<DriverCommandOutcome, ServiceError> {
+    ensure_durable_session(plan)?;
+    let metadata = plan
+        .sessions
+        .rename(plan.session_id.as_str(), title)
+        .map_err(|_| ServiceError::InvalidBoundary)?;
+    let title = metadata.name.ok_or(ServiceError::InvalidBoundary)?;
+    Ok(session_metadata_outcome(Some(title), None, None))
+}
+
+fn pin_session_outcome(
+    plan: &WorkerPlan,
+    pinned: bool,
+) -> Result<DriverCommandOutcome, ServiceError> {
+    ensure_durable_session(plan)?;
+    plan.sessions
+        .set_pinned(plan.session_id.as_str(), pinned)
+        .map_err(|_| ServiceError::Internal)?;
+    Ok(session_metadata_outcome(None, Some(pinned), None))
+}
+
+fn archive_session_outcome(
+    plan: &WorkerPlan,
+    archived: bool,
+) -> Result<DriverCommandOutcome, ServiceError> {
+    ensure_durable_session(plan)?;
+    plan.sessions
+        .set_archived(plan.session_id.as_str(), archived)
+        .map_err(|_| ServiceError::Internal)?;
+    Ok(session_metadata_outcome(None, None, Some(archived)))
+}
+
+fn ensure_durable_session(plan: &WorkerPlan) -> Result<(), ServiceError> {
+    match &plan.launch.session {
+        SessionSelection::OpenExisting(path) if path.is_file() => Ok(()),
+        SessionSelection::CreateNew(_) | SessionSelection::OpenExisting(_) => {
+            Err(ServiceError::InvalidBoundary)
+        }
+    }
+}
+
+fn session_metadata_outcome(
+    title: Option<String>,
+    pinned: Option<bool>,
+    archived: Option<bool>,
+) -> DriverCommandOutcome {
+    DriverCommandOutcome::with_events(vec![event(EventPayload::SessionMetadataChanged {
+        title,
+        pinned,
+        archived,
+    })])
 }
 
 async fn shutdown_worker_app(app: &mut Option<App>) {
@@ -1378,6 +1449,9 @@ async fn handle_active_command(
                 Err(error) => Err(error),
             }
         }
+        SessionCommand::Rename { title } => rename_session_outcome(plan, &title),
+        SessionCommand::SetPinned { pinned } => pin_session_outcome(plan, pinned),
+        SessionCommand::SetArchived { archived } => archive_session_outcome(plan, archived),
         SessionCommand::Abort { run_id: expected }
             if expected.as_ref().is_none_or(|expected| expected == run_id) =>
         {
@@ -2663,6 +2737,8 @@ fn seed_from_session(
         .as_ref()
         .map(|meta| bounded_text(&meta.title, 512))
         .unwrap_or_else(|| "Session".into());
+    let pinned = meta.as_ref().is_some_and(|meta| meta.pinned);
+    let archived = meta.as_ref().is_some_and(|meta| meta.archived);
     let summary = SessionSummary {
         id: session_id.clone(),
         project_id,
@@ -2670,8 +2746,8 @@ fn seed_from_session(
         tags: meta.map(|meta| meta.tags).unwrap_or_default(),
         created_at_ms: modified_at_ms,
         modified_at_ms,
-        pinned: false,
-        archived: false,
+        pinned,
+        archived,
         provisional: false,
         live_state: SessionLiveState::Idle,
         attention: AttentionState::None,
@@ -3153,8 +3229,8 @@ fn summary_from_meta(
         tags: meta.tags.iter().map(|tag| bounded_text(tag, 64)).collect(),
         created_at_ms: modified_at_ms,
         modified_at_ms,
-        pinned: false,
-        archived: false,
+        pinned: meta.pinned,
+        archived: meta.archived,
         provisional: false,
         live_state: SessionLiveState::Idle,
         attention: AttentionState::None,
@@ -3544,6 +3620,7 @@ mod tests {
         let session_id = SessionId::new("selection").unwrap();
         let mut plan = WorkerPlan {
             config: serve_test_config(directory.path()),
+            sessions: SessionStore::new(&session_dir, directory.path()),
             launch: LaunchSelection {
                 model: ModelId("selected-model".into()),
                 session: SessionSelection::CreateNew(session_path.clone()),
@@ -3600,6 +3677,90 @@ mod tests {
                 && reasoning == "low"
                 && reasoning_mode == "standard"
         ));
+    }
+
+    #[test]
+    fn session_metadata_mutations_are_durable_and_emit_exact_patches() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = serve_test_config(directory.path());
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let session_path = sessions.dir().join("metadata-session.jsonl");
+        let mut session = Session::create(&session_path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("original title".into())],
+            })))
+            .unwrap();
+        drop(session);
+        let plan = WorkerPlan {
+            config,
+            sessions: sessions.clone(),
+            launch: LaunchSelection {
+                model: ModelId("test-model".into()),
+                session: SessionSelection::OpenExisting(session_path),
+                reasoning: ReasoningConfig::Off,
+                reasoning_mode: ygg_ai::ReasoningMode::Standard,
+            },
+            authority: AuthorityProfile::FullAccess,
+            available_models: Vec::new(),
+            actor_generation: 1,
+            session_id: SessionId::new("metadata-session").unwrap(),
+            attachments: None,
+            resources: OpaqueResourceRegistry::default(),
+        };
+
+        let renamed = rename_session_outcome(&plan, "  Renamed session  ").unwrap();
+        assert!(matches!(
+            renamed.events.as_slice(),
+            [TimestampedEvent {
+                payload: EventPayload::SessionMetadataChanged {
+                    title: Some(title),
+                    pinned: None,
+                    archived: None,
+                },
+                ..
+            }] if title == "Renamed session"
+        ));
+        let pinned = pin_session_outcome(&plan, true).unwrap();
+        assert!(matches!(
+            pinned.events.as_slice(),
+            [TimestampedEvent {
+                payload: EventPayload::SessionMetadataChanged {
+                    title: None,
+                    pinned: Some(true),
+                    archived: None,
+                },
+                ..
+            }]
+        ));
+        let archived = archive_session_outcome(&plan, true).unwrap();
+        assert!(matches!(
+            archived.events.as_slice(),
+            [TimestampedEvent {
+                payload: EventPayload::SessionMetadataChanged {
+                    title: None,
+                    pinned: None,
+                    archived: Some(true),
+                },
+                ..
+            }]
+        ));
+
+        let reopened = SessionStore::new(&plan.config.session_dir, &plan.config.workspace);
+        let metadata = reopened.load_metadata("metadata-session").unwrap();
+        assert_eq!(metadata.name.as_deref(), Some("Renamed session"));
+        assert!(metadata.pinned);
+        assert!(metadata.archived);
+        let summary = summary_from_meta(
+            &session_meta_for_id(&reopened, &plan.session_id).unwrap(),
+            None,
+            current_selection(&plan),
+        )
+        .unwrap();
+        assert_eq!(summary.title, "Renamed session");
+        assert!(summary.pinned);
+        assert!(summary.archived);
     }
 
     #[test]

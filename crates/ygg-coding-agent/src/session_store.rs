@@ -36,18 +36,26 @@ pub struct SessionMeta {
     pub title: String,
     pub name: Option<String>,
     pub tags: Vec<String>,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub pinned: bool,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub archived: bool,
     pub modified: SystemTime,
 }
 
 /// Small user-owned metadata kept next to, but separate from, append-only
 /// session records. Sidecars let older Ygg binaries continue to open JSONL
-/// sessions while names and tags remain easy to export and recover.
+/// sessions while catalog metadata remains easy to export and recover.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUserMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 #[derive(Debug)]
@@ -922,13 +930,24 @@ impl SessionStore {
             .name
             .clone()
             .unwrap_or_else(|| fallback_title.clone());
+        let modified = self
+            .metadata_path(&id)
+            .ok()
+            .and_then(|path| path.symlink_metadata().ok())
+            .filter(|metadata| metadata.file_type().is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .map_or(candidate.modified, |metadata_modified| {
+                std::cmp::max(candidate.modified, metadata_modified)
+            });
         Some(SessionMeta {
             id,
             path: candidate.path,
             title,
             name: metadata.name,
             tags: metadata.tags,
-            modified: candidate.modified,
+            pinned: metadata.pinned,
+            archived: metadata.archived,
+            modified,
         })
     }
 
@@ -974,7 +993,7 @@ impl SessionStore {
         Ok(self.metadata_dir().join(format!("{id}.json")))
     }
 
-    /// Read optional session name/tags without opening the conversation file.
+    /// Read optional user-owned session catalog metadata.
     pub fn load_metadata(&self, id: &str) -> anyhow::Result<SessionUserMetadata> {
         let path = self.metadata_path(id)?;
         let bytes = match crate::auth::read_bounded_regular(&path, MAX_SESSION_METADATA_BYTES) {
@@ -993,10 +1012,12 @@ impl SessionStore {
                 .transpose()?
                 .flatten(),
             tags: sanitize_session_tags(&parsed.tags)?,
+            pinned: parsed.pinned,
+            archived: parsed.archived,
         })
     }
 
-    /// Atomically replace user-owned name/tags. The target session must exist.
+    /// Atomically replace user-owned catalog metadata. The target session must exist.
     pub fn save_metadata(&self, id: &str, metadata: &SessionUserMetadata) -> anyhow::Result<()> {
         self.path_by_id(id)?;
         let metadata = SessionUserMetadata {
@@ -1007,6 +1028,8 @@ impl SessionStore {
                 .transpose()?
                 .flatten(),
             tags: sanitize_session_tags(&metadata.tags)?,
+            pinned: metadata.pinned,
+            archived: metadata.archived,
         };
         let bytes = serde_json::to_vec_pretty(&metadata)?;
         if bytes.len() > MAX_SESSION_METADATA_BYTES {
@@ -1025,6 +1048,22 @@ impl SessionStore {
     pub fn set_tags(&self, id: &str, tags: Vec<String>) -> anyhow::Result<SessionUserMetadata> {
         let mut metadata = self.load_metadata(id)?;
         metadata.tags = sanitize_session_tags(&tags)?;
+        self.save_metadata(id, &metadata)?;
+        Ok(metadata)
+    }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn set_pinned(&self, id: &str, pinned: bool) -> anyhow::Result<SessionUserMetadata> {
+        let mut metadata = self.load_metadata(id)?;
+        metadata.pinned = pinned;
+        self.save_metadata(id, &metadata)?;
+        Ok(metadata)
+    }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn set_archived(&self, id: &str, archived: bool) -> anyhow::Result<SessionUserMetadata> {
+        let mut metadata = self.load_metadata(id)?;
+        metadata.archived = archived;
         self.save_metadata(id, &metadata)?;
         Ok(metadata)
     }
@@ -1059,6 +1098,43 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("2026-07-12T14-30-05Z-")));
+    }
+
+    #[test]
+    fn catalog_metadata_round_trips_without_rewriting_the_session() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("metadata.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("original title".into())],
+            })))
+            .unwrap();
+        drop(session);
+        let session_bytes = std::fs::read(&path).unwrap();
+
+        store
+            .set_tags("metadata", vec!["work".into(), "active".into()])
+            .unwrap();
+        store.rename("metadata", "  Renamed session  ").unwrap();
+        store.set_pinned("metadata", true).unwrap();
+        store.set_archived("metadata", true).unwrap();
+
+        let reopened = SessionStore::new(root.path(), workspace.path());
+        let metadata = reopened.load_metadata("metadata").unwrap();
+        assert_eq!(metadata.name.as_deref(), Some("Renamed session"));
+        assert_eq!(metadata.tags, ["work", "active"]);
+        assert!(metadata.pinned);
+        assert!(metadata.archived);
+        let listed = reopened.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Renamed session");
+        assert!(listed[0].pinned);
+        assert!(listed[0].archived);
+        assert_eq!(std::fs::read(path).unwrap(), session_bytes);
     }
 
     #[test]
