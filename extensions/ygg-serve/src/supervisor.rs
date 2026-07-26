@@ -409,6 +409,31 @@ impl<H: HostService> SessionSupervisor<H> {
         CatalogCursor(self.catalog_cursor.load(Ordering::Acquire))
     }
 
+    /// Attachment policy advertised by the running host.
+    pub fn attachment_policy(&self) -> Option<crate::AttachmentPolicy> {
+        self.host.attachment_policy()
+    }
+
+    /// Ingests one authenticated, transport-bounded attachment.
+    pub async fn ingest_attachment(
+        &self,
+        display_name: &str,
+        media_type: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<crate::AttachmentRef, crate::AttachmentError> {
+        self.host
+            .ingest_attachment(display_name, media_type, bytes)
+            .await
+    }
+
+    /// Reads one authenticated attachment without exposing its host path.
+    pub async fn attachment_content(
+        &self,
+        handle: &str,
+    ) -> Result<crate::StoredAttachment, crate::AttachmentError> {
+        self.host.attachment_content(handle).await
+    }
+
     /// Subscribes to the ordered live stream across all hosted sessions.
     ///
     /// A lagged subscriber must recover each affected session through replay

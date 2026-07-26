@@ -1,5 +1,7 @@
 //! Bounded idempotent session commands and acknowledgements.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::bounds::{
@@ -10,8 +12,6 @@ use crate::{
     AuthorityProfile, CatalogCursor, CommandId, DeviceId, ErrorCode, HostId, ModelSelection,
     ProjectId, RequestId, RunId, SanitizedError, SessionCursor, SessionId, PROTOCOL_VERSION,
 };
-
-const MAX_ATTACHMENTS: usize = 32;
 
 /// Host-scoped commands that do not target an existing session actor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,7 +412,17 @@ impl ProtocolValidation for AttachmentRef {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_public_text("attachment.handle", &self.handle, 256, false)?;
         validate_public_text("attachment.display_name", &self.display_name, 512, false)?;
-        validate_media_type(&self.media_type)
+        validate_media_type(&self.media_type)?;
+        if self.byte_len == 0 || self.byte_len > crate::MAX_ATTACHMENT_FILE_BYTES as u64 {
+            return Err(ValidationError::new(
+                "attachment.byte_len",
+                format!(
+                    "must be within 1..={} bytes",
+                    crate::MAX_ATTACHMENT_FILE_BYTES
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -425,14 +435,42 @@ impl ProtocolValidation for PromptInput {
                 "requires text or at least one attachment",
             ));
         }
-        if self.attachments.len() > MAX_ATTACHMENTS {
+        if self.attachments.len() > crate::MAX_ATTACHMENT_COUNT {
             return Err(ValidationError::new(
                 "command.input.attachments",
-                format!("exceeds the {MAX_ATTACHMENTS}-attachment limit"),
+                format!(
+                    "exceeds the {}-attachment limit",
+                    crate::MAX_ATTACHMENT_COUNT
+                ),
             ));
         }
+        let mut handles = BTreeSet::new();
+        let mut total_bytes = 0u64;
         for attachment in &self.attachments {
             attachment.validate()?;
+            if !handles.insert(attachment.handle.as_str()) {
+                return Err(ValidationError::new(
+                    "command.input.attachments",
+                    "contains a duplicate attachment handle",
+                ));
+            }
+            total_bytes = total_bytes
+                .checked_add(attachment.byte_len)
+                .ok_or_else(|| {
+                    ValidationError::new(
+                        "command.input.attachments",
+                        "exceeds the aggregate byte limit",
+                    )
+                })?;
+            if total_bytes > crate::MAX_ATTACHMENT_TOTAL_BYTES as u64 {
+                return Err(ValidationError::new(
+                    "command.input.attachments",
+                    format!(
+                        "exceeds the {}-byte aggregate limit",
+                        crate::MAX_ATTACHMENT_TOTAL_BYTES
+                    ),
+                ));
+            }
         }
         Ok(())
     }
@@ -531,5 +569,79 @@ impl ProtocolValidation for HostCommandAck {
 impl From<ValidationError> for SanitizedError {
     fn from(error: ValidationError) -> Self {
         Self::public(ErrorCode::InvalidCommand, error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn attachment(index: usize, byte_len: u64) -> AttachmentRef {
+        AttachmentRef {
+            handle: format!("handle-{index}"),
+            display_name: format!("image-{index}.png"),
+            media_type: "image/png".into(),
+            byte_len,
+        }
+    }
+
+    #[test]
+    fn attachment_only_and_exact_policy_boundaries_are_valid() {
+        let eight = PromptInput {
+            text: String::new(),
+            attachments: (0..crate::MAX_ATTACHMENT_COUNT)
+                .map(|index| attachment(index, 1))
+                .collect(),
+        };
+        eight.validate().unwrap();
+        let exact_total = PromptInput {
+            text: "four full images".into(),
+            attachments: (0..4)
+                .map(|index| attachment(index, crate::MAX_ATTACHMENT_FILE_BYTES as u64))
+                .collect(),
+        };
+        exact_total.validate().unwrap();
+    }
+
+    #[test]
+    fn count_file_total_zero_and_duplicate_bounds_are_rejected() {
+        let over_count = PromptInput {
+            text: "too many".into(),
+            attachments: (0..=crate::MAX_ATTACHMENT_COUNT)
+                .map(|index| attachment(index, 1))
+                .collect(),
+        };
+        assert!(over_count.validate().is_err());
+
+        let zero = PromptInput {
+            text: "zero".into(),
+            attachments: vec![attachment(0, 0)],
+        };
+        assert!(zero.validate().is_err());
+
+        let over_file = PromptInput {
+            text: "large".into(),
+            attachments: vec![attachment(0, crate::MAX_ATTACHMENT_FILE_BYTES as u64 + 1)],
+        };
+        assert!(over_file.validate().is_err());
+
+        let over_total = PromptInput {
+            text: "aggregate".into(),
+            attachments: vec![
+                attachment(0, crate::MAX_ATTACHMENT_FILE_BYTES as u64),
+                attachment(1, crate::MAX_ATTACHMENT_FILE_BYTES as u64),
+                attachment(2, crate::MAX_ATTACHMENT_FILE_BYTES as u64),
+                attachment(3, crate::MAX_ATTACHMENT_FILE_BYTES as u64),
+                attachment(4, 1),
+            ],
+        };
+        assert!(over_total.validate().is_err());
+
+        let duplicate = attachment(0, 1);
+        let duplicates = PromptInput {
+            text: "duplicate".into(),
+            attachments: vec![duplicate.clone(), duplicate],
+        };
+        assert!(duplicates.validate().is_err());
     }
 }

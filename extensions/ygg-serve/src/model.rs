@@ -93,6 +93,9 @@ pub struct HostCapabilities {
     pub opaque_resources: bool,
     /// Host-ingested attachment handles are available.
     pub attachments: bool,
+    /// Bounded ingest policy when attachments are available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_policy: Option<AttachmentPolicy>,
     /// Live preview targets are supported.
     pub previews: bool,
     /// A connected-device/pairing surface is available.
@@ -105,12 +108,44 @@ pub struct HostCapabilities {
     pub child_agents: bool,
 }
 
+/// Bounded host-ingest policy advertised to graphical clients.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentPolicy {
+    /// Exact accepted media types.
+    pub accepted_media_types: Vec<String>,
+    /// Maximum attachments accepted by one prompt.
+    pub max_count: u32,
+    /// Maximum bytes accepted for one file.
+    pub max_file_bytes: u64,
+    /// Maximum aggregate bytes accepted by one prompt.
+    pub max_total_bytes: u64,
+}
+
+impl AttachmentPolicy {
+    /// Returns the conservative image-only first-party policy.
+    pub fn image_defaults() -> Self {
+        Self {
+            accepted_media_types: vec![
+                "image/png".into(),
+                "image/jpeg".into(),
+                "image/gif".into(),
+                "image/webp".into(),
+            ],
+            max_count: crate::MAX_ATTACHMENT_COUNT as u32,
+            max_file_bytes: crate::MAX_ATTACHMENT_FILE_BYTES as u64,
+            max_total_bytes: crate::MAX_ATTACHMENT_TOTAL_BYTES as u64,
+        }
+    }
+}
+
 impl Default for HostCapabilities {
     fn default() -> Self {
         Self {
             concurrent_sessions: true,
             opaque_resources: true,
             attachments: false,
+            attachment_policy: None,
             previews: false,
             connected_devices: false,
             // Capability advertisements describe the transport that is
@@ -716,6 +751,40 @@ impl ProtocolValidation for HostDescriptor {
     }
 }
 
+impl ProtocolValidation for AttachmentPolicy {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.accepted_media_types.is_empty() || self.accepted_media_types.len() > 32 {
+            return Err(ValidationError::new(
+                "attachment_policy.accepted_media_types",
+                "must contain 1..=32 entries",
+            ));
+        }
+        let mut media_types = BTreeSet::new();
+        for media_type in &self.accepted_media_types {
+            validate_media_type("attachment_policy.accepted_media_types", media_type)?;
+            if !media_types.insert(media_type) {
+                return Err(ValidationError::new(
+                    "attachment_policy.accepted_media_types",
+                    "contains a duplicate media type",
+                ));
+            }
+        }
+        if self.max_count == 0
+            || self.max_count as usize > crate::MAX_ATTACHMENT_COUNT
+            || self.max_file_bytes == 0
+            || self.max_file_bytes > crate::MAX_ATTACHMENT_FILE_BYTES as u64
+            || self.max_total_bytes < self.max_file_bytes
+            || self.max_total_bytes > crate::MAX_ATTACHMENT_TOTAL_BYTES as u64
+        {
+            return Err(ValidationError::new(
+                "attachment_policy",
+                "contains an unsupported attachment bound",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ProtocolValidation for ProjectSummary {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_public_text("project.name", &self.name, 256, false)
@@ -1062,6 +1131,15 @@ impl ProtocolValidation for HostBootstrap {
             ));
         }
         self.host.validate()?;
+        if let Some(policy) = &self.capabilities.attachment_policy {
+            policy.validate()?;
+            if !self.capabilities.attachments {
+                return Err(ValidationError::new(
+                    "bootstrap.capabilities.attachment_policy",
+                    "requires the attachments capability",
+                ));
+            }
+        }
         if self.models.is_empty() || self.models.len() > MAX_MODELS {
             return Err(ValidationError::new(
                 "bootstrap.models",

@@ -8,6 +8,17 @@
     "concurrentSessions": true,
     "opaqueResources": true,
     "attachments": true,
+    "attachmentPolicy": {
+      "acceptedMediaTypes": [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp"
+      ],
+      "maxCount": 8,
+      "maxFileBytes": 5242880,
+      "maxTotalBytes": 20971520
+    },
     "previews": true,
     "connectedDevices": false,
     "lanClients": false,

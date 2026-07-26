@@ -840,6 +840,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "getrandom",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

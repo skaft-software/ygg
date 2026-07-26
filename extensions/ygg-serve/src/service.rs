@@ -3,11 +3,13 @@
 use std::future;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 
 use crate::{
-    AuthorityProfile, HostCapabilities, HostDescriptor, ModelSelection, ModelSummary, ProjectId,
-    ProjectSummary, RunId, SanitizedError, SessionCommand, SessionSnapshot, SessionSummary,
-    ThemeId, ThemeOption, TimestampedEvent,
+    AttachmentError, AttachmentPolicy, AttachmentRef, AuthorityProfile, HostCapabilities,
+    HostDescriptor, ModelSelection, ModelSummary, ProjectId, ProjectSummary, RunId, SanitizedError,
+    SessionCommand, SessionSnapshot, SessionSummary, StoredAttachment, ThemeId, ThemeOption,
+    TimestampedEvent,
 };
 
 /// Maximum immediate events one driver dispatch may return.
@@ -180,6 +182,26 @@ pub trait HostService: Send + Sync + 'static {
     /// Capabilities actually available in the running transport.
     fn capabilities(&self) -> HostCapabilities {
         HostCapabilities::default()
+    }
+
+    /// Attachment policy when authenticated host ingest is available.
+    fn attachment_policy(&self) -> Option<AttachmentPolicy> {
+        self.capabilities().attachment_policy
+    }
+
+    /// Ingests one bounded attachment from the authenticated graphical transport.
+    async fn ingest_attachment(
+        &self,
+        _display_name: &str,
+        _media_type: &str,
+        _bytes: Bytes,
+    ) -> Result<AttachmentRef, AttachmentError> {
+        Err(AttachmentError::Unavailable)
+    }
+
+    /// Returns one authoritative attachment for an authenticated content request.
+    async fn attachment_content(&self, _handle: &str) -> Result<StoredAttachment, AttachmentError> {
+        Err(AttachmentError::Unavailable)
     }
 
     /// Maximum authority remote commands may select.

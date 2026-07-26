@@ -13,23 +13,25 @@ use sexy_tui_rs::{Color as TuiColor, TextStyle as TuiTextStyle};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use ygg_agent::{
-    AgentEvent, Entry, EntryValue, FinishReason, OutputChannel, RunControl, Session, ToolProgress,
+    AgentEvent, Entry, EntryValue, FinishReason, InputPart, OutputChannel, RunControl, Session,
+    ToolProgress, UserInput,
 };
 use ygg_ai::{
-    AssistantPart, Message, Modality, Model, ModelCatalog, ModelId, ReasoningConfig, ToolCallId,
-    ToolResultPart, UserPart,
+    AssistantPart, ImageSource, Media, Message, Modality, Model, ModelCatalog, ModelId,
+    ReasoningConfig, ToolCallId, ToolResultPart, UserPart,
 };
 use ygg_serve_backend::{
-    ActorOwnerState, AttentionState, AuthorityProfile, ColorScheme, ContextUsage,
+    ActorOwnerState, AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef,
+    AttachmentStore, AttentionState, AuthorityProfile, ColorScheme, ContextUsage,
     CreateSessionRequest, DriverCommandOutcome, DurableEntryId, EventPayload, HostCapabilities,
     HostDescriptor, HostId, HostService, InputModality, ItemDelta, ItemId, ItemLifecycle,
     ItemPayload, LoopbackConfig, LoopbackServer, ModelSelection, ModelSummary, PendingRequest,
     ProjectId, ProjectSummary, ProtocolValidation, RequestAnswer, RequestId, RequestKind,
     RequestState, RunId, SemanticRole, ServiceError, SessionCommand, SessionCursor, SessionDriver,
     SessionId, SessionItem, SessionLiveState, SessionSeed, SessionSnapshot, SessionSummary,
-    SessionSupervisor, SupervisorConfig, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion,
-    ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, TurnId,
-    UsageSnapshot, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
+    SessionSupervisor, StoredAttachment, SupervisorConfig, ThemeColor, ThemeDensity, ThemeDto,
+    ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
+    TimestampedEvent, TurnId, UsageSnapshot, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
 };
 
 use crate::app::bootstrap::{build_app, LaunchSelection, SessionSelection};
@@ -158,6 +160,7 @@ struct YggHost {
     project_id: ProjectId,
     themes: Vec<ThemeOption>,
     selected_theme_id: ThemeId,
+    attachments: Option<AttachmentStore>,
 }
 
 impl YggHost {
@@ -191,6 +194,16 @@ impl YggHost {
             ),
         };
         let (themes, selected_theme_id) = graphical_themes(&config)?;
+        let state_dir = secure_serve_state_dir(&config.session_dir)?;
+        let attachments = match AttachmentStore::open(&state_dir) {
+            Ok(store) => Some(store),
+            Err(_) => {
+                crate::output::stderr_line(
+                    "warning: secure attachment storage is unavailable; image uploads are disabled",
+                );
+                None
+            }
+        };
         Ok(Self {
             config,
             catalog: boot.catalog,
@@ -200,6 +213,7 @@ impl YggHost {
             project_id,
             themes,
             selected_theme_id,
+            attachments,
         })
     }
 
@@ -271,6 +285,8 @@ impl YggHost {
             authority: request.authority,
             available_models: self.models.clone(),
             actor_generation: generation,
+            session_id: seed.summary.id.clone(),
+            attachments: self.attachments.clone(),
         };
         Ok(YggSessionDriver::spawn(seed, plan, 0))
     }
@@ -295,6 +311,7 @@ impl YggHost {
             AuthorityProfile::FullAccess,
             generation,
             session_meta_for_id(&self.sessions, session_id),
+            self.attachments.as_ref(),
         )?;
         let reasoning =
             config::parse_reasoning(&selection.reasoning).map_err(|_| ServiceError::InvalidSeed)?;
@@ -309,6 +326,8 @@ impl YggHost {
             authority: AuthorityProfile::FullAccess,
             available_models: self.models.clone(),
             actor_generation: generation,
+            session_id: session_id.clone(),
+            attachments: self.attachments.clone(),
         };
         let known_entries = session.entries().len();
         Ok(YggSessionDriver::spawn(seed, plan, known_entries))
@@ -324,16 +343,41 @@ impl HostService for YggHost {
     }
 
     fn capabilities(&self) -> HostCapabilities {
+        let attachment_policy = self.attachments.as_ref().map(AttachmentStore::policy);
         HostCapabilities {
             concurrent_sessions: true,
             opaque_resources: false,
-            attachments: false,
+            attachments: attachment_policy.is_some(),
+            attachment_policy,
             previews: false,
             connected_devices: false,
             lan_clients: false,
             terminal: false,
             child_agents: false,
         }
+    }
+
+    fn attachment_policy(&self) -> Option<AttachmentPolicy> {
+        self.attachments.as_ref().map(AttachmentStore::policy)
+    }
+
+    async fn ingest_attachment(
+        &self,
+        display_name: &str,
+        media_type: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<AttachmentRef, AttachmentError> {
+        self.attachments
+            .as_ref()
+            .ok_or(AttachmentError::Unavailable)?
+            .ingest(display_name, media_type, bytes)
+    }
+
+    async fn attachment_content(&self, handle: &str) -> Result<StoredAttachment, AttachmentError> {
+        self.attachments
+            .as_ref()
+            .ok_or(AttachmentError::Unavailable)?
+            .content(handle)
     }
 
     fn authority_ceiling(&self) -> AuthorityProfile {
@@ -467,6 +511,8 @@ struct WorkerPlan {
     authority: AuthorityProfile,
     available_models: Vec<ModelSummary>,
     actor_generation: u64,
+    session_id: SessionId,
+    attachments: Option<AttachmentStore>,
 }
 
 enum PrivateResponse {
@@ -492,6 +538,7 @@ struct ProjectionState {
     tool_items: HashMap<String, ItemId>,
     tool_progress: HashMap<String, (String, u64)>,
     private_requests: HashMap<RequestId, PrivateRequest>,
+    pending_attachments: VecDeque<Vec<AttachmentRef>>,
 }
 
 impl ProjectionState {
@@ -509,6 +556,7 @@ impl ProjectionState {
             tool_items: HashMap::new(),
             tool_progress: HashMap::new(),
             private_requests: HashMap::new(),
+            pending_attachments: VecDeque::new(),
         }
     }
 
@@ -573,10 +621,6 @@ async fn run_worker(
     while let Some(message) = commands.recv().await {
         match message.command {
             SessionCommand::SubmitPrompt { input } => {
-                if !input.attachments.is_empty() {
-                    let _ = message.response.send(Err(ServiceError::Unavailable));
-                    continue;
-                }
                 let mut owned_app = match app.take() {
                     Some(app) => app,
                     None => match build_worker_app(&plan) {
@@ -592,6 +636,7 @@ async fn run_worker(
                 match start_and_drive_run(
                     &mut owned_app,
                     input.text,
+                    input.attachments,
                     &plan,
                     &mut projection,
                     &mut commands,
@@ -640,6 +685,7 @@ async fn run_worker(
                             );
                             let outcome = reconfiguration_outcome(
                                 &rebuilt,
+                                &plan,
                                 &mut projection,
                                 selection,
                                 plan.authority,
@@ -713,6 +759,7 @@ async fn run_worker(
                             );
                             let outcome = reconfiguration_outcome(
                                 &rebuilt,
+                                &plan,
                                 &mut projection,
                                 selection,
                                 plan.authority,
@@ -763,6 +810,7 @@ async fn run_worker(
 
 fn reconfiguration_outcome(
     app: &App,
+    plan: &WorkerPlan,
     projection: &mut ProjectionState,
     selection: ModelSelection,
     authority: AuthorityProfile,
@@ -771,7 +819,14 @@ fn reconfiguration_outcome(
         model: selection,
         authority,
     })];
-    for item in project_new_entries(app.agent.session(), projection, None, None)? {
+    for item in project_new_entries(
+        app.agent.session(),
+        projection,
+        None,
+        None,
+        plan.attachments.as_ref(),
+        &plan.session_id,
+    )? {
         events.push(event(EventPayload::ItemCommitted { item }));
     }
     let durable_entry_id = app
@@ -808,9 +863,94 @@ fn build_worker_app(plan: &WorkerPlan) -> anyhow::Result<App> {
     build_app(boot, plan.launch.clone(), system)
 }
 
+fn resolve_attachment_media(
+    app: &App,
+    plan: &WorkerPlan,
+    references: &[AttachmentRef],
+) -> Result<Vec<Media>, ServiceError> {
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !app
+        .model
+        .spec
+        .capabilities
+        .input_modalities
+        .contains(Modality::Image)
+    {
+        return Err(ServiceError::InvalidBoundary);
+    }
+    let store = plan.attachments.as_ref().ok_or(ServiceError::Unavailable)?;
+    let resolved = store
+        .resolve_many(references)
+        .map_err(attachment_service_error)?;
+    resolved
+        .into_iter()
+        .map(|attachment| {
+            let media_type = attachment
+                .reference
+                .media_type
+                .parse()
+                .map_err(|_| ServiceError::InvalidBoundary)?;
+            Ok(Media::image_bytes(attachment.bytes, media_type))
+        })
+        .collect()
+}
+
+fn resolve_control_input(
+    plan: &WorkerPlan,
+    text: String,
+    references: &[AttachmentRef],
+) -> Result<UserInput, ServiceError> {
+    let mut parts = Vec::with_capacity(1 + references.len());
+    if !text.is_empty() {
+        parts.push(InputPart::Text(text));
+    }
+    if !references.is_empty() {
+        let supports_images = plan
+            .available_models
+            .iter()
+            .find(|summary| summary.id == plan.launch.model.0)
+            .is_some_and(|summary| summary.input_modalities.contains(&InputModality::Image));
+        if !supports_images {
+            return Err(ServiceError::InvalidBoundary);
+        }
+        let store = plan.attachments.as_ref().ok_or(ServiceError::Unavailable)?;
+        for attachment in store
+            .resolve_many(references)
+            .map_err(attachment_service_error)?
+        {
+            let media_type = attachment
+                .reference
+                .media_type
+                .parse()
+                .map_err(|_| ServiceError::InvalidBoundary)?;
+            parts.push(InputPart::Media(Media::image_bytes(
+                attachment.bytes,
+                media_type,
+            )));
+        }
+    }
+    Ok(UserInput::from(parts))
+}
+
+fn attachment_service_error(error: AttachmentError) -> ServiceError {
+    match error {
+        AttachmentError::Unavailable | AttachmentError::QuotaExceeded => ServiceError::Unavailable,
+        AttachmentError::Storage => ServiceError::Internal,
+        AttachmentError::InvalidName
+        | AttachmentError::UnsupportedMediaType
+        | AttachmentError::InvalidContent
+        | AttachmentError::TooLarge
+        | AttachmentError::NotFound
+        | AttachmentError::MetadataMismatch => ServiceError::InvalidBoundary,
+    }
+}
+
 async fn start_and_drive_run(
     app: &mut App,
     prompt: String,
+    attachments: Vec<AttachmentRef>,
     plan: &WorkerPlan,
     projection: &mut ProjectionState,
     commands: &mut mpsc::Receiver<WorkerCommand>,
@@ -823,6 +963,13 @@ async fn start_and_drive_run(
             return Ok(());
         }
     }
+    let media = match resolve_attachment_media(app, plan, &attachments) {
+        Ok(media) => media,
+        Err(error) => {
+            let _ = admission.send(Err(error));
+            return Ok(());
+        }
+    };
     let prompt = match crate::prompts::render_configured(app, &prompt)
         .map_err(|_| ServiceError::Internal)?
     {
@@ -841,19 +988,30 @@ async fn start_and_drive_run(
         .await
         .map_err(|_| ServiceError::Internal)?;
     let pending_context_count = composition.pending_context_count;
+    let model_prompt = composition.prompt;
     app.agent.set_system_prompt(composition.system);
     app.agent.set_prompt_display_text(Some(prompt.clone()));
     projection.begin_run();
     let run_id = projection.next_run_id(plan.actor_generation)?;
     let turn_id = projection.turn_id(&run_id)?;
     let user_item_id = projection.provisional_id(&run_id, "user", 0)?;
-    let mut run = match app.agent.prompt(composition.prompt).await {
+    let mut input_parts = Vec::with_capacity(1 + media.len());
+    if !model_prompt.is_empty() {
+        input_parts.push(InputPart::Text(model_prompt));
+    }
+    input_parts.extend(media.into_iter().map(InputPart::Media));
+    let mut run = match app.agent.prompt(UserInput::from(input_parts)).await {
         Ok(run) => run,
         Err(_) => {
             let _ = admission.send(Err(ServiceError::Internal));
             return Ok(());
         }
     };
+    if !attachments.is_empty() {
+        projection
+            .pending_attachments
+            .push_back(attachments.clone());
+    }
     app.executable_extensions
         .commit_prompt_context(pending_context_count);
     let control = run.control();
@@ -869,7 +1027,7 @@ async fn start_and_drive_run(
                 durable_entry_id: None,
                 payload: ItemPayload::UserMessage {
                     text: bounded_text(&prompt, MAX_PROMPT_BYTES),
-                    attachments: Vec::new(),
+                    attachments: attachments.clone(),
                 },
             },
         }),
@@ -916,7 +1074,7 @@ async fn start_and_drive_run(
                     terminal = TerminalProjection::stopped();
                     break;
                 };
-                handle_active_command(command, &run_id, &control, projection, events).await;
+                handle_active_command(command, &run_id, &control, plan, projection, events).await;
             }
         }
     }
@@ -928,6 +1086,8 @@ async fn start_and_drive_run(
         projection,
         Some(&run_id),
         Some(&user_item_id),
+        plan.attachments.as_ref(),
+        &plan.session_id,
     )?;
     for item in committed {
         events
@@ -987,20 +1147,41 @@ async fn handle_active_command(
     message: WorkerCommand,
     run_id: &RunId,
     control: &RunControl,
+    plan: &WorkerPlan,
     projection: &mut ProjectionState,
     events: &mpsc::Sender<TimestampedEvent>,
 ) {
     let outcome = match message.command {
-        SessionCommand::Steer { input } if input.attachments.is_empty() => control
-            .steer(input.text)
-            .await
-            .map(|_| DriverCommandOutcome::default())
-            .map_err(|_| ServiceError::InvalidBoundary),
-        SessionCommand::FollowUp { input } if input.attachments.is_empty() => control
-            .follow_up(input.text)
-            .await
-            .map(|_| DriverCommandOutcome::default())
-            .map_err(|_| ServiceError::InvalidBoundary),
+        SessionCommand::Steer { input } => {
+            let references = input.attachments;
+            match resolve_control_input(plan, input.text, &references) {
+                Ok(input) => match control.steer(input).await {
+                    Ok(()) => {
+                        if !references.is_empty() {
+                            projection.pending_attachments.push_back(references);
+                        }
+                        Ok(DriverCommandOutcome::default())
+                    }
+                    Err(_) => Err(ServiceError::InvalidBoundary),
+                },
+                Err(error) => Err(error),
+            }
+        }
+        SessionCommand::FollowUp { input } => {
+            let references = input.attachments;
+            match resolve_control_input(plan, input.text, &references) {
+                Ok(input) => match control.follow_up(input).await {
+                    Ok(()) => {
+                        if !references.is_empty() {
+                            projection.pending_attachments.push_back(references);
+                        }
+                        Ok(DriverCommandOutcome::default())
+                    }
+                    Err(_) => Err(ServiceError::InvalidBoundary),
+                },
+                Err(error) => Err(error),
+            }
+        }
         SessionCommand::Abort { run_id: expected }
             if expected.as_ref().is_none_or(|expected| expected == run_id) =>
         {
@@ -1514,12 +1695,20 @@ fn project_new_entries(
     projection: &mut ProjectionState,
     run_id: Option<&RunId>,
     user_item_id: Option<&ItemId>,
+    attachment_store: Option<&AttachmentStore>,
+    session_id: &SessionId,
 ) -> Result<Vec<SessionItem>, ServiceError> {
     let entries = session.entries();
     let start = projection.known_entries.min(entries.len());
     let mut items = Vec::new();
     let mut ordinary_user_seen = false;
     for entry in &entries[start..] {
+        let attachments = attachment_refs_for_entry(
+            entry,
+            attachment_store,
+            session_id,
+            &mut projection.pending_attachments,
+        )?;
         let (preferred, preferred_reasoning) = match &entry.value {
             EntryValue::Message(Message::User(message))
                 if message
@@ -1546,10 +1735,99 @@ fn project_new_entries(
             preferred,
             preferred_reasoning,
             &mut projection.tool_items,
+            attachments,
         )?);
     }
     projection.known_entries = entries.len();
     Ok(items)
+}
+
+fn attachment_refs_for_entry(
+    entry: &Entry,
+    attachment_store: Option<&AttachmentStore>,
+    session_id: &SessionId,
+    pending: &mut VecDeque<Vec<AttachmentRef>>,
+) -> Result<Vec<AttachmentRef>, ServiceError> {
+    let fingerprints = entry_image_fingerprints(entry)?;
+    if fingerprints.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(store) = attachment_store else {
+        return Ok(Vec::new());
+    };
+    if let Some(references) = store
+        .refs_for_entry(session_id, &entry.id.0)
+        .map_err(attachment_service_error)?
+    {
+        if references_match_fingerprints(store, &references, &fingerprints)? {
+            return Ok(references);
+        }
+        return Err(ServiceError::Internal);
+    }
+    if let Some(references) = pending.front() {
+        if references_match_fingerprints(store, references, &fingerprints)? {
+            store
+                .associate(session_id, &entry.id.0, references)
+                .map_err(attachment_service_error)?;
+            return Ok(pending.pop_front().unwrap_or_default());
+        }
+    }
+    store
+        .recover_association(session_id, &entry.id.0, &fingerprints)
+        .map_err(attachment_service_error)
+        .map(|references| references.unwrap_or_default())
+}
+
+fn entry_image_fingerprints(entry: &Entry) -> Result<Vec<AttachmentFingerprint>, ServiceError> {
+    let EntryValue::Message(Message::User(message)) = &entry.value else {
+        return Ok(Vec::new());
+    };
+    message
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            UserPart::Media(Media::Image(image)) => Some(image),
+            _ => None,
+        })
+        .filter_map(|image| match &image.source {
+            ImageSource::Inline(bytes) => Some((image, bytes)),
+            _ => None,
+        })
+        .map(|(image, bytes)| {
+            let media_type = image
+                .media_type
+                .as_ref()
+                .ok_or(ServiceError::InvalidSeed)?
+                .essence_str()
+                .to_owned();
+            Ok(AttachmentFingerprint {
+                media_type,
+                byte_len: bytes.len() as u64,
+                sha256: stable_hash(bytes),
+            })
+        })
+        .collect()
+}
+
+fn references_match_fingerprints(
+    store: &AttachmentStore,
+    references: &[AttachmentRef],
+    fingerprints: &[AttachmentFingerprint],
+) -> Result<bool, ServiceError> {
+    if references.len() != fingerprints.len() {
+        return Ok(false);
+    }
+    let resolved = store
+        .resolve_many(references)
+        .map_err(attachment_service_error)?;
+    Ok(resolved
+        .iter()
+        .zip(fingerprints)
+        .all(|(attachment, fingerprint)| {
+            attachment.reference.media_type == fingerprint.media_type
+                && attachment.reference.byte_len == fingerprint.byte_len
+                && attachment.sha256 == fingerprint.sha256
+        }))
 }
 
 fn project_entry(
@@ -1558,6 +1836,7 @@ fn project_entry(
     preferred: Option<ItemId>,
     preferred_reasoning: Option<ItemId>,
     tool_items: &mut HashMap<String, ItemId>,
+    attachments: Vec<AttachmentRef>,
 ) -> Result<Vec<SessionItem>, ServiceError> {
     let durable_id =
         DurableEntryId::new(entry.id.0.clone()).map_err(|_| ServiceError::InvalidSeed)?;
@@ -1626,7 +1905,7 @@ fn project_entry(
                         durable_id,
                         ItemPayload::UserMessage {
                             text: bounded_text(&text, MAX_PROMPT_BYTES),
-                            attachments: Vec::new(),
+                            attachments,
                         },
                     ),
                 );
@@ -1756,6 +2035,7 @@ fn seed_from_session(
     authority: AuthorityProfile,
     generation: u64,
     meta: Option<SessionMeta>,
+    attachment_store: Option<&AttachmentStore>,
 ) -> Result<SessionSeed, ServiceError> {
     let mut chain = Vec::new();
     let mut cursor = session.head_ref();
@@ -1767,8 +2047,15 @@ fn seed_from_session(
     chain.reverse();
     let mut items = Vec::new();
     let mut tool_items = HashMap::new();
+    let mut pending_attachments = VecDeque::new();
     for entry in chain {
-        let projected = project_entry(entry, None, None, None, &mut tool_items)?;
+        let attachments = attachment_refs_for_entry(
+            entry,
+            attachment_store,
+            &session_id,
+            &mut pending_attachments,
+        )?;
+        let projected = project_entry(entry, None, None, None, &mut tool_items, attachments)?;
         items.extend(projected);
     }
     if items.len() > MAX_PROJECTED_SESSION_ITEMS {

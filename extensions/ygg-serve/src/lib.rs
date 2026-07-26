@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod actor;
+mod attachment;
 mod bounds;
 mod command;
 mod embedded_web;
@@ -23,6 +24,10 @@ mod transport;
 pub use actor::{
     ActorConfig, ActorError, ActorView, CommandAdmission, SessionActor, SessionActorCore,
     SessionActorHandle,
+};
+pub use attachment::{
+    validate_reference_set, AttachmentError, AttachmentFingerprint, AttachmentStore,
+    StoredAttachment, MAX_ATTACHMENT_COUNT, MAX_ATTACHMENT_FILE_BYTES, MAX_ATTACHMENT_TOTAL_BYTES,
 };
 pub use bounds::{
     sanitize_public_text, validate_json, validate_public_text, ProtocolValidation, ValidationError,
@@ -44,10 +49,10 @@ pub use ids::{
 };
 pub use journal::{EventJournal, JournalConfig, JournalError};
 pub use model::{
-    ActorOwnerState, ArtifactKind, ArtifactRef, AttentionState, AuthorityProfile, CatalogCursor,
-    ContextUsage, FileChange, HostBootstrap, HostCapabilities, HostDescriptor, InputModality,
-    ItemLifecycle, ItemPayload, ModelSelection, ModelSummary, PendingRequest, PlanStep,
-    PlanStepState, PreviewRef, ProjectSummary, RequestKind, RequestState, RunOutcome,
+    ActorOwnerState, ArtifactKind, ArtifactRef, AttachmentPolicy, AttentionState, AuthorityProfile,
+    CatalogCursor, ContextUsage, FileChange, HostBootstrap, HostCapabilities, HostDescriptor,
+    InputModality, ItemLifecycle, ItemPayload, ModelSelection, ModelSummary, PendingRequest,
+    PlanStep, PlanStepState, PreviewRef, ProjectSummary, RequestKind, RequestState, RunOutcome,
     SessionCursor, SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, SourceKind,
     SourceRef, UsageSnapshot,
 };

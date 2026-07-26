@@ -6,35 +6,38 @@ use std::path::{Component, Path as FilePath, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST, LOCATION,
-    ORIGIN, REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
+    COOKIE, ETAG, HOST, LOCATION, ORIGIN, REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::embedded_web::WebBundle;
 use crate::{
-    HostCommandEnvelope, HostService, ProtocolValidation, SanitizedError, SessionCommandEnvelope,
-    SessionCursor, SessionId, SessionSupervisor, SupervisorError, MAX_COMMAND_BYTES,
-    PROTOCOL_VERSION,
+    AttachmentError, HostCommandEnvelope, HostService, ProtocolValidation, SanitizedError,
+    SessionCommandEnvelope, SessionCursor, SessionId, SessionSupervisor, SupervisorError,
+    MAX_ATTACHMENT_FILE_BYTES, MAX_COMMAND_BYTES, PROTOCOL_VERSION,
 };
 
 const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 8 * 1024;
 const RATE_LIMIT_REQUESTS: usize = 240;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
+const MAX_CONCURRENT_ATTACHMENT_UPLOADS: usize = 4;
 const X_YGG_WEB_BUNDLE: HeaderName = HeaderName::from_static("x-ygg-web-bundle");
 
 /// Loopback listener configuration.
@@ -101,6 +104,7 @@ impl LoopbackServer {
             auth,
             allowed_authorities: AllowedAuthorities::new(address),
             rate_limiter: RateLimiter::default(),
+            attachment_uploads: Arc::new(Semaphore::new(MAX_CONCURRENT_ATTACHMENT_UPLOADS)),
             web_bundle,
         });
         let router = build_router(state);
@@ -170,6 +174,7 @@ struct TransportState<H: HostService> {
     auth: TransportAuth,
     allowed_authorities: AllowedAuthorities,
     rate_limiter: RateLimiter,
+    attachment_uploads: Arc<Semaphore>,
     web_bundle: WebBundle,
 }
 
@@ -288,6 +293,12 @@ struct ReplayQuery {
     sequence: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttachmentUploadQuery {
+    display_name: String,
+}
+
 fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
     Router::new()
         .route("/", get(index::<H>))
@@ -298,17 +309,140 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
             "/api/v1/sessions/{session_id}/replay",
             get(session_replay::<H>),
         )
-        .route("/api/v1/commands/host", post(host_command::<H>))
-        .route("/api/v1/commands/session", post(session_command::<H>))
+        .route(
+            "/api/v1/commands/host",
+            post(host_command::<H>).layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES)),
+        )
+        .route(
+            "/api/v1/commands/session",
+            post(session_command::<H>).layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES)),
+        )
+        .route(
+            "/api/v1/attachments",
+            post(ingest_attachment::<H>)
+                .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_FILE_BYTES + 1)),
+        )
+        .route("/api/v1/attachments/{handle}", get(attachment_content::<H>))
         .route("/api/v1/events", any(events_socket::<H>))
         .route("/{*asset}", get(static_asset::<H>))
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             secure_request::<H>,
         ))
         .with_state(state)
+}
+
+async fn ingest_attachment<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    query: Result<Query<AttachmentUploadQuery>, axum::extract::rejection::QueryRejection>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_request(),
+    };
+    let Some(policy) = state.supervisor.attachment_policy() else {
+        return attachment_error_response(AttachmentError::Unavailable);
+    };
+    let media_type = match headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(value)
+            if policy
+                .accepted_media_types
+                .iter()
+                .any(|accepted| accepted == value) =>
+        {
+            value.to_owned()
+        }
+        _ => return attachment_error_response(AttachmentError::UnsupportedMediaType),
+    };
+    let permit = match Arc::clone(&state.attachment_uploads).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return attachment_error_response(AttachmentError::QuotaExceeded),
+    };
+    let mut stream = body.into_data_stream();
+    let mut bytes = BytesMut::with_capacity(
+        headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_default()
+            .min(policy.max_file_bytes as usize),
+    );
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => return invalid_request(),
+        };
+        if bytes
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > policy.max_file_bytes as usize)
+        {
+            return attachment_error_response(AttachmentError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    drop(permit);
+    match state
+        .supervisor
+        .ingest_attachment(&query.display_name, &media_type, bytes.freeze())
+        .await
+    {
+        Ok(reference) => Json(reference).into_response(),
+        Err(error) => attachment_error_response(error),
+    }
+}
+
+async fn attachment_content<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(handle): Path<String>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    match state.supervisor.attachment_content(&handle).await {
+        Ok(attachment) => {
+            let content_type = match HeaderValue::from_str(&attachment.reference.media_type) {
+                Ok(value) => value,
+                Err(_) => return attachment_error_response(AttachmentError::Storage),
+            };
+            let content_length = match HeaderValue::from_str(&attachment.bytes.len().to_string()) {
+                Ok(value) => value,
+                Err(_) => return attachment_error_response(AttachmentError::Storage),
+            };
+            let disposition = match inline_content_disposition(&attachment.reference.display_name) {
+                Ok(value) => value,
+                Err(_) => return attachment_error_response(AttachmentError::Storage),
+            };
+            let etag = match HeaderValue::from_str(&format!("\"{}\"", attachment.sha256)) {
+                Ok(value) => value,
+                Err(_) => return attachment_error_response(AttachmentError::Storage),
+            };
+            (
+                [
+                    (CONTENT_TYPE, content_type),
+                    (CONTENT_LENGTH, content_length),
+                    (CONTENT_DISPOSITION, disposition),
+                    (ETAG, etag),
+                    (
+                        CACHE_CONTROL,
+                        HeaderValue::from_static("private, max-age=31536000, immutable"),
+                    ),
+                ],
+                attachment.bytes,
+            )
+                .into_response()
+        }
+        Err(error) => attachment_error_response(error),
+    }
 }
 
 async fn exchange_launch_token<H: HostService>(
@@ -584,6 +718,8 @@ async fn secure_request<H: HostService>(
     next: Next,
 ) -> Response {
     let headers = request.headers();
+    let attachment_upload =
+        request.method() == Method::POST && request.uri().path() == "/api/v1/attachments";
     let host_allowed = headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
@@ -606,23 +742,41 @@ async fn secure_request<H: HostService>(
         .uri()
         .query()
         .is_none_or(|query| query.len() <= MAX_QUERY_BYTES);
+    let content_length_limit = if attachment_upload {
+        state
+            .supervisor
+            .attachment_policy()
+            .map(|policy| policy.max_file_bytes as usize)
+            .unwrap_or(MAX_ATTACHMENT_FILE_BYTES)
+    } else {
+        MAX_COMMAND_BYTES
+    };
     let content_length_allowed = match headers.get(CONTENT_LENGTH) {
         None => true,
         Some(value) => value
             .to_str()
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .is_some_and(|length| length <= MAX_COMMAND_BYTES),
+            .is_some_and(|length| length <= content_length_limit),
     };
     let mutation_has_json = request.method() != Method::POST
         || headers
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| {
-                value
-                    .split(';')
-                    .next()
-                    .is_some_and(|media_type| media_type.trim() == "application/json")
+                if attachment_upload {
+                    state.supervisor.attachment_policy().is_some_and(|policy| {
+                        policy
+                            .accepted_media_types
+                            .iter()
+                            .any(|accepted| accepted == value)
+                    })
+                } else {
+                    value
+                        .split(';')
+                        .next()
+                        .is_some_and(|media_type| media_type.trim() == "application/json")
+                }
             });
     let api_authenticated =
         !request.uri().path().starts_with("/api/v1/") || state.auth.allows_cookie(headers);
@@ -726,6 +880,80 @@ fn rate_limited() -> Response {
     )
 }
 
+fn attachment_error_response(error: AttachmentError) -> Response {
+    match error {
+        AttachmentError::Unavailable => error_response(
+            StatusCode::NOT_FOUND,
+            SanitizedError::public(
+                crate::ErrorCode::Unavailable,
+                "Attachment ingest is not available on this host.",
+            ),
+        ),
+        AttachmentError::InvalidName => error_response(
+            StatusCode::BAD_REQUEST,
+            SanitizedError::public(
+                crate::ErrorCode::InvalidCommand,
+                "The attachment name is invalid.",
+            ),
+        ),
+        AttachmentError::UnsupportedMediaType => error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            SanitizedError::public(
+                crate::ErrorCode::InvalidCommand,
+                "Only PNG, JPEG, GIF, and WebP images are accepted.",
+            ),
+        ),
+        AttachmentError::InvalidContent | AttachmentError::MetadataMismatch => error_response(
+            StatusCode::BAD_REQUEST,
+            SanitizedError::public(
+                crate::ErrorCode::InvalidCommand,
+                "The attachment content or metadata is invalid.",
+            ),
+        ),
+        AttachmentError::TooLarge => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            SanitizedError::public(
+                crate::ErrorCode::PayloadTooLarge,
+                "The attachment exceeds the host limit.",
+            ),
+        ),
+        AttachmentError::QuotaExceeded => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            SanitizedError::public(
+                crate::ErrorCode::Unavailable,
+                "The attachment store is currently full.",
+            )
+            .with_retryable(true),
+        ),
+        AttachmentError::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            SanitizedError::public(crate::ErrorCode::NotFound, "The attachment was not found."),
+        ),
+        AttachmentError::Storage => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SanitizedError::internal(),
+        ),
+    }
+}
+
+fn inline_content_disposition(
+    display_name: &str,
+) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    let safe = display_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || matches!(character, ' ' | '.' | '-' | '_' | '(' | ')')
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    HeaderValue::from_str(&format!("inline; filename=\"{safe}\""))
+}
+
 fn error_response(status: StatusCode, error: SanitizedError) -> Response {
     (
         status,
@@ -744,7 +972,9 @@ fn apply_security_headers(headers: &mut HeaderMap) {
             "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'",
         ),
     );
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if !headers.contains_key(CACHE_CONTROL) {
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
 }
@@ -789,12 +1019,12 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::{
-        ActorOwnerState, AttentionState, AuthorityProfile, ColorScheme, ContextUsage,
-        CreateSessionRequest, DriverCommandOutcome, HostCapabilities, HostDescriptor, HostId,
-        InputModality, ModelSelection, ModelSummary, ServiceError, SessionCommand, SessionCursor,
-        SessionDriver, SessionLiveState, SessionSeed, SessionSnapshot, SessionSummary,
-        SupervisorConfig, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
-        ThemeSourceClass, ThemeTypography,
+        ActorOwnerState, AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState,
+        AuthorityProfile, ColorScheme, ContextUsage, CreateSessionRequest, DriverCommandOutcome,
+        HostCapabilities, HostDescriptor, HostId, InputModality, ModelSelection, ModelSummary,
+        ServiceError, SessionCommand, SessionCursor, SessionDriver, SessionLiveState, SessionSeed,
+        SessionSnapshot, SessionSummary, StoredAttachment, SupervisorConfig, ThemeDensity,
+        ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeSourceClass, ThemeTypography,
     };
 
     use super::*;
@@ -805,15 +1035,21 @@ mod tests {
         opens: Arc<AtomicUsize>,
         next_session: Arc<AtomicUsize>,
         seeds: Arc<Mutex<BTreeMap<SessionId, SessionSeed>>>,
+        attachments: AttachmentStore,
+        _attachment_root: Arc<tempfile::TempDir>,
     }
 
     impl MockHost {
         fn new() -> Self {
+            let attachment_root = Arc::new(tempfile::tempdir().unwrap());
+            let attachments = AttachmentStore::open(attachment_root.path()).unwrap();
             Self {
                 creates: Arc::new(AtomicUsize::new(0)),
                 opens: Arc::new(AtomicUsize::new(0)),
                 next_session: Arc::new(AtomicUsize::new(1)),
                 seeds: Arc::new(Mutex::new(BTreeMap::new())),
+                attachments,
+                _attachment_root: attachment_root,
             }
         }
 
@@ -853,7 +1089,31 @@ mod tests {
         }
 
         fn capabilities(&self) -> HostCapabilities {
-            HostCapabilities::default()
+            HostCapabilities {
+                attachments: true,
+                attachment_policy: Some(AttachmentPolicy::image_defaults()),
+                ..HostCapabilities::default()
+            }
+        }
+
+        fn attachment_policy(&self) -> Option<AttachmentPolicy> {
+            Some(self.attachments.policy())
+        }
+
+        async fn ingest_attachment(
+            &self,
+            display_name: &str,
+            media_type: &str,
+            bytes: bytes::Bytes,
+        ) -> Result<AttachmentRef, AttachmentError> {
+            self.attachments.ingest(display_name, media_type, bytes)
+        }
+
+        async fn attachment_content(
+            &self,
+            handle: &str,
+        ) -> Result<StoredAttachment, AttachmentError> {
+            self.attachments.content(handle)
         }
 
         fn authority_profiles(&self) -> Vec<AuthorityProfile> {

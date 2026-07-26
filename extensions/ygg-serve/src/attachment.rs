@@ -1,0 +1,986 @@
+//! Private, bounded storage for browser-ingested image attachments.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+use crate::{sanitize_public_text, AttachmentPolicy, AttachmentRef, SessionId};
+
+/// Maximum number of image attachments accepted by one prompt.
+pub const MAX_ATTACHMENT_COUNT: usize = 8;
+/// Maximum bytes accepted for one image attachment.
+pub const MAX_ATTACHMENT_FILE_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum aggregate image bytes accepted by one prompt.
+pub const MAX_ATTACHMENT_TOTAL_BYTES: usize = 20 * 1024 * 1024;
+const MAX_STORED_ATTACHMENTS: usize = 1_024;
+const MAX_STORED_ATTACHMENT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_METADATA_BYTES: u64 = 8 * 1024;
+const MAX_ASSOCIATION_BYTES: u64 = 64 * 1024;
+const METADATA_VERSION: u16 = 1;
+const ASSOCIATION_VERSION: u16 = 1;
+const HANDLE_BYTES: usize = 32;
+const HANDLE_HEX_BYTES: usize = HANDLE_BYTES * 2;
+
+const ACCEPTED_MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Attachment storage or validation failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AttachmentError {
+    /// The attachment feature is unavailable.
+    #[error("attachment storage is unavailable")]
+    Unavailable,
+    /// The supplied display name is invalid.
+    #[error("invalid attachment display name")]
+    InvalidName,
+    /// The declared media type is unsupported.
+    #[error("unsupported attachment media type")]
+    UnsupportedMediaType,
+    /// The image bytes do not match the declared type or are truncated.
+    #[error("invalid attachment content")]
+    InvalidContent,
+    /// A file or aggregate limit was exceeded.
+    #[error("attachment exceeds a size limit")]
+    TooLarge,
+    /// The persistent store reached its bounded quota.
+    #[error("attachment storage quota reached")]
+    QuotaExceeded,
+    /// The opaque attachment handle does not exist.
+    #[error("attachment was not found")]
+    NotFound,
+    /// A command reference does not match authoritative stored metadata.
+    #[error("attachment metadata mismatch")]
+    MetadataMismatch,
+    /// Private persistent storage failed.
+    #[error("attachment storage failed")]
+    Storage,
+}
+
+/// Authoritative attachment bytes returned to the adapter or HTTP transport.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAttachment {
+    /// Public, path-free metadata.
+    pub reference: AttachmentRef,
+    /// Exact validated image bytes.
+    pub bytes: Bytes,
+    /// Lowercase SHA-256 digest used for corruption checks and recovery.
+    pub sha256: String,
+}
+
+/// Stable media identity used to recover a crash-interrupted association.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentFingerprint {
+    /// Validated media type.
+    pub media_type: String,
+    /// Exact byte length.
+    pub byte_len: u64,
+    /// Lowercase SHA-256 digest.
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredMetadata {
+    version: u16,
+    handle: String,
+    display_name: String,
+    media_type: String,
+    byte_len: u64,
+    sha256: String,
+    created_at_ms: u64,
+}
+
+impl StoredMetadata {
+    fn attachment_ref(&self) -> AttachmentRef {
+        AttachmentRef {
+            handle: self.handle.clone(),
+            display_name: self.display_name.clone(),
+            media_type: self.media_type.clone(),
+            byte_len: self.byte_len,
+        }
+    }
+
+    fn matches_ref(&self, reference: &AttachmentRef) -> bool {
+        self.handle == reference.handle
+            && self.display_name == reference.display_name
+            && self.media_type == reference.media_type
+            && self.byte_len == reference.byte_len
+    }
+
+    fn matches_fingerprint(&self, fingerprint: &AttachmentFingerprint) -> bool {
+        self.media_type == fingerprint.media_type
+            && self.byte_len == fingerprint.byte_len
+            && self.sha256 == fingerprint.sha256
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct AssociationKey {
+    session_id: String,
+    durable_entry_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredAssociation {
+    version: u16,
+    session_id: String,
+    durable_entry_id: String,
+    handles: Vec<String>,
+}
+
+#[derive(Default)]
+struct StoreIndex {
+    metadata: BTreeMap<String, StoredMetadata>,
+    associations: BTreeMap<AssociationKey, Vec<String>>,
+    stored_bytes: u64,
+}
+
+struct StoreInner {
+    #[cfg(test)]
+    root: PathBuf,
+    blobs: PathBuf,
+    metadata: PathBuf,
+    associations: PathBuf,
+    index: Mutex<StoreIndex>,
+}
+
+/// Cloneable private attachment store shared by the HTTP host and session drivers.
+#[derive(Clone)]
+pub struct AttachmentStore {
+    inner: Arc<StoreInner>,
+}
+
+impl AttachmentStore {
+    /// Opens or creates the store below an already-private Ygg serve state directory.
+    pub fn open(serve_state_dir: &Path) -> Result<Self, AttachmentError> {
+        let root = serve_state_dir.join("attachments");
+        ensure_private_directory(&root)?;
+        let blobs = root.join("blobs");
+        let metadata = root.join("metadata");
+        let associations = root.join("associations");
+        ensure_private_directory(&blobs)?;
+        ensure_private_directory(&metadata)?;
+        ensure_private_directory(&associations)?;
+
+        cleanup_temporary_files(&blobs);
+        cleanup_temporary_files(&metadata);
+        cleanup_temporary_files(&associations);
+
+        let mut index = StoreIndex::default();
+        load_metadata(&metadata, &blobs, &mut index)?;
+        load_associations(&associations, &mut index)?;
+        Ok(Self {
+            inner: Arc::new(StoreInner {
+                #[cfg(test)]
+                root,
+                blobs,
+                metadata,
+                associations,
+                index: Mutex::new(index),
+            }),
+        })
+    }
+
+    /// Advertised image policy for this store.
+    pub fn policy(&self) -> AttachmentPolicy {
+        AttachmentPolicy::image_defaults()
+    }
+
+    /// Ingests one fully buffered, transport-bounded image.
+    pub fn ingest(
+        &self,
+        display_name: &str,
+        declared_media_type: &str,
+        bytes: Bytes,
+    ) -> Result<AttachmentRef, AttachmentError> {
+        if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT_FILE_BYTES {
+            return Err(AttachmentError::TooLarge);
+        }
+        if !ACCEPTED_MEDIA_TYPES.contains(&declared_media_type) {
+            return Err(AttachmentError::UnsupportedMediaType);
+        }
+        validate_image(declared_media_type, &bytes)?;
+        let display_name = safe_display_name(display_name)?;
+        let sha256 = sha256_hex(&bytes);
+        let handle = random_hex(HANDLE_BYTES)?;
+        let created_at_ms = now_ms();
+        let stored = StoredMetadata {
+            version: METADATA_VERSION,
+            handle: handle.clone(),
+            display_name,
+            media_type: declared_media_type.to_owned(),
+            byte_len: bytes.len() as u64,
+            sha256,
+            created_at_ms,
+        };
+
+        {
+            let index = self
+                .inner
+                .index
+                .lock()
+                .map_err(|_| AttachmentError::Storage)?;
+            if index.metadata.len() >= MAX_STORED_ATTACHMENTS
+                || index
+                    .stored_bytes
+                    .checked_add(stored.byte_len)
+                    .is_none_or(|total| total > MAX_STORED_ATTACHMENT_BYTES)
+            {
+                return Err(AttachmentError::QuotaExceeded);
+            }
+            if index.metadata.contains_key(&handle) {
+                return Err(AttachmentError::Storage);
+            }
+        }
+
+        let blob_path = self.inner.blobs.join(format!("{handle}.blob"));
+        atomic_write(&self.inner.blobs, &blob_path, &bytes)?;
+        let metadata_bytes = serde_json::to_vec(&stored).map_err(|_| AttachmentError::Storage)?;
+        let metadata_path = self.inner.metadata.join(format!("{handle}.json"));
+        if let Err(error) = atomic_write(&self.inner.metadata, &metadata_path, &metadata_bytes) {
+            let _ = std::fs::remove_file(&blob_path);
+            return Err(error);
+        }
+
+        let reference = stored.attachment_ref();
+        let mut index = self
+            .inner
+            .index
+            .lock()
+            .map_err(|_| AttachmentError::Storage)?;
+        index.stored_bytes = index.stored_bytes.saturating_add(stored.byte_len);
+        index.metadata.insert(handle, stored);
+        Ok(reference)
+    }
+
+    /// Resolves and corruption-checks one exact authoritative reference.
+    pub fn resolve(&self, reference: &AttachmentRef) -> Result<StoredAttachment, AttachmentError> {
+        let metadata = {
+            let index = self
+                .inner
+                .index
+                .lock()
+                .map_err(|_| AttachmentError::Storage)?;
+            index
+                .metadata
+                .get(&reference.handle)
+                .cloned()
+                .ok_or(AttachmentError::NotFound)?
+        };
+        if !metadata.matches_ref(reference) {
+            return Err(AttachmentError::MetadataMismatch);
+        }
+        self.read_metadata_content(metadata)
+    }
+
+    /// Resolves one handle for an authenticated content response.
+    pub fn content(&self, handle: &str) -> Result<StoredAttachment, AttachmentError> {
+        if !valid_handle(handle) {
+            return Err(AttachmentError::NotFound);
+        }
+        let metadata = {
+            let index = self
+                .inner
+                .index
+                .lock()
+                .map_err(|_| AttachmentError::Storage)?;
+            index
+                .metadata
+                .get(handle)
+                .cloned()
+                .ok_or(AttachmentError::NotFound)?
+        };
+        self.read_metadata_content(metadata)
+    }
+
+    /// Resolves an ordered prompt attachment list and enforces aggregate limits.
+    pub fn resolve_many(
+        &self,
+        references: &[AttachmentRef],
+    ) -> Result<Vec<StoredAttachment>, AttachmentError> {
+        validate_reference_set(references)?;
+        references
+            .iter()
+            .map(|reference| self.resolve(reference))
+            .collect()
+    }
+
+    /// Persists the exact association between one durable media entry and its handles.
+    pub fn associate(
+        &self,
+        session_id: &SessionId,
+        durable_entry_id: &str,
+        references: &[AttachmentRef],
+    ) -> Result<(), AttachmentError> {
+        let resolved = self.resolve_many(references)?;
+        let handles = resolved
+            .iter()
+            .map(|attachment| attachment.reference.handle.clone())
+            .collect::<Vec<_>>();
+        self.persist_association(session_id, durable_entry_id, handles)
+    }
+
+    /// Returns a previously persisted exact entry association.
+    pub fn refs_for_entry(
+        &self,
+        session_id: &SessionId,
+        durable_entry_id: &str,
+    ) -> Result<Option<Vec<AttachmentRef>>, AttachmentError> {
+        let key = AssociationKey {
+            session_id: session_id.as_str().to_owned(),
+            durable_entry_id: durable_entry_id.to_owned(),
+        };
+        let (handles, metadata) = {
+            let index = self
+                .inner
+                .index
+                .lock()
+                .map_err(|_| AttachmentError::Storage)?;
+            let Some(handles) = index.associations.get(&key).cloned() else {
+                return Ok(None);
+            };
+            let metadata = handles
+                .iter()
+                .map(|handle| index.metadata.get(handle).cloned())
+                .collect::<Option<Vec<_>>>()
+                .ok_or(AttachmentError::NotFound)?;
+            (handles, metadata)
+        };
+        debug_assert_eq!(handles.len(), metadata.len());
+        Ok(Some(
+            metadata
+                .into_iter()
+                .map(|metadata| metadata.attachment_ref())
+                .collect(),
+        ))
+    }
+
+    /// Recovers an association by exact media fingerprints after a crash window.
+    pub fn recover_association(
+        &self,
+        session_id: &SessionId,
+        durable_entry_id: &str,
+        fingerprints: &[AttachmentFingerprint],
+    ) -> Result<Option<Vec<AttachmentRef>>, AttachmentError> {
+        if fingerprints.is_empty() || fingerprints.len() > MAX_ATTACHMENT_COUNT {
+            return Ok(None);
+        }
+        let references = {
+            let index = self
+                .inner
+                .index
+                .lock()
+                .map_err(|_| AttachmentError::Storage)?;
+            let mut references = Vec::with_capacity(fingerprints.len());
+            for fingerprint in fingerprints {
+                let candidate = index
+                    .metadata
+                    .values()
+                    .filter(|metadata| metadata.matches_fingerprint(fingerprint))
+                    .max_by(|left, right| {
+                        left.created_at_ms
+                            .cmp(&right.created_at_ms)
+                            .then_with(|| left.handle.cmp(&right.handle))
+                    });
+                let Some(candidate) = candidate else {
+                    return Ok(None);
+                };
+                references.push(candidate.attachment_ref());
+            }
+            references
+        };
+        self.associate(session_id, durable_entry_id, &references)?;
+        Ok(Some(references))
+    }
+
+    fn read_metadata_content(
+        &self,
+        metadata: StoredMetadata,
+    ) -> Result<StoredAttachment, AttachmentError> {
+        let path = self.inner.blobs.join(format!("{}.blob", metadata.handle));
+        let bytes = read_regular_file(&path, metadata.byte_len)?;
+        if sha256_hex(&bytes) != metadata.sha256 {
+            return Err(AttachmentError::Storage);
+        }
+        validate_image(&metadata.media_type, &bytes)?;
+        Ok(StoredAttachment {
+            reference: metadata.attachment_ref(),
+            bytes: Bytes::from(bytes),
+            sha256: metadata.sha256,
+        })
+    }
+
+    fn persist_association(
+        &self,
+        session_id: &SessionId,
+        durable_entry_id: &str,
+        handles: Vec<String>,
+    ) -> Result<(), AttachmentError> {
+        if durable_entry_id.is_empty()
+            || durable_entry_id.len() > 256
+            || durable_entry_id.chars().any(char::is_control)
+        {
+            return Err(AttachmentError::MetadataMismatch);
+        }
+        let association = StoredAssociation {
+            version: ASSOCIATION_VERSION,
+            session_id: session_id.as_str().to_owned(),
+            durable_entry_id: durable_entry_id.to_owned(),
+            handles: handles.clone(),
+        };
+        let bytes = serde_json::to_vec(&association).map_err(|_| AttachmentError::Storage)?;
+        if bytes.len() as u64 > MAX_ASSOCIATION_BYTES {
+            return Err(AttachmentError::TooLarge);
+        }
+        let file_name = format!(
+            "{}.json",
+            sha256_hex(format!("{}\0{}", session_id.as_str(), durable_entry_id).as_bytes())
+        );
+        atomic_write(
+            &self.inner.associations,
+            &self.inner.associations.join(file_name),
+            &bytes,
+        )?;
+        let key = AssociationKey {
+            session_id: session_id.as_str().to_owned(),
+            durable_entry_id: durable_entry_id.to_owned(),
+        };
+        self.inner
+            .index
+            .lock()
+            .map_err(|_| AttachmentError::Storage)?
+            .associations
+            .insert(key, handles);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn root(&self) -> &Path {
+        &self.inner.root
+    }
+}
+
+/// Validates the metadata-only attachment set carried by one command.
+pub fn validate_reference_set(references: &[AttachmentRef]) -> Result<(), AttachmentError> {
+    if references.len() > MAX_ATTACHMENT_COUNT {
+        return Err(AttachmentError::TooLarge);
+    }
+    let mut handles = BTreeSet::new();
+    let mut total = 0u64;
+    for reference in references {
+        if !valid_handle(&reference.handle)
+            || reference.byte_len == 0
+            || reference.byte_len > MAX_ATTACHMENT_FILE_BYTES as u64
+            || !ACCEPTED_MEDIA_TYPES.contains(&reference.media_type.as_str())
+        {
+            return Err(AttachmentError::MetadataMismatch);
+        }
+        if !handles.insert(reference.handle.as_str()) {
+            return Err(AttachmentError::MetadataMismatch);
+        }
+        total = total
+            .checked_add(reference.byte_len)
+            .ok_or(AttachmentError::TooLarge)?;
+        if total > MAX_ATTACHMENT_TOTAL_BYTES as u64 {
+            return Err(AttachmentError::TooLarge);
+        }
+    }
+    Ok(())
+}
+
+fn safe_display_name(value: &str) -> Result<String, AttachmentError> {
+    let normalized = value.replace('\\', "/");
+    let basename = normalized.rsplit('/').next().unwrap_or_default().trim();
+    if basename.is_empty() || matches!(basename, "." | "..") {
+        return Err(AttachmentError::InvalidName);
+    }
+    let sanitized = sanitize_public_text(basename, 512, false);
+    if sanitized.is_empty() {
+        return Err(AttachmentError::InvalidName);
+    }
+    Ok(sanitized)
+}
+
+fn validate_image(media_type: &str, bytes: &[u8]) -> Result<(), AttachmentError> {
+    let valid = match media_type {
+        "image/png" => valid_png(bytes),
+        "image/jpeg" => {
+            bytes.len() >= 4
+                && bytes.starts_with(&[0xff, 0xd8, 0xff])
+                && bytes.ends_with(&[0xff, 0xd9])
+        }
+        "image/gif" => {
+            bytes.len() >= 14
+                && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
+                && bytes.last() == Some(&0x3b)
+        }
+        "image/webp" => {
+            bytes.len() >= 20
+                && bytes.starts_with(b"RIFF")
+                && &bytes[8..12] == b"WEBP"
+                && u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize + 8 == bytes.len()
+                && matches!(&bytes[12..16], b"VP8 " | b"VP8L" | b"VP8X")
+        }
+        _ => false,
+    };
+    valid.then_some(()).ok_or(AttachmentError::InvalidContent)
+}
+
+fn valid_png(bytes: &[u8]) -> bool {
+    if bytes.len() < 45 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return false;
+    }
+    let mut offset = 8usize;
+    let mut first = true;
+    while offset.checked_add(12).is_some_and(|end| end <= bytes.len()) {
+        let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let Some(end) = offset
+            .checked_add(12)
+            .and_then(|base| base.checked_add(length))
+        else {
+            return false;
+        };
+        if end > bytes.len() {
+            return false;
+        }
+        let chunk_type = &bytes[offset + 4..offset + 8];
+        if first && (chunk_type != b"IHDR" || length != 13) {
+            return false;
+        }
+        if chunk_type == b"IEND" {
+            return length == 0 && end == bytes.len();
+        }
+        first = false;
+        offset = end;
+    }
+    false
+}
+
+fn valid_handle(value: &str) -> bool {
+    value.len() == HANDLE_HEX_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), AttachmentError> {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(AttachmentError::Storage),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            builder.create(path).map_err(|_| AttachmentError::Storage)?;
+        }
+        Err(_) => return Err(AttachmentError::Storage),
+    }
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|_| AttachmentError::Storage)?;
+    if !metadata.file_type().is_dir() {
+        return Err(AttachmentError::Storage);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| AttachmentError::Storage)?;
+    }
+    Ok(())
+}
+
+fn cleanup_temporary_files(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".tmp-") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn load_metadata(
+    metadata_dir: &Path,
+    blobs_dir: &Path,
+    index: &mut StoreIndex,
+) -> Result<(), AttachmentError> {
+    let entries = std::fs::read_dir(metadata_dir).map_err(|_| AttachmentError::Storage)?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(handle) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if !valid_handle(handle) {
+            continue;
+        }
+        let Ok(bytes) = read_regular_file(&entry.path(), MAX_METADATA_BYTES) else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_slice::<StoredMetadata>(&bytes) else {
+            continue;
+        };
+        if !valid_stored_metadata(&metadata, handle) {
+            continue;
+        }
+        let blob_path = blobs_dir.join(format!("{handle}.blob"));
+        let Ok(blob_metadata) = blob_path.symlink_metadata() else {
+            continue;
+        };
+        if !blob_metadata.file_type().is_file() || blob_metadata.len() != metadata.byte_len {
+            continue;
+        }
+        if index.metadata.len() >= MAX_STORED_ATTACHMENTS
+            || index
+                .stored_bytes
+                .checked_add(metadata.byte_len)
+                .is_none_or(|total| total > MAX_STORED_ATTACHMENT_BYTES)
+        {
+            break;
+        }
+        index.stored_bytes = index.stored_bytes.saturating_add(metadata.byte_len);
+        index.metadata.insert(handle.to_owned(), metadata);
+    }
+    Ok(())
+}
+
+fn load_associations(
+    association_dir: &Path,
+    index: &mut StoreIndex,
+) -> Result<(), AttachmentError> {
+    let entries = std::fs::read_dir(association_dir).map_err(|_| AttachmentError::Storage)?;
+    for entry in entries.flatten() {
+        let Ok(bytes) = read_regular_file(&entry.path(), MAX_ASSOCIATION_BYTES) else {
+            continue;
+        };
+        let Ok(association) = serde_json::from_slice::<StoredAssociation>(&bytes) else {
+            continue;
+        };
+        if association.version != ASSOCIATION_VERSION
+            || SessionId::new(association.session_id.clone()).is_err()
+            || association.durable_entry_id.is_empty()
+            || association.handles.is_empty()
+            || association.handles.len() > MAX_ATTACHMENT_COUNT
+            || association
+                .handles
+                .iter()
+                .any(|handle| !index.metadata.contains_key(handle))
+        {
+            continue;
+        }
+        index.associations.insert(
+            AssociationKey {
+                session_id: association.session_id,
+                durable_entry_id: association.durable_entry_id,
+            },
+            association.handles,
+        );
+    }
+    Ok(())
+}
+
+fn valid_stored_metadata(metadata: &StoredMetadata, expected_handle: &str) -> bool {
+    metadata.version == METADATA_VERSION
+        && metadata.handle == expected_handle
+        && valid_handle(&metadata.handle)
+        && !metadata.display_name.is_empty()
+        && metadata.display_name.len() <= 512
+        && ACCEPTED_MEDIA_TYPES.contains(&metadata.media_type.as_str())
+        && (1..=MAX_ATTACHMENT_FILE_BYTES as u64).contains(&metadata.byte_len)
+        && metadata.sha256.len() == 64
+        && metadata
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn atomic_write(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<(), AttachmentError> {
+    let temp_path = directory.join(format!(".tmp-{}", random_hex(16)?));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&temp_path)
+        .map_err(|_| AttachmentError::Storage)?;
+    if file.write_all(bytes).is_err() || file.sync_all().is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(AttachmentError::Storage);
+    }
+    drop(file);
+    if destination.exists() || std::fs::rename(&temp_path, destination).is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(AttachmentError::Storage);
+    }
+    sync_directory(directory);
+    Ok(())
+}
+
+fn read_regular_file(path: &Path, expected_or_max_bytes: u64) -> Result<Vec<u8>, AttachmentError> {
+    let metadata = path.symlink_metadata().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            AttachmentError::NotFound
+        } else {
+            AttachmentError::Storage
+        }
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > expected_or_max_bytes {
+        return Err(AttachmentError::Storage);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|_| AttachmentError::Storage)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(expected_or_max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| AttachmentError::Storage)?;
+    if bytes.len() as u64 > expected_or_max_bytes {
+        return Err(AttachmentError::Storage);
+    }
+    Ok(bytes)
+}
+
+fn sync_directory(path: &Path) {
+    if let Ok(directory) = File::open(path) {
+        let _ = directory.sync_all();
+    }
+}
+
+fn random_hex(byte_len: usize) -> Result<String, AttachmentError> {
+    let mut bytes = vec![0u8; byte_len];
+    getrandom::fill(&mut bytes).map_err(|_| AttachmentError::Storage)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    Sha256::digest(bytes.as_ref())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png() -> Bytes {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"IEND");
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        Bytes::from(bytes)
+    }
+
+    #[test]
+    fn ingest_sniffs_content_and_sanitizes_basename() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let reference = store
+            .ingest("../screens/alignment.png", "image/png", png())
+            .unwrap();
+        assert_eq!(reference.display_name, "alignment.png");
+        assert_eq!(reference.byte_len, png().len() as u64);
+        assert_eq!(store.resolve(&reference).unwrap().bytes, png());
+        assert_eq!(
+            store.ingest("spoof.jpg", "image/jpeg", png()).unwrap_err(),
+            AttachmentError::InvalidContent
+        );
+        assert_eq!(
+            store
+                .ingest("truncated.png", "image/png", png().slice(..20))
+                .unwrap_err(),
+            AttachmentError::InvalidContent
+        );
+    }
+
+    #[test]
+    fn exact_metadata_and_duplicate_sets_are_enforced() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let reference = store.ingest("alignment.png", "image/png", png()).unwrap();
+        let mut tampered = reference.clone();
+        tampered.display_name = "other.png".into();
+        assert_eq!(
+            store.resolve(&tampered).unwrap_err(),
+            AttachmentError::MetadataMismatch
+        );
+        assert_eq!(
+            store
+                .resolve_many(&[reference.clone(), reference])
+                .unwrap_err(),
+            AttachmentError::MetadataMismatch
+        );
+    }
+
+    #[test]
+    fn all_advertised_image_types_require_complete_matching_magic() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let jpeg = Bytes::from_static(&[0xff, 0xd8, 0xff, 0xe0, 0, 2, 0xff, 0xd9]);
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[0; 7]);
+        gif.push(0x3b);
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&12u32.to_le_bytes());
+        webp.extend_from_slice(b"WEBPVP8 ");
+        webp.extend_from_slice(&[0; 4]);
+        for (name, media_type, bytes) in [
+            ("one.png", "image/png", png()),
+            ("one.jpg", "image/jpeg", jpeg.clone()),
+            ("one.gif", "image/gif", Bytes::from(gif.clone())),
+            ("one.webp", "image/webp", Bytes::from(webp.clone())),
+        ] {
+            assert!(
+                store.ingest(name, media_type, bytes).is_ok(),
+                "{media_type}"
+            );
+        }
+        assert_eq!(
+            store
+                .ingest("short.jpg", "image/jpeg", jpeg.slice(..jpeg.len() - 1))
+                .unwrap_err(),
+            AttachmentError::InvalidContent
+        );
+        assert_eq!(
+            store
+                .ingest(
+                    "short.gif",
+                    "image/gif",
+                    Bytes::from(gif[..gif.len() - 1].to_vec())
+                )
+                .unwrap_err(),
+            AttachmentError::InvalidContent
+        );
+        assert_eq!(
+            store
+                .ingest(
+                    "short.webp",
+                    "image/webp",
+                    Bytes::from(webp[..webp.len() - 1].to_vec())
+                )
+                .unwrap_err(),
+            AttachmentError::InvalidContent
+        );
+    }
+
+    #[test]
+    fn store_and_association_survive_restart_and_corrupt_metadata_is_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new("session-one").unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let reference = store.ingest("alignment.png", "image/png", png()).unwrap();
+        store
+            .associate(&session_id, "entry-one", std::slice::from_ref(&reference))
+            .unwrap();
+        std::fs::write(
+            store
+                .root()
+                .join("metadata")
+                .join(format!("{}.json", "a".repeat(64))),
+            b"{bad",
+        )
+        .unwrap();
+        drop(store);
+
+        let reopened = AttachmentStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.resolve(&reference).unwrap().bytes, png());
+        assert_eq!(
+            reopened.refs_for_entry(&session_id, "entry-one").unwrap(),
+            Some(vec![reference])
+        );
+    }
+
+    #[test]
+    fn digest_recovers_missing_association_and_corrupt_blob_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new("session-recovery").unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let reference = store.ingest("alignment.png", "image/png", png()).unwrap();
+        let fingerprint = AttachmentFingerprint {
+            media_type: reference.media_type.clone(),
+            byte_len: reference.byte_len,
+            sha256: sha256_hex(png()),
+        };
+        drop(store);
+
+        let reopened = AttachmentStore::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened
+                .recover_association(&session_id, "entry-recovered", &[fingerprint])
+                .unwrap(),
+            Some(vec![reference.clone()])
+        );
+        let blob = reopened
+            .root()
+            .join("blobs")
+            .join(format!("{}.blob", reference.handle));
+        let mut corrupted = png().to_vec();
+        corrupted[20] ^= 1;
+        std::fs::write(blob, corrupted).unwrap();
+        assert_eq!(
+            reopened.resolve(&reference).unwrap_err(),
+            AttachmentError::Storage
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_permissions_and_symlink_store_rejection() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let reference = store.ingest("alignment.png", "image/png", png()).unwrap();
+        let root_mode = store.root().metadata().unwrap().permissions().mode() & 0o777;
+        let blob_mode = store
+            .root()
+            .join("blobs")
+            .join(format!("{}.blob", reference.handle))
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(root_mode, 0o700);
+        assert_eq!(blob_mode, 0o600);
+
+        let other = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        symlink(other.path(), state.path().join("attachments")).unwrap();
+        assert!(AttachmentStore::open(state.path()).is_err());
+    }
+}

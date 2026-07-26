@@ -7,15 +7,15 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use ygg_serve_backend::{
-    ActorOwnerState, AttentionState, AuthorityProfile, CatalogCursor, ColorScheme, CommandId,
-    ContextUsage, DeviceId, DurableEntryId, EventEnvelope, EventPayload, HostAckDisposition,
-    HostBootstrap, HostCapabilities, HostCommand, HostCommandAck, HostCommandEnvelope,
-    HostDescriptor, HostId, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
-    ModelSelection, ModelSummary, ProjectId, ProjectSummary, PromptInput, ProtocolValidation,
-    SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId, SessionItem,
-    SessionLiveState, SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity, ThemeDto, ThemeId,
-    ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TurnId,
-    UsageSnapshot,
+    ActorOwnerState, AttachmentPolicy, AttentionState, AuthorityProfile, CatalogCursor,
+    ColorScheme, CommandId, ContextUsage, DeviceId, DurableEntryId, EventEnvelope, EventPayload,
+    HostAckDisposition, HostBootstrap, HostCapabilities, HostCommand, HostCommandAck,
+    HostCommandEnvelope, HostDescriptor, HostId, InputModality, ItemDelta, ItemId, ItemLifecycle,
+    ItemPayload, ModelSelection, ModelSummary, ProjectId, ProjectSummary, PromptInput,
+    ProtocolValidation, SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId,
+    SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity,
+    ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
+    TurnId, UsageSnapshot,
 };
 
 fn model_selection() -> ModelSelection {
@@ -123,6 +123,7 @@ fn bootstrap() -> HostBootstrap {
             concurrent_sessions: true,
             opaque_resources: true,
             attachments: true,
+            attachment_policy: Some(AttachmentPolicy::image_defaults()),
             previews: true,
             connected_devices: false,
             lan_clients: false,
