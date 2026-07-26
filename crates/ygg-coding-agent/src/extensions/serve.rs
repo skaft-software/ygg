@@ -26,12 +26,13 @@ use ygg_serve_backend::{
     CreateSessionRequest, DriverCommandOutcome, DurableEntryId, EventPayload, HostCapabilities,
     HostDescriptor, HostId, HostService, InputModality, ItemDelta, ItemId, ItemLifecycle,
     ItemPayload, LoopbackConfig, LoopbackServer, ModelSelection, ModelSummary, PendingRequest,
-    ProjectId, ProjectSummary, ProtocolValidation, RequestAnswer, RequestId, RequestKind,
-    RequestState, RunId, SemanticRole, ServiceError, SessionCommand, SessionCursor, SessionDriver,
-    SessionId, SessionItem, SessionLiveState, SessionSeed, SessionSnapshot, SessionSummary,
-    SessionSupervisor, StoredAttachment, SupervisorConfig, ThemeColor, ThemeDensity, ThemeDto,
-    ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
-    TimestampedEvent, TurnId, UsageSnapshot, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
+    ProjectId, ProjectSummary, PromptInput, ProtocolValidation, RequestAnswer, RequestId,
+    RequestKind, RequestState, RunId, SemanticRole, ServiceError, SessionCommand, SessionCursor,
+    SessionDriver, SessionId, SessionItem, SessionLiveState, SessionSeed, SessionSnapshot,
+    SessionSummary, SessionSupervisor, StoredAttachment, SupervisorConfig, ThemeColor,
+    ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass,
+    ThemeTypography, TimestampedEvent, TurnId, UsageSnapshot, MAX_ITEM_TEXT_BYTES,
+    MAX_PROMPT_BYTES,
 };
 
 use crate::app::bootstrap::{build_app, LaunchSelection, SessionSelection};
@@ -306,12 +307,14 @@ impl YggHost {
         let seed = seed_from_session(
             &session,
             session_id.clone(),
-            Some(self.project_id.clone()),
-            selection.clone(),
-            AuthorityProfile::FullAccess,
-            generation,
-            session_meta_for_id(&self.sessions, session_id),
-            self.attachments.as_ref(),
+            SessionSeedOptions {
+                project_id: Some(self.project_id.clone()),
+                model: selection.clone(),
+                authority: AuthorityProfile::FullAccess,
+                generation,
+                meta: session_meta_for_id(&self.sessions, session_id),
+                attachment_store: self.attachments.as_ref(),
+            },
         )?;
         let reasoning =
             config::parse_reasoning(&selection.reasoning).map_err(|_| ServiceError::InvalidSeed)?;
@@ -635,8 +638,7 @@ async fn run_worker(
                 plan.launch.session = SessionSelection::OpenExisting(session_path);
                 match start_and_drive_run(
                     &mut owned_app,
-                    input.text,
-                    input.attachments,
+                    input,
                     &plan,
                     &mut projection,
                     &mut commands,
@@ -868,19 +870,27 @@ fn resolve_attachment_media(
     plan: &WorkerPlan,
     references: &[AttachmentRef],
 ) -> Result<Vec<Media>, ServiceError> {
-    if references.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !app
+    let supports_images = app
         .model
         .spec
         .capabilities
         .input_modalities
-        .contains(Modality::Image)
-    {
+        .contains(Modality::Image);
+    resolve_stored_media(supports_images, plan.attachments.as_ref(), references)
+}
+
+fn resolve_stored_media(
+    supports_images: bool,
+    store: Option<&AttachmentStore>,
+    references: &[AttachmentRef],
+) -> Result<Vec<Media>, ServiceError> {
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !supports_images {
         return Err(ServiceError::InvalidBoundary);
     }
-    let store = plan.attachments.as_ref().ok_or(ServiceError::Unavailable)?;
+    let store = store.ok_or(ServiceError::Unavailable)?;
     let resolved = store
         .resolve_many(references)
         .map_err(attachment_service_error)?;
@@ -906,31 +916,16 @@ fn resolve_control_input(
     if !text.is_empty() {
         parts.push(InputPart::Text(text));
     }
-    if !references.is_empty() {
-        let supports_images = plan
-            .available_models
-            .iter()
-            .find(|summary| summary.id == plan.launch.model.0)
-            .is_some_and(|summary| summary.input_modalities.contains(&InputModality::Image));
-        if !supports_images {
-            return Err(ServiceError::InvalidBoundary);
-        }
-        let store = plan.attachments.as_ref().ok_or(ServiceError::Unavailable)?;
-        for attachment in store
-            .resolve_many(references)
-            .map_err(attachment_service_error)?
-        {
-            let media_type = attachment
-                .reference
-                .media_type
-                .parse()
-                .map_err(|_| ServiceError::InvalidBoundary)?;
-            parts.push(InputPart::Media(Media::image_bytes(
-                attachment.bytes,
-                media_type,
-            )));
-        }
-    }
+    let supports_images = plan
+        .available_models
+        .iter()
+        .find(|summary| summary.id == plan.launch.model.0)
+        .is_some_and(|summary| summary.input_modalities.contains(&InputModality::Image));
+    parts.extend(
+        resolve_stored_media(supports_images, plan.attachments.as_ref(), references)?
+            .into_iter()
+            .map(InputPart::Media),
+    );
     Ok(UserInput::from(parts))
 }
 
@@ -949,8 +944,7 @@ fn attachment_service_error(error: AttachmentError) -> ServiceError {
 
 async fn start_and_drive_run(
     app: &mut App,
-    prompt: String,
-    attachments: Vec<AttachmentRef>,
+    input: PromptInput,
     plan: &WorkerPlan,
     projection: &mut ProjectionState,
     commands: &mut mpsc::Receiver<WorkerCommand>,
@@ -963,6 +957,10 @@ async fn start_and_drive_run(
             return Ok(());
         }
     }
+    let PromptInput {
+        text: prompt,
+        attachments,
+    } = input;
     let media = match resolve_attachment_media(app, plan, &attachments) {
         Ok(media) => media,
         Err(error) => {
@@ -2027,16 +2025,28 @@ fn item_id_for_entry(entry: &Entry, part: usize) -> Result<ItemId, ServiceError>
         .map_err(|_| ServiceError::InvalidSeed)
 }
 
-fn seed_from_session(
-    session: &Session,
-    session_id: SessionId,
+struct SessionSeedOptions<'a> {
     project_id: Option<ProjectId>,
     model: ModelSelection,
     authority: AuthorityProfile,
     generation: u64,
     meta: Option<SessionMeta>,
-    attachment_store: Option<&AttachmentStore>,
+    attachment_store: Option<&'a AttachmentStore>,
+}
+
+fn seed_from_session(
+    session: &Session,
+    session_id: SessionId,
+    options: SessionSeedOptions<'_>,
 ) -> Result<SessionSeed, ServiceError> {
+    let SessionSeedOptions {
+        project_id,
+        model,
+        authority,
+        generation,
+        meta,
+        attachment_store,
+    } = options;
     let mut chain = Vec::new();
     let mut cursor = session.head_ref();
     while let Some(id) = cursor {
@@ -2677,6 +2687,19 @@ fn system_time_ms(time: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ygg_ai::UserMessage;
+
+    fn png() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"IEND");
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
 
     #[test]
     fn serve_host_lock_is_exclusive_for_the_session_root_lifetime() {
@@ -2696,5 +2719,91 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         symlink(target.path(), directory.path().join(".serve")).unwrap();
         assert!(secure_serve_state_dir(directory.path()).is_err());
+    }
+
+    #[test]
+    fn stored_attachments_cross_the_agent_boundary_as_native_inline_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let image = png();
+        let reference = store
+            .ingest(
+                "alignment.png",
+                "image/png",
+                bytes::Bytes::from(image.clone()),
+            )
+            .unwrap();
+
+        let media = resolve_stored_media(true, Some(&store), &[reference]).unwrap();
+        assert_eq!(media.len(), 1);
+        let Media::Image(image_media) = &media[0] else {
+            panic!("image attachment was not represented as image media");
+        };
+        assert_eq!(
+            image_media.media_type.as_ref().map(mime::Mime::essence_str),
+            Some("image/png")
+        );
+        assert!(
+            matches!(&image_media.source, ImageSource::Inline(bytes) if bytes.as_ref() == image)
+        );
+    }
+
+    #[test]
+    fn unsupported_or_tampered_attachments_fail_before_agent_input_is_built() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let reference = store
+            .ingest("alignment.png", "image/png", bytes::Bytes::from(png()))
+            .unwrap();
+
+        assert_eq!(
+            resolve_stored_media(false, Some(&store), std::slice::from_ref(&reference))
+                .unwrap_err(),
+            ServiceError::InvalidBoundary
+        );
+        let mut tampered = reference;
+        tampered.byte_len += 1;
+        assert_eq!(
+            resolve_stored_media(true, Some(&store), &[tampered]).unwrap_err(),
+            ServiceError::InvalidBoundary
+        );
+    }
+
+    #[test]
+    fn durable_projection_recovers_attachment_refs_from_native_media() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let image = png();
+        let reference = store
+            .ingest(
+                "alignment.png",
+                "image/png",
+                bytes::Bytes::from(image.clone()),
+            )
+            .unwrap();
+        let entry = Entry {
+            id: ygg_agent::EntryId("entry-1".into()),
+            parent: None,
+            metadata: None,
+            value: EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Media(Media::image_bytes(
+                    bytes::Bytes::from(image),
+                    "image/png".parse().unwrap(),
+                ))],
+            })),
+        };
+        let session_id = SessionId::new("session-1").unwrap();
+        let mut pending = VecDeque::from([vec![reference.clone()]]);
+
+        let associated =
+            attachment_refs_for_entry(&entry, Some(&store), &session_id, &mut pending).unwrap();
+        assert_eq!(associated, vec![reference.clone()]);
+        assert!(pending.is_empty());
+
+        let mut after_restart = VecDeque::new();
+        let restored =
+            attachment_refs_for_entry(&entry, Some(&store), &session_id, &mut after_restart)
+                .unwrap();
+        assert_eq!(restored, vec![reference]);
     }
 }

@@ -1241,13 +1241,13 @@ mod tests {
         }
     }
 
-    async fn request(address: SocketAddr, request: String) -> String {
+    async fn request_bytes(address: SocketAddr, request: Vec<u8>) -> Vec<u8> {
         tokio::task::spawn_blocking(move || {
             let mut stream = TcpStream::connect(address).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
-            stream.write_all(request.as_bytes()).unwrap();
+            stream.write_all(&request).unwrap();
             let mut response = Vec::new();
             let mut buffer = [0u8; 4096];
             loop {
@@ -1255,15 +1255,20 @@ mod tests {
                     Ok(0) => break,
                     Ok(read) => {
                         response.extend_from_slice(&buffer[..read]);
-                        let text = String::from_utf8_lossy(&response);
-                        if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                        if let Some(header_end) =
+                            response.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&response[..header_end]);
                             let content_length = headers.lines().find_map(|line| {
                                 let (name, value) = line.split_once(':')?;
                                 name.eq_ignore_ascii_case("content-length")
                                     .then(|| value.trim().parse::<usize>().ok())
                                     .flatten()
                             });
-                            if content_length.is_some_and(|length| body.len() >= length) {
+                            if content_length.is_some_and(|length| {
+                                response.len()
+                                    >= header_end.saturating_add(4).saturating_add(length)
+                            }) {
                                 break;
                             }
                         }
@@ -1279,10 +1284,14 @@ mod tests {
                     Err(error) => panic!("response read failed: {error}"),
                 }
             }
-            String::from_utf8(response).unwrap()
+            response
         })
         .await
         .unwrap()
+    }
+
+    async fn request(address: SocketAddr, request: String) -> String {
+        String::from_utf8(request_bytes(address, request.into_bytes()).await).unwrap()
     }
 
     fn get_request(address: SocketAddr, path: &str) -> String {
@@ -1315,6 +1324,57 @@ mod tests {
     fn response_json(response: &str) -> serde_json::Value {
         let (_, body) = response.split_once("\r\n\r\n").unwrap();
         serde_json::from_str(body).unwrap()
+    }
+
+    fn png() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"IEND");
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
+
+    fn upload_request(
+        address: SocketAddr,
+        cookie: Option<&str>,
+        origin: Option<&str>,
+        media_type: &str,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut request = format!(
+            "POST /api/v1/attachments?displayName=alignment.png HTTP/1.1\r\nHost: {address}\r\nContent-Type: {media_type}\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if let Some(cookie) = cookie {
+            request.push_str(&format!("Cookie: {cookie}\r\n"));
+        }
+        if let Some(origin) = origin {
+            request.push_str(&format!("Origin: {origin}\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        let mut bytes = request.into_bytes();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn binary_response_header<'a>(response: &'a [u8], name: &str) -> Option<&'a str> {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")?;
+        let headers = std::str::from_utf8(&response[..header_end]).ok()?;
+        response_header(headers, name)
+    }
+
+    fn binary_response_body(response: &[u8]) -> &[u8] {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+        &response[header_end + 4..]
     }
 
     #[test]
@@ -1502,6 +1562,159 @@ mod tests {
         );
         let source_map = request(address, get_request(address, "/assets/app.js.map")).await;
         assert!(source_map.starts_with("HTTP/1.1 404"));
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attachment_transport_is_authenticated_bounded_and_path_free() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let server = LoopbackServer::start(
+            supervisor,
+            LoopbackConfig {
+                port: 0,
+                web_root: None,
+            },
+        )
+        .await
+        .unwrap();
+        let address = server.address();
+        let image = png();
+
+        let unauthenticated = request_bytes(
+            address,
+            upload_request(address, None, None, "image/png", &image),
+        )
+        .await;
+        assert!(unauthenticated.starts_with(b"HTTP/1.1 401"));
+
+        let exchanged = request(address, exchange_request(address, &server.launch_token)).await;
+        let cookie = response_header(&exchanged, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let cross_origin = request_bytes(
+            address,
+            upload_request(
+                address,
+                Some(cookie),
+                Some("https://attacker.example"),
+                "image/png",
+                &image,
+            ),
+        )
+        .await;
+        assert!(cross_origin.starts_with(b"HTTP/1.1 403"));
+
+        let declared_oversize = request(
+            address,
+            format!(
+                "POST /api/v1/attachments?displayName=large.png HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_ATTACHMENT_FILE_BYTES + 1
+            ),
+        )
+        .await;
+        assert!(declared_oversize.starts_with("HTTP/1.1 413"));
+
+        let spoof = request_bytes(
+            address,
+            upload_request(address, Some(cookie), None, "image/jpeg", &image),
+        )
+        .await;
+        assert!(spoof.starts_with(b"HTTP/1.1 400"));
+
+        let uploaded = request_bytes(
+            address,
+            upload_request(address, Some(cookie), None, "image/png", &image),
+        )
+        .await;
+        assert!(uploaded.starts_with(b"HTTP/1.1 200"));
+        let uploaded_text = String::from_utf8(uploaded).unwrap();
+        let uploaded_json = response_json(&uploaded_text);
+        let fields = uploaded_json.as_object().unwrap();
+        assert_eq!(fields.len(), 4);
+        for expected in ["handle", "displayName", "mediaType", "byteLen"] {
+            assert!(fields.contains_key(expected));
+        }
+        let reference: AttachmentRef = serde_json::from_value(uploaded_json).unwrap();
+        assert_eq!(reference.display_name, "alignment.png");
+        assert_eq!(reference.media_type, "image/png");
+        assert_eq!(reference.byte_len, image.len() as u64);
+        assert_eq!(reference.handle.len(), 64);
+        assert!(reference
+            .handle
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+
+        let unauthenticated_content = request(
+            address,
+            get_request(
+                address,
+                &format!("/api/v1/attachments/{}", reference.handle),
+            ),
+        )
+        .await;
+        assert!(unauthenticated_content.starts_with("HTTP/1.1 401"));
+
+        let content = request_bytes(
+            address,
+            authenticated_get_request(
+                address,
+                &format!("/api/v1/attachments/{}", reference.handle),
+                cookie,
+            )
+            .into_bytes(),
+        )
+        .await;
+        assert!(content.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(
+            binary_response_header(&content, "content-type"),
+            Some("image/png")
+        );
+        assert_eq!(
+            binary_response_header(&content, "x-content-type-options"),
+            Some("nosniff")
+        );
+        let expected_content_length = image.len().to_string();
+        assert_eq!(
+            binary_response_header(&content, "content-length"),
+            Some(expected_content_length.as_str())
+        );
+        assert_eq!(
+            binary_response_header(&content, "content-disposition"),
+            Some("inline; filename=\"alignment.png\"")
+        );
+        assert_eq!(
+            binary_response_header(&content, "cache-control"),
+            Some("private, max-age=31536000, immutable")
+        );
+        let etag = binary_response_header(&content, "etag").unwrap();
+        assert_eq!(etag.len(), 66);
+        assert!(etag.starts_with('"') && etag.ends_with('"'));
+        assert!(etag[1..65].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(binary_response_body(&content), image);
+
+        let unknown = request(
+            address,
+            authenticated_get_request(
+                address,
+                &format!("/api/v1/attachments/{}", "a".repeat(64)),
+                cookie,
+            ),
+        )
+        .await;
+        assert!(unknown.starts_with("HTTP/1.1 404"));
+
+        let mut chunked = format!(
+            "POST /api/v1/attachments?displayName=chunked.png HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+            MAX_ATTACHMENT_FILE_BYTES + 1
+        )
+        .into_bytes();
+        chunked.extend(std::iter::repeat_n(0u8, MAX_ATTACHMENT_FILE_BYTES + 1));
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        let chunked_oversize = request_bytes(address, chunked).await;
+        assert!(chunked_oversize.starts_with(b"HTTP/1.1 413"));
         server.shutdown().await.unwrap();
     }
 }
