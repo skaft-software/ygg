@@ -175,7 +175,9 @@ impl AttachmentStore {
 
         let mut index = StoreIndex::default();
         load_metadata(&metadata, &blobs, &mut index)?;
+        cleanup_unindexed_metadata(&metadata, &blobs, &index);
         load_associations(&associations, &mut index)?;
+        cleanup_unindexed_associations(&associations, &index);
         Ok(Self {
             inner: Arc::new(StoreInner {
                 #[cfg(test)]
@@ -692,6 +694,40 @@ fn load_associations(
     Ok(())
 }
 
+fn cleanup_unindexed_metadata(metadata_dir: &Path, blobs_dir: &Path, index: &StoreIndex) {
+    cleanup_handle_files(metadata_dir, ".json", |handle| {
+        index.metadata.contains_key(handle)
+    });
+    cleanup_handle_files(blobs_dir, ".blob", |handle| {
+        index.metadata.contains_key(handle)
+    });
+}
+
+fn cleanup_handle_files(directory: &Path, suffix: &str, keep: impl Fn(&str) -> bool) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(handle) = name.strip_suffix(suffix) else {
+            continue;
+        };
+        if valid_handle(handle) && !keep(handle) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn cleanup_unindexed_associations(directory: &Path, index: &StoreIndex) {
+    let expected = index
+        .associations
+        .keys()
+        .map(|key| sha256_hex(format!("{}\0{}", key.session_id, key.durable_entry_id).as_bytes()))
+        .collect::<BTreeSet<_>>();
+    cleanup_handle_files(directory, ".json", |handle| expected.contains(handle));
+}
+
 fn valid_stored_metadata(metadata: &StoredMetadata, expected_handle: &str) -> bool {
     metadata.version == METADATA_VERSION
         && metadata.handle == expected_handle
@@ -955,6 +991,31 @@ mod tests {
             reopened.resolve(&reference).unwrap_err(),
             AttachmentError::Storage
         );
+    }
+
+    #[test]
+    fn startup_removes_only_unusable_orphan_store_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let reference = store.ingest("alignment.png", "image/png", png()).unwrap();
+        let root = store.root().to_owned();
+        let orphan_blob = root.join("blobs").join(format!("{}.blob", "b".repeat(64)));
+        let orphan_metadata = root
+            .join("metadata")
+            .join(format!("{}.json", "c".repeat(64)));
+        let orphan_association = root
+            .join("associations")
+            .join(format!("{}.json", "d".repeat(64)));
+        std::fs::write(&orphan_blob, png()).unwrap();
+        std::fs::write(&orphan_metadata, b"{bad").unwrap();
+        std::fs::write(&orphan_association, b"{bad").unwrap();
+        drop(store);
+
+        let reopened = AttachmentStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.resolve(&reference).unwrap().bytes, png());
+        assert!(!orphan_blob.exists());
+        assert!(!orphan_metadata.exists());
+        assert!(!orphan_association.exists());
     }
 
     #[cfg(unix)]

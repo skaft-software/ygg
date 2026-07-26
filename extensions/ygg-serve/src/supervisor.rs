@@ -478,10 +478,11 @@ impl<H: HostService> SessionSupervisor<H> {
         if handle.session_id() != &session_id {
             return Err(SupervisorError::IdentityMismatch);
         }
+        let summary = handle.view().summary;
         self.observe_actor(&handle);
         state.actors.insert(session_id, handle.clone());
         drop(state);
-        self.bump_catalog();
+        self.publish_catalog(summary);
         Ok(handle)
     }
 
@@ -509,10 +510,11 @@ impl<H: HostService> SessionSupervisor<H> {
         if handle.session_id() != session_id {
             return Err(SupervisorError::IdentityMismatch);
         }
+        let summary = handle.view().summary;
         self.observe_actor(&handle);
         state.actors.insert(session_id.clone(), handle.clone());
         drop(state);
-        self.bump_catalog();
+        self.publish_catalog(summary);
         Ok(handle)
     }
 
@@ -654,11 +656,18 @@ impl<H: HostService> SessionSupervisor<H> {
     fn observe_actor(&self, handle: &SessionActorHandle) {
         let mut views = handle.subscribe();
         let cursor = Arc::clone(&self.catalog_cursor);
+        let sender = self.host_events.clone();
+        let order = Arc::clone(&self.host_event_order);
         tokio::spawn(async move {
             while views.changed().await.is_ok() {
-                let _ = cursor.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                    value.checked_add(1)
-                });
+                let summary = views.borrow_and_update().summary.clone();
+                let Some(catalog_cursor) = advance_catalog(&cursor) else {
+                    break;
+                };
+                let Some(streamed) = ordered_catalog_event(&order, catalog_cursor, summary) else {
+                    break;
+                };
+                let _ = sender.send(streamed);
             }
         });
 
@@ -668,13 +677,37 @@ impl<H: HostService> SessionSupervisor<H> {
         tokio::spawn(async move { forward_actor_events(&mut events, &sender, &order).await });
     }
 
-    fn bump_catalog(&self) {
-        let _ = self
-            .catalog_cursor
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_add(1)
-            });
+    fn publish_catalog(&self, summary: crate::SessionSummary) {
+        let Some(catalog_cursor) = advance_catalog(&self.catalog_cursor) else {
+            return;
+        };
+        let Some(streamed) = ordered_catalog_event(&self.host_event_order, catalog_cursor, summary)
+        else {
+            return;
+        };
+        let _ = self.host_events.send(streamed);
     }
+}
+
+fn advance_catalog(cursor: &AtomicU64) -> Option<CatalogCursor> {
+    cursor
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .ok()
+        .and_then(|previous| previous.checked_add(1))
+        .map(CatalogCursor)
+}
+
+fn ordered_catalog_event(
+    order: &std::sync::Mutex<u64>,
+    catalog_cursor: CatalogCursor,
+    summary: crate::SessionSummary,
+) -> Option<HostStreamEvent> {
+    let mut sequence = order.lock().ok()?;
+    let next = sequence.checked_add(1)?;
+    *sequence = next;
+    Some(HostStreamEvent::catalog(next, catalog_cursor, summary))
 }
 
 async fn forward_actor_events(
@@ -1092,6 +1125,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_sessions_publish_complete_catalog_summaries() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = SessionSupervisor::new(host, SupervisorConfig::default());
+        let mut events = supervisor.subscribe_events();
+
+        let handle = supervisor.create_fresh_session(None).await.unwrap();
+        let streamed = events.recv().await.unwrap();
+        let catalog = streamed.catalog.as_ref().expect("catalog change");
+
+        assert!(streamed.event.is_none());
+        assert_eq!(catalog.catalog_cursor, supervisor.catalog_cursor());
+        assert_eq!(catalog.summary.id, *handle.session_id());
+        assert!(catalog.summary.provisional);
+        streamed.validate().unwrap();
+    }
+
+    #[tokio::test]
     async fn actor_fan_in_preserves_a_detectable_session_cursor_gap_after_lag() {
         let session_id = SessionId::new("session-lag").unwrap();
         let (actor_sender, _) = broadcast::channel(2);
@@ -1119,8 +1169,8 @@ mod tests {
         forward_actor_events(&mut actor_receiver, &host_sender, &order).await;
         let first = host_receiver.recv().await.unwrap();
         let second = host_receiver.recv().await.unwrap();
-        assert_eq!(first.event.cursor.sequence, 2);
-        assert_eq!(second.event.cursor.sequence, 3);
+        assert_eq!(first.event.unwrap().cursor.sequence, 2);
+        assert_eq!(second.event.unwrap().cursor.sequence, 3);
         assert_eq!(first.host_sequence, 1);
         assert_eq!(second.host_sequence, 2);
     }

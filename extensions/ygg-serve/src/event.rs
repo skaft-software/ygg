@@ -7,9 +7,9 @@ use crate::bounds::{
     MAX_EVENT_BYTES, MAX_PUBLIC_TEXT_BYTES,
 };
 use crate::{
-    ArtifactRef, AuthorityProfile, DurableEntryId, ItemId, ItemLifecycle, ModelSelection,
-    PendingRequest, RunId, SessionCursor, SessionId, SessionItem, SessionLiveState,
-    SessionSnapshot, SourceRef, UsageSnapshot, PROTOCOL_VERSION,
+    ArtifactRef, AuthorityProfile, CatalogCursor, DurableEntryId, ItemId, ItemLifecycle,
+    ModelSelection, PendingRequest, RunId, SessionCursor, SessionId, SessionItem, SessionLiveState,
+    SessionSnapshot, SessionSummary, SourceRef, UsageSnapshot, PROTOCOL_VERSION,
 };
 
 /// Typed provisional item delta.
@@ -178,11 +178,21 @@ impl EventEnvelope {
     }
 }
 
+/// One catalog summary change in the host-global live stream.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostCatalogChange {
+    /// Monotonic catalog revision after this change.
+    pub catalog_cursor: CatalogCursor,
+    /// Complete authoritative sidebar summary.
+    pub summary: SessionSummary,
+}
+
 /// One event in the host-global live stream.
 ///
 /// Session cursors remain the authority for replay. `host_sequence` only
 /// provides deterministic ordering across concurrently running session
-/// actors on one live connection.
+/// actors and catalog changes on one live connection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostStreamEvent {
@@ -190,8 +200,12 @@ pub struct HostStreamEvent {
     pub protocol: u16,
     /// Monotonic sequence for this running host process.
     pub host_sequence: u64,
-    /// Exact session event.
-    pub event: EventEnvelope,
+    /// Exact session event, mutually exclusive with `catalog`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<EventEnvelope>,
+    /// Complete changed catalog summary, mutually exclusive with `event`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<HostCatalogChange>,
 }
 
 impl HostStreamEvent {
@@ -200,7 +214,25 @@ impl HostStreamEvent {
         Self {
             protocol: PROTOCOL_VERSION,
             host_sequence,
-            event,
+            event: Some(event),
+            catalog: None,
+        }
+    }
+
+    /// Wraps one complete catalog summary with a live host sequence.
+    pub fn catalog(
+        host_sequence: u64,
+        catalog_cursor: CatalogCursor,
+        summary: SessionSummary,
+    ) -> Self {
+        Self {
+            protocol: PROTOCOL_VERSION,
+            host_sequence,
+            event: None,
+            catalog: Some(HostCatalogChange {
+                catalog_cursor,
+                summary,
+            }),
         }
     }
 }
@@ -348,7 +380,24 @@ impl ProtocolValidation for HostStreamEvent {
                 "must be non-zero",
             ));
         }
-        self.event.validate()?;
+        match (&self.event, &self.catalog) {
+            (Some(event), None) => event.validate()?,
+            (None, Some(catalog)) => {
+                if catalog.catalog_cursor.0 == 0 {
+                    return Err(ValidationError::new(
+                        "host_stream.catalog.catalog_cursor",
+                        "must be non-zero",
+                    ));
+                }
+                catalog.summary.validate()?;
+            }
+            _ => {
+                return Err(ValidationError::new(
+                    "host_stream",
+                    "requires exactly one event or catalog change",
+                ));
+            }
+        }
         validate_serialized_size("host_stream", self, MAX_EVENT_BYTES)
     }
 }

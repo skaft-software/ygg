@@ -40,8 +40,8 @@ pub use command::{
 };
 pub use error::{ErrorCode, SanitizedError};
 pub use event::{
-    EventEnvelope, EventPayload, HostStreamEvent, ItemDelta, ReplayGap, ReplayResponse,
-    TimestampedEvent,
+    EventEnvelope, EventPayload, HostCatalogChange, HostStreamEvent, ItemDelta, ReplayGap,
+    ReplayResponse, TimestampedEvent,
 };
 pub use ids::{
     ArtifactId, CommandId, DeviceId, DurableEntryId, HostId, ItemId, ProjectId, RequestId, RunId,
