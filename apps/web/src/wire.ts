@@ -1261,6 +1261,20 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
     wire.authorityCeiling,
     "hostBootstrap.authorityCeiling",
   );
+  const themes = array(wire.themes, "hostBootstrap.themes").map(
+    (theme, index) =>
+      projectThemeOption(theme, `hostBootstrap.themes[${index}]`),
+  );
+  const selectedThemeId = string(
+    wire.selectedThemeId,
+    "hostBootstrap.selectedThemeId",
+  );
+  if (!themes.some((theme) => theme.id === selectedThemeId)) {
+    throw new WireContractError(
+      "hostBootstrap.selectedThemeId",
+      "must identify an advertised theme",
+    );
+  }
   const bootstrap: HostBootstrap = {
     protocolVersion: PROTOCOL_VERSION,
     host: {
@@ -1277,13 +1291,8 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
     sessions,
     models,
     authorityProfiles,
-    themes: array(wire.themes, "hostBootstrap.themes").map((theme, index) =>
-      projectThemeOption(theme, `hostBootstrap.themes[${index}]`),
-    ),
-    selectedThemeId: string(
-      wire.selectedThemeId,
-      "hostBootstrap.selectedThemeId",
-    ),
+    themes,
+    selectedThemeId,
     devices: [],
     capabilities: {
       attachments: boolean(
@@ -1294,6 +1303,10 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
         capabilities.previews,
         "hostBootstrap.capabilities.previews",
       ),
+      resources: boolean(
+        capabilities.opaqueResources,
+        "hostBootstrap.capabilities.opaqueResources",
+      ),
       connectedDevices: boolean(
         capabilities.connectedDevices,
         "hostBootstrap.capabilities.connectedDevices",
@@ -1302,6 +1315,15 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
         capabilities.lanClients,
         "hostBootstrap.capabilities.lanClients",
       ),
+      // These describe UI paths that require more than a host capability bit.
+      // The HTTP service currently has no ingest, pairing, metadata, or theme
+      // mutation endpoint, so live mode must not advertise fixture behavior.
+      attachmentIngest: false,
+      pairDevices: false,
+      sessionMetadata: false,
+      themeSelection: themes.length > 1,
+      steer: true,
+      followUp: true,
     },
   };
   return { bootstrap, selectedSession };
@@ -1994,11 +2016,21 @@ export function encodeClientCommand(
       },
     };
   }
-  if (command.type === "session.submit") {
+  if (
+    command.type === "session.submit" ||
+    command.type === "session.steer" ||
+    command.type === "session.followUp"
+  ) {
+    const type =
+      command.type === "session.submit"
+        ? "session.submitPrompt"
+        : command.type === "session.steer"
+          ? "session.steer"
+          : "session.followUp";
     return sessionEnvelope(
       command,
       {
-        type: "session.submitPrompt",
+        type,
         data: {
           input: {
             text: command.prompt,

@@ -1,5 +1,4 @@
 import {
-  ChevronDown,
   CircleUserRound,
   Laptop,
   Menu,
@@ -10,7 +9,12 @@ import {
   Smartphone,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import yggIconUrl from "../../../../docs/assets/ygg-braille.svg";
 import type { SessionStatus, SessionSummary } from "../protocol";
 
@@ -21,6 +25,7 @@ interface SidebarProps {
   surface: "session" | "settings" | "devices";
   hostName: string;
   devicesAvailable: boolean;
+  onRestoreFocus: () => void;
   onClose: () => void;
   onNewSession: () => void;
   onSelectSession: (sessionId: string) => void;
@@ -114,6 +119,7 @@ export function Sidebar({
   surface,
   hostName,
   devicesAvailable,
+  onRestoreFocus,
   onClose,
   onNewSession,
   onSelectSession,
@@ -130,7 +136,7 @@ export function Sidebar({
   useEffect(() => {
     if (!open || !window.matchMedia("(max-width: 760px)").matches) return;
     const sidebar = sidebarRef.current;
-    const restoreTarget =
+    const originalTarget =
       document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
@@ -139,7 +145,10 @@ export function Sidebar({
         sidebar?.querySelectorAll<HTMLElement>(
           'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
         ) ?? [],
-      );
+      ).filter((element) => {
+        const style = window.getComputedStyle(element);
+        return style.display !== "none" && style.visibility !== "hidden";
+      });
     window.requestAnimationFrame(() => focusable()[0]?.focus());
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key === "Escape") {
@@ -163,9 +172,16 @@ export function Sidebar({
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
-      restoreTarget?.focus();
+      onRestoreFocus();
+      if (
+        document.activeElement === document.body &&
+        originalTarget &&
+        !originalTarget.closest("[inert]")
+      ) {
+        originalTarget.focus();
+      }
     };
-  }, [open]);
+  }, [onRestoreFocus, open]);
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const visibleSessions = useMemo(
     () =>
@@ -226,9 +242,6 @@ export function Sidebar({
             <strong>ygg</strong>
             <span>Local agent</span>
           </div>
-          <button className="icon-button" aria-label="Open Ygg menu">
-            <ChevronDown aria-hidden="true" />
-          </button>
         </div>
 
         <nav className="primary-navigation" aria-label="Primary">

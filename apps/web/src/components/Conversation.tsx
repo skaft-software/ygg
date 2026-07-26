@@ -46,7 +46,11 @@ import type {
 interface ConversationProps {
   session: SessionSnapshot;
   bootstrap: HostBootstrap;
-  onSubmit: (prompt: string, attachments: AttachmentRef[]) => Promise<void>;
+  onSubmit: (
+    prompt: string,
+    attachments: AttachmentRef[],
+    activeDelivery?: "steer" | "followUp",
+  ) => Promise<void>;
   onInterrupt: () => Promise<void>;
   onConfigure: (patch: {
     modelId?: string;
@@ -88,12 +92,22 @@ function ActionCell({
   item,
   onOpenOutput,
   onOpenSource,
+  availableOutputIds,
+  availableSourceIds,
 }: {
   item: ActionItem;
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
+  availableOutputIds: ReadonlySet<string>;
+  availableSourceIds: ReadonlySet<string>;
 }) {
   const isStreaming = item.state === "streaming";
+  const sourceIds = item.sourceIds?.filter((id) =>
+    availableSourceIds.has(id),
+  );
+  const outputIds = item.outputIds?.filter((id) =>
+    availableOutputIds.has(id),
+  );
   return (
     <details className="action-cell" open={isStreaming}>
       <summary>
@@ -123,9 +137,9 @@ function ActionCell({
       </summary>
       <div className="action-detail">
         {item.detail ? <p>{item.detail}</p> : null}
-        {item.sourceIds?.length ? (
+        {sourceIds?.length ? (
           <div className="action-links">
-            {item.sourceIds.map((sourceId) => (
+            {sourceIds.map((sourceId) => (
               <button key={sourceId} onClick={() => onOpenSource(sourceId)}>
                 <File aria-hidden="true" />
                 Open source
@@ -133,9 +147,9 @@ function ActionCell({
             ))}
           </div>
         ) : null}
-        {item.outputIds?.length ? (
+        {outputIds?.length ? (
           <div className="action-links">
-            {item.outputIds.map((outputId) => (
+            {outputIds.map((outputId) => (
               <button key={outputId} onClick={() => onOpenOutput(outputId)}>
                 <ExternalLink aria-hidden="true" />
                 Open output
@@ -153,11 +167,15 @@ function TranscriptItemView({
   onResolveApproval,
   onOpenOutput,
   onOpenSource,
+  availableOutputIds,
+  availableSourceIds,
 }: {
   item: TranscriptItem;
   onResolveApproval: ConversationProps["onResolveApproval"];
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
+  availableOutputIds: ReadonlySet<string>;
+  availableSourceIds: ReadonlySet<string>;
 }) {
   switch (item.kind) {
     case "user_message":
@@ -219,6 +237,8 @@ function TranscriptItemView({
           item={item}
           onOpenOutput={onOpenOutput}
           onOpenSource={onOpenSource}
+          availableOutputIds={availableOutputIds}
+          availableSourceIds={availableSourceIds}
         />
       );
 
@@ -257,14 +277,6 @@ function TranscriptItemView({
                   Deny
                 </button>
                 <button
-                  className="secondary-button"
-                  onClick={() =>
-                    onResolveApproval(item.requestId, "allowed_session")
-                  }
-                >
-                  Allow for session
-                </button>
-                <button
                   className="primary-button"
                   onClick={() =>
                     onResolveApproval(item.requestId, "allowed_once")
@@ -297,7 +309,7 @@ function TranscriptItemView({
   }
 }
 
-function EmptySession() {
+function EmptySession({ attachments }: { attachments: boolean }) {
   return (
     <div className="empty-session">
       <div className="empty-session-mark" aria-hidden="true">
@@ -305,8 +317,10 @@ function EmptySession() {
       </div>
       <h1>What should we work on?</h1>
       <p>
-        Ask a question, attach a file, or describe the result you want. Ygg
-        keeps this session local and inspectable.
+        {attachments
+          ? "Ask a question, attach a file, or describe the result you want."
+          : "Ask a question or describe the result you want."}{" "}
+        Ygg keeps this session local and inspectable.
       </p>
     </div>
   );
@@ -324,6 +338,11 @@ function Composer({
 >) {
   const [prompt, setPrompt] = useState("");
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
+  const [activeDelivery, setActiveDelivery] = useState<
+    "steer" | "followUp"
+  >("followUp");
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const isWorking = session.status === "working";
@@ -336,12 +355,37 @@ function Composer({
   }, [prompt]);
 
   const submit = async () => {
-    if (!prompt.trim() || isWorking) return;
+    if (!prompt.trim() || submitting) return;
+    if (
+      isWorking &&
+      ((activeDelivery === "steer" && !bootstrap.capabilities.steer) ||
+        (activeDelivery === "followUp" && !bootstrap.capabilities.followUp))
+    ) {
+      return;
+    }
     const value = prompt;
     const submittedAttachments = attachments;
-    setPrompt("");
-    setAttachments([]);
-    await onSubmit(value, submittedAttachments);
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      await onSubmit(
+        value,
+        submittedAttachments,
+        isWorking ? activeDelivery : undefined,
+      );
+      setPrompt((current) => (current === value ? "" : current));
+      setAttachments((current) =>
+        current === submittedAttachments ? [] : current,
+      );
+    } catch (error) {
+      setSubmitError(
+        error instanceof Error
+          ? error.message
+          : "Ygg could not send this message.",
+      );
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -395,39 +439,52 @@ function Composer({
           onKeyDown={onKeyDown}
           placeholder={
             isWorking
-              ? "Add a follow-up when Ygg is ready…"
+              ? activeDelivery === "steer"
+                ? "Steer the active run…"
+                : "Queue a follow-up…"
               : "Message ygg"
           }
           rows={1}
           aria-label="Message ygg"
+          aria-describedby={submitError ? "composer-send-error" : undefined}
         />
         <div className="composer-toolbar">
           <div className="composer-leading">
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              hidden
-              onChange={addAttachments}
-            />
-            <button
-              className="composer-icon-button"
-              onClick={() => fileInputRef.current?.click()}
-              aria-label="Attach files"
-              title="Attach files"
-            >
-              <Plus aria-hidden="true" />
-            </button>
+            {bootstrap.capabilities.attachments &&
+            bootstrap.capabilities.attachmentIngest ? (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  hidden
+                  onChange={addAttachments}
+                />
+                <button
+                  className="composer-icon-button"
+                  onClick={() => fileInputRef.current?.click()}
+                  aria-label="Attach files"
+                  title="Attach files"
+                >
+                  <Plus aria-hidden="true" />
+                </button>
+              </>
+            ) : null}
             <label className="composer-select model-select">
               <span className="sr-only">Model</span>
               <select
                 value={session.modelId}
+                disabled={isWorking}
                 onChange={(event) =>
                   void onConfigure({ modelId: event.target.value })
                 }
               >
                 {bootstrap.models.map((model) => (
-                  <option key={model.id} value={model.id}>
+                  <option
+                    key={model.id}
+                    value={model.id}
+                    disabled={!model.available}
+                  >
                     {model.local ? "● " : ""}
                     {model.name}
                   </option>
@@ -439,6 +496,7 @@ function Composer({
               <span className="sr-only">Reasoning effort</span>
               <select
                 value={session.reasoning}
+                disabled={isWorking}
                 onChange={(event) =>
                   void onConfigure({
                     reasoning: event.target.value as ReasoningEffort,
@@ -462,6 +520,7 @@ function Composer({
               <span className="sr-only">Authority</span>
               <select
                 value={session.authority}
+                disabled={isWorking}
                 onChange={(event) =>
                   void onConfigure({
                     authority: event.target.value as AuthorityProfile,
@@ -476,26 +535,60 @@ function Composer({
               </select>
               <ChevronDown aria-hidden="true" />
             </label>
+            {isWorking ? (
+              <label className="composer-select delivery-select">
+                <span className="sr-only">Active run delivery</span>
+                <select
+                  value={activeDelivery}
+                  onChange={(event) =>
+                    setActiveDelivery(
+                      event.target.value as "steer" | "followUp",
+                    )
+                  }
+                >
+                  {bootstrap.capabilities.steer ? (
+                    <option value="steer">Steer now</option>
+                  ) : null}
+                  {bootstrap.capabilities.followUp ? (
+                    <option value="followUp">Follow up</option>
+                  ) : null}
+                </select>
+                <ChevronDown aria-hidden="true" />
+              </label>
+            ) : null}
           </div>
-          {isWorking ? (
-            <button
-              className="submit-button stop-button"
-              onClick={() => void onInterrupt()}
-              aria-label="Stop Ygg"
-            >
-              <CircleStop aria-hidden="true" />
-            </button>
-          ) : (
+          <div className="composer-actions">
+            {isWorking ? (
+              <button
+                className="submit-button stop-button"
+                onClick={() => void onInterrupt()}
+                aria-label="Stop Ygg"
+              >
+                <CircleStop aria-hidden="true" />
+              </button>
+            ) : null}
             <button
               className="submit-button"
               onClick={() => void submit()}
-              disabled={!prompt.trim()}
-              aria-label="Send message"
+              disabled={submitting || !prompt.trim()}
+              aria-disabled={submitting || !prompt.trim()}
+              aria-label={
+                isWorking
+                  ? activeDelivery === "steer"
+                    ? "Steer active run"
+                    : "Queue follow-up"
+                  : "Send message"
+              }
             >
               <ArrowUp aria-hidden="true" />
             </button>
-          )}
+          </div>
         </div>
+        {submitError ? (
+          <p id="composer-send-error" className="composer-error" role="alert">
+            {submitError}
+          </p>
+        ) : null}
       </div>
       <div className="composer-note">
         <span>
@@ -525,6 +618,13 @@ export function Conversation({
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showJump, setShowJump] = useState(false);
   const shouldStickRef = useRef(true);
+  const resourcesAvailable = bootstrap.capabilities.resources;
+  const availableOutputIds = new Set(
+    resourcesAvailable ? session.outputs.map((output) => output.id) : [],
+  );
+  const availableSourceIds = new Set(
+    resourcesAvailable ? session.sources.map((source) => source.id) : [],
+  );
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -565,7 +665,12 @@ export function Conversation({
           className={`transcript ${session.items.length === 0 ? "is-empty" : ""}`}
         >
           {session.items.length === 0 ? (
-            <EmptySession />
+            <EmptySession
+              attachments={
+                bootstrap.capabilities.attachments &&
+                bootstrap.capabilities.attachmentIngest
+              }
+            />
           ) : (
             session.items.map((item) => (
               <TranscriptItemView
@@ -574,6 +679,8 @@ export function Conversation({
                 onResolveApproval={onResolveApproval}
                 onOpenOutput={onOpenOutput}
                 onOpenSource={onOpenSource}
+                availableOutputIds={availableOutputIds}
+                availableSourceIds={availableSourceIds}
               />
             ))
           )}

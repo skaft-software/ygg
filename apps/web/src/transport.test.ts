@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import eventEnvelopeGolden from "../../../extensions/ygg-serve/fixtures/event-envelope.json";
 import hostBootstrapGolden from "../../../extensions/ygg-serve/fixtures/host-bootstrap.json";
-import { HttpTransport } from "./transport";
+import {
+  createTransport,
+  FixtureTransport,
+  HttpTransport,
+  resolveClientDeviceId,
+} from "./transport";
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
@@ -62,6 +67,81 @@ describe("HTTP Ygg transport", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    try {
+      window.localStorage?.clear();
+    } catch {
+      // Some hardened/jsdom environments intentionally omit storage.
+    }
+    document.documentElement.removeAttribute("data-ygg-device-id");
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("uses live HTTP by default and fixtures only when explicitly requested", () => {
+    window.history.replaceState(null, "", "/");
+    expect(createTransport()).toBeInstanceOf(HttpTransport);
+
+    window.history.replaceState(null, "", "/?transport=fixture");
+    expect(createTransport()).toBeInstanceOf(FixtureTransport);
+  });
+
+  it("persists a valid non-empty loopback device identity", () => {
+    const first = resolveClientDeviceId();
+    const second = resolveClientDeviceId();
+
+    expect(first).toMatch(/^browser-[A-Za-z0-9-]+$/);
+    expect(second).toBe(first);
+    expect(first?.length).toBeLessThanOrEqual(128);
+  });
+
+  it("puts the generated loopback identity into a live command envelope", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(hostBootstrapGolden))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          protocol: 1,
+          sessionId: "session-demo",
+          commandId: "command-live",
+          acknowledgedAtMs: 1_721_000_000_051,
+          cursor: { actorGeneration: 3, sequence: 43 },
+          disposition: { status: "accepted", runId: "run-live" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = createTransport();
+    await transport.connect();
+    await transport.send({
+      id: "command-live",
+      type: "session.submit",
+      sessionId: "session-demo",
+      prompt: "Start",
+      attachments: [],
+    });
+
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toMatchObject(
+      {
+        hostId: "host-demo",
+        deviceId: expect.stringMatching(/^browser-[A-Za-z0-9-]+$/),
+        commandId: "command-live",
+      },
+    );
+    transport.close();
+  });
+
+  it("requests the routed session in the bootstrap projection", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse(hostBootstrapGolden));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+
+    await transport.connect("session-demo");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/bootstrap?selectedSessionId=session-demo",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    transport.close();
   });
 
   it("preserves the exact command envelope across a network retry", async () => {

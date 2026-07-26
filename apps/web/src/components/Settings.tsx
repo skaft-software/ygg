@@ -13,6 +13,7 @@ import { themeColorToCss } from "../theme";
 interface SettingsViewProps {
   themes: ThemeOption[];
   selectedThemeId: string;
+  selectionAvailable: boolean;
   onThemeChange: (themeId: string) => void;
 }
 
@@ -25,6 +26,7 @@ function themeDescription(option: ThemeOption): string {
 export function SettingsView({
   themes,
   selectedThemeId,
+  selectionAvailable,
   onThemeChange,
 }: SettingsViewProps) {
   return (
@@ -43,12 +45,19 @@ export function SettingsView({
           <div>
             <h2 id="appearance-title">Appearance</h2>
             <p>
-              The installed Ygg catalog recolors the same stable interface.
+              {selectionAvailable
+                ? "The installed Ygg catalog recolors the same stable interface."
+                : "This theme is selected by the connected Ygg host."}
             </p>
           </div>
         </div>
         <div className="theme-options">
-          {themes.map((option) => {
+          {themes
+            .filter(
+              (option) =>
+                selectionAvailable || selectedThemeId === option.id,
+            )
+            .map((option) => {
             const selected = selectedThemeId === option.id;
             const pigment = themeColorToCss(
               option.theme.colors.accent,
@@ -58,7 +67,12 @@ export function SettingsView({
               <button
                 key={option.id}
                 className={selected ? "is-selected" : ""}
-                onClick={() => onThemeChange(option.id)}
+                onClick={
+                  selectionAvailable
+                    ? () => onThemeChange(option.id)
+                    : undefined
+                }
+                disabled={!selectionAvailable}
                 aria-pressed={selected}
               >
                 <span
@@ -72,9 +86,9 @@ export function SettingsView({
                 </span>
                 {selected ? (
                   <Check aria-hidden="true" />
-                ) : (
+                ) : selectionAvailable ? (
                   <ChevronRight aria-hidden="true" />
-                )}
+                ) : null}
               </button>
             );
           })}
@@ -90,20 +104,20 @@ export function SettingsView({
           </div>
         </div>
         <div className="settings-rows">
-          <button>
+          <div className="settings-static-row">
             <span>
               <strong>Default authority</strong>
-              <small>Full local access</small>
+              <small>Full access</small>
             </span>
             <ShieldCheck aria-hidden="true" />
-          </button>
-          <button>
+          </div>
+          <div className="settings-static-row">
             <span>
               <strong>Default project</strong>
               <small>Use the last active folder</small>
             </span>
             <FolderClock aria-hidden="true" />
-          </button>
+          </div>
         </div>
       </section>
     </main>

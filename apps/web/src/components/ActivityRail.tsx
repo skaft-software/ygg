@@ -7,8 +7,8 @@ import {
   Globe2,
   LoaderCircle,
   PanelRightClose,
-  Search,
 } from "lucide-react";
+import { useEffect, useRef } from "react";
 import type {
   OutputRef,
   ProgressStep,
@@ -22,6 +22,9 @@ interface ActivityRailProps {
   onClose: () => void;
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
+  modal: boolean;
+  onRestoreFocus: () => void;
+  resourcesAvailable: boolean;
 }
 
 const outputIcon = (output: OutputRef) => {
@@ -50,16 +53,62 @@ export function ActivityRail({
   onClose,
   onOpenOutput,
   onOpenSource,
+  modal,
+  onRestoreFocus,
+  resourcesAvailable,
 }: ActivityRailProps) {
+  const railRef = useRef<HTMLElement>(null);
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+  useEffect(() => {
+    if (!open || !modal) return;
+    const rail = railRef.current;
+    const focusable = () =>
+      Array.from(
+        rail?.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), summary, [href], [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+    window.requestAnimationFrame(() => focusable()[0]?.focus());
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const targets = focusable();
+      if (!targets.length) return;
+      const first = targets[0];
+      const last = targets.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      onRestoreFocus();
+    };
+  }, [modal, onRestoreFocus, open]);
   const completeCount = session.progress.filter(
     (step) => step.status === "completed",
   ).length;
 
   return (
     <aside
+      ref={railRef}
       className={`activity-rail ${open ? "is-open" : ""}`}
       aria-label="Session activity"
       aria-hidden={!open}
+      aria-modal={modal && open ? true : undefined}
+      role={modal ? "dialog" : undefined}
       inert={!open}
     >
       <header className="rail-header">
@@ -108,7 +157,7 @@ export function ActivityRail({
           </section>
         ) : null}
 
-        {session.outputs.length ? (
+        {resourcesAvailable && session.outputs.length ? (
           <section className="rail-section" aria-labelledby="outputs-heading">
             <div className="rail-section-title">
               <span id="outputs-heading">Outputs</span>
@@ -131,7 +180,7 @@ export function ActivityRail({
           </section>
         ) : null}
 
-        {session.sources.length ? (
+        {resourcesAvailable && session.sources.length ? (
           <section className="rail-section" aria-labelledby="sources-heading">
             <div className="rail-section-title">
               <span id="sources-heading">Sources</span>
@@ -151,10 +200,6 @@ export function ActivityRail({
                 </button>
               ))}
             </div>
-            <button className="view-all-button">
-              <Search aria-hidden="true" />
-              Browse consulted sources
-            </button>
           </section>
         ) : null}
       </div>

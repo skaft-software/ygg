@@ -108,8 +108,15 @@ export interface HostBootstrap {
   capabilities: {
     attachments: boolean;
     previews: boolean;
+    resources: boolean;
     connectedDevices: boolean;
     lanClients: boolean;
+    attachmentIngest: boolean;
+    pairDevices: boolean;
+    sessionMetadata: boolean;
+    themeSelection: boolean;
+    steer: boolean;
+    followUp: boolean;
   };
 }
 
@@ -322,6 +329,20 @@ export type ClientCommand =
   | {
       id: string;
       type: "session.submit";
+      sessionId: string;
+      prompt: string;
+      attachments: AttachmentRef[];
+    }
+  | {
+      id: string;
+      type: "session.steer";
+      sessionId: string;
+      prompt: string;
+      attachments: AttachmentRef[];
+    }
+  | {
+      id: string;
+      type: "session.followUp";
       sessionId: string;
       prompt: string;
       attachments: AttachmentRef[];

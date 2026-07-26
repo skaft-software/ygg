@@ -152,6 +152,53 @@ describe("authoritative Rust wire contract", () => {
     expect(encoded).toEqual(sessionCommandGolden);
   });
 
+  it("encodes explicit active-run steer and follow-up commands", () => {
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const context = {
+      hostId: "host-demo",
+      deviceId: "device-browser",
+      issuedAtMs: 1_721_000_000_052,
+      actorGenerationBySession: { "session-demo": 3 },
+      modelIdBySession: { "session-demo": "gpt-5.6" },
+      models: bootstrap.models,
+    };
+    const input = {
+      text: "Use the smaller layout",
+      attachments: [],
+    };
+
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-steer",
+          type: "session.steer",
+          sessionId: "session-demo",
+          prompt: input.text,
+          attachments: [],
+        },
+        context,
+      ),
+    ).toMatchObject({
+      expectedActorGeneration: 3,
+      command: { type: "session.steer", data: { input } },
+    });
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-follow-up",
+          type: "session.followUp",
+          sessionId: "session-demo",
+          prompt: input.text,
+          attachments: [],
+        },
+        context,
+      ),
+    ).toMatchObject({
+      expectedActorGeneration: 3,
+      command: { type: "session.followUp", data: { input } },
+    });
+  });
+
   it("decodes the exact host acknowledgement golden and session acks", () => {
     expect(decodeWireCommandAck(hostCommandAckGolden)).toEqual({
       commandId: "command-create",

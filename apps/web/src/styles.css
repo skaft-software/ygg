@@ -290,6 +290,7 @@ kbd {
 }
 
 .sidebar-header {
+  flex: 0 0 auto;
   height: 46px;
   padding: 0 12px;
   display: flex;
@@ -307,8 +308,9 @@ kbd {
 }
 
 .brand-row {
+  flex: 0 0 auto;
   display: grid;
-  grid-template-columns: 40px minmax(0, 1fr) 36px;
+  grid-template-columns: 40px minmax(0, 1fr);
   align-items: center;
   gap: 10px;
   margin: 2px 12px 12px;
@@ -350,6 +352,7 @@ kbd {
 }
 
 .primary-navigation {
+  flex: 0 0 auto;
   padding: 0 12px 10px;
 }
 
@@ -411,8 +414,10 @@ kbd {
 .sidebar-scroll {
   flex: 1;
   min-height: 0;
+  max-height: 100%;
   overflow-y: auto;
   overscroll-behavior: contain;
+  touch-action: pan-y;
   scrollbar-width: thin;
   scrollbar-color: var(--line-strong) transparent;
   padding: 4px 8px 18px;
@@ -551,6 +556,7 @@ kbd {
 }
 
 .sidebar-footer {
+  flex: 0 0 auto;
   padding: 10px 10px 12px;
   border-top: 1px solid var(--line);
   background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.04));
@@ -1222,6 +1228,12 @@ kbd {
   justify-content: space-between;
 }
 
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
 .composer-leading {
   min-width: 0;
   flex: 1;
@@ -1320,6 +1332,11 @@ kbd {
   justify-content: space-between;
   gap: 12px;
   color: var(--text-faint);
+}
+
+.composer-error {
+  margin: 8px 4px 0;
+  color: var(--danger);
 }
 
 .composer-note span {
@@ -1577,7 +1594,7 @@ kbd {
 .preview-browser-bar {
   min-height: 48px;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
   gap: 10px;
   padding: 6px 10px;
@@ -1790,7 +1807,7 @@ kbd {
 }
 
 .theme-options button,
-.settings-rows button {
+.settings-static-row {
   width: 100%;
   min-height: 64px;
   display: grid;
@@ -1804,26 +1821,26 @@ kbd {
 }
 
 .theme-options button + button,
-.settings-rows button + button,
+.settings-static-row + .settings-static-row,
 .device-list article + article {
   border-top: 1px solid var(--line);
 }
 
 .theme-options button:hover,
 .theme-options button.is-selected,
-.settings-rows button:hover {
+.settings-static-row {
   background: var(--surface-hover);
 }
 
 .theme-options button > span:nth-child(2),
-.settings-rows button > span:first-child {
+.settings-static-row > span:first-child {
   min-width: 0;
   display: flex;
   flex-direction: column;
 }
 
 .theme-options small,
-.settings-rows small {
+.settings-static-row small {
   color: var(--text-faint);
   text-transform: capitalize;
 }
@@ -1842,8 +1859,23 @@ kbd {
   color: var(--accent);
 }
 
-.settings-rows button {
+.settings-static-row {
   grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.theme-options button:disabled {
+  cursor: default;
+}
+
+@media (max-height: 520px) {
+  .brand-row {
+    margin-bottom: 2px;
+    padding-block: 2px;
+  }
+
+  .local-identity {
+    display: none;
+  }
 }
 
 .connection-summary {

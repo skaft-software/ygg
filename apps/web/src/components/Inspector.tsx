@@ -1,16 +1,8 @@
 import {
-  ArrowLeft,
-  ArrowRight,
   Check,
-  Code2,
-  Download,
-  ExternalLink,
   File,
   FileText,
   Globe2,
-  Maximize2,
-  MoreHorizontal,
-  RefreshCw,
   X,
 } from "lucide-react";
 import { useEffect, useRef } from "react";
@@ -24,30 +16,18 @@ export type InspectorSelection =
 interface InspectorProps {
   session: SessionSnapshot;
   selection: InspectorSelection | null;
+  previewsAvailable: boolean;
+  onRestoreFocus: () => void;
   onClose: () => void;
 }
 
 function PreviewToolbar({ preview }: { preview: PreviewRef }) {
   return (
     <div className="preview-browser-bar">
-      <div className="preview-nav">
-        <button aria-label="Go back">
-          <ArrowLeft aria-hidden="true" />
-        </button>
-        <button aria-label="Go forward">
-          <ArrowRight aria-hidden="true" />
-        </button>
-        <button aria-label="Refresh preview">
-          <RefreshCw aria-hidden="true" />
-        </button>
-      </div>
       <div className="preview-address">
         <span className={`preview-live-dot is-${preview.status}`} />
         <span>{preview.urlLabel ?? preview.title}</span>
       </div>
-      <button aria-label="Open preview in browser">
-        <ExternalLink aria-hidden="true" />
-      </button>
     </div>
   );
 }
@@ -136,21 +116,17 @@ function SourceInspector({ source }: { source: SourceRef }) {
           <pre>{source.excerpt}</pre>
         </section>
       ) : null}
-      <div className="source-actions">
-        <button className="secondary-button">
-          <Code2 aria-hidden="true" />
-          View source
-        </button>
-        <button className="secondary-button">
-          <ExternalLink aria-hidden="true" />
-          Open
-        </button>
-      </div>
     </div>
   );
 }
 
-export function Inspector({ session, selection, onClose }: InspectorProps) {
+export function Inspector({
+  session,
+  selection,
+  previewsAvailable,
+  onRestoreFocus,
+  onClose,
+}: InspectorProps) {
   const inspectorRef = useRef<HTMLElement>(null);
   const onCloseRef = useRef(onClose);
   useEffect(() => {
@@ -160,7 +136,7 @@ export function Inspector({ session, selection, onClose }: InspectorProps) {
   useEffect(() => {
     if (!selection) return;
     const inspector = inspectorRef.current;
-    const restoreTarget =
+    const originalTarget =
       document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
@@ -193,9 +169,16 @@ export function Inspector({ session, selection, onClose }: InspectorProps) {
     document.addEventListener("keydown", onKeyDown);
     return () => {
       document.removeEventListener("keydown", onKeyDown);
-      restoreTarget?.focus();
+      onRestoreFocus();
+      if (
+        document.activeElement === document.body &&
+        originalTarget &&
+        !originalTarget.closest("[inert]")
+      ) {
+        originalTarget.focus();
+      }
     };
-  }, [selection]);
+  }, [onRestoreFocus, selection]);
 
   if (!selection) return null;
 
@@ -207,7 +190,7 @@ export function Inspector({ session, selection, onClose }: InspectorProps) {
     selection.type === "source"
       ? session.sources.find((candidate) => candidate.id === selection.id)
       : undefined;
-  const preview = output?.previewId
+  const preview = previewsAvailable && output?.previewId
     ? session.previews.find((candidate) => candidate.id === output.previewId)
     : undefined;
   const title = output?.title ?? source?.title ?? "Inspector";
@@ -241,15 +224,6 @@ export function Inspector({ session, selection, onClose }: InspectorProps) {
           </div>
         </div>
         <div className="inspector-actions">
-          <button aria-label="Download">
-            <Download aria-hidden="true" />
-          </button>
-          <button aria-label="Maximize">
-            <Maximize2 aria-hidden="true" />
-          </button>
-          <button aria-label="More options">
-            <MoreHorizontal aria-hidden="true" />
-          </button>
           <button aria-label="Close inspector" onClick={onClose}>
             <X aria-hidden="true" />
           </button>

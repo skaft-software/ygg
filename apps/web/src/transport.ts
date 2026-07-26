@@ -23,7 +23,7 @@ import {
 type EventListener = (event: SessionEvent) => void;
 
 export interface YggTransport {
-  connect(): Promise<HostBootstrap>;
+  connect(selectedSessionId?: string): Promise<HostBootstrap>;
   getSession(sessionId: string, signal?: AbortSignal): Promise<SessionSnapshot>;
   send(command: ClientCommand): Promise<CommandAck>;
   subscribe(listener: EventListener): () => void;
@@ -39,7 +39,13 @@ export class FixtureTransport implements YggTransport {
   private timers = new Set<number>();
   private createdCount = 0;
 
-  async connect(): Promise<HostBootstrap> {
+  async connect(selectedSessionId?: string): Promise<HostBootstrap> {
+    if (selectedSessionId) {
+      if (!this.sessions[selectedSessionId]) {
+        throw new Error(`Unknown fixture session ${selectedSessionId}`);
+      }
+      this.bootstrap.selectedSessionId = selectedSessionId;
+    }
     return clone(this.bootstrap);
   }
 
@@ -204,7 +210,11 @@ export class FixtureTransport implements YggTransport {
       };
     }
 
-    if (command.type === "session.submit") {
+    if (
+      command.type === "session.submit" ||
+      command.type === "session.steer" ||
+      command.type === "session.followUp"
+    ) {
       const turnId = `turn-${snapshot.sequence + 1}`;
       let sequence = snapshot.sequence + 1;
       const now = new Date().toISOString();
@@ -486,17 +496,23 @@ export class HttpTransport implements YggTransport {
   private selectedSessionCache: SessionSnapshot | null = null;
   private encodedCommands = new Map<
     string,
-    { endpoint: string; body: string }
+    { hostScoped: boolean; body: string }
   >();
 
   constructor(private readonly deviceId?: string) {}
 
-  async connect(): Promise<HostBootstrap> {
+  async connect(selectedSessionId?: string): Promise<HostBootstrap> {
     this.closedByClient = false;
-    const response = await fetch("/api/v1/bootstrap", {
+    const request: RequestInit = {
       headers: { Accept: "application/json" },
       credentials: "same-origin",
-    });
+    };
+    const response = selectedSessionId
+      ? await fetch(
+          `/api/v1/bootstrap?selectedSessionId=${encodeURIComponent(selectedSessionId)}`,
+          request,
+        )
+      : await fetch("/api/v1/bootstrap", request);
     if (!response.ok) {
       throw new Error(`Bootstrap failed with ${response.status}`);
     }
@@ -554,16 +570,13 @@ export class HttpTransport implements YggTransport {
         models: this.models,
       });
       encoded = {
-        endpoint:
-          command.type === "session.create"
-            ? "/api/v1/commands/host"
-            : "/api/v1/commands/session",
+        hostScoped: command.type === "session.create",
         body: JSON.stringify(envelope),
       };
       this.encodedCommands.set(command.id, encoded);
     }
 
-    const response = await fetch(encoded.endpoint, {
+    const request: RequestInit = {
       method: "POST",
       credentials: "same-origin",
       headers: {
@@ -571,7 +584,10 @@ export class HttpTransport implements YggTransport {
         "Content-Type": "application/json",
       },
       body: encoded.body,
-    });
+    };
+    const response = encoded.hostScoped
+      ? await fetch("/api/v1/commands/host", request)
+      : await fetch("/api/v1/commands/session", request);
     if (!response.ok) {
       throw new Error(`Command failed with ${response.status}`);
     }
@@ -739,18 +755,43 @@ export class HttpTransport implements YggTransport {
   }
 }
 
+const loopbackDeviceStorageKey = "ygg:loopback-device-id";
+const validDeviceId = /^[A-Za-z0-9_.:-]{1,128}$/;
+let volatileLoopbackDeviceId: string | undefined;
+
+export function resolveClientDeviceId(): string | undefined {
+  const injected =
+    document
+      .querySelector<HTMLMetaElement>('meta[name="ygg-device-id"]')
+      ?.content.trim() ||
+    document.documentElement.dataset.yggDeviceId?.trim();
+  if (injected && validDeviceId.test(injected)) return injected;
+
+  const host = window.location.hostname;
+  if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1") {
+    return undefined;
+  }
+  try {
+    const stored = window.localStorage.getItem(loopbackDeviceStorageKey);
+    if (stored && validDeviceId.test(stored)) return stored;
+  } catch {
+    // A stable ID for this page lifetime is still better than an empty ID.
+  }
+  const generated =
+    volatileLoopbackDeviceId ?? `browser-${crypto.randomUUID()}`;
+  volatileLoopbackDeviceId = generated;
+  try {
+    window.localStorage.setItem(loopbackDeviceStorageKey, generated);
+  } catch {
+    // Storage can be unavailable in a hardened browser.
+  }
+  return generated;
+}
+
 export function createTransport(): YggTransport {
   const params = new URLSearchParams(window.location.search);
-  const forceHttp = params.get("transport") === "http";
-  // Live transport remains opt-in until this projector passes the Rust golden
-  // contract fixtures. Production mode alone must not imply compatibility.
-  if (forceHttp) {
-    const deviceId =
-      document
-        .querySelector<HTMLMetaElement>('meta[name="ygg-device-id"]')
-        ?.content.trim() ||
-      document.documentElement.dataset.yggDeviceId?.trim();
-    return new HttpTransport(deviceId || undefined);
+  if (params.get("transport") === "fixture") {
+    return new FixtureTransport();
   }
-  return new FixtureTransport();
+  return new HttpTransport(resolveClientDeviceId());
 }

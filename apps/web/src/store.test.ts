@@ -7,7 +7,7 @@ import type {
   SessionEvent,
   SessionSnapshot,
 } from "./protocol";
-import { YggStore } from "./store";
+import { sessionIdFromPathname, YggStore } from "./store";
 import type { YggTransport } from "./transport";
 
 type SessionLoader = (
@@ -161,5 +161,22 @@ describe("YggStore", () => {
     });
     unsubscribe();
     store.dispose();
+  });
+});
+
+describe("session routes", () => {
+  it("decodes one explicit session route", () => {
+    expect(sessionIdFromPathname("/session/session-demo")).toBe(
+      "session-demo",
+    );
+    expect(sessionIdFromPathname("/session/a%20session/")).toBe("a session");
+  });
+
+  it("rejects root, nested, blank, and malformed session routes", () => {
+    expect(sessionIdFromPathname("/")).toBeNull();
+    expect(sessionIdFromPathname("/session/")).toBeNull();
+    expect(sessionIdFromPathname("/session/a/extra")).toBeNull();
+    expect(sessionIdFromPathname("/session/%2F")).toBeNull();
+    expect(sessionIdFromPathname("/session/%E0%A4%A")).toBeNull();
   });
 });

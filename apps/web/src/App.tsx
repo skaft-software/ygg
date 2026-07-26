@@ -11,7 +11,14 @@ import {
   RefreshCw,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  type RefObject,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import yggIconUrl from "../../../docs/assets/ygg-braille.svg";
 import { ActivityRail } from "./components/ActivityRail";
 import { Conversation } from "./components/Conversation";
@@ -23,7 +30,11 @@ import {
 import { SettingsView } from "./components/Settings";
 import { Sidebar } from "./components/Sidebar";
 import type { SessionStatus } from "./protocol";
-import { YggStore, useYggStore } from "./store";
+import {
+  sessionIdFromPathname,
+  YggStore,
+  useYggStore,
+} from "./store";
 import { applyTheme } from "./theme";
 import { createTransport } from "./transport";
 
@@ -75,6 +86,9 @@ interface HeaderProps {
   activityAvailable: boolean;
   activityOpen: boolean;
   pinned: boolean;
+  sessionActionsAvailable: boolean;
+  activityButtonRef: RefObject<HTMLButtonElement | null>;
+  sidebarButtonRef: RefObject<HTMLButtonElement | null>;
   onOpenSidebar: () => void;
   onToggleActivity: () => void;
   onRename: (title: string) => void;
@@ -90,6 +104,9 @@ function SessionHeader({
   activityAvailable,
   activityOpen,
   pinned,
+  sessionActionsAvailable,
+  activityButtonRef,
+  sidebarButtonRef,
   onOpenSidebar,
   onToggleActivity,
   onRename,
@@ -99,6 +116,19 @@ function SessionHeader({
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [draftTitle, setDraftTitle] = useState(sessionTitle);
+  const menuTriggerRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setMenuOpen(false);
+      window.requestAnimationFrame(() => menuTriggerRef.current?.focus());
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [menuOpen]);
 
   const submitRename = () => {
     if (draftTitle.trim()) onRename(draftTitle);
@@ -110,7 +140,11 @@ function SessionHeader({
     <header className="session-header">
       <div className="session-header-leading">
         {!sidebarOpen ? (
-          <button className="icon-button open-sidebar" onClick={onOpenSidebar}>
+          <button
+            ref={sidebarButtonRef}
+            className="icon-button open-sidebar"
+            onClick={onOpenSidebar}
+          >
             <Menu aria-hidden="true" />
             <span className="sr-only">Open sidebar</span>
           </button>
@@ -148,6 +182,7 @@ function SessionHeader({
         </span>
         {activityAvailable ? (
           <button
+            ref={activityButtonRef}
             className={`icon-button ${activityOpen ? "is-active" : ""}`}
             onClick={onToggleActivity}
             aria-label={activityOpen ? "Close activity" : "Open activity"}
@@ -155,51 +190,58 @@ function SessionHeader({
             <PanelRight aria-hidden="true" />
           </button>
         ) : null}
-        <div className="menu-anchor">
-          <button
-            className="icon-button"
-            onClick={() => setMenuOpen((open) => !open)}
-            aria-expanded={menuOpen}
-            aria-label="Session actions"
-          >
-            <MoreHorizontal aria-hidden="true" />
-          </button>
-          {menuOpen ? (
-            <>
-              <button
-                className="menu-dismiss"
-                onClick={() => setMenuOpen(false)}
-                aria-label="Close menu"
-                tabIndex={-1}
-              />
-              <div className="session-menu" role="menu">
+        {sessionActionsAvailable ? (
+          <div className="menu-anchor">
+            <button
+              ref={menuTriggerRef}
+              className="icon-button"
+              onClick={() => setMenuOpen((open) => !open)}
+              aria-expanded={menuOpen}
+              aria-label="Session actions"
+            >
+              <MoreHorizontal aria-hidden="true" />
+            </button>
+            {menuOpen ? (
+              <>
                 <button
-                  role="menuitem"
-                  onClick={() => {
-                    setDraftTitle(sessionTitle);
-                    setRenaming(true);
-                    setMenuOpen(false);
-                  }}
-                >
-                  <Pencil aria-hidden="true" />
-                  Rename
-                </button>
-                <button role="menuitem" onClick={() => onPin(!pinned)}>
-                  {pinned ? (
-                    <PinOff aria-hidden="true" />
-                  ) : (
-                    <Pin aria-hidden="true" />
-                  )}
-                  {pinned ? "Unpin" : "Pin"}
-                </button>
-                <button className="danger-row" role="menuitem" onClick={onArchive}>
-                  <Archive aria-hidden="true" />
-                  Archive
-                </button>
-              </div>
-            </>
-          ) : null}
-        </div>
+                  className="menu-dismiss"
+                  onClick={() => setMenuOpen(false)}
+                  aria-label="Close menu"
+                  tabIndex={-1}
+                />
+                <div className="session-menu" role="menu">
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setDraftTitle(sessionTitle);
+                      setRenaming(true);
+                      setMenuOpen(false);
+                    }}
+                  >
+                    <Pencil aria-hidden="true" />
+                    Rename
+                  </button>
+                  <button role="menuitem" onClick={() => onPin(!pinned)}>
+                    {pinned ? (
+                      <PinOff aria-hidden="true" />
+                    ) : (
+                      <Pin aria-hidden="true" />
+                    )}
+                    {pinned ? "Unpin" : "Pin"}
+                  </button>
+                  <button
+                    className="danger-row"
+                    role="menuitem"
+                    onClick={onArchive}
+                  >
+                    <Archive aria-hidden="true" />
+                    Archive
+                  </button>
+                </div>
+              </>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     </header>
   );
@@ -208,13 +250,19 @@ function SessionHeader({
 function UtilityTopbar({
   title,
   onOpenSidebar,
+  sidebarButtonRef,
 }: {
   title: string;
   onOpenSidebar: () => void;
+  sidebarButtonRef: RefObject<HTMLButtonElement | null>;
 }) {
   return (
     <header className="utility-topbar">
-      <button className="icon-button" onClick={onOpenSidebar}>
+      <button
+        ref={sidebarButtonRef}
+        className="icon-button"
+        onClick={onOpenSidebar}
+      >
         <Menu aria-hidden="true" />
         <span className="sr-only">Open sidebar</span>
       </button>
@@ -235,11 +283,43 @@ export default function App() {
   const [activityOpen, setActivityOpen] = useState(false);
   const [inspector, setInspector] = useState<InspectorSelection | null>(null);
   const [surface, setSurface] = useState<Surface>("session");
-  const querySelectionApplied = useRef(false);
+  const activityButtonRef = useRef<HTMLButtonElement>(null);
+  const sidebarButtonRef = useRef<HTMLButtonElement>(null);
+  const restoreActivityFocus = useCallback(() => {
+    const restore = () => activityButtonRef.current?.focus();
+    restore();
+    window.requestAnimationFrame(restore);
+  }, []);
+  const restoreSidebarFocus = useCallback(() => {
+    const restore = () => sidebarButtonRef.current?.focus();
+    restore();
+    window.requestAnimationFrame(restore);
+  }, []);
+  const closeActivity = useCallback(() => {
+    setActivityOpen(false);
+    restoreActivityFocus();
+  }, [restoreActivityFocus]);
+  const closeInspector = useCallback(() => {
+    setInspector(null);
+    restoreActivityFocus();
+  }, [restoreActivityFocus]);
+  const closeSidebar = useCallback(() => {
+    setSidebarOpen(false);
+    restoreSidebarFocus();
+  }, [restoreSidebarFocus]);
 
   useEffect(() => {
     void store.initialize();
     return () => store.dispose();
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const sessionId = sessionIdFromPathname(window.location.pathname);
+      if (sessionId) void store.selectSession(sessionId, "none");
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
   const session = state.selectedSessionId
@@ -258,27 +338,9 @@ export default function App() {
   const activityAvailable = Boolean(
     session &&
       (session.progress.length ||
-        session.outputs.length ||
-        session.sources.length),
+        (state.bootstrap?.capabilities.resources &&
+          (session.outputs.length || session.sources.length))),
   );
-
-  useEffect(() => {
-    if (
-      querySelectionApplied.current ||
-      !state.ready ||
-      !state.bootstrap
-    ) {
-      return;
-    }
-    querySelectionApplied.current = true;
-    const requested = new URLSearchParams(window.location.search).get("session");
-    if (
-      requested &&
-      state.bootstrap.sessions.some((candidate) => candidate.id === requested)
-    ) {
-      void store.selectSession(requested);
-    }
-  }, [state.ready, state.bootstrap]);
 
   useEffect(() => {
     if (selectedTheme) applyTheme(selectedTheme.theme);
@@ -331,9 +393,11 @@ export default function App() {
         hostName={state.bootstrap.host.name}
         devicesAvailable={
           state.bootstrap.capabilities.connectedDevices &&
-          state.bootstrap.capabilities.lanClients
+          state.bootstrap.capabilities.lanClients &&
+          state.bootstrap.capabilities.pairDevices
         }
-        onClose={() => setSidebarOpen(false)}
+        onRestoreFocus={restoreSidebarFocus}
+        onClose={closeSidebar}
         onNewSession={() => {
           setSurface("session");
           setInspector(null);
@@ -368,7 +432,10 @@ export default function App() {
       {surface === "session" ? (
         <div
           className="session-column"
-          inert={mobileLayout && sidebarOpen}
+          inert={
+            mobileLayout &&
+            (sidebarOpen || activityOpen || Boolean(inspector))
+          }
         >
           <SessionHeader
             sidebarOpen={sidebarOpen}
@@ -378,6 +445,11 @@ export default function App() {
             activityAvailable={activityAvailable}
             activityOpen={activityOpen}
             pinned={selectedSummary?.pinned ?? false}
+            sessionActionsAvailable={
+              state.bootstrap.capabilities.sessionMetadata
+            }
+            activityButtonRef={activityButtonRef}
+            sidebarButtonRef={sidebarButtonRef}
             onOpenSidebar={() => setSidebarOpen(true)}
             onToggleActivity={() => {
               setInspector(null);
@@ -388,15 +460,18 @@ export default function App() {
               void store.pin(pinned);
             }}
             onArchive={() => {
-              void store.archive(true);
-              void store.createSession();
+              void (async () => {
+                if (await store.archive(true)) {
+                  await store.createSession();
+                }
+              })();
             }}
           />
           <Conversation
             session={session}
             bootstrap={state.bootstrap}
-            onSubmit={(prompt, attachments) =>
-              store.submit(prompt, attachments)
+            onSubmit={(prompt, attachments, activeDelivery) =>
+              store.submit(prompt, attachments, activeDelivery)
             }
             onInterrupt={() => store.interrupt()}
             onConfigure={(patch) => store.configure(patch)}
@@ -410,16 +485,23 @@ export default function App() {
       ) : (
         <div
           className="utility-column"
-          inert={mobileLayout && sidebarOpen}
+          inert={
+            mobileLayout &&
+            (sidebarOpen || activityOpen || Boolean(inspector))
+          }
         >
           <UtilityTopbar
             title={surface === "settings" ? "Settings" : "Connected devices"}
             onOpenSidebar={() => setSidebarOpen(true)}
+            sidebarButtonRef={sidebarButtonRef}
           />
           {surface === "settings" ? (
             <SettingsView
               themes={state.bootstrap.themes}
               selectedThemeId={state.bootstrap.selectedThemeId}
+              selectionAvailable={
+                state.bootstrap.capabilities.themeSelection
+              }
               onThemeChange={(themeId) => void store.selectTheme(themeId)}
             />
           ) : (
@@ -428,7 +510,8 @@ export default function App() {
               devices={state.bootstrap.devices}
               lanAvailable={
                 state.bootstrap.capabilities.connectedDevices &&
-                state.bootstrap.capabilities.lanClients
+                state.bootstrap.capabilities.lanClients &&
+                state.bootstrap.capabilities.pairDevices
               }
             />
           )}
@@ -444,14 +527,19 @@ export default function App() {
               !inspector &&
               !(mobileLayout && sidebarOpen)
             }
-            onClose={() => setActivityOpen(false)}
+            onClose={closeActivity}
             onOpenOutput={openOutput}
             onOpenSource={openSource}
+            modal={mobileLayout}
+            onRestoreFocus={restoreActivityFocus}
+            resourcesAvailable={state.bootstrap.capabilities.resources}
           />
           <Inspector
             session={session}
             selection={inspector}
-            onClose={() => setInspector(null)}
+            previewsAvailable={state.bootstrap.capabilities.previews}
+            onRestoreFocus={restoreActivityFocus}
+            onClose={closeInspector}
           />
         </>
       ) : null}

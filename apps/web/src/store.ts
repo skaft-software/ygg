@@ -36,6 +36,46 @@ const initialState: YggState = {
 
 const commandId = () => crypto.randomUUID();
 
+export type SessionRouteMode = "push" | "replace" | "none";
+
+export function sessionIdFromPathname(pathname: string): string | null {
+  const match = /^\/session\/([^/]+)\/?$/.exec(pathname);
+  if (!match?.[1]) return null;
+  try {
+    const sessionId = decodeURIComponent(match[1]);
+    return sessionId.trim() && !sessionId.includes("/") ? sessionId : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSessionRoute(
+  sessionId: string,
+  mode: Exclude<SessionRouteMode, "none">,
+): void {
+  const route = `/session/${encodeURIComponent(sessionId)}${window.location.search}`;
+  if (mode === "replace") {
+    window.history.replaceState(null, "", route);
+  } else {
+    window.history.pushState(null, "", route);
+  }
+}
+
+function themeStorageKey(hostId: string): string {
+  return `ygg:theme:${hostId}`;
+}
+
+function readLocalTheme(bootstrap: HostBootstrap): string | undefined {
+  try {
+    const stored = window.localStorage.getItem(themeStorageKey(bootstrap.host.id));
+    return bootstrap.themes.some((theme) => theme.id === stored)
+      ? stored ?? undefined
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function latestAssistant(snapshot: SessionSnapshot): string | undefined {
   return snapshot.items
     .filter((item) => item.kind === "assistant_message")
@@ -225,7 +265,15 @@ export class YggStore {
     });
 
     try {
-      const bootstrap = await this.transport.connect();
+      const routedSessionId = sessionIdFromPathname(window.location.pathname);
+      const hostBootstrap = await this.transport.connect(
+        routedSessionId ?? undefined,
+      );
+      const bootstrap: HostBootstrap = {
+        ...hostBootstrap,
+        selectedThemeId:
+          readLocalTheme(hostBootstrap) ?? hostBootstrap.selectedThemeId,
+      };
       const selected = await this.transport.getSession(
         bootstrap.selectedSessionId,
       );
@@ -237,6 +285,7 @@ export class YggStore {
         selectedSessionId: selected.sessionId,
         sessions: { [selected.sessionId]: selected },
       });
+      writeSessionRoute(selected.sessionId, "replace");
     } catch (error) {
       this.publish({
         ...this.state,
@@ -247,11 +296,15 @@ export class YggStore {
     }
   }
 
-  async selectSession(sessionId: string): Promise<void> {
+  async selectSession(
+    sessionId: string,
+    routeMode: SessionRouteMode = "push",
+  ): Promise<void> {
     if (this.state.selectedSessionId === sessionId) {
       this.selectionGeneration += 1;
       this.selectionAbort?.abort();
       this.selectionAbort = null;
+      if (routeMode !== "none") writeSessionRoute(sessionId, routeMode);
       return;
     }
     const generation = ++this.selectionGeneration;
@@ -271,6 +324,7 @@ export class YggStore {
         selectedSessionId: sessionId,
         sessions: { ...this.state.sessions, [sessionId]: snapshot },
       });
+      if (routeMode !== "none") writeSessionRoute(sessionId, routeMode);
       this.selectionAbort = null;
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
@@ -320,18 +374,50 @@ export class YggStore {
       selectedSessionId: snapshot.sessionId,
       sessions: { ...this.state.sessions, [snapshot.sessionId]: snapshot },
     });
+    writeSessionRoute(snapshot.sessionId, "push");
   }
 
-  async submit(prompt: string, attachments: AttachmentRef[]): Promise<void> {
+  private async sendInput(
+    type: "session.submit" | "session.steer" | "session.followUp",
+    prompt: string,
+    attachments: AttachmentRef[],
+  ): Promise<void> {
     const session = this.selectedSession;
     if (!session || !prompt.trim()) return;
-    await this.sendCommand({
+    const ack = await this.sendCommand({
       id: commandId(),
-      type: "session.submit",
+      type,
       sessionId: session.sessionId,
       prompt: prompt.trim(),
       attachments,
     });
+    if (!ack.accepted) {
+      throw new Error(ack.error ?? "The Ygg host rejected this message.");
+    }
+  }
+
+  async steer(prompt: string, attachments: AttachmentRef[]): Promise<void> {
+    await this.sendInput("session.steer", prompt, attachments);
+  }
+
+  async followUp(prompt: string, attachments: AttachmentRef[]): Promise<void> {
+    await this.sendInput("session.followUp", prompt, attachments);
+  }
+
+  async submit(
+    prompt: string,
+    attachments: AttachmentRef[],
+    activeDelivery: "steer" | "followUp" = "followUp",
+  ): Promise<void> {
+    const session = this.selectedSession;
+    if (!session || !prompt.trim()) return;
+    if (session.status !== "working") {
+      await this.sendInput("session.submit", prompt, attachments);
+    } else if (activeDelivery === "steer") {
+      await this.steer(prompt, attachments);
+    } else {
+      await this.followUp(prompt, attachments);
+    }
   }
 
   async interrupt(): Promise<void> {
@@ -394,17 +480,17 @@ export class YggStore {
     });
   }
 
-  async archive(archived: boolean): Promise<void> {
+  async archive(archived: boolean): Promise<boolean> {
     const session = this.selectedSession;
     const bootstrap = this.state.bootstrap;
-    if (!session || !bootstrap) return;
+    if (!session || !bootstrap) return false;
     const ack = await this.sendCommand({
       id: commandId(),
       type: "session.archive",
       sessionId: session.sessionId,
       archived,
     });
-    if (!ack.accepted) return;
+    if (!ack.accepted) return false;
     this.publish({
       ...this.state,
       bootstrap: {
@@ -414,6 +500,7 @@ export class YggStore {
         ),
       },
     });
+    return true;
   }
 
   async resolveApproval(
@@ -434,12 +521,12 @@ export class YggStore {
   async selectTheme(themeId: string): Promise<void> {
     const bootstrap = this.state.bootstrap;
     if (!bootstrap || bootstrap.selectedThemeId === themeId) return;
-    const ack = await this.sendCommand({
-      id: commandId(),
-      type: "theme.select",
-      themeId,
-    });
-    if (!ack.accepted) return;
+    if (!bootstrap.themes.some((theme) => theme.id === themeId)) return;
+    try {
+      window.localStorage.setItem(themeStorageKey(bootstrap.host.id), themeId);
+    } catch {
+      // Local presentation still changes for this page lifetime.
+    }
     this.publish({
       ...this.state,
       bootstrap: { ...bootstrap, selectedThemeId: themeId },

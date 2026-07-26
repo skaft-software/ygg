@@ -255,8 +255,15 @@ export const fixtureBootstrap: HostBootstrap = {
   capabilities: {
     attachments: true,
     previews: true,
+    resources: true,
     connectedDevices: true,
     lanClients: true,
+    attachmentIngest: true,
+    pairDevices: true,
+    sessionMetadata: true,
+    themeSelection: true,
+    steer: true,
+    followUp: true,
   },
 };
 
