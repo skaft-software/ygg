@@ -13,6 +13,19 @@ export class SessionSequenceGapError extends Error {
   }
 }
 
+export class SessionGenerationMismatchError extends Error {
+  constructor(
+    readonly sessionId: string,
+    readonly expected: number,
+    readonly received: number,
+  ) {
+    super(
+      `Session ${sessionId} expected actor generation ${expected}, received ${received}.`,
+    );
+    this.name = "SessionGenerationMismatchError";
+  }
+}
+
 function upsertItem(
   items: TranscriptItem[],
   incoming: TranscriptItem,
@@ -38,7 +51,9 @@ export function reduceSessionEvent(
   if (event.type === "session.snapshot") {
     if (
       event.snapshot.sessionId !== event.sessionId ||
-      event.snapshot.sequence !== event.sequence
+      event.snapshot.sequence !== event.sequence ||
+      (event.actorGeneration !== undefined &&
+        event.snapshot.actorGeneration !== event.actorGeneration)
     ) {
       return snapshot;
     }
@@ -50,6 +65,17 @@ export function reduceSessionEvent(
 
   if (event.sequence <= snapshot.sequence) {
     return snapshot;
+  }
+
+  if (
+    event.actorGeneration !== undefined &&
+    event.actorGeneration !== snapshot.actorGeneration
+  ) {
+    throw new SessionGenerationMismatchError(
+      snapshot.sessionId,
+      snapshot.actorGeneration,
+      event.actorGeneration,
+    );
   }
 
   if (event.sequence !== snapshot.sequence + 1) {
@@ -83,14 +109,24 @@ export function reduceSessionEvent(
         }
 
         if (event.field === "content" && "content" in item) {
-          return { ...item, content: `${item.content}${event.delta}` };
+          return {
+            ...item,
+            content: event.replace
+              ? event.delta
+              : `${item.content}${event.delta}`,
+          };
         }
 
         if (
           event.field === "detail" &&
           item.kind === "action"
         ) {
-          return { ...item, detail: `${item.detail ?? ""}${event.delta}` };
+          return {
+            ...item,
+            detail: event.replace
+              ? event.delta
+              : `${item.detail ?? ""}${event.delta}`,
+          };
         }
 
         return item;
@@ -111,6 +147,25 @@ export function reduceSessionEvent(
       };
 
     case "session.resources":
+      if (event.merge) {
+        const mergeById = <T extends { id: string }>(
+          current: T[],
+          incoming: T[] | undefined,
+        ) => {
+          if (!incoming) return current;
+          const merged = new Map(current.map((item) => [item.id, item]));
+          for (const item of incoming) merged.set(item.id, item);
+          return [...merged.values()];
+        };
+        return {
+          ...snapshot,
+          sequence: event.sequence,
+          progress: mergeById(snapshot.progress, event.progress),
+          sources: mergeById(snapshot.sources, event.sources),
+          outputs: mergeById(snapshot.outputs, event.outputs),
+          previews: mergeById(snapshot.previews, event.previews),
+        };
+      }
       return {
         ...snapshot,
         sequence: event.sequence,

@@ -6,9 +6,19 @@ import type {
   ClientCommand,
   CommandAck,
   HostBootstrap,
+  ModelSummary,
   SessionEvent,
   SessionSnapshot,
+  SessionSummary,
 } from "./protocol";
+import {
+  decodeWireCommandAck,
+  encodeClientCommand,
+  projectHostBootstrap,
+  projectHostStreamEvent,
+  projectReplayResponse,
+  projectSessionSnapshot,
+} from "./wire";
 
 type EventListener = (event: SessionEvent) => void;
 
@@ -21,66 +31,6 @@ export interface YggTransport {
 }
 
 const clone = <T,>(value: T): T => structuredClone(value);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-// The wire contract is deliberately contained here. The Rust golden payload
-// integration can replace these projectors without leaking wire naming into UI.
-function decodeBootstrap(value: unknown): HostBootstrap {
-  if (
-    !isRecord(value) ||
-    !isRecord(value.host) ||
-    !Array.isArray(value.sessions) ||
-    !Array.isArray(value.projects) ||
-    !Array.isArray(value.models) ||
-    !Array.isArray(value.themes) ||
-    typeof value.selectedSessionId !== "string"
-  ) {
-    throw new Error("Unsupported Ygg bootstrap payload.");
-  }
-  return value as unknown as HostBootstrap;
-}
-
-function decodeSession(value: unknown): SessionSnapshot {
-  if (
-    !isRecord(value) ||
-    typeof value.sessionId !== "string" ||
-    typeof value.sequence !== "number" ||
-    !Array.isArray(value.items)
-  ) {
-    throw new Error("Unsupported Ygg session payload.");
-  }
-  return value as unknown as SessionSnapshot;
-}
-
-function decodeAck(value: unknown): CommandAck {
-  if (
-    !isRecord(value) ||
-    typeof value.commandId !== "string" ||
-    typeof value.accepted !== "boolean"
-  ) {
-    throw new Error("Unsupported Ygg command acknowledgement.");
-  }
-  return value as unknown as CommandAck;
-}
-
-function decodeEvent(value: unknown): SessionEvent {
-  if (
-    !isRecord(value) ||
-    typeof value.type !== "string" ||
-    typeof value.sessionId !== "string" ||
-    typeof value.sequence !== "number"
-  ) {
-    throw new Error("Unsupported Ygg event payload.");
-  }
-  return value as unknown as SessionEvent;
-}
-
-function encodeCommand(command: ClientCommand): unknown {
-  return command;
-}
 
 export class FixtureTransport implements YggTransport {
   private bootstrap = clone(fixtureBootstrap);
@@ -515,16 +465,51 @@ export class FixtureTransport implements YggTransport {
 export class HttpTransport implements YggTransport {
   private listeners = new Set<EventListener>();
   private socket: WebSocket | null = null;
+  private reconnectTimer: number | null = null;
+  private reconnectAttempt = 0;
+  private hasOpened = false;
+  private closedByClient = false;
+  private replaying = false;
+  private bufferedEvents: Array<{
+    hostSequence: number;
+    event: SessionEvent;
+  }> = [];
+  private hostId: string | null = null;
+  private models: ModelSummary[] = [];
+  private summaries = new Map<string, SessionSummary>();
+  private actorGenerationBySession: Record<string, number> = {};
+  private modelIdBySession: Record<string, string> = {};
+  private cursorBySession = new Map<
+    string,
+    { actorGeneration: number; sequence: number }
+  >();
+  private selectedSessionCache: SessionSnapshot | null = null;
+  private encodedCommands = new Map<
+    string,
+    { endpoint: string; body: string }
+  >();
+
+  constructor(private readonly deviceId?: string) {}
 
   async connect(): Promise<HostBootstrap> {
-    const response = await fetch("/api/bootstrap", {
+    this.closedByClient = false;
+    const response = await fetch("/api/v1/bootstrap", {
       headers: { Accept: "application/json" },
       credentials: "same-origin",
     });
     if (!response.ok) {
       throw new Error(`Bootstrap failed with ${response.status}`);
     }
-    const bootstrap = decodeBootstrap(await response.json());
+    const { bootstrap, selectedSession } = projectHostBootstrap(
+      await response.json(),
+    );
+    this.hostId = bootstrap.host.id;
+    this.models = bootstrap.models;
+    this.summaries = new Map(
+      bootstrap.sessions.map((summary) => [summary.id, summary]),
+    );
+    this.selectedSessionCache = selectedSession;
+    this.rememberSnapshot(selectedSession);
     this.openSocket();
     return bootstrap;
   }
@@ -533,8 +518,13 @@ export class HttpTransport implements YggTransport {
     sessionId: string,
     signal?: AbortSignal,
   ): Promise<SessionSnapshot> {
+    if (this.selectedSessionCache?.sessionId === sessionId) {
+      const cached = this.selectedSessionCache;
+      this.selectedSessionCache = null;
+      return clone(cached);
+    }
     const response = await fetch(
-      `/api/sessions/${encodeURIComponent(sessionId)}`,
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
       {
         headers: { Accept: "application/json" },
         credentials: "same-origin",
@@ -544,23 +534,53 @@ export class HttpTransport implements YggTransport {
     if (!response.ok) {
       throw new Error(`Session failed with ${response.status}`);
     }
-    return decodeSession(await response.json());
+    const snapshot = projectSessionSnapshot(await response.json(), {
+      summary: this.summaries.get(sessionId),
+      models: this.models,
+    });
+    this.rememberSnapshot(snapshot);
+    return snapshot;
   }
 
   async send(command: ClientCommand): Promise<CommandAck> {
-    const response = await fetch("/api/commands", {
+    let encoded = this.encodedCommands.get(command.id);
+    if (!encoded) {
+      const envelope = encodeClientCommand(command, {
+        hostId: this.hostId ?? "",
+        deviceId: this.deviceId ?? "",
+        issuedAtMs: Date.now(),
+        actorGenerationBySession: this.actorGenerationBySession,
+        modelIdBySession: this.modelIdBySession,
+        models: this.models,
+      });
+      encoded = {
+        endpoint:
+          command.type === "session.create"
+            ? "/api/v1/commands/host"
+            : "/api/v1/commands/session",
+        body: JSON.stringify(envelope),
+      };
+      this.encodedCommands.set(command.id, encoded);
+    }
+
+    const response = await fetch(encoded.endpoint, {
       method: "POST",
       credentials: "same-origin",
       headers: {
         Accept: "application/json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(encodeCommand(command)),
+      body: encoded.body,
     });
     if (!response.ok) {
       throw new Error(`Command failed with ${response.status}`);
     }
-    return decodeAck(await response.json());
+    const ack = decodeWireCommandAck(await response.json());
+    if (ack.commandId !== command.id) {
+      throw new Error("The host acknowledged a different command.");
+    }
+    this.encodedCommands.delete(command.id);
+    return ack;
   }
 
   subscribe(listener: EventListener): () => void {
@@ -569,20 +589,153 @@ export class HttpTransport implements YggTransport {
   }
 
   close(): void {
+    this.closedByClient = true;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.socket?.close();
     this.socket = null;
+    this.bufferedEvents = [];
     this.listeners.clear();
   }
 
   private openSocket(): void {
+    if (this.closedByClient) return;
     const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-    this.socket = new WebSocket(`${scheme}//${window.location.host}/api/events`);
-    this.socket.addEventListener("message", (message) => {
-      const event = decodeEvent(JSON.parse(String(message.data)));
-      for (const listener of this.listeners) {
-        listener(event);
+    const socket = new WebSocket(
+      `${scheme}//${window.location.host}/api/v1/events`,
+    );
+    this.socket = socket;
+
+    socket.addEventListener("open", () => {
+      const reconnecting = this.hasOpened;
+      this.hasOpened = true;
+      this.reconnectAttempt = 0;
+      if (!reconnecting) return;
+      this.replaying = true;
+      void this.replayAll().then(
+        () => {
+          if (this.socket !== socket) return;
+          this.replaying = false;
+          const buffered = this.bufferedEvents
+            .splice(0)
+            .sort((left, right) => left.hostSequence - right.hostSequence);
+          for (const projection of buffered) {
+            this.dispatch(projection.event);
+          }
+        },
+        () => {
+          if (this.socket === socket) socket.close();
+        },
+      );
+    });
+
+    socket.addEventListener("message", (message) => {
+      try {
+        const projection = projectHostStreamEvent(
+          JSON.parse(String(message.data)),
+          { models: this.models },
+        );
+        this.rememberEvent(projection.event);
+        if (this.replaying) {
+          this.bufferedEvents.push(projection);
+        } else {
+          this.dispatch(projection.event);
+        }
+      } catch {
+        socket.close(1002, "Invalid Ygg event");
       }
     });
+
+    socket.addEventListener("close", () => {
+      if (this.socket === socket) this.socket = null;
+      if (this.closedByClient) return;
+      const delay = Math.min(5_000, 250 * 2 ** this.reconnectAttempt);
+      this.reconnectAttempt += 1;
+      this.reconnectTimer = window.setTimeout(() => {
+        this.reconnectTimer = null;
+        this.openSocket();
+      }, delay);
+    });
+  }
+
+  private dispatch(event: SessionEvent): void {
+    for (const listener of this.listeners) listener(event);
+  }
+
+  private rememberSnapshot(snapshot: SessionSnapshot): void {
+    this.actorGenerationBySession[snapshot.sessionId] =
+      snapshot.actorGeneration;
+    this.modelIdBySession[snapshot.sessionId] = snapshot.modelId;
+    this.cursorBySession.set(snapshot.sessionId, {
+      actorGeneration: snapshot.actorGeneration,
+      sequence: snapshot.sequence,
+    });
+  }
+
+  private rememberEvent(event: SessionEvent): void {
+    const generation = event.actorGeneration;
+    if (generation !== undefined) {
+      this.actorGenerationBySession[event.sessionId] = generation;
+      this.cursorBySession.set(event.sessionId, {
+        actorGeneration: generation,
+        sequence: event.sequence,
+      });
+    }
+    if (event.type === "session.snapshot") {
+      this.rememberSnapshot(event.snapshot);
+    } else if (event.type === "session.updated" && event.patch.modelId) {
+      this.modelIdBySession[event.sessionId] = event.patch.modelId;
+    }
+  }
+
+  private async replayAll(): Promise<void> {
+    const cursors = [...this.cursorBySession.entries()];
+    await Promise.all(
+      cursors.map(async ([sessionId, cursor]) => {
+        const query = new URLSearchParams({
+          actorGeneration: String(cursor.actorGeneration),
+          sequence: String(cursor.sequence),
+        });
+        const response = await fetch(
+          `/api/v1/sessions/${encodeURIComponent(sessionId)}/replay?${query}`,
+          {
+            headers: { Accept: "application/json" },
+            credentials: "same-origin",
+          },
+        );
+        if (!response.ok) {
+          throw new Error(`Replay failed with ${response.status}`);
+        }
+        const replay = projectReplayResponse(await response.json(), {
+          summary: this.summaries.get(sessionId),
+          models: this.models,
+        });
+        if (replay.type === "gap") {
+          this.rememberSnapshot(replay.snapshot);
+          this.dispatch({
+            type: "session.snapshot",
+            sessionId: replay.snapshot.sessionId,
+            actorGeneration: replay.snapshot.actorGeneration,
+            sequence: replay.snapshot.sequence,
+            snapshot: replay.snapshot,
+          });
+          return;
+        }
+        for (const event of replay.events) {
+          this.rememberEvent(event);
+          this.dispatch(event);
+        }
+        if (replay.events.length === 0) {
+          this.actorGenerationBySession[sessionId] = replay.actorGeneration;
+          this.cursorBySession.set(sessionId, {
+            actorGeneration: replay.actorGeneration,
+            sequence: replay.sequence,
+          });
+        }
+      }),
+    );
   }
 }
 
@@ -592,7 +745,12 @@ export function createTransport(): YggTransport {
   // Live transport remains opt-in until this projector passes the Rust golden
   // contract fixtures. Production mode alone must not imply compatibility.
   if (forceHttp) {
-    return new HttpTransport();
+    const deviceId =
+      document
+        .querySelector<HTMLMetaElement>('meta[name="ygg-device-id"]')
+        ?.content.trim() ||
+      document.documentElement.dataset.yggDeviceId?.trim();
+    return new HttpTransport(deviceId || undefined);
   }
   return new FixtureTransport();
 }

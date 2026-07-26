@@ -14,7 +14,7 @@ const base: SessionSnapshot = {
   projectId: "project-1",
   modelId: "model-1",
   reasoning: "medium",
-  authority: "ask",
+  authority: "readOnly",
   contextPercent: 12,
   startedAt: "2026-07-26T12:00:00.000Z",
   items: [],

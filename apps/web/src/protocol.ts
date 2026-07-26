@@ -14,9 +14,11 @@ export type SessionStatus =
 
 export type ItemState = "streaming" | "committed" | "failed" | "stopped";
 
-export type ReasoningEffort = "low" | "medium" | "high";
+// Reasoning choices are provider-defined catalog values. Keep the UI model
+// open while validating every selection against its model's bounded catalog.
+export type ReasoningEffort = string;
 
-export type AuthorityProfile = "ask" | "auto" | "full";
+export type AuthorityProfile = "readOnly" | "workspace" | "fullAccess";
 
 export type ThemeColor =
   | { kind: "default" }
@@ -67,7 +69,10 @@ export interface ModelSummary {
   name: string;
   provider: string;
   local: boolean;
+  available: boolean;
   reasoning: ReasoningEffort[];
+  defaultReasoning?: ReasoningEffort;
+  inputModalities: Array<"text" | "image" | "audio" | "document">;
 }
 
 export interface SessionSummary {
@@ -217,6 +222,7 @@ export interface PreviewRef {
 
 export interface AttachmentRef {
   id: string;
+  handle?: string;
   name: string;
   mediaType: string;
   size: number;
@@ -245,12 +251,14 @@ export type SessionEvent =
   | {
       type: "session.snapshot";
       sessionId: string;
+      actorGeneration?: number;
       sequence: number;
       snapshot: SessionSnapshot;
     }
   | {
       type: "session.updated";
       sessionId: string;
+      actorGeneration?: number;
       sequence: number;
       patch: Partial<
         Pick<
@@ -262,33 +270,40 @@ export type SessionEvent =
   | {
       type: "item.started";
       sessionId: string;
+      actorGeneration?: number;
       sequence: number;
       item: TranscriptItem;
     }
   | {
       type: "item.delta";
       sessionId: string;
+      actorGeneration?: number;
       sequence: number;
       itemId: string;
       field: "content" | "detail";
       delta: string;
+      replace?: boolean;
     }
   | {
       type: "item.committed";
       sessionId: string;
+      actorGeneration?: number;
       sequence: number;
       item: TranscriptItem;
     }
   | {
       type: "item.retracted";
       sessionId: string;
+      actorGeneration?: number;
       sequence: number;
       itemId: string;
     }
   | {
       type: "session.resources";
       sessionId: string;
+      actorGeneration?: number;
       sequence: number;
+      merge?: boolean;
       progress?: ProgressStep[];
       sources?: SourceRef[];
       outputs?: OutputRef[];

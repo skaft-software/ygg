@@ -11,6 +11,7 @@ import type {
 } from "./protocol";
 import {
   reduceSessionEvent,
+  SessionGenerationMismatchError,
   SessionSequenceGapError,
 } from "./reducer";
 import type { YggTransport } from "./transport";
@@ -146,7 +147,10 @@ export class YggStore {
         try {
           updated = reduceSessionEvent(current, event);
         } catch (error) {
-          if (error instanceof SessionSequenceGapError) {
+          if (
+            error instanceof SessionSequenceGapError ||
+            error instanceof SessionGenerationMismatchError
+          ) {
             void this.resyncSession(event.sessionId);
             continue;
           }
@@ -283,8 +287,12 @@ export class YggStore {
       type: "session.create",
       projectId: selected?.projectId ?? bootstrap.projects[0]?.id ?? "default",
       modelId: selected?.modelId ?? bootstrap.models[0]?.id ?? "default",
-      reasoning: selected?.reasoning ?? "high",
-      authority: selected?.authority ?? "full",
+      reasoning:
+        selected?.reasoning ??
+        bootstrap.models[0]?.defaultReasoning ??
+        bootstrap.models[0]?.reasoning[0] ??
+        "off",
+      authority: selected?.authority ?? "fullAccess",
     };
     const ack = await this.sendCommand(command);
     if (!ack.accepted || !ack.createdSessionId) return;

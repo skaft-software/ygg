@@ -71,9 +71,9 @@ const actionIcons: Record<ActionItem["actionKind"], ReactNode> = {
 };
 
 const authorityLabels: Record<AuthorityProfile, string> = {
-  ask: "Ask",
-  auto: "Auto",
-  full: "Full access",
+  readOnly: "Read only",
+  workspace: "Workspace",
+  fullAccess: "Full access",
 };
 
 function formatDuration(durationMs: number): string {
@@ -445,9 +445,15 @@ function Composer({
                   })
                 }
               >
-                <option value="low">Low reasoning</option>
-                <option value="medium">Medium reasoning</option>
-                <option value="high">High reasoning</option>
+                {(
+                  bootstrap.models.find(
+                    (model) => model.id === session.modelId,
+                  )?.reasoning ?? [session.reasoning]
+                ).map((reasoning) => (
+                  <option key={reasoning} value={reasoning}>
+                    {reasoning}
+                  </option>
+                ))}
               </select>
               <ChevronDown aria-hidden="true" />
             </label>
@@ -494,11 +500,11 @@ function Composer({
       <div className="composer-note">
         <span>
           <Code2 aria-hidden="true" />
-          {session.authority === "full"
-            ? "Full local access"
-            : session.authority === "auto"
-              ? "Reviewing edits automatically"
-              : "Ygg will ask before sensitive actions"}
+          {session.authority === "fullAccess"
+            ? "Broad Ygg authority"
+            : session.authority === "workspace"
+              ? "Mutations stay in this workspace"
+              : "Read only — no mutations"}
         </span>
         <span>{session.contextPercent}% context</span>
       </div>
