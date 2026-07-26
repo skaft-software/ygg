@@ -20,11 +20,11 @@ name = "ygg"
 path = "src/main.rs"
 
 [dependencies]
-ygg-ai = { version = "=0.3.1-alpha", path = "../ygg-ai" }
-ygg-agent = { version = "=0.3.1-alpha", path = "../ygg-agent" }
+ygg-ai = { version = "=0.3.2-alpha", path = "../ygg-ai" }
+ygg-agent = { version = "=0.3.2-alpha", path = "../ygg-agent" }
 # Vendored semantic rich-rendering integration. Keeping it in this workspace
 # makes fresh clones build the exact implementation reviewed with Ygg.
-sexy-tui-rs = { version = "=0.3.0", path = "../sexy-tui-rs" }
+sexy-tui-rs = { version = "=0.3.1", path = "../sexy-tui-rs" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "process", "sync"] }
 crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
 futures-util = "0.3"

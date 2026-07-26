@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! sexy-tui-rs — Rust port of @earendil-works/pi-tui
 //!
 //! A minimal terminal UI framework with differential rendering,

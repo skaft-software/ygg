@@ -584,9 +584,9 @@ impl YggTerminal<Stdout> {
         Self::enter_with_mouse(size, false)
     }
 
-    /// Enter the primary screen with optional SGR mouse reporting. Existing
-    /// shell scrollback and the terminal's native selection remain available;
-    /// Ygg virtualizes transcript history in its own semantic viewport.
+    /// Enter the primary screen with optional SGR mouse reporting. When capture
+    /// is enabled Ygg owns semantic scrolling and selection; without capture,
+    /// native terminal selection and history remain available.
     pub fn enter_with_mouse(size: TerminalSize, capture_mouse: bool) -> Result<Self> {
         terminal::enable_raw_mode()?;
         RAW_ACTIVE.store(true, Ordering::SeqCst);

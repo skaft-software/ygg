@@ -4,7 +4,7 @@ A small retained terminal UI and a reusable semantic rich-text renderer for Rust
 It renders directly to terminal rows (no Ratatui dependency), keeps differential
 updates stable, and degrades to deterministic escape-free text.
 
-**Version 0.2 · Ygg workspace MSRV Rust 1.86**
+**Ygg vendored package 0.3.1 · workspace MSRV Rust 1.86**
 
 ## Highlights
 
@@ -20,19 +20,27 @@ updates stable, and degrades to deterministic escape-free text.
 - Stable-ID `LiveRegion` updates with stale-generation rejection and chronological
   log events for noninteractive frontends.
 - Retained `Component`/`TUI` line-differential rendering and resize reflow.
+- A crate-level `#![forbid(unsafe_code)]` contract for the complete renderer and
+  terminal abstraction.
 
-## Install
+## Workspace dependency
+
+Ygg consumes this directory directly and pins its package version exactly:
 
 ```toml
 [dependencies]
-sexy-tui-rs = "0.2"
+sexy-tui-rs = { version = "=0.3.1", path = "../sexy-tui-rs" }
 ```
+
+The path above is relative to `crates/ygg-coding-agent`; adjust it for another
+workspace. The `0.3.1` vendored line has not been synchronized to a public
+standalone tag, so use this Ygg source rather than assuming an external release.
 
 Default features include syntax highlighting:
 
 ```toml
 # Smaller build; unknown/all code remains readable plain code.
-sexy-tui-rs = { version = "0.2", default-features = false }
+sexy-tui-rs = { version = "=0.3.1", path = "../sexy-tui-rs", default-features = false }
 ```
 
 Features:
@@ -263,6 +271,14 @@ Goldens cover widths 20/40/60/80/120/160 and plain/ANSI16/ANSI256/truecolor
 capability profiles. Unit tests include malformed Markdown, arbitrary byte chunk
 boundaries, hostile terminal controls, CJK/combining/emoji layout, syntax-cache
 hits, stale live updates, and resize redraws.
+
+## Scope and provenance
+
+The semantic rich renderer is a Rust-specific extension. Pi TUI remains the
+normative reference for shared core behavior, and complete editor, autocomplete,
+widget, and test parity has not been claimed. The pinned source, import history,
+and current port status are recorded in [`VENDORED.md`](VENDORED.md) and
+[`UPSTREAM-PARITY.md`](UPSTREAM-PARITY.md).
 
 ## License
 

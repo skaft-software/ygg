@@ -87,7 +87,9 @@ pub struct Cli {
     /// Use chronological ASCII output without cursor control.
     #[arg(long)]
     pub plain: bool,
-    /// Mouse ownership: auto/terminal/off preserve native selection; app captures the mouse.
+    /// Mouse ownership: auto/app use stable semantic scrolling; terminal
+    /// preserves native scrollback; off uses terminal-owned scrolling without
+    /// capture.
     #[arg(long, value_name = "MODE")]
     pub mouse: Option<String>,
     /// Emit reasoning deltas in print mode.

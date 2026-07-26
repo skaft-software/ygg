@@ -2490,7 +2490,7 @@ fn compaction_disclosure_preserves_native_presentation() {
         terminal.set_scrollback(0);
         let visible = terminal.screen().contents();
         assert!(visible.contains("compaction-detail-39"), "{visible}");
-        assert!(visible.contains("│ ›"), "composer disappeared: {visible}");
+        assert!(visible.contains("│  ›"), "composer disappeared: {visible}");
 
         shell.expand_focused_tool();
         shell.render();
@@ -2512,7 +2512,7 @@ fn compaction_disclosure_preserves_native_presentation() {
         assert!(collapsed.contains("ctrl+o to view"), "{collapsed}");
         assert!(!collapsed.contains("compaction-detail-"), "{collapsed}");
         assert!(
-            collapsed.contains("│ ›"),
+            collapsed.contains("│  ›"),
             "composer disappeared: {collapsed}"
         );
 
@@ -2883,7 +2883,7 @@ fn streamed_table_and_wrapped_lists_survive_shrink_scroll_and_resize() {
     terminal.set_scrollback(usize::MAX);
     let physical = terminal.screen().contents();
     assert_eq!(
-        physical.matches("│ ›").count(),
+        physical.matches("│  ›").count(),
         1,
         "mutable composer was committed to scrollback:\n{physical}"
     );
@@ -3427,6 +3427,51 @@ fn explicit_application_viewport_bounds_history_and_keeps_old_rows_reachable() {
 }
 
 #[test]
+fn application_viewport_stays_anchored_while_one_markdown_block_streams() {
+    const WIDTH: u16 = 80;
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(WIDTH, 16);
+    for number in 0..80 {
+        shell.notice(format!("reading anchor {number:02}"));
+    }
+
+    let _ = render_shell_viewport_at(&shell.state.borrow(), WIDTH, Instant::now());
+    shell.scroll_lines(-8);
+    let anchor_rows = |shell: &InteractiveShell| {
+        render_shell_viewport_at(&shell.state.borrow(), WIDTH, Instant::now())
+            .into_iter()
+            .map(|line| strip_terminal_sequences(&line))
+            .filter(|line| line.contains("reading anchor"))
+            .collect::<Vec<_>>()
+    };
+    let before = anchor_rows(&shell);
+    assert!(!before.is_empty());
+
+    let run_id = shell.begin_run("openai");
+    for number in 0..24 {
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::OutputDelta {
+                channel: OutputChannel::Text,
+                text: format!(
+                    "\n\n### streamed section {number}\n\nA growing Markdown paragraph whose wrapping changes while the reader remains above the live tail."
+                ),
+            },
+        );
+        assert_eq!(
+            anchor_rows(&shell),
+            before,
+            "viewport moved on token batch {number}"
+        );
+    }
+
+    let scrolled =
+        render_shell_viewport_at(&shell.state.borrow(), WIDTH, Instant::now()).join("\n");
+    assert!(scrolled.contains("new"), "{scrolled}");
+    assert!(scrolled.contains("PageDown returns to live"), "{scrolled}");
+}
+
+#[test]
 fn select_all_copy_is_semantic_and_excludes_pinned_chrome() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("openai", "gpt-test", "high");
@@ -3826,7 +3871,7 @@ fn tool_output_starts_under_tool_input() {
         .expect("tool input should render");
     let output = lines
         .iter()
-        .find(|line| line.trim_start().starts_with("hello"))
+        .find(|line| line.contains("hello") && !line.contains("printf hello"))
         .expect("tool output should render");
     let input_column = command
         .find("printf hello")
@@ -4327,7 +4372,7 @@ fn reasoning_enabled_run_shows_fallback_before_provider_deltas() {
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>();
     assert_eq!(rendered.len(), 2, "{rendered:?}");
-    assert!(rendered[0].contains("• Thinking"), "{rendered:?}");
+    assert!(rendered[0].contains("• │ Thinking"), "{rendered:?}");
     assert!(rendered[1].contains("ctrl+o to expand"), "{rendered:?}");
 }
 
@@ -4831,6 +4876,94 @@ fn completed_reasoning_uses_rich_markdown_without_raw_delimiters() {
 }
 
 #[test]
+fn compiled_default_fixture_is_calm_and_responsive() {
+    let shell = InteractiveShell::test_shell();
+    let args = serde_json::json!({"path": "crates/ygg-coding-agent/src/tui/view.rs"});
+    {
+        let mut state = shell.state.borrow_mut();
+        state.push_block(TranscriptBlock::User {
+            text: "Keep streaming stable while I read above the live tail.".into(),
+            model_lab: Some(ModelLab::OpenAi),
+            prompt_color: Some("#123456".into()),
+            persisted: true,
+        });
+        state.push_block(TranscriptBlock::Assistant(Box::new(
+            AssistantBlock::finalized(
+                "I traced the viewport ownership boundary. The fix keeps the reading anchor stable without shifting prose as tokens arrive.".into(),
+            ),
+        )));
+        state.push_block(TranscriptBlock::Tool(Box::new(ToolPanel::new(
+            ToolCallId("default-fixture-read".into()),
+            "read".into(),
+            args.to_string(),
+            summarize_tool("read", &args),
+            String::new(),
+            true,
+            false,
+            None,
+            None,
+        ))));
+        state.push_block(TranscriptBlock::Assistant(Box::new(
+            AssistantBlock::finalized(
+                "The semantic viewport now stays put; PageDown returns to live output.".into(),
+            ),
+        )));
+    }
+    let render = |width| {
+        shell
+            .state
+            .borrow()
+            .rendered_transcript(width)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+    };
+    let wide = render(120);
+    let narrow = render(60);
+
+    assert!(wide.iter().all(|line| visible_width(line) <= 120));
+    assert!(narrow.iter().all(|line| visible_width(line) <= 60));
+    let wide_prompt = wide
+        .iter()
+        .find(|line| line.contains("Keep streaming stable"))
+        .expect("wide user prompt");
+    let narrow_prompt = narrow
+        .iter()
+        .find(|line| line.contains("Keep streaming stable"))
+        .expect("narrow user prompt");
+    let marker_column = |line: &str| {
+        let marker = line.find('›').expect("user marker");
+        visible_width(&line[..marker])
+    };
+    assert!(
+        marker_column(wide_prompt) >= 44,
+        "wide user surface should oppose assistant prose: {wide_prompt:?}"
+    );
+    assert!(
+        marker_column(narrow_prompt) <= 2,
+        "narrow user surface should return space to content: {narrow_prompt:?}"
+    );
+    assert!(
+        wide.iter().any(|line| line.starts_with("• │ Read")),
+        "wide operational events should share one quiet rail: {wide:?}"
+    );
+    assert!(
+        narrow.iter().any(|line| line.starts_with("• Read")),
+        "narrow events should shed the rail: {narrow:?}"
+    );
+    assert!(
+        narrow.iter().any(|line| line.contains("tokens arrive.")),
+        "the narrow render must be recomputed rather than reuse wide rows: {narrow:?}"
+    );
+    assert!(
+        wide.iter()
+            .chain(&narrow)
+            .all(|line| !line.chars().any(|ch| "╭╮╰╯┌┐└┘".contains(ch))),
+        "the default transcript should not add ornamental boxes"
+    );
+}
+
+#[test]
 fn reasoning_is_subdued_without_losing_inline_code_colour() {
     let theme = crate::tui::theme::test_theme();
     let response = AssistantBlock::finalized("Answer with `Session`".into())
@@ -4902,9 +5035,14 @@ fn reasoning_is_subdued_without_losing_inline_code_colour() {
         response.starts_with("Answer"),
         "responses stay flush: {response:?}"
     );
+    let plain_prompt = strip_terminal_sequences(&prompt);
     assert!(
-        strip_terminal_sequences(&prompt).starts_with("› prompt"),
-        "prompts should begin at the primary transcript edge: {prompt:?}"
+        plain_prompt.trim_start().starts_with("› prompt"),
+        "prompt should retain its marker inside the compact user surface: {prompt:?}"
+    );
+    assert!(
+        plain_prompt.starts_with(' '),
+        "the compiled default should right-align short user surfaces: {prompt:?}"
     );
     assert!(
         !prompt.contains("\x1b[48;"),
@@ -4920,7 +5058,7 @@ fn reasoning_is_subdued_without_losing_inline_code_colour() {
         "inline code should be coloured"
     );
     assert!(
-        strip_terminal_sequences(&reasoning_block).starts_with("  · Thinking"),
+        strip_terminal_sequences(&reasoning_block).starts_with("  │ · Thinking"),
         "reasoning keeps the transcript inset without a second dot: {reasoning_block:?}"
     );
     assert!(reasoning.contains("Session"));
@@ -5017,13 +5155,18 @@ fn persisted_prompt_background_fills_the_semantic_row_in_terminal_cells() {
         WIDTH,
         false,
     );
+    let plan = compile_surface_plan(None, &block, &theme, WIDTH);
     let terminal = emulate_rows(&rendered, WIDTH);
     let expected = vt100::Color::Rgb(0x12, 0x34, 0x56);
     assert_eq!(rendered.len(), 2, "fixture should wrap to two prompt rows");
-    assert!(
-        strip_terminal_sequences(&rendered[0]).starts_with('›'),
-        "prompt should begin at the primary transcript edge: {rendered:?}"
+    let first = strip_terminal_sequences(&rendered[0]);
+    let marker = first.find('›').expect("prompt marker");
+    assert_eq!(
+        visible_width(&first[..marker]),
+        usize::from(plan.geometry.content_left),
+        "prompt should begin at the compact surface's content edge: {rendered:?}"
     );
+    let surface_end = plan.frame_left.saturating_add(plan.frame_width);
     for row in 0..rendered.len() as u16 {
         for column in 0..WIDTH {
             let background = terminal
@@ -5031,9 +5174,14 @@ fn persisted_prompt_background_fills_the_semantic_row_in_terminal_cells() {
                 .cell(row, column)
                 .expect("prompt row cell inside terminal bounds")
                 .bgcolor();
+            let expected_cell = if (plan.frame_left..surface_end).contains(&column) {
+                expected
+            } else {
+                vt100::Color::Default
+            };
             assert_eq!(
-                background, expected,
-                "prompt background did not reach row {row}, column {column}"
+                background, expected_cell,
+                "prompt surface mismatch at row {row}, column {column}"
             );
         }
     }
@@ -5450,12 +5598,24 @@ fn wrapped_tool_summaries_keep_their_action_indent() {
         .collect::<Vec<_>>();
 
     assert!(lines.len() > 1, "the long summary should wrap: {lines:?}");
-    assert!(lines[0].starts_with("• Explored"), "{lines:?}");
+    assert!(lines[0].starts_with("• │ Explored"), "{lines:?}");
+    let summary = lines[0]
+        .find("crates/ygg-coding-agent")
+        .expect("summary value on first row");
+    let summary_column = visible_width(&lines[0][..summary]);
+    let continuation_column = |line: &str| {
+        let rail = line.find('│').expect("default event rail");
+        let body = rail + '│'.len_utf8();
+        let content = line[body..]
+            .find(|character: char| !character.is_whitespace())
+            .expect("wrapped summary content");
+        visible_width(&line[..body + content])
+    };
     assert!(
         lines[1..]
             .iter()
             .filter(|line| !line.is_empty())
-            .all(|line| line.starts_with("            ")),
+            .all(|line| continuation_column(line) == summary_column),
         "continuations must hang under the summary column: {lines:?}"
     );
     assert!(lines.last().is_some_and(|line| !line.is_empty()));
@@ -5861,9 +6021,12 @@ fn bash_output_and_hidden_metadata_share_a_terminal_content_gutter() {
         command_column,
         "{rendered:?}"
     );
+    let output_byte = output
+        .find("result line 4")
+        .expect("first retained output text");
     assert_eq!(
-        output.find("result line 4"),
-        Some(command_column),
+        visible_width(&output[..output_byte]),
+        command_column,
         "{rendered:?}"
     );
     let TranscriptBlock::Tool(panel) = &block else {
@@ -5900,17 +6063,17 @@ fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
     let now = Instant::now();
     assert_eq!(
         plain_footer(&shell, 100, now),
-        "  Qwen3.6 35B A3B · high   5.6k/246k   ↑26.8k ↓422   41.9 tok/s   $0"
+        "   Qwen3.6 35B A3B · high   5.6k/246k   ↑26.8k ↓422   41.9 tok/s   $0"
     );
     assert_eq!(
         plain_footer(&shell, 68, now),
-        "  Qwen3.6 35B A3B   5.6k/246k   ↑26.8k ↓422   41.9 tok/s   $0"
+        "   Qwen3.6 35B A3B   5.6k/246k   ↑26.8k ↓422   41.9 tok/s   $0"
     );
     assert_eq!(
         plain_footer(&shell, 44, now),
-        "  Qwen3.6 35B A3B   41.9 tok/s   $0"
+        "   Qwen3.6 35B A3B   41.9 tok/s   $0"
     );
-    assert_eq!(plain_footer(&shell, 30, now), "  Qwen3.6  41.9 tok/s  $0");
+    assert_eq!(plain_footer(&shell, 30, now), "   Qwen3.6  41.9 tok/s  $0");
 
     let surface = plain_composer_surface(&shell, 100, now);
     assert_eq!(surface.len(), 4, "one editor row, two borders, one footer");

@@ -1408,6 +1408,121 @@ fn apply_required_surfaces(theme: &mut YggTheme, background: TerminalBackground)
     }
 }
 
+/// The compiled default is intentionally quieter than the authored theme pack,
+/// but it still needs a recognizable product silhouette. Conversation content
+/// gets one readable measure, user input forms a compact opposing surface, and
+/// operational events share a low-contrast timeline rail. Narrow terminals
+/// remove that chrome before it can compete with the text.
+fn apply_compiled_default_composition(theme: &mut YggTheme) {
+    theme.layout = ThemeLayout {
+        density: ThemeDensity::Comfortable,
+        show_header: false,
+        show_footer: true,
+        show_status_line: true,
+        show_tool_duration: true,
+        show_reasoning: true,
+        show_panel_borders: true,
+        transcript_inset: 2,
+        composer_padding: 2,
+        narrow_breakpoint: 72,
+        narrow_show_header: false,
+        narrow_show_footer: true,
+        narrow_show_status_line: true,
+        narrow_show_tool_duration: false,
+        narrow_show_reasoning: true,
+        narrow_show_panel_borders: false,
+    };
+
+    theme.surfaces.insert(
+        "user".to_owned(),
+        ThemeSurface {
+            chrome: ThemeSurfaceChrome::Band,
+            heading: ThemeSurfaceHeading::None,
+            label: None,
+            padding: 2,
+            width: ThemeSurfaceWidth::Content,
+            align: ThemeSurfaceAlign::Right,
+            max_width: Some(76),
+            narrow_chrome: Some(ThemeSurfaceChrome::Plain),
+            narrow_heading: Some(ThemeSurfaceHeading::None),
+            narrow_label: None,
+            narrow_padding: Some(1),
+        },
+    );
+    theme.surfaces.insert(
+        "assistant".to_owned(),
+        ThemeSurface {
+            chrome: ThemeSurfaceChrome::Plain,
+            heading: ThemeSurfaceHeading::None,
+            label: None,
+            padding: 0,
+            width: ThemeSurfaceWidth::Full,
+            align: ThemeSurfaceAlign::Left,
+            max_width: Some(100),
+            narrow_chrome: Some(ThemeSurfaceChrome::Plain),
+            narrow_heading: Some(ThemeSurfaceHeading::None),
+            narrow_label: None,
+            narrow_padding: Some(0),
+        },
+    );
+
+    for (kind, max_width) in [
+        ("reasoning", 92),
+        ("tool", 100),
+        ("shell", 100),
+        ("notice", 92),
+        ("compaction", 92),
+    ] {
+        theme.surfaces.insert(
+            kind.to_owned(),
+            ThemeSurface {
+                chrome: ThemeSurfaceChrome::Rail,
+                heading: ThemeSurfaceHeading::None,
+                label: None,
+                // The rail renderer already contributes one breathing cell.
+                // More padding misaligns event labels and needlessly wraps
+                // disclosure text at ordinary terminal widths.
+                padding: 0,
+                width: ThemeSurfaceWidth::Full,
+                align: ThemeSurfaceAlign::Left,
+                max_width: Some(max_width),
+                narrow_chrome: Some(ThemeSurfaceChrome::Plain),
+                narrow_heading: Some(ThemeSurfaceHeading::None),
+                narrow_label: None,
+                narrow_padding: Some(0),
+            },
+        );
+    }
+
+    theme.surfaces.insert(
+        "outcome".to_owned(),
+        ThemeSurface {
+            chrome: ThemeSurfaceChrome::Plain,
+            heading: ThemeSurfaceHeading::None,
+            label: None,
+            padding: 0,
+            width: ThemeSurfaceWidth::Content,
+            align: ThemeSurfaceAlign::Left,
+            max_width: Some(92),
+            narrow_chrome: Some(ThemeSurfaceChrome::Plain),
+            narrow_heading: Some(ThemeSurfaceHeading::None),
+            narrow_label: None,
+            narrow_padding: Some(0),
+        },
+    );
+
+    let rail =
+        TextStyle::plain().foreground(theme.inner.resolve_color("muted").unwrap_or(Color::Default));
+    for kind in ["reasoning", "tool", "shell", "notice", "compaction"] {
+        theme
+            .semantic_styles
+            .insert(format!("surface.{kind}.border"), rail);
+    }
+
+    theme.metadata.description =
+        "Calm, model-adaptive conversation surfaces with a compact event timeline".to_owned();
+}
+
 fn default_theme_for(
     background: TerminalBackground,
     capabilities: TerminalCapabilities,
@@ -1440,6 +1555,7 @@ fn default_theme_for(
     theme.override_token("model.use_lab_color", "true");
     theme.override_token("model_accent", &neutral_model_accent);
     theme.override_token("model_assistant", "default");
+    apply_compiled_default_composition(&mut theme);
     theme
 }
 
@@ -2213,6 +2329,37 @@ mod tests {
         let names = available_themes(&config);
         assert_eq!(names.first().map(String::as_str), Some(DEFAULT_THEME_NAME));
         assert!(load_named_theme(DEFAULT_THEME_NAME, &config).is_ok());
+    }
+
+    #[test]
+    fn compiled_default_has_a_restrained_responsive_composition() {
+        let theme = test_theme();
+        let layout = theme.layout_for_width(120);
+        assert_eq!(layout.density, ThemeDensity::Comfortable);
+        assert_eq!(layout.transcript_inset, 2);
+        assert_eq!(layout.composer_padding, 2);
+
+        let user = theme.surface_for_width("user", 120);
+        assert_eq!(user.chrome, ThemeSurfaceChrome::Band);
+        assert_eq!(user.width, ThemeSurfaceWidth::Content);
+        assert_eq!(user.align, ThemeSurfaceAlign::Right);
+        assert_eq!(user.max_width, Some(76));
+
+        let assistant = theme.surface_for_width("assistant", 120);
+        assert_eq!(assistant.chrome, ThemeSurfaceChrome::Plain);
+        assert_eq!(assistant.max_width, Some(100));
+
+        let tool = theme.surface_for_width("tool", 120);
+        assert_eq!(tool.chrome, ThemeSurfaceChrome::Rail);
+        assert_eq!(tool.padding, 0);
+        assert_eq!(tool.max_width, Some(100));
+
+        let narrow_user = theme.surface_for_width("user", 60);
+        let narrow_tool = theme.surface_for_width("tool", 60);
+        assert_eq!(narrow_user.chrome, ThemeSurfaceChrome::Plain);
+        assert_eq!(narrow_user.padding, 1);
+        assert_eq!(narrow_tool.chrome, ThemeSurfaceChrome::Plain);
+        assert_eq!(narrow_tool.padding, 0);
     }
 
     #[test]

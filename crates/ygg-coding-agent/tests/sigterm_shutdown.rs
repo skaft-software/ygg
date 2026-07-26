@@ -46,6 +46,20 @@ impl PtyYgg {
         interactive: bool,
         wait_for_app: bool,
     ) -> Self {
+        Self::spawn_with_mode_and_mouse(root, extra_args, interactive, wait_for_app, "app")
+    }
+
+    fn spawn_with_mouse(root: &Path, mouse: &str) -> Self {
+        Self::spawn_with_mode_and_mouse(root, &[], true, true, mouse)
+    }
+
+    fn spawn_with_mode_and_mouse(
+        root: &Path,
+        extra_args: &[String],
+        interactive: bool,
+        wait_for_app: bool,
+        mouse: &str,
+    ) -> Self {
         let home = root.join("home");
         let workspace = root.join("workspace");
         let sessions = root.join("sessions");
@@ -110,7 +124,7 @@ impl PtyYgg {
                 "--no-tools",
                 "--allow-shell",
                 "--mouse",
-                "app",
+                mouse,
                 "--model",
                 "custom/probe",
                 "--workspace",
@@ -281,6 +295,32 @@ fn idle_interactive_sigterm_is_coordinated_and_restores_terminal() {
     assert_eq!(status.code(), Some(128 + libc::SIGTERM));
     assert!(elapsed < EXIT_DEADLINE, "shutdown took {elapsed:?}");
     assert!(contains_bytes(&output, b"\x1b[?1003l"));
+}
+
+#[test]
+fn mouse_modes_apply_expected_terminal_ownership_and_restore() {
+    let _guard = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    for (mode, application_owned) in [
+        ("auto", true),
+        ("app", true),
+        ("terminal", false),
+        ("off", false),
+    ] {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let ygg = PtyYgg::spawn_with_mouse(directory.path(), mode);
+        let (status, elapsed, output) = ygg.terminate();
+
+        assert_eq!(status.code(), Some(128 + libc::SIGTERM), "mode {mode}");
+        assert!(elapsed < EXIT_DEADLINE, "mode {mode} took {elapsed:?}");
+        assert_eq!(
+            contains_bytes(&output, b"\x1b[?1000h") && contains_bytes(&output, b"\x1b[?1006h"),
+            application_owned,
+            "mode {mode} negotiated the wrong mouse ownership"
+        );
+    }
 }
 
 #[test]

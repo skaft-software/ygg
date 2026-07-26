@@ -1184,7 +1184,10 @@ impl ShellState {
     }
 
     fn rendered_transcript(&self, width: u16) -> Ref<'_, Vec<String>> {
-        let stale = self.transcript_cache.borrow().dirty;
+        let stale = {
+            let cache = self.transcript_cache.borrow();
+            cache.dirty || cache.width != Some(width)
+        };
         if stale {
             let mut rich_renderer_slot = self.rich_renderer.borrow_mut();
             if rich_renderer_slot.is_none() {
@@ -1802,9 +1805,9 @@ struct ShellFrameState {
 struct ShellComponent {
     state: SharedState,
     frame: RefCell<ShellFrameState>,
-    /// Explicit `--mouse app` compatibility mode keeps the bounded semantic
-    /// viewport. The default path emits committed transcript rows into native
-    /// terminal scrollback instead.
+    /// Stable semantic scrolling renders one bounded viewport and is the
+    /// default (`--mouse auto`/`app`). Explicit `--mouse terminal`/`off`
+    /// retain the append-only native-scrollback renderer instead.
     application_viewport: bool,
 }
 
@@ -2023,7 +2026,12 @@ fn render_user_prompt(
     width: u16,
 ) -> Vec<String> {
     let inner_width = width.saturating_sub(2).max(1);
-    let document = parse_markdown(text);
+    // User text crosses a system boundary before Markdown parsing. Strip
+    // complete terminal protocols here as well as in the semantic copy path;
+    // otherwise the rich renderer safely exposes an escape sequence as text
+    // while content-width planning measures the shorter stripped projection.
+    let safe_text = sanitize_for_terminal(text);
+    let document = parse_markdown(&safe_text);
     let render_result = renderer.render(&document, inner_width);
     let accent = |glyph: &str| match model_lab.filter(|lab| *lab != ModelLab::Unknown) {
         Some(lab) => theme.model_fg(Some(lab), glyph),
@@ -5026,9 +5034,9 @@ fn wrapped_line_offset(text: &str, n: usize, wrap_width: usize) -> usize {
 }
 
 fn append_viewport_chrome(lines: &mut Vec<String>, chrome: ShellChrome) {
-    // Explicit application-owned scrolling still renders exactly one terminal
-    // viewport. Native mode uses `append_chrome` below so committed transcript
-    // rows can enter terminal scrollback instead of being sliced away here.
+    // Application-owned mode renders exactly one terminal viewport. Explicit
+    // terminal-owned mode uses `append_chrome` below so committed transcript
+    // rows can enter native scrollback instead of being sliced away here.
     lines.truncate(chrome.transcript_rows);
     lines.resize(chrome.transcript_rows, String::new());
     lines.extend(chrome.header);
@@ -5119,10 +5127,11 @@ fn render_shell_viewport_update(
 }
 
 fn append_chrome(lines: &mut Vec<String>, chrome: ShellChrome, stable_prefix_rows: usize) {
-    // Native mode follows the logical content height. Padding a short frame to
-    // the terminal height pins the composer to the bottom and creates a large
-    // dead zone below the transcript. Once the frame naturally grows past the
-    // viewport, sexy-tui moves committed rows into terminal-owned scrollback.
+    // Terminal-owned compatibility mode follows the logical content height.
+    // Padding a short frame to the terminal height pins the composer to the
+    // bottom and creates a large dead zone below the transcript. Once the frame
+    // naturally grows past the viewport, sexy-tui moves committed rows into
+    // terminal-owned scrollback.
     // `lines` may be only a lazy suffix, so its retained prefix still decides
     // whether the transcript owns the single breathing row before chrome.
     let complete_transcript_rows = stable_prefix_rows.saturating_add(lines.len());
@@ -5187,9 +5196,10 @@ fn render_native_overlay_suffix(
     (stable_prefix, replacement, total_rows, overlay_prefix_len)
 }
 
-/// Full logical primary-screen frame. The terminal backend paints only its
-/// visible tail; committed rows naturally move into native scrollback and are
-/// never sliced into an application-owned viewport on the default path.
+/// Full logical primary-screen frame for explicit terminal-owned scrolling.
+/// The terminal backend paints only its visible tail; committed rows naturally
+/// move into native scrollback and are never sliced into an application-owned
+/// viewport.
 fn render_shell_at(state: &ShellState, width: u16, now: Instant) -> Vec<String> {
     let chrome = shell_chrome(state, width, now);
     let transcript = transcript_lines(state, width);

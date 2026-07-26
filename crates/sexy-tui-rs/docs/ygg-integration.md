@@ -20,7 +20,8 @@ results; it must not learn what a run, tool call, provider, or model is.
 
 ## Replace generic duplicates
 
-After pinning Ygg to `sexy-tui-rs` 0.2, migrate these generic mechanisms:
+The current Ygg workspace pins vendored package `0.3.1`. When replacing any
+remaining generic mechanisms, preserve these ownership boundaries:
 
 | Current Ygg location | Replace with |
 |---|---|
@@ -38,22 +39,18 @@ terminal encoding and quantization to `Theme`. Application-specific contrast
 selection and model palette classification can produce typed colors or semantic
 overrides, then call `set_accent`, `override_token`, or `override_style`.
 
-## Dependency update
+## Dependency pin
 
-Update `crates/ygg-coding-agent/Cargo.toml` from the old pinned revision to the
-reviewed 0.2 revision/tag. Keep syntax highlighting enabled unless binary size is
-a deployment concern:
+Ygg uses an exact package version and a workspace-relative path:
 
 ```toml
-sexy-tui-rs = { git = "https://github.com/achuthanmukundan00/sexy-tui-rs", tag = "v0.2.0" }
+sexy-tui-rs = { version = "=0.3.1", path = "../sexy-tui-rs" }
 ```
 
-For local migration:
-
-```toml
-[patch.'https://github.com/achuthanmukundan00/sexy-tui-rs']
-sexy-tui-rs = { path = "../sexy-tui-rs" }
-```
+This is intentional: the vendored `0.3.1` history is not yet available from a
+public standalone tag. [`../VENDORED.md`](../VENDORED.md) records the imported
+standalone revision and the synchronization boundary. Do not replace the path
+with an unverified branch or tag.
 
 ## Capability handoff
 

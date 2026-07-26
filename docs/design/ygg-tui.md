@@ -7,34 +7,47 @@ The interactive frontend owns terminal setup/restoration and presentation only;
 
 ## Terminal guarantees
 
-- The interactive frontend renders on the primary screen so newly committed
-  transcript rows flow into terminal-native scrollback.
-- A theme swap clears and repaints every cell in the visible viewport. Rows
-  already committed to native scrollback cannot be rewritten by portable
-  terminal APIs and retain their original styling; Ygg preserves that history
-  rather than clearing it implicitly. Application-owned mouse mode re-renders
-  retained semantic rows with the current theme as they enter its viewport.
-- Raw mode, bracketed paste, keyboard enhancements, and synchronized output are
-  enabled only when supported and are restored idempotently.
-- Mouse reporting is disabled by default, preserving native selection and wheel
-  scrolling. Application-owned transcript selection is an explicit compatibility
-  mode (`--mouse app`).
+- The interactive frontend renders on the primary screen. `auto` and `app`
+  mouse modes keep a bounded, application-owned semantic viewport. Explicit
+  `--mouse terminal` lets committed transcript rows flow into terminal-native
+  scrollback; `--mouse off` disables capture and uses that same renderer.
+- A theme swap clears and repaints every cell in the visible viewport.
+  Application-owned history is semantic and therefore adopts the current theme
+  whenever it becomes visible. Rows already committed by a terminal-owned mode
+  cannot be rewritten through portable terminal APIs and retain their original
+  styling; Ygg preserves that history rather than clearing it implicitly.
+- Raw mode, bracketed paste, keyboard enhancements, synchronized output, and
+  mouse reporting are enabled only when supported and restored idempotently.
+- Mouse reporting is enabled by default so Ygg can own scrolling and semantic
+  selection. `--mouse terminal` preserves native drag selection and history;
+  `--mouse off` disables capture and uses the same terminal-owned renderer.
+  Neither mode can provide stable read-while-streaming anchoring because terminal
+  protocols do not report the user's native scrollback offset.
 - Redirected, unknown, or explicitly plain terminals use the chronological
   fallback without cursor-control sequences.
-- Provider and tool text is sanitized before terminal output.
+- Provider, tool, and user text is sanitized before terminal output.
 - Rendering never relies on color alone; no-color and ANSI-16 paths preserve
   structure.
+- The generic renderer crate enforces `#![forbid(unsafe_code)]`; OS-specific
+  terminal setup remains isolated in Ygg's terminal boundary.
 
 ## Transcript and input
 
 The transcript is semantic blocks rather than a terminal framebuffer. Wrapped
-layouts are cached per block, and streaming invalidates only changed blocks.
-The default primary-screen path exposes committed rows to native scrolling and
-selection while redrawing only a mutable suffix. The
-optional application-owned selection mode, copy, resize, and new streamed output
-retain stable semantic coordinates. Resume materializes only a bounded tail for
-first input; older active-branch blocks are loaded when semantic navigation or
-select-all reaches beyond that tail.
+layouts are cached per block and width, and streaming invalidates only changed
+blocks. In the default application-owned path, `follow_tail` and
+`scroll_from_bottom` select one bounded viewport. Scrolling above the tail keeps
+those semantic rows fixed while one Markdown block continues to grow, increments
+the new-output state, and exposes the PageDown return-to-live affordance.
+
+Terminal-owned modes instead redraw only a mutable suffix and commit stable rows
+into native history. This preserves terminal-native selection and long-lived
+scrollback, but Ygg cannot observe or freeze a reader's position inside that
+history. Semantic copy and resize retain stable coordinates in either renderer;
+application-owned drag selection is available only while mouse capture is
+enabled. Resume materializes only a bounded tail for first input; older
+active-branch blocks are loaded when semantic navigation or select-all reaches
+beyond that tail.
 
 Held-key repeats are accepted only for text editing and navigation. One-shot
 actions such as submit, panel confirmation, close, abort, and reasoning/summary expansion
@@ -47,12 +60,21 @@ PDFs are not decoded or sent as multimodal payloads: a dropped PDF receives a
 composer chip, but submission resolves that chip to the file path as text so the
 model can inspect it with file tools.
 
-The compiled default composer leaves the terminal canvas unfilled and keeps a
-restrained perimeter at rest; live work animates a model-colored shimmer around
-that perimeter. Fenced Markdown code is borderless and uses `#202630` on known
-dark profiles or `#f1f5f4` on known light profiles, falling back to an unpainted
-surface when the background is unknown. Named and custom themes keep their
-authored chrome.
+The compiled default uses one calm, responsive composition rather than requiring
+a specialty theme: two-cell transcript inset, compact right-aligned user bands
+capped at 76 columns, plain assistant prose capped at 100 columns, and one muted
+rail for reasoning, tool, shell, notice, and compaction events. It uses a single
+comfortable transition row and no transcript cards. Below 72 columns, bands and
+rails become plain rows, tool duration disappears, and content gets the terminal
+width back. These decisions are block-stable, so token arrival changes prose
+layout only when content itself crosses a wrapping boundary.
+
+The compiled default composer leaves the terminal canvas unfilled, uses two cells
+of horizontal padding, and keeps a restrained perimeter at rest; live work
+animates a model-colored shimmer around that perimeter. Fenced Markdown code is
+borderless and uses `#202630` on known dark profiles or `#f1f5f4` on known light
+profiles, falling back to an unpainted surface when the background is unknown.
+Named and custom themes keep their authored chrome.
 
 ## Reasoning presentation
 

@@ -1,15 +1,33 @@
 # Changelog
 
 > **sexy-tui-rs** is a Rust port of [@earendil-works/pi-tui](https://github.com/earendil-works/pi-mono/tree/main/packages/tui).
-> Changes below the fork line are from the upstream pi-tui changelog.
+> Changes below the fork line are retained from the upstream pi-tui changelog as
+> provenance only; they do not imply that each upstream behavior has been ported.
 
 ---
 
-## [Unreleased]
+## [0.3.1] - 2026-07-26 (Ygg experimental)
+
+### Added
+
+- Enforced the renderer's memory-safety contract with crate-level
+  `#![forbid(unsafe_code)]`.
 
 ### Changed
 
-- Markdown fenced code blocks are borderless by default, allowing copy-safe themed background surfaces without printable frame glyphs.
+- Pointed package metadata at the Ygg source of truth and documented the exact
+  workspace dependency pin, imported `0.2.0` baseline, and unsynchronized
+  standalone release boundary.
+
+## [0.3.0] - 2026-07-26
+
+### Changed
+
+- Integrated the Ygg-maintained terminal lifecycle, native-scrollback, input,
+  selection, and long-session rendering updates with targeted regression tests.
+- Markdown fenced code blocks are borderless by default, allowing copy-safe
+  themed background surfaces without printable frame glyphs.
+- Raised the vendored workspace package's minimum supported Rust version to 1.86.
 
 ## [0.2.0] - 2026-07-13
 
@@ -34,7 +52,7 @@
 
 ### Added
 
-- Complete Rust port of pi-tui (~12K TS → 4.6K Rust)
+- Initial Rust port of pi-tui (~12K TS → 4.6K Rust)
 - 3-layer theme engine with TOML config and agent runtime overrides
 - 5 progressive enhancement tiers (baseline ANSI → GPU terminal)
 - Nerd Font icon tokens with automatic ASCII fallbacks

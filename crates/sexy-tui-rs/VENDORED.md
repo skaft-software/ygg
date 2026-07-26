@@ -3,10 +3,17 @@
 This crate is vendored into the Ygg workspace so a fresh clone builds the exact
 terminal renderer used by `ygg-coding-agent`.
 
-- Upstream: <https://github.com/achuthanmukundan00/sexy-tui-rs>
-- Upstream base revision: `7770c3ef52d1df5b554f597f77d9e85803d8976d`
-- Imported version: `0.2.0`
+- Standalone source: <https://github.com/achuthanmukundan00/sexy-tui-rs>
+- Imported standalone revision: `7770c3ef52d1df5b554f597f77d9e85803d8976d`
+- Imported standalone version: `0.2.0`
+- Current Ygg workspace package: `0.3.1`
 - License: MIT (`LICENSE`)
+
+The imported revision belongs to the standalone repository's local
+`pre-rich-rendering` line and is not currently reachable from one of its public
+branches or a release tag. The Ygg workspace is therefore the source of truth for
+package `0.3.1`; synchronize the standalone history deliberately before
+advertising an external release.
 
 The behavioral source of truth is a pinned Pi TUI release, not `main` and not
 this crate's earlier independently evolved behavior:

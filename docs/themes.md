@@ -20,6 +20,22 @@ Use `/theme` to pick a theme, `/theme list` to inspect the catalog, and
 also refreshes resource discovery. At startup, use `--theme <name>` and add
 repeatable explicit roots with `--theme-dir <directory>`.
 
+## Compiled default
+
+The built-in `default` is a complete responsive composition, not an unstyled
+fallback. At ordinary widths it uses comfortable one-row transitions, a two-cell
+transcript inset, compact right-aligned user bands capped at 76 columns, plain
+assistant prose capped at 100 columns, and low-contrast rails for operational
+events. The composer and footer share two cells of horizontal padding. No
+transcript surface uses a card or decorative heading.
+
+Below 72 columns, user bands and operational rails resolve to plain rows, tool
+durations disappear, and user padding contracts to one cell. Unicode/ASCII and
+color capability fallback happens independently, so reduced-capability terminals
+keep the same hierarchy without broken border fragments. This compiled recipe is
+also covered at wide and narrow widths; users do not need to select a bundled
+theme to get Ygg's default hierarchy.
+
 ## Bundled theme pack
 
 The pack intentionally demonstrates different design philosophies without
@@ -63,21 +79,23 @@ cannot recolour old prompts. Only output capability changes the wire encoding:
 truecolor uses the stored RGB exactly, ANSI 256/16 quantize it, and plain/no-color
 terminals retain the same row geometry without escapes.
 
-## Runtime reload and native scrollback
+## Runtime reload and scrolling ownership
 
 Selecting or reloading a theme clears and repaints the complete visible
 viewport before the next frame. Current rows and rows rendered afterward
 therefore use the new theme, including byte-identical separator rows that a
 normal differential update would otherwise skip.
 
-The default primary-screen renderer deliberately commits older transcript rows
-to the terminal's native scrollback. Terminal protocols do not provide a safe,
-portable way to rewrite those historical cells, so Ygg does not claim to
-recolour them and does not clear the user's scrollback on a theme change. Rows
-already in native history retain the colours with which they were committed;
-the visible viewport and future rows use the new theme. `--mouse app` instead
-uses an application-owned semantic viewport, so retained transcript rows are
-rendered with the current theme whenever they become visible.
+The default `auto` mode and explicit `--mouse app` use an application-owned
+semantic viewport. Retained rows are restyled whenever they enter that viewport,
+and a reader who scrolls above live output stays anchored while streaming
+continues. `--mouse terminal` deliberately switches to the primary-screen native
+scrollback renderer for terminal-owned selection and history; `--mouse off`
+disables capture and uses the same renderer. Terminal protocols do not expose a
+portable reading offset or a way to rewrite historical cells, so rows already
+committed in either terminal-owned mode retain their old colors after a theme
+change and the reading viewport may move while new output arrives. Ygg neither
+clears nor claims to restyle that terminal-owned history.
 
 ## Schema
 
