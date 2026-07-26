@@ -26,7 +26,7 @@
 
 <p align="center">
   <a href="https://skaft.org/ygg">
-    <img src="docs/assets/ygg-demo.gif" alt="ygg — a local-first coding agent — terminal demo" width="800">
+    <img src="docs/assets/ygg-demo-v0.3.1-alpha.gif" alt="ygg — a local-first coding agent — terminal demo" width="800">
   </a>
 </p>
 
