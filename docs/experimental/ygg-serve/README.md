@@ -41,6 +41,12 @@ to construct and control its private `App` from the extension service, plus a
 small `ygg serve` command dispatch. The default CLI, TUI, agent, AI, and
 `sexy-tui-rs` behavior must not change when the feature is disabled.
 
+The adapter and client are presentation-only boundaries. They must not add
+presentation instructions to the model, alter the system prompt or active tool
+schemas, insert frontend state into session content, or ask another model to
+summarize work for the interface. Ygg's existing broad local authority remains
+the default; client authentication and agent authority are separate controls.
+
 See:
 
 - [Architecture](architecture.md)

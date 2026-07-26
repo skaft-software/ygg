@@ -45,6 +45,10 @@ inspection evidence.
 
 - The interface is inspected at 1440×900, 1024×768, 768×1024, 390×844, and
   360×800.
+- The application uses exactly two semantic font-size tokens—body and
+  display—and a style check rejects arbitrary component sizes.
+- Hierarchy comes from tonal surfaces, spacing, weight, and shape rather than a
+  dashboard grid of outlined cards.
 - Mobile displays one primary surface at a time.
 - Core flows work by keyboard and return focus correctly after overlays.
 - Focus is visible, contrast is safe, and state is not encoded by color alone.
@@ -58,6 +62,13 @@ inspection evidence.
 
 - The rejected frontend has no visual or ontology inheritance.
 - No excluded feature appears as an empty placeholder.
+- No presentation context, model-authored UI schema, or dashboard-summary model
+  call is introduced.
+- Existing extension enablement, source-bound trust, context composition, and
+  agent tool schemas remain unchanged.
+- Existing TUI, print, and plain modes work without the serve feature, browser,
+  Node.js, daemon, discovery, or native client.
+- Ygg's existing default authority remains unchanged.
 - Generated server assets exactly match the tested frontend source.
 - Focused Rust and web tests pass before full workspace tests.
 - The main checkout remains untouched.
