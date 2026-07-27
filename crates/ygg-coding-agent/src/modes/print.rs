@@ -61,7 +61,14 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
         None => prompt,
     };
     let display_prompt = prompt.clone();
-    let prompt = expand_skill_command(app.skills.as_ref(), &prompt)?.unwrap_or(prompt);
+    let prompt = match expand_skill_command(app.skills.as_ref(), &prompt) {
+        Ok(Some(expanded)) => expanded,
+        Ok(None) => prompt,
+        Err(error) => {
+            eprintln!("warning: failed to expand /skill: command: {error}");
+            prompt
+        }
+    };
 
     // The Agent owns cancellable capacity checks and compaction. Check spend
     // before creating any billable subrequest.

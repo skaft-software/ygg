@@ -188,7 +188,14 @@ async fn run_prompt(
         None => prompt,
     };
     let display_prompt = prompt.clone();
-    let prompt = expand_skill_command(app.skills.as_ref(), &prompt)?.unwrap_or(prompt);
+    let prompt = match expand_skill_command(app.skills.as_ref(), &prompt) {
+        Ok(Some(expanded)) => expanded,
+        Ok(None) => prompt,
+        Err(error) => {
+            eprintln!("warning: failed to expand /skill: command: {error}");
+            prompt
+        }
+    };
     write_prompt(output, theme, &display_prompt)?;
     let run_id = tracker
         .begin(&app.model.endpoint.id.0)

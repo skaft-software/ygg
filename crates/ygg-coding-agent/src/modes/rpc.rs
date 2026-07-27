@@ -2290,9 +2290,6 @@ async fn handle_idle_command(
             }
             output.success(id.as_deref(), &kind, None)?;
         }
-        "steer" | "follow_up" => {
-            output.error(id.as_deref(), &kind, "Agent is not streaming")?;
-        }
         "export_html" | "fork" | "clone" | "get_fork_messages" => {
             output.error(
                 id.as_deref(),
@@ -2409,6 +2406,40 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
                     output.error(active.id.as_deref(), "bash", error.to_string())?;
                 }
             }
+            continue;
+        }
+
+        // steer/follow_up queue at idle; they're applied when the next
+        // prompt starts (drive_run re-submits QueueState).
+        if kind == "steer" || kind == "follow_up" {
+            let id = command_id(&command).map(str::to_owned);
+            let raw = match required_string(&command, "message") {
+                Ok(message) => message.to_owned(),
+                Err(error) => {
+                    output.error(id.as_deref(), &kind, error.to_string())?;
+                    continue;
+                }
+            };
+            let queued = match queued_input(
+                &command,
+                &raw,
+                app.skills.as_ref(),
+                app.prompts.as_ref(),
+                &app.config.workspace,
+            ) {
+                Ok(queued) => queued,
+                Err(error) => {
+                    output.error(id.as_deref(), &kind, error.to_string())?;
+                    continue;
+                }
+            };
+            if kind == "steer" {
+                queue.steering.push_back(queued);
+            } else {
+                queue.follow_up.push_back(queued);
+            }
+            output.success(id.as_deref(), &kind, None)?;
+            output.send(queue.event())?;
             continue;
         }
 
