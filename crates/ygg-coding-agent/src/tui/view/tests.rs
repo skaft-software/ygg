@@ -125,11 +125,7 @@ fn emulated_shell_with_sync(
         synchronized_output,
     }));
     tui.set_inline_scrollback(true);
-    tui.add_child(Box::new(ShellComponent {
-        state: state.clone(),
-        frame: RefCell::new(ShellFrameState::default()),
-        application_viewport: false,
-    }));
+    tui.add_child(Box::new(ShellComponent::new(state.clone(), false)));
     tui.start();
     (
         InteractiveShell {

@@ -2,12 +2,13 @@ use std::time::Instant;
 
 use sexy_tui_rs::{CommitCursor, FrameUpdate};
 
+use super::renderer_runtime::ShellFrameState;
 use super::shell_chrome::{
     append_chrome, append_viewport_chrome, shell_chrome, shell_chrome_rows, ShellChrome,
 };
 use super::transcript_commit::transcript_pinned_frame;
 use super::viewport::{overlay_lines, transcript_lines};
-use super::{ShellFrameState, ShellState};
+use super::ShellState;
 
 fn native_overlay_prefix_len(transcript_len: usize, chrome: &ShellChrome) -> usize {
     let chrome_rows = shell_chrome_rows(chrome);

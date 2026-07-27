@@ -3,8 +3,9 @@ use std::time::Instant;
 
 use sexy_tui_rs::{wrap_text_with_ansi, FrameUpdate};
 
+use super::renderer_runtime::ShellFrameState;
 use super::shell_chrome::{append_viewport_chrome, shell_chrome};
-use super::{fit_line, semantic_separator, ShellFrameState, ShellOverlay, ShellState};
+use super::{fit_line, semantic_separator, ShellOverlay, ShellState};
 
 pub(super) fn transcript_lines(state: &ShellState, width: u16) -> Ref<'_, Vec<String>> {
     state.rendered_transcript(width)
