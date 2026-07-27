@@ -1,0 +1,224 @@
+//! Terminal presentation for completed, failed, and interrupted runs.
+
+use crate::presentation::{format_duration, RunOutcome};
+use crate::tui::theme::YggTheme;
+
+use super::terminal_text::sanitize_for_terminal;
+use super::{finish_transcript_block, fit_line, semantic_separator, subdued_text, wrap_hanging};
+
+const MAX_OUTCOME_DETAIL_BYTES: usize = 4 * 1024;
+
+fn outcome_line(outcome: &RunOutcome, theme: &YggTheme) -> String {
+    let separator = semantic_separator(theme);
+    match outcome {
+        RunOutcome::Completed { elapsed, .. } => {
+            let text = subdued_text(
+                theme,
+                &format!("completed{separator}{}", format_duration(*elapsed)),
+            );
+            format!("{} {text}", theme.fg("success", theme.glyph("success")))
+        }
+        RunOutcome::CompletedWithWarnings {
+            elapsed, warnings, ..
+        } => format!(
+            "{} {}",
+            theme.fg("warning", theme.glyph("success")),
+            subdued_text(
+                theme,
+                &format!(
+                    "completed with {} note{}{separator}{}",
+                    warnings,
+                    if *warnings == 1 { "" } else { "s" },
+                    format_duration(*elapsed)
+                )
+            )
+        ),
+        RunOutcome::Failed { elapsed, .. } => format!(
+            "{} {}",
+            theme.fg("error", theme.glyph("error")),
+            theme.fg(
+                "error",
+                &format!("failed{separator}{}", format_duration(*elapsed))
+            )
+        ),
+        RunOutcome::Interrupted { elapsed } | RunOutcome::Cancelled { elapsed } => format!(
+            "{} {}",
+            theme.fg("warning", theme.glyph("interrupt")),
+            subdued_text(
+                theme,
+                &format!("interrupted{separator}{}", format_duration(*elapsed))
+            )
+        ),
+        RunOutcome::NeedsInput { .. } => format!(
+            "{} {}",
+            theme.fg("warning", theme.glyph("note")),
+            subdued_text(theme, "needs input")
+        ),
+    }
+}
+
+pub(super) fn bounded_outcome_detail(raw: &str) -> String {
+    let mut safe = sanitize_for_terminal(raw);
+    if safe.len() <= MAX_OUTCOME_DETAIL_BYTES {
+        return safe;
+    }
+
+    let mut end = MAX_OUTCOME_DETAIL_BYTES - '…'.len_utf8();
+    while end > 0 && !safe.is_char_boundary(end) {
+        end -= 1;
+    }
+    safe.truncate(end);
+    safe.push('…');
+    safe
+}
+
+pub(super) fn render_outcome(outcome: &RunOutcome, theme: &YggTheme, width: u16) -> Vec<String> {
+    let mut lines = vec![fit_line(&outcome_line(outcome, theme), width)];
+    let detail = match outcome {
+        // Inference diagnostics are credential-redacted at the request boundary.
+        // Bound and terminal-sanitize them again at this presentation boundary.
+        RunOutcome::Failed { reason, .. } => Some(("error", reason.as_str())),
+        RunOutcome::NeedsInput { prompt } => Some(("warning", prompt.as_str())),
+        _ => None,
+    };
+    if let Some((role, detail)) = detail {
+        let safe = bounded_outcome_detail(detail);
+        for source_line in safe.split('\n') {
+            if source_line.is_empty() {
+                lines.push(String::new());
+                continue;
+            }
+            lines.extend(wrap_hanging(
+                &theme.fg(role, source_line),
+                "  ",
+                "  ",
+                width,
+            ));
+        }
+    }
+    finish_transcript_block(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use sexy_tui_rs::strip_terminal_sequences;
+
+    use super::super::{block_copy_text, TranscriptBlock};
+    use super::*;
+    use crate::presentation::RunSummary;
+
+    #[test]
+    fn renderer_covers_all_terminal_outcomes() {
+        let theme = crate::tui::theme::test_theme();
+        let summary = RunSummary {
+            files_changed: 2,
+            tool_calls: 4,
+            warnings: 0,
+        };
+        let outcomes = [
+            (
+                RunOutcome::Completed {
+                    elapsed: Duration::from_millis(13700),
+                    summary: summary.clone(),
+                },
+                "completed · 13.7s",
+            ),
+            (
+                RunOutcome::CompletedWithWarnings {
+                    elapsed: Duration::from_millis(18200),
+                    warnings: 2,
+                    summary: RunSummary {
+                        warnings: 2,
+                        ..summary.clone()
+                    },
+                },
+                "completed with 2 notes · 18.2s",
+            ),
+            (
+                RunOutcome::Failed {
+                    elapsed: Duration::from_millis(9400),
+                    reason: "command exited 1".into(),
+                },
+                "failed",
+            ),
+            (
+                RunOutcome::Interrupted {
+                    elapsed: Duration::from_millis(6800),
+                },
+                "interrupted · 6.8s",
+            ),
+            (
+                RunOutcome::NeedsInput {
+                    prompt: "choose an implementation".into(),
+                },
+                "needs input",
+            ),
+            (
+                RunOutcome::Cancelled {
+                    elapsed: Duration::from_secs(1),
+                },
+                "interrupted · 1.0s",
+            ),
+        ];
+        for (outcome, expected) in outcomes {
+            let rendered = outcome_line(&outcome, &theme);
+            assert!(rendered.contains(expected), "{rendered:?}");
+            if matches!(outcome, RunOutcome::CompletedWithWarnings { .. }) {
+                assert!(
+                    strip_terminal_sequences(&rendered).starts_with('✓'),
+                    "completed-with-notes should use a checkmark: {rendered:?}"
+                );
+            }
+            assert!(
+                rendered.contains('✓')
+                    || rendered.contains('◇')
+                    || rendered.contains('×')
+                    || rendered.contains('■')
+            );
+        }
+    }
+
+    #[test]
+    fn failed_outcome_keeps_the_headline_and_shows_a_bounded_safe_reason() {
+        let theme = crate::tui::theme::test_theme();
+        let reason = format!(
+            "\x1b[31mProvider unavailable\x1b[0m\x07\n{}",
+            "é".repeat(MAX_OUTCOME_DETAIL_BYTES)
+        );
+        let outcome = RunOutcome::Failed {
+            elapsed: Duration::from_millis(9400),
+            reason,
+        };
+
+        assert_eq!(
+            strip_terminal_sequences(&outcome_line(&outcome, &theme)),
+            "× failed · 9.4s"
+        );
+        let RunOutcome::Failed { reason, .. } = &outcome else {
+            unreachable!()
+        };
+        let detail = bounded_outcome_detail(reason);
+        assert!(detail.starts_with("Provider unavailable␇\n"), "{detail:?}");
+        assert!(detail.ends_with('…'));
+        assert!(detail.len() <= MAX_OUTCOME_DETAIL_BYTES);
+        assert!(detail.is_char_boundary(detail.len()));
+        assert!(!detail.contains("\x1b[31m"));
+        assert!(detail
+            .chars()
+            .all(|character| !character.is_control() || character == '\n'));
+
+        let rendered = render_outcome(&outcome, &theme, 48)
+            .into_iter()
+            .map(|line| strip_terminal_sequences(&line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.starts_with("× failed · 9.4s\n"), "{rendered:?}");
+        assert!(rendered.contains("Provider unavailable␇"), "{rendered:?}");
+
+        let copied = block_copy_text(&TranscriptBlock::Outcome(outcome));
+        assert!(copied.starts_with("failed · 9.4s\nProvider unavailable␇\n"));
+        assert!(copied.ends_with('…'));
+    }
+}

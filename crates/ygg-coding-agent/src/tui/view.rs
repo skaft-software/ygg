@@ -48,6 +48,7 @@ use self::input_overlays::render_slash_suggestions;
 use self::input_overlays::{
     input_slash_suggestions, render_input_suggestions, render_pending_steering,
 };
+use self::outcome_render::{bounded_outcome_detail, render_outcome};
 #[cfg(test)]
 use self::panel_render::render_panel;
 use self::panel_render::{filtered_indices, render_panel_with_limit};
@@ -58,7 +59,6 @@ use self::transcript_history::{
     materialize_deferred_session_history, DeferredSessionHistory, NextTranscriptCommitId,
 };
 
-const MAX_OUTCOME_DETAIL_BYTES: usize = 4 * 1024;
 /// Default render cap — roughly 60 fps. Decorative shimmer uses the separate,
 /// deliberately slower cap below; input and streamed output stay on this path.
 const RENDER_INTERVAL: Duration = Duration::from_millis(16);
@@ -1565,97 +1565,6 @@ fn render_user_prompt(
     }
     if lines.is_empty() {
         lines.push(fit_line(&marker, width));
-    }
-    finish_transcript_block(lines)
-}
-
-fn outcome_line(outcome: &RunOutcome, theme: &YggTheme) -> String {
-    let separator = semantic_separator(theme);
-    match outcome {
-        RunOutcome::Completed { elapsed, .. } => {
-            let text = subdued_text(
-                theme,
-                &format!("completed{separator}{}", format_duration(*elapsed)),
-            );
-            format!("{} {text}", theme.fg("success", theme.glyph("success")))
-        }
-        RunOutcome::CompletedWithWarnings {
-            elapsed, warnings, ..
-        } => format!(
-            "{} {}",
-            theme.fg("warning", theme.glyph("success")),
-            subdued_text(
-                theme,
-                &format!(
-                    "completed with {} note{}{separator}{}",
-                    warnings,
-                    if *warnings == 1 { "" } else { "s" },
-                    format_duration(*elapsed)
-                )
-            )
-        ),
-        RunOutcome::Failed { elapsed, .. } => format!(
-            "{} {}",
-            theme.fg("error", theme.glyph("error")),
-            theme.fg(
-                "error",
-                &format!("failed{separator}{}", format_duration(*elapsed))
-            )
-        ),
-        RunOutcome::Interrupted { elapsed } | RunOutcome::Cancelled { elapsed } => format!(
-            "{} {}",
-            theme.fg("warning", theme.glyph("interrupt")),
-            subdued_text(
-                theme,
-                &format!("interrupted{separator}{}", format_duration(*elapsed))
-            )
-        ),
-        RunOutcome::NeedsInput { .. } => format!(
-            "{} {}",
-            theme.fg("warning", theme.glyph("note")),
-            subdued_text(theme, "needs input")
-        ),
-    }
-}
-
-fn bounded_outcome_detail(raw: &str) -> String {
-    let mut safe = sanitize_for_terminal(raw);
-    if safe.len() <= MAX_OUTCOME_DETAIL_BYTES {
-        return safe;
-    }
-
-    let mut end = MAX_OUTCOME_DETAIL_BYTES - '…'.len_utf8();
-    while end > 0 && !safe.is_char_boundary(end) {
-        end -= 1;
-    }
-    safe.truncate(end);
-    safe.push('…');
-    safe
-}
-
-fn render_outcome(outcome: &RunOutcome, theme: &YggTheme, width: u16) -> Vec<String> {
-    let mut lines = vec![fit_line(&outcome_line(outcome, theme), width)];
-    let detail = match outcome {
-        // Inference diagnostics are credential-redacted at the request boundary.
-        // Bound and terminal-sanitize them again at this presentation boundary.
-        RunOutcome::Failed { reason, .. } => Some(("error", reason.as_str())),
-        RunOutcome::NeedsInput { prompt } => Some(("warning", prompt.as_str())),
-        _ => None,
-    };
-    if let Some((role, detail)) = detail {
-        let safe = bounded_outcome_detail(detail);
-        for source_line in safe.split('\n') {
-            if source_line.is_empty() {
-                lines.push(String::new());
-                continue;
-            }
-            lines.extend(wrap_hanging(
-                &theme.fg(role, source_line),
-                "  ",
-                "  ",
-                width,
-            ));
-        }
     }
     finish_transcript_block(lines)
 }
@@ -6081,6 +5990,7 @@ mod assistant_block;
 mod bash_render;
 mod editor_layout;
 mod input_overlays;
+mod outcome_render;
 mod panel_render;
 mod terminal_text;
 mod transcript_history;
