@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use ygg_agent::{EntryId, Session};
 
+use super::renderer_runtime::SharedState;
 use super::transcript_hydration::append_hydrated_items;
-use super::{SharedState, TranscriptBlock};
+use super::TranscriptBlock;
 use crate::hydrate::hydrate_transcript_at;
 
 #[derive(Clone, Copy)]
