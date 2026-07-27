@@ -37,13 +37,20 @@ tail or selects the complete semantic transcript.
 
 ## System prompt
 
-The stable, model-agnostic base contract gives both local and cloud models an
-explicit completion trajectory: honor answer/investigate/review/plan/implement
-mode; use tools rather than guess; inspect before editing; continue until done
-or concretely blocked; preserve unrelated work; make the smallest complete
-change; verify the diff and relevant checks; and report concise observed
-results with `path:line` references. It forbids commits unless requested and
-makes clear that supplied tool schemas are authoritative.
+System instructions are composed through `compose_instructions(&Config)`.
+
+- If `Config::system_prompt` is `Some(value)`, composition is replaced entirely by
+  that exact value (including `""`), bypassing AGENTS and skill instructions.
+- If `system_prompt` is `None`, the default flow composes:
+  base prompt + trusted workspace/global `AGENTS.md` context + active skill
+  instructions.
+- Layer precedence for `system_prompt` follows the same startup precedence model as
+  `model`/`reasoning`: CLI `--system-prompt` overrides project config, which
+  overrides global config, with environment variable `YGG_SYSTEM_PROMPT` as the
+  lowest optional layer.
+- The override does not persist through session metadata; startup and rebuild each
+  time compose instructions from the current live config, keeping behavior
+  deterministic across `interactive`, `plain`, `print`, and `rpc`.
 
 The environment block truthfully distinguishes the workspace root from the
 invocation directory. Relative tool paths and the default `bash` working

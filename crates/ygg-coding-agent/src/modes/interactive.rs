@@ -32,7 +32,7 @@ use crate::config::{CompactionMode, ThinkingLevel};
 use crate::modes::RunEnded;
 use crate::presentation::RunId;
 use crate::prompts::{render_and_record, RenderedPrompt};
-use crate::resources::{compose_instructions, validate_skill_requirements};
+use crate::resources::{compose_instructions, expand_skill_command};
 use crate::session_tree::render_session_tree;
 use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
@@ -1339,6 +1339,13 @@ fn update_status(shell: &mut InteractiveShell, app: &App) {
     shell.set_input_modalities(app.model.spec.capabilities.input_modalities);
     shell.set_workspace(app.config.workspace.clone());
     shell.set_prompt_templates(app.prompts.descriptors());
+    shell.set_skill_commands(Arc::from(
+        app.skills
+            .descriptors()
+            .iter()
+            .map(|skill| (format!("skill:{}", skill.id), skill.description.clone()))
+            .collect::<Vec<_>>(),
+    ));
     shell.set_extension_commands(Arc::from(app.executable_extensions.command_suggestions()));
     shell.set_context_estimate(context_estimate, context_window(&app.model));
     shell.set_session_telemetry(
@@ -1929,34 +1936,11 @@ async fn execute_skills_command(
             shell.show_overlay_text(text);
         }
         commands::SkillsSubcommand::Load(id) => match app.skills.load(&id) {
-            Ok(loaded) => {
-                let registered_tools = app.agent.registered_tool_names();
-                if let Err(error) =
-                    validate_skill_requirements(&loaded.descriptor, &registered_tools)
-                {
-                    shell.error(format!("Failed to load skill '{id}': {error}"));
-                    return Ok(());
-                }
-                let event = ygg_agent::session::EntryValue::SkillActivated {
-                    descriptor: loaded.descriptor.clone(),
-                    instructions_hash: loaded.content_hash.clone(),
-                    instructions: loaded.instructions.clone(),
-                };
-                match app.agent.session_mut().append(event) {
-                    Ok(act_id) => {
-                        shell.notice(format!(
-                            "Skill '{}' loaded successfully (activation: {})",
-                            id, act_id.0
-                        ));
-                    }
-                    Err(e) => {
-                        shell.error(format!("Failed to record skill activation in session: {e}"));
-                    }
-                }
+            Ok(_) => {
+                shell.restore_composed(ComposedInput::from_text(format!("/skill:{id}")));
+                shell.notice(format!("skill invocation /skill:{id} is ready to submit"));
             }
-            Err(e) => {
-                shell.error(format!("Failed to load skill '{}': {}", id, e));
-            }
+            Err(error) => shell.error(format!("Failed to invoke skill '{id}': {error}")),
         },
         commands::SkillsSubcommand::Reload => {
             shell.error("skill reload must run at an idle resource boundary".into());
@@ -2368,6 +2352,16 @@ async fn run_idle_command(
         Command::Checkout(id) => {
             app = checkout_entry(app, shell, input, id).await?;
         }
+        Command::Skills(commands::SkillsSubcommand::Load(id)) => {
+            if let Err(error) = app.skills.load(&id) {
+                shell.error(format!("Failed to invoke skill '{id}': {error}"));
+            } else {
+                return Ok(IdleCommandOutcome::Submit {
+                    app: Box::new(app),
+                    prompt: format!("/skill:{id}"),
+                });
+            }
+        }
         Command::Skills(commands::SkillsSubcommand::Reload) => {
             app = reload_resources(app, shell, input).await?;
             request_extension_ui(shell, &mut app);
@@ -2685,6 +2679,10 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 shell.render();
             }
             Idle::Command(command_input) => {
+                if command_input.trim_start().starts_with("/skill:") {
+                    startup_prompt = Some(command_input);
+                    continue;
+                }
                 match run_idle_command(app, &mut shell, &mut input, commands::parse(&command_input))
                     .await?
                 {
@@ -2963,6 +2961,17 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     shell.render();
                     continue;
                 }
+                let model_prompt =
+                    match expand_skill_command(app.skills.as_ref(), &composed.transcript_text) {
+                        Ok(Some(expanded)) => expanded,
+                        Ok(None) => composed.transcript_text.clone(),
+                        Err(error) => {
+                            shell.restore_composed(composed);
+                            shell.error(format!("skill invocation failed: {error}"));
+                            shell.render();
+                            continue;
+                        }
+                    };
                 app.executable_extensions.refresh_host_state(
                     app.agent.session(),
                     &app.model,
@@ -2979,7 +2988,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     result = await_with_ctrl_c(
                         app.executable_extensions.compose_prompt(
                             &app.system,
-                            composed.transcript_text.clone(),
+                            model_prompt,
                         ),
                         &mut shell,
                         &mut input,

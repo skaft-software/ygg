@@ -717,7 +717,7 @@ impl RunTracker {
                 let provider = run.provider.clone();
                 run.transition(RunPhase::AwaitingProvider { provider }, now);
             }
-            AgentEvent::SteeringDelivered { .. } => {
+            AgentEvent::SteeringDelivered { .. } | AgentEvent::FollowUpDelivered { .. } => {
                 let provider = run.provider.clone();
                 run.transition(RunPhase::AwaitingProvider { provider }, now);
             }
@@ -1189,6 +1189,7 @@ mod tests {
                 model: ModelId("m".into()),
                 protocol: Protocol::OpenAiChat,
             },
+            stop_reason: ygg_ai::StopReason::ToolUse,
             turn_usage: Usage::default(),
             usage: Usage::default(),
             session_cost_microdollars: None,

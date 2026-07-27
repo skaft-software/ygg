@@ -6,7 +6,7 @@ use ygg_agent::{AgentEvent, OutputChannel};
 
 use crate::app::bootstrap::{build_app, resolve_launch_print, Bootstrap};
 use crate::modes::{timestamp, RunEnded};
-use crate::resources::compose_instructions;
+use crate::resources::{compose_instructions, expand_skill_command};
 
 /// Convert an explicit terminal run result to process success or an actionable
 /// nonzero error. A started run must always yield `RunFinished`.
@@ -60,6 +60,8 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
         }
         None => prompt,
     };
+    let display_prompt = prompt.clone();
+    let prompt = expand_skill_command(app.skills.as_ref(), &prompt)?.unwrap_or(prompt);
 
     // The Agent owns cancellable capacity checks and compaction. Check spend
     // before creating any billable subrequest.
@@ -87,7 +89,7 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
         crate::output::stderr!("extension: {notification}");
     }
     app.agent.set_system_prompt(composition.system);
-    app.agent.set_prompt_display_text(Some(prompt));
+    app.agent.set_prompt_display_text(Some(display_prompt));
     let mut run = match app.agent.prompt(composition.prompt).await {
         Ok(run) => run,
         Err(error) => return Err(error.into()),

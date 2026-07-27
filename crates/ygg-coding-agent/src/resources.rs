@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::Config;
-use crate::resource_resolver::{ResourceKind, ResourceResolver, ResourceSnapshot, ResourceTrust};
+#[cfg(test)]
+use crate::resource_resolver::ResourceResolver;
+use crate::resource_resolver::{ResourceKind, ResourceSnapshot, ResourceTrust};
 
 /// Stable identity applied before the dynamic environment and tool contract.
 pub const BASE_PERSONA: &str = "You are Ygg, an expert coding assistant.";
@@ -177,9 +179,14 @@ fn compose_instructions_at(config: &Config, global: &Path) -> anyhow::Result<Str
 
 /// Compose global then workspace-root-to-leaf AGENTS.md instructions.
 pub fn compose_instructions(config: &Config) -> anyhow::Result<String> {
-    compose_instructions_at(config, &global_agents_path())
+    if let Some(prompt) = config.system_prompt.as_deref() {
+        Ok(prompt.to_owned())
+    } else {
+        compose_instructions_at(config, &global_agents_path())
+    }
 }
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use ygg_agent::skills::{
@@ -192,21 +199,58 @@ use ygg_agent::tool::{
 };
 use ygg_agent::{Extension, ExtensionHost};
 
-/// Scanning and loading registry for filesystem-based skills.
+const MAX_SKILL_FILE_BYTES: usize = 256 * 1024;
+const MAX_SKILL_FRONTMATTER_BYTES: usize = 32 * 1024;
+const MAX_SKILL_ENTRIES_PER_ROOT: usize = 4096;
+const MAX_SKILL_NAME_LENGTH: usize = 64;
+const MAX_SKILL_DESCRIPTION_LENGTH: usize = 1024;
+const MAX_SKILL_COMPATIBILITY_LENGTH: usize = 500;
+
+/// Immutable catalog built from one best-effort filesystem discovery pass.
 pub struct FileSystemSkillRegistry {
-    _workspace_root: PathBuf,
-    _additional_paths: Vec<PathBuf>,
     descriptors: Arc<[SkillDescriptor]>,
     diagnostics: Arc<[SkillDiagnostic]>,
     workspace_trusted: bool,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
+#[serde(untagged)]
+enum AllowedToolsHeader {
+    #[default]
+    Empty,
+    Text(String),
+    List(Vec<String>),
+}
+
+impl AllowedToolsHeader {
+    fn into_tools(self) -> Vec<String> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::Text(value) => value.split_whitespace().map(str::to_owned).collect(),
+            Self::List(values) => values,
+        }
+    }
+}
+
+#[derive(Default, serde::Deserialize)]
 struct ManifestHeader {
     #[serde(default)]
     id: Option<String>,
-    name: String,
-    description: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    compatibility: Option<String>,
+    #[serde(default)]
+    metadata: BTreeMap<String, serde_json::Value>,
+    #[serde(rename = "allowed-tools", default)]
+    allowed_tools: AllowedToolsHeader,
+    #[serde(rename = "disable-model-invocation", default)]
+    disable_model_invocation: bool,
+    #[serde(default)]
     version: Option<String>,
     #[serde(rename = "required-tools", default)]
     required_tools: Vec<String>,
@@ -214,12 +258,15 @@ struct ManifestHeader {
     tags: Vec<String>,
 }
 
-fn validate_id(id: &str) -> bool {
-    if id.is_empty() {
-        return false;
-    }
-    id.chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+fn valid_agent_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SKILL_NAME_LENGTH
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
 }
 
 fn check_symlinks(root: &Path, target: &Path) -> Result<(), SkillLoadError> {
@@ -265,78 +312,155 @@ fn check_allowed_subdirs(root: &Path, target: &Path) -> Result<(), SkillLoadErro
     ))
 }
 
-fn parse_manifest_header(
-    skill_md: &Path,
-    trust: SkillTrust,
-    dir_path: &Path,
-) -> Result<SkillDescriptor, SkillLoadError> {
-    let file = fs::File::open(skill_md).map_err(|e| SkillLoadError::Io(e.to_string()))?;
-    let limit = 32 * 1024; // 32 KiB
-                           // `BufRead::read_line` normally grows until a newline. Wrap the file in a
-                           // hard byte cap first so a hostile newline-free manifest cannot allocate
-                           // an unbounded String during startup scanning.
-    let mut reader = BufReader::new(file.take((limit + 1) as u64));
-
-    let mut header_buf = Vec::new();
-    let mut total_read = 0usize;
-    let mut dash_count = 0;
+fn read_manifest_header(skill_md: &Path) -> Result<ManifestHeader, SkillLoadError> {
+    let file = fs::File::open(skill_md).map_err(|error| SkillLoadError::Io(error.to_string()))?;
+    // Cap the reader itself: `read_line` must never allocate an unbounded
+    // newline-free manifest during startup discovery.
+    let mut reader = BufReader::new(file.take((MAX_SKILL_FRONTMATTER_BYTES + 1) as u64));
     let mut line = String::new();
-    loop {
-        line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .map_err(|e| SkillLoadError::Io(e.to_string()))?;
-        if bytes_read == 0 {
-            break;
-        }
-        if total_read.saturating_add(bytes_read) > limit {
-            return Err(SkillLoadError::InvalidManifest(
-                "YAML frontmatter exceeds the 32 KiB limit".into(),
-            ));
-        }
-        total_read += bytes_read;
-
-        if line.trim() == "---" {
-            dash_count += 1;
-            if dash_count == 2 {
-                break;
-            }
-        } else if dash_count == 1 {
-            header_buf.extend_from_slice(line.as_bytes());
-        }
+    let mut total = reader
+        .read_line(&mut line)
+        .map_err(|error| SkillLoadError::Io(error.to_string()))?;
+    if total > MAX_SKILL_FRONTMATTER_BYTES {
+        return Err(SkillLoadError::InvalidManifest(
+            "YAML frontmatter exceeds the 32 KiB limit".into(),
+        ));
     }
-
-    if dash_count < 2 {
+    if line.trim() != "---" {
         return Err(SkillLoadError::InvalidManifest(
             "Missing YAML frontmatter delimiters '---'".into(),
         ));
     }
 
-    let header_str = std::str::from_utf8(&header_buf).map_err(|_| SkillLoadError::InvalidUtf8)?;
-    let header: ManifestHeader = serde_yaml::from_str(header_str)
-        .map_err(|e| SkillLoadError::InvalidManifest(e.to_string()))?;
+    let mut header = String::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| SkillLoadError::Io(error.to_string()))?;
+        if read == 0 {
+            return Err(SkillLoadError::InvalidManifest(
+                "Missing YAML frontmatter delimiters '---'".into(),
+            ));
+        }
+        total = total.saturating_add(read);
+        if total > MAX_SKILL_FRONTMATTER_BYTES {
+            return Err(SkillLoadError::InvalidManifest(
+                "YAML frontmatter exceeds the 32 KiB limit".into(),
+            ));
+        }
+        if line.trim() == "---" {
+            break;
+        }
+        header.push_str(&line);
+    }
 
-    let id = header.id.unwrap_or_else(|| {
-        dir_path
+    serde_yaml::from_str(&header)
+        .map_err(|error| SkillLoadError::InvalidManifest(error.to_string()))
+}
+
+fn fallback_skill_name(skill_md: &Path, skill_root: &Path) -> String {
+    if skill_md.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+        skill_root
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_owned()
-    });
-    if !validate_id(&id) {
-        return Err(SkillLoadError::InvalidManifest(format!(
-            "Invalid ID grammar for '{}'. ID must be lowercase alphanumeric and hyphens.",
-            id
-        )));
+    } else {
+        skill_md
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned()
+    }
+}
+
+fn parse_manifest_header_with_diagnostics(
+    skill_md: &Path,
+    trust: SkillTrust,
+    skill_root: &Path,
+    legacy_ygg: bool,
+    diagnostics: &mut Vec<SkillDiagnostic>,
+) -> Result<SkillDescriptor, SkillLoadError> {
+    let header = read_manifest_header(skill_md)?;
+    let fallback = fallback_skill_name(skill_md, skill_root);
+    let declared_name = header
+        .name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| fallback.clone());
+    let canonical_name = if legacy_ygg {
+        header
+            .id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| declared_name.clone())
+    } else {
+        declared_name.clone()
+    };
+
+    if !valid_agent_skill_name(&canonical_name) {
+        diagnostics.push(SkillDiagnostic {
+            path: skill_md.to_path_buf(),
+            message: format!(
+                "invalid skill name {canonical_name:?}; expected 1-64 lowercase letters, digits, and single interior hyphens"
+            ),
+        });
+    }
+
+    let description = header.description.unwrap_or_default();
+    if description.trim().is_empty() {
+        diagnostics.push(SkillDiagnostic {
+            path: skill_md.to_path_buf(),
+            message: "description is required".into(),
+        });
+        return Err(SkillLoadError::InvalidManifest(
+            "description is required".into(),
+        ));
+    }
+    if description.len() > MAX_SKILL_DESCRIPTION_LENGTH {
+        diagnostics.push(SkillDiagnostic {
+            path: skill_md.to_path_buf(),
+            message: format!(
+                "description exceeds {MAX_SKILL_DESCRIPTION_LENGTH} characters ({})",
+                description.len()
+            ),
+        });
+    }
+    if header
+        .compatibility
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_SKILL_COMPATIBILITY_LENGTH)
+    {
+        diagnostics.push(SkillDiagnostic {
+            path: skill_md.to_path_buf(),
+            message: format!("compatibility exceeds {MAX_SKILL_COMPATIBILITY_LENGTH} characters"),
+        });
+    }
+    if skill_md.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
+        && !fallback.is_empty()
+        && fallback != canonical_name
+    {
+        diagnostics.push(SkillDiagnostic {
+            path: skill_md.to_path_buf(),
+            message: format!(
+                "skill name {canonical_name:?} does not match directory name {fallback:?}; loading it anyway"
+            ),
+        });
     }
 
     Ok(SkillDescriptor {
-        id,
-        name: header.name,
-        description: header.description,
+        id: canonical_name,
+        name: declared_name,
+        description,
+        license: header.license,
+        compatibility: header.compatibility,
+        metadata: header.metadata,
+        allowed_tools: header.allowed_tools.into_tools(),
+        disable_model_invocation: header.disable_model_invocation,
         version: header.version,
         source: SkillSource::FileSystem {
-            root: dir_path.to_path_buf(),
+            root: skill_root.to_path_buf(),
             entrypoint: skill_md.to_path_buf(),
         },
         trust,
@@ -345,17 +469,32 @@ fn parse_manifest_header(
     })
 }
 
+fn parse_manifest_header(
+    skill_md: &Path,
+    trust: SkillTrust,
+    skill_root: &Path,
+) -> Result<SkillDescriptor, SkillLoadError> {
+    parse_manifest_header_with_diagnostics(skill_md, trust, skill_root, false, &mut Vec::new())
+}
+
 /// Return SKILL.md's markdown body, excluding its required YAML frontmatter.
 fn strip_frontmatter(content: &str) -> Result<String, SkillLoadError> {
-    let mut offset = 0;
-    let mut delimiters = 0;
-    for line in content.split_inclusive('\n') {
+    let mut lines = content.split_inclusive('\n');
+    let Some(first) = lines.next() else {
+        return Err(SkillLoadError::InvalidManifest(
+            "Missing YAML frontmatter delimiters '---'".into(),
+        ));
+    };
+    if first.trim() != "---" {
+        return Err(SkillLoadError::InvalidManifest(
+            "Missing YAML frontmatter delimiters '---'".into(),
+        ));
+    }
+    let mut offset = first.len();
+    for line in lines {
         offset += line.len();
         if line.trim() == "---" {
-            delimiters += 1;
-            if delimiters == 2 {
-                return Ok(content[offset..].to_owned());
-            }
+            return Ok(content[offset..].to_owned());
         }
     }
     Err(SkillLoadError::InvalidManifest(
@@ -363,81 +502,403 @@ fn strip_frontmatter(content: &str) -> Result<String, SkillLoadError> {
     ))
 }
 
-#[cfg(test)]
-fn scan_skills_dir(
-    dir: &Path,
+#[derive(Clone, Copy)]
+struct SkillRootPolicy {
     trust: SkillTrust,
-    map: &mut std::collections::HashMap<SkillId, SkillDescriptor>,
-) -> Result<(), SkillLoadError> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    let metadata = fs::symlink_metadata(dir).map_err(|e| SkillLoadError::Io(e.to_string()))?;
-    if metadata.file_type().is_symlink() {
-        return Err(SkillLoadError::SymlinkRejected);
-    }
-    // secure_fs requires an absolute path with no symlinked ancestors. macOS
-    // temporary directories commonly arrive through `/var` -> `/private/var`,
-    // so normalize the already-validated root before retaining descriptors.
-    let dir = dir
-        .canonicalize()
-        .map_err(|e| SkillLoadError::Io(e.to_string()))?;
+    direct_markdown: bool,
+    legacy_ygg: bool,
+}
 
-    let mut paths = fs::read_dir(&dir)
-        .map_err(|e| SkillLoadError::Io(e.to_string()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    paths.sort();
-    for path in paths {
-        if path.is_dir() {
-            let skill_md = path.join("SKILL.md");
-            if skill_md.is_file() {
-                match parse_manifest_header(&skill_md, trust, &path) {
-                    Ok(descriptor) => {
-                        if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
-                            if dir_name != descriptor.id {
-                                crate::output::stderr_line(format!(
-                                    "warning: ignoring skill {}: directory name does not match manifest ID {}",
-                                    path.display(), descriptor.id
-                                ));
-                                continue;
-                            }
-                        }
-                        map.insert(descriptor.id.clone(), descriptor);
-                    }
-                    Err(error) => crate::output::stderr_line(format!(
-                        "warning: ignoring malformed skill {}: {error}",
-                        skill_md.display()
-                    )),
+#[derive(Clone)]
+struct SkillCandidate {
+    entrypoint: PathBuf,
+    root: PathBuf,
+    policy: SkillRootPolicy,
+}
+
+fn skill_diagnostic(path: impl Into<PathBuf>, message: impl Into<String>) -> SkillDiagnostic {
+    SkillDiagnostic {
+        path: path.into(),
+        message: message.into(),
+    }
+}
+
+fn scan_skill_root(
+    path: &Path,
+    policy: SkillRootPolicy,
+    candidates: &mut Vec<SkillCandidate>,
+    diagnostics: &mut Vec<SkillDiagnostic>,
+) {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            diagnostics.push(skill_diagnostic(
+                path,
+                format!("cannot inspect skill root: {error}"),
+            ));
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        diagnostics.push(skill_diagnostic(path, "skill root must not be a symlink"));
+        return;
+    }
+    if metadata.is_file() {
+        if policy.direct_markdown && path.extension().and_then(|value| value.to_str()) == Some("md")
+        {
+            let Some(parent) = path.parent() else {
+                diagnostics.push(skill_diagnostic(path, "skill file has no parent directory"));
+                return;
+            };
+            let canonical_parent = match parent.canonicalize() {
+                Ok(parent) => parent,
+                Err(error) => {
+                    diagnostics.push(skill_diagnostic(
+                        path,
+                        format!("cannot canonicalize skill parent: {error}"),
+                    ));
+                    return;
                 }
+            };
+            let Some(name) = path.file_name() else {
+                diagnostics.push(skill_diagnostic(path, "skill file has no file name"));
+                return;
+            };
+            candidates.push(SkillCandidate {
+                entrypoint: canonical_parent.join(name),
+                root: canonical_parent,
+                policy,
+            });
+        } else {
+            diagnostics.push(skill_diagnostic(
+                path,
+                "explicit skill path must be a markdown file or directory",
+            ));
+        }
+        return;
+    }
+    if !metadata.is_dir() {
+        diagnostics.push(skill_diagnostic(
+            path,
+            "skill root must be a regular file or directory",
+        ));
+        return;
+    }
+    let canonical_root = match path.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            diagnostics.push(skill_diagnostic(
+                path,
+                format!("cannot canonicalize skill root: {error}"),
+            ));
+            return;
+        }
+    };
+
+    let mut builder = ignore::WalkBuilder::new(&canonical_root);
+    builder
+        .hidden(true)
+        .parents(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(true)
+        .follow_links(false)
+        .sort_by_file_path(|left, right| left.cmp(right))
+        .add_custom_ignore_filename(".fdignore");
+
+    let mut discovered = Vec::<PathBuf>::new();
+    let mut visited = 0usize;
+    for result in builder.build() {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(error) => {
+                diagnostics.push(skill_diagnostic(
+                    &canonical_root,
+                    format!("cannot scan skill root: {error}"),
+                ));
+                continue;
             }
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        visited = visited.saturating_add(1);
+        if visited > MAX_SKILL_ENTRIES_PER_ROOT {
+            diagnostics.push(skill_diagnostic(
+                &canonical_root,
+                format!("skill root exceeds the {MAX_SKILL_ENTRIES_PER_ROOT}-entry scan limit"),
+            ));
+            return;
+        }
+        let file_type = match entry.file_type() {
+            Some(file_type) => file_type,
+            None => continue,
+        };
+        if file_type.is_symlink() {
+            diagnostics.push(skill_diagnostic(
+                entry.path(),
+                "symlinked skill candidate was ignored",
+            ));
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let is_entrypoint = entry.file_name() == "SKILL.md";
+        let is_direct_markdown = policy.direct_markdown
+            && entry.depth() == 1
+            && entry.path().extension().and_then(|value| value.to_str()) == Some("md");
+        if is_entrypoint || is_direct_markdown {
+            discovered.push(entry.into_path());
         }
     }
-    Ok(())
+
+    // A directory containing SKILL.md is a complete skill root. Do not also
+    // discover nested skill entrypoints beneath it.
+    discovered.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut selected_skill_dirs = Vec::<PathBuf>::new();
+    for entrypoint in discovered {
+        let Some(parent) = entrypoint.parent() else {
+            continue;
+        };
+        let skill_root = parent.to_path_buf();
+        if selected_skill_dirs
+            .iter()
+            .any(|root| skill_root.starts_with(root))
+        {
+            continue;
+        }
+        if entrypoint.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+            selected_skill_dirs.push(skill_root.clone());
+        }
+        candidates.push(SkillCandidate {
+            entrypoint,
+            root: skill_root,
+            policy,
+        });
+    }
+}
+
+fn project_skill_directories(workspace: &Path, invocation_cwd: &Path) -> Vec<PathBuf> {
+    let mut directories = dirs_from_workspace_to_cwd(workspace, invocation_cwd);
+    // Roots are applied from low to high precedence; the nearest .agents
+    // directory therefore wins a collision with an ancestor.
+    directories
+        .drain(..)
+        .map(|directory| directory.join(".agents").join("skills"))
+        .collect()
 }
 
 impl FileSystemSkillRegistry {
-    /// Creates a new skills registry scanning the user config directory, workspace directory, and CLI paths.
+    /// Creates a catalog using the workspace as both repository and invocation directory.
     pub fn new(
         workspace_root: PathBuf,
         additional_paths: Vec<PathBuf>,
         workspace_trusted: bool,
     ) -> Result<Self, SkillLoadError> {
-        let resolver = ResourceResolver::new(workspace_root.clone(), workspace_trusted);
-        let snapshot = resolver.discover(ResourceKind::Skill, &additional_paths);
-        Ok(Self::from_snapshot(
+        Self::new_with_invocation(
+            workspace_root.clone(),
             workspace_root,
             additional_paths,
             workspace_trusted,
-            &snapshot,
-        ))
+        )
     }
 
-    /// Parse an immutable skill discovery snapshot from the shared resolver.
-    pub fn from_snapshot(
+    /// Creates a catalog from all Pi, Agent Skills, and legacy Ygg roots.
+    pub fn new_with_invocation(
         workspace_root: PathBuf,
+        invocation_cwd: PathBuf,
         additional_paths: Vec<PathBuf>,
+        workspace_trusted: bool,
+    ) -> Result<Self, SkillLoadError> {
+        Self::discover(
+            workspace_root,
+            invocation_cwd,
+            additional_paths,
+            workspace_trusted,
+            dirs::home_dir().filter(|home| home.is_absolute()),
+        )
+    }
+
+    fn discover(
+        workspace_root: PathBuf,
+        invocation_cwd: PathBuf,
+        additional_paths: Vec<PathBuf>,
+        workspace_trusted: bool,
+        home: Option<PathBuf>,
+    ) -> Result<Self, SkillLoadError> {
+        let mut roots = Vec::<(PathBuf, SkillRootPolicy)>::new();
+        let user_standard = SkillRootPolicy {
+            trust: SkillTrust::UserInstalled,
+            direct_markdown: false,
+            legacy_ygg: false,
+        };
+        if let Some(home) = &home {
+            roots.push((home.join(".agents/skills"), user_standard));
+            roots.push((
+                home.join(".pi/agent/skills"),
+                SkillRootPolicy {
+                    direct_markdown: true,
+                    ..user_standard
+                },
+            ));
+            roots.push((
+                home.join(".ygg/skills"),
+                SkillRootPolicy {
+                    legacy_ygg: true,
+                    ..user_standard
+                },
+            ));
+        }
+
+        let mut diagnostics = Vec::new();
+        let project_roots = project_skill_directories(&workspace_root, &invocation_cwd);
+        let project_standard = SkillRootPolicy {
+            trust: SkillTrust::Workspace,
+            direct_markdown: false,
+            legacy_ygg: false,
+        };
+        let mut gated_project_roots = project_roots;
+        gated_project_roots.push(invocation_cwd.join(".pi/skills"));
+        gated_project_roots.push(workspace_root.join(".ygg/skills"));
+        if workspace_trusted {
+            for (index, root) in gated_project_roots.into_iter().enumerate() {
+                let is_pi = index + 2
+                    == project_skill_directories(&workspace_root, &invocation_cwd).len() + 2;
+                let is_ygg = root == workspace_root.join(".ygg/skills");
+                roots.push((
+                    root,
+                    SkillRootPolicy {
+                        direct_markdown: is_pi,
+                        legacy_ygg: is_ygg,
+                        ..project_standard
+                    },
+                ));
+            }
+        } else {
+            for root in gated_project_roots {
+                if root.exists() {
+                    diagnostics.push(skill_diagnostic(
+                        root,
+                        "ignored project skills because the workspace is not trusted",
+                    ));
+                }
+            }
+        }
+
+        for path in additional_paths {
+            let path = if path.is_absolute() {
+                path
+            } else {
+                invocation_cwd.join(path)
+            };
+            roots.push((
+                path,
+                SkillRootPolicy {
+                    trust: SkillTrust::ExplicitExternal,
+                    direct_markdown: true,
+                    legacy_ygg: false,
+                },
+            ));
+        }
+
+        let mut candidates = Vec::new();
+        for (root, policy) in roots {
+            scan_skill_root(&root, policy, &mut candidates, &mut diagnostics);
+        }
+        Self::from_candidates(candidates, diagnostics, workspace_trusted)
+    }
+
+    fn from_candidates(
+        candidates: Vec<SkillCandidate>,
+        mut diagnostics: Vec<SkillDiagnostic>,
+        workspace_trusted: bool,
+    ) -> Result<Self, SkillLoadError> {
+        let mut selected = BTreeMap::<SkillId, SkillDescriptor>::new();
+        let mut real_paths = HashSet::<PathBuf>::new();
+        for candidate in candidates {
+            let real_path = match candidate.entrypoint.canonicalize() {
+                Ok(path) => path,
+                Err(error) => {
+                    diagnostics.push(skill_diagnostic(
+                        &candidate.entrypoint,
+                        format!("cannot canonicalize skill entrypoint: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            if !real_paths.insert(real_path.clone()) {
+                continue;
+            }
+            let root = match real_path.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => {
+                    diagnostics.push(skill_diagnostic(
+                        &real_path,
+                        "skill entrypoint has no parent",
+                    ));
+                    continue;
+                }
+            };
+            let mut parsed_diagnostics = Vec::new();
+            match parse_manifest_header_with_diagnostics(
+                &real_path,
+                candidate.policy.trust,
+                &root,
+                candidate.policy.legacy_ygg,
+                &mut parsed_diagnostics,
+            ) {
+                Ok(descriptor) => {
+                    diagnostics.extend(parsed_diagnostics);
+                    if let Some(shadowed) =
+                        selected.insert(descriptor.id.clone(), descriptor.clone())
+                    {
+                        let loser = match shadowed.source {
+                            SkillSource::FileSystem { entrypoint, .. } => entrypoint,
+                            SkillSource::BuiltIn => PathBuf::from("<built-in>"),
+                        };
+                        diagnostics.push(skill_diagnostic(
+                            &real_path,
+                            format!(
+                                "skill name {:?} collision; {} was shadowed by this higher-precedence definition",
+                                descriptor.id,
+                                loser.display()
+                            ),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    diagnostics.extend(parsed_diagnostics);
+                    diagnostics.push(skill_diagnostic(&real_path, error.to_string()));
+                }
+            }
+        }
+        let descriptors = selected.into_values().collect::<Vec<_>>();
+        for diagnostic in &diagnostics {
+            crate::output::stderr_line(format!(
+                "resource: skill {}: {}",
+                diagnostic.path.display(),
+                diagnostic.message
+            ));
+        }
+        Ok(Self {
+            descriptors: Arc::from(descriptors),
+            diagnostics: Arc::from(diagnostics),
+            workspace_trusted,
+        })
+    }
+
+    /// Parse the legacy shared-resolver snapshot retained for embedders and migration tests.
+    pub fn from_snapshot(
+        _workspace_root: PathBuf,
+        _additional_paths: Vec<PathBuf>,
         workspace_trusted: bool,
         snapshot: &ResourceSnapshot,
     ) -> Self {
@@ -445,85 +906,43 @@ impl FileSystemSkillRegistry {
         let mut diagnostics = snapshot
             .diagnostics()
             .iter()
-            .map(|diagnostic| SkillDiagnostic {
-                path: diagnostic.path.clone(),
-                message: diagnostic.message.clone(),
-            })
+            .map(|diagnostic| skill_diagnostic(&diagnostic.path, &diagnostic.message))
             .collect::<Vec<_>>();
-        for diagnostic in snapshot.diagnostics() {
-            crate::output::stderr_line(format!(
-                "resource: skill {}: {}",
-                diagnostic.path.display(),
-                diagnostic.message
-            ));
-        }
-        let mut descriptors = Vec::new();
+        let mut candidates = Vec::new();
         for resource in snapshot.resources() {
             let trust = match resource.trust {
                 ResourceTrust::User => SkillTrust::UserInstalled,
                 ResourceTrust::TrustedWorkspace => SkillTrust::Workspace,
                 ResourceTrust::Explicit => SkillTrust::ExplicitExternal,
             };
-            let entrypoint = match resource.path.canonicalize() {
-                Ok(path) => path,
-                Err(error) => {
-                    crate::output::stderr_line(format!(
-                        "warning: ignoring unreadable skill {}: {error}",
-                        resource.path.display()
-                    ));
-                    diagnostics.push(SkillDiagnostic {
-                        path: resource.path.clone(),
-                        message: format!("cannot read skill entrypoint: {error}"),
-                    });
-                    continue;
-                }
-            };
-            let Some(skill_root) = entrypoint.parent() else {
-                crate::output::stderr_line(format!(
-                    "warning: ignoring malformed skill path {}",
-                    resource.path.display()
-                ));
-                diagnostics.push(SkillDiagnostic {
-                    path: resource.path.clone(),
-                    message: "skill entrypoint has no parent directory".into(),
-                });
-                continue;
-            };
-            match parse_manifest_header(&entrypoint, trust, skill_root) {
-                Ok(descriptor) if descriptor.id == resource.name => descriptors.push(descriptor),
-                Ok(descriptor) => {
-                    let message = format!(
-                        "manifest ID {} does not match directory name {}",
-                        descriptor.id, resource.name
-                    );
-                    crate::output::stderr_line(format!(
-                        "warning: ignoring skill {}: {message}",
-                        resource.path.display()
-                    ));
-                    diagnostics.push(SkillDiagnostic {
-                        path: resource.path.clone(),
-                        message,
-                    });
-                }
-                Err(error) => {
-                    crate::output::stderr_line(format!(
-                        "warning: ignoring malformed skill {}: {error}",
-                        resource.path.display()
-                    ));
-                    diagnostics.push(SkillDiagnostic {
-                        path: resource.path.clone(),
-                        message: error.to_string(),
-                    });
-                }
-            }
+            candidates.push(SkillCandidate {
+                entrypoint: resource.path.clone(),
+                root: resource
+                    .path
+                    .parent()
+                    .unwrap_or(&resource.root)
+                    .to_path_buf(),
+                policy: SkillRootPolicy {
+                    trust,
+                    direct_markdown: false,
+                    legacy_ygg: resource
+                        .path
+                        .components()
+                        .any(|component| component.as_os_str() == ".ygg"),
+                },
+            });
         }
-        descriptors.sort_by(|left, right| left.id.cmp(&right.id));
-        Self {
-            _workspace_root: workspace_root,
-            _additional_paths: additional_paths,
-            descriptors: Arc::from(descriptors),
-            diagnostics: Arc::from(diagnostics),
+        match Self::from_candidates(
+            candidates,
+            std::mem::take(&mut diagnostics),
             workspace_trusted,
+        ) {
+            Ok(registry) => registry,
+            Err(error) => Self {
+                descriptors: Arc::from([]),
+                diagnostics: Arc::from([skill_diagnostic("<snapshot>", error.to_string())]),
+                workspace_trusted,
+            },
         }
     }
 
@@ -534,40 +953,40 @@ impl FileSystemSkillRegistry {
         workspace_trusted: bool,
         user_dir: Option<PathBuf>,
     ) -> Result<Self, SkillLoadError> {
-        let mut map = std::collections::HashMap::new();
-        let mut scan = |path: &Path, trust| {
-            if let Err(error) = scan_skills_dir(path, trust, &mut map) {
-                crate::output::stderr_line(format!(
-                    "warning: failed to scan skills directory {}: {error}",
-                    path.display()
-                ));
-            }
+        let mut candidates = Vec::new();
+        let mut diagnostics = Vec::new();
+        let legacy_user = SkillRootPolicy {
+            trust: SkillTrust::UserInstalled,
+            direct_markdown: false,
+            legacy_ygg: true,
         };
-
-        if let Some(user_dir) = user_dir.as_deref() {
-            scan(user_dir, SkillTrust::UserInstalled);
+        if let Some(user_dir) = user_dir {
+            scan_skill_root(&user_dir, legacy_user, &mut candidates, &mut diagnostics);
         }
-        let workspace_dir = workspace_root.join(".ygg").join("skills");
-        // An untrusted checkout must not publish metadata or shadow a trusted
-        // user skill with the same ID. The load-time check remains a
-        // defense-in-depth guard for any future descriptor source.
+        let workspace_dir = workspace_root.join(".ygg/skills");
         if workspace_trusted {
-            scan(&workspace_dir, SkillTrust::Workspace);
+            scan_skill_root(
+                &workspace_dir,
+                SkillRootPolicy {
+                    trust: SkillTrust::Workspace,
+                    ..legacy_user
+                },
+                &mut candidates,
+                &mut diagnostics,
+            );
         }
-        for path in &additional_paths {
-            scan(path, SkillTrust::ExplicitExternal);
+        for path in additional_paths {
+            scan_skill_root(
+                &path,
+                SkillRootPolicy {
+                    trust: SkillTrust::ExplicitExternal,
+                    ..legacy_user
+                },
+                &mut candidates,
+                &mut diagnostics,
+            );
         }
-
-        let mut descriptors: Vec<SkillDescriptor> = map.into_values().collect();
-        descriptors.sort_by(|left, right| left.id.cmp(&right.id));
-
-        Ok(Self {
-            _workspace_root: workspace_root,
-            _additional_paths: additional_paths,
-            descriptors: Arc::from(descriptors),
-            diagnostics: Arc::from([]),
-            workspace_trusted,
-        })
+        Self::from_candidates(candidates, diagnostics, workspace_trusted)
     }
 }
 
@@ -581,94 +1000,182 @@ impl SkillRegistry for FileSystemSkillRegistry {
     }
 
     fn find(&self, query: &SkillQuery) -> Vec<SkillSearchResult> {
-        let q = query.text.to_ascii_lowercase();
+        let query = query.text.to_ascii_lowercase();
         self.descriptors
             .iter()
-            .filter(|d| {
-                d.id.to_ascii_lowercase().contains(&q)
-                    || d.name.to_ascii_lowercase().contains(&q)
-                    || d.description.to_ascii_lowercase().contains(&q)
-                    || d.tags.iter().any(|t| t.to_ascii_lowercase().contains(&q))
+            .filter(|descriptor| {
+                descriptor.id.to_ascii_lowercase().contains(&query)
+                    || descriptor.name.to_ascii_lowercase().contains(&query)
+                    || descriptor.description.to_ascii_lowercase().contains(&query)
+                    || descriptor
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_ascii_lowercase().contains(&query))
             })
-            .map(|d| SkillSearchResult {
-                descriptor: d.clone(),
+            .map(|descriptor| SkillSearchResult {
+                descriptor: descriptor.clone(),
             })
             .collect()
     }
 
     fn load(&self, id: &SkillId) -> Result<LoadedSkill, SkillLoadError> {
-        let desc = self
+        let descriptor = self
             .descriptors
             .iter()
-            .find(|d| &d.id == id)
+            .find(|descriptor| &descriptor.id == id)
             .ok_or_else(|| SkillLoadError::NotFound(id.clone()))?;
-
-        if desc.trust == SkillTrust::Workspace && !self.workspace_trusted {
+        if descriptor.trust == SkillTrust::Workspace && !self.workspace_trusted {
             return Err(SkillLoadError::UntrustedWorkspace);
         }
-
-        let entrypoint = match &desc.source {
+        let (root, entrypoint) = match &descriptor.source {
             SkillSource::BuiltIn => {
-                return Err(SkillLoadError::UnsupportedSource("built-in".to_string()))
+                return Err(SkillLoadError::UnsupportedSource("built-in".into()))
             }
-            SkillSource::FileSystem { entrypoint, .. } => entrypoint,
-        };
-
-        let root = match &desc.source {
-            SkillSource::FileSystem { root, .. } => root,
-            _ => unreachable!(),
+            SkillSource::FileSystem { root, entrypoint } => (root, entrypoint),
         };
         check_symlinks(root, entrypoint)?;
-
-        let limit = 256 * 1024; // 256 KiB
-        let content_bytes = ygg_agent::secure_fs::read_regular_file_bounded(entrypoint, limit)
-            .map_err(|error| match error {
-                ygg_agent::secure_fs::SecureFileError::TooLarge { actual, .. } => {
-                    SkillLoadError::ResourceTooLarge(actual)
-                }
-                other => SkillLoadError::Io(other.to_string()),
-            })?;
-        let content_str =
-            String::from_utf8(content_bytes).map_err(|_| SkillLoadError::InvalidUtf8)?;
-        let hash = ygg_agent::content_hash(content_str.as_bytes());
-
+        let bytes =
+            ygg_agent::secure_fs::read_regular_file_bounded(entrypoint, MAX_SKILL_FILE_BYTES)
+                .map_err(|error| match error {
+                    ygg_agent::secure_fs::SecureFileError::TooLarge { actual, .. } => {
+                        SkillLoadError::ResourceTooLarge(actual)
+                    }
+                    other => SkillLoadError::Io(other.to_string()),
+                })?;
+        let content = String::from_utf8(bytes).map_err(|_| SkillLoadError::InvalidUtf8)?;
+        let content_hash = ygg_agent::content_hash(content.as_bytes());
         Ok(LoadedSkill {
-            descriptor: desc.clone(),
-            instructions: strip_frontmatter(&content_str)?,
-            content_hash: hash,
+            descriptor: descriptor.clone(),
+            instructions: strip_frontmatter(&content)?,
+            content_hash,
         })
     }
 
     fn read_resource(&self, snapshot: &LoadedSkill, path: &str) -> Result<String, SkillLoadError> {
-        let root_path = match &snapshot.descriptor.source {
+        let root = match &snapshot.descriptor.source {
             SkillSource::BuiltIn => {
-                return Err(SkillLoadError::UnsupportedSource("built-in".to_string()))
+                return Err(SkillLoadError::UnsupportedSource("built-in".into()))
             }
             SkillSource::FileSystem { root, .. } => root,
         };
-
-        let path_obj = Path::new(path);
-        if path_obj.is_absolute() || path.contains("..") {
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
             return Err(SkillLoadError::InvalidResourcePath);
         }
-
-        let target = root_path.join(path_obj);
-        check_allowed_subdirs(root_path, &target)?;
-        check_symlinks(root_path, &target)?;
-
-        let size_limit = 512 * 1024; // 512 KiB
-        let content_bytes = ygg_agent::secure_fs::read_regular_file_bounded(&target, size_limit)
-            .map_err(|error| match error {
+        let target = root.join(relative);
+        check_allowed_subdirs(root, &target)?;
+        check_symlinks(root, &target)?;
+        let bytes = ygg_agent::secure_fs::read_regular_file_bounded(&target, 512 * 1024).map_err(
+            |error| match error {
                 ygg_agent::secure_fs::SecureFileError::TooLarge { actual, .. } => {
                     SkillLoadError::ResourceTooLarge(actual)
                 }
                 other => SkillLoadError::Io(other.to_string()),
-            })?;
-        let content_str =
-            String::from_utf8(content_bytes).map_err(|_| SkillLoadError::InvalidUtf8)?;
-
-        Ok(content_str)
+            },
+        )?;
+        String::from_utf8(bytes).map_err(|_| SkillLoadError::InvalidUtf8)
     }
+}
+
+fn skill_location(descriptor: &SkillDescriptor) -> Option<&Path> {
+    match &descriptor.source {
+        SkillSource::FileSystem { entrypoint, .. } => Some(entrypoint),
+        SkillSource::BuiltIn => None,
+    }
+}
+
+fn normalize_lf(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn skill_xml(value: &str) -> String {
+    normalize_lf(value)
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Format the immutable model-visible Agent Skills catalog in Pi's XML form.
+pub fn format_skills_for_prompt(descriptors: &[SkillDescriptor]) -> String {
+    let mut visible = descriptors
+        .iter()
+        .filter(|descriptor| !descriptor.disable_model_invocation)
+        .filter_map(|descriptor| skill_location(descriptor).map(|path| (descriptor, path)))
+        .collect::<Vec<_>>();
+    visible.sort_by(|(left, left_path), (right, right_path)| {
+        left.id
+            .cmp(&right.id)
+            .then_with(|| left_path.cmp(right_path))
+    });
+    if visible.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![
+        "".to_owned(),
+        "".to_owned(),
+        "The following skills provide specialized instructions for specific tasks.".to_owned(),
+        "Use the read tool to load a skill's file when the task matches its description.".to_owned(),
+        "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_owned(),
+        "".to_owned(),
+        "<available_skills>".to_owned(),
+    ];
+    for (descriptor, path) in visible {
+        lines.push("  <skill>".into());
+        lines.push(format!("    <name>{}</name>", skill_xml(&descriptor.id)));
+        lines.push(format!(
+            "    <description>{}</description>",
+            skill_xml(&descriptor.description)
+        ));
+        lines.push(format!(
+            "    <location>{}</location>",
+            skill_xml(&prompt_path(path))
+        ));
+        lines.push("  </skill>".into());
+    }
+    lines.push("</available_skills>".into());
+    lines.join("\n")
+}
+
+/// Expand an explicit `/skill:name arguments` invocation into an ordinary user message.
+pub fn expand_skill_command(
+    registry: &dyn SkillRegistry,
+    input: &str,
+) -> Result<Option<String>, SkillLoadError> {
+    let Some(rest) = input.strip_prefix("/skill:") else {
+        return Ok(None);
+    };
+    let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    if name.is_empty() {
+        return Err(SkillLoadError::NotFound(String::new()));
+    }
+    let arguments = rest[name_end..].trim();
+    let loaded = registry.load(&name.to_owned())?;
+    let location = skill_location(&loaded.descriptor)
+        .ok_or_else(|| SkillLoadError::UnsupportedSource("built-in".into()))?;
+    let base = location
+        .parent()
+        .ok_or_else(|| SkillLoadError::SecurityViolation("skill has no base directory".into()))?;
+    let body = loaded.instructions.trim();
+    let block = format!(
+        "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
+        skill_xml(&loaded.descriptor.id),
+        skill_xml(&prompt_path(location)),
+        prompt_path(base),
+        body
+    );
+    Ok(Some(if arguments.is_empty() {
+        block
+    } else {
+        format!("{block}\n\n{arguments}")
+    }))
 }
 
 /// Validates a skill's declared tool requirements against the exact final tool
@@ -1024,6 +1531,7 @@ mod tests {
             cache_retention: ygg_ai::CacheRetention::Short,
             sandbox: SandboxPolicy::default(),
             theme: None,
+            system_prompt: None,
             theme_paths: vec![],
             color: crate::config::ColorMode::Auto,
             mouse: crate::config::MouseMode::Auto,
@@ -1236,6 +1744,28 @@ Environment:
     }
 
     #[test]
+    fn compose_instructions_uses_system_prompt_when_present() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "project context").unwrap();
+        let mut config = config(root.path().to_owned(), root.path().to_owned());
+        config.system_prompt = Some("system override".into());
+
+        let output = compose_instructions(&config).unwrap();
+        assert_eq!(output, "system override");
+    }
+
+    #[test]
+    fn compose_instructions_allows_explicit_empty_system_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "project context").unwrap();
+        let mut config = config(root.path().to_owned(), root.path().to_owned());
+        config.system_prompt = Some("".into());
+
+        let output = compose_instructions(&config).unwrap();
+        assert_eq!(output, "");
+    }
+
+    #[test]
     fn untrusted_or_disabled_workspace_context_never_enters_the_system_prompt() {
         let root = tempfile::tempdir().unwrap();
         let global_dir = tempfile::tempdir().unwrap();
@@ -1408,14 +1938,14 @@ Environment:
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(
             skill.join("SKILL.md"),
-            "---\nname: Focused Review\ndescription: Review only relevant code.\n---\nStay focused.",
+            "---\nname: focused-review\ndescription: Review only relevant code.\n---\nStay focused.",
         )
         .unwrap();
         let resolver = ResourceResolver::with_global_ygg_dir(workspace.clone(), true, global);
         let snapshot = resolver.discover(ResourceKind::Skill, &[]);
         let registry = FileSystemSkillRegistry::from_snapshot(workspace, vec![], true, &snapshot);
         let loaded = registry.load(&"focused-review".to_owned()).unwrap();
-        assert_eq!(loaded.descriptor.name, "Focused Review");
+        assert_eq!(loaded.descriptor.name, "focused-review");
         assert_eq!(loaded.descriptor.id, "focused-review");
         assert_eq!(loaded.instructions.trim(), "Stay focused.");
     }
@@ -1447,13 +1977,14 @@ Environment:
         let diagnostics = registry.diagnostics();
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.path.ends_with("malformed/SKILL.md")
-                && diagnostic.message.contains("missing field")
+                && diagnostic.message.contains("description is required")
         }));
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.path.ends_with("wrong-directory/SKILL.md")
                 && diagnostic.message.contains("does not match directory name")
         }));
-        assert!(registry.descriptors().is_empty());
+        assert_eq!(registry.descriptors().len(), 1);
+        assert_eq!(registry.descriptors()[0].id, "declared-id");
     }
 
     #[tokio::test]
@@ -1498,6 +2029,11 @@ Environment:
             id: "needs-tools".to_string(),
             name: "Needs tools".to_string(),
             description: "test".to_string(),
+            license: None,
+            compatibility: None,
+            metadata: Default::default(),
+            allowed_tools: vec![],
+            disable_model_invocation: false,
             version: None,
             source: SkillSource::BuiltIn,
             trust: SkillTrust::BuiltIn,
@@ -1644,6 +2180,11 @@ Environment:
             id: "my-skill".to_string(),
             name: "My Skill".to_string(),
             description: "Desc".to_string(),
+            license: None,
+            compatibility: None,
+            metadata: Default::default(),
+            allowed_tools: vec![],
+            disable_model_invocation: false,
             version: None,
             source: SkillSource::FileSystem {
                 root: PathBuf::from("root"),
@@ -1708,6 +2249,11 @@ Environment:
             id: "my-skill".to_string(),
             name: "My Skill".to_string(),
             description: "Desc".to_string(),
+            license: None,
+            compatibility: None,
+            metadata: Default::default(),
+            allowed_tools: vec![],
+            disable_model_invocation: false,
             version: None,
             source: SkillSource::FileSystem {
                 root: PathBuf::from("root"),

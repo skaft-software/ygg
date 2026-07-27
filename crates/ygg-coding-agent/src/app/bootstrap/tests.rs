@@ -74,6 +74,7 @@ fn config(directory: &std::path::Path, model: Option<&str>) -> Config {
         cache_retention: ygg_ai::CacheRetention::Short,
         sandbox: SandboxPolicy::default(),
         theme: None,
+        system_prompt: None,
         theme_paths: vec![],
         color: crate::config::ColorMode::Auto,
         plain: false,
@@ -105,20 +106,12 @@ fn config(directory: &std::path::Path, model: Option<&str>) -> Config {
     }
 }
 
-fn configured_test_extensions(skills: Arc<dyn SkillRegistry>, config: &Config) -> ExtensionHost {
+fn configured_test_extensions(_skills: Arc<dyn SkillRegistry>, config: &Config) -> ExtensionHost {
     let boot = bootstrap(config.clone()).unwrap();
     let model_id = config.model.as_ref().expect("test model");
     let model = boot.catalog.resolve(model_id).unwrap();
     let session = Session::create(config.workspace.join("tool-policy-test.jsonl")).unwrap();
-    configured_extensions(
-        skills,
-        config,
-        &session,
-        &model,
-        &config.reasoning,
-        &boot.sessions,
-    )
-    .0
+    configured_extensions(config, &session, &model, &config.reasoning, &boot.sessions).0
 }
 
 fn append_active_skill(session: &mut Session, id: &str, required_tools: &[&str]) {
@@ -128,6 +121,11 @@ fn append_active_skill(session: &mut Session, id: &str, required_tools: &[&str])
                 id: id.into(),
                 name: id.into(),
                 description: "test active skill".into(),
+                license: None,
+                compatibility: None,
+                metadata: Default::default(),
+                allowed_tools: vec![],
+                disable_model_invocation: false,
                 version: None,
                 source: ygg_agent::SkillSource::BuiltIn,
                 trust: ygg_agent::SkillTrust::BuiltIn,
@@ -1801,15 +1799,8 @@ fn disabled_tools_are_absent_from_both_schema_and_execution_registry() {
 }
 
 #[test]
-fn skill_requirements_use_the_filtered_core_and_extension_registry() {
+fn legacy_skill_tools_are_not_registered_by_default() {
     let directory = tempfile::tempdir().unwrap();
-    let skill_root = directory.path().join(".ygg/skills/reviewer");
-    std::fs::create_dir_all(&skill_root).unwrap();
-    std::fs::write(
-        skill_root.join("SKILL.md"),
-        "---\nid: reviewer\nname: Reviewer\ndescription: Review code\n---\nReview carefully.",
-    )
-    .unwrap();
     let skills: Arc<dyn SkillRegistry> =
         Arc::new(FileSystemSkillRegistry::new(directory.path().to_owned(), vec![], true).unwrap());
     let mut config = config(directory.path(), Some("gpt-4o-mini"));
@@ -1822,32 +1813,11 @@ fn skill_requirements_use_the_filtered_core_and_extension_registry() {
         .into_iter()
         .map(|definition| definition.name)
         .collect::<Vec<_>>();
-    assert_eq!(registered, vec!["read", "load_skill"]);
-
-    let available = ygg_agent::SkillDescriptor {
-        id: "available".into(),
-        name: "Available".into(),
-        description: "test".into(),
-        version: None,
-        source: ygg_agent::SkillSource::BuiltIn,
-        trust: ygg_agent::SkillTrust::BuiltIn,
-        required_tools: vec!["read".into(), "load_skill".into()],
-        tags: vec![],
-    };
-    assert!(crate::resources::validate_skill_requirements(&available, &registered).is_ok());
-
-    let unavailable = ygg_agent::SkillDescriptor {
-        required_tools: vec!["edit".into()],
-        ..available
-    };
-    assert!(matches!(
-        crate::resources::validate_skill_requirements(&unavailable, &registered),
-        Err(ygg_agent::SkillLoadError::MissingRequiredTools(missing)) if missing == vec!["edit"]
-    ));
+    assert_eq!(registered, vec!["read"]);
 }
 
 #[test]
-fn initial_build_rejects_an_active_skill_missing_from_the_final_tool_registry() {
+fn initial_build_ignores_legacy_active_skill_tool_requirements() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("active-skill.jsonl");
     let mut session = Session::create(&path).unwrap();
@@ -1857,7 +1827,7 @@ fn initial_build_rejects_an_active_skill_missing_from_the_final_tool_registry() 
     let mut config = config(directory.path(), Some("gpt-4o-mini"));
     config.tools = crate::config::ToolPolicy::only(["read".to_owned()]).unwrap();
     let boot = bootstrap(config).unwrap();
-    let error = match build_app(
+    let app = build_app(
         boot,
         LaunchSelection {
             model: ModelId("gpt-4o-mini".into()),
@@ -1866,22 +1836,13 @@ fn initial_build_rejects_an_active_skill_missing_from_the_final_tool_registry() 
             reasoning_mode: ygg_ai::ReasoningMode::Standard,
         },
         "system".into(),
-    ) {
-        Ok(_) => panic!("an incompatible active skill must fail before the app starts"),
-        Err(error) => error,
-    };
-    let message = error.to_string();
-    assert!(message.contains("active skill \"editor\""), "{message}");
-    assert!(
-        message.contains("Missing required tools: [\"edit\"]"),
-        "{message}"
-    );
-    assert!(message.contains("available tools: read"), "{message}");
-    assert!(message.contains("sandbox capabilities"), "{message}");
+    )
+    .unwrap();
+    assert!(!app.system.contains("test instructions"));
 }
 
 #[test]
-fn rebuild_revalidates_active_skills_after_the_tool_policy_changes() {
+fn rebuild_ignores_legacy_active_skill_tool_requirements() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("active-skill-rebuild.jsonl");
     let mut session = Session::create(&path).unwrap();
@@ -1903,17 +1864,8 @@ fn rebuild_revalidates_active_skills_after_the_tool_policy_changes() {
     .unwrap();
     app.config.tools = crate::config::ToolPolicy::only(["read".to_owned()]).unwrap();
 
-    let error = match rebuild_app(app, None, None, None, None) {
-        Ok(_) => panic!("rebuild must revalidate persisted active skills"),
-        Err(error) => error,
-    };
-    let message = error.to_string();
-    assert!(message.contains("active skill \"editor\""), "{message}");
-    assert!(
-        message.contains("Missing required tools: [\"edit\"]"),
-        "{message}"
-    );
-    assert!(message.contains("available tools: read"), "{message}");
+    let rebuilt = rebuild_app(app, None, None, None, None).unwrap();
+    assert!(!rebuilt.system.contains("test instructions"));
 }
 
 #[test]
@@ -1964,10 +1916,7 @@ fn model_without_tool_capability_gets_no_default_surface_and_rejects_explicit_to
         endpoint: resolved.endpoint,
     };
     let session = Session::create(directory.path().join("no-tools-default.jsonl")).unwrap();
-    let skills: Arc<dyn SkillRegistry> =
-        Arc::new(FileSystemSkillRegistry::new(directory.path().to_owned(), vec![], false).unwrap());
     let (extensions, _) = configured_extensions(
-        skills.clone(),
         &default_config,
         &session,
         &model,
@@ -1981,7 +1930,6 @@ fn model_without_tool_capability_gets_no_default_surface_and_rejects_explicit_to
     let explicit_session =
         Session::create(directory.path().join("no-tools-explicit.jsonl")).unwrap();
     let (extensions, _) = configured_extensions(
-        skills,
         &default_config,
         &explicit_session,
         &model,

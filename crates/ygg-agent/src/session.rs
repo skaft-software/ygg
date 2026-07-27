@@ -35,7 +35,8 @@ use std::path::PathBuf;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use ygg_ai::{
-    Cost, EndpointId, Message, ModelId, Usage, UserMessage, UserPart, PICODOLLARS_PER_MICRODOLLAR,
+    Cost, EndpointId, Message, ModelId, StopReason, Usage, UserMessage, UserPart,
+    PICODOLLARS_PER_MICRODOLLAR,
 };
 
 /// Identifier of a session entry. Unique within one session file.
@@ -89,6 +90,10 @@ pub struct UsageRecord {
     pub kind: UsageRecordKind,
     /// Provider-reported, disjoint token buckets.
     pub usage: Usage,
+    /// Provider-authoritative terminal reason for an assistant turn.
+    /// Legacy usage records and non-assistant operations omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
     /// Endpoint/provider route used for this operation.
     #[serde(default)]
     pub endpoint: Option<EndpointId>,
@@ -189,6 +194,10 @@ pub struct Entry {
     /// Stable presentation metadata. Legacy sessions omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<EntryMetadata>,
+    /// Wall-clock creation time for protocol/session presentation. Legacy
+    /// entries omit it because historical append times cannot be recovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_unix_ms: Option<u64>,
     /// The payload.
     pub value: EntryValue,
 }
@@ -1109,6 +1118,7 @@ impl Session {
             id: id.clone(),
             parent: self.head.clone(),
             metadata,
+            timestamp_unix_ms: Some(now_unix_millis()),
             value,
         };
         let mut buf = Vec::with_capacity(256);
@@ -1265,6 +1275,39 @@ impl Session {
         usage: Usage,
         cost: Option<Cost>,
     ) -> Result<(), SessionError> {
+        self.record_assistant_usage_inner(assistant, endpoint, model, usage, cost, None)
+    }
+
+    /// Persist usage and the provider-authoritative stop reason for one
+    /// completed assistant turn.
+    pub fn record_assistant_usage_with_stop_reason(
+        &mut self,
+        assistant: EntryId,
+        endpoint: EndpointId,
+        model: ModelId,
+        usage: Usage,
+        cost: Option<Cost>,
+        stop_reason: StopReason,
+    ) -> Result<(), SessionError> {
+        self.record_assistant_usage_inner(
+            assistant,
+            endpoint,
+            model,
+            usage,
+            cost,
+            Some(stop_reason),
+        )
+    }
+
+    fn record_assistant_usage_inner(
+        &mut self,
+        assistant: EntryId,
+        endpoint: EndpointId,
+        model: ModelId,
+        usage: Usage,
+        cost: Option<Cost>,
+        stop_reason: Option<StopReason>,
+    ) -> Result<(), SessionError> {
         let valid_assistant = self.entry(&assistant).is_some_and(|entry| {
             matches!(&entry.value, EntryValue::Message(Message::Assistant(_)))
         });
@@ -1274,6 +1317,7 @@ impl Session {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::AssistantTurn { assistant },
             usage,
+            stop_reason,
             endpoint: Some(endpoint),
             model: Some(model),
             completed_at_unix_ms: Some(now_unix_millis()),
@@ -1295,6 +1339,7 @@ impl Session {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::Compaction,
             usage,
+            stop_reason: None,
             endpoint: Some(endpoint),
             model: Some(model),
             completed_at_unix_ms: Some(now_unix_millis()),
@@ -1317,6 +1362,7 @@ impl Session {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::RejectedResponsesTurn,
             usage,
+            stop_reason: None,
             endpoint: Some(endpoint),
             model: Some(model),
             completed_at_unix_ms: Some(now_unix_millis()),
@@ -1339,6 +1385,7 @@ impl Session {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::TerminalGate { returned },
             usage,
+            stop_reason: None,
             endpoint: Some(endpoint),
             model: Some(model),
             completed_at_unix_ms: Some(now_unix_millis()),
@@ -2160,6 +2207,11 @@ mod tests {
             id: id.to_string(),
             name: id.to_string(),
             description: String::new(),
+            license: None,
+            compatibility: None,
+            metadata: Default::default(),
+            allowed_tools: vec![],
+            disable_model_invocation: false,
             version: None,
             source: crate::skills::SkillSource::BuiltIn,
             trust: crate::skills::SkillTrust::BuiltIn,
@@ -2753,6 +2805,7 @@ mod tests {
                 id: id.clone(),
                 parent: parent.clone(),
                 metadata: None,
+                timestamp_unix_ms: None,
                 value: if number == 1 {
                     user("checkpoint root")
                 } else {

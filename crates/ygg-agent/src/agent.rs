@@ -26,7 +26,7 @@ use crate::compaction::{
 use crate::context::{ContextSnapshot, ContextTracker};
 use crate::events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
-    OutputChannel,
+    OutputChannel, QueueDeliveryMode,
 };
 use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
 use crate::input::UserInput;
@@ -232,6 +232,7 @@ pub struct Agent {
     /// persisted in the message body for exact replay instead.
     prompt_display_text: Option<String>,
     max_session_cost_microdollars: Option<u64>,
+    provider_retries_enabled: bool,
     last_run_lifecycle: Option<Arc<RunLifecycle>>,
 }
 
@@ -360,6 +361,22 @@ impl RunControl {
     pub async fn follow_up(&self, input: impl Into<UserInput>) -> Result<(), AgentError> {
         self.tx
             .send(Control::FollowUp(input.into()))
+            .await
+            .map_err(|_| AgentError::RunEnded)
+    }
+
+    /// Changes how pending steering messages are delivered.
+    pub async fn set_steering_mode(&self, mode: QueueDeliveryMode) -> Result<(), AgentError> {
+        self.tx
+            .send(Control::SetSteeringMode(mode))
+            .await
+            .map_err(|_| AgentError::RunEnded)
+    }
+
+    /// Changes how pending follow-up messages are delivered.
+    pub async fn set_follow_up_mode(&self, mode: QueueDeliveryMode) -> Result<(), AgentError> {
+        self.tx
+            .send(Control::SetFollowUpMode(mode))
             .await
             .map_err(|_| AgentError::RunEnded)
     }
@@ -1143,35 +1160,6 @@ async fn execute_recovery_call(
         }
     };
     Ok(result)
-}
-
-fn xml_attribute(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn active_system_prompt(base: &str, session: &Session) -> String {
-    let mut system = base.to_owned();
-    if let Some(head_id) = session.head() {
-        if let Ok(state) = session.resolve_active_skills(&head_id) {
-            for skill in state.active_skills {
-                if !system.is_empty() {
-                    system.push_str("\n\n");
-                }
-                system.push_str(&format!(
-                    "<skill_instructions id=\"{}\" hash=\"{}\">\n",
-                    xml_attribute(&skill.descriptor.id),
-                    xml_attribute(&skill.instructions_hash)
-                ));
-                system.push_str(&skill.instructions);
-                system.push_str("\n</skill_instructions>");
-            }
-        }
-    }
-    system
 }
 
 fn model_visible_branch_entries(session: &Session) -> Vec<&crate::session::Entry> {
@@ -2033,7 +2021,7 @@ impl<'a> CompactionContext<'a> {
             .floor() as u64;
         let mut native_attempted = false;
         loop {
-            let active_system = active_system_prompt(system, self.session);
+            let active_system = system.to_owned();
             let estimate = {
                 let messages = self.session.context_ref()?;
                 estimate_context_tokens(self.session, self.model, &active_system, &messages, tools)
@@ -2099,7 +2087,7 @@ impl<'a> CompactionContext<'a> {
         max_output_tokens: u64,
     ) -> Result<(), AgentError> {
         if self.mode == AgentCompactionMode::NativeResponses {
-            let active_system = active_system_prompt(system, self.session);
+            let active_system = system.to_owned();
             self.compact_native_responses(&active_system, tools, CompactionReason::Overflow)
                 .await?;
             return Ok(());
@@ -2117,7 +2105,7 @@ impl<'a> CompactionContext<'a> {
         }
         let estimate = {
             let messages = self.session.context_ref()?;
-            let active_system = active_system_prompt(system, self.session);
+            let active_system = system.to_owned();
             estimate_context_tokens(self.session, self.model, &active_system, &messages, tools)
         };
         let budget = self
@@ -2270,6 +2258,7 @@ impl Agent {
             prompt_color: None,
             prompt_display_text: None,
             max_session_cost_microdollars: None,
+            provider_retries_enabled: true,
             last_run_lifecycle: None,
         })
     }
@@ -2346,6 +2335,11 @@ impl Agent {
     /// rejected before network I/O.
     pub fn set_max_session_cost_microdollars(&mut self, limit: Option<u64>) {
         self.max_session_cost_microdollars = limit;
+    }
+
+    /// Enable or disable transient provider retries for subsequent runs.
+    pub fn set_provider_retries_enabled(&mut self, enabled: bool) {
+        self.provider_retries_enabled = enabled;
     }
 
     /// Configure the model used for autonomous context summaries. Passing
@@ -2447,7 +2441,7 @@ impl Agent {
     /// as autonomous capacity checks, without mutating the session.
     pub fn request_context_estimate(&self) -> Result<RequestContextEstimate, SessionError> {
         let messages = self.session.context_ref()?;
-        let system = active_system_prompt(&self.system, &self.session);
+        let system = self.system.clone();
         let tools = self.extensions.tool_definitions();
         Ok(reconcile_context_estimate(
             &self.session,
@@ -2473,7 +2467,7 @@ impl Agent {
         else {
             return Ok(None);
         };
-        let system = active_system_prompt(&self.system, &self.session);
+        let system = self.system.clone();
         Ok(Some(ygg_ai::responses::encode_responses_replay(
             &self.model,
             (!system.is_empty()).then_some(system.as_str()),
@@ -2507,7 +2501,7 @@ impl Agent {
                 )
             })?;
         let input = ygg_ai::responses::encode_responses_replay(&self.model, None, &replay);
-        let active_system = active_system_prompt(&self.system, &self.session);
+        let active_system = self.system.clone();
         let instructions = (!active_system.is_empty()).then_some(active_system.as_str());
         let tools = self.extensions.tool_definitions();
         if replay.is_empty() {
@@ -2738,6 +2732,7 @@ impl Agent {
         let auto_compaction_mode = self.auto_compaction_mode;
         let compaction_threshold_fraction = self.compaction_threshold_fraction;
         let compaction_keep_recent_turns = self.compaction_keep_recent_turns;
+        let provider_retries_enabled = self.provider_retries_enabled;
         let stream_lifecycle = lifecycle.clone();
         let session = &mut self.session;
 
@@ -2764,6 +2759,10 @@ impl Agent {
 
             let mut pending_steer: Vec<UserInput> = Vec::new();
             let mut followups: VecDeque<UserInput> = VecDeque::new();
+            // Preserve Ygg's historical defaults; frontends that expose queue
+            // modes can update either mode through RunControl.
+            let mut steering_mode = QueueDeliveryMode::All;
+            let mut follow_up_mode = QueueDeliveryMode::OneAtATime;
             let mut control_open = true;
             let mut completed_turns: u64 = 0;
             let mut terminal_gate_requests = vec![initial_request];
@@ -2778,6 +2777,8 @@ impl Agent {
                     match control_rx.try_recv() {
                         Ok(Control::Steer(input)) => pending_steer.push(input),
                         Ok(Control::FollowUp(input)) => followups.push_back(input),
+                        Ok(Control::SetSteeringMode(mode)) => steering_mode = mode,
+                        Ok(Control::SetFollowUpMode(mode)) => follow_up_mode = mode,
                         Ok(Control::Abort) => break 'run FinishReason::Aborted,
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => control_open = false,
@@ -2788,13 +2789,11 @@ impl Agent {
                 }
 
                 // ── Steering enters here, at the model-turn boundary ───────
-                // Drain the whole steering queue before opening the next
-                // request. This is the "all at once" steering mode: every
-                // message queued since the previous boundary is visible to
-                // the same model turn, after all of that turn's tools have
-                // finished.
                 if !pending_steer.is_empty() {
-                    let queued = std::mem::take(&mut pending_steer);
+                    let queued = match steering_mode {
+                        QueueDeliveryMode::All => std::mem::take(&mut pending_steer),
+                        QueueDeliveryMode::OneAtATime => vec![pending_steer.remove(0)],
+                    };
                     let mut delivered = Vec::with_capacity(queued.len());
                     for input in queued {
                         let summary = input.text_summary();
@@ -2942,7 +2941,8 @@ impl Agent {
                     .await
                     {
                         Err(error)
-                            if stream_retries < provider_retry_limit(&error)
+                            if provider_retries_enabled
+                                && stream_retries < provider_retry_limit(&error)
                                 && retryable_before_generation(&error) =>
                         {
                             let delay = retry_after(&error, stream_retries);
@@ -3050,12 +3050,15 @@ impl Agent {
                         }
                         Next::Ctl(Some(Control::Steer(input))) => pending_steer.push(input),
                         Next::Ctl(Some(Control::FollowUp(input))) => followups.push_back(input),
+                        Next::Ctl(Some(Control::SetSteeringMode(mode))) => steering_mode = mode,
+                        Next::Ctl(Some(Control::SetFollowUpMode(mode))) => follow_up_mode = mode,
                         Next::Ctl(None) => control_open = false,
                         Next::Event(None) => {
                             let error = AiError::StreamProtocol(
                                 ygg_ai::StreamProtocolError::MissingFinish,
                             );
-                            if !attempt_saw_generation
+                            if provider_retries_enabled
+                                && !attempt_saw_generation
                                 && stream_retries < MAX_PROVIDER_RETRIES
                                 && retryable_stream_start(&error)
                             {
@@ -3151,8 +3154,9 @@ impl Agent {
                                     }
                                 }
                             }
-                            while (!attempt_saw_generation
-                                || is_transient_network_failure(&error))
+                            while provider_retries_enabled
+                                && (!attempt_saw_generation
+                                    || is_transient_network_failure(&error))
                                 && stream_retries < provider_retry_limit(&error)
                                 && retryable_stream_start(&error)
                             {
@@ -3294,12 +3298,13 @@ impl Agent {
                 };
                 add_usage(&mut run_usage, &turn_usage);
                 let turn_cost = response.cost;
-                if let Err(error) = session.record_assistant_usage(
+                if let Err(error) = session.record_assistant_usage_with_stop_reason(
                     assistant_entry.clone(),
                     model.endpoint.id.clone(),
                     model.spec.id.clone(),
                     turn_usage,
                     turn_cost,
+                    stop_reason.clone(),
                 ) {
                     break 'run FinishReason::Failed(error.into());
                 }
@@ -3329,6 +3334,7 @@ impl Agent {
                     .then(|| session.total_cost_microdollars());
                     let ev = AgentEvent::TurnFinished {
                         message: assistant.clone(),
+                        stop_reason: stop_reason.clone(),
                         turn_usage,
                         usage: run_usage,
                         session_cost_microdollars: session_cost,
@@ -3344,6 +3350,8 @@ impl Agent {
                     match control_rx.try_recv() {
                         Ok(Control::Steer(input)) => pending_steer.push(input),
                         Ok(Control::FollowUp(input)) => followups.push_back(input),
+                        Ok(Control::SetSteeringMode(mode)) => steering_mode = mode,
+                        Ok(Control::SetFollowUpMode(mode)) => follow_up_mode = mode,
                         Ok(Control::Abort) => {
                             abort.set();
                             break;
@@ -3399,6 +3407,7 @@ impl Agent {
                             .then(|| session.total_cost_microdollars());
                             let ev = AgentEvent::TurnFinished {
                                 message: assistant.clone(),
+                                stop_reason: stop_reason.clone(),
                                 turn_usage,
                                 usage: run_usage,
                                 session_cost_microdollars: session_cost,
@@ -3409,13 +3418,14 @@ impl Agent {
                         }
                         continue;
                     }
-                    if let Some(input) = followups.pop_front() {
+                    if !followups.is_empty() {
                         if gated_candidate {
                             let session_cost = (session.total_cost_microdollars() > 0
                                 || model.spec.pricing.is_some())
                             .then(|| session.total_cost_microdollars());
                             let ev = AgentEvent::TurnFinished {
                                 message: assistant.clone(),
+                                stop_reason: stop_reason.clone(),
                                 turn_usage,
                                 usage: run_usage,
                                 session_cost_microdollars: session_cost,
@@ -3424,14 +3434,36 @@ impl Agent {
                             notify_observers(&observers, &ev);
                             yield ev;
                         }
-                        let summary = input.text_summary();
-                        terminal_gate_requests.push(summary);
-                        if let Err(e) = session.append_with_metadata(
-                            user_message(input),
-                            Some(prompt_metadata.clone()),
-                        ) {
-                            break 'run FinishReason::Failed(e.into());
+                        let queued = match follow_up_mode {
+                            QueueDeliveryMode::All => followups.drain(..).collect::<Vec<_>>(),
+                            QueueDeliveryMode::OneAtATime => {
+                                vec![followups.pop_front().expect("follow-up queue is non-empty")]
+                            }
+                        };
+                        let mut delivered = Vec::with_capacity(queued.len());
+                        for input in queued {
+                            let summary = input.text_summary();
+                            terminal_gate_requests.push(summary.clone());
+                            if let Err(e) = session.append_with_metadata(
+                                user_message(input),
+                                Some(prompt_metadata.clone()),
+                            ) {
+                                if !delivered.is_empty() {
+                                    let ev = AgentEvent::FollowUpDelivered {
+                                        messages: delivered,
+                                    };
+                                    notify_observers(&observers, &ev);
+                                    yield ev;
+                                }
+                                break 'run FinishReason::Failed(e.into());
+                            }
+                            delivered.push(summary);
                         }
+                        let ev = AgentEvent::FollowUpDelivered {
+                            messages: delivered,
+                        };
+                        notify_observers(&observers, &ev);
+                        yield ev;
                         continue;
                     }
                     if completion_policy == CompletionPolicy::TerminalGate {
@@ -3461,6 +3493,7 @@ impl Agent {
                                 .then(|| session.total_cost_microdollars());
                                 let ev = AgentEvent::TurnFinished {
                                     message: assistant.clone(),
+                                    stop_reason: stop_reason.clone(),
                                     turn_usage,
                                     usage: run_usage,
                                     session_cost_microdollars: session_cost,
@@ -3587,6 +3620,8 @@ impl Agent {
                                         c = control_rx.recv(), if control_open => match c {
                                             Some(Control::Steer(input)) => pending_steer.push(input),
                                             Some(Control::FollowUp(input)) => followups.push_back(input),
+                                            Some(Control::SetSteeringMode(mode)) => steering_mode = mode,
+                                            Some(Control::SetFollowUpMode(mode)) => follow_up_mode = mode,
                                             Some(Control::Abort) => {
                                                 abort.set();
                                                 break None;
@@ -3835,6 +3870,7 @@ impl Agent {
                     run_cost = cost;
                 }
                 AgentEvent::SteeringDelivered { .. }
+                | AgentEvent::FollowUpDelivered { .. }
                 | AgentEvent::CompactionStarted { .. }
                 | AgentEvent::CompactionFinished { .. } => {}
                 AgentEvent::TurnFinished {
@@ -3870,36 +3906,6 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn active_skill_instructions_are_labelled_and_injected_once() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
-        session
-            .append(EntryValue::SkillActivated {
-                descriptor: crate::skills::SkillDescriptor {
-                    id: "focused-review".into(),
-                    name: "Focused review".into(),
-                    description: "Review relevant code".into(),
-                    version: None,
-                    source: crate::skills::SkillSource::BuiltIn,
-                    trust: crate::skills::SkillTrust::BuiltIn,
-                    required_tools: vec![],
-                    tags: vec![],
-                },
-                instructions_hash: "abc123".into(),
-                instructions: "Inspect only the relevant files.".into(),
-            })
-            .unwrap();
-
-        let prompt = active_system_prompt("base", &session);
-        assert!(prompt.contains("<skill_instructions id=\"focused-review\" hash=\"abc123\">"));
-        assert!(prompt.contains("</skill_instructions>"));
-        assert_eq!(
-            prompt.matches("Inspect only the relevant files.").count(),
-            1
-        );
-    }
 
     #[test]
     fn response_header_timeout_is_not_automatically_retried() {

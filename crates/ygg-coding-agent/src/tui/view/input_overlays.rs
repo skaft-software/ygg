@@ -49,6 +49,24 @@ pub(super) fn input_slash_suggestions(state: &ShellState) -> Vec<InputSlashSugge
         });
     }
     for (name, description) in state
+        .skill_commands
+        .iter()
+        .filter(|(name, _)| name.starts_with(query))
+    {
+        if suggestions
+            .iter()
+            .any(|suggestion| suggestion.name == *name)
+        {
+            continue;
+        }
+        suggestions.push(InputSlashSuggestion {
+            name: name.clone(),
+            description: format!("skill · {description}"),
+            argument_hint: None,
+            accepts_argument: true,
+        });
+    }
+    for (name, description) in state
         .extension_commands
         .iter()
         .filter(|(name, _)| name.starts_with(query))

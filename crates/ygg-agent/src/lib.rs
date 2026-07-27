@@ -96,7 +96,7 @@ pub use compaction::{
 pub use context::ContextSnapshot;
 pub use events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
-    OutputChannel,
+    OutputChannel, QueueDeliveryMode,
 };
 pub use extension::{EventObserver, Extension, ExtensionHost, ToolCallHook};
 pub use extension_process::{
