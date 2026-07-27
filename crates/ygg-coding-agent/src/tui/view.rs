@@ -52,6 +52,10 @@ use self::outcome_render::{bounded_outcome_detail, render_outcome};
 #[cfg(test)]
 use self::panel_render::render_panel;
 use self::panel_render::{filtered_indices, render_panel_with_limit};
+use self::status_telemetry::{
+    output_tokens_per_second, status_telemetry, styled_status_text,
+    usage_cache_hit_rate_basis_points,
+};
 pub use self::terminal_text::bounded_append;
 use self::terminal_text::{sanitize_extension_surface, sanitize_extension_tool_render_segments};
 pub(crate) use self::terminal_text::{sanitize_for_terminal, sanitized_editor};
@@ -2865,26 +2869,6 @@ fn render_shell_header(state: &ShellState, width: u16) -> Vec<String> {
     lines
 }
 
-/// Calculate a nonzero output-generation rate from a token count and measured
-/// generation interval. Completed turns pass provider-reported tokens; live
-/// rendering passes the explicitly marked character-based estimate.
-fn output_tokens_per_second(output_tokens: u64, elapsed: Duration) -> Option<f64> {
-    (output_tokens > 0 && !elapsed.is_zero())
-        .then(|| output_tokens as f64 / elapsed.as_secs_f64())
-        .filter(|rate| rate.is_finite())
-}
-
-fn usage_cache_hit_rate_basis_points(usage: Usage) -> Option<u16> {
-    let prompt_tokens = usage
-        .input_tokens
-        .saturating_add(usage.cache_read_tokens)
-        .saturating_add(usage.cache_write_tokens);
-    if prompt_tokens == 0 || (usage.cache_read_tokens == 0 && usage.cache_write_tokens == 0) {
-        return None;
-    }
-    Some(((u128::from(usage.cache_read_tokens) * 10_000) / u128::from(prompt_tokens)) as u16)
-}
-
 #[derive(Clone)]
 struct ShellChrome {
     header: Vec<String>,
@@ -2988,110 +2972,6 @@ fn transcript_viewport_capacity_for_state(state: &ShellState, width: u16) -> usi
 /// Picker rows use the legacy closure-styled compatibility API, so each row is
 /// explicitly closed even though sexy-tui 0.2 now preserves extended colors
 /// safely across wraps.
-fn status_dollars(microdollars: u64) -> String {
-    format!("${:.6}", microdollars as f64 / 1_000_000.0)
-}
-
-fn status_telemetry(state: &ShellState, now: Instant) -> String {
-    let mut lines = vec!["Telemetry".to_owned()];
-    if let Some(usage) = state.last_turn_usage {
-        lines.extend([
-            "Usage source   provider-reported (exact)".to_owned(),
-            format!("Input tokens   {}", usage.input_tokens),
-            format!("Cache read     {}", usage.cache_read_tokens),
-            format!("Cache write    {}", usage.cache_write_tokens),
-            format!("Output tokens  {}", usage.output_tokens),
-            format!("Reasoning      {}", usage.reasoning_tokens),
-            format!("Total tokens   {}", usage.total_tokens),
-        ]);
-    } else if let Some(tokens) = state.live_generated_tokens() {
-        lines.push(format!("Output tokens  ~{tokens} (stream estimate)"));
-        lines.push("Usage source   awaiting provider report".to_owned());
-    } else {
-        lines.push("Usage source   unavailable (no completed model turn)".to_owned());
-    }
-
-    let active = state.run.current().is_some_and(|run| run.is_active());
-    match state.price_display {
-        PriceDisplay::Unknown => {
-            lines.push("Turn cost      unavailable (pricing not configured)".to_owned());
-            lines.push("Session cost   unavailable (pricing not configured)".to_owned());
-        }
-        PriceDisplay::ExplicitZero => {
-            lines.push("Turn cost      $0 (configured zero-priced)".to_owned());
-            lines.push("Session cost   $0 (configured zero-priced)".to_owned());
-        }
-        PriceDisplay::Priced => {
-            if state.run_cost_available {
-                let approximate = if active { "~" } else { "" };
-                lines.push(format!(
-                    "Turn cost      {approximate}{} ({})",
-                    status_dollars(state.run_cost_microdollars),
-                    if active { "incomplete" } else { "reported" }
-                ));
-            } else {
-                lines.push("Turn cost      unavailable (no durable completed run)".to_owned());
-            }
-            lines.push(match state.session_cost_microdollars {
-                Some(cost) => format!("Session cost   {} (reported)", status_dollars(cost)),
-                None => "Session cost   awaiting first usage report".to_owned(),
-            });
-        }
-    }
-
-    if let (Some(rate), Some(tokens), Some(elapsed)) = (
-        state.last_turn_tokens_per_second,
-        state.last_turn_generated_tokens,
-        state.last_turn_generation_elapsed,
-    ) {
-        lines.push(format!(
-            "Throughput     {rate:.1} tok/s final ({tokens} reported tokens / {:.2}s measured)",
-            elapsed.as_secs_f64()
-        ));
-    } else if let Some(started) = state.turn_generation_started_at {
-        lines.push(format!(
-            "Throughput     awaiting turn completion ({:.2}s generation in progress)",
-            now.saturating_duration_since(started).as_secs_f64()
-        ));
-    } else {
-        lines.push("Throughput     unavailable".to_owned());
-    }
-    lines.join("\n")
-}
-
-fn styled_status_text(theme: &YggTheme, text: &str) -> String {
-    let safe = sanitize_for_terminal(text);
-    let mut metadata = true;
-    safe.lines()
-        .map(|line| {
-            if line.is_empty() {
-                metadata = false;
-                return String::new();
-            }
-            if !metadata {
-                return line.to_owned();
-            }
-            let Some(separator) = line.find("  ") else {
-                return line.to_owned();
-            };
-            let label = &line[..separator];
-            let spacing_and_value = &line[separator..];
-            let spacing = spacing_and_value
-                .chars()
-                .take_while(|character| character.is_whitespace())
-                .collect::<String>();
-            let value = &spacing_and_value[spacing.len()..];
-            let value = if label == "Model" {
-                theme.bold(&theme.fg("model_accent", value))
-            } else {
-                value.to_owned()
-            };
-            format!("{}{}{}", theme.fg("model_accent", label), spacing, value)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn wrap_overlay_text(text: &str, width: usize) -> Vec<String> {
     let mut wrapped = Vec::new();
     for source_line in text.split('\n') {
@@ -5750,6 +5630,7 @@ mod editor_layout;
 mod input_overlays;
 mod outcome_render;
 mod panel_render;
+mod status_telemetry;
 mod terminal_text;
 mod tool_render;
 mod transcript_history;

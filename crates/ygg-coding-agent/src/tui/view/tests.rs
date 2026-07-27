@@ -1015,18 +1015,6 @@ fn unsupported_media_mention_falls_back_to_a_path_and_notice() {
 }
 
 #[test]
-fn output_token_rate_uses_authoritative_usage_and_generation_elapsed_time() {
-    assert_eq!(
-        output_tokens_per_second(120, Duration::from_secs(2)),
-        Some(60.0)
-    );
-    assert!(output_tokens_per_second(1, Duration::from_millis(250))
-        .is_some_and(|rate| (rate - 4.0).abs() < f64::EPSILON));
-    assert_eq!(output_tokens_per_second(0, Duration::from_secs(1)), None);
-    assert_eq!(output_tokens_per_second(1, Duration::ZERO), None);
-}
-
-#[test]
 fn context_uses_single_turn_provider_total_not_cumulative_run_usage() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("openai", "gpt-5", "high");
@@ -3867,31 +3855,6 @@ fn responsive_header_drops_metadata_instead_of_truncating_every_field() {
     assert!(!narrow.contains("..."));
     assert!(!narrow.contains('…'));
     assert!(narrow.contains("ygg"));
-}
-
-#[test]
-fn status_metadata_uses_the_model_accent_but_no_color_stays_plain() {
-    use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
-
-    let mut theme = crate::tui::theme::test_theme();
-    crate::tui::theme::apply_model_lab(&mut theme, crate::tui::theme::ModelLab::Anthropic);
-    let styled = styled_status_text(
-            &theme,
-            "Provider       anthropic\nModel          claude\nReasoning      high\n\nSecurity model: trusted local agent",
-        );
-    assert!(styled.contains("38;2;169;99;76"), "{styled:?}");
-    assert!(styled.contains("Model"));
-    assert!(styled.contains("claude"));
-
-    let mut plain = crate::tui::theme::test_theme_with(TerminalCapabilities::test(
-        true,
-        true,
-        ColorDepth::None,
-    ));
-    crate::tui::theme::apply_model_lab(&mut plain, crate::tui::theme::ModelLab::Anthropic);
-    let plain = styled_status_text(&plain, "Model          claude");
-    assert_eq!(plain, "Model          claude");
-    assert!(!plain.contains('\x1b'));
 }
 
 #[test]
