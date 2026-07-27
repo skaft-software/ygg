@@ -1,16 +1,23 @@
 import { PROTOCOL_VERSION } from "./protocol";
 import type {
+  ActionPresentation,
   ActionItem,
+  ActivityPhaseSummary,
   AttachmentRef,
   AuthorityProfile,
   ClientCommand,
   CommandAck,
+  CompletionReview,
+  DocumentReference,
   HostBootstrap,
   HostEvent,
   ModelSummary,
   OutputRef,
   PreviewRef,
   ProgressStep,
+  ProjectCatalog,
+  ProjectSummary,
+  RepositoryContextSnapshot,
   ReasoningEffort,
   SessionBranchEntry,
   SessionBranchGraph,
@@ -22,7 +29,12 @@ import type {
   ThemeColor,
   ThemeDto,
   ThemeOption,
+  TranscriptSearchResult,
   TranscriptItem,
+  TrustedFileCatalog,
+  TrustedFileEntry,
+  TrustedFileRead,
+  TrustedFileSearchResult,
 } from "./protocol";
 import {
   deriveSessionTitle,
@@ -89,6 +101,13 @@ function number(value: unknown, path: string): number {
     value < 0
   ) {
     throw new WireContractError(path, "must be a non-negative safe integer");
+  }
+  return value;
+}
+
+function integer(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new WireContractError(path, "must be a safe integer");
   }
   return value;
 }
@@ -441,6 +460,63 @@ function summaryPreview(
   return "Ready when you are";
 }
 
+function projectConversationBranchProvenance(
+  value: unknown,
+  path: string,
+  models?: readonly ModelSummary[],
+) {
+  const provenance = object(value, path, [
+    "operation",
+    "sourceSessionId",
+    "sourceEntryId",
+    "originatingUserEntryId",
+    "modelOverride",
+    "externalEffectsPreserved",
+    "warning",
+  ]);
+  const externalEffectsPreserved = boolean(
+    provenance.externalEffectsPreserved,
+    `${path}.externalEffectsPreserved`,
+  );
+  if (!externalEffectsPreserved) {
+    throw new WireContractError(
+      `${path}.externalEffectsPreserved`,
+      "must explicitly preserve external effects",
+    );
+  }
+  return {
+    operation: enumeration(provenance.operation, `${path}.operation`, [
+      "editUserTurn",
+      "retryResponse",
+      "forkSession",
+    ] as const),
+    sourceSessionId: boundedString(
+      provenance.sourceSessionId,
+      `${path}.sourceSessionId`,
+      256,
+    ),
+    sourceEntryId: boundedString(
+      provenance.sourceEntryId,
+      `${path}.sourceEntryId`,
+      256,
+    ),
+    originatingUserEntryId: optionalString(
+      provenance.originatingUserEntryId,
+      `${path}.originatingUserEntryId`,
+    ),
+    modelOverride:
+      provenance.modelOverride === undefined
+        ? undefined
+        : projectModelSelection(
+            provenance.modelOverride,
+            `${path}.modelOverride`,
+            models,
+          ),
+    externalEffectsPreserved: true as const,
+    warning: boundedString(provenance.warning, `${path}.warning`, 2_048),
+  };
+}
+
 function projectSummary(
   value: unknown,
   path: string,
@@ -455,6 +531,9 @@ function projectSummary(
     "modifiedAtMs",
     "pinned",
     "archived",
+    "lifecycle",
+    "retention",
+    "forkedFrom",
     "provisional",
     "liveState",
     "attention",
@@ -476,6 +555,83 @@ function projectSummary(
   array(summary.tags ?? [], `${path}.tags`).forEach((tag, index) =>
     string(tag, `${path}.tags[${index}]`),
   );
+  const archived = boolean(summary.archived, `${path}.archived`);
+  const lifecycle =
+    summary.lifecycle === undefined
+      ? archived
+        ? "archived"
+        : "active"
+      : enumeration(summary.lifecycle, `${path}.lifecycle`, [
+          "active",
+          "archived",
+          "trash",
+        ] as const);
+  if (archived !== (lifecycle !== "active")) {
+    throw new WireContractError(
+      `${path}.lifecycle`,
+      "must agree with the archived compatibility field",
+    );
+  }
+  const retention =
+    summary.retention === undefined
+      ? undefined
+      : (() => {
+          const value = object(summary.retention, `${path}.retention`, [
+            "trashedAtMs",
+            "purgeAfterMs",
+            "permanentDeleteRequiresConfirmation",
+          ]);
+          const trashedAtMs = number(
+            value.trashedAtMs,
+            `${path}.retention.trashedAtMs`,
+          );
+          const purgeAfterMs = number(
+            value.purgeAfterMs,
+            `${path}.retention.purgeAfterMs`,
+          );
+          if (purgeAfterMs <= trashedAtMs) {
+            throw new WireContractError(
+              `${path}.retention.purgeAfterMs`,
+              "must be after trashedAtMs",
+            );
+          }
+          if (
+            boolean(
+              value.permanentDeleteRequiresConfirmation,
+              `${path}.retention.permanentDeleteRequiresConfirmation`,
+            ) !== true
+          ) {
+            throw new WireContractError(
+              `${path}.retention.permanentDeleteRequiresConfirmation`,
+              "must remain enabled",
+            );
+          }
+          return {
+            trashedAtMs,
+            purgeAfterMs,
+            permanentDeleteRequiresConfirmation: true as const,
+          };
+        })();
+  if ((lifecycle === "trash") !== (retention !== undefined)) {
+    throw new WireContractError(
+      `${path}.retention`,
+      "must be present exactly for trashed sessions",
+    );
+  }
+  const forkedFrom =
+    summary.forkedFrom === undefined
+      ? undefined
+      : projectConversationBranchProvenance(
+          summary.forkedFrom,
+          `${path}.forkedFrom`,
+          models,
+        );
+  if (forkedFrom && forkedFrom.operation !== "forkSession") {
+    throw new WireContractError(
+      `${path}.forkedFrom.operation`,
+      "must identify a new-session fork",
+    );
+  }
   return {
     id: string(summary.id, `${path}.id`),
     projectId:
@@ -485,7 +641,10 @@ function projectSummary(
     status,
     updatedAt: iso(number(summary.modifiedAtMs, `${path}.modifiedAtMs`)),
     pinned: boolean(summary.pinned, `${path}.pinned`),
-    archived: boolean(summary.archived, `${path}.archived`),
+    archived,
+    lifecycle,
+    retention,
+    forkedFrom,
     unread: attention === "unreadCompletion",
     modelId: model.model,
     attentionCount:
@@ -514,32 +673,244 @@ function projectAttachment(value: unknown, path: string): AttachmentRef {
   };
 }
 
+export function projectDocumentReference(
+  value: unknown,
+  path = "document",
+): DocumentReference {
+  const document = object(value, path, [
+    "id",
+    "displayName",
+    "mediaType",
+    "sourceByteCount",
+    "extractedTextByteCount",
+    "sha256",
+    "fidelity",
+    "pageCount",
+    "createdAtMs",
+  ]);
+  return {
+    id: boundedString(document.id, `${path}.id`, 128),
+    displayName: boundedString(
+      document.displayName,
+      `${path}.displayName`,
+      512,
+    ),
+    mediaType: enumeration(document.mediaType, `${path}.mediaType`, [
+      "text/plain",
+      "text/markdown",
+      "application/pdf",
+    ] as const),
+    sourceByteCount: number(
+      document.sourceByteCount,
+      `${path}.sourceByteCount`,
+    ),
+    extractedTextByteCount: number(
+      document.extractedTextByteCount,
+      `${path}.extractedTextByteCount`,
+    ),
+    sha256: boundedString(document.sha256, `${path}.sha256`, 64),
+    fidelity: enumeration(document.fidelity, `${path}.fidelity`, [
+      "exactUtf8",
+      "pdfTextOnlyPartial",
+    ] as const),
+    pageCount:
+      document.pageCount === undefined
+        ? undefined
+        : number(document.pageCount, `${path}.pageCount`),
+    createdAtMs: number(document.createdAtMs, `${path}.createdAtMs`),
+  };
+}
+
+export function projectTrustedFileEntry(
+  value: unknown,
+  path = "trustedFile",
+): TrustedFileEntry {
+  const entry = object(value, path, [
+    "id",
+    "relativePath",
+    "displayName",
+    "kind",
+    "byteLen",
+  ]);
+  return {
+    id: boundedString(entry.id, `${path}.id`, 128),
+    relativePath: boundedString(
+      entry.relativePath,
+      `${path}.relativePath`,
+      2_048,
+    ),
+    displayName: boundedString(
+      entry.displayName,
+      `${path}.displayName`,
+      512,
+    ),
+    kind: enumeration(entry.kind, `${path}.kind`, [
+      "documentation",
+      "source",
+      "configuration",
+      "text",
+    ] as const),
+    byteLen: number(entry.byteLen, `${path}.byteLen`),
+  };
+}
+
+export function projectTrustedFileCatalog(
+  value: unknown,
+): TrustedFileCatalog {
+  const catalog = object(value, "trustedFileCatalog", [
+    "protocol",
+    "summary",
+    "files",
+  ]);
+  protocol(catalog.protocol, "trustedFileCatalog.protocol");
+  const summary = object(catalog.summary, "trustedFileCatalog.summary", [
+    "indexedFiles",
+    "ignoredEntries",
+    "truncated",
+  ]);
+  return {
+    summary: {
+      indexedFiles: number(
+        summary.indexedFiles,
+        "trustedFileCatalog.summary.indexedFiles",
+      ),
+      ignoredEntries: number(
+        summary.ignoredEntries,
+        "trustedFileCatalog.summary.ignoredEntries",
+      ),
+      truncated: boolean(
+        summary.truncated,
+        "trustedFileCatalog.summary.truncated",
+      ),
+    },
+    files: array(catalog.files, "trustedFileCatalog.files").map(
+      (entry, index) =>
+        projectTrustedFileEntry(
+          entry,
+          `trustedFileCatalog.files[${index}]`,
+        ),
+    ),
+  };
+}
+
+export function projectTrustedFileSearchResult(
+  value: unknown,
+): TrustedFileSearchResult {
+  const result = object(value, "trustedFileSearch", [
+    "hits",
+    "truncated",
+    "scannedBytes",
+  ]);
+  return {
+    hits: array(result.hits, "trustedFileSearch.hits").map((value, index) => {
+      const hit = object(value, `trustedFileSearch.hits[${index}]`, [
+        "entry",
+        "snippet",
+        "line",
+      ]);
+      return {
+        entry: projectTrustedFileEntry(
+          hit.entry,
+          `trustedFileSearch.hits[${index}].entry`,
+        ),
+        snippet: boundedString(
+          hit.snippet,
+          `trustedFileSearch.hits[${index}].snippet`,
+          480,
+        ),
+        line:
+          hit.line === undefined
+            ? undefined
+            : number(hit.line, `trustedFileSearch.hits[${index}].line`),
+      };
+    }),
+    truncated: boolean(result.truncated, "trustedFileSearch.truncated"),
+    scannedBytes: number(
+      result.scannedBytes,
+      "trustedFileSearch.scannedBytes",
+    ),
+  };
+}
+
+export function projectTrustedFileRead(value: unknown): TrustedFileRead {
+  const read = object(value, "trustedFileRead", ["entry", "text", "sha256"]);
+  return {
+    entry: projectTrustedFileEntry(read.entry, "trustedFileRead.entry"),
+    text: boundedString(read.text, "trustedFileRead.text", 1024 * 1024),
+    sha256: boundedString(read.sha256, "trustedFileRead.sha256", 64),
+  };
+}
+
+export function projectTranscriptSearchResult(
+  value: unknown,
+): TranscriptSearchResult {
+  const result = object(value, "transcriptSearch", ["hits", "truncated"]);
+  return {
+    hits: array(result.hits, "transcriptSearch.hits").map((value, index) => {
+      const path = `transcriptSearch.hits[${index}]`;
+      const hit = object(value, path, [
+        "sessionId",
+        "itemId",
+        "kind",
+        "sessionTitle",
+        "snippet",
+        "matchRanges",
+        "titleMatchRanges",
+        "timestampMs",
+        "score",
+      ]);
+      const ranges = (value: unknown, rangePath: string) =>
+        array(value, rangePath).map((value, rangeIndex) => {
+          const range = object(value, `${rangePath}[${rangeIndex}]`, [
+            "startChar",
+            "endChar",
+          ]);
+          return {
+            startChar: number(
+              range.startChar,
+              `${rangePath}[${rangeIndex}].startChar`,
+            ),
+            endChar: number(
+              range.endChar,
+              `${rangePath}[${rangeIndex}].endChar`,
+            ),
+          };
+        });
+      return {
+        sessionId: boundedString(hit.sessionId, `${path}.sessionId`, 256),
+        itemId: boundedString(hit.itemId, `${path}.itemId`, 512),
+        kind: enumeration(hit.kind, `${path}.kind`, [
+          "user",
+          "assistant",
+          "tool",
+          "error",
+          "attachment",
+        ] as const),
+        sessionTitle: boundedString(
+          hit.sessionTitle,
+          `${path}.sessionTitle`,
+          512,
+        ),
+        snippet: boundedString(hit.snippet, `${path}.snippet`, 1_024),
+        matchRanges: ranges(hit.matchRanges, `${path}.matchRanges`),
+        titleMatchRanges: ranges(
+          hit.titleMatchRanges,
+          `${path}.titleMatchRanges`,
+        ),
+        timestampMs: number(hit.timestampMs, `${path}.timestampMs`),
+        score: number(hit.score, `${path}.score`),
+      };
+    }),
+    truncated: boolean(result.truncated, "transcriptSearch.truncated"),
+  };
+}
+
 function itemState(value: unknown, path: string) {
   const lifecycle = enumeration(value, path, [
     "provisional",
     "committed",
   ] as const);
   return lifecycle === "provisional" ? ("streaming" as const) : ("committed" as const);
-}
-
-function actionKind(name: string): ActionItem["actionKind"] {
-  const normalized = name.toLocaleLowerCase();
-  if (normalized.includes("search")) return "web_search";
-  if (normalized.includes("preview") || normalized.includes("browser")) {
-    return "preview";
-  }
-  if (normalized.includes("write") || normalized.includes("edit")) {
-    return "file_write";
-  }
-  if (normalized.includes("read")) return "file_read";
-  if (
-    normalized.includes("shell") ||
-    normalized.includes("command") ||
-    normalized.includes("exec")
-  ) {
-    return "command";
-  }
-  return "analysis";
 }
 
 interface ProjectItemContext {
@@ -655,10 +1026,143 @@ function taggedPayload(value: unknown, path: string) {
   };
 }
 
+function stringArray(value: unknown, path: string): string[] {
+  return array(value ?? [], path).map((entry, index) =>
+    string(entry, `${path}[${index}]`),
+  );
+}
+
+function projectToolActivity(
+  value: unknown,
+  path: string,
+): ActionPresentation {
+  const data = object(value, path, [
+    "rawToolName",
+    "kind",
+    "phase",
+    "status",
+    "title",
+    "summary",
+    "target",
+    "cwd",
+    "commandPreview",
+    "exitCode",
+    "signal",
+    "startedAtMs",
+    "completedAtMs",
+    "durationMs",
+    "outputSummary",
+    "outputHandle",
+    "observedOutputBytes",
+    "droppedOutputBytes",
+    "changedPaths",
+    "sourceIds",
+    "artifactIds",
+  ]);
+  const kind = enumeration(data.kind, `${path}.kind`, [
+    "read",
+    "search",
+    "edit",
+    "write",
+    "command",
+    "web",
+    "skill",
+    "other",
+  ] as const);
+  const actionKind: ActionItem["actionKind"] =
+    kind === "read"
+      ? "file_read"
+      : kind === "search"
+        ? "file_search"
+        : kind === "edit" || kind === "write"
+          ? "file_write"
+          : kind === "command"
+            ? "command"
+            : kind === "web"
+              ? "web_search"
+              : kind === "skill"
+                ? "skill"
+                : "analysis";
+  const status = enumeration(data.status, `${path}.status`, [
+    "running",
+    "succeeded",
+    "failed",
+    "stopped",
+  ] as const);
+  const startedAtMs = number(data.startedAtMs, `${path}.startedAtMs`);
+  const completedAtMs =
+    data.completedAtMs === undefined
+      ? undefined
+      : number(data.completedAtMs, `${path}.completedAtMs`);
+  const durationMs =
+    data.durationMs === undefined
+      ? undefined
+      : number(data.durationMs, `${path}.durationMs`);
+  const summary = optionalString(data.summary, `${path}.summary`);
+  const outputSummary = optionalString(
+    data.outputSummary,
+    `${path}.outputSummary`,
+  );
+  return {
+    actionKind,
+    phase: enumeration(data.phase, `${path}.phase`, [
+      "investigated",
+      "changed",
+      "verified",
+      "produced",
+      "other",
+    ] as const),
+    status,
+    rawToolName: string(data.rawToolName, `${path}.rawToolName`),
+    label: string(data.title, `${path}.title`),
+    summary,
+    target: optionalString(data.target, `${path}.target`),
+    detail: outputSummary ?? summary,
+    cwd: optionalString(data.cwd, `${path}.cwd`),
+    commandPreview: optionalString(
+      data.commandPreview,
+      `${path}.commandPreview`,
+    ),
+    exitCode:
+      data.exitCode === undefined
+        ? undefined
+        : integer(data.exitCode, `${path}.exitCode`),
+    signal:
+      data.signal === undefined
+        ? undefined
+        : integer(data.signal, `${path}.signal`),
+    startedAt: iso(startedAtMs),
+    completedAt:
+      completedAtMs === undefined ? undefined : iso(completedAtMs),
+    durationMs,
+    outputSummary,
+    outputHandle: optionalString(
+      data.outputHandle,
+      `${path}.outputHandle`,
+    ),
+    observedOutputBytes: number(
+      data.observedOutputBytes ?? 0,
+      `${path}.observedOutputBytes`,
+    ),
+    droppedOutputBytes: number(
+      data.droppedOutputBytes ?? 0,
+      `${path}.droppedOutputBytes`,
+    ),
+    changedPaths: stringArray(
+      data.changedPaths,
+      `${path}.changedPaths`,
+    ),
+    sourceIds: stringArray(data.sourceIds, `${path}.sourceIds`),
+    outputIds: stringArray(data.artifactIds, `${path}.artifactIds`),
+  };
+}
+
 interface ToolResultProjection {
   toolCallItemId: string;
-  content: string;
-  failed: boolean;
+  result: Extract<
+    SessionEvent,
+    { type: "item.activity_result" }
+  >["result"];
 }
 
 function projectToolResult(
@@ -667,16 +1171,319 @@ function projectToolResult(
 ): ToolResultProjection {
   const data = object(value, path, [
     "toolCallItemId",
-    "content",
-    "isError",
+    "status",
+    "summary",
+    "outputSummary",
+    "outputHandle",
+    "exitCode",
+    "signal",
+    "completedAtMs",
+    "durationMs",
+    "observedOutputBytes",
+    "droppedOutputBytes",
   ]);
+  const status = enumeration(data.status, `${path}.status`, [
+    "running",
+    "succeeded",
+    "failed",
+    "stopped",
+  ] as const);
   return {
     toolCallItemId: string(
       data.toolCallItemId,
       `${path}.toolCallItemId`,
     ),
-    content: string(data.content, `${path}.content`),
-    failed: boolean(data.isError, `${path}.isError`),
+    result: {
+      status,
+      summary: string(data.summary, `${path}.summary`),
+      exitCode:
+        data.exitCode === undefined
+          ? undefined
+          : integer(data.exitCode, `${path}.exitCode`),
+      signal:
+        data.signal === undefined
+          ? undefined
+          : integer(data.signal, `${path}.signal`),
+      completedAt: iso(
+        number(data.completedAtMs, `${path}.completedAtMs`),
+      ),
+      durationMs: number(data.durationMs, `${path}.durationMs`),
+      outputSummary: optionalString(
+        data.outputSummary,
+        `${path}.outputSummary`,
+      ),
+      outputHandle: optionalString(
+        data.outputHandle,
+        `${path}.outputHandle`,
+      ),
+      observedOutputBytes: number(
+        data.observedOutputBytes ?? 0,
+        `${path}.observedOutputBytes`,
+      ),
+      droppedOutputBytes: number(
+        data.droppedOutputBytes ?? 0,
+        `${path}.droppedOutputBytes`,
+      ),
+    },
+  };
+}
+
+function projectPhaseSummary(
+  value: unknown,
+  path: string,
+): ActivityPhaseSummary {
+  const phase = object(value, path, [
+    "phase",
+    "actionCount",
+    "succeededCount",
+    "failedCount",
+    "stoppedCount",
+  ]);
+  return {
+    phase: enumeration(phase.phase, `${path}.phase`, [
+      "investigated",
+      "changed",
+      "verified",
+      "produced",
+      "other",
+    ] as const),
+    actionCount: number(phase.actionCount, `${path}.actionCount`),
+    succeededCount: number(
+      phase.succeededCount,
+      `${path}.succeededCount`,
+    ),
+    failedCount: number(phase.failedCount, `${path}.failedCount`),
+    stoppedCount: number(phase.stoppedCount, `${path}.stoppedCount`),
+  };
+}
+
+function projectReportedTestCounts(
+  value: unknown,
+  path: string,
+): import("./protocol").ReportedTestCounts {
+  const counts = object(value, path, [
+    "total",
+    "passed",
+    "failed",
+    "skipped",
+    "errors",
+  ]);
+  const optionalCount = (field: keyof typeof counts) =>
+    counts[field] === undefined
+      ? undefined
+      : number(counts[field], `${path}.${field}`);
+  return {
+    total: optionalCount("total"),
+    passed: optionalCount("passed"),
+    failed: optionalCount("failed"),
+    skipped: optionalCount("skipped"),
+    errors: optionalCount("errors"),
+  };
+}
+
+function projectStructuredTestResults(
+  value: unknown,
+  path: string,
+): import("./protocol").StructuredTestResults {
+  const result = object(value, path, [
+    "originItemId",
+    "framework",
+    "parser",
+    "command",
+    "verification",
+    "reported",
+    "reportedSuites",
+    "summaryCount",
+    "suites",
+    "coverage",
+  ]);
+  const command = object(result.command, `${path}.command`, [
+    "status",
+    "exitCode",
+    "signal",
+  ]);
+  const coverage = object(result.coverage, `${path}.coverage`, [
+    "inputTruncated",
+    "recordsTruncated",
+    "unsupportedSummaryFields",
+    "summaries",
+    "cases",
+  ]);
+  return {
+    originItemId: string(result.originItemId, `${path}.originItemId`),
+    framework: enumeration(result.framework, `${path}.framework`, [
+      "cargoLibtest",
+      "vitest",
+      "jest",
+      "pytest",
+      "goTest",
+    ] as const),
+    parser: enumeration(result.parser, `${path}.parser`, [
+      "cargoLibtestTextV1",
+      "vitestTextV1",
+      "jestTextV1",
+      "pytestTextV1",
+      "goTestTextV1",
+    ] as const),
+    command: {
+      status: enumeration(command.status, `${path}.command.status`, [
+        "succeeded",
+        "failed",
+        "stopped",
+      ] as const),
+      exitCode:
+        command.exitCode === undefined
+          ? undefined
+          : integer(command.exitCode, `${path}.command.exitCode`),
+      signal:
+        command.signal === undefined
+          ? undefined
+          : integer(command.signal, `${path}.command.signal`),
+    },
+    verification: enumeration(
+      result.verification,
+      `${path}.verification`,
+      ["passed", "failed", "stopped", "inconclusive"] as const,
+    ),
+    reported: projectReportedTestCounts(
+      result.reported,
+      `${path}.reported`,
+    ),
+    reportedSuites: projectReportedTestCounts(
+      result.reportedSuites,
+      `${path}.reportedSuites`,
+    ),
+    summaryCount: number(result.summaryCount, `${path}.summaryCount`),
+    suites: array(result.suites, `${path}.suites`).map((value, index) => {
+      const suitePath = `${path}.suites[${index}]`;
+      const suite = object(value, suitePath, [
+        "name",
+        "status",
+        "reported",
+        "cases",
+      ]);
+      return {
+        name: string(suite.name, `${suitePath}.name`),
+        status:
+          suite.status === undefined
+            ? undefined
+            : enumeration(suite.status, `${suitePath}.status`, [
+                "passed",
+                "failed",
+                "skipped",
+                "error",
+              ] as const),
+        reported: projectReportedTestCounts(
+          suite.reported,
+          `${suitePath}.reported`,
+        ),
+        cases: array(suite.cases, `${suitePath}.cases`).map(
+          (value, caseIndex) => {
+            const casePath = `${suitePath}.cases[${caseIndex}]`;
+            const testCase = object(value, casePath, ["name", "status"]);
+            return {
+              name: string(testCase.name, `${casePath}.name`),
+              status: enumeration(testCase.status, `${casePath}.status`, [
+                "passed",
+                "failed",
+                "skipped",
+                "error",
+              ] as const),
+            };
+          },
+        ),
+      };
+    }),
+    coverage: {
+      inputTruncated: boolean(
+        coverage.inputTruncated,
+        `${path}.coverage.inputTruncated`,
+      ),
+      recordsTruncated: boolean(
+        coverage.recordsTruncated,
+        `${path}.coverage.recordsTruncated`,
+      ),
+      unsupportedSummaryFields: boolean(
+        coverage.unsupportedSummaryFields,
+        `${path}.coverage.unsupportedSummaryFields`,
+      ),
+      summaries: enumeration(
+        coverage.summaries,
+        `${path}.coverage.summaries`,
+        ["none", "partial", "complete"] as const,
+      ),
+      cases: enumeration(coverage.cases, `${path}.coverage.cases`, [
+        "none",
+        "partial",
+        "complete",
+      ] as const),
+    },
+  };
+}
+
+function projectCompletionReview(
+  value: unknown,
+  path: string,
+): CompletionReview {
+  const review = object(value, path, [
+    "summary",
+    "durationMs",
+    "actionCount",
+    "phases",
+    "changedFileItemIds",
+    "verificationActionItemIds",
+    "failedActionItemIds",
+    "warningActionItemIds",
+    "sourceIds",
+    "outputIds",
+    "testResults",
+    "evidenceCoverage",
+    "openQuestions",
+  ]);
+  return {
+    summary: string(review.summary, `${path}.summary`),
+    durationMs: number(review.durationMs, `${path}.durationMs`),
+    actionCount: number(review.actionCount, `${path}.actionCount`),
+    phases: array(review.phases ?? [], `${path}.phases`).map(
+      (phase, index) =>
+        projectPhaseSummary(phase, `${path}.phases[${index}]`),
+    ),
+    changedFileItemIds: stringArray(
+      review.changedFileItemIds,
+      `${path}.changedFileItemIds`,
+    ),
+    verificationActionItemIds: stringArray(
+      review.verificationActionItemIds,
+      `${path}.verificationActionItemIds`,
+    ),
+    failedActionItemIds: stringArray(
+      review.failedActionItemIds,
+      `${path}.failedActionItemIds`,
+    ),
+    warningActionItemIds: stringArray(
+      review.warningActionItemIds,
+      `${path}.warningActionItemIds`,
+    ),
+    sourceIds: stringArray(review.sourceIds, `${path}.sourceIds`),
+    outputIds: stringArray(review.outputIds, `${path}.outputIds`),
+    testResults: array(
+      review.testResults ?? [],
+      `${path}.testResults`,
+    ).map((result, index) =>
+      projectStructuredTestResults(
+        result,
+        `${path}.testResults[${index}]`,
+      ),
+    ),
+    evidenceCoverage: enumeration(
+      review.evidenceCoverage,
+      `${path}.evidenceCoverage`,
+      ["none", "partial", "complete"] as const,
+    ),
+    openQuestions: stringArray(
+      review.openQuestions,
+      `${path}.openQuestions`,
+    ),
   };
 }
 
@@ -694,21 +1501,28 @@ function projectItem(
     "durableEntryId",
     "payload",
   ]);
-  optionalString(item.runId, `${path}.runId`);
+  const runId = optionalString(item.runId, `${path}.runId`);
   const id = string(item.id, `${path}.id`);
   const turnId =
     optionalString(item.turnId, `${path}.turnId`) ??
     optionalString(item.runId, `${path}.runId`) ??
     id;
-  if (item.providerAttempt !== undefined) {
-    number(item.providerAttempt, `${path}.providerAttempt`);
-  }
-  optionalString(item.durableEntryId, `${path}.durableEntryId`);
+  const providerAttempt =
+    item.providerAttempt === undefined
+      ? undefined
+      : number(item.providerAttempt, `${path}.providerAttempt`);
+  const durableEntryId = optionalString(
+    item.durableEntryId,
+    `${path}.durableEntryId`,
+  );
   const state = itemState(item.lifecycle, `${path}.lifecycle`);
   const payload = taggedPayload(item.payload, `${path}.payload`);
   const base = {
     id,
+    runId,
     turnId,
+    providerAttempt,
+    durableEntryId,
     state,
     createdAt: iso(context.timestampMs),
   };
@@ -718,7 +1532,10 @@ function projectItem(
       const data = object(payload.data, `${path}.payload.data`, [
         "text",
         "attachments",
+        "documents",
+        "projectFiles",
         "delivery",
+        "branchProvenance",
       ]);
       const delivery =
         data.delivery === undefined
@@ -742,6 +1559,31 @@ function projectItem(
             `${path}.payload.data.attachments[${index}]`,
           ),
         ),
+        documents: array(
+          data.documents ?? [],
+          `${path}.payload.data.documents`,
+        ).map((document, index) =>
+          projectDocumentReference(
+            document,
+            `${path}.payload.data.documents[${index}]`,
+          ),
+        ),
+        projectFiles: array(
+          data.projectFiles ?? [],
+          `${path}.payload.data.projectFiles`,
+        ).map((entry, index) =>
+          projectTrustedFileEntry(
+            entry,
+            `${path}.payload.data.projectFiles[${index}]`,
+          ),
+        ),
+        branchProvenance:
+          data.branchProvenance === undefined
+            ? undefined
+            : projectConversationBranchProvenance(
+                data.branchProvenance,
+                `${path}.payload.data.branchProvenance`,
+              ),
       };
     }
     case "assistantMessage": {
@@ -762,33 +1604,22 @@ function projectItem(
       };
     }
     case "toolCall": {
-      const data = object(payload.data, `${path}.payload.data`, [
-        "name",
-        "arguments",
-        "progress",
-        "droppedProgressBytes",
-      ]);
-      const name = string(data.name, `${path}.payload.data.name`);
-      if (!("arguments" in data)) {
-        throw new WireContractError(
-          `${path}.payload.data.arguments`,
-          "is required",
-        );
-      }
-      const progress = optionalString(
-        data.progress,
-        `${path}.payload.data.progress`,
-      );
-      number(
-        data.droppedProgressBytes ?? 0,
-        `${path}.payload.data.droppedProgressBytes`,
+      const activity = projectToolActivity(
+        payload.data,
+        `${path}.payload.data`,
       );
       return {
         ...base,
         kind: "action",
-        actionKind: actionKind(name),
-        label: name,
-        detail: progress,
+        ...activity,
+        state:
+          activity.status === "running"
+            ? "streaming"
+            : activity.status === "failed"
+              ? "failed"
+              : activity.status === "stopped"
+                ? "stopped"
+                : state,
       };
     }
     case "toolResult": {
@@ -800,6 +1631,7 @@ function projectItem(
         "handle",
         "resultHandle",
         "displayPath",
+        "originItemId",
         "additions",
         "deletions",
       ]);
@@ -815,11 +1647,28 @@ function projectItem(
         ...base,
         kind: "action",
         actionKind: "file_write",
+        phase: "changed",
+        status: "succeeded",
+        rawToolName: "fileChange",
         label: "Changed file",
+        originItemId: optionalString(
+          data.originItemId,
+          `${path}.payload.data.originItemId`,
+        ),
         target: string(
           data.displayPath,
           `${path}.payload.data.displayPath`,
         ),
+        observedOutputBytes: 0,
+        droppedOutputBytes: 0,
+        changedPaths: [
+          string(
+            data.displayPath,
+            `${path}.payload.data.displayPath`,
+          ),
+        ],
+        sourceIds: [],
+        outputIds: [],
         additions: number(
           data.additions,
           `${path}.payload.data.additions`,
@@ -838,14 +1687,23 @@ function projectItem(
         ...base,
         kind: "action",
         actionKind: "analysis",
+        phase: "other",
+        status: "succeeded",
+        rawToolName: "compaction",
         label: "Compacted session context",
         detail: string(data.reason, `${path}.payload.data.reason`),
+        observedOutputBytes: 0,
+        droppedOutputBytes: 0,
+        changedPaths: [],
+        sourceIds: [],
+        outputIds: [],
       };
     }
     case "runOutcome": {
       const data = object(payload.data, `${path}.payload.data`, [
         "outcome",
         "message",
+        "review",
       ]);
       const outcome = enumeration(
         data.outcome,
@@ -856,12 +1714,20 @@ function projectItem(
         data.message,
         `${path}.payload.data.message`,
       );
+      const review = projectCompletionReview(
+        data.review,
+        `${path}.payload.data.review`,
+      );
       return {
         ...base,
         kind: "run_outcome",
         outcome: outcome === "completed" ? "done" : outcome,
-        durationMs: 0,
-        summary: message ?? (outcome === "completed" ? "Run completed" : `Run ${outcome}`),
+        durationMs: review.durationMs,
+        summary:
+          message ??
+          review.summary ??
+          (outcome === "completed" ? "Run completed" : `Run ${outcome}`),
+        review,
       };
     }
     case "plan":
@@ -1193,12 +2059,23 @@ export function projectSessionSnapshot(
       if (targetIndex !== -1) {
         const target = items[targetIndex];
         if (target?.kind === "action") {
+          const resultState =
+            result.result.status === "failed"
+              ? "failed"
+              : result.result.status === "stopped"
+                ? "stopped"
+                : result.result.status === "running"
+                  ? "streaming"
+                  : itemState(
+                      wireItem.lifecycle,
+                      `${path}.lifecycle`,
+                    );
           items[targetIndex] = {
             ...target,
-            detail: result.content,
-            state: result.failed
-              ? "failed"
-              : itemState(wireItem.lifecycle, `${path}.lifecycle`),
+            ...result.result,
+            detail:
+              result.result.outputSummary ?? result.result.summary,
+            state: resultState,
           };
         }
       }
@@ -1342,6 +2219,283 @@ export interface HostBootstrapProjection {
   selectedSession: SessionSnapshot;
 }
 
+function projectProjectSummary(value: unknown, path: string): ProjectSummary {
+  const entry = object(value, path, [
+    "id",
+    "name",
+    "trusted",
+    "archived",
+    "available",
+    "isDefault",
+    "sessionCount",
+    "liveSessionCount",
+  ]);
+  return {
+    id: string(entry.id, `${path}.id`),
+    name: string(entry.name, `${path}.name`),
+    trusted: boolean(entry.trusted, `${path}.trusted`),
+    archived: boolean(entry.archived, `${path}.archived`),
+    available: boolean(entry.available, `${path}.available`),
+    isDefault: boolean(entry.isDefault, `${path}.isDefault`),
+    sessionCount: number(entry.sessionCount, `${path}.sessionCount`),
+    liveSessionCount: number(
+      entry.liveSessionCount,
+      `${path}.liveSessionCount`,
+    ),
+  };
+}
+
+export function projectProjectCatalog(value: unknown): ProjectCatalog {
+  const catalog = object(value, "projectCatalog", [
+    "protocol",
+    "host",
+    "catalogCursor",
+    "lifecycleMutationsSupported",
+    "importSupported",
+    "projects",
+  ]);
+  protocol(catalog.protocol, "projectCatalog.protocol");
+  const host = object(catalog.host, "projectCatalog.host", ["id", "name"]);
+  return {
+    host: {
+      id: string(host.id, "projectCatalog.host.id"),
+      name: string(host.name, "projectCatalog.host.name"),
+    },
+    catalogRevision: number(
+      catalog.catalogCursor,
+      "projectCatalog.catalogCursor",
+    ),
+    lifecycleMutationsSupported: boolean(
+      catalog.lifecycleMutationsSupported,
+      "projectCatalog.lifecycleMutationsSupported",
+    ),
+    importSupported: boolean(
+      catalog.importSupported,
+      "projectCatalog.importSupported",
+    ),
+    projects: array(catalog.projects, "projectCatalog.projects").map(
+      (project, index) =>
+        projectProjectSummary(
+          project,
+          `projectCatalog.projects[${index}]`,
+        ),
+    ),
+  };
+}
+
+function projectContextRefresh(
+  value: unknown,
+  path: string,
+): RepositoryContextSnapshot["repository"]["refresh"] {
+  const refresh = object(value, path, [
+    "state",
+    "refreshedAtUnixMs",
+    "durationMs",
+    "truncated",
+  ]);
+  return {
+    state: enumeration(refresh.state, `${path}.state`, [
+      "current",
+      "partial",
+      "notApplicable",
+      "unavailable",
+      "timedOut",
+    ] as const),
+    refreshedAtUnixMs: number(
+      refresh.refreshedAtUnixMs,
+      `${path}.refreshedAtUnixMs`,
+    ),
+    durationMs: number(refresh.durationMs, `${path}.durationMs`),
+    truncated: boolean(refresh.truncated, `${path}.truncated`),
+  };
+}
+
+function projectInstructionOrigin(
+  value: unknown,
+  path: string,
+): import("./protocol").InstructionOrigin {
+  const origin = object(value, path, ["relativePath", "scope"]);
+  const relativePath = boundedString(
+    origin.relativePath,
+    `${path}.relativePath`,
+    2_048,
+  );
+  const scope = boundedString(origin.scope, `${path}.scope`, 2_048);
+  for (const [field, candidate] of [
+    ["relativePath", relativePath],
+    ["scope", scope],
+  ] as const) {
+    if (
+      candidate.startsWith("/") ||
+      candidate.startsWith("\\") ||
+      candidate.includes("\\") ||
+      /^[a-z]:/iu.test(candidate) ||
+      candidate.split("/").some((segment) => segment === "..")
+    ) {
+      throw new WireContractError(
+        `${path}.${field}`,
+        "must be a project-relative display path",
+      );
+    }
+  }
+  return { relativePath, scope };
+}
+
+export function projectRepositoryContext(
+  value: unknown,
+  path = "repositoryContext",
+): RepositoryContextSnapshot {
+  const snapshot = object(value, path, [
+    "projectId",
+    "trust",
+    "repository",
+    "instructions",
+  ]);
+  const repository = object(snapshot.repository, `${path}.repository`, [
+    "source",
+    "refresh",
+    "worktree",
+    "head",
+    "branchState",
+    "branch",
+    "dirty",
+    "ahead",
+    "behind",
+  ]);
+  const instructions = object(snapshot.instructions, `${path}.instructions`, [
+    "source",
+    "refresh",
+    "files",
+    "errors",
+    "omittedErrors",
+    "loadedBytes",
+  ]);
+  return {
+    projectId: boundedString(snapshot.projectId, `${path}.projectId`, 128),
+    trust: enumeration(snapshot.trust, `${path}.trust`, ["verified"] as const),
+    repository: {
+      source: enumeration(
+        repository.source,
+        `${path}.repository.source`,
+        ["gitStatusPorcelainV2"] as const,
+      ),
+      refresh: projectContextRefresh(
+        repository.refresh,
+        `${path}.repository.refresh`,
+      ),
+      worktree: enumeration(
+        repository.worktree,
+        `${path}.repository.worktree`,
+        ["present", "notRepository", "unknown"] as const,
+      ),
+      head: optionalString(repository.head, `${path}.repository.head`),
+      branchState: enumeration(
+        repository.branchState,
+        `${path}.repository.branchState`,
+        ["named", "detached", "unborn", "unknown"] as const,
+      ),
+      branch: optionalString(repository.branch, `${path}.repository.branch`),
+      dirty:
+        repository.dirty === undefined
+          ? undefined
+          : boolean(repository.dirty, `${path}.repository.dirty`),
+      ahead:
+        repository.ahead === undefined
+          ? undefined
+          : number(repository.ahead, `${path}.repository.ahead`),
+      behind:
+        repository.behind === undefined
+          ? undefined
+          : number(repository.behind, `${path}.repository.behind`),
+    },
+    instructions: {
+      source: enumeration(
+        instructions.source,
+        `${path}.instructions.source`,
+        ["projectAgentsMdV1"] as const,
+      ),
+      refresh: projectContextRefresh(
+        instructions.refresh,
+        `${path}.instructions.refresh`,
+      ),
+      files: array(
+        instructions.files,
+        `${path}.instructions.files`,
+      ).map((value, index) => {
+        const filePath = `${path}.instructions.files[${index}]`;
+        const file = object(value, filePath, [
+          "origin",
+          "precedence",
+          "byteLen",
+          "sha256",
+          "summary",
+          "visibleContent",
+          "contentTruncated",
+        ]);
+        return {
+          origin: projectInstructionOrigin(file.origin, `${filePath}.origin`),
+          precedence: number(file.precedence, `${filePath}.precedence`),
+          byteLen: number(file.byteLen, `${filePath}.byteLen`),
+          sha256: boundedString(file.sha256, `${filePath}.sha256`, 64),
+          summary: boundedString(
+            file.summary,
+            `${filePath}.summary`,
+            240,
+            true,
+          ),
+          visibleContent: boundedString(
+            file.visibleContent,
+            `${filePath}.visibleContent`,
+            128 * 1_024,
+            true,
+          ),
+          contentTruncated: boolean(
+            file.contentTruncated,
+            `${filePath}.contentTruncated`,
+          ),
+        };
+      }),
+      errors: array(
+        instructions.errors,
+        `${path}.instructions.errors`,
+      ).map((value, index) => {
+        const errorPath = `${path}.instructions.errors[${index}]`;
+        const error = object(value, errorPath, ["origin", "code"]);
+        return {
+          origin:
+            error.origin === undefined
+              ? undefined
+              : projectInstructionOrigin(
+                  error.origin,
+                  `${errorPath}.origin`,
+                ),
+          code: enumeration(error.code, `${errorPath}.code`, [
+            "directoryUnavailable",
+            "unsupportedName",
+            "symlinkRejected",
+            "notRegularFile",
+            "hardLinkRejected",
+            "fileTooLarge",
+            "aggregateLimitReached",
+            "changedDuringRead",
+            "invalidUtf8",
+            "binaryContent",
+            "discoveryLimitReached",
+          ] as const),
+        };
+      }),
+      omittedErrors: number(
+        instructions.omittedErrors,
+        `${path}.instructions.omittedErrors`,
+      ),
+      loadedBytes: number(
+        instructions.loadedBytes,
+        `${path}.instructions.loadedBytes`,
+      ),
+    },
+  };
+}
+
 export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
   const wire = object(value, "hostBootstrap", [
     "protocol",
@@ -1368,6 +2522,9 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
       "opaqueResources",
       "attachments",
       "attachmentPolicy",
+      "documents",
+      "trustedProjectFiles",
+      "transcriptSearch",
       "previews",
       "connectedDevices",
       "lanClients",
@@ -1375,6 +2532,8 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
       "childAgents",
       "sessionMetadata",
       "sessionBranches",
+      "conversationBranching",
+      "sessionTrash",
       "sessionExport",
     ],
   );
@@ -1396,6 +2555,20 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
     capabilities.sessionBranches,
     "hostBootstrap.capabilities.sessionBranches",
   );
+  const conversationBranching =
+    capabilities.conversationBranching === undefined
+      ? false
+      : boolean(
+          capabilities.conversationBranching,
+          "hostBootstrap.capabilities.conversationBranching",
+        );
+  const sessionTrash =
+    capabilities.sessionTrash === undefined
+      ? false
+      : boolean(
+          capabilities.sessionTrash,
+          "hostBootstrap.capabilities.sessionTrash",
+        );
   const sessionExport = boolean(
     capabilities.sessionExport,
     "hostBootstrap.capabilities.sessionExport",
@@ -1404,6 +2577,27 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
     capabilities.attachments,
     "hostBootstrap.capabilities.attachments",
   );
+  const documents =
+    capabilities.documents === undefined
+      ? false
+      : boolean(
+          capabilities.documents,
+          "hostBootstrap.capabilities.documents",
+        );
+  const trustedProjectFiles =
+    capabilities.trustedProjectFiles === undefined
+      ? false
+      : boolean(
+          capabilities.trustedProjectFiles,
+          "hostBootstrap.capabilities.trustedProjectFiles",
+        );
+  const transcriptSearch =
+    capabilities.transcriptSearch === undefined
+      ? false
+      : boolean(
+          capabilities.transcriptSearch,
+          "hostBootstrap.capabilities.transcriptSearch",
+        );
   const attachmentPolicy =
     capabilities.attachmentPolicy === undefined
       ? undefined
@@ -1444,33 +2638,11 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
           };
         })();
   const projects = array(wire.projects, "hostBootstrap.projects").map(
-    (project, index) => {
-      const entry = object(project, `hostBootstrap.projects[${index}]`, [
-        "id",
-        "name",
-        "trusted",
-        "sessionCount",
-        "liveSessionCount",
-      ]);
-      number(
-        entry.sessionCount,
-        `hostBootstrap.projects[${index}].sessionCount`,
-      );
-      number(
-        entry.liveSessionCount,
-        `hostBootstrap.projects[${index}].liveSessionCount`,
-      );
-      const name = string(entry.name, `hostBootstrap.projects[${index}].name`);
-      return {
-        id: string(entry.id, `hostBootstrap.projects[${index}].id`),
-        name,
-        pathLabel: name,
-        trusted: boolean(
-          entry.trusted,
-          `hostBootstrap.projects[${index}].trusted`,
-        ),
-      };
-    },
+    (project, index) =>
+      projectProjectSummary(
+        project,
+        `hostBootstrap.projects[${index}]`,
+      ),
   );
   const models = array(wire.models, "hostBootstrap.models").map(
     (model, index) => projectModel(model, `hostBootstrap.models[${index}]`),
@@ -1575,7 +2747,12 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
       pairDevices: false,
       sessionMetadata,
       sessionBranches,
+      conversationBranching,
+      sessionTrash,
       sessionExport,
+      documents,
+      trustedProjectFiles,
+      transcriptSearch,
       themeSelection: themes.length > 1,
       steer: true,
       followUp: true,
@@ -1662,18 +2839,13 @@ function resourceEventFromItem(
       "event.event.data.item.id",
     );
     return {
-      type: "item.tool_result",
+      type: "item.activity_result",
       sessionId,
       actorGeneration,
       sequence,
       itemId: result.toolCallItemId,
       resultItemId: itemId,
-      detail: result.content,
-      state: result.failed
-        ? "failed"
-        : committed
-          ? "committed"
-          : "streaming",
+      result: result.result,
     };
   }
   const projected = projectItem(itemValue, "event.event.data.item", {
@@ -1896,28 +3068,22 @@ export function projectEventEnvelope(
           ),
         };
       }
-      if (delta.type === "toolProgress") {
+      if (delta.type === "toolActivity") {
         const deltaData = object(
           delta.data,
           "event.event.data.delta.data",
-          ["text", "droppedBytes"],
-        );
-        number(
-          deltaData.droppedBytes,
-          "event.event.data.delta.data.droppedBytes",
+          ["activity"],
         );
         return {
-          type: "item.delta",
+          type: "item.activity",
           sessionId,
           actorGeneration,
           sequence,
           itemId,
-          field: "detail",
-          delta: string(
-            deltaData.text,
-            "event.event.data.delta.data.text",
+          activity: projectToolActivity(
+            deltaData.activity,
+            "event.event.data.delta.data.activity",
           ),
-          replace: true,
         };
       }
       throw new WireContractError(
@@ -2166,14 +3332,22 @@ export function projectReplayResponse(
   };
 }
 
-function projectSanitizedError(value: unknown, path: string): string {
+function projectSanitizedError(
+  value: unknown,
+  path: string,
+): {
+  code: CommandAck["errorCode"];
+  message: string;
+  retryable: boolean;
+  currentGeneration?: number;
+} {
   const error = object(value, path, [
     "code",
     "message",
     "retryable",
     "currentGeneration",
   ]);
-  enumeration(error.code, `${path}.code`, [
+  const code = enumeration(error.code, `${path}.code`, [
     "incompatibleProtocol",
     "invalidCommand",
     "commandIdConflict",
@@ -2188,11 +3362,17 @@ function projectSanitizedError(value: unknown, path: string): string {
     "unavailable",
     "internal",
   ] as const);
-  boolean(error.retryable, `${path}.retryable`);
-  if (error.currentGeneration !== undefined) {
-    number(error.currentGeneration, `${path}.currentGeneration`);
-  }
-  return string(error.message, `${path}.message`);
+  const retryable = boolean(error.retryable, `${path}.retryable`);
+  const currentGeneration =
+    error.currentGeneration === undefined
+      ? undefined
+      : number(error.currentGeneration, `${path}.currentGeneration`);
+  return {
+    code,
+    message: string(error.message, `${path}.message`),
+    retryable,
+    currentGeneration,
+  };
 }
 
 export function decodeWireCommandAck(value: unknown): CommandAck {
@@ -2249,37 +3429,65 @@ export function decodeWireCommandAck(value: unknown): CommandAck {
       "commandAck.disposition",
       ["status", "error"],
     );
+    const error = projectSanitizedError(
+      disposition.error,
+      "commandAck.disposition.error",
+    );
     return {
       commandId,
       accepted: false,
-      error: projectSanitizedError(
-        disposition.error,
-        "commandAck.disposition.error",
-      ),
+      error: error.message,
+      errorCode: error.code,
+      retryable: error.retryable,
+      currentGeneration: error.currentGeneration,
     };
   }
   const disposition = object(
     ack.disposition,
     "commandAck.disposition",
-    hostAck ? ["status", "createdSessionId"] : ["status", "runId"],
+    hostAck
+      ? ["status", "createdSessionId", "project", "catalogChanged"]
+      : ["status", "runId", "createdSessionId"],
   );
-  if (hostAck) {
-    string(
-      disposition.createdSessionId,
-      "commandAck.disposition.createdSessionId",
-    );
-  } else {
+  if (!hostAck) {
     optionalString(disposition.runId, "commandAck.disposition.runId");
+  }
+  const createdSessionId = optionalString(
+    disposition.createdSessionId,
+    "commandAck.disposition.createdSessionId",
+  );
+  const project =
+    hostAck && disposition.project !== undefined
+      ? projectProjectSummary(
+          disposition.project,
+          "commandAck.disposition.project",
+        )
+      : undefined;
+  const catalogChanged =
+    hostAck && disposition.catalogChanged !== undefined
+      ? boolean(
+          disposition.catalogChanged,
+          "commandAck.disposition.catalogChanged",
+        )
+      : undefined;
+  if (
+    hostAck &&
+    Number(createdSessionId !== undefined) +
+      Number(project !== undefined) +
+      Number(catalogChanged === true) !==
+      1
+  ) {
+    throw new WireContractError(
+      "commandAck.disposition",
+      "must contain exactly one accepted host result",
+    );
   }
   return {
     commandId,
     accepted: true,
-    createdSessionId: hostAck
-      ? string(
-          disposition.createdSessionId,
-          "commandAck.disposition.createdSessionId",
-        )
-      : undefined,
+    createdSessionId,
+    project,
+    catalogChanged,
   };
 }
 
@@ -2400,6 +3608,87 @@ export function encodeClientCommand(
     };
   }
   if (
+    command.type === "session.setLifecycle" ||
+    command.type === "session.deletePermanently"
+  ) {
+    return {
+      protocol: PROTOCOL_VERSION.major,
+      hostId: context.hostId,
+      deviceId: context.deviceId,
+      commandId: command.id,
+      issuedAtMs: context.issuedAtMs,
+      command:
+        command.type === "session.setLifecycle"
+          ? {
+              type: "session.setLifecycle",
+              data: {
+                sessionId: command.sessionId,
+                lifecycle: command.lifecycle,
+              },
+            }
+          : {
+              type: "session.deletePermanently",
+              data: {
+                sessionId: command.sessionId,
+                confirmation: command.confirmation,
+              },
+            },
+    };
+  }
+  if (
+    command.type === "project.import" ||
+    command.type === "project.rename" ||
+    command.type === "project.setDefault" ||
+    command.type === "project.clearDefault" ||
+    command.type === "project.setTrust" ||
+    command.type === "project.archive"
+  ) {
+    const wireCommand =
+      command.type === "project.import"
+        ? {
+            type: "project.import",
+            data: {
+              candidateId: command.candidateId,
+              displayName: command.displayName,
+            },
+          }
+        : command.type === "project.rename"
+          ? {
+              type: "project.rename",
+              data: {
+                projectId: command.projectId,
+                displayName: command.displayName,
+              },
+            }
+          : command.type === "project.setDefault"
+            ? {
+                type: "project.setDefault",
+                data: { projectId: command.projectId },
+              }
+            : command.type === "project.clearDefault"
+              ? { type: "project.clearDefault" }
+              : command.type === "project.setTrust"
+                ? {
+                    type: "project.setTrust",
+                    data: {
+                      projectId: command.projectId,
+                      trusted: command.trusted,
+                    },
+                  }
+                : {
+                    type: "project.archive",
+                    data: { projectId: command.projectId },
+                  };
+    return {
+      protocol: PROTOCOL_VERSION.major,
+      hostId: context.hostId,
+      deviceId: context.deviceId,
+      commandId: command.id,
+      issuedAtMs: context.issuedAtMs,
+      command: wireCommand,
+    };
+  }
+  if (
     command.type === "session.submit" ||
     command.type === "session.steer" ||
     command.type === "session.followUp"
@@ -2418,6 +3707,12 @@ export function encodeClientCommand(
           input: {
             text: command.prompt,
             attachments: encodeAttachments(command.attachments),
+            ...(command.documentIds?.length
+              ? { documentIds: command.documentIds }
+              : {}),
+            ...(command.projectFileIds?.length
+              ? { projectFileIds: command.projectFileIds }
+              : {}),
           },
         },
       },
@@ -2574,6 +3869,66 @@ export function encodeClientCommand(
       command,
       {
         type: "session.checkout",
+        data: { entryId: command.entryId },
+      },
+      context,
+    );
+  }
+  if (command.type === "session.editUserTurn") {
+    return sessionEnvelope(
+      command,
+      {
+        type: "session.editUserTurn",
+        data: {
+          sourceUserEntryId: command.sourceUserEntryId,
+          input: {
+            text: command.prompt,
+            attachments: encodeAttachments(command.attachments),
+            ...(command.documentIds?.length
+              ? { documentIds: command.documentIds }
+              : {}),
+            ...(command.projectFileIds?.length
+              ? { projectFileIds: command.projectFileIds }
+              : {}),
+          },
+        },
+      },
+      context,
+    );
+  }
+  if (command.type === "session.retryResponse") {
+    if ((command.modelId === undefined) !== (command.reasoning === undefined)) {
+      throw new UnsupportedWireCommandError(
+        command.type,
+        "an alternate model and reasoning selection must be supplied together",
+      );
+    }
+    return sessionEnvelope(
+      command,
+      {
+        type: "session.retryResponse",
+        data: {
+          sourceAssistantEntryId: command.sourceAssistantEntryId,
+          ...(command.modelId && command.reasoning
+            ? {
+                model: commandModel(
+                  command.modelId,
+                  command.reasoning,
+                  context,
+                  command.type,
+                ),
+              }
+            : {}),
+        },
+      },
+      context,
+    );
+  }
+  if (command.type === "session.forkConversation") {
+    return sessionEnvelope(
+      command,
+      {
+        type: "session.forkConversation",
         data: { entryId: command.entryId },
       },
       context,

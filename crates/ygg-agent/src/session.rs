@@ -388,6 +388,16 @@ pub enum SessionRecord {
         #[serde(default)]
         total_cost_picodollars_remainder: u32,
     },
+    /// A durable checkout before the first entry. Subsequent appends create a
+    /// new root branch while preserving every existing root and descendant.
+    RootHead {
+        /// Cumulative whole-microdollar session cost.
+        #[serde(default)]
+        total_cost_microdollars: u64,
+        /// Picodollar remainder paired with `total_cost_microdollars`.
+        #[serde(default)]
+        total_cost_picodollars_remainder: u32,
+    },
     /// A completed prompt's durable restore point. Checkpoints do not alter
     /// the active head or model-visible context.
     Checkpoint {
@@ -418,6 +428,10 @@ enum SessionRecordRef<'a> {
     Entry(&'a Entry),
     Head {
         id: &'a EntryId,
+        total_cost_microdollars: &'a u64,
+        total_cost_picodollars_remainder: &'a u32,
+    },
+    RootHead {
         total_cost_microdollars: &'a u64,
         total_cost_picodollars_remainder: &'a u32,
     },
@@ -887,6 +901,14 @@ impl Session {
                     total_cost_microdollars = cost;
                     total_cost_picodollars_remainder = remainder;
                 }
+                SessionRecord::RootHead {
+                    total_cost_microdollars: cost,
+                    total_cost_picodollars_remainder: remainder,
+                } => {
+                    head = None;
+                    total_cost_microdollars = cost;
+                    total_cost_picodollars_remainder = remainder;
+                }
                 SessionRecord::Checkpoint {
                     prompt,
                     head: checkpoint_head,
@@ -1231,6 +1253,70 @@ impl Session {
         self.head = Some(id);
         *self.context_cache.get_mut() = None;
         Ok(())
+    }
+
+    /// Durably selects the empty pre-entry boundary. Future appends create a
+    /// new root branch; all existing roots and descendants remain preserved.
+    pub fn checkout_root(&mut self) -> Result<(), SessionError> {
+        let mut buf = Vec::with_capacity(64);
+        write_json_line(
+            &mut buf,
+            &SessionRecordRef::RootHead {
+                total_cost_microdollars: &self.total_cost_microdollars,
+                total_cost_picodollars_remainder: &self.total_cost_picodollars_remainder,
+            },
+        )?;
+        self.persist(&buf)?;
+        self.head = None;
+        *self.context_cache.get_mut() = None;
+        Ok(())
+    }
+
+    /// Copies exactly one committed ancestor chain into a new session file.
+    ///
+    /// Entry IDs and semantic sidecar references are preserved, but sibling
+    /// branches, usage telemetry, and later checkpoints are deliberately not
+    /// copied. The destination is created atomically enough to remain absent
+    /// on every validation/write failure.
+    pub fn fork_to(
+        &self,
+        path: impl Into<PathBuf>,
+        checkpoint: EntryId,
+    ) -> Result<Self, SessionError> {
+        let path = path.into();
+        let mut newest_first = Vec::<&Entry>::new();
+        let mut cursor = Some(&checkpoint);
+        while let Some(id) = cursor {
+            let entry = self
+                .entry(id)
+                .ok_or_else(|| SessionError::UnknownEntry(id.clone()))?;
+            newest_first.push(entry);
+            cursor = entry.parent.as_ref();
+        }
+        newest_first.reverse();
+
+        let mut destination = Session::create(path.clone())?;
+        let result = (|| {
+            let mut bytes = Vec::new();
+            for entry in newest_first {
+                write_json_line(&mut bytes, &SessionRecordRef::Entry(entry))?;
+            }
+            write_json_line(
+                &mut bytes,
+                &SessionRecordRef::Head {
+                    id: &checkpoint,
+                    total_cost_microdollars: &0,
+                    total_cost_picodollars_remainder: &0,
+                },
+            )?;
+            destination.persist(&bytes)?;
+            drop(destination);
+            Session::open(&path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+        result
     }
 
     /// Persist a restore point for a completed prompt without changing the
@@ -2600,6 +2686,77 @@ mod tests {
         let reopened = Session::open(&path).unwrap();
         assert_eq!(reopened.entries().len(), 3);
         assert_eq!(reopened.head(), Some(e3));
+    }
+
+    #[test]
+    fn checkout_root_and_continue_preserves_the_original_root_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+
+        let mut session = Session::create(&path).unwrap();
+        let original_user = session.append(user("original prompt")).unwrap();
+        let original_assistant = session.append(assistant("original answer")).unwrap();
+        session.checkout_root().unwrap();
+        let edited_user = session.append(user("edited prompt")).unwrap();
+
+        assert_eq!(session.entry(&original_user).unwrap().parent, None);
+        assert_eq!(
+            session.entry(&original_assistant).unwrap().parent,
+            Some(original_user.clone())
+        );
+        assert_eq!(session.entry(&edited_user).unwrap().parent, None);
+        assert_eq!(session.entries().len(), 3);
+        assert_eq!(session.context().unwrap().len(), 1);
+        assert_eq!(
+            text_of(&session.context().unwrap()[0]),
+            "edited prompt",
+            "the active branch starts at the edited root"
+        );
+
+        drop(session);
+        let reopened = Session::open(path).unwrap();
+        assert_eq!(reopened.entries().len(), 3);
+        assert_eq!(reopened.head(), Some(edited_user));
+        assert!(reopened.entry(&original_assistant).is_some());
+    }
+
+    #[test]
+    fn fork_to_copies_only_the_selected_committed_ancestor_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.jsonl");
+        let fork_path = dir.path().join("fork.jsonl");
+        let mut source = Session::create(&source_path).unwrap();
+
+        let root = source.append(user("root")).unwrap();
+        let selected = source.append(assistant("selected answer")).unwrap();
+        let later = source.append(user("later work")).unwrap();
+        source.checkout(root.clone()).unwrap();
+        let sibling = source.append(assistant("sibling answer")).unwrap();
+
+        let mut fork = source.fork_to(&fork_path, selected.clone()).unwrap();
+        assert_eq!(fork.head(), Some(selected.clone()));
+        assert_eq!(fork.entries().len(), 2);
+        assert!(fork.entry(&root).is_some());
+        assert!(fork.entry(&selected).is_some());
+        assert!(fork.entry(&later).is_none());
+        assert!(fork.entry(&sibling).is_none());
+        let context = fork.context().unwrap();
+        assert_eq!(context.len(), 2);
+        assert_eq!(text_of(&context[0]), "root");
+        assert_eq!(text_of(&context[1]), "selected answer");
+
+        let continuation = fork.append(user("fork-only continuation")).unwrap();
+        assert_eq!(
+            fork.entry(&continuation).unwrap().parent,
+            Some(selected.clone())
+        );
+        drop(fork);
+        let reopened = Session::open(fork_path).unwrap();
+        assert_eq!(reopened.head(), Some(continuation));
+        assert_eq!(reopened.entries().len(), 3);
+
+        assert_eq!(source.head(), Some(sibling));
+        assert_eq!(source.entries().len(), 4);
     }
 
     #[test]

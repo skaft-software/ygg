@@ -6,14 +6,17 @@ import {
   FileText,
   Globe2,
   PanelRightClose,
+  TerminalSquare,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type {
+  ActionItem,
   OutputRef,
   ProgressStep,
   SessionSnapshot,
   SourceRef,
 } from "../protocol";
+import { CompletionReview } from "./CompletionReview";
 
 interface ActivityRailProps {
   session: SessionSnapshot;
@@ -21,6 +24,11 @@ interface ActivityRailProps {
   onClose: () => void;
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
+  onOpenResource?: (
+    handle: string,
+    title: string,
+    presentation: "text" | "diff" | "image",
+  ) => void;
   modal: boolean;
   onRestoreFocus: () => void;
   resourcesAvailable: boolean;
@@ -38,36 +46,26 @@ const sourceIcon = (source: SourceRef) => {
   return <File aria-hidden="true" />;
 };
 
-function LiveDots() {
-  return (
-    <span className="live-dots" aria-hidden="true">
-      <i />
-      <i />
-      <i />
-    </span>
-  );
-}
-
 function StepGlyph({ step }: { step: ProgressStep }) {
   if (step.status === "completed") return <Check aria-hidden="true" />;
-  if (step.status === "in_progress") {
-    return <LiveDots />;
-  }
   return <Circle aria-hidden="true" />;
 }
 
-export function ActivityRail({
+function ActivityRailView({
   session,
   open,
   onClose,
   onOpenOutput,
   onOpenSource,
+  onOpenResource,
   modal,
   onRestoreFocus,
   resourcesAvailable,
 }: ActivityRailProps) {
   const railRef = useRef<HTMLElement>(null);
   const [openSections, setOpenSections] = useState({
+    review: true,
+    commands: false,
     progress: true,
     artifacts: true,
     context: true,
@@ -114,6 +112,20 @@ export function ActivityRail({
   const completeCount = session.progress.filter(
     (step) => step.status === "completed",
   ).length;
+  const latestOutcome = [...session.items]
+    .reverse()
+    .find((item) => item.kind === "run_outcome");
+  const actions = session.items.filter((item): item is ActionItem => {
+    if (item.kind !== "action" || !latestOutcome) return false;
+    return latestOutcome.runId
+      ? item.runId === latestOutcome.runId
+      : !item.runId && item.turnId === latestOutcome.turnId;
+  });
+  const outputs = new Map(session.outputs.map((output) => [output.id, output]));
+  const commands = session.items.filter(
+    (item): item is ActionItem =>
+      item.kind === "action" && item.actionKind === "command",
+  );
 
   return (
     <aside
@@ -131,6 +143,98 @@ export function ActivityRail({
       </button>
 
       <div className="rail-scroll">
+        {latestOutcome ? (
+          <section className="rail-section" aria-labelledby="review-heading">
+            <details
+              open={openSections.review}
+              onToggle={(event) => {
+                const open = event.currentTarget.open;
+                setOpenSections((current) => ({
+                  ...current,
+                  review: open,
+                }));
+              }}
+            >
+              <summary>
+                <span id="review-heading">Review</span>
+                <em>{latestOutcome.review.evidenceCoverage}</em>
+                <ChevronDown aria-hidden="true" />
+              </summary>
+              <CompletionReview
+                outcome={latestOutcome}
+                actions={actions}
+                outputs={outputs}
+                onOpenOutput={onOpenOutput}
+                onOpenResource={onOpenResource}
+                compact
+              />
+            </details>
+          </section>
+        ) : null}
+
+        {commands.length ? (
+          <section className="rail-section" aria-labelledby="commands-heading">
+            <details
+              open={openSections.commands}
+              onToggle={(event) => {
+                const open = event.currentTarget.open;
+                setOpenSections((current) => ({
+                  ...current,
+                  commands: open,
+                }));
+              }}
+            >
+              <summary>
+                <span id="commands-heading">Command history</span>
+                <em>{commands.length}</em>
+                <ChevronDown aria-hidden="true" />
+              </summary>
+              <ol className="command-history-list">
+                {[...commands].reverse().map((command) => (
+                  <li key={command.id} data-status={command.status}>
+                    <TerminalSquare aria-hidden="true" />
+                    <span>
+                      <strong>
+                        {command.commandPreview ?? command.label}
+                      </strong>
+                      <small>
+                        {[
+                          command.cwd,
+                          command.durationMs === undefined
+                            ? undefined
+                            : `${command.durationMs}ms`,
+                          typeof command.exitCode === "number"
+                            ? `exit ${command.exitCode}`
+                            : command.status,
+                        ]
+                          .filter(Boolean)
+                          .join(" · ")}
+                      </small>
+                      {command.outputSummary ? (
+                        <small>{command.outputSummary}</small>
+                      ) : null}
+                    </span>
+                    {command.outputHandle && onOpenResource ? (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onOpenResource(
+                            command.outputHandle!,
+                            `${command.label} output`,
+                            "text",
+                          )
+                        }
+                      >
+                        Output
+                      </button>
+                    ) : null}
+                  </li>
+                ))}
+              </ol>
+            </details>
+          </section>
+        ) : null}
+
         {session.progress.length ? (
           <section className="rail-section" aria-labelledby="progress-heading">
             <details
@@ -240,3 +344,21 @@ export function ActivityRail({
     </aside>
   );
 }
+
+export const ActivityRail = memo(
+  ActivityRailView,
+  (previous, next) =>
+    previous.session.sessionId === next.session.sessionId &&
+    previous.session.progress === next.session.progress &&
+    previous.session.items === next.session.items &&
+    previous.session.outputs === next.session.outputs &&
+    previous.session.sources === next.session.sources &&
+    previous.open === next.open &&
+    previous.onClose === next.onClose &&
+    previous.onOpenOutput === next.onOpenOutput &&
+    previous.onOpenSource === next.onOpenSource &&
+    previous.onOpenResource === next.onOpenResource &&
+    previous.modal === next.modal &&
+    previous.onRestoreFocus === next.onRestoreFocus &&
+    previous.resourcesAvailable === next.resourcesAvailable,
+);

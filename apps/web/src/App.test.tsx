@@ -18,6 +18,7 @@ function renderHeader(sessionExportAvailable: boolean) {
       activityAvailable={false}
       activityOpen={false}
       pinned={false}
+      archived={false}
       sessionActionsAvailable
       metadataActionsAvailable
       branchHistoryAvailable={false}

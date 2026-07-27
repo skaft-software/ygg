@@ -1,12 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CommandRejectedError } from "./command-error";
 import { fixtureBootstrap, fixtureSessions } from "./fixtures";
 import type {
   ClientCommand,
   CommandAck,
   AttachmentRef,
+  DocumentReference,
   HostEvent,
   HostBootstrap,
+  ProjectCatalog,
+  RepositoryContextSnapshot,
   SessionSnapshot,
+  TranscriptSearchResult,
+  TrustedFileCatalog,
+  TrustedFileRead,
+  TrustedFileSearchResult,
 } from "./protocol";
 import { sessionIdFromPathname, YggStore } from "./store";
 import type { YggTransport } from "./transport";
@@ -21,6 +29,17 @@ const clone = <T,>(value: T): T => structuredClone(value);
 class TestTransport implements YggTransport {
   readonly commands: ClientCommand[] = [];
   readonly listeners = new Set<(event: HostEvent) => void>();
+  connectCount = 0;
+  projectCatalog: ProjectCatalog = {
+    host: {
+      id: fixtureBootstrap.host.id,
+      name: fixtureBootstrap.host.name,
+    },
+    catalogRevision: fixtureBootstrap.catalogRevision,
+    lifecycleMutationsSupported: true,
+    importSupported: false,
+    projects: clone(fixtureBootstrap.projects),
+  };
   sessionLoader: SessionLoader = async (sessionId) => {
     const snapshot = fixtureSessions[sessionId];
     if (!snapshot) throw new Error(`Unknown session ${sessionId}`);
@@ -30,7 +49,45 @@ class TestTransport implements YggTransport {
     command,
   ) => ({ commandId: command.id, accepted: true });
 
+  async getProjectCatalog(): Promise<ProjectCatalog> {
+    return clone(this.projectCatalog);
+  }
+
+  async getRepositoryContext(
+    projectId: string,
+  ): Promise<RepositoryContextSnapshot> {
+    return {
+      projectId,
+      trust: "verified",
+      repository: {
+        source: "gitStatusPorcelainV2",
+        refresh: {
+          state: "current",
+          refreshedAtUnixMs: 1,
+          durationMs: 1,
+          truncated: false,
+        },
+        worktree: "notRepository",
+        branchState: "unknown",
+      },
+      instructions: {
+        source: "projectAgentsMdV1",
+        refresh: {
+          state: "current",
+          refreshedAtUnixMs: 1,
+          durationMs: 1,
+          truncated: false,
+        },
+        files: [],
+        errors: [],
+        omittedErrors: 0,
+        loadedBytes: 0,
+      },
+    };
+  }
+
   async connect(): Promise<HostBootstrap> {
+    this.connectCount += 1;
     return clone(fixtureBootstrap);
   }
 
@@ -53,6 +110,52 @@ class TestTransport implements YggTransport {
       name: file.name,
       mediaType: file.type,
       size: file.size,
+    };
+  }
+
+  async ingestDocument(
+    ...args: [sessionId: string, file: File]
+  ): Promise<DocumentReference> {
+    const file = args[1];
+    return {
+      id: "test-document",
+      displayName: file.name,
+      mediaType: "text/plain",
+      sourceByteCount: file.size,
+      extractedTextByteCount: file.size,
+      sha256: "test",
+      fidelity: "exactUtf8",
+      createdAtMs: 1,
+    };
+  }
+
+  async listDocuments(): Promise<DocumentReference[]> {
+    return [];
+  }
+
+  async getTrustedFiles(): Promise<TrustedFileCatalog> {
+    return {
+      files: [],
+      summary: {
+        indexedFiles: 0,
+        ignoredEntries: 0,
+        truncated: false,
+      },
+    };
+  }
+
+  async searchTrustedFiles(): Promise<TrustedFileSearchResult> {
+    return { hits: [], truncated: false, scannedBytes: 0 };
+  }
+
+  async readTrustedFile(): Promise<TrustedFileRead> {
+    throw new Error("No trusted file fixture.");
+  }
+
+  async searchTranscripts(): Promise<TranscriptSearchResult> {
+    return {
+      hits: [],
+      truncated: false,
     };
   }
 
@@ -106,6 +209,53 @@ afterEach(() => {
 });
 
 describe("YggStore", () => {
+  it("renders session-free trust onboarding before opening a project", async () => {
+    const transport = new TestTransport();
+    transport.projectCatalog.projects = transport.projectCatalog.projects.map(
+      (project) => ({ ...project, trusted: false, isDefault: false }),
+    );
+    transport.commandHandler = async (command) => {
+      if (command.type === "project.setTrust") {
+        transport.projectCatalog.projects =
+          transport.projectCatalog.projects.map((project) =>
+            project.id === command.projectId
+              ? { ...project, trusted: command.trusted }
+              : project,
+          );
+        return {
+          commandId: command.id,
+          accepted: true,
+          project: transport.projectCatalog.projects.find(
+            (project) => project.id === command.projectId,
+          ),
+        };
+      }
+      return { commandId: command.id, accepted: true };
+    };
+    const store = new YggStore(transport);
+
+    await store.initialize();
+    expect(transport.connectCount).toBe(0);
+    expect(store.getSnapshot()).toMatchObject({
+      ready: true,
+      connecting: false,
+      bootstrap: null,
+      selectedSessionId: null,
+    });
+
+    await store.setProjectTrust(
+      transport.projectCatalog.projects[0]!.id,
+      true,
+    );
+    expect(transport.connectCount).toBe(1);
+    expect(store.getSnapshot().bootstrap).not.toBeNull();
+    expect(transport.commands.at(-1)).toMatchObject({
+      type: "project.setTrust",
+      trusted: true,
+    });
+    store.dispose();
+  });
+
   it("retries a transport failure with the same command identity", async () => {
     const transport = new TestTransport();
     let attempt = 0;
@@ -182,6 +332,57 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("coalesces a frame of deltas without churning catalog identity", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+    const initialBootstrap = store.getSnapshot().bootstrap;
+    const initialSummaries = initialBootstrap?.sessions;
+    let publications = 0;
+    const unsubscribe = store.subscribe(() => {
+      publications += 1;
+    });
+
+    transport.emit({
+      type: "item.started",
+      sessionId: "session-fresh",
+      sequence: 2,
+      item: {
+        id: "assistant-frame",
+        turnId: "turn-frame",
+        kind: "assistant_message",
+        content: "",
+        state: "streaming",
+        createdAt: new Date().toISOString(),
+      },
+    });
+    for (let index = 0; index < 120; index += 1) {
+      transport.emit({
+        type: "item.delta",
+        sessionId: "session-fresh",
+        sequence: index + 3,
+        itemId: "assistant-frame",
+        field: "content",
+        delta: "x",
+      });
+    }
+    await nextFrame();
+
+    const snapshot = store.getSnapshot();
+    expect(publications).toBe(1);
+    expect(snapshot.bootstrap).toBe(initialBootstrap);
+    expect(snapshot.bootstrap?.sessions).toBe(initialSummaries);
+    expect(store.selectedSession?.sequence).toBe(122);
+    expect(
+      store.selectedSession?.items.find(
+        (item) => item.id === "assistant-frame" && "content" in item,
+      ),
+    ).toMatchObject({ content: "x".repeat(120) });
+
+    unsubscribe();
+    store.dispose();
+  });
+
   it("inserts and refreshes background summaries from other clients", async () => {
     const transport = new TestTransport();
     const store = new YggStore(transport);
@@ -199,6 +400,7 @@ describe("YggStore", () => {
         updatedAt: new Date().toISOString(),
         pinned: false,
         archived: false,
+        lifecycle: "active",
         unread: true,
         modelId: "gpt-5.6",
         attentionCount: 0,
@@ -229,6 +431,7 @@ describe("YggStore", () => {
         updatedAt: new Date().toISOString(),
         pinned: false,
         archived: false,
+        lifecycle: "active",
         unread: false,
         modelId: "gpt-5.6",
         attentionCount: 1,
@@ -302,12 +505,45 @@ describe("YggStore", () => {
       },
     });
     await nextFrame();
-    await store.submit("Here is the requested input", [], "followUp");
+    await store.submit(
+      "Here is the requested input",
+      [],
+      "followUp",
+      "command-recovery-stable",
+    );
 
     expect(transport.commands.at(-1)).toMatchObject({
+      id: "command-recovery-stable",
       type: "session.followUp",
       sessionId: "session-fresh",
     });
+    store.dispose();
+  });
+
+  it("preserves classified retry metadata when a submission is rejected", async () => {
+    const transport = new TestTransport();
+    transport.commandHandler = async (command) => ({
+      commandId: command.id,
+      accepted: false,
+      error: "The session generation changed.",
+      errorCode: "staleGeneration",
+      retryable: true,
+      currentGeneration: 9,
+    });
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    const rejection = await store
+      .submit("Retry this safely", [], undefined, "command-stale")
+      .catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(CommandRejectedError);
+    expect(rejection).toMatchObject({
+      code: "staleGeneration",
+      retryable: true,
+      currentGeneration: 9,
+    });
+    expect(transport.commands.at(-1)?.id).toBe("command-stale");
     store.dispose();
   });
 

@@ -45,17 +45,80 @@ export class SessionProjectionReplacementRequiredError extends Error {
   }
 }
 
+type TranscriptItemIndex = ReadonlyMap<string, number>;
+
+const transcriptItemIndexes = new WeakMap<
+  readonly TranscriptItem[],
+  TranscriptItemIndex
+>();
+
+function transcriptItemIndex(
+  items: readonly TranscriptItem[],
+): TranscriptItemIndex {
+  const cached = transcriptItemIndexes.get(items);
+  if (cached) return cached;
+
+  const index = new Map<string, number>();
+  for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
+    const item = items[itemIndex]!;
+    if (!index.has(item.id)) index.set(item.id, itemIndex);
+  }
+  transcriptItemIndexes.set(items, index);
+  return index;
+}
+
+/**
+ * Builds the transcript lookup once when an authoritative snapshot enters the
+ * store. Subsequent immutable item arrays inherit the index, so live deltas do
+ * not scan the full transcript to locate their target.
+ */
+export function primeSessionItemIndex(snapshot: SessionSnapshot): void {
+  transcriptItemIndex(snapshot.items);
+}
+
+function cacheTranscriptItemIndex(
+  items: readonly TranscriptItem[],
+  index: TranscriptItemIndex,
+): void {
+  transcriptItemIndexes.set(items, index);
+}
+
+function updateItem(
+  items: TranscriptItem[],
+  itemId: string,
+  update: (item: TranscriptItem) => TranscriptItem,
+): TranscriptItem[] {
+  const index = transcriptItemIndex(items);
+  const itemIndex = index.get(itemId);
+  if (itemIndex === undefined) return items;
+
+  const current = items[itemIndex]!;
+  const updated = update(current);
+  if (updated === current) return items;
+
+  const next = items.slice();
+  next[itemIndex] = updated;
+  cacheTranscriptItemIndex(next, index);
+  return next;
+}
+
 function upsertItem(
   items: TranscriptItem[],
   incoming: TranscriptItem,
 ): TranscriptItem[] {
-  const existingIndex = items.findIndex((item) => item.id === incoming.id);
-  if (existingIndex === -1) {
-    return [...items, incoming];
+  const index = transcriptItemIndex(items);
+  const existingIndex = index.get(incoming.id);
+  if (existingIndex === undefined) {
+    const next = [...items, incoming];
+    const nextIndex = new Map(index);
+    nextIndex.set(incoming.id, items.length);
+    cacheTranscriptItemIndex(next, nextIndex);
+    return next;
   }
 
-  const next = [...items];
+  const next = items.slice();
   next[existingIndex] = incoming;
+  cacheTranscriptItemIndex(next, index);
   return next;
 }
 
@@ -133,6 +196,7 @@ export function reduceSessionEvent(
     ) {
       return snapshot;
     }
+    primeSessionItemIndex(event.snapshot);
     return event.snapshot;
   }
 
@@ -209,11 +273,7 @@ export function reduceSessionEvent(
       };
 
     case "item.delta": {
-      const items = snapshot.items.map((item) => {
-        if (item.id !== event.itemId) {
-          return item;
-        }
-
+      const items = updateItem(snapshot.items, event.itemId, (item) => {
         if (event.field === "content" && "content" in item) {
           return {
             ...item,
@@ -246,22 +306,79 @@ export function reduceSessionEvent(
     }
 
     case "item.retracted":
-      return {
-        ...snapshot,
-        sequence: event.sequence,
-        items: snapshot.items.filter((item) => item.id !== event.itemId),
-      };
+      {
+        const index = transcriptItemIndex(snapshot.items);
+        const itemIndex = index.get(event.itemId);
+        if (itemIndex === undefined) {
+          return {
+            ...snapshot,
+            sequence: event.sequence,
+          };
+        }
+        const items = [
+          ...snapshot.items.slice(0, itemIndex),
+          ...snapshot.items.slice(itemIndex + 1),
+        ];
+        const nextIndex = new Map<string, number>();
+        for (const [itemId, indexValue] of index) {
+          if (itemId === event.itemId) continue;
+          nextIndex.set(
+            itemId,
+            indexValue > itemIndex ? indexValue - 1 : indexValue,
+          );
+        }
+        cacheTranscriptItemIndex(items, nextIndex);
+        return {
+          ...snapshot,
+          sequence: event.sequence,
+          items,
+        };
+      }
 
-    case "item.tool_result":
+    case "item.activity":
       return {
         ...snapshot,
         sequence: event.sequence,
-        items: snapshot.items.map((item) =>
-          item.id === event.itemId && item.kind === "action"
+        items: updateItem(snapshot.items, event.itemId, (item) =>
+          item.kind === "action"
             ? {
                 ...item,
-                detail: event.detail,
-                state: event.state,
+                ...event.activity,
+                detail:
+                  event.activity.outputSummary ??
+                  event.activity.summary,
+                state:
+                  event.activity.status === "running"
+                    ? "streaming"
+                    : event.activity.status === "failed"
+                      ? "failed"
+                      : event.activity.status === "stopped"
+                        ? "stopped"
+                        : "committed",
+              }
+            : item,
+        ),
+      };
+
+    case "item.activity_result":
+      return {
+        ...snapshot,
+        sequence: event.sequence,
+        items: updateItem(snapshot.items, event.itemId, (item) =>
+          item.kind === "action"
+            ? {
+                ...item,
+                ...event.result,
+                detail:
+                  event.result.outputSummary ?? event.result.summary,
+                state:
+                  event.result.status === "running"
+                    ? "streaming"
+                    : event.result.status === "failed"
+                      ? "failed"
+                      : event.result.status === "stopped"
+                        ? "stopped"
+                        : "committed",
               }
             : item,
         ),
@@ -296,4 +413,81 @@ export function reduceSessionEvent(
         previews: event.previews ?? snapshot.previews,
       };
   }
+}
+
+function sameDeltaTarget(
+  left: Extract<SessionEvent, { type: "item.delta" }>,
+  right: SessionEvent,
+  actorGeneration: number,
+): right is Extract<SessionEvent, { type: "item.delta" }> {
+  return (
+    right.type === "item.delta" &&
+    right.sessionId === left.sessionId &&
+    right.itemId === left.itemId &&
+    right.field === left.field &&
+    (right.actorGeneration ?? actorGeneration) === actorGeneration
+  );
+}
+
+/**
+ * Reduces an ordered event batch while applying adjacent deltas to the same
+ * transcript field with one item-array copy. Every sequence is still
+ * validated, and non-delta events retain their original ordering.
+ */
+export function reduceSessionEvents(
+  snapshot: SessionSnapshot,
+  events: readonly SessionEvent[],
+): SessionSnapshot {
+  let next = snapshot;
+  let index = 0;
+
+  while (index < events.length) {
+    const event = events[index]!;
+    const eventGeneration = event.actorGeneration ?? next.actorGeneration;
+    if (
+      event.type !== "item.delta" ||
+      event.sessionId !== next.sessionId ||
+      event.sequence !== next.sequence + 1 ||
+      eventGeneration !== next.actorGeneration
+    ) {
+      next = reduceSessionEvent(next, event);
+      index += 1;
+      continue;
+    }
+
+    let lastIndex = index;
+    let lastSequence = event.sequence;
+    let delta = event.delta;
+    let replace = Boolean(event.replace);
+    while (lastIndex + 1 < events.length) {
+      const candidate = events[lastIndex + 1]!;
+      if (
+        !sameDeltaTarget(event, candidate, eventGeneration) ||
+        candidate.sequence !== lastSequence + 1
+      ) {
+        break;
+      }
+      if (candidate.replace) {
+        delta = candidate.delta;
+        replace = true;
+      } else {
+        delta += candidate.delta;
+      }
+      lastSequence = candidate.sequence;
+      lastIndex += 1;
+    }
+
+    const reduced = reduceSessionEvent(next, {
+      ...event,
+      delta,
+      replace,
+    });
+    next =
+      lastSequence === event.sequence || reduced === next
+        ? reduced
+        : { ...reduced, sequence: lastSequence };
+    index = lastIndex + 1;
+  }
+
+  return next;
 }

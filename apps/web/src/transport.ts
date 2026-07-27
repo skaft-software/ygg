@@ -6,20 +6,39 @@ import type {
   AttachmentRef,
   ClientCommand,
   CommandAck,
+  DocumentReference,
   HostBootstrap,
   HostEvent,
   ModelSummary,
+  ProjectCatalog,
+  RepositoryContextSnapshot,
   SessionEvent,
   SessionSnapshot,
   SessionSummary,
+  TranscriptSearchRequest,
+  TranscriptSearchResult,
+  TrustedFileCatalog,
+  TrustedFileRead,
+  TrustedFileSearchResult,
 } from "./protocol";
+import {
+  primeSessionItemIndex,
+  reduceSessionEvent,
+} from "./reducer";
 import {
   decodeWireCommandAck,
   encodeClientCommand,
   projectHostBootstrap,
+  projectProjectCatalog,
+  projectRepositoryContext,
   projectHostStreamEvent,
+  projectDocumentReference,
   projectReplayResponse,
   projectSessionSnapshot,
+  projectTranscriptSearchResult,
+  projectTrustedFileCatalog,
+  projectTrustedFileRead,
+  projectTrustedFileSearchResult,
 } from "./wire";
 
 type EventListener = (event: HostEvent) => void;
@@ -30,10 +49,26 @@ export type TransportConnectionState =
 type ConnectionListener = (state: TransportConnectionState) => void;
 
 export interface YggTransport {
+  getProjectCatalog(): Promise<ProjectCatalog>;
+  getRepositoryContext(projectId: string): Promise<RepositoryContextSnapshot>;
   connect(selectedSessionId?: string): Promise<HostBootstrap>;
   getSession(sessionId: string, signal?: AbortSignal): Promise<SessionSnapshot>;
   send(command: ClientCommand): Promise<CommandAck>;
   ingestAttachment(file: File): Promise<AttachmentRef>;
+  ingestDocument(sessionId: string, file: File): Promise<DocumentReference>;
+  listDocuments(sessionId: string): Promise<DocumentReference[]>;
+  getTrustedFiles(projectId: string): Promise<TrustedFileCatalog>;
+  searchTrustedFiles(
+    projectId: string,
+    query: string,
+  ): Promise<TrustedFileSearchResult>;
+  readTrustedFile(
+    projectId: string,
+    entryId: string,
+  ): Promise<TrustedFileRead>;
+  searchTranscripts(
+    request: TranscriptSearchRequest,
+  ): Promise<TranscriptSearchResult>;
   attachmentContentUrl(handle: string): string;
   resourceContentUrl(sessionId: string, handle: string): string;
   subscribe(listener: EventListener): () => void;
@@ -51,6 +86,67 @@ export class FixtureTransport implements YggTransport {
   private createdCount = 0;
   private attachmentFiles = new Map<string, File>();
   private attachmentUrls = new Map<string, string>();
+  private documents = new Map<string, DocumentReference[]>();
+
+  async getProjectCatalog(): Promise<ProjectCatalog> {
+    return {
+      host: {
+        id: this.bootstrap.host.id,
+        name: this.bootstrap.host.name,
+      },
+      catalogRevision: this.bootstrap.catalogRevision,
+      lifecycleMutationsSupported: true,
+      importSupported: false,
+      projects: clone(this.bootstrap.projects),
+    };
+  }
+
+  async getRepositoryContext(
+    projectId: string,
+  ): Promise<RepositoryContextSnapshot> {
+    const known = this.bootstrap.projects.some(
+      (project) =>
+        project.id === projectId &&
+        project.trusted &&
+        project.available &&
+        !project.archived,
+    );
+    if (!known) throw new Error("Explicit project trust is required.");
+    const refreshedAtUnixMs = Date.now();
+    return {
+      projectId,
+      trust: "verified",
+      repository: {
+        source: "gitStatusPorcelainV2",
+        refresh: {
+          state: "current",
+          refreshedAtUnixMs,
+          durationMs: 12,
+          truncated: false,
+        },
+        worktree: "present",
+        head: "aa56661f9b1f14933b57848d08144e8604e2e9cb",
+        branchState: "named",
+        branch: "explore/ygg-serve-web-v2",
+        dirty: true,
+        ahead: 0,
+        behind: 0,
+      },
+      instructions: {
+        source: "projectAgentsMdV1",
+        refresh: {
+          state: "current",
+          refreshedAtUnixMs,
+          durationMs: 3,
+          truncated: false,
+        },
+        files: [],
+        errors: [],
+        omittedErrors: 0,
+        loadedBytes: 0,
+      },
+    };
+  }
 
   async connect(selectedSessionId?: string): Promise<HostBootstrap> {
     if (selectedSessionId) {
@@ -93,6 +189,7 @@ export class FixtureTransport implements YggTransport {
     for (const url of this.attachmentUrls.values()) URL.revokeObjectURL(url);
     this.attachmentFiles.clear();
     this.attachmentUrls.clear();
+    this.documents.clear();
   }
 
   async ingestAttachment(file: File): Promise<AttachmentRef> {
@@ -110,6 +207,172 @@ export class FixtureTransport implements YggTransport {
       name: file.name,
       mediaType: file.type || "application/octet-stream",
       size: file.size,
+    };
+  }
+
+  async ingestDocument(
+    sessionId: string,
+    file: File,
+  ): Promise<DocumentReference> {
+    const identity = `${sessionId}\0${file.name}\0${file.type}\0${file.size}`;
+    let hash = 2_166_136_261;
+    for (let index = 0; index < identity.length; index += 1) {
+      hash ^= identity.charCodeAt(index);
+      hash = Math.imul(hash, 16_777_619);
+    }
+    const mediaType =
+      file.type === "application/pdf"
+        ? "application/pdf"
+        : file.type === "text/markdown" ||
+            /\.(?:md|markdown)$/iu.test(file.name)
+          ? "text/markdown"
+          : "text/plain";
+    const reference: DocumentReference = {
+      id: `doc_${(hash >>> 0).toString(16).padStart(32, "0")}`,
+      displayName: file.name,
+      mediaType,
+      sourceByteCount: file.size,
+      extractedTextByteCount: file.size,
+      sha256: (hash >>> 0).toString(16).padStart(64, "0"),
+      fidelity:
+        mediaType === "application/pdf" ? "pdfTextOnlyPartial" : "exactUtf8",
+      pageCount: mediaType === "application/pdf" ? 1 : undefined,
+      createdAtMs: Date.now(),
+    };
+    const current = this.documents.get(sessionId) ?? [];
+    this.documents.set(sessionId, [...current, reference]);
+    return clone(reference);
+  }
+
+  async listDocuments(sessionId: string): Promise<DocumentReference[]> {
+    return clone(this.documents.get(sessionId) ?? []);
+  }
+
+  async getTrustedFiles(projectId: string): Promise<TrustedFileCatalog> {
+    if (!projectId.trim()) {
+      throw new Error("A fixture project id is required.");
+    }
+    const files = [
+      {
+        id: "file_11111111111111111111111111111111",
+        relativePath: "README.md",
+        displayName: "README.md",
+        kind: "documentation" as const,
+        byteLen: 1_024,
+      },
+      {
+        id: "file_22222222222222222222222222222222",
+        relativePath: "src/lib.rs",
+        displayName: "lib.rs",
+        kind: "source" as const,
+        byteLen: 2_048,
+      },
+    ];
+    return {
+      summary: {
+        indexedFiles: files.length,
+        ignoredEntries: 3,
+        truncated: false,
+      },
+      files,
+    };
+  }
+
+  async searchTrustedFiles(
+    projectId: string,
+    query: string,
+  ): Promise<TrustedFileSearchResult> {
+    const catalog = await this.getTrustedFiles(projectId);
+    const needle = query.toLocaleLowerCase();
+    return {
+      hits: catalog.files
+        .filter((entry) =>
+          entry.relativePath.toLocaleLowerCase().includes(needle),
+        )
+        .map((entry) => ({
+          entry,
+          snippet: `Fixture match in ${entry.relativePath}`,
+        })),
+      truncated: false,
+      scannedBytes: catalog.files.reduce(
+        (total, entry) => total + entry.byteLen,
+        0,
+      ),
+    };
+  }
+
+  async readTrustedFile(
+    projectId: string,
+    entryId: string,
+  ): Promise<TrustedFileRead> {
+    const catalog = await this.getTrustedFiles(projectId);
+    const entry = catalog.files.find((candidate) => candidate.id === entryId);
+    if (!entry) throw new Error("Project file is not available.");
+    return {
+      entry,
+      text: `Fixture snapshot for ${entry.relativePath}\n`,
+      sha256: entry.id.slice(5).padEnd(64, "0"),
+    };
+  }
+
+  async searchTranscripts(
+    request: TranscriptSearchRequest,
+  ): Promise<TranscriptSearchResult> {
+    const query = request.query.trim().toLocaleLowerCase();
+    const hits = Object.values(this.sessions).flatMap((session) =>
+      session.items.flatMap((item) => {
+        const projected =
+          item.kind === "user_message"
+            ? { kind: "user" as const, text: item.content }
+            : item.kind === "assistant_message"
+              ? { kind: "assistant" as const, text: item.content }
+              : item.kind === "action"
+                ? {
+                    kind:
+                      item.status === "failed"
+                        ? ("error" as const)
+                        : ("tool" as const),
+                    text: [item.label, item.summary, item.target]
+                      .filter(Boolean)
+                      .join("\n"),
+                  }
+                : item.kind === "run_outcome" && item.outcome === "failed"
+                  ? { kind: "error" as const, text: item.summary }
+                  : undefined;
+        if (
+          !projected ||
+          !projected.text.toLocaleLowerCase().includes(query) ||
+          (request.filter.sessionId &&
+            request.filter.sessionId !== session.sessionId) ||
+          (request.filter.kinds?.length &&
+            !request.filter.kinds.includes(projected.kind))
+        ) {
+          return [];
+        }
+        const start = projected.text.toLocaleLowerCase().indexOf(query);
+        return [
+          {
+            sessionId: session.sessionId,
+            itemId: item.id,
+            kind: projected.kind,
+            sessionTitle:
+              this.bootstrap.sessions.find(
+                (summary) => summary.id === session.sessionId,
+              )?.title ?? "Session",
+            snippet: projected.text,
+            matchRanges: [
+              { startChar: start, endChar: start + [...query].length },
+            ],
+            titleMatchRanges: [],
+            timestampMs: Date.parse(item.createdAt),
+            score: 100,
+          },
+        ];
+      }),
+    );
+    return {
+      hits: hits.slice(0, request.limit),
+      truncated: hits.length > request.limit,
     };
   }
 
@@ -145,20 +408,8 @@ export class FixtureTransport implements YggTransport {
           items: [...current.items, clone(event.item)],
         };
       } else if (event.type === "item.delta") {
-        this.sessions[event.sessionId] = {
-          ...current,
-          sequence: event.sequence,
-          items: current.items.map((item) => {
-            if (item.id !== event.itemId) return item;
-            if (event.field === "content" && "content" in item) {
-              return { ...item, content: `${item.content}${event.delta}` };
-            }
-            if (event.field === "detail" && item.kind === "action") {
-              return { ...item, detail: `${item.detail ?? ""}${event.delta}` };
-            }
-            return item;
-          }),
-        };
+        primeSessionItemIndex(current);
+        this.sessions[event.sessionId] = reduceSessionEvent(current, event);
       } else if (event.type === "item.committed") {
         this.sessions[event.sessionId] = {
           ...current,
@@ -173,7 +424,7 @@ export class FixtureTransport implements YggTransport {
           sequence: event.sequence,
           items: current.items.filter((item) => item.id !== event.itemId),
         };
-      } else if (event.type === "item.tool_result") {
+      } else if (event.type === "item.activity") {
         this.sessions[event.sessionId] = {
           ...current,
           sequence: event.sequence,
@@ -181,8 +432,41 @@ export class FixtureTransport implements YggTransport {
             item.id === event.itemId && item.kind === "action"
               ? {
                   ...item,
-                  detail: event.detail,
-                  state: event.state,
+                  ...event.activity,
+                  detail:
+                    event.activity.outputSummary ??
+                    event.activity.summary,
+                  state:
+                    event.activity.status === "running"
+                      ? "streaming"
+                      : event.activity.status === "failed"
+                        ? "failed"
+                        : event.activity.status === "stopped"
+                          ? "stopped"
+                          : "committed",
+                }
+              : item,
+          ),
+        };
+      } else if (event.type === "item.activity_result") {
+        this.sessions[event.sessionId] = {
+          ...current,
+          sequence: event.sequence,
+          items: current.items.map((item) =>
+            item.id === event.itemId && item.kind === "action"
+              ? {
+                  ...item,
+                  ...event.result,
+                  detail:
+                    event.result.outputSummary ?? event.result.summary,
+                  state:
+                    event.result.status === "running"
+                      ? "streaming"
+                      : event.result.status === "failed"
+                        ? "failed"
+                        : event.result.status === "stopped"
+                          ? "stopped"
+                          : "committed",
                 }
               : item,
           ),
@@ -237,6 +521,64 @@ export class FixtureTransport implements YggTransport {
       return { commandId: command.id, accepted: true };
     }
 
+    if (command.type === "project.import") {
+      return {
+        commandId: command.id,
+        accepted: false,
+        error: "This host has no active folder-selection grant.",
+      };
+    }
+
+    if (
+      command.type === "project.rename" ||
+      command.type === "project.setDefault" ||
+      command.type === "project.setTrust" ||
+      command.type === "project.archive"
+    ) {
+      const project = this.bootstrap.projects.find(
+        (candidate) => candidate.id === command.projectId,
+      );
+      if (!project) {
+        return {
+          commandId: command.id,
+          accepted: false,
+          error: "Project is not available.",
+        };
+      }
+      if (command.type === "project.rename") {
+        project.name = command.displayName.trim();
+      } else if (command.type === "project.setDefault") {
+        for (const candidate of this.bootstrap.projects) {
+          candidate.isDefault = candidate.id === project.id;
+        }
+      } else if (command.type === "project.setTrust") {
+        project.trusted = command.trusted;
+      } else {
+        project.archived = true;
+        project.trusted = false;
+        project.isDefault = false;
+        project.liveSessionCount = 0;
+      }
+      this.bootstrap.catalogRevision += 1;
+      return {
+        commandId: command.id,
+        accepted: true,
+        project: clone(project),
+      };
+    }
+
+    if (command.type === "project.clearDefault") {
+      for (const project of this.bootstrap.projects) {
+        project.isDefault = false;
+      }
+      this.bootstrap.catalogRevision += 1;
+      return {
+        commandId: command.id,
+        accepted: true,
+        catalogChanged: true,
+      };
+    }
+
     if (command.type === "session.create") {
       this.createdCount += 1;
       const sessionId = `session-created-${this.createdCount}`;
@@ -270,6 +612,7 @@ export class FixtureTransport implements YggTransport {
         updatedAt: now,
         pinned: false,
         archived: false,
+        lifecycle: "active",
         unread: false,
         modelId: command.modelId,
         attentionCount: 0,
@@ -278,6 +621,66 @@ export class FixtureTransport implements YggTransport {
         commandId: command.id,
         accepted: true,
         createdSessionId: sessionId,
+      };
+    }
+
+    if (command.type === "session.setLifecycle") {
+      const summary = this.bootstrap.sessions.find(
+        (candidate) => candidate.id === command.sessionId,
+      );
+      if (!summary) {
+        return {
+          commandId: command.id,
+          accepted: false,
+          error: "Session is not available.",
+        };
+      }
+      summary.lifecycle = command.lifecycle;
+      summary.archived = command.lifecycle !== "active";
+      summary.retention =
+        command.lifecycle === "trash"
+          ? {
+              trashedAtMs: Date.now(),
+              purgeAfterMs: Date.now() + 30 * 24 * 60 * 60 * 1_000,
+              permanentDeleteRequiresConfirmation: true,
+            }
+          : undefined;
+      this.bootstrap.catalogRevision += 1;
+      return {
+        commandId: command.id,
+        accepted: true,
+        catalogChanged: true,
+      };
+    }
+
+    if (command.type === "session.deletePermanently") {
+      const summaryIndex = this.bootstrap.sessions.findIndex(
+        (candidate) => candidate.id === command.sessionId,
+      );
+      const summary = this.bootstrap.sessions[summaryIndex];
+      const expectedPhrase = `permanently delete ${command.sessionId}`;
+      if (
+        !summary ||
+        summary.lifecycle !== "trash" ||
+        !summary.retention ||
+        summary.retention.trashedAtMs !==
+          command.confirmation.trashedAtMs ||
+        command.confirmation.sessionId !== command.sessionId ||
+        command.confirmation.phrase !== expectedPhrase
+      ) {
+        return {
+          commandId: command.id,
+          accepted: false,
+          error: "Permanent-delete confirmation is stale or incomplete.",
+        };
+      }
+      this.bootstrap.sessions.splice(summaryIndex, 1);
+      delete this.sessions[command.sessionId];
+      this.bootstrap.catalogRevision += 1;
+      return {
+        commandId: command.id,
+        accepted: true,
+        catalogChanged: true,
       };
     }
 
@@ -298,6 +701,26 @@ export class FixtureTransport implements YggTransport {
       const turnId = `turn-${snapshot.sequence + 1}`;
       let sequence = snapshot.sequence + 1;
       const now = new Date().toISOString();
+      if (
+        command.sessionId === "session-performance" &&
+        command.prompt === "Stream 60 fixture deltas"
+      ) {
+        const assistantId = "performance-turn-223-answer";
+        this.later(0, () => {
+          for (let deltaIndex = 1; deltaIndex <= 60; deltaIndex += 1) {
+            this.emit({
+              type: "item.delta",
+              sessionId: command.sessionId,
+              sequence: sequence++,
+              itemId: assistantId,
+              field: "content",
+              delta: ` [stream ${deltaIndex}/60]`,
+            });
+          }
+        });
+        return { commandId: command.id, accepted: true };
+      }
+
       this.emit({
         type: "session.updated",
         sessionId: command.sessionId,
@@ -380,8 +803,17 @@ export class FixtureTransport implements YggTransport {
             turnId,
             kind: "action",
             actionKind: "analysis",
+            phase: "investigated",
+            status: "succeeded",
+            rawToolName: "fixture_context",
             label: "Inspected the project context",
+            summary: "Found the relevant session and project state.",
             detail: "Found the relevant session and project state.",
+            observedOutputBytes: 0,
+            droppedOutputBytes: 0,
+            changedPaths: [],
+            sourceIds: [],
+            outputIds: [],
             state: "committed",
             createdAt: new Date().toISOString(),
           },
@@ -458,6 +890,29 @@ export class FixtureTransport implements YggTransport {
             outcome: "done",
             durationMs: 2_650,
             summary: "Request completed",
+            review: {
+              summary: "Request completed",
+              durationMs: 2_650,
+              actionCount: 1,
+              phases: [
+                {
+                  phase: "investigated",
+                  actionCount: 1,
+                  succeededCount: 1,
+                  failedCount: 0,
+                  stoppedCount: 0,
+                },
+              ],
+              changedFileItemIds: [],
+              verificationActionItemIds: [],
+              failedActionItemIds: [],
+              warningActionItemIds: [],
+              sourceIds: [],
+              outputIds: [],
+              testResults: [],
+              evidenceCoverage: "none",
+              openQuestions: [],
+            },
             state: "committed",
             createdAt: new Date().toISOString(),
           },
@@ -598,6 +1053,121 @@ export class FixtureTransport implements YggTransport {
       return { commandId: command.id, accepted: true };
     }
 
+    if (command.type === "session.editUserTurn") {
+      const source = snapshot.items.find(
+        (item) =>
+          item.kind === "user_message" &&
+          item.durableEntryId === command.sourceUserEntryId,
+      );
+      if (!source) {
+        return {
+          commandId: command.id,
+          accepted: false,
+          error: "That user checkpoint is not available.",
+          errorCode: "notFound",
+          retryable: false,
+        };
+      }
+      this.emit({
+        type: "item.committed",
+        sessionId: command.sessionId,
+        sequence: snapshot.sequence + 1,
+        item: {
+          id: `fixture-edit-${snapshot.sequence + 1}`,
+          turnId: `fixture-edit-turn-${snapshot.sequence + 1}`,
+          durableEntryId: `fixture-entry-edit-${snapshot.sequence + 1}`,
+          kind: "user_message",
+          content: command.prompt,
+          state: "committed",
+          createdAt: new Date().toISOString(),
+          branchProvenance: {
+            operation: "editUserTurn",
+            sourceSessionId: command.sessionId,
+            sourceEntryId: command.sourceUserEntryId,
+            externalEffectsPreserved: true,
+            warning:
+              "External side effects from the earlier transcript are preserved.",
+          },
+        },
+      });
+      return { commandId: command.id, accepted: true };
+    }
+
+    if (command.type === "session.retryResponse") {
+      const source = snapshot.items.find(
+        (item) =>
+          item.kind === "assistant_message" &&
+          item.durableEntryId === command.sourceAssistantEntryId,
+      );
+      if (!source) {
+        return {
+          commandId: command.id,
+          accepted: false,
+          error: "That assistant checkpoint is not available.",
+          errorCode: "notFound",
+          retryable: false,
+        };
+      }
+      return { commandId: command.id, accepted: true };
+    }
+
+    if (command.type === "session.forkConversation") {
+      const sourceIndex = snapshot.items.findIndex(
+        (item) => item.durableEntryId === command.entryId,
+      );
+      if (sourceIndex < 0) {
+        return {
+          commandId: command.id,
+          accepted: false,
+          error: "That conversation checkpoint is not available.",
+          errorCode: "notFound",
+          retryable: false,
+        };
+      }
+      this.createdCount += 1;
+      const sessionId = `session-forked-${this.createdCount}`;
+      const now = new Date().toISOString();
+      this.sessions[sessionId] = {
+        ...clone(snapshot),
+        sessionId,
+        sequence: 1,
+        title: `${snapshot.title} fork`,
+        status: "idle",
+        activeRunId: undefined,
+        startedAt: now,
+        branches: { ...clone(snapshot.branches), head: command.entryId },
+        items: clone(snapshot.items.slice(0, sourceIndex + 1)),
+        progress: [],
+      };
+      this.bootstrap.sessions.unshift({
+        id: sessionId,
+        projectId: snapshot.projectId,
+        title: `${snapshot.title} fork`,
+        preview: "Forked conversation",
+        status: "idle",
+        updatedAt: now,
+        pinned: false,
+        archived: false,
+        lifecycle: "active",
+        forkedFrom: {
+          operation: "forkSession",
+          sourceSessionId: command.sessionId,
+          sourceEntryId: command.entryId,
+          externalEffectsPreserved: true,
+          warning:
+            "External side effects from the source session are preserved.",
+        },
+        unread: false,
+        modelId: snapshot.modelId,
+        attentionCount: 0,
+      });
+      return {
+        commandId: command.id,
+        accepted: true,
+        createdSessionId: sessionId,
+      };
+    }
+
     if (command.type === "approval.resolve") {
       const item = snapshot.items.find(
         (candidate) =>
@@ -694,6 +1264,36 @@ export class HttpTransport implements YggTransport {
 
   constructor(private readonly deviceId?: string) {}
 
+  async getProjectCatalog(): Promise<ProjectCatalog> {
+    const response = await fetch("/api/v1/projects", {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    });
+    if (!response.ok) {
+      throw new Error(`Project catalog failed with ${response.status}`);
+    }
+    const catalog = projectProjectCatalog(await response.json());
+    this.hostId = catalog.host.id;
+    this.catalogRevision = catalog.catalogRevision;
+    return catalog;
+  }
+
+  async getRepositoryContext(
+    projectId: string,
+  ): Promise<RepositoryContextSnapshot> {
+    const response = await fetch(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/context`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Project context failed with ${response.status}`);
+    }
+    return projectRepositoryContext(await response.json());
+  }
+
   async connect(selectedSessionId?: string): Promise<HostBootstrap> {
     this.closedByClient = false;
     const request: RequestInit = {
@@ -768,7 +1368,11 @@ export class HttpTransport implements YggTransport {
         models: this.models,
       });
       encoded = {
-        hostScoped: command.type === "session.create",
+        hostScoped:
+          command.type === "session.create" ||
+          command.type.startsWith("project.") ||
+          command.type === "session.setLifecycle" ||
+          command.type === "session.deletePermanently",
         body: JSON.stringify(envelope),
       };
       this.encodedCommands.set(command.id, encoded);
@@ -800,6 +1404,12 @@ export class HttpTransport implements YggTransport {
       ack.createdSessionId
     ) {
       this.rememberCreatedSession(command, ack.createdSessionId);
+    } else if (
+      command.type === "session.forkConversation" &&
+      ack.accepted &&
+      ack.createdSessionId
+    ) {
+      this.rememberForkedSession(command, ack.createdSessionId);
     }
     return ack;
   }
@@ -817,11 +1427,50 @@ export class HttpTransport implements YggTransport {
       updatedAt: new Date().toISOString(),
       pinned: false,
       archived: false,
+      lifecycle: "active",
       unread: false,
       modelId: command.modelId,
       attentionCount: 0,
     });
     this.modelIdBySession[sessionId] = command.modelId;
+  }
+
+  private rememberForkedSession(
+    command: Extract<
+      ClientCommand,
+      { type: "session.forkConversation" }
+    >,
+    sessionId: string,
+  ): void {
+    const source = this.summaries.get(command.sessionId);
+    const modelId =
+      this.modelIdBySession[command.sessionId] ??
+      source?.modelId ??
+      this.models[0]?.id ??
+      "";
+    this.summaries.set(sessionId, {
+      id: sessionId,
+      projectId: source?.projectId ?? "",
+      title: source ? `${source.title} fork` : "Forked conversation",
+      preview: "Forked conversation",
+      status: "idle",
+      updatedAt: new Date().toISOString(),
+      pinned: false,
+      archived: false,
+      lifecycle: "active",
+      forkedFrom: {
+        operation: "forkSession",
+        sourceSessionId: command.sessionId,
+        sourceEntryId: command.entryId,
+        externalEffectsPreserved: true,
+        warning:
+          "External side effects from the source session are preserved.",
+      },
+      unread: false,
+      modelId,
+      attentionCount: 0,
+    });
+    this.modelIdBySession[sessionId] = modelId;
   }
 
   async ingestAttachment(file: File): Promise<AttachmentRef> {
@@ -860,6 +1509,121 @@ export class HttpTransport implements YggTransport {
       mediaType: result.mediaType,
       size: result.byteLen,
     };
+  }
+
+  async ingestDocument(
+    sessionId: string,
+    file: File,
+  ): Promise<DocumentReference> {
+    const mediaType =
+      file.type === "application/pdf"
+        ? "application/pdf"
+        : file.type === "text/markdown" ||
+            /\.(?:md|markdown)$/iu.test(file.name)
+          ? "text/markdown"
+          : "text/plain";
+    const response = await fetch(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/documents?displayName=${encodeURIComponent(file.name)}`,
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": mediaType,
+        },
+        body: file,
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Document upload failed with ${response.status}`);
+    }
+    return projectDocumentReference(await response.json());
+  }
+
+  async listDocuments(sessionId: string): Promise<DocumentReference[]> {
+    const response = await fetch(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/documents`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Document listing failed with ${response.status}`);
+    }
+    const value: unknown = await response.json();
+    if (!Array.isArray(value)) {
+      throw new Error("Document listing returned an invalid response.");
+    }
+    return value.map((document, index) =>
+      projectDocumentReference(document, `documents[${index}]`),
+    );
+  }
+
+  async getTrustedFiles(projectId: string): Promise<TrustedFileCatalog> {
+    const response = await fetch(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/files`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Project-file listing failed with ${response.status}`);
+    }
+    return projectTrustedFileCatalog(await response.json());
+  }
+
+  async searchTrustedFiles(
+    projectId: string,
+    query: string,
+  ): Promise<TrustedFileSearchResult> {
+    const response = await fetch(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/files/search?query=${encodeURIComponent(query)}`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Project-file search failed with ${response.status}`);
+    }
+    return projectTrustedFileSearchResult(await response.json());
+  }
+
+  async readTrustedFile(
+    projectId: string,
+    entryId: string,
+  ): Promise<TrustedFileRead> {
+    const response = await fetch(
+      `/api/v1/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(entryId)}`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Project-file read failed with ${response.status}`);
+    }
+    return projectTrustedFileRead(await response.json());
+  }
+
+  async searchTranscripts(
+    request: TranscriptSearchRequest,
+  ): Promise<TranscriptSearchResult> {
+    const response = await fetch("/api/v1/search", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(request),
+    });
+    if (!response.ok) {
+      throw new Error(`Conversation search failed with ${response.status}`);
+    }
+    return projectTranscriptSearchResult(await response.json());
   }
 
   attachmentContentUrl(handle: string): string {

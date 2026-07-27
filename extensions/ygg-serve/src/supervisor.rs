@@ -1,6 +1,6 @@
 //! Host catalog and exclusive multi-session actor supervision.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,9 +11,9 @@ use crate::{
     ActorConfig, ActorError, ActorView, AuthorityProfile, CatalogCursor, CommandAdmission,
     CommandId, CreateSessionRequest, DeviceId, ErrorCode, HostBootstrap, HostCommand,
     HostCommandAck, HostCommandEnvelope, HostService, HostStreamEvent, ModelSelection,
-    ProtocolValidation, ReplayResponse, SanitizedError, ServiceError, SessionActor,
-    SessionActorHandle, SessionCommandEnvelope, SessionCursor, SessionDriver, SessionId,
-    PROTOCOL_VERSION,
+    ProjectCatalog, ProjectId, ProtocolValidation, ReplayResponse, SanitizedError, ServiceError,
+    SessionActor, SessionActorHandle, SessionCommandEnvelope, SessionCursor, SessionDriver,
+    SessionId, PROTOCOL_VERSION,
 };
 
 const HOST_COMMAND_CACHE_CAPACITY: usize = 2_048;
@@ -94,6 +94,7 @@ enum HostCommandCacheEntry {
 
 struct SupervisorState {
     actors: BTreeMap<SessionId, SessionActorHandle>,
+    blocked_projects: BTreeSet<ProjectId>,
     session_openings:
         BTreeMap<SessionId, Vec<oneshot::Sender<Result<SessionActorHandle, SupervisorError>>>>,
     host_commands: BTreeMap<HostCommandKey, HostCommandCacheEntry>,
@@ -135,6 +136,7 @@ impl<H: HostService> SessionSupervisor<H> {
             config,
             state: Arc::new(Mutex::new(SupervisorState {
                 actors: BTreeMap::new(),
+                blocked_projects: BTreeSet::new(),
                 session_openings: BTreeMap::new(),
                 host_commands: BTreeMap::new(),
                 host_command_order: VecDeque::new(),
@@ -184,6 +186,16 @@ impl<H: HostService> SessionSupervisor<H> {
         loop {
             let begin = {
                 let mut state = self.state.lock().await;
+                if state.actors.get(session_id).is_some_and(|handle| {
+                    handle
+                        .view()
+                        .summary
+                        .project_id
+                        .as_ref()
+                        .is_some_and(|project_id| state.blocked_projects.contains(project_id))
+                }) {
+                    return Err(ServiceError::Unauthorized.into());
+                }
                 if state
                     .actors
                     .get(session_id)
@@ -244,7 +256,7 @@ impl<H: HostService> SessionSupervisor<H> {
         &self,
         selected_session_id: &SessionId,
     ) -> Result<HostBootstrap, SupervisorError> {
-        let projects = self.host.list_projects().await?;
+        let projects = self.project_catalog().await?.projects;
         let mut summaries = self
             .host
             .list_sessions()
@@ -459,6 +471,44 @@ impl<H: HostService> SessionSupervisor<H> {
         CatalogCursor(self.catalog_cursor.load(Ordering::Acquire))
     }
 
+    /// Returns a session-free, path-free project catalog for trust onboarding.
+    pub async fn project_catalog(&self) -> Result<ProjectCatalog, SupervisorError> {
+        let mut projects = self.host.list_projects().await?;
+        let live_project_ids = {
+            let state = self.state.lock().await;
+            state
+                .actors
+                .values()
+                .filter(|handle| !handle.is_closed())
+                .filter_map(|handle| {
+                    let project_id = handle.view().summary.project_id?;
+                    (!state.blocked_projects.contains(&project_id)).then_some(project_id)
+                })
+                .collect::<Vec<_>>()
+        };
+        for project in &mut projects {
+            let live = live_project_ids
+                .iter()
+                .filter(|project_id| *project_id == &project.id)
+                .count()
+                .min(u32::MAX as usize) as u32;
+            project.live_session_count = live;
+            project.session_count = project.session_count.max(live);
+        }
+        let catalog = ProjectCatalog {
+            protocol: PROTOCOL_VERSION,
+            host: self.host.descriptor(),
+            catalog_cursor: self.catalog_cursor(),
+            lifecycle_mutations_supported: self.host.project_lifecycle_mutations_supported(),
+            import_supported: self.host.project_import_supported(),
+            projects,
+        };
+        catalog
+            .validate()
+            .map_err(|_| SupervisorError::InvalidBootstrap)?;
+        Ok(catalog)
+    }
+
     /// Attachment policy advertised by the running host.
     pub fn attachment_policy(&self) -> Option<crate::AttachmentPolicy> {
         self.host.attachment_policy()
@@ -482,6 +532,101 @@ impl<H: HostService> SessionSupervisor<H> {
         handle: &str,
     ) -> Result<crate::StoredAttachment, crate::AttachmentError> {
         self.host.attachment_content(handle).await
+    }
+
+    /// Whether the concrete host supports bounded document ingestion.
+    pub fn document_ingest_supported(&self) -> bool {
+        self.host.document_ingest_supported()
+    }
+
+    /// Ingests one document after the host verifies its session/project binding.
+    pub async fn ingest_document(
+        &self,
+        session_id: &crate::SessionId,
+        display_name: &str,
+        media_type: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<crate::DocumentReference, crate::ServiceError> {
+        self.host
+            .ingest_document(session_id, display_name, media_type, bytes)
+            .await
+    }
+
+    /// Lists immutable documents owned by one session.
+    pub async fn list_documents(
+        &self,
+        session_id: &crate::SessionId,
+    ) -> Result<Vec<crate::DocumentReference>, crate::ServiceError> {
+        self.host.list_documents(session_id).await
+    }
+
+    /// Whether the concrete host supports root-confined project-file browsing.
+    pub fn trusted_project_files_supported(&self) -> bool {
+        self.host.trusted_project_files_supported()
+    }
+
+    /// Returns the trusted-file index status for one project.
+    pub async fn trusted_file_index(
+        &self,
+        project_id: &crate::ProjectId,
+    ) -> Result<crate::TrustedFileIndexSummary, crate::ServiceError> {
+        self.host.trusted_file_index(project_id).await
+    }
+
+    /// Lists safe trusted-project file entries.
+    pub async fn list_trusted_files(
+        &self,
+        project_id: &crate::ProjectId,
+        limit: usize,
+    ) -> Result<Vec<crate::TrustedFileEntry>, crate::ServiceError> {
+        self.host.list_trusted_files(project_id, limit).await
+    }
+
+    /// Searches safe trusted-project file names and text.
+    pub async fn search_trusted_files(
+        &self,
+        project_id: &crate::ProjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<crate::TrustedFileSearchResult, crate::ServiceError> {
+        self.host
+            .search_trusted_files(project_id, query, limit)
+            .await
+    }
+
+    /// Reads one trusted-project file by its opaque index identity.
+    pub async fn read_trusted_file(
+        &self,
+        project_id: &crate::ProjectId,
+        entry_id: &crate::FileEntryId,
+    ) -> Result<crate::TrustedFileRead, crate::ServiceError> {
+        self.host.read_trusted_file(project_id, entry_id).await
+    }
+
+    /// Whether the host exposes authenticated durable transcript search.
+    pub fn transcript_search_supported(&self) -> bool {
+        self.host.transcript_search_supported()
+    }
+
+    /// Searches already-redacted durable transcript projections.
+    pub async fn search_transcripts(
+        &self,
+        request: &crate::TranscriptSearchRequest,
+    ) -> Result<crate::TranscriptSearchResult, crate::ServiceError> {
+        self.host.search_transcripts(request).await
+    }
+
+    /// Whether the host exposes trusted repository and folder-instruction context.
+    pub fn repository_context_supported(&self) -> bool {
+        self.host.repository_context_supported()
+    }
+
+    /// Refreshes path-free repository context for one authoritative project.
+    pub async fn repository_context(
+        &self,
+        project_id: &crate::ProjectId,
+    ) -> Result<crate::RepositoryContextSnapshot, crate::ServiceError> {
+        self.host.repository_context(project_id).await
     }
 
     /// Reads one authenticated opaque resource without interpreting its handle.
@@ -518,6 +663,15 @@ impl<H: HostService> SessionSupervisor<H> {
         let driver = self.host.create_session(request).await?;
         let session_id = driver.seed().summary.id;
         let mut state = self.state.lock().await;
+        if driver
+            .seed()
+            .summary
+            .project_id
+            .as_ref()
+            .is_some_and(|project_id| state.blocked_projects.contains(project_id))
+        {
+            return Err(SupervisorError::Service(ServiceError::Unauthorized));
+        }
         let provisional_owners = state
             .actors
             .values()
@@ -559,6 +713,15 @@ impl<H: HostService> SessionSupervisor<H> {
         }
 
         let mut state = self.state.lock().await;
+        if driver
+            .seed()
+            .summary
+            .project_id
+            .as_ref()
+            .is_some_and(|project_id| state.blocked_projects.contains(project_id))
+        {
+            return Err(SupervisorError::Service(ServiceError::Unauthorized));
+        }
         if state
             .actors
             .get(session_id)
@@ -678,6 +841,186 @@ impl<H: HostService> SessionSupervisor<H> {
                     ),
                     Err(error) => reject(supervisor_error_to_public(error), self.catalog_cursor()),
                 }
+            }
+            HostCommand::ImportProject {
+                candidate_id,
+                display_name,
+            } => match self
+                .host
+                .import_project(candidate_id, display_name.as_deref())
+                .await
+            {
+                Ok(project) => HostCommandAck::accepted_project(
+                    host_id,
+                    envelope.command_id.clone(),
+                    acknowledged_at_ms,
+                    self.advance_project_catalog(),
+                    Some(project),
+                ),
+                Err(error) => reject(error.into_public(), self.catalog_cursor()),
+            },
+            HostCommand::RenameProject {
+                project_id,
+                display_name,
+            } => match self.host.rename_project(project_id, display_name).await {
+                Ok(project) => HostCommandAck::accepted_project(
+                    host_id,
+                    envelope.command_id.clone(),
+                    acknowledged_at_ms,
+                    self.advance_project_catalog(),
+                    Some(project),
+                ),
+                Err(error) => reject(error.into_public(), self.catalog_cursor()),
+            },
+            HostCommand::SetDefaultProject { project_id } => {
+                match self.host.set_default_project(project_id).await {
+                    Ok(project) => HostCommandAck::accepted_project(
+                        host_id,
+                        envelope.command_id.clone(),
+                        acknowledged_at_ms,
+                        self.advance_project_catalog(),
+                        Some(project),
+                    ),
+                    Err(error) => reject(error.into_public(), self.catalog_cursor()),
+                }
+            }
+            HostCommand::ClearDefaultProject => match self.host.clear_default_project().await {
+                Ok(()) => HostCommandAck::accepted_project(
+                    host_id,
+                    envelope.command_id.clone(),
+                    acknowledged_at_ms,
+                    self.advance_project_catalog(),
+                    None,
+                ),
+                Err(error) => reject(error.into_public(), self.catalog_cursor()),
+            },
+            HostCommand::SetProjectTrust {
+                project_id,
+                trusted,
+            } => {
+                if !trusted {
+                    self.block_and_retire_project(project_id).await;
+                }
+                match self.host.set_project_trust(project_id, *trusted).await {
+                    Ok(project) => {
+                        if *trusted {
+                            self.unblock_project(project_id).await;
+                        }
+                        HostCommandAck::accepted_project(
+                            host_id,
+                            envelope.command_id.clone(),
+                            acknowledged_at_ms,
+                            self.advance_project_catalog(),
+                            Some(project),
+                        )
+                    }
+                    Err(error) => {
+                        if !trusted {
+                            self.unblock_project(project_id).await;
+                        }
+                        reject(error.into_public(), self.catalog_cursor())
+                    }
+                }
+            }
+            HostCommand::ArchiveProject { project_id } => {
+                self.block_and_retire_project(project_id).await;
+                match self.host.archive_project(project_id).await {
+                    Ok(project) => HostCommandAck::accepted_project(
+                        host_id,
+                        envelope.command_id.clone(),
+                        acknowledged_at_ms,
+                        self.advance_project_catalog(),
+                        Some(project),
+                    ),
+                    Err(error) => {
+                        self.unblock_project(project_id).await;
+                        reject(error.into_public(), self.catalog_cursor())
+                    }
+                }
+            }
+            HostCommand::SetSessionLifecycle {
+                session_id,
+                lifecycle,
+            } => {
+                self.retire_session_owner(session_id).await;
+                match self
+                    .host
+                    .set_session_lifecycle(session_id, *lifecycle, acknowledged_at_ms)
+                    .await
+                {
+                    Ok(_) => HostCommandAck::accepted_project(
+                        host_id,
+                        envelope.command_id.clone(),
+                        acknowledged_at_ms,
+                        self.advance_project_catalog(),
+                        None,
+                    ),
+                    Err(error) => reject(error.into_public(), self.catalog_cursor()),
+                }
+            }
+            HostCommand::DeleteSessionPermanently {
+                session_id,
+                confirmation,
+            } => {
+                self.retire_session_owner(session_id).await;
+                match self
+                    .host
+                    .delete_session_permanently(session_id, confirmation)
+                    .await
+                {
+                    Ok(()) => HostCommandAck::accepted_project(
+                        host_id,
+                        envelope.command_id.clone(),
+                        acknowledged_at_ms,
+                        self.advance_project_catalog(),
+                        None,
+                    ),
+                    Err(error) => reject(error.into_public(), self.catalog_cursor()),
+                }
+            }
+        }
+    }
+
+    fn advance_project_catalog(&self) -> CatalogCursor {
+        advance_catalog(&self.catalog_cursor).unwrap_or_else(|| self.catalog_cursor())
+    }
+
+    async fn block_and_retire_project(&self, project_id: &ProjectId) {
+        let actors = {
+            let mut state = self.state.lock().await;
+            state.blocked_projects.insert(project_id.clone());
+            state
+                .actors
+                .values()
+                .filter(|handle| {
+                    handle.view().summary.project_id.as_ref() == Some(project_id)
+                        && !handle.is_closed()
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for actor in actors {
+            actor.retire().await;
+        }
+    }
+
+    async fn unblock_project(&self, project_id: &ProjectId) {
+        self.state.lock().await.blocked_projects.remove(project_id);
+    }
+
+    async fn retire_session_owner(&self, session_id: &SessionId) {
+        let actor = self.state.lock().await.actors.get(session_id).cloned();
+        if let Some(actor) = actor {
+            actor.retire().await;
+            actor.closed().await;
+            actor.quiesced().await;
+            let mut state = self.state.lock().await;
+            if state
+                .actors
+                .get(session_id)
+                .is_some_and(|current| current.same_actor(&actor))
+            {
+                state.actors.remove(session_id);
             }
         }
     }
@@ -913,6 +1256,7 @@ mod tests {
         list_projects_release: Option<Arc<tokio::sync::Barrier>>,
         list_sessions_entered: Option<Arc<tokio::sync::Barrier>>,
         list_sessions_release: Option<Arc<tokio::sync::Barrier>>,
+        project: Arc<StdMutex<Option<crate::ProjectSummary>>>,
     }
 
     impl MockHost {
@@ -934,7 +1278,26 @@ mod tests {
                 list_projects_release: None,
                 list_sessions_entered: None,
                 list_sessions_release: None,
+                project: Arc::new(StdMutex::new(None)),
             }
+        }
+
+        fn with_project() -> (Self, ProjectId) {
+            let project_id = ProjectId::new("prj_11111111111111111111111111111111").unwrap();
+            let host = Self {
+                project: Arc::new(StdMutex::new(Some(crate::ProjectSummary {
+                    id: project_id.clone(),
+                    name: "Project".into(),
+                    trusted: true,
+                    archived: false,
+                    available: true,
+                    is_default: true,
+                    session_count: 0,
+                    live_session_count: 0,
+                }))),
+                ..Self::new()
+            };
+            (host, project_id)
         }
 
         fn with_create_barrier(parties: usize) -> Self {
@@ -1025,6 +1388,9 @@ mod tests {
                     modified_at_ms: number as u64,
                     pinned: false,
                     archived: false,
+                    lifecycle: crate::SessionCatalogState::Active,
+                    retention: None,
+                    forked_from: None,
                     provisional: request.provisional,
                     live_state: SessionLiveState::Idle,
                     attention: AttentionState::None,
@@ -1141,7 +1507,10 @@ mod tests {
                 payload: ItemPayload::UserMessage {
                     text: input.text,
                     attachments: input.attachments,
+                    documents: Vec::new(),
+                    project_files: Vec::new(),
                     delivery: None,
+                    branch_provenance: None,
                 },
             };
             Ok(DriverCommandOutcome::run(
@@ -1235,7 +1604,7 @@ mod tests {
         }
 
         async fn list_projects(&self) -> Result<Vec<crate::ProjectSummary>, ServiceError> {
-            let projects = Vec::new();
+            let projects = self.project.lock().unwrap().clone().into_iter().collect();
             if let Some(entered) = &self.list_projects_entered {
                 entered.wait().await;
             }
@@ -1243,6 +1612,43 @@ mod tests {
                 release.wait().await;
             }
             Ok(projects)
+        }
+
+        fn project_lifecycle_mutations_supported(&self) -> bool {
+            self.project.lock().unwrap().is_some()
+        }
+
+        async fn set_project_trust(
+            &self,
+            project_id: &ProjectId,
+            trusted: bool,
+        ) -> Result<crate::ProjectSummary, ServiceError> {
+            let mut project = self.project.lock().unwrap();
+            let project = project.as_mut().ok_or(ServiceError::NotFound)?;
+            if &project.id != project_id {
+                return Err(ServiceError::NotFound);
+            }
+            if project.archived && trusted {
+                return Err(ServiceError::InvalidBoundary);
+            }
+            project.trusted = trusted;
+            Ok(project.clone())
+        }
+
+        async fn archive_project(
+            &self,
+            project_id: &ProjectId,
+        ) -> Result<crate::ProjectSummary, ServiceError> {
+            let mut project = self.project.lock().unwrap();
+            let project = project.as_mut().ok_or(ServiceError::NotFound)?;
+            if &project.id != project_id {
+                return Err(ServiceError::NotFound);
+            }
+            project.trusted = false;
+            project.archived = true;
+            project.is_default = false;
+            project.live_session_count = 0;
+            Ok(project.clone())
         }
 
         async fn list_sessions(&self) -> Result<Vec<crate::SessionSummary>, ServiceError> {
@@ -1326,6 +1732,8 @@ mod tests {
                 input: PromptInput {
                     text: text.into(),
                     attachments: Vec::new(),
+                    document_ids: Vec::new(),
+                    project_file_ids: Vec::new(),
                 },
             },
         )
@@ -1363,6 +1771,93 @@ mod tests {
                 }),
             },
         )
+    }
+
+    fn project_command(command_id: &str, command: HostCommand) -> HostCommandEnvelope {
+        HostCommandEnvelope::new(
+            HostId::new("host-mock").unwrap(),
+            DeviceId::new("device-mock").unwrap(),
+            CommandId::new(command_id).unwrap(),
+            1,
+            command,
+        )
+    }
+
+    #[tokio::test]
+    async fn trust_revocation_fences_commands_and_retires_matching_actors() {
+        let (host, project_id) = MockHost::with_project();
+        let supervisor = SessionSupervisor::new(Arc::new(host), SupervisorConfig::default());
+        let handle = supervisor
+            .create_fresh_session(Some(project_id.clone()))
+            .await
+            .unwrap();
+        let session_id = handle.session_id().clone();
+
+        let revoked = supervisor
+            .host_command(
+                project_command(
+                    "project-revoke",
+                    HostCommand::SetProjectTrust {
+                        project_id: project_id.clone(),
+                        trusted: false,
+                    },
+                ),
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            revoked.ack.disposition,
+            crate::HostAckDisposition::Accepted {
+                project: Some(crate::ProjectSummary { trusted: false, .. }),
+                ..
+            }
+        ));
+        let catalog = supervisor.project_catalog().await.unwrap();
+        assert_eq!(catalog.projects[0].live_session_count, 0);
+        assert!(matches!(
+            supervisor
+                .command(command(session_id, "blocked-command", "must not run"), 11)
+                .await,
+            Err(SupervisorError::Service(ServiceError::Unauthorized))
+        ));
+        assert!(matches!(
+            supervisor
+                .create_fresh_session(Some(project_id.clone()))
+                .await,
+            Err(SupervisorError::Service(ServiceError::Unauthorized))
+        ));
+        tokio::time::timeout(Duration::from_secs(1), handle.closed())
+            .await
+            .expect("revoked project owner must close");
+        tokio::time::timeout(Duration::from_secs(1), handle.quiesced())
+            .await
+            .expect("revoked project owner must quiesce");
+
+        let granted = supervisor
+            .host_command(
+                project_command(
+                    "project-grant",
+                    HostCommand::SetProjectTrust {
+                        project_id: project_id.clone(),
+                        trusted: true,
+                    },
+                ),
+                12,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            granted.ack.disposition,
+            crate::HostAckDisposition::Accepted {
+                project: Some(crate::ProjectSummary { trusted: true, .. }),
+                ..
+            }
+        ));
+        supervisor
+            .create_fresh_session(Some(project_id))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1595,6 +2090,8 @@ mod tests {
                 input: PromptInput {
                     text: "independent device identity".into(),
                     attachments: Vec::new(),
+                    document_ids: Vec::new(),
+                    project_file_ids: Vec::new(),
                 },
             },
         );

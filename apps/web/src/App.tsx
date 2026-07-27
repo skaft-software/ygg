@@ -1,5 +1,6 @@
 import {
   Archive,
+  ArchiveRestore,
   ChevronDown,
   Download,
   Folder,
@@ -16,6 +17,7 @@ import {
 import {
   type CSSProperties,
   type RefObject,
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -31,8 +33,22 @@ import {
 } from "./components/Inspector";
 import { SettingsView } from "./components/Settings";
 import { Sidebar } from "./components/Sidebar";
+import { TranscriptSearch } from "./components/TranscriptSearch";
+import { ProjectsView } from "./components/Projects";
 import { YggGlyph } from "./components/YggGlyph";
-import type { SessionSnapshot, SessionStatus } from "./protocol";
+import type {
+  AttachmentRef,
+  AuthorityProfile,
+  DocumentReference,
+  ReasoningEffort,
+  SessionSnapshot,
+  SessionStatus,
+  TrustedFileEntry,
+} from "./protocol";
+import {
+  AttentionNotificationManager,
+  browserNotificationAdapter,
+} from "./notifications";
 import {
   sessionIdFromPathname,
   YggStore,
@@ -45,7 +61,7 @@ import {
   transportModeFromSearch,
 } from "./transport";
 
-type Surface = "session" | "settings" | "devices";
+type Surface = "session" | "projects" | "settings" | "devices";
 
 const statusLabel: Record<SessionStatus, string> = {
   idle: "Ready",
@@ -61,6 +77,23 @@ const transportMode = transportModeFromSearch(window.location.search);
 const store = new YggStore(createTransport(transportMode));
 const activityPaneStorageKey = "ygg.ui.activity-width";
 const inspectorPaneStorageKey = "ygg.ui.inspector-width";
+const notificationPreferenceKey = (hostId: string) =>
+  `ygg.notifications.enabled.${encodeURIComponent(hostId)}`;
+const MemoizedInspector = memo(
+  Inspector,
+  (previous, next) =>
+    previous.session.sessionId === next.session.sessionId &&
+    previous.session.outputs === next.session.outputs &&
+    previous.session.sources === next.session.sources &&
+    previous.session.previews === next.session.previews &&
+    previous.selection === next.selection &&
+    previous.closing === next.closing &&
+    previous.modal === next.modal &&
+    previous.previewsAvailable === next.previewsAvailable &&
+    previous.resourceContentUrl === next.resourceContentUrl &&
+    previous.onRestoreFocus === next.onRestoreFocus &&
+    previous.onClose === next.onClose,
+);
 
 function storedPaneWidth(key: string, fallback: number): number {
   try {
@@ -76,6 +109,35 @@ function persistPaneWidth(key: string, value: number) {
     window.localStorage.setItem(key, String(Math.round(value)));
   } catch {
     // A hardened browser may disable storage; resizing still works in memory.
+  }
+}
+
+function localStorageIfAvailable(): Storage | undefined {
+  try {
+    return window.localStorage;
+  } catch {
+    return undefined;
+  }
+}
+
+function storedNotificationPreference(hostId: string): boolean {
+  try {
+    return (
+      window.localStorage.getItem(notificationPreferenceKey(hostId)) === "true"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function persistNotificationPreference(hostId: string, enabled: boolean) {
+  try {
+    window.localStorage.setItem(
+      notificationPreferenceKey(hostId),
+      String(enabled),
+    );
+  } catch {
+    // A storage-hardened browser keeps the preference for this page only.
   }
 }
 
@@ -152,6 +214,7 @@ interface HeaderProps {
   activityAvailable: boolean;
   activityOpen: boolean;
   pinned: boolean;
+  archived: boolean;
   sessionActionsAvailable: boolean;
   metadataActionsAvailable: boolean;
   branchHistoryAvailable: boolean;
@@ -162,7 +225,7 @@ interface HeaderProps {
   onToggleActivity: () => void;
   onRename: (title: string) => void;
   onPin: (pinned: boolean) => void;
-  onArchive: () => void;
+  onArchive: (archived: boolean) => void;
   onOpenBranchHistory: () => void;
 }
 
@@ -175,6 +238,7 @@ export function SessionHeader({
   activityAvailable,
   activityOpen,
   pinned,
+  archived,
   sessionActionsAvailable,
   metadataActionsAvailable,
   branchHistoryAvailable,
@@ -343,12 +407,16 @@ export function SessionHeader({
                         {pinned ? "Unpin" : "Pin"}
                       </button>
                       <button
-                        className="danger-row"
+                        className={archived ? undefined : "danger-row"}
                         role="menuitem"
-                        onClick={onArchive}
+                        onClick={() => onArchive(!archived)}
                       >
-                        <Archive aria-hidden="true" />
-                        Archive
+                        {archived ? (
+                          <ArchiveRestore aria-hidden="true" />
+                        ) : (
+                          <Archive aria-hidden="true" />
+                        )}
+                        {archived ? "Restore from archive" : "Archive"}
                       </button>
                     </>
                   ) : null}
@@ -541,6 +609,7 @@ export default function App() {
   );
   const [activityOpen, setActivityOpen] = useState(false);
   const [branchHistoryOpen, setBranchHistoryOpen] = useState(false);
+  const [transcriptSearchOpen, setTranscriptSearchOpen] = useState(false);
   const [inspector, setInspector] = useState<InspectorSelection | null>(null);
   const [inspectorClosing, setInspectorClosing] = useState(false);
   const [activityPaneWidth, setActivityPaneWidth] = useState(() =>
@@ -550,6 +619,17 @@ export default function App() {
     storedPaneWidth(inspectorPaneStorageKey, 720),
   );
   const [surface, setSurface] = useState<Surface>("session");
+  const notificationManagerRef =
+    useRef<AttentionNotificationManager | null>(null);
+  const [notificationState, setNotificationState] = useState<{
+    supported: boolean;
+    enabled: boolean;
+    permission: NotificationPermission | "unsupported";
+  }>({
+    supported: false,
+    enabled: false,
+    permission: "unsupported",
+  });
   const activityButtonRef = useRef<HTMLButtonElement>(null);
   const sidebarButtonRef = useRef<HTMLButtonElement>(null);
   const inspectorCloseTimerRef = useRef<number | null>(null);
@@ -570,6 +650,12 @@ export default function App() {
   }, [restoreActivityFocus]);
   const closeInspector = useCallback(() => {
     if (inspectorCloseTimerRef.current !== null) return;
+    if (!wideLayout) {
+      setInspector(null);
+      setInspectorClosing(false);
+      restoreActivityFocus();
+      return;
+    }
     setInspectorClosing(true);
     inspectorCloseTimerRef.current = window.setTimeout(() => {
       inspectorCloseTimerRef.current = null;
@@ -577,7 +663,7 @@ export default function App() {
       setInspectorClosing(false);
       restoreActivityFocus();
     }, 180);
-  }, [restoreActivityFocus]);
+  }, [restoreActivityFocus, wideLayout]);
   const closeSidebar = useCallback(() => {
     setSidebarOpen(false);
     restoreSidebarFocus();
@@ -618,6 +704,45 @@ export default function App() {
   }, [state.bootstrap, state.error]);
 
   useEffect(() => {
+    const hostId = state.bootstrap?.host.id;
+    if (!hostId) return;
+    const manager = new AttentionNotificationManager(
+      hostId,
+      browserNotificationAdapter(),
+      localStorageIfAvailable(),
+    );
+    notificationManagerRef.current = manager;
+    let cancelled = false;
+    const preferred = storedNotificationPreference(hostId);
+    const initialFrame = window.requestAnimationFrame(() => {
+      if (cancelled) return;
+      setNotificationState({
+        supported: manager.supported,
+        enabled: false,
+        permission: manager.permission,
+      });
+    });
+    if (preferred && manager.permission === "granted") {
+      void manager.enable().then((enabled) => {
+        if (cancelled) return;
+        setNotificationState({
+          supported: manager.supported,
+          enabled,
+          permission: manager.permission,
+        });
+      });
+    }
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(initialFrame);
+      manager.disable();
+      if (notificationManagerRef.current === manager) {
+        notificationManagerRef.current = null;
+      }
+    };
+  }, [state.bootstrap?.host.id]);
+
+  useEffect(() => {
     const onPopState = () => {
       const sessionId = sessionIdFromPathname(window.location.pathname);
       if (sessionId) void store.selectSession(sessionId, "none");
@@ -641,13 +766,15 @@ export default function App() {
 
   const activityAvailable = Boolean(
     session &&
-      (session.progress.length ||
+      (session.items.some((item) => item.kind === "run_outcome") ||
+        session.progress.length ||
         (state.bootstrap?.capabilities.resources &&
           (session.outputs.length || session.sources.length))),
   );
   const visibleActivityOpen = activityOpen && activityAvailable;
   const modalWorkspaceOpen =
     branchHistoryOpen ||
+    transcriptSearchOpen ||
     (!wideLayout && (visibleActivityOpen || Boolean(inspector)));
 
   useEffect(() => {
@@ -672,7 +799,7 @@ export default function App() {
     return () => media.removeEventListener("change", onChange);
   }, []);
 
-  const openOutput = (outputId: string) => {
+  const openOutput = useCallback((outputId: string) => {
     if (inspectorCloseTimerRef.current !== null) {
       window.clearTimeout(inspectorCloseTimerRef.current);
       inspectorCloseTimerRef.current = null;
@@ -680,8 +807,8 @@ export default function App() {
     setInspectorClosing(false);
     setActivityOpen(false);
     setInspector({ type: "output", id: outputId });
-  };
-  const openSource = (sourceId: string) => {
+  }, []);
+  const openSource = useCallback((sourceId: string) => {
     if (inspectorCloseTimerRef.current !== null) {
       window.clearTimeout(inspectorCloseTimerRef.current);
       inspectorCloseTimerRef.current = null;
@@ -689,20 +816,23 @@ export default function App() {
     setInspectorClosing(false);
     setActivityOpen(false);
     setInspector({ type: "source", id: sourceId });
-  };
-  const openResource = (
-    handle: string,
-    title: string,
-    presentation: "text" | "diff" | "image",
-  ) => {
-    if (inspectorCloseTimerRef.current !== null) {
-      window.clearTimeout(inspectorCloseTimerRef.current);
-      inspectorCloseTimerRef.current = null;
-    }
-    setInspectorClosing(false);
-    setActivityOpen(false);
-    setInspector({ type: "resource", handle, title, presentation });
-  };
+  }, []);
+  const openResource = useCallback(
+    (
+      handle: string,
+      title: string,
+      presentation: "text" | "diff" | "image",
+    ) => {
+      if (inspectorCloseTimerRef.current !== null) {
+        window.clearTimeout(inspectorCloseTimerRef.current);
+        inspectorCloseTimerRef.current = null;
+      }
+      setInspectorClosing(false);
+      setActivityOpen(false);
+      setInspector({ type: "resource", handle, title, presentation });
+    },
+    [],
+  );
 
   const paneBounds = useCallback(
     (kind: "activity" | "inspector") => {
@@ -800,6 +930,268 @@ export default function App() {
     "--activity-width": `${activityPaneWidth}px`,
     "--inspector-width": `${inspectorPaneWidth}px`,
   } as CSSProperties;
+  const startNewSession = useCallback(() => {
+    setSurface("session");
+    setInspector(null);
+    setActivityOpen(false);
+    void store.createSession();
+  }, []);
+  const selectSession = useCallback(
+    (sessionId: string) => {
+      setSurface("session");
+      setInspector(null);
+      if (sessionId !== state.selectedSessionId) {
+        setActivityOpen(false);
+      }
+      void store.selectSession(sessionId);
+      if (window.matchMedia("(max-width: 760px)").matches) {
+        setSidebarOpen(false);
+      }
+    },
+    [state.selectedSessionId],
+  );
+  const activateSearchResult = useCallback(
+    (sessionId: string, itemId: string) => {
+      void (async () => {
+        setSurface("session");
+        setInspector(null);
+        setActivityOpen(false);
+        await store.selectSession(sessionId);
+        for (let attempt = 0; attempt < 12; attempt += 1) {
+          await new Promise<void>((resolve) =>
+            window.requestAnimationFrame(() => resolve()),
+          );
+          const target = document.getElementById(
+            `transcript-item-${itemId}`,
+          );
+          if (!target) continue;
+          for (
+            let details = target.closest("details");
+            details;
+            details = details.parentElement?.closest("details") ?? null
+          ) {
+            details.open = true;
+          }
+          target.scrollIntoView({ block: "center", behavior: "smooth" });
+          target.focus({ preventScroll: true });
+          target.classList.add("is-search-target");
+          window.setTimeout(
+            () => target.classList.remove("is-search-target"),
+            1_800,
+          );
+          break;
+        }
+      })();
+    },
+    [],
+  );
+  const restoreSession = useCallback(async (sessionId: string) => {
+    setSurface("session");
+    setInspector(null);
+    setActivityOpen(false);
+    await store.selectSession(sessionId);
+    await store.archive(false);
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      setSidebarOpen(false);
+    }
+  }, []);
+  const changeNotifications = useCallback(
+    async (enabled: boolean): Promise<boolean> => {
+      const manager = notificationManagerRef.current;
+      const hostId = state.bootstrap?.host.id;
+      if (!manager || !hostId) return false;
+      if (!enabled) {
+        manager.disable();
+        persistNotificationPreference(hostId, false);
+        setNotificationState({
+          supported: manager.supported,
+          enabled: false,
+          permission: manager.permission,
+        });
+        return false;
+      }
+      const granted = await manager.enable();
+      persistNotificationPreference(hostId, granted);
+      setNotificationState({
+        supported: manager.supported,
+        enabled: granted,
+        permission: manager.permission,
+      });
+      return granted;
+    },
+    [state.bootstrap?.host.id],
+  );
+  useEffect(() => {
+    const manager = notificationManagerRef.current;
+    const summaries = state.bootstrap?.sessions;
+    if (!manager || !summaries || !notificationState.enabled) return;
+    const observe = () => {
+      for (const summary of summaries) {
+        manager.observe(summary, {
+          hidden: document.visibilityState !== "visible",
+          focused: document.hasFocus(),
+          focusWindow: () => window.focus(),
+          openSession: selectSession,
+        });
+      }
+    };
+    observe();
+    document.addEventListener("visibilitychange", observe);
+    window.addEventListener("focus", observe);
+    window.addEventListener("blur", observe);
+    return () => {
+      document.removeEventListener("visibilitychange", observe);
+      window.removeEventListener("focus", observe);
+      window.removeEventListener("blur", observe);
+    };
+  }, [
+    notificationState.enabled,
+    selectSession,
+    state.bootstrap?.sessions,
+  ]);
+  const openSettings = useCallback(() => {
+    setSurface("settings");
+    setInspector(null);
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      setSidebarOpen(false);
+    }
+  }, []);
+  const openProjects = useCallback(() => {
+    setSurface("projects");
+    setInspector(null);
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      setSidebarOpen(false);
+    }
+  }, []);
+  const openDevices = useCallback(() => {
+    setSurface("devices");
+    setInspector(null);
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      setSidebarOpen(false);
+    }
+  }, []);
+  const submitSession = useCallback(
+    (
+      prompt: string,
+      attachments: AttachmentRef[],
+      activeDelivery?: "steer" | "followUp",
+      idempotencyKey?: string,
+      documents?: DocumentReference[],
+      projectFiles?: TrustedFileEntry[],
+    ) =>
+      store.submit(
+        prompt,
+        attachments,
+        activeDelivery,
+        idempotencyKey,
+        documents,
+        projectFiles,
+      ),
+    [],
+  );
+  const interruptSession = useCallback(() => store.interrupt(), []);
+  const configureSession = useCallback(
+    (patch: {
+      modelId?: string;
+      reasoning?: ReasoningEffort;
+      authority?: AuthorityProfile;
+    }) => store.configure(patch),
+    [],
+  );
+  const resolveApproval = useCallback(
+    (
+      requestId: string,
+      decision: "allowed_once" | "allowed_session" | "denied",
+    ) => store.resolveApproval(requestId, decision),
+    [],
+  );
+  const resolveUserInput = useCallback(
+    (
+      requestId: string,
+      answer: Parameters<YggStore["resolveUserInput"]>[1],
+    ) => store.resolveUserInput(requestId, answer),
+    [],
+  );
+  const ingestAttachment = useCallback(
+    (file: File) => store.ingestAttachment(file),
+    [],
+  );
+  const ingestDocument = useCallback(
+    (file: File) => store.ingestDocument(file),
+    [],
+  );
+  const selectedProjectId = session?.projectId;
+  const listProjectFiles = useCallback(() => {
+    if (!selectedProjectId) {
+      throw new Error("This conversation is not bound to a project.");
+    }
+    return store.getTrustedFiles(selectedProjectId);
+  }, [selectedProjectId]);
+  const searchProjectFiles = useCallback(
+    (query: string) => {
+      if (!selectedProjectId) {
+        throw new Error("This conversation is not bound to a project.");
+      }
+      return store.searchTrustedFiles(selectedProjectId, query);
+    },
+    [selectedProjectId],
+  );
+  const readProjectFile = useCallback(
+    (entryId: string) => {
+      if (!selectedProjectId) {
+        throw new Error("This conversation is not bound to a project.");
+      }
+      return store.readTrustedFile(selectedProjectId, entryId);
+    },
+    [selectedProjectId],
+  );
+  const editUserTurn = useCallback(
+    (entryId: string, text: string) =>
+      store.editUserTurn(entryId, text),
+    [],
+  );
+  const retryResponse = useCallback(
+    (
+      entryId: string,
+      model?: { id: string; reasoning: ReasoningEffort },
+    ) => store.retryResponse(entryId, model),
+    [],
+  );
+  const forkConversation = useCallback(
+    (entryId: string) => store.forkConversation(entryId),
+    [],
+  );
+  const attachmentContentUrl = useCallback(
+    (handle: string) => store.attachmentContentUrl(handle),
+    [],
+  );
+  const resourceContentUrl = useCallback(
+    (sessionId: string, handle: string) =>
+      store.resourceContentUrl(sessionId, handle),
+    [],
+  );
+  const renameProject = useCallback(
+    (projectId: string, name: string) =>
+      store.renameProject(projectId, name),
+    [],
+  );
+  const setDefaultProject = useCallback(
+    (projectId: string | null) => store.setDefaultProject(projectId),
+    [],
+  );
+  const setProjectTrust = useCallback(
+    (projectId: string, trusted: boolean) =>
+      store.setProjectTrust(projectId, trusted),
+    [],
+  );
+  const archiveProject = useCallback(
+    (projectId: string) => store.archiveProject(projectId),
+    [],
+  );
+  const loadProjectContext = useCallback(
+    (projectId: string) => store.getRepositoryContext(projectId),
+    [],
+  );
 
   if (state.connecting) return <LoadingState />;
   if (state.error) {
@@ -810,7 +1202,22 @@ export default function App() {
       />
     );
   }
-  if (!state.bootstrap || !session) return <ErrorState message="No session was selected." />;
+  if (!state.bootstrap || !session) {
+    if (state.projectCatalog) {
+      return (
+        <ProjectsView
+          catalog={state.projectCatalog}
+          onboarding
+          onRename={renameProject}
+          onSetDefault={setDefaultProject}
+          onSetTrust={setProjectTrust}
+          onArchive={archiveProject}
+          onLoadContext={loadProjectContext}
+        />
+      );
+    }
+    return <ErrorState message="No session was selected." />;
+  }
 
   return (
     <div className={appClass} style={appStyle}>
@@ -824,33 +1231,19 @@ export default function App() {
         devicesAvailable={state.bootstrap.capabilities.connectedDevices}
         onRestoreFocus={restoreSidebarFocus}
         onClose={closeSidebar}
-        onNewSession={() => {
-          setSurface("session");
-          setInspector(null);
-          setActivityOpen(false);
-          void store.createSession();
+        onNewSession={startNewSession}
+        onSelectSession={selectSession}
+        onRestoreSession={(sessionId) => {
+          void restoreSession(sessionId);
         }}
-        onSelectSession={(sessionId) => {
-          setSurface("session");
-          setInspector(null);
-          if (sessionId !== state.selectedSessionId) {
-            setActivityOpen(false);
-          }
-          void store.selectSession(sessionId);
-          if (window.matchMedia("(max-width: 760px)").matches) {
-            setSidebarOpen(false);
-          }
-        }}
-        onOpenSettings={() => {
-          setSurface("settings");
-          setInspector(null);
-          if (window.matchMedia("(max-width: 760px)").matches) {
-            setSidebarOpen(false);
-          }
-        }}
-        onOpenDevices={() => {
-          setSurface("devices");
-          setInspector(null);
+        onOpenProjects={openProjects}
+        onOpenSettings={openSettings}
+        onOpenDevices={openDevices}
+        transcriptSearchAvailable={
+          state.bootstrap.capabilities.transcriptSearch
+        }
+        onOpenTranscriptSearch={() => {
+          setTranscriptSearchOpen(true);
           if (window.matchMedia("(max-width: 760px)").matches) {
             setSidebarOpen(false);
           }
@@ -873,6 +1266,7 @@ export default function App() {
             activityAvailable={activityAvailable}
             activityOpen={visibleActivityOpen}
             pinned={selectedSummary?.pinned ?? false}
+            archived={selectedSummary?.archived ?? false}
             sessionActionsAvailable={
               state.bootstrap.capabilities.sessionMetadata ||
               state.bootstrap.capabilities.sessionBranches ||
@@ -899,9 +1293,9 @@ export default function App() {
             onPin={(pinned) => {
               void store.pin(pinned);
             }}
-            onArchive={() => {
+            onArchive={(archived) => {
               void (async () => {
-                if (await store.archive(true)) {
+                if (await store.archive(archived) && archived) {
                   await store.createSession();
                 }
               })();
@@ -914,17 +1308,11 @@ export default function App() {
             key={session.sessionId}
             session={session}
             bootstrap={state.bootstrap}
-            onSubmit={(prompt, attachments, activeDelivery) =>
-              store.submit(prompt, attachments, activeDelivery)
-            }
-            onInterrupt={() => store.interrupt()}
-            onConfigure={(patch) => store.configure(patch)}
-            onResolveApproval={(requestId, decision) =>
-              store.resolveApproval(requestId, decision)
-            }
-            onResolveUserInput={(requestId, answer) =>
-              store.resolveUserInput(requestId, answer)
-            }
+            onSubmit={submitSession}
+            onInterrupt={interruptSession}
+            onConfigure={configureSession}
+            onResolveApproval={resolveApproval}
+            onResolveUserInput={resolveUserInput}
             onOpenOutput={openOutput}
             onOpenSource={openSource}
             onOpenResource={
@@ -932,10 +1320,15 @@ export default function App() {
                 ? openResource
                 : undefined
             }
-            onIngestAttachment={(file) => store.ingestAttachment(file)}
-            attachmentContentUrl={(handle) =>
-              store.attachmentContentUrl(handle)
-            }
+            onIngestAttachment={ingestAttachment}
+            onIngestDocument={ingestDocument}
+            onListProjectFiles={listProjectFiles}
+            onSearchProjectFiles={searchProjectFiles}
+            onReadProjectFile={readProjectFile}
+            onEditUserTurn={editUserTurn}
+            onRetryResponse={retryResponse}
+            onForkConversation={forkConversation}
+            attachmentContentUrl={attachmentContentUrl}
           />
         </div>
       ) : (
@@ -946,7 +1339,13 @@ export default function App() {
           }
         >
           <UtilityTopbar
-            title={surface === "settings" ? "Settings" : "Connected devices"}
+            title={
+              surface === "settings"
+                ? "Settings"
+                : surface === "projects"
+                  ? "Projects"
+                  : "Connected devices"
+            }
             sidebarOpen={sidebarOpen}
             onOpenSidebar={() => setSidebarOpen(true)}
             sidebarButtonRef={sidebarButtonRef}
@@ -961,6 +1360,19 @@ export default function App() {
                 state.bootstrap.capabilities.themeSelection
               }
               onThemeChange={(themeId) => void store.selectTheme(themeId)}
+              notificationsSupported={notificationState.supported}
+              notificationsEnabled={notificationState.enabled}
+              notificationPermission={notificationState.permission}
+              onNotificationsChange={changeNotifications}
+            />
+          ) : surface === "projects" && state.projectCatalog ? (
+            <ProjectsView
+              catalog={state.projectCatalog}
+              onRename={renameProject}
+              onSetDefault={setDefaultProject}
+              onSetTrust={setProjectTrust}
+              onArchive={archiveProject}
+              onLoadContext={loadProjectContext}
             />
           ) : (
             <DevicesView
@@ -1021,19 +1433,22 @@ export default function App() {
             onClose={closeActivity}
             onOpenOutput={openOutput}
             onOpenSource={openSource}
+            onOpenResource={
+              state.bootstrap.capabilities.resources
+                ? openResource
+                : undefined
+            }
             modal={!wideLayout}
             onRestoreFocus={restoreActivityFocus}
             resourcesAvailable={state.bootstrap.capabilities.resources}
           />
-          <Inspector
+          <MemoizedInspector
             session={session}
             selection={inspector}
             closing={inspectorClosing}
             modal={!wideLayout}
             previewsAvailable={state.bootstrap.capabilities.previews}
-            resourceContentUrl={(sessionId, handle) =>
-              store.resourceContentUrl(sessionId, handle)
-            }
+            resourceContentUrl={resourceContentUrl}
             onRestoreFocus={restoreActivityFocus}
             onClose={closeInspector}
           />
@@ -1046,6 +1461,15 @@ export default function App() {
           onCheckout={(entryId) => store.checkoutBranch(entryId)}
         />
       ) : null}
+      <TranscriptSearch
+        open={
+          Boolean(state.bootstrap.capabilities.transcriptSearch) &&
+          transcriptSearchOpen
+        }
+        onClose={() => setTranscriptSearchOpen(false)}
+        onSearch={(request) => store.searchTranscripts(request)}
+        onActivate={activateSearchResult}
+      />
     </div>
   );
 }

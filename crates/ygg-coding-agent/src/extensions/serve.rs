@@ -2,13 +2,11 @@
 
 //! Default-off adapter from the graphical host contracts to the real Ygg App.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Read as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-#[cfg(test)]
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -17,34 +15,47 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use ygg_agent::{
     AgentEvent, Entry, EntryId, EntryValue, FinishReason, InputPart, OutputChannel, RunControl,
-    Session, SessionRunOutcome, SessionRunOutcomeStatus, ToolOutput, ToolProgress, UserInput,
+    Session, SessionRunOutcome, SessionRunOutcomeStatus, ToolError, ToolOutput, ToolProgress,
+    UserInput,
 };
 use ygg_ai::{
     AssistantPart, ImageSource, Media, Message, Modality, Model, ModelCatalog, ModelId,
     ReasoningConfig, ToolCallId, ToolResultPart, UserPart,
 };
 use ygg_serve_backend::{
-    ActorOwnerState, ArtifactId, ArtifactKind, ArtifactRef, AttachmentError, AttachmentFingerprint,
-    AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState, AuthorityProfile,
-    ColorScheme, ContextUsage, CreateSessionRequest, DriverCommandOutcome, DurableEntryId,
-    EventPayload, FileChange, FinalizeCompletion, FinalizeDecision, HostCapabilities,
-    HostDescriptor, HostId, HostService, InputModality, ItemDelta, ItemId, ItemLifecycle,
-    ItemPayload, LoopbackConfig, LoopbackServer, ModelSelection, ModelSummary, PendingRequest,
-    ProjectId, ProjectSummary, PromptInput, ProtocolValidation, RequestAnswer, RequestId,
-    RequestKind, RequestState, RunId, SemanticRole, ServiceError, SessionBranchEntry,
-    SessionBranchEntryKind, SessionBranchGraph, SessionCommand, SessionCursor, SessionDriver,
-    SessionId, SessionItem, SessionLiveState, SessionSeed, SessionSnapshot, SessionSummary,
+    ActivityPhase, ActivityPhaseSummary, ActorOwnerState, ArtifactId, ArtifactKind, ArtifactRef,
+    AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef, AttachmentStore,
+    AttentionState, AuthorityProfile, ColorScheme, CompletionReview, ContextUsage,
+    ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
+    DocumentReference, DocumentStore, DocumentStoreError,
+    DriverCommandOutcome, DurableEntryId, EventPayload, EvidenceCoverage, FileChange, FileEntryId,
+    FinalizeCompletion, FinalizeDecision, HostCapabilities, HostDescriptor, HostId, HostService,
+    InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload, LoopbackConfig, LoopbackServer,
+    ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProjectId,
+    ProjectRegistry,
+    ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation, RegistryProjectId,
+    RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer,
+    RequestId, RequestKind, RequestState, RunId, SemanticRole,
+    SearchDocument, SearchDocumentKind, SearchError, ServiceError, SessionBranchEntry,
+    SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor,
+    SessionDriver, SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed,
+    SessionSnapshot, SessionSummary,
     SessionSupervisor, SourceId, SourceKind, SourceRef, StoredAttachment, StoredResource,
     SupervisorConfig, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
-    ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, TurnId, UsageSnapshot,
-    UserMessageDelivery, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
+    ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity,
+    ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
+    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
+    TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
+    UsageSnapshot, UserMessageDelivery, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
+    MAX_TEST_OUTPUT_BYTES, StructuredTestResults, TestCommandOutcome, TestCommandStatus,
+    TestFramework, TestOutputInput, parse_test_output, refresh_repository_context,
 };
 
 use crate::app::bootstrap::{build_app, rebuild_app, LaunchSelection, SessionSelection};
 use crate::app::{reasoning_label, supported_levels, App, Reconfig};
 use crate::config::{self, Config};
 use crate::resources::compose_instructions;
-use crate::session_store::{SessionMeta, SessionStore};
+use crate::session_store::{SessionMeta, SessionStorageLifecycle, SessionStore};
 
 const DRIVER_MAILBOX_CAPACITY: usize = 64;
 const DRIVER_EVENT_CAPACITY: usize = 512;
@@ -54,6 +65,7 @@ const MAX_PROJECTED_BRANCH_ENTRIES: usize = 2_048;
 const MAX_BRANCH_DELTA_ENTRIES: usize = 128;
 const MAX_GRAPHICAL_SESSION_EXPORT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OPAQUE_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
+const EXTERNAL_EFFECTS_WARNING: &str = "Conversation branching changes only Ygg's transcript. Filesystem, command, network, and other external effects from later work are not rolled back.";
 
 static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -165,13 +177,16 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 struct YggHost {
     config: Config,
     catalog: ModelCatalog,
-    sessions: SessionStore,
     models: Vec<ModelSummary>,
     descriptor: HostDescriptor,
-    project_id: ProjectId,
+    projects: Arc<Mutex<ProjectRegistry>>,
+    launch_project_id: ProjectId,
     themes: Vec<ThemeOption>,
     selected_theme_id: ThemeId,
     attachments: Option<AttachmentStore>,
+    documents: Option<DocumentStore>,
+    trusted_files: Arc<Mutex<HashMap<String, TrustedProjectFiles>>>,
+    search_index: Arc<Mutex<TranscriptSearchIndex>>,
     resources: Option<ygg_serve_backend::ResourceStore>,
     serve_state_dir: PathBuf,
     #[cfg(test)]
@@ -180,17 +195,24 @@ struct YggHost {
     open_count: Arc<AtomicU64>,
 }
 
+struct ProjectContext {
+    project_id: ProjectId,
+    config: Config,
+    sessions: SessionStore,
+}
+
 impl YggHost {
     fn new(config: Config) -> anyhow::Result<Self> {
+        #[cfg(not(unix))]
+        anyhow::bail!(
+            "ygg serve project trust is unavailable on this platform because stable directory identity checks are not implemented"
+        );
         let boot = crate::app::bootstrap::bootstrap(config.clone())?;
         let models = graphical_model_catalog(&boot.catalog, &config);
         if models.is_empty() {
             anyhow::bail!("no configured models are available for ygg serve");
         }
-        let workspace_hash = stable_hash(config.workspace.to_string_lossy().as_bytes());
         let host_id = load_or_create_host_id(&config)?;
-        let project_id = ProjectId::new(format!("project-{}", &workspace_hash[..24]))
-            .map_err(anyhow::Error::msg)?;
         let workspace_name = config
             .workspace
             .file_name()
@@ -206,11 +228,49 @@ impl YggHost {
         };
         let (themes, selected_theme_id) = graphical_themes(&config)?;
         let state_dir = secure_serve_state_dir(&config.session_dir)?;
+        let mut projects = ProjectRegistry::open(state_dir.join("projects"))?;
+        let existing_session_ids = boot
+            .sessions
+            .list()
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect::<Vec<_>>();
+        let launch_project = match projects.find_by_root(&config.workspace)? {
+            Some(project) => {
+                projects
+                    .bind_sessions(&project.id, existing_session_ids.iter().map(String::as_str))?;
+                project
+            }
+            None => projects.import_with_sessions(
+                &config.workspace,
+                Some(workspace_name),
+                existing_session_ids.iter().map(String::as_str),
+            )?,
+        };
+        if config.workspace_trusted && launch_project.state == RegistryProjectState::Untrusted {
+            projects.grant_trust(&launch_project.id)?;
+        }
+        if projects.default_project().is_none()
+            && launch_project.state != RegistryProjectState::Archived
+        {
+            projects.set_default(&launch_project.id)?;
+        }
+        let launch_project_id =
+            ProjectId::new(launch_project.id.as_str()).map_err(anyhow::Error::msg)?;
         let attachments = match AttachmentStore::open(&state_dir) {
             Ok(store) => Some(store),
             Err(_) => {
                 crate::output::stderr_line(
                     "warning: secure attachment storage is unavailable; image uploads are disabled",
+                );
+                None
+            }
+        };
+        let documents = match DocumentStore::open(&state_dir) {
+            Ok(store) => Some(store),
+            Err(_) => {
+                crate::output::stderr_line(
+                    "warning: secure document storage is unavailable; text, Markdown, and PDF uploads are disabled",
                 );
                 None
             }
@@ -227,13 +287,16 @@ impl YggHost {
         Ok(Self {
             config,
             catalog: boot.catalog,
-            sessions: boot.sessions,
             models,
             descriptor,
-            project_id,
+            projects: Arc::new(Mutex::new(projects)),
+            launch_project_id,
             themes,
             selected_theme_id,
             attachments,
+            documents,
+            trusted_files: Arc::new(Mutex::new(HashMap::new())),
+            search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources,
             serve_state_dir: state_dir,
             #[cfg(test)]
@@ -256,17 +319,92 @@ impl YggHost {
         Ok(selection_from_summary(summary))
     }
 
+    fn project_context(
+        &self,
+        requested: Option<&ProjectId>,
+    ) -> Result<ProjectContext, ServiceError> {
+        let projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
+        let registry_id = match requested {
+            Some(project_id) => registry_project_id(project_id)?,
+            None => {
+                let default = projects.default_project().map(|project| project.id);
+                let mut candidates = default.into_iter().collect::<Vec<_>>();
+                let launch_project_id = registry_project_id(&self.launch_project_id)?;
+                if !candidates.contains(&launch_project_id) {
+                    candidates.push(launch_project_id);
+                }
+                for project_id in projects.list().into_iter().map(|project| project.id) {
+                    if !candidates.contains(&project_id) {
+                        candidates.push(project_id);
+                    }
+                }
+                candidates
+                    .into_iter()
+                    .find(|project_id| projects.resolve_trusted_root(project_id).is_ok())
+                    .ok_or(ServiceError::Unauthorized)?
+            }
+        };
+        let root = projects
+            .resolve_trusted_root(&registry_id)
+            .map_err(project_registry_service_error)?;
+        let project_id =
+            ProjectId::new(registry_id.as_str()).map_err(|_| ServiceError::Internal)?;
+        let mut config = self.config.clone();
+        config.workspace = root.as_path().to_owned();
+        config.invocation_cwd = root.as_path().to_owned();
+        config.workspace_trusted = true;
+        let sessions = SessionStore::new(&config.session_dir, root.as_path());
+        Ok(ProjectContext {
+            project_id,
+            config,
+            sessions,
+        })
+    }
+
+    fn project_context_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ProjectContext, ServiceError> {
+        let project_id = {
+            let projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
+            projects
+                .project_for_session(session_id.as_str())
+                .ok_or(ServiceError::NotFound)?
+        };
+        let project_id = ProjectId::new(project_id.as_str()).map_err(|_| ServiceError::Internal)?;
+        self.project_context(Some(&project_id))
+    }
+
+    fn storage_context_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ProjectContext, ServiceError> {
+        let projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
+        let registry_id = projects
+            .project_for_session(session_id.as_str())
+            .ok_or(ServiceError::NotFound)?;
+        let root = projects
+            .resolve_root(&registry_id)
+            .map_err(project_registry_service_error)?;
+        let project_id =
+            ProjectId::new(registry_id.as_str()).map_err(|_| ServiceError::Internal)?;
+        let mut config = self.config.clone();
+        config.workspace = root.as_path().to_owned();
+        config.invocation_cwd = root.as_path().to_owned();
+        config.workspace_trusted = false;
+        let sessions = SessionStore::new(&config.session_dir, root.as_path());
+        Ok(ProjectContext {
+            project_id,
+            config,
+            sessions,
+        })
+    }
+
     fn driver_for_new(
         &self,
         request: CreateSessionRequest,
     ) -> Result<YggSessionDriver, ServiceError> {
-        if request
-            .project_id
-            .as_ref()
-            .is_some_and(|project_id| project_id != &self.project_id)
-        {
-            return Err(ServiceError::NotFound);
-        }
+        let context = self.project_context(request.project_id.as_ref())?;
         let model = match request.model {
             Some(model) => model,
             None => self.default_selection()?,
@@ -289,11 +427,18 @@ impl YggHost {
             .map_err(|_| ServiceError::InvalidSeed)?;
         let reasoning =
             config::parse_reasoning(&model.reasoning).map_err(|_| ServiceError::InvalidSeed)?;
-        let session_path = self.sessions.new_path(&crate::modes::timestamp());
+        let session_path = context.sessions.new_path(&crate::modes::timestamp());
         let session_id = session_id_from_path(&session_path)?;
+        {
+            let mut projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
+            let registry_id = registry_project_id(&context.project_id)?;
+            projects
+                .bind_session(session_id.as_str(), &registry_id)
+                .map_err(project_registry_service_error)?;
+        }
         let generation = next_actor_generation();
-        let selection = selection_for_model(&resolved, &reasoning, &self.config);
-        let project_id = request.project_id.or_else(|| Some(self.project_id.clone()));
+        let selection = selection_for_model(&resolved, &reasoning, &context.config);
+        let project_id = Some(context.project_id.clone());
         let seed = empty_seed(
             session_id,
             project_id.clone(),
@@ -302,8 +447,8 @@ impl YggHost {
             generation,
         );
         let plan = WorkerPlan {
-            config: self.config.clone(),
-            sessions: self.sessions.clone(),
+            config: context.config,
+            sessions: context.sessions,
             launch: LaunchSelection {
                 model: resolved.spec.id.clone(),
                 session: SessionSelection::CreateNew(session_path),
@@ -316,6 +461,10 @@ impl YggHost {
             session_id: seed.summary.id.clone(),
             project_id,
             attachments: self.attachments.clone(),
+            documents: self.documents.clone(),
+            projects: Arc::clone(&self.projects),
+            trusted_files: Arc::clone(&self.trusted_files),
+            search_index: Arc::clone(&self.search_index),
             resources: self.resources.clone(),
             #[cfg(test)]
             checkout_hooks: CheckoutTestHooks::default(),
@@ -329,7 +478,13 @@ impl YggHost {
     ) -> Result<YggSessionDriver, ServiceError> {
         #[cfg(test)]
         self.open_count.fetch_add(1, Ordering::Relaxed);
-        let path = self
+        let context = self.project_context_for_session(session_id)?;
+        if session_meta_for_id(&context.sessions, session_id)
+            .is_some_and(|meta| meta.trashed_at_ms.is_some())
+        {
+            return Err(ServiceError::InvalidBoundary);
+        }
+        let path = context
             .sessions
             .path_by_id(session_id.as_str())
             .map_err(|_| ServiceError::NotFound)?;
@@ -341,11 +496,12 @@ impl YggHost {
             &session,
             session_id.clone(),
             SessionSeedOptions {
-                project_id: Some(self.project_id.clone()),
+                workspace: &context.config.workspace,
+                project_id: Some(context.project_id.clone()),
                 model: selection.clone(),
                 authority: AuthorityProfile::FullAccess,
                 generation,
-                meta: session_meta_for_id(&self.sessions, session_id),
+                meta: session_meta_for_id(&context.sessions, session_id),
                 attachment_store: self.attachments.as_ref(),
                 resource_store: self.resources.as_ref(),
             },
@@ -353,8 +509,8 @@ impl YggHost {
         let reasoning =
             config::parse_reasoning(&selection.reasoning).map_err(|_| ServiceError::InvalidSeed)?;
         let plan = WorkerPlan {
-            config: self.config.clone(),
-            sessions: self.sessions.clone(),
+            config: context.config,
+            sessions: context.sessions,
             launch: LaunchSelection {
                 model: ModelId(selection.model),
                 session: SessionSelection::OpenExisting(path),
@@ -365,8 +521,12 @@ impl YggHost {
             available_models: self.models.clone(),
             actor_generation: generation,
             session_id: session_id.clone(),
-            project_id: Some(self.project_id.clone()),
+            project_id: Some(context.project_id),
             attachments: self.attachments.clone(),
+            documents: self.documents.clone(),
+            projects: Arc::clone(&self.projects),
+            trusted_files: Arc::clone(&self.trusted_files),
+            search_index: Arc::clone(&self.search_index),
             resources: self.resources.clone(),
             #[cfg(test)]
             checkout_hooks: self
@@ -379,6 +539,256 @@ impl YggHost {
         let known_entries = session.entries().len();
         Ok(YggSessionDriver::spawn(seed, plan, known_entries))
     }
+}
+
+fn registry_project_id(project_id: &ProjectId) -> Result<RegistryProjectId, ServiceError> {
+    RegistryProjectId::parse(project_id.as_str()).map_err(project_registry_service_error)
+}
+
+fn project_registry_service_error(error: ProjectRegistryError) -> ServiceError {
+    match error {
+        ProjectRegistryError::ProjectNotFound => ServiceError::NotFound,
+        ProjectRegistryError::ProjectUntrusted => ServiceError::Unauthorized,
+        ProjectRegistryError::ProjectArchived => ServiceError::InvalidBoundary,
+        ProjectRegistryError::RootUnavailable
+        | ProjectRegistryError::RootIdentityChanged
+        | ProjectRegistryError::RootSymlink
+        | ProjectRegistryError::RootNotDirectory => ServiceError::Unavailable,
+        ProjectRegistryError::RelativePath
+        | ProjectRegistryError::PathTraversal
+        | ProjectRegistryError::InvalidProjectId
+        | ProjectRegistryError::ProjectLimitReached
+        | ProjectRegistryError::InvalidDisplayName
+        | ProjectRegistryError::InvalidCanonicalRoot
+        | ProjectRegistryError::RootOverlapsState
+        | ProjectRegistryError::DuplicateRoot
+        | ProjectRegistryError::InvalidSessionId
+        | ProjectRegistryError::SessionAlreadyBound
+        | ProjectRegistryError::SessionBindingLimitReached => ServiceError::InvalidBoundary,
+        ProjectRegistryError::StateParentUnavailable
+        | ProjectRegistryError::UnsafeStatePath
+        | ProjectRegistryError::UnsafePermissions
+        | ProjectRegistryError::StateTooLarge
+        | ProjectRegistryError::CorruptState
+        | ProjectRegistryError::UnsupportedStateVersion
+        | ProjectRegistryError::RevisionExhausted
+        | ProjectRegistryError::RandomnessUnavailable
+        | ProjectRegistryError::Storage(_) => ServiceError::Internal,
+    }
+}
+
+fn document_store_service_error(error: DocumentStoreError) -> ServiceError {
+    match error {
+        DocumentStoreError::InvalidAssociation
+        | DocumentStoreError::InvalidDocumentId
+        | DocumentStoreError::Ingest(_) => ServiceError::InvalidBoundary,
+        DocumentStoreError::QuotaExceeded => ServiceError::Unavailable,
+        DocumentStoreError::PromptLimitExceeded => ServiceError::PayloadTooLarge,
+        DocumentStoreError::NotFound => ServiceError::NotFound,
+        DocumentStoreError::Corrupt => ServiceError::CorruptResource,
+        DocumentStoreError::Storage => ServiceError::Internal,
+    }
+}
+
+fn trusted_file_service_error(error: TrustedFileError) -> ServiceError {
+    match error {
+        TrustedFileError::TrustRequired => ServiceError::Unauthorized,
+        TrustedFileError::RootChanged
+        | TrustedFileError::ChangedSinceIndex
+        | TrustedFileError::Storage => ServiceError::Unavailable,
+        TrustedFileError::NotFound => ServiceError::NotFound,
+        TrustedFileError::InvalidEntryId
+        | TrustedFileError::InvalidSearch
+        | TrustedFileError::NotText => ServiceError::InvalidBoundary,
+        TrustedFileError::ContextLimitExceeded => ServiceError::PayloadTooLarge,
+    }
+}
+
+fn repository_context_service_error(error: RepositoryContextError) -> ServiceError {
+    match error {
+        RepositoryContextError::TrustRequired => ServiceError::Unauthorized,
+        RepositoryContextError::RootChanged => ServiceError::Unavailable,
+    }
+}
+
+fn transcript_search_service_error(error: SearchError) -> ServiceError {
+    match error {
+        SearchError::EmptyQuery
+        | SearchError::TooLarge
+        | SearchError::InvalidText
+        | SearchError::InvalidLimit
+        | SearchError::InvalidLimits => ServiceError::InvalidBoundary,
+        SearchError::Capacity => ServiceError::Unavailable,
+    }
+}
+
+fn search_document_for_item(
+    session_id: &SessionId,
+    session_title: &str,
+    fallback_timestamp_ms: u64,
+    item: &SessionItem,
+) -> Option<SearchDocument> {
+    if item.lifecycle != ItemLifecycle::Committed {
+        return None;
+    }
+    let (kind, text, timestamp_ms) = match &item.payload {
+        ItemPayload::UserMessage {
+            text,
+            attachments,
+            documents,
+            project_files,
+            ..
+        } => {
+            let mut visible = Vec::new();
+            if !text.trim().is_empty() {
+                visible.push(text.clone());
+            }
+            visible.extend(
+                attachments
+                    .iter()
+                    .map(|attachment| attachment.display_name.clone()),
+            );
+            visible.extend(
+                documents
+                    .iter()
+                    .map(|document| document.display_name.clone()),
+            );
+            visible.extend(
+                project_files
+                    .iter()
+                    .map(|file| file.relative_path.clone()),
+            );
+            (SearchDocumentKind::User, visible.join("\n"), fallback_timestamp_ms)
+        }
+        ItemPayload::AssistantMessage { text } => (
+            SearchDocumentKind::Assistant,
+            text.clone(),
+            fallback_timestamp_ms,
+        ),
+        ItemPayload::ToolCall(activity) => {
+            let text = [
+                Some(activity.title.as_str()),
+                activity.summary.as_deref(),
+                activity.target.as_deref(),
+                activity.output_summary.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+            (
+                if activity.status == ToolActivityStatus::Failed {
+                    SearchDocumentKind::Error
+                } else {
+                    SearchDocumentKind::Tool
+                },
+                text,
+                activity.completed_at_ms.unwrap_or(activity.started_at_ms),
+            )
+        }
+        ItemPayload::ToolResult(result) => (
+            if result.status == ToolActivityStatus::Failed {
+                SearchDocumentKind::Error
+            } else {
+                SearchDocumentKind::Tool
+            },
+            [Some(result.summary.as_str()), result.output_summary.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            result.completed_at_ms,
+        ),
+        ItemPayload::RunOutcome {
+            outcome: ygg_serve_backend::RunOutcome::Failed,
+            message,
+            ..
+        } => (
+            SearchDocumentKind::Error,
+            message
+                .clone()
+                .unwrap_or_else(|| "The run failed.".to_owned()),
+            fallback_timestamp_ms,
+        ),
+        ItemPayload::Source(source) if source.kind == SourceKind::Attachment => (
+            SearchDocumentKind::Attachment,
+            source.title.clone(),
+            source.consulted_at_ms,
+        ),
+        _ => return None,
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(SearchDocument {
+        session_id: session_id.as_str().to_owned(),
+        item_id: item.id.as_str().to_owned(),
+        kind,
+        session_title: bounded_text(session_title, 512),
+        text: bounded_text(
+            &text,
+            ygg_serve_backend::MAX_SEARCH_DOCUMENT_TEXT_BYTES,
+        ),
+        timestamp_ms,
+    })
+}
+
+fn search_documents_for_seed(seed: &SessionSeed) -> Vec<SearchDocument> {
+    seed.snapshot
+        .items
+        .iter()
+        .filter_map(|item| {
+            search_document_for_item(
+                &seed.snapshot.session_id,
+                &seed.summary.title,
+                seed.summary.modified_at_ms,
+                item,
+            )
+        })
+        .collect()
+}
+
+fn with_trusted_project_files<T>(
+    projects: &Arc<Mutex<ProjectRegistry>>,
+    trusted_files: &Arc<Mutex<HashMap<String, TrustedProjectFiles>>>,
+    project_id: &ProjectId,
+    operation: impl FnOnce(&TrustedProjectFiles, &ProjectRegistry) -> Result<T, TrustedFileError>,
+) -> Result<T, ServiceError> {
+    let registry_id = registry_project_id(project_id)?;
+    let projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+    let service = {
+        let mut services = trusted_files.lock().map_err(|_| ServiceError::Internal)?;
+        match services.get(registry_id.as_str()) {
+            Some(service) => service.clone(),
+            None => {
+                let service = TrustedProjectFiles::open(&projects, &registry_id)
+                    .map_err(trusted_file_service_error)?;
+                services.insert(registry_id.as_str().to_owned(), service.clone());
+                service
+            }
+        }
+    };
+    operation(&service, &projects).map_err(trusted_file_service_error)
+}
+
+fn public_project_summary(
+    registry: &ProjectRegistry,
+    project: ygg_serve_backend::RegistryProjectSummary,
+) -> Result<ProjectSummary, ServiceError> {
+    let session_count = registry
+        .sessions_for_project(&project.id)
+        .len()
+        .min(u32::MAX as usize) as u32;
+    Ok(ProjectSummary {
+        id: ProjectId::new(project.id.as_str()).map_err(|_| ServiceError::Internal)?,
+        name: ygg_serve_backend::sanitize_public_text(&project.display_name, 256, false),
+        trusted: project.state == RegistryProjectState::Trusted,
+        archived: project.state == RegistryProjectState::Archived,
+        available: project.available,
+        is_default: project.is_default,
+        session_count,
+        live_session_count: 0,
+    })
 }
 
 fn export_session_bytes(
@@ -436,10 +846,15 @@ impl HostService for YggHost {
             opaque_resources: self.resources.is_some(),
             attachments: attachment_policy.is_some(),
             attachment_policy,
+            documents: self.documents.is_some(),
+            trusted_project_files: cfg!(unix),
+            transcript_search: true,
             previews: false,
             connected_devices: false,
             session_metadata: true,
             session_branches: true,
+            conversation_branching: true,
+            session_trash: true,
             session_export: true,
             lan_clients: false,
             terminal: false,
@@ -470,6 +885,226 @@ impl HostService for YggHost {
             .content(handle)
     }
 
+    fn document_ingest_supported(&self) -> bool {
+        self.documents.is_some()
+    }
+
+    async fn ingest_document(
+        &self,
+        session_id: &SessionId,
+        display_name: &str,
+        media_type: &str,
+        bytes: bytes::Bytes,
+    ) -> Result<DocumentReference, ServiceError> {
+        let context = self.project_context_for_session(session_id)?;
+        let store = self.documents.clone().ok_or(ServiceError::Unavailable)?;
+        store
+            .ingest_async(
+                context.project_id.as_str().to_owned(),
+                session_id.as_str().to_owned(),
+                display_name.to_owned(),
+                media_type.to_owned(),
+                bytes,
+            )
+            .await
+            .map_err(document_store_service_error)
+    }
+
+    async fn list_documents(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<DocumentReference>, ServiceError> {
+        let context = self.project_context_for_session(session_id)?;
+        self.documents
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .list_for_session(context.project_id.as_str(), session_id.as_str())
+            .map_err(document_store_service_error)
+    }
+
+    fn trusted_project_files_supported(&self) -> bool {
+        cfg!(unix)
+    }
+
+    async fn trusted_file_index(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<TrustedFileIndexSummary, ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        let trusted_files = Arc::clone(&self.trusted_files);
+        let project_id = project_id.clone();
+        tokio::task::spawn_blocking(move || {
+            with_trusted_project_files(
+                &projects,
+                &trusted_files,
+                &project_id,
+                |service, registry| service.summary(registry),
+            )
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    async fn list_trusted_files(
+        &self,
+        project_id: &ProjectId,
+        limit: usize,
+    ) -> Result<Vec<TrustedFileEntry>, ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        let trusted_files = Arc::clone(&self.trusted_files);
+        let project_id = project_id.clone();
+        tokio::task::spawn_blocking(move || {
+            with_trusted_project_files(
+                &projects,
+                &trusted_files,
+                &project_id,
+                |service, registry| service.list(registry, limit),
+            )
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    async fn search_trusted_files(
+        &self,
+        project_id: &ProjectId,
+        query: &str,
+        limit: usize,
+    ) -> Result<TrustedFileSearchResult, ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        let trusted_files = Arc::clone(&self.trusted_files);
+        let project_id = project_id.clone();
+        let query = query.to_owned();
+        tokio::task::spawn_blocking(move || {
+            with_trusted_project_files(
+                &projects,
+                &trusted_files,
+                &project_id,
+                |service, registry| service.search(registry, &query, limit),
+            )
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    async fn read_trusted_file(
+        &self,
+        project_id: &ProjectId,
+        entry_id: &FileEntryId,
+    ) -> Result<TrustedFileRead, ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        let trusted_files = Arc::clone(&self.trusted_files);
+        let project_id = project_id.clone();
+        let entry_id = entry_id.clone();
+        tokio::task::spawn_blocking(move || {
+            with_trusted_project_files(
+                &projects,
+                &trusted_files,
+                &project_id,
+                |service, registry| service.read(registry, &entry_id),
+            )
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    fn transcript_search_supported(&self) -> bool {
+        true
+    }
+
+    async fn search_transcripts(
+        &self,
+        request: &TranscriptSearchRequest,
+    ) -> Result<TranscriptSearchResult, ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        let search_index = Arc::clone(&self.search_index);
+        let base_config = self.config.clone();
+        let catalog = self.catalog.clone();
+        let fallback = self.default_selection()?;
+        let attachments = self.attachments.clone();
+        let resources = self.resources.clone();
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || {
+            let projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            let mut rebuilt = TranscriptSearchIndex::new();
+            for project in projects.list() {
+                let Ok(root) = projects.resolve_trusted_root(&project.id) else {
+                    continue;
+                };
+                let sessions = SessionStore::new(&base_config.session_dir, root.as_path());
+                let bound = projects
+                    .sessions_for_project(&project.id)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let public_project_id =
+                    ProjectId::new(project.id.as_str()).map_err(|_| ServiceError::Internal)?;
+                let mut project_config = base_config.clone();
+                project_config.workspace = root.as_path().to_owned();
+                project_config.invocation_cwd = root.as_path().to_owned();
+                project_config.workspace_trusted = true;
+                for meta in sessions.list() {
+                    if !bound.contains(&meta.id) {
+                        continue;
+                    }
+                    let Ok(session_id) = SessionId::new(meta.id.clone()) else {
+                        continue;
+                    };
+                    let Ok(session) = Session::open_read_only(&meta.path) else {
+                        continue;
+                    };
+                    let selection = selection_from_session(&session, &catalog, &project_config)
+                        .unwrap_or_else(|_| fallback.clone());
+                    let seed = seed_from_session(
+                        &session,
+                        session_id.clone(),
+                        SessionSeedOptions {
+                            workspace: &project_config.workspace,
+                            project_id: Some(public_project_id.clone()),
+                            model: selection,
+                            authority: AuthorityProfile::FullAccess,
+                            generation: 1,
+                            meta: Some(meta),
+                            attachment_store: attachments.as_ref(),
+                            resource_store: resources.as_ref(),
+                        },
+                    )?;
+                    rebuilt
+                        .replace_session(
+                            session_id.as_str(),
+                            search_documents_for_seed(&seed),
+                        )
+                        .map_err(transcript_search_service_error)?;
+                }
+            }
+            let result = rebuilt
+                .search_request(&request)
+                .map_err(transcript_search_service_error)?;
+            *search_index.lock().map_err(|_| ServiceError::Internal)? = rebuilt;
+            Ok(result)
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    fn repository_context_supported(&self) -> bool {
+        cfg!(unix)
+    }
+
+    async fn repository_context(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<RepositoryContextSnapshot, ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        let project_id = registry_project_id(project_id)?;
+        tokio::task::spawn_blocking(move || {
+            let projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            refresh_repository_context(&projects, &project_id)
+                .map_err(repository_context_service_error)
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
     async fn resource_content(
         &self,
         session_id: &SessionId,
@@ -483,7 +1118,7 @@ impl HostService for YggHost {
     }
 
     async fn session_export(&self, session_id: &SessionId) -> Result<bytes::Bytes, ServiceError> {
-        let sessions = self.sessions.clone();
+        let sessions = self.project_context_for_session(session_id)?.sessions;
         let session_id = session_id.clone();
         let serve_state_dir = self.serve_state_dir.clone();
         tokio::task::spawn_blocking(move || {
@@ -522,41 +1157,241 @@ impl HostService for YggHost {
     }
 
     async fn list_projects(&self) -> Result<Vec<ProjectSummary>, ServiceError> {
-        let session_count = self.sessions.list().len().min(u32::MAX as usize) as u32;
-        Ok(vec![ProjectSummary {
-            id: self.project_id.clone(),
-            name: ygg_serve_backend::sanitize_public_text(
-                self.config
-                    .workspace
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Workspace"),
-                256,
-                false,
-            ),
-            trusted: self.config.workspace_trusted,
-            session_count,
-            live_session_count: 0,
-        }])
+        let projects = Arc::clone(&self.projects);
+        tokio::task::spawn_blocking(move || {
+            let projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            projects
+                .list()
+                .into_iter()
+                .map(|project| public_project_summary(&projects, project))
+                .collect()
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    fn project_lifecycle_mutations_supported(&self) -> bool {
+        cfg!(unix)
+    }
+
+    fn project_import_supported(&self) -> bool {
+        false
+    }
+
+    async fn import_project(
+        &self,
+        _candidate_id: &str,
+        display_name: Option<&str>,
+    ) -> Result<ProjectSummary, ServiceError> {
+        let _ = display_name;
+        // The browser transport has no native folder picker. Real roots are
+        // imported from the trusted launch/CLI workspace; this command remains
+        // unavailable until a host UI can mint one-use opaque candidates.
+        Err(ServiceError::Unavailable)
+    }
+
+    async fn rename_project(
+        &self,
+        project_id: &ProjectId,
+        display_name: &str,
+    ) -> Result<ProjectSummary, ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        let project_id = registry_project_id(project_id)?;
+        let display_name = display_name.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            let project = projects
+                .update_display_name(&project_id, &display_name)
+                .map_err(project_registry_service_error)?;
+            public_project_summary(&projects, project)
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    async fn set_default_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<ProjectSummary, ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        let project_id = registry_project_id(project_id)?;
+        tokio::task::spawn_blocking(move || {
+            let mut projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            let project = projects
+                .set_default(&project_id)
+                .map_err(project_registry_service_error)?;
+            public_project_summary(&projects, project)
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    async fn clear_default_project(&self) -> Result<(), ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        tokio::task::spawn_blocking(move || {
+            projects
+                .lock()
+                .map_err(|_| ServiceError::Internal)?
+                .clear_default()
+                .map_err(project_registry_service_error)
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    async fn set_project_trust(
+        &self,
+        project_id: &ProjectId,
+        trusted: bool,
+    ) -> Result<ProjectSummary, ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        let project_id = registry_project_id(project_id)?;
+        tokio::task::spawn_blocking(move || {
+            let mut projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            let project = if trusted {
+                projects.grant_trust(&project_id)
+            } else {
+                projects.revoke_trust(&project_id)
+            }
+            .map_err(project_registry_service_error)?;
+            public_project_summary(&projects, project)
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    async fn archive_project(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<ProjectSummary, ServiceError> {
+        let projects = Arc::clone(&self.projects);
+        let project_id = registry_project_id(project_id)?;
+        tokio::task::spawn_blocking(move || {
+            let mut projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            let project = projects
+                .archive(&project_id)
+                .map_err(project_registry_service_error)?;
+            public_project_summary(&projects, project)
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
+    }
+
+    fn session_trash_supported(&self) -> bool {
+        true
+    }
+
+    async fn set_session_lifecycle(
+        &self,
+        session_id: &SessionId,
+        lifecycle: SessionCatalogState,
+        changed_at_ms: u64,
+    ) -> Result<SessionSummary, ServiceError> {
+        let context = self.storage_context_for_session(session_id)?;
+        let storage_lifecycle = match lifecycle {
+            SessionCatalogState::Active => SessionStorageLifecycle::Active,
+            SessionCatalogState::Archived => SessionStorageLifecycle::Archived,
+            SessionCatalogState::Trash => SessionStorageLifecycle::Trash,
+        };
+        context
+            .sessions
+            .set_lifecycle(session_id.as_str(), storage_lifecycle, changed_at_ms)
+            .map_err(|_| ServiceError::Internal)?;
+        let meta = session_meta_for_id(&context.sessions, session_id)
+            .ok_or(ServiceError::NotFound)?;
+        let selection = Session::open_read_only(&meta.path)
+            .ok()
+            .and_then(|session| {
+                selection_from_session(&session, &self.catalog, &context.config).ok()
+            })
+            .unwrap_or(self.default_selection()?);
+        summary_from_meta(&meta, Some(context.project_id), selection)
+    }
+
+    async fn delete_session_permanently(
+        &self,
+        session_id: &SessionId,
+        confirmation: &PermanentDeleteConfirmation,
+    ) -> Result<(), ServiceError> {
+        if &confirmation.session_id != session_id
+            || confirmation.phrase
+                != format!("permanently delete {}", session_id.as_str())
+        {
+            return Err(ServiceError::InvalidBoundary);
+        }
+        let context = self.storage_context_for_session(session_id)?;
+        let previous_project = {
+            let mut projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
+            projects
+                .unbind_session(session_id.as_str())
+                .map_err(project_registry_service_error)?
+        };
+        if let Err(error) = context
+            .sessions
+            .delete_permanently(session_id.as_str(), confirmation.trashed_at_ms)
+        {
+            if let Some(project_id) = previous_project {
+                let mut projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
+                projects
+                    .bind_session(session_id.as_str(), &project_id)
+                    .map_err(project_registry_service_error)?;
+            }
+            let _ = error;
+            return Err(ServiceError::InvalidBoundary);
+        }
+        if let Ok(mut search_index) = self.search_index.lock() {
+            let _ = search_index.remove_session(session_id.as_str());
+        }
+        Ok(())
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionSummary>, ServiceError> {
         let fallback = self.default_selection()?;
-        Ok(self
-            .sessions
-            .list()
-            .into_iter()
-            .take(2_000)
-            .filter_map(|meta| {
-                let selection = Session::open_read_only(&meta.path)
-                    .ok()
-                    .and_then(|session| {
-                        selection_from_session(&session, &self.catalog, &self.config).ok()
-                    })
-                    .unwrap_or_else(|| fallback.clone());
-                summary_from_meta(&meta, Some(self.project_id.clone()), selection).ok()
-            })
-            .collect())
+        let projects = Arc::clone(&self.projects);
+        let catalog = self.catalog.clone();
+        let base_config = self.config.clone();
+        tokio::task::spawn_blocking(move || {
+            let projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            let mut summaries = Vec::new();
+            for project in projects.list() {
+                if summaries.len() >= 2_000 || project.state == RegistryProjectState::Archived {
+                    continue;
+                }
+                let Ok(root) = projects.resolve_root(&project.id) else {
+                    continue;
+                };
+                let sessions = SessionStore::new(&base_config.session_dir, root.as_path());
+                let bound = projects
+                    .sessions_for_project(&project.id)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let public_project_id =
+                    ProjectId::new(project.id.as_str()).map_err(|_| ServiceError::Internal)?;
+                let mut project_config = base_config.clone();
+                project_config.workspace = root.as_path().to_owned();
+                project_config.invocation_cwd = root.as_path().to_owned();
+                project_config.workspace_trusted = project.state == RegistryProjectState::Trusted;
+                for meta in sessions.list() {
+                    if summaries.len() >= 2_000 || !bound.contains(&meta.id) {
+                        continue;
+                    }
+                    let selection = Session::open_read_only(&meta.path)
+                        .ok()
+                        .and_then(|session| {
+                            selection_from_session(&session, &catalog, &project_config).ok()
+                        })
+                        .unwrap_or_else(|| fallback.clone());
+                    if let Ok(summary) =
+                        summary_from_meta(&meta, Some(public_project_id.clone()), selection)
+                    {
+                        summaries.push(summary);
+                    }
+                }
+            }
+            Ok(summaries)
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
     }
 
     async fn create_session(
@@ -645,6 +1480,10 @@ struct WorkerPlan {
     session_id: SessionId,
     project_id: Option<ProjectId>,
     attachments: Option<AttachmentStore>,
+    documents: Option<DocumentStore>,
+    projects: Arc<Mutex<ProjectRegistry>>,
+    trusted_files: Arc<Mutex<HashMap<String, TrustedProjectFiles>>>,
+    search_index: Arc<Mutex<TranscriptSearchIndex>>,
     resources: Option<ygg_serve_backend::ResourceStore>,
     #[cfg(test)]
     checkout_hooks: CheckoutTestHooks,
@@ -680,6 +1519,15 @@ struct PrivateRequest {
 struct ProjectedToolCall {
     name: String,
     arguments: serde_json::Value,
+    activity: ToolActivity,
+    result: Option<ToolResultSummary>,
+    turn_id: TurnId,
+}
+
+#[derive(Clone, Default)]
+struct ProjectedToolProgress {
+    observed_output_bytes: u64,
+    dropped_output_bytes: u64,
 }
 
 struct CompletedToolEvidence {
@@ -693,6 +1541,31 @@ struct CompletedToolEvidence {
 struct PendingUserItem {
     id: ItemId,
     delivery: UserMessageDelivery,
+    turn_id: TurnId,
+    documents: Vec<DocumentReference>,
+    project_files: Vec<TrustedFileEntry>,
+    branch_provenance: Option<ConversationBranchProvenance>,
+}
+
+struct ResolvedPromptInput {
+    display_text: String,
+    model_text: String,
+    attachments: Vec<AttachmentRef>,
+    documents: Vec<DocumentReference>,
+    project_files: Vec<TrustedFileEntry>,
+}
+
+enum RunPromptInput {
+    New(PromptInput),
+    Replay(ResolvedPromptInput),
+}
+
+enum RunDriveOutcome {
+    Admitted,
+    Rejected {
+        admission: oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>,
+        error: ServiceError,
+    },
 }
 
 struct ProjectionState {
@@ -704,12 +1577,15 @@ struct ProjectionState {
     provider_attempt: u32,
     assistant_item: Option<ItemId>,
     reasoning_item: Option<ItemId>,
-    completed_assistant_items: VecDeque<Option<ItemId>>,
-    completed_reasoning_items: VecDeque<Option<ItemId>>,
+    completed_assistant_items: VecDeque<Option<(ItemId, TurnId)>>,
+    completed_reasoning_items: VecDeque<Option<(ItemId, TurnId)>>,
     tool_items: HashMap<String, ItemId>,
     tool_calls: HashMap<String, ProjectedToolCall>,
     pending_tool_evidence: VecDeque<CompletedToolEvidence>,
-    tool_progress: HashMap<String, (String, u64)>,
+    tool_progress: HashMap<String, ProjectedToolProgress>,
+    test_results: Vec<StructuredTestResults>,
+    item_turns: HashMap<ItemId, TurnId>,
+    run_started_at_ms: u64,
     private_requests: HashMap<RequestId, PrivateRequest>,
     pending_attachments: VecDeque<Vec<AttachmentRef>>,
     pending_user_items: VecDeque<PendingUserItem>,
@@ -732,6 +1608,9 @@ impl ProjectionState {
             tool_calls: HashMap::new(),
             pending_tool_evidence: VecDeque::new(),
             tool_progress: HashMap::new(),
+            test_results: Vec::new(),
+            item_turns: HashMap::new(),
+            run_started_at_ms: now_ms(),
             private_requests: HashMap::new(),
             pending_attachments: VecDeque::new(),
             pending_user_items: VecDeque::new(),
@@ -758,6 +1637,9 @@ impl ProjectionState {
         self.tool_items.clear();
         self.tool_calls.clear();
         self.tool_progress.clear();
+        self.test_results.clear();
+        self.item_turns.clear();
+        self.run_started_at_ms = now_ms();
         self.private_requests.clear();
         self.pending_attachments.clear();
         self.pending_user_items.clear();
@@ -791,10 +1673,16 @@ impl ProjectionState {
     }
 
     fn finish_turn(&mut self) {
+        let turn_id = self
+            .assistant_item
+            .as_ref()
+            .or(self.reasoning_item.as_ref())
+            .and_then(|item_id| self.item_turns.get(item_id))
+            .cloned();
         self.completed_assistant_items
-            .push_back(self.assistant_item.take());
+            .push_back(self.assistant_item.take().zip(turn_id.clone()));
         self.completed_reasoning_items
-            .push_back(self.reasoning_item.take());
+            .push_back(self.reasoning_item.take().zip(turn_id));
         self.turn_counter = self.turn_counter.saturating_add(1);
         self.provider_attempt = 1;
     }
@@ -825,7 +1713,8 @@ async fn run_worker(
                 plan.launch.session = SessionSelection::OpenExisting(session_path);
                 match start_and_drive_run(
                     &mut owned_app,
-                    input,
+                    RunPromptInput::New(input),
+                    None,
                     &plan,
                     &mut projection,
                     &mut commands,
@@ -834,7 +1723,11 @@ async fn run_worker(
                 )
                 .await
                 {
-                    Ok(()) => app = Some(owned_app),
+                    Ok(RunDriveOutcome::Admitted) => app = Some(owned_app),
+                    Ok(RunDriveOutcome::Rejected { admission, error }) => {
+                        let _ = admission.send(Err(error));
+                        app = Some(owned_app);
+                    }
                     Err(_) => {
                         let _ = events
                             .send(event(EventPayload::SessionStateChanged {
@@ -843,6 +1736,192 @@ async fn run_worker(
                             }))
                             .await;
                         app = Some(owned_app);
+                    }
+                }
+            }
+            SessionCommand::EditUserTurn {
+                source_user_entry_id,
+                input,
+            } => {
+                let owned_app = match app.take() {
+                    Some(app) => app,
+                    None => match build_worker_app(&plan) {
+                        Ok(app) => app,
+                        Err(_) => {
+                            let _ = message.response.send(Err(ServiceError::Internal));
+                            continue;
+                        }
+                    },
+                };
+                let source_entry =
+                    EntryId(source_user_entry_id.as_str().to_owned());
+                if owned_app
+                    .agent
+                    .session()
+                    .entry(&source_entry)
+                    .is_none_or(|entry| !is_user_authored_entry(entry))
+                {
+                    app = Some(owned_app);
+                    let _ = message
+                        .response
+                        .send(Err(ServiceError::InvalidBoundary));
+                    continue;
+                }
+                let provenance = ConversationBranchProvenance {
+                    operation: ConversationBranchOperation::EditUserTurn,
+                    source_session_id: plan.session_id.clone(),
+                    source_entry_id: source_user_entry_id,
+                    originating_user_entry_id: None,
+                    model_override: None,
+                    external_effects_preserved: true,
+                    warning: EXTERNAL_EFFECTS_WARNING.to_owned(),
+                };
+                match drive_sibling_conversation_branch(
+                    owned_app,
+                    source_entry,
+                    RunPromptInput::New(input),
+                    provenance,
+                    None,
+                    &mut plan,
+                    &mut projection,
+                    &mut commands,
+                    &events,
+                    message.response,
+                )
+                .await
+                {
+                    Ok((owned_app, post_ack_failed)) => {
+                        app = Some(owned_app);
+                        if post_ack_failed {
+                            let _ = events
+                                .send(event(EventPayload::SessionStateChanged {
+                                    state: SessionLiveState::Failed,
+                                    active_run_id: None,
+                                }))
+                                .await;
+                        }
+                    }
+                    Err(_) => {
+                        app = None;
+                        break;
+                    }
+                }
+            }
+            SessionCommand::RetryResponse {
+                source_assistant_entry_id,
+                model,
+            } => {
+                let owned_app = match app.take() {
+                    Some(app) => app,
+                    None => match build_worker_app(&plan) {
+                        Ok(app) => app,
+                        Err(_) => {
+                            let _ = message.response.send(Err(ServiceError::Internal));
+                            continue;
+                        }
+                    },
+                };
+                let assistant_entry =
+                    EntryId(source_assistant_entry_id.as_str().to_owned());
+                let source_user_entry = match retry_originating_user_entry(
+                    owned_app.agent.session(),
+                    &assistant_entry,
+                ) {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        app = Some(owned_app);
+                        let _ = message.response.send(Err(error));
+                        continue;
+                    }
+                };
+                let replay = match replay_prompt_input(
+                    owned_app.agent.session(),
+                    &source_user_entry,
+                    &plan,
+                ) {
+                    Ok(replay) => replay,
+                    Err(error) => {
+                        app = Some(owned_app);
+                        let _ = message.response.send(Err(error));
+                        continue;
+                    }
+                };
+                let originating_user_entry_id =
+                    match DurableEntryId::new(source_user_entry.0.clone()) {
+                        Ok(entry) => entry,
+                        Err(_) => {
+                            app = Some(owned_app);
+                            let _ = message
+                                .response
+                                .send(Err(ServiceError::InvalidBoundary));
+                            continue;
+                        }
+                    };
+                let provenance = ConversationBranchProvenance {
+                    operation: ConversationBranchOperation::RetryResponse,
+                    source_session_id: plan.session_id.clone(),
+                    source_entry_id: source_assistant_entry_id,
+                    originating_user_entry_id: Some(originating_user_entry_id),
+                    model_override: model.clone(),
+                    external_effects_preserved: true,
+                    warning: EXTERNAL_EFFECTS_WARNING.to_owned(),
+                };
+                match drive_sibling_conversation_branch(
+                    owned_app,
+                    source_user_entry,
+                    RunPromptInput::Replay(replay),
+                    provenance,
+                    model,
+                    &mut plan,
+                    &mut projection,
+                    &mut commands,
+                    &events,
+                    message.response,
+                )
+                .await
+                {
+                    Ok((owned_app, post_ack_failed)) => {
+                        app = Some(owned_app);
+                        if post_ack_failed {
+                            let _ = events
+                                .send(event(EventPayload::SessionStateChanged {
+                                    state: SessionLiveState::Failed,
+                                    active_run_id: None,
+                                }))
+                                .await;
+                        }
+                    }
+                    Err(_) => {
+                        app = None;
+                        break;
+                    }
+                }
+            }
+            SessionCommand::ForkConversation { entry_id } => {
+                let owned_app = match app.take() {
+                    Some(app) => app,
+                    None => match build_worker_app(&plan) {
+                        Ok(app) => app,
+                        Err(_) => {
+                            let _ = message.response.send(Err(ServiceError::Internal));
+                            continue;
+                        }
+                    },
+                };
+                match create_conversation_fork(&owned_app, &plan, &entry_id) {
+                    Ok(created_session_id) => {
+                        let outcome = DriverCommandOutcome::fork(created_session_id.clone());
+                        if message.response.send(Ok(outcome)).is_err() {
+                            let _ = rollback_conversation_fork(
+                                &plan,
+                                &created_session_id,
+                            );
+                        }
+                        app = Some(owned_app);
+                    }
+                    Err(error) => {
+                        app = Some(owned_app);
+                        let _ = message.response.send(Err(error));
                     }
                 }
             }
@@ -901,6 +1980,7 @@ async fn run_worker(
                     rebuilt.agent.session(),
                     plan.session_id.clone(),
                     SessionSeedOptions {
+                        workspace: &plan.config.workspace,
                         project_id: plan.project_id.clone(),
                         model,
                         authority: plan.authority,
@@ -1176,7 +2256,9 @@ fn reconfiguration_outcome(
     let branch_start = projection.known_entries;
     for item in project_new_entries(
         app.agent.session(),
+        &plan.config.workspace,
         projection,
+        None,
         None,
         plan.attachments.as_ref(),
         &plan.session_id,
@@ -1244,6 +2326,9 @@ fn rename_session_outcome(
         .rename(plan.session_id.as_str(), title)
         .map_err(|_| ServiceError::InvalidBoundary)?;
     let title = metadata.name.ok_or(ServiceError::InvalidBoundary)?;
+    if let Ok(mut search_index) = plan.search_index.lock() {
+        let _ = search_index.update_session_title(plan.session_id.as_str(), &title);
+    }
     Ok(session_metadata_outcome(Some(title), None, None))
 }
 
@@ -1281,6 +2366,342 @@ fn ensure_durable_session(plan: &WorkerPlan) -> Result<(), ServiceError> {
 fn restore_session_head(path: &std::path::Path, head: EntryId) -> Result<(), ServiceError> {
     let mut session = Session::open(path).map_err(|_| ServiceError::Internal)?;
     session.checkout(head).map_err(|_| ServiceError::Internal)
+}
+
+fn checkout_before_user_entry(
+    session: &mut Session,
+    source_user_entry_id: &EntryId,
+) -> Result<(), ServiceError> {
+    let source = session
+        .entry(source_user_entry_id)
+        .ok_or(ServiceError::InvalidBoundary)?;
+    if !is_user_authored_entry(source) {
+        return Err(ServiceError::InvalidBoundary);
+    }
+    match source.parent.clone() {
+        Some(parent) => session
+            .checkout(parent)
+            .map_err(|_| ServiceError::InvalidBoundary),
+        None => session
+            .checkout_root()
+            .map_err(|_| ServiceError::InvalidBoundary),
+    }
+}
+
+fn is_user_authored_entry(entry: &Entry) -> bool {
+    matches!(
+        &entry.value,
+        EntryValue::Message(Message::User(message))
+            if !message.content.is_empty()
+                && message
+                    .content
+                    .iter()
+                    .all(|part| matches!(part, UserPart::Text(_) | UserPart::Media(_)))
+    )
+}
+
+fn retry_originating_user_entry(
+    session: &Session,
+    source_assistant_entry_id: &EntryId,
+) -> Result<EntryId, ServiceError> {
+    let assistant = session
+        .entry(source_assistant_entry_id)
+        .ok_or(ServiceError::InvalidBoundary)?;
+    if !matches!(
+        &assistant.value,
+        EntryValue::Message(Message::Assistant(_))
+    ) {
+        return Err(ServiceError::InvalidBoundary);
+    }
+    let mut cursor = assistant.parent.as_ref();
+    while let Some(id) = cursor {
+        let entry = session.entry(id).ok_or(ServiceError::InvalidBoundary)?;
+        if is_user_authored_entry(entry) {
+            return Ok(entry.id.clone());
+        }
+        cursor = entry.parent.as_ref();
+    }
+    Err(ServiceError::InvalidBoundary)
+}
+
+fn replay_prompt_input(
+    session: &Session,
+    source_user_entry_id: &EntryId,
+    plan: &WorkerPlan,
+) -> Result<ResolvedPromptInput, ServiceError> {
+    let entry = session
+        .entry(source_user_entry_id)
+        .ok_or(ServiceError::InvalidBoundary)?;
+    let EntryValue::Message(Message::User(message)) = &entry.value else {
+        return Err(ServiceError::InvalidBoundary);
+    };
+    if !is_user_authored_entry(entry) {
+        return Err(ServiceError::InvalidBoundary);
+    }
+    let mut model_text = String::new();
+    for part in &message.content {
+        if let UserPart::Text(text) = part {
+            model_text.push_str(text);
+        }
+    }
+    let display_text = entry
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.display_text.clone())
+        .unwrap_or_else(|| model_text.clone());
+    let attachments = if message
+        .content
+        .iter()
+        .any(|part| matches!(part, UserPart::Media(_)))
+    {
+        let store = plan
+            .attachments
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?;
+        store
+            .refs_for_entry(&plan.session_id, &entry.id.0)
+            .map_err(attachment_service_error)?
+            .ok_or(ServiceError::InvalidBoundary)?
+    } else {
+        Vec::new()
+    };
+    let (documents, project_files) = stored_prompt_context_for_entry(
+        session,
+        plan.resources.as_ref(),
+        &plan.session_id,
+        &entry.id.0,
+    );
+    Ok(ResolvedPromptInput {
+        display_text,
+        model_text,
+        attachments,
+        documents,
+        project_files,
+    })
+}
+
+fn stored_prompt_context_for_entry(
+    session: &Session,
+    resources: Option<&ygg_serve_backend::ResourceStore>,
+    session_id: &SessionId,
+    durable_entry_id: &str,
+) -> (Vec<DocumentReference>, Vec<TrustedFileEntry>) {
+    let Some(resources) = resources else {
+        return (Vec::new(), Vec::new());
+    };
+    for entry in session.entries().iter().rev() {
+        if !entry
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.run_outcome.is_some())
+        {
+            continue;
+        }
+        let Ok(outcome_entry_id) = DurableEntryId::new(entry.id.0.clone()) else {
+            continue;
+        };
+        let Some(record) = load_stored_run_record(resources, session_id, &outcome_entry_id) else {
+            continue;
+        };
+        if let Some(item) = record
+            .items
+            .into_iter()
+            .find(|item| item.durable_entry_id == durable_entry_id)
+        {
+            return (item.documents, item.project_files);
+        }
+    }
+    (Vec::new(), Vec::new())
+}
+
+async fn drive_sibling_conversation_branch(
+    mut owned_app: App,
+    source_user_entry_id: EntryId,
+    input: RunPromptInput,
+    provenance: ConversationBranchProvenance,
+    model_override: Option<ModelSelection>,
+    plan: &mut WorkerPlan,
+    projection: &mut ProjectionState,
+    commands: &mut mpsc::Receiver<WorkerCommand>,
+    events: &mpsc::Sender<TimestampedEvent>,
+    admission: oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>,
+) -> Result<(App, bool), ServiceError> {
+    let path = owned_app.agent.session().path().to_owned();
+    let previous_head = owned_app
+        .agent
+        .session()
+        .head()
+        .ok_or(ServiceError::InvalidBoundary)?;
+    let (new_model, new_reasoning) = match model_override.as_ref() {
+        Some(selection) => {
+            let available = plan.available_models.iter().any(|model| {
+                model.available
+                    && model.provider == selection.provider
+                    && model.id == selection.model
+                    && model
+                        .reasoning
+                        .iter()
+                        .any(|reasoning| reasoning == &selection.reasoning)
+            });
+            if !available {
+                let _ = admission.send(Err(ServiceError::InvalidBoundary));
+                return Ok((owned_app, false));
+            }
+            let model = match owned_app
+                .catalog
+                .resolve(&ModelId(selection.model.clone()))
+            {
+                Ok(model) => model,
+                Err(_) => {
+                    let _ = admission.send(Err(ServiceError::InvalidBoundary));
+                    return Ok((owned_app, false));
+                }
+            };
+            let reasoning = match config::parse_reasoning(&selection.reasoning) {
+                Ok(reasoning) => reasoning,
+                Err(_) => {
+                    let _ = admission.send(Err(ServiceError::InvalidBoundary));
+                    return Ok((owned_app, false));
+                }
+            };
+            (Some(model), Some(reasoning))
+        }
+        None => (None, None),
+    };
+    if let Err(error) =
+        checkout_before_user_entry(owned_app.agent.session_mut(), &source_user_entry_id)
+    {
+        let _ = admission.send(Err(error));
+        return Ok((owned_app, false));
+    }
+    let selection = SessionSelection::OpenExisting(path.clone());
+    let mut candidate = match rebuild_app(
+        owned_app,
+        new_model,
+        new_reasoning,
+        None,
+        Some(selection.clone()),
+    ) {
+        Ok(candidate) => candidate,
+        Err(_) => {
+            let restored = restore_checkout_owner(&path, previous_head, plan)?;
+            let _ = admission.send(Err(ServiceError::Internal));
+            return Ok((restored, false));
+        }
+    };
+    let previous_model = plan.launch.model.clone();
+    let previous_reasoning = plan.launch.reasoning.clone();
+    let previous_reasoning_mode = plan.launch.reasoning_mode;
+    plan.launch.model = candidate.model.spec.id.clone();
+    plan.launch.reasoning = candidate.reasoning.clone();
+    plan.launch.reasoning_mode = candidate.reasoning_mode;
+    plan.launch.session = selection;
+    match start_and_drive_run(
+        &mut candidate,
+        input,
+        Some(provenance),
+        plan,
+        projection,
+        commands,
+        events,
+        admission,
+    )
+    .await
+    {
+        Ok(RunDriveOutcome::Admitted) => Ok((candidate, false)),
+        Ok(RunDriveOutcome::Rejected { admission, error }) => {
+            plan.launch.model = previous_model;
+            plan.launch.reasoning = previous_reasoning;
+            plan.launch.reasoning_mode = previous_reasoning_mode;
+            let restored = rollback_checkout_candidate(candidate, &path, previous_head, plan)?;
+            let _ = admission.send(Err(error));
+            Ok((restored, false))
+        }
+        Err(_) => Ok((candidate, true)),
+    }
+}
+
+fn create_conversation_fork(
+    app: &App,
+    plan: &WorkerPlan,
+    source_entry_id: &DurableEntryId,
+) -> Result<SessionId, ServiceError> {
+    let source_entry = EntryId(source_entry_id.as_str().to_owned());
+    let entry = app
+        .agent
+        .session()
+        .entry(&source_entry)
+        .ok_or(ServiceError::InvalidBoundary)?;
+    if !matches!(
+        &entry.value,
+        EntryValue::Message(Message::User(_))
+            | EntryValue::Message(Message::Assistant(_))
+            | EntryValue::Compaction { .. }
+    ) {
+        return Err(ServiceError::InvalidBoundary);
+    }
+    let project_id = plan
+        .project_id
+        .as_ref()
+        .ok_or(ServiceError::InvalidBoundary)
+        .and_then(registry_project_id)?;
+    let destination = plan.sessions.new_path(&crate::modes::timestamp());
+    let created_session_id = session_id_from_path(&destination)?;
+    let forked = app
+        .agent
+        .session()
+        .fork_to(&destination, source_entry)
+        .map_err(|_| ServiceError::Internal)?;
+    drop(forked);
+    if plan
+        .sessions
+        .set_fork_provenance(
+            created_session_id.as_str(),
+            plan.session_id.as_str(),
+            source_entry_id.as_str(),
+        )
+        .is_err()
+    {
+        let _ = plan
+            .sessions
+            .discard_unacknowledged(created_session_id.as_str());
+        return Err(ServiceError::Internal);
+    }
+    let mut projects = plan.projects.lock().map_err(|_| ServiceError::Internal)?;
+    if let Err(error) = projects.bind_session(created_session_id.as_str(), &project_id) {
+        drop(projects);
+        let _ = plan
+            .sessions
+            .discard_unacknowledged(created_session_id.as_str());
+        return Err(project_registry_service_error(error));
+    }
+    Ok(created_session_id)
+}
+
+fn rollback_conversation_fork(
+    plan: &WorkerPlan,
+    created_session_id: &SessionId,
+) -> Result<(), ServiceError> {
+    let previous_project = {
+        let mut projects = plan.projects.lock().map_err(|_| ServiceError::Internal)?;
+        projects
+            .unbind_session(created_session_id.as_str())
+            .map_err(project_registry_service_error)?
+    };
+    if let Err(error) = plan
+        .sessions
+        .discard_unacknowledged(created_session_id.as_str())
+    {
+        if let Some(project_id) = previous_project {
+            let mut projects = plan.projects.lock().map_err(|_| ServiceError::Internal)?;
+            projects
+                .bind_session(created_session_id.as_str(), &project_id)
+                .map_err(project_registry_service_error)?;
+        }
+        let _ = error;
+        return Err(ServiceError::Internal);
+    }
+    Ok(())
 }
 
 fn rollback_checkout_candidate(
@@ -1402,6 +2823,84 @@ fn resolve_stored_media(
         .collect()
 }
 
+async fn resolve_prompt_input(
+    plan: &WorkerPlan,
+    input: PromptInput,
+) -> Result<ResolvedPromptInput, ServiceError> {
+    let PromptInput {
+        text,
+        attachments,
+        document_ids,
+        project_file_ids,
+    } = input;
+    let project_id = plan.project_id.as_ref();
+    let document_context = if document_ids.is_empty() {
+        None
+    } else {
+        let project_id = project_id.ok_or(ServiceError::Unauthorized)?.clone();
+        let session_id = plan.session_id.clone();
+        let store = plan.documents.clone().ok_or(ServiceError::Unavailable)?;
+        Some(
+            tokio::task::spawn_blocking(move || {
+                store.prompt_context(project_id.as_str(), session_id.as_str(), &document_ids)
+            })
+            .await
+            .map_err(|_| ServiceError::Internal)?
+            .map_err(document_store_service_error)?,
+        )
+    };
+    let project_file_context = if project_file_ids.is_empty() {
+        None
+    } else {
+        let project_id = project_id.ok_or(ServiceError::Unauthorized)?.clone();
+        let projects = Arc::clone(&plan.projects);
+        let trusted_files = Arc::clone(&plan.trusted_files);
+        Some(
+            tokio::task::spawn_blocking(move || {
+                with_trusted_project_files(
+                    &projects,
+                    &trusted_files,
+                    &project_id,
+                    |service, registry| {
+                        service.attach_as_context(registry, &project_file_ids)
+                    },
+                )
+            })
+            .await
+            .map_err(|_| ServiceError::Internal)??,
+        )
+    };
+    let composed = ygg_serve_backend::compose_prompt_text(
+        &text,
+        document_context.as_ref().map(|context| context.text.as_str()),
+        project_file_context
+            .as_ref()
+            .map(|context| context.text.as_str()),
+    )
+    .map_err(|error| match error {
+        ygg_serve_backend::PromptContextError::InvalidUserText
+        | ygg_serve_backend::PromptContextError::InvalidDocumentContext
+        | ygg_serve_backend::PromptContextError::InvalidProjectFileContext => {
+            ServiceError::InvalidBoundary
+        }
+        ygg_serve_backend::PromptContextError::DocumentContextTooLarge
+        | ygg_serve_backend::PromptContextError::ProjectFileContextTooLarge
+        | ygg_serve_backend::PromptContextError::AuxiliaryContextTooLarge
+        | ygg_serve_backend::PromptContextError::PromptTooLarge => ServiceError::PayloadTooLarge,
+    })?;
+    Ok(ResolvedPromptInput {
+        display_text: text,
+        model_text: composed.into_string(),
+        attachments,
+        documents: document_context
+            .map(|context| context.documents)
+            .unwrap_or_default(),
+        project_files: project_file_context
+            .map(|context| context.files)
+            .unwrap_or_default(),
+    })
+}
+
 fn resolve_control_input(
     plan: &WorkerPlan,
     text: String,
@@ -1449,35 +2948,57 @@ fn resource_store_service_error(error: ygg_serve_backend::ResourceStoreError) ->
 
 async fn start_and_drive_run(
     app: &mut App,
-    input: PromptInput,
+    input: RunPromptInput,
+    branch_provenance: Option<ConversationBranchProvenance>,
     plan: &WorkerPlan,
     projection: &mut ProjectionState,
     commands: &mut mpsc::Receiver<WorkerCommand>,
     events: &mpsc::Sender<TimestampedEvent>,
     admission: oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>,
-) -> Result<(), ServiceError> {
+) -> Result<RunDriveOutcome, ServiceError> {
     if let Some(limit) = app.config.max_cost_microdollars {
         if app.agent.session().total_cost_microdollars() >= limit {
-            let _ = admission.send(Err(ServiceError::InvalidBoundary));
-            return Ok(());
+            return Ok(RunDriveOutcome::Rejected {
+                admission,
+                error: ServiceError::InvalidBoundary,
+            });
         }
     }
-    let PromptInput {
-        text: prompt,
+    let (resolved, replay_exact) = match input {
+        RunPromptInput::New(input) => match resolve_prompt_input(plan, input).await {
+            Ok(resolved) => (resolved, false),
+            Err(error) => {
+                return Ok(RunDriveOutcome::Rejected { admission, error });
+            }
+        },
+        RunPromptInput::Replay(resolved) => (resolved, true),
+    };
+    let ResolvedPromptInput {
+        display_text,
+        model_text,
         attachments,
-    } = input;
+        documents,
+        project_files,
+    } = resolved;
     let media = match resolve_attachment_media(app, plan, &attachments) {
         Ok(media) => media,
         Err(error) => {
-            let _ = admission.send(Err(error));
-            return Ok(());
+            return Ok(RunDriveOutcome::Rejected { admission, error });
         }
     };
-    let prompt = match crate::prompts::render_configured(app, &prompt)
-        .map_err(|_| ServiceError::Internal)?
-    {
-        Some(rendered) => rendered.text,
-        None => prompt,
+    let prompt = if replay_exact {
+        model_text
+    } else {
+        match crate::prompts::render_configured(app, &model_text) {
+            Err(_) => {
+                return Ok(RunDriveOutcome::Rejected {
+                    admission,
+                    error: ServiceError::Internal,
+                })
+            }
+            Ok(Some(rendered)) => rendered.text,
+            Ok(None) => model_text,
+        }
     };
     app.executable_extensions.refresh_host_state(
         app.agent.session(),
@@ -1485,19 +3006,46 @@ async fn start_and_drive_run(
         &app.reasoning,
         &app.sessions,
     );
-    let composition = app
-        .executable_extensions
-        .compose_prompt(&app.system, prompt.clone())
-        .await
-        .map_err(|_| ServiceError::Internal)?;
-    let pending_context_count = composition.pending_context_count;
-    let model_prompt = composition.prompt;
-    app.agent.set_system_prompt(composition.system);
-    app.agent.set_prompt_display_text(Some(prompt.clone()));
+    let (pending_context_count, model_prompt) = if replay_exact {
+        app.agent.set_system_prompt(app.system.clone());
+        (0, prompt)
+    } else {
+        let composition = match app
+            .executable_extensions
+            .compose_prompt(&app.system, prompt.clone())
+            .await
+        {
+            Ok(composition) => composition,
+            Err(_) => {
+                return Ok(RunDriveOutcome::Rejected {
+                    admission,
+                    error: ServiceError::Internal,
+                })
+            }
+        };
+        let pending_context_count = composition.pending_context_count;
+        let model_prompt = composition.prompt;
+        app.agent.set_system_prompt(composition.system);
+        (pending_context_count, model_prompt)
+    };
+    app.agent
+        .set_prompt_display_text(Some(display_text.clone()));
     projection.begin_run();
-    let run_id = projection.next_run_id(plan.actor_generation)?;
-    let turn_id = projection.turn_id(&run_id)?;
-    let user_item_id = projection.provisional_id(&run_id, "user", 0)?;
+    let run_id = match projection.next_run_id(plan.actor_generation) {
+        Ok(run_id) => run_id,
+        Err(error) => return Ok(RunDriveOutcome::Rejected { admission, error }),
+    };
+    let turn_id = match projection.turn_id(&run_id) {
+        Ok(turn_id) => turn_id,
+        Err(error) => return Ok(RunDriveOutcome::Rejected { admission, error }),
+    };
+    let user_item_id = match projection.provisional_id(&run_id, "user", 0) {
+        Ok(item_id) => item_id,
+        Err(error) => return Ok(RunDriveOutcome::Rejected { admission, error }),
+    };
+    projection
+        .item_turns
+        .insert(user_item_id.clone(), turn_id.clone());
     let mut input_parts = Vec::with_capacity(1 + media.len());
     if !model_prompt.is_empty() {
         input_parts.push(InputPart::Text(model_prompt));
@@ -1506,8 +3054,10 @@ async fn start_and_drive_run(
     let mut run = match app.agent.prompt(UserInput::from(input_parts)).await {
         Ok(run) => run,
         Err(_) => {
-            let _ = admission.send(Err(ServiceError::Internal));
-            return Ok(());
+            return Ok(RunDriveOutcome::Rejected {
+                admission,
+                error: ServiceError::Internal,
+            });
         }
     };
     if !attachments.is_empty() {
@@ -1518,6 +3068,10 @@ async fn start_and_drive_run(
     projection.pending_user_items.push_back(PendingUserItem {
         id: user_item_id.clone(),
         delivery: UserMessageDelivery::Submit,
+        turn_id: turn_id.clone(),
+        documents: documents.clone(),
+        project_files: project_files.clone(),
+        branch_provenance: branch_provenance.clone(),
     });
     app.executable_extensions
         .commit_prompt_context(pending_context_count);
@@ -1533,9 +3087,12 @@ async fn start_and_drive_run(
                 lifecycle: ItemLifecycle::Provisional,
                 durable_entry_id: None,
                 payload: ItemPayload::UserMessage {
-                    text: bounded_text(&prompt, MAX_PROMPT_BYTES),
+                    text: bounded_text(&display_text, MAX_PROMPT_BYTES),
                     attachments: attachments.clone(),
+                    documents,
+                    project_files,
                     delivery: Some(UserMessageDelivery::Submit),
+                    branch_provenance,
                 },
             },
         }),
@@ -1588,10 +3145,64 @@ async fn start_and_drive_run(
         }
     }
     drop(run);
+    let settled_at_ms = now_ms();
+    let unfinished = projection
+        .tool_calls
+        .iter()
+        .filter_map(|(tool_call_id, tool)| {
+            (tool.activity.status == ToolActivityStatus::Running).then(|| tool_call_id.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut stopped_updates = Vec::new();
+    for tool_call_id in unfinished {
+        let Some(item_id) = projection.tool_items.get(&tool_call_id).cloned() else {
+            continue;
+        };
+        let progress = projection
+            .tool_progress
+            .remove(&tool_call_id)
+            .unwrap_or_default();
+        let Some(tool) = projection.tool_calls.get_mut(&tool_call_id) else {
+            continue;
+        };
+        tool.activity.status = ToolActivityStatus::Stopped;
+        tool.activity.summary = Some("Stopped".into());
+        tool.activity.completed_at_ms = Some(settled_at_ms.max(tool.activity.started_at_ms));
+        tool.activity.duration_ms = Some(settled_at_ms.saturating_sub(tool.activity.started_at_ms));
+        tool.activity.output_summary = Some("Tool stopped before completion".into());
+        tool.activity.observed_output_bytes = progress.observed_output_bytes;
+        tool.activity.dropped_output_bytes = progress.dropped_output_bytes;
+        tool.result = Some(ToolResultSummary {
+            tool_call_item_id: item_id.clone(),
+            status: ToolActivityStatus::Stopped,
+            summary: "Stopped".into(),
+            output_summary: tool.activity.output_summary.clone(),
+            output_handle: None,
+            exit_code: None,
+            signal: None,
+            completed_at_ms: tool.activity.completed_at_ms.unwrap_or(settled_at_ms),
+            duration_ms: tool.activity.duration_ms.unwrap_or_default(),
+            observed_output_bytes: tool.activity.observed_output_bytes,
+            dropped_output_bytes: tool.activity.dropped_output_bytes,
+        });
+        stopped_updates.push((item_id, tool.activity.clone()));
+    }
+    for (item_id, activity) in stopped_updates {
+        events
+            .send(event(EventPayload::ItemDelta {
+                item_id,
+                delta: ItemDelta::ToolActivity { activity },
+            }))
+            .await
+            .map_err(|_| ServiceError::Unavailable)?;
+    }
+    let mut changed_file_item_ids = BTreeSet::new();
+    let mut source_ids = BTreeSet::new();
+    let mut output_ids = BTreeSet::new();
     if let Some(resources) = plan.resources.as_ref() {
         let completed = std::mem::take(&mut projection.pending_tool_evidence);
         for completed in completed {
-            for payload in project_tool_evidence(
+            let payloads = project_tool_evidence(
                 app.agent.session(),
                 &plan.config.workspace,
                 resources,
@@ -1602,7 +3213,53 @@ async fn start_and_drive_run(
                 &completed.tool_item_id,
                 &completed.tool,
                 &completed.output,
-            ) {
+            );
+            let mut changed_paths = BTreeSet::new();
+            let mut linked_sources = BTreeSet::new();
+            let mut linked_outputs = BTreeSet::new();
+            for payload in &payloads {
+                match payload {
+                    EventPayload::SourceUpserted { source } => {
+                        source_ids.insert(source.id.clone());
+                        linked_sources.insert(source.id.clone());
+                    }
+                    EventPayload::ArtifactUpserted { artifact } => {
+                        output_ids.insert(artifact.id.clone());
+                        linked_outputs.insert(artifact.id.clone());
+                    }
+                    EventPayload::ItemCommitted { item } => match &item.payload {
+                        ItemPayload::FileChange(change) => {
+                            changed_file_item_ids.insert(item.id.clone());
+                            changed_paths.insert(change.display_path.clone());
+                        }
+                        ItemPayload::Source(source) => {
+                            source_ids.insert(source.id.clone());
+                            linked_sources.insert(source.id.clone());
+                        }
+                        ItemPayload::Artifact(artifact) => {
+                            output_ids.insert(artifact.id.clone());
+                            linked_outputs.insert(artifact.id.clone());
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            if let Some(tool) = projection.tool_calls.get_mut(&completed.tool_call_id) {
+                tool.activity.changed_paths = changed_paths.into_iter().collect();
+                tool.activity.source_ids = linked_sources.into_iter().collect();
+                tool.activity.artifact_ids = linked_outputs.into_iter().collect();
+                events
+                    .send(event(EventPayload::ItemDelta {
+                        item_id: completed.tool_item_id.clone(),
+                        delta: ItemDelta::ToolActivity {
+                            activity: tool.activity.clone(),
+                        },
+                    }))
+                    .await
+                    .map_err(|_| ServiceError::Unavailable)?;
+            }
+            for payload in payloads {
                 events
                     .send(event(payload))
                     .await
@@ -1612,6 +3269,15 @@ async fn start_and_drive_run(
     } else {
         projection.pending_tool_evidence.clear();
     }
+    let review = build_completion_review(
+        &terminal,
+        projection.run_started_at_ms,
+        settled_at_ms,
+        projection,
+        changed_file_item_ids,
+        source_ids,
+        output_ids,
+    );
     app.agent.set_system_prompt(app.system.clone());
     app.agent
         .record_run_outcome(SessionRunOutcome {
@@ -1627,11 +3293,37 @@ async fn start_and_drive_run(
     let branch_start = projection.known_entries;
     let committed = project_new_entries(
         app.agent.session(),
+        &plan.config.workspace,
         projection,
         Some(&run_id),
+        Some(&review),
         plan.attachments.as_ref(),
         &plan.session_id,
     )?;
+    let search_title = session_meta_for_id(&plan.sessions, &plan.session_id)
+        .map(|meta| meta.name.unwrap_or(meta.title))
+        .unwrap_or_else(|| "Session".to_owned());
+    if let Ok(mut search_index) = plan.search_index.lock() {
+        for item in &committed {
+            if let Some(document) =
+                search_document_for_item(&plan.session_id, &search_title, settled_at_ms, item)
+            {
+                let _ = search_index.upsert_document(document);
+            }
+        }
+    }
+    if let Some(resources) = plan.resources.as_ref() {
+        persist_run_projection(
+            resources,
+            &plan.session_id,
+            &run_id,
+            projection.run_started_at_ms,
+            settled_at_ms,
+            projection,
+            &committed,
+            &review,
+        )?;
+    }
     for item in committed {
         events
             .send(event(EventPayload::ItemCommitted { item }))
@@ -1669,7 +3361,7 @@ async fn start_and_drive_run(
             .after_response(&response_text)
             .await;
     }
-    Ok(())
+    Ok(RunDriveOutcome::Admitted)
 }
 
 async fn handle_active_command(
@@ -1682,47 +3374,51 @@ async fn handle_active_command(
 ) {
     let outcome = match message.command {
         SessionCommand::Steer { input } => {
-            let PromptInput {
-                text,
-                attachments: references,
-            } = input;
-            match resolve_control_input(plan, text.clone(), &references) {
-                Ok(input) => match control.steer(input).await {
-                    Ok(()) => {
-                        publish_control_user_item(
-                            run_id,
-                            text,
-                            references,
-                            UserMessageDelivery::Steer,
-                            projection,
-                            events,
-                        )
-                        .await
-                    }
-                    Err(_) => Err(ServiceError::InvalidBoundary),
+            match resolve_prompt_input(plan, input).await {
+                Ok(resolved) => match resolve_control_input(
+                    plan,
+                    resolved.model_text.clone(),
+                    &resolved.attachments,
+                ) {
+                    Ok(input) => match control.steer(input).await {
+                        Ok(()) => {
+                            publish_control_user_item(
+                                run_id,
+                                resolved,
+                                UserMessageDelivery::Steer,
+                                projection,
+                                events,
+                            )
+                            .await
+                        }
+                        Err(_) => Err(ServiceError::InvalidBoundary),
+                    },
+                    Err(error) => Err(error),
                 },
                 Err(error) => Err(error),
             }
         }
         SessionCommand::FollowUp { input } => {
-            let PromptInput {
-                text,
-                attachments: references,
-            } = input;
-            match resolve_control_input(plan, text.clone(), &references) {
-                Ok(input) => match control.follow_up(input).await {
-                    Ok(()) => {
-                        publish_control_user_item(
-                            run_id,
-                            text,
-                            references,
-                            UserMessageDelivery::FollowUp,
-                            projection,
-                            events,
-                        )
-                        .await
-                    }
-                    Err(_) => Err(ServiceError::InvalidBoundary),
+            match resolve_prompt_input(plan, input).await {
+                Ok(resolved) => match resolve_control_input(
+                    plan,
+                    resolved.model_text.clone(),
+                    &resolved.attachments,
+                ) {
+                    Ok(input) => match control.follow_up(input).await {
+                        Ok(()) => {
+                            publish_control_user_item(
+                                run_id,
+                                resolved,
+                                UserMessageDelivery::FollowUp,
+                                projection,
+                                events,
+                            )
+                            .await
+                        }
+                        Err(_) => Err(ServiceError::InvalidBoundary),
+                    },
+                    Err(error) => Err(error),
                 },
                 Err(error) => Err(error),
             }
@@ -1832,18 +3528,31 @@ async fn handle_active_command(
 
 async fn publish_control_user_item(
     run_id: &RunId,
-    text: String,
-    attachments: Vec<AttachmentRef>,
+    resolved: ResolvedPromptInput,
     delivery: UserMessageDelivery,
     projection: &mut ProjectionState,
     events: &mpsc::Sender<TimestampedEvent>,
 ) -> Result<DriverCommandOutcome, ServiceError> {
+    let ResolvedPromptInput {
+        display_text,
+        model_text: _,
+        attachments,
+        documents,
+        project_files,
+    } = resolved;
     let item_id = projection.next_user_item_id(run_id)?;
     let turn_id = projection.turn_id(run_id)?;
     projection.pending_user_items.push_back(PendingUserItem {
         id: item_id.clone(),
         delivery,
+        turn_id: turn_id.clone(),
+        documents: documents.clone(),
+        project_files: project_files.clone(),
+        branch_provenance: None,
     });
+    projection
+        .item_turns
+        .insert(item_id.clone(), turn_id.clone());
     if !attachments.is_empty() {
         projection
             .pending_attachments
@@ -1859,9 +3568,12 @@ async fn publish_control_user_item(
                 lifecycle: ItemLifecycle::Provisional,
                 durable_entry_id: None,
                 payload: ItemPayload::UserMessage {
-                    text: bounded_text(&text, MAX_PROMPT_BYTES),
+                    text: bounded_text(&display_text, MAX_PROMPT_BYTES),
                     attachments,
+                    documents,
+                    project_files,
                     delivery: Some(delivery),
+                    branch_provenance: None,
                 },
             },
         }))
@@ -1877,6 +3589,579 @@ fn projection_actor_generation(run_id: &RunId) -> u64 {
         .nth(1)
         .and_then(|value| value.parse().ok())
         .unwrap_or(1)
+}
+
+fn normalized_tool_name(name: &str) -> String {
+    let normalized = name
+        .chars()
+        .take(128)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if normalized.trim_matches('_').is_empty() {
+        "tool".into()
+    } else {
+        normalized
+    }
+}
+
+fn safe_relative_path(value: &str) -> Option<String> {
+    if value.is_empty() || value.contains('\0') {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in Path::new(value).components() {
+        match component {
+            Component::Normal(value) => components.push(value.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if components.is_empty() {
+        Some(".".into())
+    } else {
+        Some(components.join("/"))
+    }
+}
+
+fn safe_public_target(workspace: &Path, value: &str) -> Option<String> {
+    if value.contains("://") {
+        let url = url::Url::parse(value).ok()?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return None;
+        }
+        let host = url.host_str()?;
+        let port = url
+            .port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        let path = if url.path().is_empty() {
+            "/"
+        } else {
+            url.path()
+        };
+        return Some(bounded_text(
+            &format!("{}://{host}{port}{path}", url.scheme()),
+            1024,
+        ));
+    }
+    let source = Path::new(value);
+    if !source.is_absolute() {
+        return safe_relative_path(value);
+    }
+    let workspace = workspace.canonicalize().ok()?;
+    let candidate = source.canonicalize().ok()?;
+    let relative = candidate.strip_prefix(workspace).ok()?;
+    if relative.as_os_str().is_empty() {
+        return Some(".".into());
+    }
+    safe_relative_path(&relative.to_string_lossy())
+}
+
+fn safe_workspace_path(workspace: &Path, value: &str) -> Option<String> {
+    if value.contains("://") {
+        return None;
+    }
+    safe_public_target(workspace, value)
+}
+
+fn safe_public_query(workspace: &Path, value: &str) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.contains("://") && url::Url::parse(&normalized).is_ok() {
+        return safe_public_target(workspace, &normalized);
+    }
+
+    let lower = normalized.to_ascii_lowercase();
+    let sensitive_assignments = [
+        "api_key=",
+        "api_key:",
+        "api-key=",
+        "api-key:",
+        "apikey=",
+        "apikey:",
+        "access_token=",
+        "access_token:",
+        "access-token=",
+        "access-token:",
+        "auth_token=",
+        "auth_token:",
+        "authorization=",
+        "authorization:",
+        "bearer ",
+        "basic ",
+        "client_secret=",
+        "client_secret:",
+        "cookie=",
+        "cookie:",
+        "credential=",
+        "credential:",
+        "password=",
+        "password:",
+        "password ",
+        "secret=",
+        "secret:",
+        "secret ",
+        "session_token=",
+        "session_token:",
+        "token=",
+        "token:",
+    ];
+    let known_token_prefixes = [
+        "akia",
+        "asia",
+        "aiza",
+        "dop_v1_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "glpat-",
+        "hf_",
+        "npm_",
+        "pypi-",
+        "sk-",
+        "sk_live_",
+        "rk_live_",
+        "xoxb-",
+        "xoxa-",
+        "xoxp-",
+        "xoxr-",
+        "xoxs-",
+        "xoxapp-",
+        "ya29.",
+    ];
+    let contains_known_token = normalized.split_ascii_whitespace().any(|word| {
+        let word = word.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.')
+        });
+        let word = word.to_ascii_lowercase();
+        word.len() >= 12
+            && known_token_prefixes
+                .iter()
+                .any(|prefix| word.starts_with(prefix))
+    });
+    if sensitive_assignments
+        .iter()
+        .any(|needle| lower.contains(needle))
+        || contains_known_token
+    {
+        return Some("[redacted query]".into());
+    }
+
+    Some(bounded_text(&normalized, 512))
+}
+
+fn search_target(query: Option<String>, path: Option<String>) -> Option<String> {
+    match (query, path) {
+        (Some(query), Some(path)) => Some(bounded_text(&format!("{query} in {path}"), 1024)),
+        (Some(query), None) => Some(query),
+        (None, Some(path)) => Some(path),
+        (None, None) => None,
+    }
+}
+
+fn safe_command_shape(
+    name: &str,
+    arguments: &serde_json::Value,
+    workspace: &Path,
+) -> (Option<String>, bool) {
+    if !matches!(name, "bash" | "exec") {
+        return (None, false);
+    }
+    // Reuse the native presentation normalizer only as an internal first pass.
+    // None of its argument-derived strings cross the public boundary until the
+    // strict allowlist below has reduced the command to a known shape.
+    let normalized =
+        crate::presentation::summarize_tool_with_workspace(name, arguments, Some(workspace))
+            .shell_command
+            .unwrap_or_default();
+    if normalized.is_empty()
+        || normalized.chars().any(|character| {
+            matches!(
+                character,
+                '\n' | '\r' | ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\'' | '"'
+            )
+        })
+    {
+        return (None, false);
+    }
+    let words = normalized.split_ascii_whitespace().collect::<Vec<_>>();
+    let program = words
+        .first()
+        .and_then(|word| Path::new(word).file_name())
+        .and_then(|word| word.to_str())
+        .unwrap_or_default();
+    let subcommand = words.get(1).copied().unwrap_or_default();
+    let shape = match (program, subcommand, words.get(2).copied()) {
+        ("cargo", command, _)
+            if matches!(
+                command,
+                "test" | "check" | "clippy" | "fmt" | "build" | "doc"
+            ) =>
+        {
+            Some(format!("cargo {command}"))
+        }
+        ("npm" | "pnpm" | "yarn" | "bun", "test" | "build" | "lint" | "check", _) => {
+            Some(format!("{program} {subcommand}"))
+        }
+        ("npm" | "pnpm" | "yarn" | "bun", "run", Some(command))
+            if matches!(command, "test" | "build" | "lint" | "check" | "typecheck") =>
+        {
+            Some(format!("{program} run {command}"))
+        }
+        ("pytest", _, _) => Some("pytest".into()),
+        ("python" | "python3", "-m", Some("pytest" | "unittest")) => {
+            Some(format!("{program} -m {}", words[2]))
+        }
+        ("go", "test" | "vet" | "build", _) => Some(format!("go {subcommand}")),
+        ("rustc", _, _) => Some("rustc".into()),
+        ("git", "status" | "diff" | "log" | "show", _) => Some(format!("git {subcommand}")),
+        _ => None,
+    };
+    let verification = matches!(
+        (program, subcommand, words.get(2).copied()),
+        (
+            "cargo",
+            "test" | "check" | "clippy" | "fmt" | "build" | "doc",
+            _
+        ) | (
+            "npm" | "pnpm" | "yarn" | "bun",
+            "test" | "build" | "lint" | "check",
+            _
+        ) | (
+            "npm" | "pnpm" | "yarn" | "bun",
+            "run",
+            Some("test" | "build" | "lint" | "check" | "typecheck")
+        ) | ("pytest", _, _)
+            | ("python" | "python3", "-m", Some("pytest" | "unittest"))
+            | ("go", "test" | "vet" | "build", _)
+            | ("rustc", _, _)
+    );
+    (shape.map(|shape| bounded_text(&shape, 1024)), verification)
+}
+
+fn semantic_tool_activity(
+    name: &str,
+    arguments: &serde_json::Value,
+    workspace: &Path,
+    started_at_ms: u64,
+) -> ToolActivity {
+    let path = arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| safe_public_target(workspace, value));
+    let resource_path = arguments
+        .get("resource_path")
+        .and_then(serde_json::Value::as_str)
+        .and_then(safe_relative_path);
+    let query = arguments
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| safe_public_query(workspace, value));
+    let url = arguments
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| safe_public_target(workspace, value));
+    let cwd = arguments
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| safe_workspace_path(workspace, value));
+    let (command_preview, verification) = safe_command_shape(name, arguments, workspace);
+    let remote_read = name == "read"
+        && arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value.starts_with("http://") || value.starts_with("https://"));
+    let (kind, phase, title, target) = match name {
+        "read" if remote_read => (
+            ToolKind::Web,
+            ActivityPhase::Investigated,
+            path.as_ref()
+                .map(|target| format!("Read {target}"))
+                .unwrap_or_else(|| "Read remote resource".into()),
+            path,
+        ),
+        "read" => (
+            ToolKind::Read,
+            ActivityPhase::Investigated,
+            path.as_ref()
+                .map(|target| format!("Read {target}"))
+                .unwrap_or_else(|| "Read file".into()),
+            path,
+        ),
+        "search" => {
+            let target = search_target(query, path);
+            (
+                ToolKind::Search,
+                ActivityPhase::Investigated,
+                target
+                    .as_ref()
+                    .map(|target| format!("Search {target}"))
+                    .unwrap_or_else(|| "Search workspace".into()),
+                target,
+            )
+        }
+        "edit" => (
+            ToolKind::Edit,
+            ActivityPhase::Changed,
+            path.as_ref()
+                .map(|target| format!("Update {target}"))
+                .unwrap_or_else(|| "Update file".into()),
+            path,
+        ),
+        "write" => (
+            ToolKind::Write,
+            ActivityPhase::Changed,
+            path.as_ref()
+                .map(|target| format!("Write {target}"))
+                .unwrap_or_else(|| "Write file".into()),
+            path,
+        ),
+        "bash" | "exec" => (
+            ToolKind::Command,
+            if verification {
+                ActivityPhase::Verified
+            } else {
+                ActivityPhase::Other
+            },
+            command_preview
+                .as_ref()
+                .map(|command| format!("Run {command}"))
+                .unwrap_or_else(|| "Run command".into()),
+            None,
+        ),
+        "read_skill_resource" => (
+            ToolKind::Skill,
+            ActivityPhase::Investigated,
+            resource_path
+                .as_ref()
+                .map(|target| format!("Read skill resource {target}"))
+                .unwrap_or_else(|| "Read skill resource".into()),
+            resource_path,
+        ),
+        "web_search" => {
+            let target = url.or(query);
+            (
+                ToolKind::Web,
+                ActivityPhase::Investigated,
+                target
+                    .as_ref()
+                    .map(|target| format!("Search the web for {target}"))
+                    .unwrap_or_else(|| "Search the web".into()),
+                target,
+            )
+        }
+        _ => (
+            ToolKind::Other,
+            ActivityPhase::Other,
+            format!(
+                "Run {}",
+                normalized_tool_name(name).replace(['_', '-'], " ")
+            ),
+            None,
+        ),
+    };
+    ToolActivity {
+        raw_tool_name: normalized_tool_name(name),
+        kind,
+        phase,
+        status: ToolActivityStatus::Running,
+        title: bounded_text(&title, 512),
+        summary: Some("Running".into()),
+        target,
+        cwd,
+        command_preview,
+        exit_code: None,
+        signal: None,
+        started_at_ms: started_at_ms.max(1),
+        completed_at_ms: None,
+        duration_ms: None,
+        output_summary: None,
+        output_handle: None,
+        observed_output_bytes: 0,
+        dropped_output_bytes: 0,
+        changed_paths: Vec::new(),
+        source_ids: Vec::new(),
+        artifact_ids: Vec::new(),
+    }
+}
+
+fn parse_process_metadata(text: &str) -> (Option<i32>, Option<i32>, Option<u64>) {
+    let mut exit_code = None;
+    let mut signal = None;
+    let mut duration_ms = None;
+    for token in text.lines().take(4).flat_map(str::split_ascii_whitespace) {
+        if let Some(value) = token.strip_prefix("exit=") {
+            if let Some(value) = value.strip_prefix("signal:") {
+                signal = value.parse::<i32>().ok();
+            } else if value != "unknown" {
+                exit_code = value.parse::<i32>().ok();
+            }
+        } else if let Some(value) = token
+            .strip_prefix("duration=")
+            .and_then(|value| value.strip_suffix('s'))
+        {
+            duration_ms = value
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .map(|seconds| (seconds * 1_000.0).round().min(u64::MAX as f64) as u64);
+        }
+    }
+    (exit_code, signal, duration_ms)
+}
+
+fn complete_tool_activity(
+    mut activity: ToolActivity,
+    name: &str,
+    result: &Result<ToolOutput, ToolError>,
+    completed_at_ms: u64,
+    progress: ProjectedToolProgress,
+) -> (ToolActivity, ToolResultSummary) {
+    let raw_result = match result {
+        Ok(output) => output.text.as_str(),
+        Err(error) => error.message.as_str(),
+    };
+    let (exit_code, signal, parsed_duration_ms) = if matches!(name, "bash" | "exec") {
+        parse_process_metadata(raw_result)
+    } else {
+        (None, None, None)
+    };
+    let failed = crate::presentation::tool_result_is_failure(name, result);
+    let status = if failed {
+        ToolActivityStatus::Failed
+    } else {
+        ToolActivityStatus::Succeeded
+    };
+    let duration_ms = parsed_duration_ms
+        .unwrap_or_else(|| completed_at_ms.saturating_sub(activity.started_at_ms));
+    let output_summary = match status {
+        ToolActivityStatus::Succeeded if activity.phase == ActivityPhase::Verified => {
+            Some("Verification completed".into())
+        }
+        ToolActivityStatus::Succeeded if activity.kind == ToolKind::Read => {
+            Some("Read completed".into())
+        }
+        ToolActivityStatus::Succeeded if activity.kind == ToolKind::Search => {
+            Some("Search completed".into())
+        }
+        ToolActivityStatus::Succeeded if activity.kind == ToolKind::Edit => {
+            Some("File updated".into())
+        }
+        ToolActivityStatus::Succeeded if activity.kind == ToolKind::Write => {
+            Some("File written".into())
+        }
+        ToolActivityStatus::Succeeded if activity.kind == ToolKind::Web => {
+            Some("Remote lookup completed".into())
+        }
+        ToolActivityStatus::Succeeded => Some("Tool completed".into()),
+        ToolActivityStatus::Failed if activity.phase == ActivityPhase::Verified => {
+            Some("Verification failed".into())
+        }
+        ToolActivityStatus::Failed if exit_code.is_some() => {
+            Some(format!("Command exited {}", exit_code.unwrap_or_default()))
+        }
+        ToolActivityStatus::Failed if signal.is_some() => Some(format!(
+            "Command stopped by signal {}",
+            signal.unwrap_or_default()
+        )),
+        ToolActivityStatus::Failed => Some("Tool failed".into()),
+        ToolActivityStatus::Running | ToolActivityStatus::Stopped => None,
+    };
+    let final_bytes = raw_result.len().min(u64::MAX as usize) as u64;
+    activity.status = status;
+    activity.summary = Some(match status {
+        ToolActivityStatus::Succeeded => "Completed".into(),
+        ToolActivityStatus::Failed => "Failed".into(),
+        ToolActivityStatus::Stopped => "Stopped".into(),
+        ToolActivityStatus::Running => "Running".into(),
+    });
+    activity.exit_code = exit_code;
+    activity.signal = signal;
+    activity.completed_at_ms = Some(completed_at_ms.max(activity.started_at_ms));
+    activity.duration_ms = Some(duration_ms);
+    activity.output_summary = output_summary.clone();
+    activity.observed_output_bytes = progress.observed_output_bytes.max(final_bytes);
+    activity.dropped_output_bytes = progress.dropped_output_bytes;
+    let summary = activity
+        .summary
+        .clone()
+        .unwrap_or_else(|| "Completed".into());
+    let result = ToolResultSummary {
+        tool_call_item_id: ItemId::new("placeholder").expect("static item ID is valid"),
+        status,
+        summary,
+        output_summary,
+        output_handle: activity.output_handle.clone(),
+        exit_code,
+        signal,
+        completed_at_ms: activity.completed_at_ms.unwrap_or(completed_at_ms),
+        duration_ms,
+        observed_output_bytes: activity.observed_output_bytes,
+        dropped_output_bytes: activity.dropped_output_bytes,
+    };
+    (activity, result)
+}
+
+fn test_framework_hint(activity: &ToolActivity) -> Option<TestFramework> {
+    match activity.command_preview.as_deref() {
+        Some("cargo test") => Some(TestFramework::CargoLibtest),
+        Some("pytest") | Some("python -m pytest") | Some("python3 -m pytest") => {
+            Some(TestFramework::Pytest)
+        }
+        Some("go test") => Some(TestFramework::GoTest),
+        // Package runners may dispatch either Vitest or Jest, so their
+        // deterministic reporter markers select the parser.
+        _ => None,
+    }
+}
+
+fn project_test_results(
+    item_id: &ItemId,
+    activity: &ToolActivity,
+    output: &ToolOutput,
+) -> Option<StructuredTestResults> {
+    if activity.kind != ToolKind::Command || activity.phase != ActivityPhase::Verified {
+        return None;
+    }
+    let status = match activity.status {
+        ToolActivityStatus::Succeeded => TestCommandStatus::Succeeded,
+        ToolActivityStatus::Failed => TestCommandStatus::Failed,
+        ToolActivityStatus::Stopped => TestCommandStatus::Stopped,
+        ToolActivityStatus::Running => return None,
+    };
+    let bytes = output.text.as_bytes();
+    let retained_len = bytes.len().min(MAX_TEST_OUTPUT_BYTES);
+    parse_test_output(TestOutputInput {
+        origin_item_id: item_id.clone(),
+        output: &bytes[..retained_len],
+        input_truncated: bytes.len() > retained_len || activity.dropped_output_bytes > 0,
+        command: TestCommandOutcome {
+            status,
+            exit_code: activity.exit_code,
+            signal: activity.signal,
+        },
+        framework_hint: test_framework_hint(activity),
+    })
+    .ok()
+}
+
+fn stable_tool_item_id(tool_call_id: &str) -> Result<ItemId, ServiceError> {
+    let hash = stable_hash(tool_call_id.as_bytes());
+    ItemId::new(format!("item-tool-{}", &hash[..24])).map_err(|_| ServiceError::Internal)
 }
 
 async fn project_agent_event(
@@ -1937,7 +4222,7 @@ async fn project_agent_event(
                         item: SessionItem {
                             id: item_id.clone(),
                             run_id: Some(run_id.clone()),
-                            turn_id: Some(turn_id),
+                            turn_id: Some(turn_id.clone()),
                             provider_attempt: Some(projection.provider_attempt),
                             lifecycle: ItemLifecycle::Provisional,
                             durable_entry_id: None,
@@ -1946,6 +4231,7 @@ async fn project_agent_event(
                     }))
                     .await
                     .map_err(|_| ServiceError::Unavailable)?;
+                projection.item_turns.insert(item_id.clone(), turn_id);
                 *slot = Some(item_id);
             }
         }
@@ -1954,38 +4240,41 @@ async fn project_agent_event(
             projection.provider_attempt = projection.provider_attempt.saturating_add(1);
         }
         AgentEvent::ToolStarted { id, name, args } => {
-            let item_id =
-                projection.provisional_id(run_id, "tool", projection.tool_items.len() as u64)?;
+            let item_id = stable_tool_item_id(&id.0)?;
+            let turn_id = projection.turn_id(run_id)?;
+            let started_at_ms = now_ms();
             projection.tool_items.insert(id.0.clone(), item_id.clone());
-            let arguments = if ygg_serve_backend::validate_json("tool.arguments", &args, 256 * 1024)
-                .is_ok()
-            {
-                args
-            } else {
-                serde_json::json!({"unavailable": "arguments exceeded the graphical projection limit"})
-            };
+            let arguments =
+                if ygg_serve_backend::validate_json("tool.arguments", &args, 256 * 1024).is_ok() {
+                    args
+                } else {
+                    serde_json::Value::Null
+                };
+            let activity =
+                semantic_tool_activity(&name, &arguments, &plan.config.workspace, started_at_ms);
             projection.tool_calls.insert(
                 id.0.clone(),
                 ProjectedToolCall {
                     name: name.clone(),
-                    arguments: arguments.clone(),
+                    arguments,
+                    activity: activity.clone(),
+                    result: None,
+                    turn_id: turn_id.clone(),
                 },
             );
+            projection
+                .item_turns
+                .insert(item_id.clone(), turn_id.clone());
             events
                 .send(event(EventPayload::ItemStarted {
                     item: SessionItem {
                         id: item_id,
                         run_id: Some(run_id.clone()),
-                        turn_id: Some(projection.turn_id(run_id)?),
+                        turn_id: Some(turn_id),
                         provider_attempt: Some(projection.provider_attempt),
                         lifecycle: ItemLifecycle::Provisional,
                         durable_entry_id: None,
-                        payload: ItemPayload::ToolCall {
-                            name: bounded_text(&name, 128),
-                            arguments,
-                            progress: None,
-                            dropped_progress_bytes: 0,
-                        },
+                        payload: ItemPayload::ToolCall(activity),
                     },
                 }))
                 .await
@@ -1995,18 +4284,32 @@ async fn project_agent_event(
             project_tool_progress(id, progress, run_id, projection, events).await?;
         }
         AgentEvent::ToolFinished { id, result } => {
-            if let Some(item_id) = projection.tool_items.get(&id.0).cloned() {
+            let tool_item_id = projection.tool_items.get(&id.0).cloned();
+            let projected = projection.tool_calls.get(&id.0).cloned();
+            if let (Some(item_id), Some(mut tool)) = (tool_item_id.clone(), projected) {
+                let progress = projection.tool_progress.remove(&id.0).unwrap_or_default();
+                let (activity, mut semantic_result) = complete_tool_activity(
+                    tool.activity.clone(),
+                    &tool.name,
+                    &result,
+                    now_ms(),
+                    progress,
+                );
+                semantic_result.tool_call_item_id = item_id.clone();
+                tool.activity = activity.clone();
+                tool.result = Some(semantic_result);
+                projection.tool_calls.insert(id.0.clone(), tool);
+                if let Ok(output) = result.as_ref() {
+                    if let Some(test_results) =
+                        project_test_results(&item_id, &activity, output)
+                    {
+                        projection.test_results.push(test_results);
+                    }
+                }
                 events
                     .send(event(EventPayload::ItemDelta {
                         item_id,
-                        delta: ItemDelta::ToolProgress {
-                            text: "Finished".into(),
-                            dropped_bytes: projection
-                                .tool_progress
-                                .get(&id.0)
-                                .map(|(_, dropped)| *dropped)
-                                .unwrap_or_default(),
-                        },
+                        delta: ItemDelta::ToolActivity { activity },
                     }))
                     .await
                     .map_err(|_| ServiceError::Unavailable)?;
@@ -2014,7 +4317,7 @@ async fn project_agent_event(
             if let (Some(_), Some(tool), Some(tool_item_id), Ok(output)) = (
                 plan.resources.as_ref(),
                 projection.tool_calls.get(&id.0).cloned(),
-                projection.tool_items.get(&id.0).cloned(),
+                tool_item_id,
                 result.as_ref(),
             ) {
                 projection
@@ -2077,7 +4380,50 @@ struct WorkspaceFileSnapshot {
     artifact_kind: ArtifactKind,
 }
 
-const STORED_EVIDENCE_VERSION: u16 = 1;
+const STORED_EVIDENCE_VERSION: u16 = 2;
+const STORED_RUN_RECORD_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredRunItemAttribution {
+    durable_entry_id: String,
+    ordinal: u32,
+    item_id: String,
+    turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_delivery: Option<UserMessageDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    documents: Vec<DocumentReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    project_files: Vec<TrustedFileEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch_provenance: Option<ConversationBranchProvenance>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredRunTool {
+    tool_call_id: String,
+    item_id: String,
+    turn_id: String,
+    activity: ToolActivity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result: Option<ToolResultSummary>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredRunRecord {
+    version: u16,
+    session_id: String,
+    run_id: String,
+    outcome_entry_id: String,
+    started_at_ms: u64,
+    completed_at_ms: u64,
+    items: Vec<StoredRunItemAttribution>,
+    tools: Vec<StoredRunTool>,
+    review: CompletionReview,
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -2087,6 +4433,12 @@ struct StoredToolEvidence {
     tool_call_id: String,
     call_entry_id: String,
     result_entry_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin_item_id: Option<String>,
     entries: Vec<StoredEvidenceEntry>,
 }
 
@@ -2226,17 +4578,20 @@ fn project_tool_evidence_inner(
             }]
         }
         "read_skill_resource" => {
-            let title = tool
+            let Some(title) = tool
                 .arguments
                 .get("resource_path")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("skill resource");
+                .and_then(safe_relative_path)
+            else {
+                return Ok(Vec::new());
+            };
             let stored = resources
                 .register(
                     session_id,
                     tool_call_id,
                     "source",
-                    title,
+                    &title,
                     "text/plain",
                     bytes::Bytes::copy_from_slice(output.text.as_bytes()),
                 )
@@ -2245,7 +4600,7 @@ fn project_tool_evidence_inner(
                 item_id: format!("item-source-{short_identity}"),
                 source_id: format!("source-{short_identity}"),
                 source_kind: SourceKind::Resource,
-                title: bounded_text(title, 512),
+                title: bounded_text(&title, 512),
                 handle: stored.handle,
                 consulted_at_ms: now_ms(),
             }]
@@ -2360,6 +4715,9 @@ fn project_tool_evidence_inner(
         tool_call_id: tool_call_id.to_owned(),
         call_entry_id: call_entry_id.as_str().to_owned(),
         result_entry_id: result_entry_id.as_str().to_owned(),
+        run_id: Some(run_id.as_str().to_owned()),
+        turn_id: Some(turn_id.as_str().to_owned()),
+        origin_item_id: Some(tool_item_id.as_str().to_owned()),
         entries,
     };
     let record_bytes = serde_json::to_vec(&record).map_err(|_| ServiceError::Internal)?;
@@ -2490,7 +4848,7 @@ fn project_stored_evidence(
     turn_id: Option<TurnId>,
     origin_item_id: Option<ItemId>,
 ) -> Result<EvidenceProjection, ServiceError> {
-    if record.version != STORED_EVIDENCE_VERSION
+    if !matches!(record.version, 1 | STORED_EVIDENCE_VERSION)
         || record.session_id != session_id.as_str()
         || record.entries.is_empty()
     {
@@ -2498,6 +4856,21 @@ fn project_stored_evidence(
     }
     let durable_entry_id = DurableEntryId::new(record.result_entry_id.clone())
         .map_err(|_| ServiceError::InvalidSeed)?;
+    let run_id = record
+        .run_id
+        .clone()
+        .and_then(|value| RunId::new(value).ok())
+        .or(run_id);
+    let turn_id = record
+        .turn_id
+        .clone()
+        .and_then(|value| TurnId::new(value).ok())
+        .or(turn_id);
+    let origin_item_id = record
+        .origin_item_id
+        .clone()
+        .and_then(|value| ItemId::new(value).ok())
+        .or(origin_item_id);
     let mut projection = EvidenceProjection {
         items: Vec::new(),
         sources: Vec::new(),
@@ -2539,6 +4912,7 @@ fn project_stored_evidence(
                     handle: diff_handle.clone(),
                     result_handle: Some(result_handle.clone()),
                     display_path: bounded_text(display_path, 1024),
+                    origin_item_id: origin_item_id.clone(),
                     additions: *additions,
                     deletions: *deletions,
                 }),
@@ -2720,6 +5094,315 @@ impl TerminalProjection {
     }
 }
 
+fn default_completion_review(
+    outcome: ygg_serve_backend::RunOutcome,
+    duration_ms: u64,
+    message: Option<&str>,
+) -> CompletionReview {
+    let summary = message.map_or_else(
+        || match outcome {
+            ygg_serve_backend::RunOutcome::Completed => "Run completed.".into(),
+            ygg_serve_backend::RunOutcome::Stopped => "Run stopped.".into(),
+            ygg_serve_backend::RunOutcome::Failed => "Run failed.".into(),
+        },
+        |message| bounded_text(message, 2 * 1024),
+    );
+    CompletionReview {
+        summary,
+        duration_ms,
+        action_count: 0,
+        phases: Vec::new(),
+        changed_file_item_ids: Vec::new(),
+        verification_action_item_ids: Vec::new(),
+        failed_action_item_ids: Vec::new(),
+        warning_action_item_ids: Vec::new(),
+        source_ids: Vec::new(),
+        output_ids: Vec::new(),
+        test_results: Vec::new(),
+        evidence_coverage: EvidenceCoverage::None,
+        open_questions: Vec::new(),
+    }
+}
+
+fn build_completion_review(
+    terminal: &TerminalProjection,
+    started_at_ms: u64,
+    completed_at_ms: u64,
+    projection: &ProjectionState,
+    changed_file_item_ids: BTreeSet<ItemId>,
+    source_ids: BTreeSet<SourceId>,
+    output_ids: BTreeSet<ArtifactId>,
+) -> CompletionReview {
+    let mut phases = BTreeMap::<ActivityPhase, ActivityPhaseSummary>::new();
+    let mut verification_action_item_ids = Vec::new();
+    let mut failed_action_item_ids = Vec::new();
+    let mut warning_action_item_ids = Vec::new();
+    let mut activities = projection
+        .tool_items
+        .iter()
+        .filter_map(|(call_id, item_id)| {
+            projection
+                .tool_calls
+                .get(call_id)
+                .map(|tool| (item_id.clone(), tool.activity.clone()))
+        })
+        .collect::<Vec<_>>();
+    activities.sort_by(|left, right| {
+        left.1
+            .started_at_ms
+            .cmp(&right.1.started_at_ms)
+            .then_with(|| left.0.as_str().cmp(right.0.as_str()))
+    });
+    for (item_id, activity) in &activities {
+        let phase = phases
+            .entry(activity.phase)
+            .or_insert(ActivityPhaseSummary {
+                phase: activity.phase,
+                action_count: 0,
+                succeeded_count: 0,
+                failed_count: 0,
+                stopped_count: 0,
+            });
+        phase.action_count = phase.action_count.saturating_add(1);
+        match activity.status {
+            ToolActivityStatus::Succeeded => {
+                phase.succeeded_count = phase.succeeded_count.saturating_add(1)
+            }
+            ToolActivityStatus::Failed => {
+                phase.failed_count = phase.failed_count.saturating_add(1);
+                failed_action_item_ids.push(item_id.clone());
+                if terminal.outcome == ygg_serve_backend::RunOutcome::Completed {
+                    warning_action_item_ids.push(item_id.clone());
+                }
+            }
+            ToolActivityStatus::Stopped | ToolActivityStatus::Running => {
+                phase.stopped_count = phase.stopped_count.saturating_add(1)
+            }
+        }
+        if activity.phase == ActivityPhase::Verified {
+            verification_action_item_ids.push(item_id.clone());
+        }
+    }
+    let phase_summaries = phases.into_values().collect::<Vec<_>>();
+    let changed_file_item_ids = changed_file_item_ids.into_iter().collect::<Vec<_>>();
+    let source_ids = source_ids.into_iter().collect::<Vec<_>>();
+    let output_ids = output_ids.into_iter().collect::<Vec<_>>();
+    let action_count = activities.len().min(u32::MAX as usize) as u32;
+    let has_unbounded_mutator = activities
+        .iter()
+        .any(|(_, activity)| matches!(activity.kind, ToolKind::Command | ToolKind::Other));
+    let linked_evidence =
+        !changed_file_item_ids.is_empty() || !source_ids.is_empty() || !output_ids.is_empty();
+    let evidence_coverage = if has_unbounded_mutator {
+        EvidenceCoverage::Partial
+    } else if !linked_evidence {
+        EvidenceCoverage::None
+    } else if activities.iter().all(|(_, activity)| match activity.kind {
+        ToolKind::Read | ToolKind::Web | ToolKind::Skill => !activity.source_ids.is_empty(),
+        ToolKind::Edit | ToolKind::Write => {
+            activity.status != ToolActivityStatus::Succeeded || !activity.changed_paths.is_empty()
+        }
+        ToolKind::Search => false,
+        ToolKind::Command | ToolKind::Other => false,
+    }) {
+        EvidenceCoverage::Complete
+    } else {
+        EvidenceCoverage::Partial
+    };
+    let summary = format!(
+        "{} {} action{}, {} changed file{}, {} verification{}, {} failure{}, {} warning{}, and {} output{}.",
+        match terminal.outcome {
+            ygg_serve_backend::RunOutcome::Completed => "Completed",
+            ygg_serve_backend::RunOutcome::Stopped => "Stopped after",
+            ygg_serve_backend::RunOutcome::Failed => "Failed after",
+        },
+        action_count,
+        if action_count == 1 { "" } else { "s" },
+        changed_file_item_ids.len(),
+        if changed_file_item_ids.len() == 1 { "" } else { "s" },
+        verification_action_item_ids.len(),
+        if verification_action_item_ids.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        failed_action_item_ids.len(),
+        if failed_action_item_ids.len() == 1 { "" } else { "s" },
+        warning_action_item_ids.len(),
+        if warning_action_item_ids.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        output_ids.len(),
+        if output_ids.len() == 1 { "" } else { "s" },
+    );
+    CompletionReview {
+        summary: bounded_text(&summary, 2 * 1024),
+        duration_ms: completed_at_ms.saturating_sub(started_at_ms),
+        action_count,
+        phases: phase_summaries,
+        changed_file_item_ids,
+        verification_action_item_ids,
+        failed_action_item_ids,
+        warning_action_item_ids,
+        source_ids,
+        output_ids,
+        test_results: projection.test_results.clone(),
+        evidence_coverage,
+        // The adapter cannot infer unresolved questions from prose safely.
+        open_questions: Vec::new(),
+    }
+}
+
+fn persist_run_projection(
+    resources: &ygg_serve_backend::ResourceStore,
+    session_id: &SessionId,
+    run_id: &RunId,
+    started_at_ms: u64,
+    completed_at_ms: u64,
+    projection: &ProjectionState,
+    committed: &[SessionItem],
+    review: &CompletionReview,
+) -> Result<(), ServiceError> {
+    let outcome_entry_id = committed
+        .iter()
+        .find_map(|item| {
+            matches!(&item.payload, ItemPayload::RunOutcome { .. })
+                .then(|| item.durable_entry_id.clone())
+                .flatten()
+        })
+        .ok_or(ServiceError::Internal)?;
+    let fallback_turn = projection.turn_id(run_id)?;
+    let mut ordinals = HashMap::<String, u32>::new();
+    let mut items = Vec::with_capacity(committed.len());
+    for item in committed {
+        let Some(durable_entry_id) = item.durable_entry_id.as_ref() else {
+            continue;
+        };
+        let ordinal = ordinals
+            .entry(durable_entry_id.as_str().to_owned())
+            .or_default();
+        items.push(StoredRunItemAttribution {
+            durable_entry_id: durable_entry_id.as_str().to_owned(),
+            ordinal: *ordinal,
+            item_id: item.id.as_str().to_owned(),
+            turn_id: item
+                .turn_id
+                .as_ref()
+                .unwrap_or(&fallback_turn)
+                .as_str()
+                .to_owned(),
+            user_delivery: match &item.payload {
+                ItemPayload::UserMessage { delivery, .. } => *delivery,
+                _ => None,
+            },
+            documents: match &item.payload {
+                ItemPayload::UserMessage { documents, .. } => documents.clone(),
+                _ => Vec::new(),
+            },
+            project_files: match &item.payload {
+                ItemPayload::UserMessage { project_files, .. } => project_files.clone(),
+                _ => Vec::new(),
+            },
+            branch_provenance: match &item.payload {
+                ItemPayload::UserMessage {
+                    branch_provenance,
+                    ..
+                } => branch_provenance.clone(),
+                _ => None,
+            },
+        });
+        *ordinal = ordinal.saturating_add(1);
+    }
+    let mut tools = projection
+        .tool_items
+        .iter()
+        .filter_map(|(tool_call_id, item_id)| {
+            let tool = projection.tool_calls.get(tool_call_id)?;
+            Some(StoredRunTool {
+                tool_call_id: tool_call_id.clone(),
+                item_id: item_id.as_str().to_owned(),
+                turn_id: tool.turn_id.as_str().to_owned(),
+                activity: tool.activity.clone(),
+                result: tool.result.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| {
+        left.activity
+            .started_at_ms
+            .cmp(&right.activity.started_at_ms)
+            .then_with(|| left.item_id.cmp(&right.item_id))
+    });
+    let record = StoredRunRecord {
+        version: STORED_RUN_RECORD_VERSION,
+        session_id: session_id.as_str().to_owned(),
+        run_id: run_id.as_str().to_owned(),
+        outcome_entry_id: outcome_entry_id.as_str().to_owned(),
+        started_at_ms,
+        completed_at_ms,
+        items,
+        tools,
+        review: review.clone(),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(|_| ServiceError::Internal)?;
+    resources
+        .persist_run_record(session_id, &outcome_entry_id, &bytes)
+        .map_err(resource_store_service_error)
+}
+
+fn load_stored_run_record(
+    resources: &ygg_serve_backend::ResourceStore,
+    session_id: &SessionId,
+    outcome_entry_id: &DurableEntryId,
+) -> Option<StoredRunRecord> {
+    let bytes = resources.run_record(session_id, outcome_entry_id).ok()?;
+    let record = serde_json::from_slice::<StoredRunRecord>(&bytes).ok()?;
+    if record.version != STORED_RUN_RECORD_VERSION
+        || record.session_id != session_id.as_str()
+        || record.outcome_entry_id != outcome_entry_id.as_str()
+        || record.started_at_ms == 0
+        || record.completed_at_ms < record.started_at_ms
+        || RunId::new(record.run_id.clone()).is_err()
+        || record.review.validate().is_err()
+    {
+        return None;
+    }
+    for item in &record.items {
+        if DurableEntryId::new(item.durable_entry_id.clone()).is_err()
+            || ItemId::new(item.item_id.clone()).is_err()
+            || TurnId::new(item.turn_id.clone()).is_err()
+            || (ItemPayload::UserMessage {
+                text: String::new(),
+                attachments: Vec::new(),
+                documents: item.documents.clone(),
+                project_files: item.project_files.clone(),
+                delivery: item.user_delivery,
+                branch_provenance: item.branch_provenance.clone(),
+            })
+            .validate()
+            .is_err()
+        {
+            return None;
+        }
+    }
+    for tool in &record.tools {
+        if tool.tool_call_id.len() > 512
+            || ItemId::new(tool.item_id.clone()).is_err()
+            || TurnId::new(tool.turn_id.clone()).is_err()
+            || tool.activity.validate().is_err()
+            || tool
+                .result
+                .as_ref()
+                .is_some_and(|result| result.validate().is_err())
+        {
+            return None;
+        }
+    }
+    Some(record)
+}
+
 async fn expire_private_requests(
     projection: &mut ProjectionState,
     events: &mpsc::Sender<TimestampedEvent>,
@@ -2781,28 +5464,16 @@ async fn project_tool_progress(
 ) -> Result<(), ServiceError> {
     match progress {
         ToolProgress::Output { bytes, .. } => {
-            let entry = projection
-                .tool_progress
-                .entry(id.0.clone())
-                .or_insert_with(|| (String::new(), 0));
-            entry.0.push_str(&String::from_utf8_lossy(bytes.as_ref()));
-            entry.0 = bounded_text(&entry.0, 16 * 1024);
+            let entry = projection.tool_progress.entry(id.0.clone()).or_default();
+            entry.observed_output_bytes = entry
+                .observed_output_bytes
+                .saturating_add(bytes.len() as u64);
             publish_tool_progress(&id.0, projection, events).await?;
         }
-        ToolProgress::Status(status) => {
-            let entry = projection
-                .tool_progress
-                .entry(id.0.clone())
-                .or_insert_with(|| (String::new(), 0));
-            entry.0 = bounded_text(&status, 16 * 1024);
-            publish_tool_progress(&id.0, projection, events).await?;
-        }
+        ToolProgress::Status(_) => {}
         ToolProgress::Dropped { bytes, .. } => {
-            let entry = projection
-                .tool_progress
-                .entry(id.0.clone())
-                .or_insert_with(|| (String::new(), 0));
-            entry.1 = entry.1.saturating_add(bytes);
+            let entry = projection.tool_progress.entry(id.0.clone()).or_default();
+            entry.dropped_output_bytes = entry.dropped_output_bytes.saturating_add(bytes);
             publish_tool_progress(&id.0, projection, events).await?;
         }
         ToolProgress::Confirmation(request) => {
@@ -2813,10 +5484,11 @@ async fn project_tool_progress(
                 projection.request_counter
             ))
             .map_err(|_| ServiceError::Internal)?;
-            let action = match &request.detail {
-                Some(detail) => format!("{}\n\n{}", request.prompt, detail),
-                None => request.prompt.clone(),
-            };
+            let action = projection
+                .tool_calls
+                .get(&id.0)
+                .map(|tool| format!("Approve {}?", tool.activity.title))
+                .unwrap_or_else(|| "Approve this tool action?".into());
             let pending = PendingRequest {
                 id: request_id.clone(),
                 actor_generation: projection_actor_generation(run_id),
@@ -2862,7 +5534,9 @@ async fn project_tool_progress(
                 id: request_id.clone(),
                 actor_generation: projection_actor_generation(run_id),
                 kind: RequestKind::UserInput {
-                    prompt: bounded_text(&request.prompt, 8 * 1024),
+                    // The extension-owned prompt is private tool progress. Do
+                    // not forward it verbatim across the public boundary.
+                    prompt: "A tool needs additional input to continue.".into(),
                     choices: Vec::new(),
                 },
                 state: RequestState::Pending,
@@ -2905,18 +5579,21 @@ async fn publish_tool_progress(
     let Some(item_id) = projection.tool_items.get(tool_call_id).cloned() else {
         return Ok(());
     };
-    let (text, dropped_bytes) = projection
+    let Some(tool) = projection.tool_calls.get(tool_call_id) else {
+        return Ok(());
+    };
+    let progress = projection
         .tool_progress
         .get(tool_call_id)
         .cloned()
         .unwrap_or_default();
+    let mut activity = tool.activity.clone();
+    activity.observed_output_bytes = progress.observed_output_bytes;
+    activity.dropped_output_bytes = progress.dropped_output_bytes;
     events
         .send(event(EventPayload::ItemDelta {
             item_id,
-            delta: ItemDelta::ToolProgress {
-                text,
-                dropped_bytes,
-            },
+            delta: ItemDelta::ToolActivity { activity },
         }))
         .await
         .map_err(|_| ServiceError::Unavailable)
@@ -2924,8 +5601,10 @@ async fn publish_tool_progress(
 
 fn project_new_entries(
     session: &Session,
+    workspace: &Path,
     projection: &mut ProjectionState,
     run_id: Option<&RunId>,
+    completion_review: Option<&CompletionReview>,
     attachment_store: Option<&AttachmentStore>,
     session_id: &SessionId,
 ) -> Result<Vec<SessionItem>, ServiceError> {
@@ -2939,7 +5618,14 @@ fn project_new_entries(
             session_id,
             &mut projection.pending_attachments,
         )?;
-        let (preferred, user_delivery, preferred_reasoning) = match &entry.value {
+        let (
+            preferred,
+            user_delivery,
+            preferred_reasoning,
+            resolved_documents,
+            resolved_project_files,
+            branch_provenance,
+        ) = match &entry.value {
             EntryValue::Message(Message::User(message))
                 if message
                     .content
@@ -2947,26 +5633,102 @@ fn project_new_entries(
                     .any(|part| matches!(part, UserPart::Text(_) | UserPart::Media(_))) =>
             {
                 match projection.pending_user_items.pop_front() {
-                    Some(pending) => (Some(pending.id), Some(pending.delivery), None),
-                    None => (None, None, None),
+                    Some(pending) => {
+                        projection
+                            .item_turns
+                            .insert(pending.id.clone(), pending.turn_id);
+                        (
+                            Some(pending.id),
+                            Some(pending.delivery),
+                            None,
+                            pending.documents,
+                            pending.project_files,
+                            pending.branch_provenance,
+                        )
+                    }
+                    None => (None, None, None, Vec::new(), Vec::new(), None),
                 }
             }
             EntryValue::Message(Message::Assistant(_)) => (
-                projection.completed_assistant_items.pop_front().flatten(),
+                projection
+                    .completed_assistant_items
+                    .pop_front()
+                    .flatten()
+                    .map(|(item_id, turn_id)| {
+                        projection.item_turns.insert(item_id.clone(), turn_id);
+                        item_id
+                    }),
                 None,
-                projection.completed_reasoning_items.pop_front().flatten(),
+                projection
+                    .completed_reasoning_items
+                    .pop_front()
+                    .flatten()
+                    .map(|(item_id, turn_id)| {
+                        projection.item_turns.insert(item_id.clone(), turn_id);
+                        item_id
+                    }),
+                Vec::new(),
+                Vec::new(),
+                None,
             ),
-            _ => (None, None, None),
+            _ => (None, None, None, Vec::new(), Vec::new(), None),
         };
-        items.extend(project_entry(
+        let mut projected = project_entry(
             entry,
+            workspace,
             run_id.cloned(),
             preferred,
             user_delivery,
             preferred_reasoning,
             &mut projection.tool_items,
+            &mut projection.tool_calls,
+            completion_review,
             attachments,
-        )?);
+        )?;
+        if let Some(user_item) = projected
+            .iter_mut()
+            .find(|item| matches!(item.payload, ItemPayload::UserMessage { .. }))
+        {
+            if let ItemPayload::UserMessage {
+                documents,
+                project_files,
+                branch_provenance: projected_provenance,
+                ..
+            } = &mut user_item.payload
+            {
+                *documents = resolved_documents;
+                *project_files = resolved_project_files;
+                *projected_provenance = branch_provenance;
+            }
+        }
+        for item in &mut projected {
+            let turn_id =
+                projection
+                    .item_turns
+                    .get(&item.id)
+                    .cloned()
+                    .or_else(|| match &item.payload {
+                        ItemPayload::ToolCall(_) => {
+                            projection.tool_items.iter().find_map(|(call_id, item_id)| {
+                                if item_id == &item.id {
+                                    projection
+                                        .tool_calls
+                                        .get(call_id)
+                                        .map(|tool| tool.turn_id.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                        }
+                        ItemPayload::ToolResult(result) => projection
+                            .item_turns
+                            .get(&result.tool_call_item_id)
+                            .cloned(),
+                        _ => run_id.and_then(|run_id| projection.turn_id(run_id).ok()),
+                    });
+            item.turn_id = turn_id;
+        }
+        items.extend(projected);
     }
     projection.known_entries = entries.len();
     Ok(items)
@@ -3181,11 +5943,14 @@ fn references_match_fingerprints(
 
 fn project_entry(
     entry: &Entry,
+    workspace: &Path,
     run_id: Option<RunId>,
     preferred: Option<ItemId>,
     user_delivery: Option<UserMessageDelivery>,
     preferred_reasoning: Option<ItemId>,
     tool_items: &mut HashMap<String, ItemId>,
+    tool_calls: &mut HashMap<String, ProjectedToolCall>,
+    completion_review: Option<&CompletionReview>,
     attachments: Vec<AttachmentRef>,
 ) -> Result<Vec<SessionItem>, ServiceError> {
     let durable_id =
@@ -3208,20 +5973,70 @@ fn project_entry(
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
-                        let tool_call_item_id =
-                            tool_items.get(&result.tool_call_id.0).cloned().unwrap_or(
-                                ItemId::new(format!("item-entry-{}-unknown-call", entry.id.0))
-                                    .map_err(|_| ServiceError::InvalidSeed)?,
+                        let tool_call_item_id = tool_items
+                            .get(&result.tool_call_id.0)
+                            .cloned()
+                            .unwrap_or(stable_tool_item_id(&result.tool_call_id.0)?);
+                        let durable_result = if result.is_error {
+                            Err(ToolError::new(content.clone()))
+                        } else {
+                            Ok(ToolOutput::new(content.clone()))
+                        };
+                        let semantic_result = if let Some(mut tool) =
+                            tool_calls.get(&result.tool_call_id.0).cloned()
+                        {
+                            if let Some(summary) = tool.result.clone() {
+                                summary
+                            } else {
+                                let (activity, mut summary) = complete_tool_activity(
+                                    tool.activity,
+                                    &tool.name,
+                                    &durable_result,
+                                    1,
+                                    ProjectedToolProgress::default(),
+                                );
+                                summary.tool_call_item_id = tool_call_item_id.clone();
+                                tool.activity = activity;
+                                tool.result = Some(summary.clone());
+                                tool_calls.insert(result.tool_call_id.0.clone(), tool);
+                                summary
+                            }
+                        } else {
+                            let fallback_turn = TurnId::new("turn-history")
+                                .map_err(|_| ServiceError::InvalidSeed)?;
+                            let mut fallback = ProjectedToolCall {
+                                name: "tool".into(),
+                                arguments: serde_json::Value::Null,
+                                activity: semantic_tool_activity(
+                                    "tool",
+                                    &serde_json::Value::Null,
+                                    workspace,
+                                    1,
+                                ),
+                                result: None,
+                                turn_id: fallback_turn,
+                            };
+                            let (activity, mut summary) = complete_tool_activity(
+                                fallback.activity,
+                                &fallback.name,
+                                &durable_result,
+                                1,
+                                ProjectedToolProgress::default(),
                             );
+                            summary.tool_call_item_id = tool_call_item_id.clone();
+                            fallback.activity = activity;
+                            fallback.result = Some(summary.clone());
+                            tool_calls.insert(result.tool_call_id.0.clone(), fallback);
+                            summary
+                        };
                         items.push(committed_item(
                             item_id_for_entry(entry, items.len())?,
                             run_id.clone(),
                             durable_id.clone(),
-                            ItemPayload::ToolResult {
+                            ItemPayload::ToolResult(ToolResultSummary {
                                 tool_call_item_id,
-                                content: bounded_text(&content, MAX_ITEM_TEXT_BYTES),
-                                is_error: result.is_error,
-                            },
+                                ..semantic_result
+                            }),
                         ));
                     }
                 }
@@ -3256,7 +6071,10 @@ fn project_entry(
                         ItemPayload::UserMessage {
                             text: bounded_text(&text, MAX_PROMPT_BYTES),
                             attachments,
+                            documents: Vec::new(),
+                            project_files: Vec::new(),
                             delivery: user_delivery,
+                            branch_provenance: None,
                         },
                     ),
                 );
@@ -3306,32 +6124,35 @@ fn project_entry(
                 _ => None,
             }) {
                 let arguments = call.arguments_value().unwrap_or(serde_json::Value::Null);
-                let arguments = if ygg_serve_backend::validate_json(
-                    "tool.arguments",
-                    &arguments,
-                    256 * 1024,
-                )
-                .is_ok()
-                {
-                    arguments
-                } else {
-                    serde_json::json!({"unavailable": "arguments exceeded the graphical projection limit"})
-                };
+                let arguments =
+                    if ygg_serve_backend::validate_json("tool.arguments", &arguments, 256 * 1024)
+                        .is_ok()
+                    {
+                        arguments
+                    } else {
+                        serde_json::Value::Null
+                    };
                 let item_id = tool_items
                     .get(&call.id.0)
                     .cloned()
-                    .unwrap_or(item_id_for_entry(entry, items.len())?);
+                    .unwrap_or(stable_tool_item_id(&call.id.0)?);
                 tool_items.insert(call.id.0.clone(), item_id.clone());
+                let projected =
+                    tool_calls
+                        .entry(call.id.0.clone())
+                        .or_insert_with(|| ProjectedToolCall {
+                            name: call.name.clone(),
+                            arguments: arguments.clone(),
+                            activity: semantic_tool_activity(&call.name, &arguments, workspace, 1),
+                            result: None,
+                            turn_id: TurnId::new("turn-history")
+                                .expect("static historical turn ID is valid"),
+                        });
                 items.push(committed_item(
                     item_id,
                     run_id.clone(),
                     durable_id.clone(),
-                    ItemPayload::ToolCall {
-                        name: bounded_text(&call.name, 128),
-                        arguments,
-                        progress: None,
-                        dropped_progress_bytes: 0,
-                    },
+                    ItemPayload::ToolCall(projected.activity.clone()),
                 ));
             }
         }
@@ -3366,7 +6187,13 @@ fn project_entry(
                     item_id_for_entry(entry, 0)?,
                     run_id,
                     durable_id,
-                    ItemPayload::RunOutcome { outcome, message },
+                    ItemPayload::RunOutcome {
+                        outcome,
+                        review: completion_review.cloned().unwrap_or_else(|| {
+                            default_completion_review(outcome, 0, message.as_deref())
+                        }),
+                        message,
+                    },
                 ));
             }
         }
@@ -3413,7 +6240,7 @@ fn rehydrate_stored_evidence(
     let durable_result_id = DurableEntryId::new(result_entry.id.0.clone()).ok()?;
     let bytes = resources.record(session_id, &durable_result_id).ok()?;
     let record = serde_json::from_slice::<StoredToolEvidence>(&bytes).ok()?;
-    if record.version != STORED_EVIDENCE_VERSION
+    if !matches!(record.version, 1 | STORED_EVIDENCE_VERSION)
         || record.session_id != session_id.as_str()
         || record.result_entry_id != result_entry.id.0
         || !active_entry_ids.contains(record.call_entry_id.as_str())
@@ -3464,6 +6291,7 @@ fn entry_has_tool_call(entry: &Entry, tool_call_id: &str) -> bool {
 }
 
 struct SessionSeedOptions<'a> {
+    workspace: &'a Path,
     project_id: Option<ProjectId>,
     model: ModelSelection,
     authority: AuthorityProfile,
@@ -3479,6 +6307,7 @@ fn seed_from_session(
     options: SessionSeedOptions<'_>,
 ) -> Result<SessionSeed, ServiceError> {
     let SessionSeedOptions {
+        workspace,
         project_id,
         model,
         authority,
@@ -3503,6 +6332,64 @@ fn seed_from_session(
     let mut sources = Vec::new();
     let mut artifacts = Vec::new();
     let mut tool_items = HashMap::new();
+    let mut tool_calls = HashMap::new();
+    let mut attributions = HashMap::<String, Vec<StoredRunItemAttribution>>::new();
+    let mut run_ids_by_entry = HashMap::<String, RunId>::new();
+    let mut reviews_by_outcome = HashMap::<String, CompletionReview>::new();
+    if let Some(resources) = resource_store {
+        for entry in &chain {
+            if !entry
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.run_outcome.is_some())
+            {
+                continue;
+            }
+            let Ok(outcome_entry_id) = DurableEntryId::new(entry.id.0.clone()) else {
+                continue;
+            };
+            let Some(record) = load_stored_run_record(resources, &session_id, &outcome_entry_id)
+            else {
+                continue;
+            };
+            let Ok(run_id) = RunId::new(record.run_id.clone()) else {
+                continue;
+            };
+            reviews_by_outcome.insert(entry.id.0.clone(), record.review.clone());
+            for item in record.items {
+                if !active_entry_ids.contains(item.durable_entry_id.as_str()) {
+                    continue;
+                }
+                run_ids_by_entry.insert(item.durable_entry_id.clone(), run_id.clone());
+                attributions
+                    .entry(item.durable_entry_id.clone())
+                    .or_default()
+                    .push(item);
+            }
+            for tool in record.tools {
+                let Ok(item_id) = ItemId::new(tool.item_id.clone()) else {
+                    continue;
+                };
+                let Ok(turn_id) = TurnId::new(tool.turn_id.clone()) else {
+                    continue;
+                };
+                tool_items.insert(tool.tool_call_id.clone(), item_id);
+                tool_calls.insert(
+                    tool.tool_call_id,
+                    ProjectedToolCall {
+                        name: tool.activity.raw_tool_name.clone(),
+                        arguments: serde_json::Value::Null,
+                        activity: tool.activity,
+                        result: tool.result,
+                        turn_id,
+                    },
+                );
+            }
+        }
+    }
+    for entries in attributions.values_mut() {
+        entries.sort_by_key(|item| item.ordinal);
+    }
     let mut pending_attachments = VecDeque::new();
     for entry in chain {
         let attachments = attachment_refs_for_entry(
@@ -3511,7 +6398,44 @@ fn seed_from_session(
             &session_id,
             &mut pending_attachments,
         )?;
-        let projected = project_entry(entry, None, None, None, None, &mut tool_items, attachments)?;
+        let run_id = run_ids_by_entry.get(&entry.id.0).cloned();
+        let review = reviews_by_outcome.get(&entry.id.0);
+        let mut projected = project_entry(
+            entry,
+            workspace,
+            run_id.clone(),
+            None,
+            None,
+            None,
+            &mut tool_items,
+            &mut tool_calls,
+            review,
+            attachments,
+        )?;
+        if let Some(stored) = attributions.get(&entry.id.0) {
+            for (item, attribution) in projected.iter_mut().zip(stored) {
+                item.id = ItemId::new(attribution.item_id.clone())
+                    .map_err(|_| ServiceError::InvalidSeed)?;
+                item.turn_id = Some(
+                    TurnId::new(attribution.turn_id.clone())
+                        .map_err(|_| ServiceError::InvalidSeed)?,
+                );
+                item.run_id = run_id.clone();
+                if let ItemPayload::UserMessage {
+                    delivery,
+                    documents,
+                    project_files,
+                    branch_provenance,
+                    ..
+                } = &mut item.payload
+                {
+                    *delivery = attribution.user_delivery;
+                    *documents = attribution.documents.clone();
+                    *project_files = attribution.project_files.clone();
+                    *branch_provenance = attribution.branch_provenance.clone();
+                }
+            }
+        }
         items.extend(projected);
         if let Some(projection) = resource_store.and_then(|store| {
             rehydrate_stored_evidence(
@@ -3528,6 +6452,25 @@ fn seed_from_session(
             artifacts.extend(projection.artifacts);
         }
     }
+    // A legacy session may predate semantic run sidecars. Its result entry is
+    // encountered after the corresponding call entry, so apply the safe
+    // terminal fallback back onto the already-projected call. New sessions
+    // take the same path with the exact persisted activity.
+    let projected_tools = tool_items
+        .iter()
+        .filter_map(|(tool_call_id, item_id)| {
+            tool_calls
+                .get(tool_call_id)
+                .map(|tool| (item_id.clone(), tool.activity.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    for item in &mut items {
+        if let ItemPayload::ToolCall(activity) = &mut item.payload {
+            if let Some(projected) = projected_tools.get(&item.id) {
+                *activity = projected.clone();
+            }
+        }
+    }
     if items.len() > MAX_PROJECTED_SESSION_ITEMS {
         items = items.split_off(items.len() - MAX_PROJECTED_SESSION_ITEMS);
     }
@@ -3541,6 +6484,11 @@ fn seed_from_session(
         .unwrap_or_else(|| "Session".into());
     let pinned = meta.as_ref().is_some_and(|meta| meta.pinned);
     let archived = meta.as_ref().is_some_and(|meta| meta.archived);
+    let (lifecycle, retention, forked_from) = meta
+        .as_ref()
+        .map(|meta| session_catalog_metadata(meta, &session_id))
+        .transpose()?
+        .unwrap_or((SessionCatalogState::Active, None, None));
     let summary = SessionSummary {
         id: session_id.clone(),
         project_id,
@@ -3550,6 +6498,9 @@ fn seed_from_session(
         modified_at_ms,
         pinned,
         archived,
+        lifecycle,
+        retention,
+        forked_from,
         provisional: false,
         live_state: SessionLiveState::Idle,
         attention: AttentionState::None,
@@ -3596,6 +6547,9 @@ fn empty_seed(
             modified_at_ms: timestamp,
             pinned: false,
             archived: false,
+            lifecycle: SessionCatalogState::Active,
+            retention: None,
+            forked_from: None,
             provisional: true,
             live_state: SessionLiveState::Idle,
             attention: AttentionState::None,
@@ -4023,6 +6977,7 @@ fn summary_from_meta(
 ) -> Result<SessionSummary, ServiceError> {
     let id = SessionId::new(meta.id.clone()).map_err(|_| ServiceError::InvalidSeed)?;
     let modified_at_ms = system_time_ms(meta.modified);
+    let (lifecycle, retention, forked_from) = session_catalog_metadata(meta, &id)?;
     Ok(SessionSummary {
         id,
         project_id,
@@ -4032,12 +6987,63 @@ fn summary_from_meta(
         modified_at_ms,
         pinned: meta.pinned,
         archived: meta.archived,
+        lifecycle,
+        retention,
+        forked_from,
         provisional: false,
         live_state: SessionLiveState::Idle,
         attention: AttentionState::None,
         owner: ActorOwnerState::Inactive,
         model,
     })
+}
+
+fn session_catalog_metadata(
+    meta: &SessionMeta,
+    session_id: &SessionId,
+) -> Result<
+    (
+        SessionCatalogState,
+        Option<SessionRetention>,
+        Option<ConversationBranchProvenance>,
+    ),
+    ServiceError,
+> {
+    let (lifecycle, retention) = match (meta.trashed_at_ms, meta.purge_after_ms) {
+        (Some(trashed_at_ms), Some(purge_after_ms)) => (
+            SessionCatalogState::Trash,
+            Some(SessionRetention {
+                trashed_at_ms,
+                purge_after_ms,
+                permanent_delete_requires_confirmation: true,
+            }),
+        ),
+        (None, None) if meta.archived => (SessionCatalogState::Archived, None),
+        (None, None) => (SessionCatalogState::Active, None),
+        _ => return Err(ServiceError::InvalidSeed),
+    };
+    let forked_from = match (
+        meta.forked_from_session_id.as_deref(),
+        meta.forked_from_entry_id.as_deref(),
+    ) {
+        (None, None) => None,
+        (Some(source_session_id), Some(source_entry_id)) => {
+            Some(ConversationBranchProvenance {
+                operation: ConversationBranchOperation::ForkSession,
+                source_session_id: SessionId::new(source_session_id.to_owned())
+                    .map_err(|_| ServiceError::InvalidSeed)?,
+                source_entry_id: DurableEntryId::new(source_entry_id.to_owned())
+                    .map_err(|_| ServiceError::InvalidSeed)?,
+                originating_user_entry_id: None,
+                model_override: None,
+                external_effects_preserved: true,
+                warning: EXTERNAL_EFFECTS_WARNING.to_owned(),
+            })
+        }
+        _ => return Err(ServiceError::InvalidSeed),
+    };
+    let _ = session_id;
+    Ok((lifecycle, retention, forked_from))
 }
 
 fn session_id_from_path(path: &Path) -> Result<SessionId, ServiceError> {
@@ -4232,17 +7238,192 @@ mod tests {
         }
     }
 
+    fn project_test_config(directory: &Path, trusted: bool) -> Config {
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut config = serve_test_config(&workspace);
+        config.session_dir = directory.join("sessions");
+        config.workspace_trusted = trusted;
+        config
+    }
+
+    #[tokio::test]
+    async fn real_project_trust_is_required_and_session_binding_survives_restart() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = project_test_config(fixture.path(), false);
+        let host = YggHost::new(config.clone()).unwrap();
+        let launch_project = host.launch_project_id.clone();
+        let projects = host.list_projects().await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, launch_project);
+        assert!(!projects[0].trusted);
+        assert!(projects[0].available);
+        assert!(projects[0].is_default);
+
+        let request = CreateSessionRequest {
+            project_id: Some(launch_project.clone()),
+            provisional: true,
+            authority: AuthorityProfile::FullAccess,
+            model: None,
+        };
+        assert!(matches!(
+            host.create_session(request.clone()).await,
+            Err(ServiceError::Unauthorized)
+        ));
+        let trusted = host.set_project_trust(&launch_project, true).await.unwrap();
+        assert!(trusted.trusted);
+        let driver = host.create_session(request.clone()).await.unwrap();
+        let session_id = driver.seed().summary.id;
+        assert_eq!(
+            driver.seed().summary.project_id,
+            Some(launch_project.clone())
+        );
+        assert_eq!(
+            host.projects
+                .lock()
+                .unwrap()
+                .project_for_session(session_id.as_str())
+                .unwrap()
+                .as_str(),
+            launch_project.as_str()
+        );
+        drop(driver);
+        drop(host);
+
+        let reopened = YggHost::new(config).unwrap();
+        assert!(
+            reopened
+                .list_projects()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|project| project.id == launch_project)
+                .unwrap()
+                .trusted,
+            "a durable explicit trust grant must not depend on the next CLI flag"
+        );
+        assert_eq!(
+            reopened
+                .projects
+                .lock()
+                .unwrap()
+                .project_for_session(session_id.as_str())
+                .unwrap()
+                .as_str(),
+            launch_project.as_str()
+        );
+        reopened
+            .set_project_trust(&launch_project, false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reopened.create_session(request).await,
+            Err(ServiceError::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn imported_project_lifecycle_never_exposes_or_bypasses_its_root_authority() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = project_test_config(fixture.path(), true);
+        let imported_root = fixture.path().join("private-imported-root");
+        std::fs::create_dir(&imported_root).unwrap();
+        let first_host = YggHost::new(config.clone()).unwrap();
+        assert_eq!(
+            first_host
+                .import_project("browser-authored-candidate", Some("Rejected"))
+                .await
+                .unwrap_err(),
+            ServiceError::Unavailable,
+            "the browser cannot mint or submit filesystem authority"
+        );
+        drop(first_host);
+
+        let mut imported_launch = config;
+        imported_launch.workspace = imported_root.clone();
+        imported_launch.invocation_cwd = imported_root.clone();
+        imported_launch.workspace_trusted = false;
+        let host = YggHost::new(imported_launch).unwrap();
+        let imported = host
+            .list_projects()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|project| project.name == "private-imported-root")
+            .unwrap();
+        host.set_default_project(&imported.id).await.unwrap();
+        assert_eq!(
+            host.project_context(None).unwrap().config.workspace,
+            fixture.path().join("workspace").canonicalize().unwrap(),
+            "a cold launch must skip an untrusted default when another trusted project exists"
+        );
+        assert!(!imported.trusted);
+        assert!(imported.available);
+        assert!(!imported.archived);
+        let public_json = serde_json::to_string(&imported).unwrap();
+        assert!(!public_json.contains(imported_root.to_str().unwrap()));
+        assert!(matches!(
+            host.create_session(CreateSessionRequest {
+                project_id: Some(imported.id.clone()),
+                provisional: true,
+                authority: AuthorityProfile::FullAccess,
+                model: None,
+            })
+            .await,
+            Err(ServiceError::Unauthorized)
+        ));
+
+        host.set_project_trust(&imported.id, true).await.unwrap();
+        let context = host.project_context(Some(&imported.id)).unwrap();
+        assert_eq!(
+            context.config.workspace,
+            imported_root.canonicalize().unwrap()
+        );
+        assert_eq!(context.config.invocation_cwd, context.config.workspace);
+        assert!(context.config.workspace_trusted);
+
+        let renamed = host.rename_project(&imported.id, "Renamed").await.unwrap();
+        assert_eq!(renamed.name, "Renamed");
+        assert!(
+            host.set_default_project(&imported.id)
+                .await
+                .unwrap()
+                .is_default
+        );
+        let archived = host.archive_project(&imported.id).await.unwrap();
+        assert!(archived.archived);
+        assert!(!archived.trusted);
+        assert!(!archived.is_default);
+        assert!(matches!(
+            host.project_context(Some(&imported.id)),
+            Err(ServiceError::InvalidBoundary)
+        ));
+    }
+
     fn worker_checkout_fixture(
         directory: &Path,
         session_name: &str,
     ) -> (YggHost, SessionId, DurableEntryId, DurableEntryId, PathBuf) {
         let mut config = serve_test_config(directory);
+        let workspace = directory.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        config.workspace = workspace.clone();
+        config.invocation_cwd = workspace;
         config.model = Some(ModelId("gpt-4o-mini".into()));
         config.model_explicit = true;
         let host = YggHost::new(config).unwrap();
         let session_id = SessionId::new(session_name).unwrap();
-        std::fs::create_dir_all(host.sessions.dir()).unwrap();
-        let path = host.sessions.dir().join(format!("{session_name}.jsonl"));
+        let context = host.project_context(Some(&host.launch_project_id)).unwrap();
+        std::fs::create_dir_all(context.sessions.dir()).unwrap();
+        let path = context.sessions.dir().join(format!("{session_name}.jsonl"));
+        host.projects
+            .lock()
+            .unwrap()
+            .bind_session(
+                session_name,
+                &registry_project_id(&host.launch_project_id).unwrap(),
+            )
+            .unwrap();
         let mut session = Session::create(&path).unwrap();
         let root = session
             .append(EntryValue::Message(Message::User(UserMessage {
@@ -4333,6 +7514,20 @@ mod tests {
         session
     }
 
+    fn projected_tool(
+        workspace: &Path,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> ProjectedToolCall {
+        ProjectedToolCall {
+            name: name.into(),
+            activity: semantic_tool_activity(name, &arguments, workspace, 1),
+            arguments,
+            result: None,
+            turn_id: TurnId::new("turn-test").unwrap(),
+        }
+    }
+
     #[test]
     fn serve_host_lock_is_exclusive_for_the_session_root_lifetime() {
         let directory = tempfile::tempdir().unwrap();
@@ -4412,10 +7607,11 @@ mod tests {
         let run_id = RunId::new("run-evidence").unwrap();
         let turn_id = TurnId::new("turn-evidence").unwrap();
         let tool_item_id = ItemId::new("item-tool-read").unwrap();
-        let tool = ProjectedToolCall {
-            name: "read".into(),
-            arguments: serde_json::json!({"path": "src/lib.rs"}),
-        };
+        let tool = projected_tool(
+            workspace.path(),
+            "read",
+            serde_json::json!({"path": "src/lib.rs"}),
+        );
         let output = format!(
             "src/lib.rs:1-1/1 hash={}\n1: pub fn ygg() {{}}\ntruncated=false",
             stable_hash(content)
@@ -4460,10 +7656,11 @@ mod tests {
         std::fs::write(workspace.path().join("notes.txt"), b"durable evidence\n").unwrap();
         let session_path = workspace.path().join("branch-evidence.jsonl");
         let session_id = SessionId::new("branch-evidence").unwrap();
-        let tool = ProjectedToolCall {
-            name: "read".into(),
-            arguments: serde_json::json!({"path": "notes.txt"}),
-        };
+        let tool = projected_tool(
+            workspace.path(),
+            "read",
+            serde_json::json!({"path": "notes.txt"}),
+        );
         let output = format!(
             "notes.txt:1-1/1 hash={}\n1: durable evidence\ntruncated=false",
             stable_hash(b"durable evidence\n")
@@ -4499,6 +7696,7 @@ mod tests {
                 session,
                 session_id.clone(),
                 SessionSeedOptions {
+                    workspace: workspace.path(),
                     project_id: None,
                     model: ModelSelection {
                         provider: "test".into(),
@@ -4527,6 +7725,13 @@ mod tests {
         session.checkout(result_entry).unwrap();
         let restored = seed_for(&session);
         assert_eq!(restored.snapshot.sources.len(), 1);
+        assert_eq!(
+            restored.snapshot.sources[0]
+                .origin_item_id
+                .as_ref()
+                .map(ItemId::as_str),
+            Some("item-call-branch-read")
+        );
         assert!(restored
             .snapshot
             .items
@@ -4543,10 +7748,11 @@ mod tests {
         let run_id = RunId::new("run-evidence").unwrap();
         let turn_id = TurnId::new("turn-evidence").unwrap();
         let tool_item_id = ItemId::new("item-tool").unwrap();
-        let outside_tool = ProjectedToolCall {
-            name: "read".into(),
-            arguments: serde_json::json!({"path": outside.path()}),
-        };
+        let outside_tool = projected_tool(
+            workspace.path(),
+            "read",
+            serde_json::json!({"path": outside.path()}),
+        );
         let outside_session = session_with_successful_tool_result(
             &workspace.path().join("outside-session.jsonl"),
             "call-outside",
@@ -4569,14 +7775,15 @@ mod tests {
         .is_empty());
 
         std::fs::write(workspace.path().join("notes.md"), b"after\nsecond\n").unwrap();
-        let edit = ProjectedToolCall {
-            name: "edit".into(),
-            arguments: serde_json::json!({
+        let edit = projected_tool(
+            workspace.path(),
+            "edit",
+            serde_json::json!({
                 "path": "notes.md",
                 "old": "before\n",
                 "new": "after\nsecond\n"
             }),
-        };
+        );
         let output = format!(
             "ok modified=1\nnotes.md  +2 -1 hash={}\n--- a/notes.md\n+++ b/notes.md\n@@ -1,1 +1,2 @@\n-before\n+after\n+second\n",
             stable_hash(b"after\nsecond\n")
@@ -4608,6 +7815,7 @@ mod tests {
             panic!("edit item was not a file change");
         };
         assert_eq!(change.display_path, "notes.md");
+        assert_eq!(change.origin_item_id.as_ref(), Some(&tool_item_id));
         assert_eq!((change.additions, change.deletions), (2, 1));
         assert!(change.result_handle.is_some());
         assert_eq!(
@@ -4631,10 +7839,11 @@ mod tests {
         std::fs::write(workspace.path().join("empty.txt"), b"").unwrap();
         let store = ygg_serve_backend::ResourceStore::open(workspace.path()).unwrap();
         let session_id = SessionId::new("session-partial-evidence").unwrap();
-        let tool = ProjectedToolCall {
-            name: "write".into(),
-            arguments: serde_json::json!({"path": "empty.txt", "content": ""}),
-        };
+        let tool = projected_tool(
+            workspace.path(),
+            "write",
+            serde_json::json!({"path": "empty.txt", "content": ""}),
+        );
         let output = format!(
             "ok\nempty.txt  created hash={}\n--- /dev/null\n+++ b/empty.txt\n@@ -0,0 +1,0 @@\n",
             stable_hash(b"")
@@ -4690,10 +7899,11 @@ mod tests {
         let tool_item_id = ItemId::new("item-tool-write").unwrap();
 
         std::fs::write(workspace.path().join("report.md"), b"# Report\n").unwrap();
-        let created = ProjectedToolCall {
-            name: "write".into(),
-            arguments: serde_json::json!({"path": "report.md", "content": "# Report\n"}),
-        };
+        let created = projected_tool(
+            workspace.path(),
+            "write",
+            serde_json::json!({"path": "report.md", "content": "# Report\n"}),
+        );
         let created_output = format!(
             "ok\nreport.md  created hash={}\n--- /dev/null\n+++ b/report.md\n@@ -0,0 +1,1 @@\n+# Report\n",
             stable_hash(b"# Report\n")
@@ -4720,12 +7930,20 @@ mod tests {
         assert!(created_events
             .iter()
             .any(|event| matches!(event, EventPayload::ArtifactUpserted { artifact } if artifact.kind == ArtifactKind::Document)));
+        assert!(created_events.iter().any(|event| {
+            matches!(
+                event,
+                EventPayload::ArtifactUpserted { artifact }
+                    if artifact.origin_item_id.as_ref() == Some(&tool_item_id)
+            )
+        }));
 
         std::fs::write(workspace.path().join("report.md"), b"# Revised\n").unwrap();
-        let replaced = ProjectedToolCall {
-            name: "write".into(),
-            arguments: serde_json::json!({"path": "report.md", "content": "# Revised\n"}),
-        };
+        let replaced = projected_tool(
+            workspace.path(),
+            "write",
+            serde_json::json!({"path": "report.md", "content": "# Revised\n"}),
+        );
         let replaced_output = format!(
             "ok\nreport.md  replaced hash={}\n--- a/report.md\n+++ b/report.md\n@@ -1,1 +1,1 @@\n-# Report\n+# Revised\n",
             stable_hash(b"# Revised\n")
@@ -4800,6 +8018,12 @@ mod tests {
             session_id,
             project_id: None,
             attachments: None,
+            documents: None,
+            projects: Arc::new(Mutex::new(
+                ProjectRegistry::open(directory.path().join("selection-projects")).unwrap(),
+            )),
+            trusted_files: Arc::new(Mutex::new(HashMap::new())),
+            search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources: None,
             checkout_hooks: CheckoutTestHooks::default(),
         };
@@ -4902,6 +8126,7 @@ mod tests {
             &session,
             session_id.clone(),
             SessionSeedOptions {
+                workspace: directory.path(),
                 project_id: None,
                 model: model.clone(),
                 authority: AuthorityProfile::FullAccess,
@@ -4971,6 +8196,7 @@ mod tests {
             &reopened,
             session_id,
             SessionSeedOptions {
+                workspace: directory.path(),
                 project_id: None,
                 model,
                 authority: AuthorityProfile::FullAccess,
@@ -5287,6 +8513,12 @@ mod tests {
             session_id: SessionId::new("metadata-session").unwrap(),
             project_id: None,
             attachments: None,
+            documents: None,
+            projects: Arc::new(Mutex::new(
+                ProjectRegistry::open(directory.path().join("metadata-projects")).unwrap(),
+            )),
+            trusted_files: Arc::new(Mutex::new(HashMap::new())),
+            search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources: None,
             checkout_hooks: CheckoutTestHooks::default(),
         };
@@ -5429,15 +8661,25 @@ mod tests {
         projection.pending_user_items.push_back(PendingUserItem {
             id: ItemId::new("live-original").unwrap(),
             delivery: UserMessageDelivery::Submit,
+            turn_id: TurnId::new("turn-live-original").unwrap(),
+            documents: Vec::new(),
+            project_files: Vec::new(),
+            branch_provenance: None,
         });
         projection.pending_user_items.push_back(PendingUserItem {
             id: ItemId::new("live-steer").unwrap(),
             delivery: UserMessageDelivery::Steer,
+            turn_id: TurnId::new("turn-live-steer").unwrap(),
+            documents: Vec::new(),
+            project_files: Vec::new(),
+            branch_provenance: None,
         });
         let live = project_new_entries(
             &session,
+            directory.path(),
             &mut projection,
             Some(&RunId::new("run-1-1").unwrap()),
+            None,
             None,
             &session_id,
         )
@@ -5473,6 +8715,7 @@ mod tests {
             &reopened,
             session_id,
             SessionSeedOptions {
+                workspace: directory.path(),
                 project_id: None,
                 model: ModelSelection {
                     provider: "test".into(),
@@ -5515,8 +8758,13 @@ mod tests {
         ] {
             publish_control_user_item(
                 &run_id,
-                text.into(),
-                Vec::new(),
+                ResolvedPromptInput {
+                    display_text: text.into(),
+                    model_text: text.into(),
+                    attachments: Vec::new(),
+                    documents: Vec::new(),
+                    project_files: Vec::new(),
+                },
                 delivery,
                 &mut projection,
                 &sender,
@@ -5546,6 +8794,7 @@ mod tests {
                     text: ref actual,
                     ref attachments,
                     delivery: Some(actual_delivery),
+                    ..
                 } if actual == text
                     && attachments.is_empty()
                     && actual_delivery == delivery
@@ -5589,8 +8838,10 @@ mod tests {
         let mut projection = ProjectionState::new(known_entries);
         let live = project_new_entries(
             &session,
+            directory.path(),
             &mut projection,
             Some(&RunId::new("run-1-1").unwrap()),
+            None,
             None,
             &session_id,
         )
@@ -5612,6 +8863,7 @@ mod tests {
             &reopened,
             session_id,
             SessionSeedOptions {
+                workspace: directory.path(),
                 project_id: None,
                 model: ModelSelection {
                     provider: "test".into(),
@@ -5638,8 +8890,541 @@ mod tests {
             ItemPayload::RunOutcome {
                 outcome: ygg_serve_backend::RunOutcome::Completed,
                 message: None,
+                ..
             }
         ));
+    }
+
+    #[test]
+    fn semantic_tool_projection_redacts_canaries_and_freezes_exit_timing() {
+        let workspace = tempfile::tempdir().unwrap();
+        let argument_canary = "sk-live-ARGUMENT-CANARY-123456";
+        let output_canary = "ghp_OUTPUTCANARY123456789";
+        let arguments = serde_json::json!({
+            "command": format!("cargo test token={argument_canary}"),
+            "cwd": "crates/ygg"
+        });
+        let activity = semantic_tool_activity("bash", &arguments, workspace.path(), 10_000);
+        assert_eq!(activity.kind, ToolKind::Command);
+        assert_eq!(activity.phase, ActivityPhase::Verified);
+        assert_eq!(activity.command_preview.as_deref(), Some("cargo test"));
+        assert_eq!(activity.cwd.as_deref(), Some("crates/ygg"));
+
+        let raw = ToolOutput::new(format!("exit=7 duration=1.25s\nstderr:\n{output_canary}"));
+        let (activity, mut result) = complete_tool_activity(
+            activity,
+            "bash",
+            &Ok(raw),
+            20_000,
+            ProjectedToolProgress {
+                observed_output_bytes: 99,
+                dropped_output_bytes: 23,
+            },
+        );
+        result.tool_call_item_id = ItemId::new("item-redaction-test").unwrap();
+        assert_eq!(activity.status, ToolActivityStatus::Failed);
+        assert_eq!(activity.exit_code, Some(7));
+        assert_eq!(activity.duration_ms, Some(1_250));
+        assert_eq!(result.duration_ms, 1_250);
+        assert_eq!(result.dropped_output_bytes, 23);
+
+        let public = serde_json::to_string(&(activity, result)).unwrap();
+        for secret in [argument_canary, output_canary] {
+            assert!(
+                !public.contains(secret),
+                "secret canary crossed the public projection: {public}"
+            );
+        }
+        for forbidden_field in ["arguments", "content", "progress", "stdout", "stderr"] {
+            assert!(
+                !public.contains(&format!("\"{forbidden_field}\"")),
+                "raw field crossed the public projection: {public}"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_test_command_projects_only_parser_proven_counts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let item_id = ItemId::new("item-test-command").unwrap();
+        let activity = semantic_tool_activity(
+            "bash",
+            &serde_json::json!({"command": "cargo test"}),
+            workspace.path(),
+            10,
+        );
+        let output = ToolOutput::new(format!(
+            "exit=0 duration=0.10s\nstdout:\n{}",
+            String::from_utf8_lossy(include_bytes!(
+                "../../../../extensions/ygg-serve/fixtures/test-results/cargo-libtest.txt"
+            ))
+        ));
+        let (activity, _) = complete_tool_activity(
+            activity,
+            "bash",
+            &Ok(output.clone()),
+            110,
+            ProjectedToolProgress::default(),
+        );
+        let projected =
+            project_test_results(&item_id, &activity, &output).expect("supported test output");
+        assert_eq!(projected.origin_item_id, item_id);
+        assert_eq!(projected.framework, TestFramework::CargoLibtest);
+        assert_eq!(projected.reported.total, None);
+        assert_eq!(projected.reported.passed, None);
+        assert_eq!(projected.suites[0].reported.passed, Some(2));
+        assert_eq!(
+            projected.verification,
+            ygg_serve_backend::TestVerificationOutcome::Passed
+        );
+
+        let unsupported = ToolOutput::new("exit=0 duration=0.01s\nstdout:\nbuild completed");
+        assert!(project_test_results(&item_id, &activity, &unsupported).is_none());
+    }
+
+    #[test]
+    fn semantic_search_metadata_is_safe_bounded_and_workspace_relative() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source_dir = workspace.path().join("src");
+        std::fs::create_dir(&source_dir).unwrap();
+
+        let local_search = semantic_tool_activity(
+            "search",
+            &serde_json::json!({
+                "query": "focus trap",
+                "path": "src",
+                "cwd": source_dir,
+            }),
+            workspace.path(),
+            1,
+        );
+        assert_eq!(local_search.kind, ToolKind::Search);
+        assert_eq!(local_search.target.as_deref(), Some("focus trap in src"));
+        assert_eq!(local_search.cwd.as_deref(), Some("src"));
+
+        let web_search = semantic_tool_activity(
+            "web_search",
+            &serde_json::json!({
+                "query": "Claude app local web search",
+                "url": "https://example.test/docs?token=query-secret#private",
+            }),
+            workspace.path(),
+            2,
+        );
+        assert_eq!(web_search.kind, ToolKind::Web);
+        assert_eq!(
+            web_search.target.as_deref(),
+            Some("https://example.test/docs")
+        );
+
+        let query_canary = "sk-live-QUERY-CANARY-123456";
+        let redacted_search = semantic_tool_activity(
+            "web_search",
+            &serde_json::json!({
+                "query": format!("find onboarding notes with {query_canary}"),
+            }),
+            workspace.path(),
+            3,
+        );
+        assert_eq!(redacted_search.target.as_deref(), Some("[redacted query]"));
+        let public = serde_json::to_string(&redacted_search).unwrap();
+        assert!(!public.contains(query_canary));
+        assert!(redacted_search
+            .target
+            .as_deref()
+            .is_some_and(|target| target.len() <= 512));
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_cwd = semantic_tool_activity(
+            "bash",
+            &serde_json::json!({
+                "command": "cargo test",
+                "cwd": outside.path(),
+            }),
+            workspace.path(),
+            4,
+        );
+        assert_eq!(outside_cwd.cwd, None);
+        let remote_cwd = semantic_tool_activity(
+            "bash",
+            &serde_json::json!({
+                "command": "cargo test",
+                "cwd": "https://example.test/private",
+            }),
+            workspace.path(),
+            5,
+        );
+        assert_eq!(remote_cwd.cwd, None);
+    }
+
+    #[tokio::test]
+    async fn live_tool_progress_is_count_only_and_never_forwards_status_or_output_text() {
+        let workspace = tempfile::tempdir().unwrap();
+        let run_id = RunId::new("run-progress-redaction").unwrap();
+        let call_id = "call-progress-redaction";
+        let item_id = stable_tool_item_id(call_id).unwrap();
+        let mut projection = ProjectionState::new(0);
+        projection
+            .tool_items
+            .insert(call_id.into(), item_id.clone());
+        projection.tool_calls.insert(
+            call_id.into(),
+            projected_tool(
+                workspace.path(),
+                "bash",
+                serde_json::json!({"command": "cargo test"}),
+            ),
+        );
+        let (events, mut receiver) = mpsc::channel(4);
+        let canary = "xoxb-LIVE-PROGRESS-CANARY-123456";
+        project_tool_progress(
+            ToolCallId(call_id.into()),
+            ToolProgress::Output {
+                stream: ygg_agent::OutputStream::Stdout,
+                bytes: bytes::Bytes::copy_from_slice(canary.as_bytes()),
+            },
+            &run_id,
+            &mut projection,
+            &events,
+        )
+        .await
+        .unwrap();
+        let output_event = receiver.recv().await.unwrap();
+        let serialized = serde_json::to_string(&output_event.payload).unwrap();
+        assert!(!serialized.contains(canary));
+        assert!(matches!(
+            output_event.payload,
+            EventPayload::ItemDelta {
+                item_id: actual_item_id,
+                delta: ItemDelta::ToolActivity {
+                    activity: ToolActivity {
+                        observed_output_bytes,
+                        ..
+                    }
+                }
+            } if actual_item_id == item_id && observed_output_bytes == canary.len() as u64
+        ));
+
+        project_tool_progress(
+            ToolCallId(call_id.into()),
+            ToolProgress::Status("token=STATUS-CANARY-SECRET".into()),
+            &run_id,
+            &mut projection,
+            &events,
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv())
+                .await
+                .is_err(),
+            "raw status text unexpectedly produced a public event"
+        );
+    }
+
+    #[test]
+    fn completion_review_links_changes_verification_failures_warnings_and_outputs() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut projection = ProjectionState::new(0);
+        let command_item = ItemId::new("item-review-command").unwrap();
+        let edit_item = ItemId::new("item-review-edit").unwrap();
+
+        let command_args = serde_json::json!({"command": "cargo test"});
+        let command = semantic_tool_activity("bash", &command_args, workspace.path(), 10);
+        let (command, mut command_result) = complete_tool_activity(
+            command,
+            "bash",
+            &Ok(ToolOutput::new("exit=1 duration=0.20s\nstderr:\nfailed")),
+            210,
+            ProjectedToolProgress::default(),
+        );
+        command_result.tool_call_item_id = command_item.clone();
+        projection
+            .tool_items
+            .insert("call-review-command".into(), command_item.clone());
+        projection.tool_calls.insert(
+            "call-review-command".into(),
+            ProjectedToolCall {
+                name: "bash".into(),
+                arguments: command_args,
+                activity: command,
+                result: Some(command_result),
+                turn_id: TurnId::new("turn-review-command").unwrap(),
+            },
+        );
+
+        let edit_args = serde_json::json!({"path": "src/lib.rs"});
+        let mut edit = semantic_tool_activity("edit", &edit_args, workspace.path(), 20);
+        edit.status = ToolActivityStatus::Succeeded;
+        edit.summary = Some("Completed".into());
+        edit.completed_at_ms = Some(30);
+        edit.duration_ms = Some(10);
+        edit.output_summary = Some("File updated".into());
+        edit.changed_paths = vec!["src/lib.rs".into()];
+        projection
+            .tool_items
+            .insert("call-review-edit".into(), edit_item);
+        projection.tool_calls.insert(
+            "call-review-edit".into(),
+            ProjectedToolCall {
+                name: "edit".into(),
+                arguments: edit_args,
+                activity: edit,
+                result: None,
+                turn_id: TurnId::new("turn-review-edit").unwrap(),
+            },
+        );
+        let terminal = TerminalProjection::completed();
+        let changed_item = ItemId::new("item-review-change").unwrap();
+        let output_id = ArtifactId::new("artifact-review").unwrap();
+        let review = build_completion_review(
+            &terminal,
+            1,
+            1_001,
+            &projection,
+            BTreeSet::from([changed_item.clone()]),
+            BTreeSet::new(),
+            BTreeSet::from([output_id.clone()]),
+        );
+        assert_eq!(review.duration_ms, 1_000);
+        assert_eq!(review.action_count, 2);
+        assert_eq!(review.changed_file_item_ids, vec![changed_item]);
+        assert_eq!(
+            review.verification_action_item_ids,
+            vec![command_item.clone()]
+        );
+        assert_eq!(review.failed_action_item_ids, vec![command_item.clone()]);
+        assert_eq!(review.warning_action_item_ids, vec![command_item]);
+        assert_eq!(review.output_ids, vec![output_id]);
+        assert_eq!(review.evidence_coverage, EvidenceCoverage::Partial);
+        assert!(review
+            .phases
+            .iter()
+            .any(|phase| phase.phase == ActivityPhase::Verified && phase.failed_count == 1));
+        review.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_session_without_run_record_rehydrates_a_terminal_safe_tool_call() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("legacy-semantic.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("verify this".into())],
+            })))
+            .unwrap();
+        let argument_canary = "sk-live-LEGACY-ARGUMENT-CANARY-123456";
+        let output_canary = "ghp_LEGACYOUTPUTCANARY123456789";
+        let arguments =
+            serde_json::json!({"command": format!("cargo test token={argument_canary}")});
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::ToolCall(ygg_ai::ToolCall {
+                    id: ToolCallId("call-legacy-semantic".into()),
+                    name: "bash".into(),
+                    arguments_json: serde_json::to_string(&arguments).unwrap(),
+                })],
+                model: ModelId("test-model".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::ToolResult(ygg_ai::ToolResult {
+                    tool_call_id: ToolCallId("call-legacy-semantic".into()),
+                    content: vec![ToolResultPart::Text(format!(
+                        "exit=0 duration=0.05s\n{output_canary}"
+                    ))],
+                    is_error: false,
+                })],
+            })))
+            .unwrap();
+
+        let seed = seed_from_session(
+            &session,
+            SessionId::new("legacy-semantic").unwrap(),
+            SessionSeedOptions {
+                workspace: workspace.path(),
+                project_id: None,
+                model: ModelSelection {
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    reasoning: "off".into(),
+                },
+                authority: AuthorityProfile::FullAccess,
+                generation: 1,
+                meta: None,
+                attachment_store: None,
+                resource_store: None,
+            },
+        )
+        .unwrap();
+        let activity = seed
+            .snapshot
+            .items
+            .iter()
+            .find_map(|item| match &item.payload {
+                ItemPayload::ToolCall(activity) => Some(activity),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(activity.status, ToolActivityStatus::Succeeded);
+        assert_eq!(activity.command_preview.as_deref(), Some("cargo test"));
+        assert_eq!(activity.duration_ms, Some(50));
+        let public = serde_json::to_string(&seed.snapshot).unwrap();
+        for secret in [argument_canary, output_canary] {
+            assert!(!public.contains(secret));
+        }
+        assert!(!public.contains("\"arguments\""));
+    }
+
+    #[test]
+    fn semantic_run_record_rehydrates_live_ids_timestamps_results_and_review_exactly() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("semantic-replay.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("verify this".into())],
+            })))
+            .unwrap();
+        let arguments = serde_json::json!({"command": "cargo test"});
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::ToolCall(ygg_ai::ToolCall {
+                    id: ToolCallId("call-semantic-replay".into()),
+                    name: "bash".into(),
+                    arguments_json: serde_json::to_string(&arguments).unwrap(),
+                })],
+                model: ModelId("test-model".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+        let raw_result = "exit=0 duration=0.25s\n(no output)";
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::ToolResult(ygg_ai::ToolResult {
+                    tool_call_id: ToolCallId("call-semantic-replay".into()),
+                    content: vec![ToolResultPart::Text(raw_result.into())],
+                    is_error: false,
+                })],
+            })))
+            .unwrap();
+        session
+            .append_run_outcome(SessionRunOutcome {
+                status: SessionRunOutcomeStatus::Completed,
+                message: None,
+            })
+            .unwrap();
+
+        let session_id = SessionId::new("semantic-replay").unwrap();
+        let run_id = RunId::new("run-stable-semantic").unwrap();
+        let turn_id = TurnId::new("turn-stable-semantic").unwrap();
+        let tool_item_id = stable_tool_item_id("call-semantic-replay").unwrap();
+        let mut projection = ProjectionState::new(0);
+        projection.run_started_at_ms = 1_000;
+        projection.pending_user_items.push_back(PendingUserItem {
+            id: ItemId::new("item-stable-user").unwrap(),
+            delivery: UserMessageDelivery::Submit,
+            turn_id: TurnId::new("turn-stable-user").unwrap(),
+            documents: Vec::new(),
+            project_files: Vec::new(),
+            branch_provenance: None,
+        });
+        projection
+            .tool_items
+            .insert("call-semantic-replay".into(), tool_item_id.clone());
+        projection
+            .item_turns
+            .insert(tool_item_id.clone(), turn_id.clone());
+        let activity = semantic_tool_activity("bash", &arguments, workspace.path(), 1_100);
+        let (activity, mut result) = complete_tool_activity(
+            activity,
+            "bash",
+            &Ok(ToolOutput::new(raw_result)),
+            1_350,
+            ProjectedToolProgress::default(),
+        );
+        result.tool_call_item_id = tool_item_id;
+        projection.tool_calls.insert(
+            "call-semantic-replay".into(),
+            ProjectedToolCall {
+                name: "bash".into(),
+                arguments,
+                activity,
+                result: Some(result),
+                turn_id,
+            },
+        );
+        let review = build_completion_review(
+            &TerminalProjection::completed(),
+            1_000,
+            1_500,
+            &projection,
+            BTreeSet::new(),
+            BTreeSet::new(),
+            BTreeSet::new(),
+        );
+        let live = project_new_entries(
+            &session,
+            workspace.path(),
+            &mut projection,
+            Some(&run_id),
+            Some(&review),
+            None,
+            &session_id,
+        )
+        .unwrap();
+        let resources = ygg_serve_backend::ResourceStore::open(workspace.path()).unwrap();
+        persist_run_projection(
+            &resources,
+            &session_id,
+            &run_id,
+            1_000,
+            1_500,
+            &projection,
+            &live,
+            &review,
+        )
+        .unwrap();
+        drop(session);
+        drop(resources);
+
+        let reopened = Session::open_read_only(&path).unwrap();
+        let resources = ygg_serve_backend::ResourceStore::open(workspace.path()).unwrap();
+        let seed = seed_from_session(
+            &reopened,
+            session_id,
+            SessionSeedOptions {
+                workspace: workspace.path(),
+                project_id: None,
+                model: ModelSelection {
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    reasoning: "off".into(),
+                },
+                authority: AuthorityProfile::FullAccess,
+                generation: 99,
+                meta: None,
+                attachment_store: None,
+                resource_store: Some(&resources),
+            },
+        )
+        .unwrap();
+        assert_eq!(seed.snapshot.items, live);
+        let outcome = seed
+            .snapshot
+            .items
+            .iter()
+            .find_map(|item| match &item.payload {
+                ItemPayload::RunOutcome { review, .. } => Some(review),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(outcome, &review);
+        assert_eq!(outcome.duration_ms, 500);
+        assert_eq!(outcome.evidence_coverage, EvidenceCoverage::Partial);
     }
 
     fn catalog_model(index: usize) -> ModelSummary {

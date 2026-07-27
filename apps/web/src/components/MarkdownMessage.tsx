@@ -1,5 +1,5 @@
 import { Check, Copy } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { memo, type ReactNode, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -66,7 +66,7 @@ const markdownComponents: Components = {
   ),
 };
 
-export default function MarkdownMessage({ content }: { content: string }) {
+function MarkdownMessage({ content }: { content: string }) {
   return (
     <div className="markdown-body">
       <ReactMarkdown
@@ -78,3 +78,8 @@ export default function MarkdownMessage({ content }: { content: string }) {
     </div>
   );
 }
+
+export default memo(
+  MarkdownMessage,
+  (previous, next) => previous.content === next.content,
+);

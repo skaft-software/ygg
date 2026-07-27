@@ -1,17 +1,29 @@
 import { useSyncExternalStore } from "react";
+import { rejectedCommandError } from "./command-error";
 import type {
   AttachmentRef,
   AuthorityProfile,
   ClientCommand,
+  DocumentReference,
   HostEvent,
   HostBootstrap,
+  ProjectCatalog,
+  RepositoryContextSnapshot,
   ReasoningEffort,
   SessionEvent,
   SessionSnapshot,
   SessionSummary,
+  TranscriptSearchRequest,
+  TranscriptSearchResult,
+  TrustedFileCatalog,
+  TrustedFileEntry,
+  TrustedFileRead,
+  TrustedFileSearchResult,
 } from "./protocol";
 import {
+  primeSessionItemIndex,
   reduceSessionEvent,
+  reduceSessionEvents,
   SessionBranchGraphError,
   SessionGenerationMismatchError,
   SessionProjectionReplacementRequiredError,
@@ -32,6 +44,7 @@ export interface YggState {
   connection: TransportConnectionState;
   error: string | null;
   bootstrap: HostBootstrap | null;
+  projectCatalog: ProjectCatalog | null;
   selectedSessionId: string | null;
   sessions: Record<string, SessionSnapshot>;
 }
@@ -42,6 +55,7 @@ const initialState: YggState = {
   connection: "connecting",
   error: null,
   bootstrap: null,
+  projectCatalog: null,
   selectedSessionId: null,
   sessions: {},
 };
@@ -157,13 +171,19 @@ function updateSummary(
     };
   }
   if (snapshot) {
-    return {
-      ...summary,
-      title: snapshot.title,
-      status: snapshot.status,
-      modelId: snapshot.modelId,
-      updatedAt: new Date().toISOString(),
-    };
+    if (
+      summary.title !== snapshot.title ||
+      summary.status !== snapshot.status ||
+      summary.modelId !== snapshot.modelId
+    ) {
+      return {
+        ...summary,
+        title: snapshot.title,
+        status: snapshot.status,
+        modelId: snapshot.modelId,
+        updatedAt: new Date().toISOString(),
+      };
+    }
   }
   return summary;
 }
@@ -214,7 +234,8 @@ export class YggStore {
     let next = this.state;
     let changed = false;
 
-    for (const event of events) {
+    for (let eventIndex = 0; eventIndex < events.length; eventIndex += 1) {
+      const event = events[eventIndex]!;
       if (event.type === "catalog.summary") {
         const bootstrap = next.bootstrap;
         if (
@@ -253,6 +274,22 @@ export class YggStore {
       }
       const current = next.sessions[event.sessionId];
       let updated = current;
+      const reducedEvents: SessionEvent[] = [event];
+      if (event.type === "item.delta") {
+        while (eventIndex + 1 < events.length) {
+          const candidate = events[eventIndex + 1]!;
+          if (
+            candidate.type !== "item.delta" ||
+            candidate.sessionId !== event.sessionId ||
+            candidate.itemId !== event.itemId ||
+            candidate.field !== event.field
+          ) {
+            break;
+          }
+          reducedEvents.push(candidate);
+          eventIndex += 1;
+        }
+      }
 
       if (event.type === "session.projectionReplaced") {
         const incomingGeneration =
@@ -276,11 +313,15 @@ export class YggStore {
           event.snapshot.sessionId === event.sessionId &&
           event.snapshot.sequence === event.sequence
         ) {
+          primeSessionItemIndex(event.snapshot);
           updated = event.snapshot;
         }
       } else if (current) {
         try {
-          updated = reduceSessionEvent(current, event);
+          updated =
+            reducedEvents.length === 1
+              ? reduceSessionEvent(current, event)
+              : reduceSessionEvents(current, reducedEvents);
         } catch (error) {
           if (
             error instanceof SessionSequenceGapError ||
@@ -309,27 +350,34 @@ export class YggStore {
         };
       }
 
-      const summaries = next.bootstrap?.sessions.map((summary) =>
-        summary.id === event.sessionId
-          ? updateSummary(
-              summary,
-              event,
-              updated,
-              event.sessionId === next.selectedSessionId,
-            )
-          : summary,
-      );
-      next = {
-        ...next,
-        bootstrap:
-          next.bootstrap && summaries
-            ? { ...next.bootstrap, sessions: summaries }
-            : next.bootstrap,
-        sessions: updated
-          ? { ...next.sessions, [event.sessionId]: updated }
-          : next.sessions,
-      };
-      changed = true;
+      const bootstrap = next.bootstrap;
+      let summaryChanged = false;
+      const summaries = bootstrap?.sessions.map((summary) => {
+        if (summary.id !== event.sessionId) return summary;
+        const candidate = updateSummary(
+          summary,
+          event,
+          updated,
+          event.sessionId === next.selectedSessionId,
+        );
+        if (candidate !== summary) summaryChanged = true;
+        return candidate;
+      });
+      const sessionChanged = Boolean(updated && updated !== current);
+      if (summaryChanged || sessionChanged) {
+        next = {
+          ...next,
+          bootstrap:
+            bootstrap && summaries && summaryChanged
+              ? { ...bootstrap, sessions: summaries }
+              : bootstrap,
+          sessions:
+            updated && sessionChanged
+              ? { ...next.sessions, [event.sessionId]: updated }
+              : next.sessions,
+        };
+        changed = true;
+      }
     }
 
     if (changed) this.publish(next);
@@ -379,6 +427,7 @@ export class YggStore {
             throw new Error("Session resync returned a stale projection.");
           }
           const bootstrap = this.state.bootstrap;
+          primeSessionItemIndex(snapshot);
           const summaries = bootstrap?.sessions.map((summary) =>
             summary.id === sessionId
               ? {
@@ -428,6 +477,11 @@ export class YggStore {
 
   async initialize(): Promise<void> {
     this.disposed = false;
+    this.publish({
+      ...this.state,
+      connecting: true,
+      error: null,
+    });
     this.unsubscribeTransport?.();
     this.unsubscribeConnection?.();
     this.unsubscribeTransport = this.transport.subscribe((event) => {
@@ -440,8 +494,42 @@ export class YggStore {
 
     try {
       const routedSessionId = sessionIdFromPathname(window.location.pathname);
+      const projectCatalog = await this.transport.getProjectCatalog();
+      const hasRunnableProject = projectCatalog.projects.some(
+        (project) =>
+          project.trusted && project.available && !project.archived,
+      );
+      if (!hasRunnableProject) {
+        this.publish({
+          ready: true,
+          connecting: false,
+          connection: this.state.connection,
+          error: null,
+          bootstrap: null,
+          projectCatalog,
+          selectedSessionId: null,
+          sessions: {},
+        });
+        return;
+      }
+      this.publish({
+        ...this.state,
+        projectCatalog,
+      });
+      const routedProjectId = this.state.bootstrap?.sessions.find(
+        (summary) => summary.id === routedSessionId,
+      )?.projectId;
+      const routedProjectRunnable =
+        routedProjectId === undefined ||
+        projectCatalog.projects.some(
+          (project) =>
+            project.id === routedProjectId &&
+            project.trusted &&
+            project.available &&
+            !project.archived,
+        );
       const hostBootstrap = await this.transport.connect(
-        routedSessionId ?? undefined,
+        routedProjectRunnable ? routedSessionId ?? undefined : undefined,
       );
       const bootstrap: HostBootstrap = {
         ...hostBootstrap,
@@ -451,6 +539,7 @@ export class YggStore {
       const selected = await this.transport.getSession(
         bootstrap.selectedSessionId,
       );
+      primeSessionItemIndex(selected);
       const summaries = bootstrap.sessions.map((summary) =>
         summary.id === selected.sessionId
           ? { ...summary, title: selected.title }
@@ -462,6 +551,7 @@ export class YggStore {
         connection: this.state.connection,
         error: null,
         bootstrap: { ...bootstrap, sessions: summaries },
+        projectCatalog,
         selectedSessionId: selected.sessionId,
         sessions: { [selected.sessionId]: selected },
       });
@@ -478,6 +568,46 @@ export class YggStore {
 
   ingestAttachment(file: File): Promise<AttachmentRef> {
     return this.transport.ingestAttachment(file);
+  }
+
+  ingestDocument(file: File): Promise<DocumentReference> {
+    const session = this.selectedSession;
+    if (!session) return Promise.reject(new Error("No session is selected."));
+    return this.transport.ingestDocument(session.sessionId, file);
+  }
+
+  listDocuments(): Promise<DocumentReference[]> {
+    const session = this.selectedSession;
+    if (!session) return Promise.resolve([]);
+    return this.transport.listDocuments(session.sessionId);
+  }
+
+  getTrustedFiles(projectId: string): Promise<TrustedFileCatalog> {
+    return this.transport.getTrustedFiles(projectId);
+  }
+
+  getRepositoryContext(projectId: string): Promise<RepositoryContextSnapshot> {
+    return this.transport.getRepositoryContext(projectId);
+  }
+
+  searchTrustedFiles(
+    projectId: string,
+    query: string,
+  ): Promise<TrustedFileSearchResult> {
+    return this.transport.searchTrustedFiles(projectId, query);
+  }
+
+  readTrustedFile(
+    projectId: string,
+    entryId: string,
+  ): Promise<TrustedFileRead> {
+    return this.transport.readTrustedFile(projectId, entryId);
+  }
+
+  searchTranscripts(
+    request: TranscriptSearchRequest,
+  ): Promise<TranscriptSearchResult> {
+    return this.transport.searchTranscripts(request);
   }
 
   attachmentContentUrl(handle: string): string {
@@ -508,6 +638,7 @@ export class YggStore {
       const snapshot =
         this.state.sessions[sessionId] ??
         (await this.transport.getSession(sessionId, controller.signal));
+      primeSessionItemIndex(snapshot);
       if (generation !== this.selectionGeneration || controller.signal.aborted) {
         return;
       }
@@ -560,7 +691,14 @@ export class YggStore {
     };
     const ack = await this.sendCommand(command);
     if (!ack.accepted || !ack.createdSessionId) return;
-    const snapshot = await this.transport.getSession(ack.createdSessionId);
+    await this.installCreatedSession(ack.createdSessionId, bootstrap);
+  }
+
+  private async installCreatedSession(
+    sessionId: string,
+    bootstrap: HostBootstrap,
+  ): Promise<void> {
+    const snapshot = await this.transport.getSession(sessionId);
     const summary: SessionSummary = {
       id: snapshot.sessionId,
       projectId: snapshot.projectId,
@@ -570,6 +708,7 @@ export class YggStore {
       updatedAt: snapshot.startedAt,
       pinned: false,
       archived: false,
+      lifecycle: "active",
       unread: false,
       modelId: snapshot.modelId,
       attentionCount: 0,
@@ -597,46 +736,116 @@ export class YggStore {
     type: "session.submit" | "session.steer" | "session.followUp",
     prompt: string,
     attachments: AttachmentRef[],
+    idempotencyKey?: string,
+    documents: DocumentReference[] = [],
+    projectFiles: TrustedFileEntry[] = [],
   ): Promise<void> {
     const session = this.selectedSession;
-    if (!session || (!prompt.trim() && attachments.length === 0)) return;
+    if (
+      !session ||
+      (!prompt.trim() &&
+        attachments.length === 0 &&
+        documents.length === 0 &&
+        projectFiles.length === 0)
+    )
+      return;
     const ack = await this.sendCommand({
-      id: commandId(),
+      id: idempotencyKey ?? commandId(),
       type,
       sessionId: session.sessionId,
       prompt: prompt.trim(),
       attachments,
+      documentIds: documents.map((document) => document.id),
+      projectFileIds: projectFiles.map((file) => file.id),
     });
     if (!ack.accepted) {
-      throw new Error(ack.error ?? "The ygg host rejected this message.");
+      throw rejectedCommandError(
+        ack,
+        "The ygg host rejected this message.",
+      );
     }
   }
 
-  async steer(prompt: string, attachments: AttachmentRef[]): Promise<void> {
-    await this.sendInput("session.steer", prompt, attachments);
+  async steer(
+    prompt: string,
+    attachments: AttachmentRef[],
+    idempotencyKey?: string,
+    documents: DocumentReference[] = [],
+    projectFiles: TrustedFileEntry[] = [],
+  ): Promise<void> {
+    await this.sendInput(
+      "session.steer",
+      prompt,
+      attachments,
+      idempotencyKey,
+      documents,
+      projectFiles,
+    );
   }
 
-  async followUp(prompt: string, attachments: AttachmentRef[]): Promise<void> {
-    await this.sendInput("session.followUp", prompt, attachments);
+  async followUp(
+    prompt: string,
+    attachments: AttachmentRef[],
+    idempotencyKey?: string,
+    documents: DocumentReference[] = [],
+    projectFiles: TrustedFileEntry[] = [],
+  ): Promise<void> {
+    await this.sendInput(
+      "session.followUp",
+      prompt,
+      attachments,
+      idempotencyKey,
+      documents,
+      projectFiles,
+    );
   }
 
   async submit(
     prompt: string,
     attachments: AttachmentRef[],
     activeDelivery: "steer" | "followUp" = "followUp",
+    idempotencyKey?: string,
+    documents: DocumentReference[] = [],
+    projectFiles: TrustedFileEntry[] = [],
   ): Promise<void> {
     const session = this.selectedSession;
-    if (!session || (!prompt.trim() && attachments.length === 0)) return;
+    if (
+      !session ||
+      (!prompt.trim() &&
+        attachments.length === 0 &&
+        documents.length === 0 &&
+        projectFiles.length === 0)
+    )
+      return;
     const activeRun =
       session.activeRunId !== undefined ||
       session.status === "working" ||
       session.status === "needs_attention";
     if (!activeRun) {
-      await this.sendInput("session.submit", prompt, attachments);
+      await this.sendInput(
+        "session.submit",
+        prompt,
+        attachments,
+        idempotencyKey,
+        documents,
+        projectFiles,
+      );
     } else if (activeDelivery === "steer") {
-      await this.steer(prompt, attachments);
+      await this.steer(
+        prompt,
+        attachments,
+        idempotencyKey,
+        documents,
+        projectFiles,
+      );
     } else {
-      await this.followUp(prompt, attachments);
+      await this.followUp(
+        prompt,
+        attachments,
+        idempotencyKey,
+        documents,
+        projectFiles,
+      );
     }
   }
 
@@ -747,8 +956,121 @@ export class YggStore {
       entryId,
     });
     if (!ack.accepted) {
-      throw new Error(ack.error ?? "The ygg host rejected this branch checkout.");
+      throw rejectedCommandError(
+        ack,
+        "The ygg host rejected this branch checkout.",
+      );
     }
+  }
+
+  async editUserTurn(
+    sourceUserEntryId: string,
+    prompt: string,
+    attachments: AttachmentRef[] = [],
+    documents: DocumentReference[] = [],
+    projectFiles: TrustedFileEntry[] = [],
+  ): Promise<void> {
+    const session = this.selectedSession;
+    if (!session || !prompt.trim()) return;
+    const ack = await this.sendCommand({
+      id: commandId(),
+      type: "session.editUserTurn",
+      sessionId: session.sessionId,
+      sourceUserEntryId,
+      prompt: prompt.trim(),
+      attachments,
+      documentIds: documents.map((document) => document.id),
+      projectFileIds: projectFiles.map((file) => file.id),
+    });
+    if (!ack.accepted) {
+      throw rejectedCommandError(
+        ack,
+        "The ygg host rejected this edited turn.",
+      );
+    }
+  }
+
+  async retryResponse(
+    sourceAssistantEntryId: string,
+    model?: { id: string; reasoning: ReasoningEffort },
+  ): Promise<void> {
+    const session = this.selectedSession;
+    if (!session) return;
+    const ack = await this.sendCommand({
+      id: commandId(),
+      type: "session.retryResponse",
+      sessionId: session.sessionId,
+      sourceAssistantEntryId,
+      modelId: model?.id,
+      reasoning: model?.reasoning,
+    });
+    if (!ack.accepted) {
+      throw rejectedCommandError(
+        ack,
+        "The ygg host rejected this response retry.",
+      );
+    }
+  }
+
+  async forkConversation(entryId: string): Promise<void> {
+    const session = this.selectedSession;
+    const bootstrap = this.state.bootstrap;
+    if (!session || !bootstrap) return;
+    const ack = await this.sendCommand({
+      id: commandId(),
+      type: "session.forkConversation",
+      sessionId: session.sessionId,
+      entryId,
+    });
+    if (!ack.accepted || !ack.createdSessionId) {
+      if (!ack.accepted) {
+        throw rejectedCommandError(
+          ack,
+          "The ygg host rejected this conversation fork.",
+        );
+      }
+      throw new Error("The ygg host did not identify the forked session.");
+    }
+    await this.installCreatedSession(ack.createdSessionId, bootstrap);
+  }
+
+  async setSessionLifecycle(
+    sessionId: string,
+    lifecycle: "active" | "archived" | "trash",
+  ): Promise<void> {
+    const ack = await this.sendCommand({
+      id: commandId(),
+      type: "session.setLifecycle",
+      sessionId,
+      lifecycle,
+    });
+    if (!ack.accepted) {
+      throw rejectedCommandError(
+        ack,
+        "The ygg host rejected this session lifecycle change.",
+      );
+    }
+    await this.initialize();
+  }
+
+  async deleteSessionPermanently(
+    sessionId: string,
+    trashedAtMs: number,
+    phrase: string,
+  ): Promise<void> {
+    const ack = await this.sendCommand({
+      id: commandId(),
+      type: "session.deletePermanently",
+      sessionId,
+      confirmation: { sessionId, trashedAtMs, phrase },
+    });
+    if (!ack.accepted) {
+      throw rejectedCommandError(
+        ack,
+        "The ygg host rejected permanent deletion.",
+      );
+    }
+    await this.initialize();
   }
 
   async resolveApproval(
@@ -795,6 +1117,100 @@ export class YggStore {
     this.publish({
       ...this.state,
       bootstrap: { ...bootstrap, selectedThemeId: themeId },
+    });
+  }
+
+  private async refreshProjectCatalog(): Promise<ProjectCatalog> {
+    const projectCatalog = await this.transport.getProjectCatalog();
+    const bootstrap = this.state.bootstrap;
+    this.publish({
+      ...this.state,
+      projectCatalog,
+      bootstrap: bootstrap
+        ? {
+            ...bootstrap,
+            catalogRevision: Math.max(
+              bootstrap.catalogRevision,
+              projectCatalog.catalogRevision,
+            ),
+            projects: projectCatalog.projects,
+          }
+        : null,
+    });
+    return projectCatalog;
+  }
+
+  private async mutateProject(command: ClientCommand): Promise<void> {
+    const ack = await this.sendCommand(command);
+    if (!ack.accepted) {
+      throw rejectedCommandError(
+        ack,
+        "The ygg host rejected this project change.",
+      );
+    }
+    await this.refreshProjectCatalog();
+  }
+
+  async renameProject(projectId: string, displayName: string): Promise<void> {
+    const name = displayName.trim();
+    if (!name) return;
+    await this.mutateProject({
+      id: commandId(),
+      type: "project.rename",
+      projectId,
+      displayName: name,
+    });
+  }
+
+  async setDefaultProject(projectId: string | null): Promise<void> {
+    await this.mutateProject(
+      projectId
+        ? {
+            id: commandId(),
+            type: "project.setDefault",
+            projectId,
+          }
+        : {
+            id: commandId(),
+            type: "project.clearDefault",
+          },
+    );
+  }
+
+  async setProjectTrust(projectId: string, trusted: boolean): Promise<void> {
+    const selectedProjectId = this.selectedSession?.projectId;
+    await this.mutateProject({
+      id: commandId(),
+      type: "project.setTrust",
+      projectId,
+      trusted,
+    });
+    if (!this.state.bootstrap || selectedProjectId === projectId) {
+      await this.initialize();
+    }
+  }
+
+  async archiveProject(projectId: string): Promise<void> {
+    const selectedProjectId = this.selectedSession?.projectId;
+    await this.mutateProject({
+      id: commandId(),
+      type: "project.archive",
+      projectId,
+    });
+    if (!this.state.bootstrap || selectedProjectId === projectId) {
+      await this.initialize();
+    }
+  }
+
+  async importProjectCandidate(
+    candidateId: string,
+    displayName?: string,
+  ): Promise<void> {
+    await this.mutateProject({
+      id: commandId(),
+      type: "project.import",
+      candidateId,
+      displayName: displayName?.trim() || undefined,
     });
   }
 

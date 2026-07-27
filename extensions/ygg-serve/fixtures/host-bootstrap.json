@@ -23,6 +23,8 @@
     "connectedDevices": false,
     "sessionMetadata": true,
     "sessionBranches": true,
+    "conversationBranching": true,
+    "sessionTrash": true,
     "sessionExport": true,
     "lanClients": false,
     "terminal": false,
@@ -90,6 +92,9 @@
       "id": "project-ygg",
       "name": "ygg",
       "trusted": true,
+      "archived": false,
+      "available": true,
+      "isDefault": true,
       "sessionCount": 1,
       "liveSessionCount": 1
     }
@@ -103,6 +108,7 @@
       "modifiedAtMs": 1721000000042,
       "pinned": false,
       "archived": false,
+      "lifecycle": "active",
       "provisional": false,
       "liveState": "idle",
       "attention": "none",

@@ -1,0 +1,44 @@
+{
+  "id": "item-run-outcome",
+  "runId": "run-stable-1",
+  "turnId": "turn-stable-2",
+  "lifecycle": "committed",
+  "durableEntryId": "entry-run-outcome",
+  "payload": {
+    "type": "runOutcome",
+    "data": {
+      "outcome": "completed",
+      "review": {
+        "summary": "Completed 2 actions, 1 changed file, 1 verification, 0 failures, 0 warnings, and 1 output.",
+        "durationMs": 1250,
+        "actionCount": 2,
+        "phases": [
+          {
+            "phase": "changed",
+            "actionCount": 1,
+            "succeededCount": 1,
+            "failedCount": 0,
+            "stoppedCount": 0
+          },
+          {
+            "phase": "verified",
+            "actionCount": 1,
+            "succeededCount": 1,
+            "failedCount": 0,
+            "stoppedCount": 0
+          }
+        ],
+        "changedFileItemIds": [
+          "item-file-change"
+        ],
+        "verificationActionItemIds": [
+          "item-tool-cargo-test"
+        ],
+        "outputIds": [
+          "artifact-report"
+        ],
+        "evidenceCoverage": "partial"
+      }
+    }
+  }
+}

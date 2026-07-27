@@ -139,14 +139,22 @@ export const fixtureBootstrap: HostBootstrap = {
     {
       id: "project-ygg",
       name: "ygg",
-      pathLabel: "~/github/skaft-software/ygg",
       trusted: true,
+      archived: false,
+      available: true,
+      isDefault: true,
+      sessionCount: 4,
+      liveSessionCount: 2,
     },
     {
       id: "project-notes",
       name: "Research notes",
-      pathLabel: "~/Documents/Research",
       trusted: true,
+      archived: false,
+      available: true,
+      isDefault: false,
+      sessionCount: 1,
+      liveSessionCount: 0,
     },
   ],
   sessions: [
@@ -159,6 +167,7 @@ export const fixtureBootstrap: HostBootstrap = {
       updatedAt: at(58),
       pinned: false,
       archived: false,
+      lifecycle: "active",
       unread: false,
       modelId: "claude-sonnet-4-6",
       attentionCount: 0,
@@ -172,6 +181,7 @@ export const fixtureBootstrap: HostBootstrap = {
       updatedAt: at(54),
       pinned: true,
       archived: false,
+      lifecycle: "active",
       unread: false,
       modelId: "gpt-5.4",
       attentionCount: 0,
@@ -185,6 +195,7 @@ export const fixtureBootstrap: HostBootstrap = {
       updatedAt: at(48),
       pinned: false,
       archived: false,
+      lifecycle: "active",
       unread: true,
       modelId: "claude-sonnet-4-6",
       attentionCount: 1,
@@ -198,6 +209,7 @@ export const fixtureBootstrap: HostBootstrap = {
       updatedAt: at(32),
       pinned: true,
       archived: false,
+      lifecycle: "active",
       unread: true,
       modelId: "qwen3.5-27b",
       attentionCount: 0,
@@ -211,6 +223,7 @@ export const fixtureBootstrap: HostBootstrap = {
       updatedAt: at(12),
       pinned: false,
       archived: false,
+      lifecycle: "active",
       unread: false,
       modelId: "qwen3.5-27b",
       attentionCount: 0,
@@ -254,6 +267,9 @@ export const fixtureBootstrap: HostBootstrap = {
   devices: devicesCatalog,
   capabilities: {
     attachments: true,
+    documents: true,
+    trustedProjectFiles: true,
+    transcriptSearch: true,
     attachmentPolicy: {
       acceptedMediaTypes: ["image/*", "text/*", "application/pdf"],
       maxCount: 8,
@@ -268,6 +284,8 @@ export const fixtureBootstrap: HostBootstrap = {
     pairDevices: true,
     sessionMetadata: true,
     sessionBranches: true,
+    conversationBranching: true,
+    sessionTrash: true,
     sessionExport: false,
     themeSelection: true,
     steer: true,
@@ -329,45 +347,71 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
       },
       {
         id: "live-read",
+        runId: "run-live",
         turnId: "live-turn",
         kind: "action",
         actionKind: "file_read",
+        phase: "investigated",
+        status: "succeeded",
+        rawToolName: "read",
         label: "Read onboarding flow",
         target: "apps/web/src/onboarding",
         detail: "Read 7 files",
         state: "committed",
         createdAt: at(44),
         durationMs: 1280,
+        observedOutputBytes: 8_240,
+        droppedOutputBytes: 0,
+        changedPaths: [],
         sourceIds: ["source-onboarding", "source-tokens"],
+        outputIds: [],
       },
       {
         id: "live-edit",
+        runId: "run-live",
         turnId: "live-turn",
         kind: "action",
         actionKind: "file_write",
+        phase: "changed",
+        status: "succeeded",
+        rawToolName: "apply_patch",
         label: "Refined responsive layout",
         target: "OnboardingFlow.tsx",
         detail: "Unified the narrow and desktop navigation states.",
         state: "committed",
         createdAt: at(48),
         durationMs: 3230,
+        observedOutputBytes: 412,
+        droppedOutputBytes: 0,
+        changedPaths: ["apps/web/src/OnboardingFlow.tsx"],
+        sourceIds: [],
+        outputIds: [],
         additions: 84,
         deletions: 31,
       },
       {
         id: "live-preview",
+        runId: "run-live",
         turnId: "live-turn",
         kind: "action",
         actionKind: "preview",
+        phase: "verified",
+        status: "succeeded",
+        rawToolName: "browser",
         label: "Preview is live",
         target: "localhost:5173",
         detail: "Desktop and phone views connected.",
         state: "committed",
         createdAt: at(51),
+        observedOutputBytes: 0,
+        droppedOutputBytes: 0,
+        changedPaths: [],
+        sourceIds: [],
         outputIds: ["output-onboarding"],
       },
       {
         id: "live-reasoning",
+        runId: "run-live",
         turnId: "live-turn",
         kind: "reasoning",
         summary: "Checking the narrow layout",
@@ -474,15 +518,24 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
       },
       {
         id: "attention-action",
+        runId: "run-attention",
         turnId: "attention-turn",
         kind: "action",
         actionKind: "command",
+        phase: "produced",
+        status: "succeeded",
+        rawToolName: "bash",
         label: "Built release application",
         target: "target/release/ygg.app",
+        commandPreview: "cargo build --release",
         detail: "Build completed without warnings.",
         state: "committed",
         createdAt: at(41),
         durationMs: 64_420,
+        observedOutputBytes: 12_644,
+        droppedOutputBytes: 0,
+        changedPaths: [],
+        sourceIds: [],
         outputIds: ["output-build"],
       },
       {
@@ -590,27 +643,45 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
       },
       {
         id: "done-command",
+        runId: "run-done",
         turnId: "done-turn",
         kind: "action",
         actionKind: "command",
+        phase: "verified",
+        status: "succeeded",
+        rawToolName: "bash",
         label: "Ran focused release checks",
         target: "cargo test --workspace",
+        commandPreview: "cargo test --workspace",
         detail: "42 checks passed · 0 failed",
         state: "committed",
         createdAt: at(18),
         durationMs: 83_240,
+        exitCode: 0,
+        observedOutputBytes: 24_804,
+        droppedOutputBytes: 0,
+        changedPaths: [],
         sourceIds: ["source-cargo", "source-changelog"],
+        outputIds: [],
       },
       {
         id: "done-report",
+        runId: "run-done",
         turnId: "done-turn",
         kind: "action",
         actionKind: "file_write",
+        phase: "produced",
+        status: "succeeded",
+        rawToolName: "write",
         label: "Created release pulse",
         target: "release-pulse.html",
         detail: "Interactive summary ready to inspect.",
         state: "committed",
         createdAt: at(27),
+        observedOutputBytes: 312,
+        droppedOutputBytes: 0,
+        changedPaths: ["release-pulse.html"],
+        sourceIds: [],
         additions: 184,
         deletions: 0,
         outputIds: ["output-release-pulse"],
@@ -626,11 +697,43 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
       },
       {
         id: "done-outcome",
+        runId: "run-done",
         turnId: "done-turn",
         kind: "run_outcome",
         outcome: "done",
         durationMs: 132_000,
         summary: "Release review completed",
+        review: {
+          summary:
+            "All focused checks passed and the review artifact is ready.",
+          durationMs: 132_000,
+          actionCount: 2,
+          phases: [
+            {
+              phase: "verified",
+              actionCount: 1,
+              succeededCount: 1,
+              failedCount: 0,
+              stoppedCount: 0,
+            },
+            {
+              phase: "produced",
+              actionCount: 1,
+              succeededCount: 1,
+              failedCount: 0,
+              stoppedCount: 0,
+            },
+          ],
+          changedFileItemIds: ["done-report"],
+          verificationActionItemIds: ["done-command"],
+          failedActionItemIds: [],
+          warningActionItemIds: [],
+          sourceIds: ["source-cargo", "source-changelog"],
+          outputIds: ["output-release-pulse"],
+          testResults: [],
+          evidenceCoverage: "complete",
+          openQuestions: [],
+        },
         state: "committed",
         createdAt: at(31),
       },
@@ -755,6 +858,291 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     previews: [],
   },
 };
+
+function createPerformanceSession(): SessionSnapshot {
+  const items: SessionSnapshot["items"] = [];
+  const longCodeBlock = [
+    "```ts",
+    ...Array.from(
+      { length: 120 },
+      (_, index) =>
+        `const result${index} = await verifyShard(${index}, { retries: 2 });`,
+    ),
+    "```",
+  ].join("\n");
+
+  const shellRunId = "performance-shell-run";
+  const shellTurnId = "performance-shell-turn";
+  const shellCreatedAt = new Date(
+    Date.UTC(2026, 6, 26, 11, 58, 0),
+  ).toISOString();
+  items.push(
+    {
+      id: "performance-shell-user",
+      runId: shellRunId,
+      turnId: shellTurnId,
+      kind: "user_message",
+      content:
+        "Run every verification shard and keep the command history compact.",
+      state: "committed",
+      createdAt: shellCreatedAt,
+    },
+    {
+      id: "performance-shell-intro",
+      runId: shellRunId,
+      turnId: shellTurnId,
+      kind: "assistant_message",
+      content:
+        "I’ll run the full shard matrix, preserve each exit result, and summarize it as one verification phase.",
+      state: "committed",
+      createdAt: shellCreatedAt,
+    },
+  );
+  for (let command = 0; command < 100; command += 1) {
+    items.push({
+      id: `performance-shell-command-${command}`,
+      runId: shellRunId,
+      turnId: shellTurnId,
+      kind: "action",
+      actionKind: "command",
+      phase: "verified",
+      status: "succeeded",
+      rawToolName: "bash",
+      label: `Ran shell check ${command + 1}`,
+      target: `npm test -- --run shard-${command + 1}`,
+      commandPreview: `npm test -- --run shard-${command + 1}`,
+      detail: `Shard ${command + 1} passed with 24 assertions.`,
+      state: "committed",
+      createdAt: shellCreatedAt,
+      durationMs: 420 + command,
+      exitCode: 0,
+      observedOutputBytes: 2_048 + command,
+      droppedOutputBytes: 0,
+      changedPaths: [],
+      sourceIds: [],
+      outputIds: [],
+    });
+  }
+  items.push(
+    {
+      id: "performance-shell-reasoning",
+      runId: shellRunId,
+      turnId: shellTurnId,
+      kind: "reasoning",
+      summary: "Reconciled the shard matrix",
+      content:
+        "All command exits are accounted for without expanding 100 repetitive cards by default.",
+      state: "committed",
+      createdAt: shellCreatedAt,
+    },
+    {
+      id: "performance-shell-answer",
+      runId: shellRunId,
+      turnId: shellTurnId,
+      kind: "assistant_message",
+      content: `The 100-shard matrix passed.\n\n${longCodeBlock}`,
+      state: "committed",
+      createdAt: shellCreatedAt,
+    },
+  );
+
+  for (let turn = 0; turn < 224; turn += 1) {
+    const turnId = `performance-turn-${turn}`;
+    const createdAt = new Date(
+      Date.UTC(2026, 6, 26, 12, 0, turn),
+    ).toISOString();
+    items.push(
+      {
+        id: `${turnId}-user`,
+        turnId,
+        kind: "user_message",
+        content: `Review performance batch ${turn + 1}.`,
+        state: "committed",
+        createdAt,
+      },
+      {
+        id: `${turnId}-intro`,
+        turnId,
+        kind: "assistant_message",
+        content: `I’ll inspect batch ${turn + 1} and keep the evidence concise.`,
+        state: "committed",
+        createdAt,
+      },
+      {
+        id: `${turnId}-reasoning`,
+        turnId,
+        kind: "reasoning",
+        summary: `Checked batch ${turn + 1}`,
+        content: "The batch is consistent with the expected output.",
+        state: "committed",
+        createdAt,
+      },
+      {
+        id: `${turnId}-answer`,
+        turnId,
+        kind: "assistant_message",
+        content:
+          turn % 25 === 0
+            ? `Batch ${turn + 1} is verified.\n\n${longCodeBlock}`
+            : `Batch ${turn + 1} is verified with no unresolved failures.`,
+        state: turn === 223 ? "streaming" : "committed",
+        createdAt,
+      },
+    );
+  }
+
+  return {
+    sessionId: "session-performance",
+    actorGeneration: 1,
+    sequence: 1_001,
+    title: "Profile 1,000-item transcript",
+    status: "working",
+    activeRunId: "performance-run",
+    projectId: "project-ygg",
+    modelId: "gpt-5.4",
+    reasoning: "high",
+    authority: "workspace",
+    contextPercent: 82,
+    startedAt: new Date(Date.UTC(2026, 6, 26, 12, 0, 0)).toISOString(),
+    branches: { entries: [], truncated: false },
+    items,
+    progress: [
+      {
+        id: "performance-progress",
+        content: "Stream final verification",
+        activeForm: "Streaming final verification",
+        status: "in_progress",
+      },
+    ],
+    sources: [],
+    outputs: [],
+    previews: [],
+  };
+}
+
+function createPerformanceReplaySession(): SessionSnapshot {
+  const startedAt = new Date(
+    Date.UTC(2026, 6, 26, 12, 4, 0),
+  ).toISOString();
+  return {
+    sessionId: "session-performance-replay",
+    actorGeneration: 4,
+    sequence: 3_407,
+    title: "Recovered replay after reconnect",
+    status: "working",
+    activeRunId: "performance-replay-run",
+    projectId: "project-ygg",
+    modelId: "claude-sonnet-4-6",
+    reasoning: "high",
+    authority: "workspace",
+    contextPercent: 47,
+    startedAt,
+    branches: { entries: [], truncated: false },
+    items: [
+      {
+        id: "performance-replay-user",
+        turnId: "performance-replay-turn",
+        kind: "user_message",
+        content:
+          "Reconnect this background run and recover every durable event after the last cursor.",
+        state: "committed",
+        createdAt: startedAt,
+      },
+      {
+        id: "performance-replay-action",
+        runId: "performance-replay-run",
+        turnId: "performance-replay-turn",
+        kind: "action",
+        actionKind: "analysis",
+        phase: "investigated",
+        status: "succeeded",
+        rawToolName: "session_replay",
+        label: "Replayed durable session events",
+        summary: "Recovered the projection from cursor 3,392 through 3,406.",
+        detail:
+          "Actor generation 4 resumed without duplicating transcript items.",
+        state: "committed",
+        createdAt: startedAt,
+        durationMs: 184,
+        observedOutputBytes: 4_128,
+        droppedOutputBytes: 0,
+        changedPaths: [],
+        sourceIds: [],
+        outputIds: [],
+      },
+      {
+        id: "performance-replay-assistant",
+        runId: "performance-replay-run",
+        turnId: "performance-replay-turn",
+        kind: "assistant_message",
+        content:
+          "Replay is current through sequence 3,407. The background verification is continuing from the recovered projection.",
+        state: "streaming",
+        createdAt: startedAt,
+      },
+    ],
+    progress: [
+      {
+        id: "performance-replay-progress",
+        content: "Continue recovered verification",
+        activeForm: "Continuing recovered verification",
+        status: "in_progress",
+      },
+    ],
+    sources: [],
+    outputs: [],
+    previews: [],
+  };
+}
+
+if (
+  import.meta.env.DEV &&
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).get("fixture") === "performance"
+) {
+  const performanceSession = createPerformanceSession();
+  const replaySession = createPerformanceReplaySession();
+  fixtureSessions[performanceSession.sessionId] = performanceSession;
+  fixtureSessions[replaySession.sessionId] = replaySession;
+  fixtureBootstrap.selectedSessionId = performanceSession.sessionId;
+  fixtureBootstrap.sessions.unshift(
+    {
+      id: performanceSession.sessionId,
+      projectId: performanceSession.projectId,
+      title: performanceSession.title,
+      preview: "1,000 items · 100 shell calls · long Markdown",
+      status: performanceSession.status,
+      updatedAt: performanceSession.startedAt,
+      pinned: true,
+      archived: false,
+      lifecycle: "active",
+      unread: false,
+      modelId: performanceSession.modelId,
+      attentionCount: 0,
+    },
+    {
+      id: replaySession.sessionId,
+      projectId: replaySession.projectId,
+      title: replaySession.title,
+      preview: "Actor 4 · replayed through sequence 3,407",
+      status: replaySession.status,
+      updatedAt: replaySession.startedAt,
+      pinned: true,
+      archived: false,
+      lifecycle: "active",
+      unread: true,
+      modelId: replaySession.modelId,
+      attentionCount: 0,
+    },
+  );
+  const project = fixtureBootstrap.projects.find(
+    (candidate) => candidate.id === performanceSession.projectId,
+  );
+  if (project) {
+    project.sessionCount += 2;
+    project.liveSessionCount += 2;
+  }
+}
 
 export const fixtureDevices = devicesCatalog;
 

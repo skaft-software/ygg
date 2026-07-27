@@ -38,6 +38,12 @@ async function ensureActivityOpen(page: Page) {
   return rail;
 }
 
+function releasePulseArtifact(page: Page) {
+  return page
+    .locator(".activity-rail .resource-list")
+    .getByRole("button", { name: /Release pulse/ });
+}
+
 async function expectNoViewportOverflow(page: Page) {
   await expect
     .poll(() =>
@@ -141,13 +147,15 @@ test("keeps composer controls keyboard focusable with a visible focus ring", asy
   await expect(authority).toBeFocused();
 });
 
-test("uses a model-colored loader and quiet blue activity dots", async ({
+test("uses a static model-colored status and quiet blue activity dots", async ({
   page,
 }) => {
   const working = page.getByRole("button", {
     name: /Refine onboarding preview, Working/,
   });
-  await expect(working.locator(".session-loader .spin")).toBeVisible();
+  const status = working.locator(".session-status-dot");
+  await expect(status).toBeVisible();
+  await expect(status).toHaveCSS("animation-name", "none");
   await expect(working).toHaveCSS("--session-model-color", "#10a37f");
 
   const attention = page.getByRole("button", {
@@ -292,22 +300,23 @@ test("shows typed work and a conditional activity rail", async ({ page }) => {
     conversation.getByText("Read onboarding flow"),
   ).toBeVisible();
   await expect(
-    conversation.getByText("Checking the narrow layout"),
+    conversation.getByRole("button", {
+      name: "Checking the narrow layout",
+    }),
   ).toBeVisible();
   await expect
     .poll(() =>
       page.locator(".composer").evaluate((composer) => ({
         border: getComputedStyle(composer).borderColor,
         shimmer: getComputedStyle(composer, "::before").animationName,
-        perimeter: getComputedStyle(
-          composer.querySelector(".composer-running-edge-chase")!,
-        ).animationName,
+        perimeter:
+          composer.querySelector(".composer-running-edge-chase") !== null,
       })),
     )
     .toEqual({
       border: "rgba(0, 0, 0, 0)",
       shimmer: "none",
-      perimeter: "composer-ring-chase",
+      perimeter: false,
     });
   await expect(page.getByRole("button", { name: "Stop ygg" })).toBeVisible();
   await expect(
@@ -316,6 +325,295 @@ test("shows typed work and a conditional activity rail", async ({ page }) => {
   await ensureActivityOpen(page);
   await expect(page.getByText("Verifying keyboard and touch behavior")).toBeVisible();
   await expect(page.getByRole("button", { name: /Onboarding preview/ })).toBeVisible();
+});
+
+test("keeps the 1,000-item performance fixture bounded and quiet", async (
+  { page },
+  testInfo,
+) => {
+  test.skip(testInfo.project.name !== "desktop");
+  await page.goto("/?transport=fixture&fixture=performance");
+
+  const conversation = page.getByRole("region", { name: "Conversation" });
+  const transcript = conversation.locator(".transcript");
+  await expect(transcript).toHaveAttribute("data-item-count", "1000");
+  await expect(conversation.locator(".command-batch")).toHaveCount(1);
+  await expect(
+    conversation.locator(".command-batch > summary"),
+  ).toContainText("Ran 100 bash commands");
+  await expect(
+    conversation.locator(".command-batch > summary"),
+  ).toContainText("100 succeeded");
+  await expect
+    .poll(() =>
+      conversation
+        .locator(".assistant-message:not(.is-streaming)")
+        .first()
+        .evaluate((element) => getComputedStyle(element).contentVisibility),
+    )
+    .toBe("auto");
+  expect(
+    await conversation.evaluate((element) =>
+      element
+        .getAnimations({ subtree: true })
+        .filter(
+          (animation) =>
+            animation.effect instanceof KeyframeEffect &&
+            animation.effect.getTiming().iterations === Infinity,
+        ).length,
+    ),
+  ).toBeLessThanOrEqual(1);
+});
+
+test("rehydrates a replayed background run while concurrent sessions remain live", async (
+  { page },
+  testInfo,
+) => {
+  test.skip(testInfo.project.name !== "desktop");
+  await page.goto("/?transport=fixture&fixture=performance");
+  await ensureSidebar(page);
+
+  await expect(page.locator(".session-row[data-status='working']")).toHaveCount(
+    3,
+  );
+  await selectSession(page, "Recovered replay after reconnect");
+  const transcript = page.locator(".transcript");
+  await expect(transcript).toHaveAttribute("data-item-count", "3");
+  await expect(transcript).toHaveAttribute("data-session-sequence", "3407");
+  await expect(
+    page.getByText(
+      "Replay is current through sequence 3,407. The background verification is continuing from the recovered projection.",
+    ),
+  ).toBeVisible();
+  await expect(page).toHaveURL(
+    /\/session\/session-performance-replay\?transport=fixture&fixture=performance$/,
+  );
+
+  await page.reload();
+  await expect(transcript).toHaveAttribute("data-session-sequence", "3407");
+  await expect(
+    page.getByText("Replayed durable session events"),
+  ).toBeVisible();
+  await ensureSidebar(page);
+  await expect(page.locator(".session-row[data-status='working']")).toHaveCount(
+    3,
+  );
+
+  await selectSession(page, "Profile 1,000-item transcript");
+  await expect(transcript).toHaveAttribute("data-item-count", "1000");
+  await expect(transcript).toHaveAttribute("data-session-sequence", "1001");
+});
+
+test("does not pull a scrolled-away performance transcript to the latest item", async (
+  { page },
+  testInfo,
+) => {
+  test.skip(testInfo.project.name !== "desktop");
+  await page.goto("/?transport=fixture&fixture=performance");
+
+  const transcript = page.locator(".transcript");
+  await expect(transcript).toHaveAttribute("data-item-count", "1000");
+  const scroll = page.locator(".transcript-scroll");
+  await scroll.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+    element.tabIndex = -1;
+  });
+  await scroll.focus();
+  await page.keyboard.press("Home");
+  await expect(page.getByRole("button", { name: "Jump to latest" })).toBeVisible();
+  const manualScrollPosition = await scroll.evaluate((element) => ({
+    top: element.scrollTop,
+    maximum: element.scrollHeight - element.clientHeight,
+  }));
+  await page.getByLabel("Message ygg").fill("Stream 60 fixture deltas");
+  await page.evaluate(() => {
+    const probe = {
+      frameTimestamps: [] as number[],
+      longTaskObservationSupported:
+        PerformanceObserver.supportedEntryTypes.includes("longtask"),
+      longTasks: [] as number[],
+      running: true,
+      startedAt: performance.now(),
+      streamCompletedAt: undefined as number | undefined,
+      samplingCompletedAt: undefined as number | undefined,
+      observer: undefined as PerformanceObserver | undefined,
+    };
+    const probeWindow = window as typeof window & {
+      __yggPerformanceProbe?: typeof probe;
+    };
+    probeWindow.__yggPerformanceProbe = probe;
+    const transcript = document.querySelector(".transcript");
+    const completionObserver = new MutationObserver(() => {
+      const active = probeWindow.__yggPerformanceProbe;
+      if (
+        !active?.running ||
+        transcript?.getAttribute("data-session-sequence") !== "1061"
+      ) {
+        return;
+      }
+      active.streamCompletedAt = performance.now();
+      completionObserver.disconnect();
+    });
+    if (transcript) {
+      completionObserver.observe(transcript, {
+        attributeFilter: ["data-session-sequence"],
+      });
+    }
+    const frame = (timestamp: number) => {
+      const active = probeWindow.__yggPerformanceProbe;
+      if (!active?.running) return;
+      active.frameTimestamps.push(timestamp);
+      if (
+        active.streamCompletedAt !== undefined &&
+        timestamp - active.streamCompletedAt >= 1_500
+      ) {
+        active.samplingCompletedAt = timestamp;
+        active.running = false;
+        active.observer?.disconnect();
+        return;
+      }
+      window.requestAnimationFrame(frame);
+    };
+    window.requestAnimationFrame(frame);
+    if (probe.longTaskObservationSupported) {
+      try {
+        const observer = new PerformanceObserver((list) => {
+          const active = probeWindow.__yggPerformanceProbe;
+          if (!active?.running) return;
+          for (const entry of list.getEntries()) {
+            active.longTasks.push(entry.duration);
+          }
+        });
+        observer.observe({ type: "longtask" });
+        probe.observer = observer;
+      } catch {
+        probe.longTaskObservationSupported = false;
+      }
+    }
+    const submit = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Queue follow-up"]',
+    );
+    if (!submit) throw new Error("Performance fixture submit button is missing.");
+    submit.click();
+  });
+  await expect(transcript).toHaveAttribute("data-item-count", "1000");
+  await expect(transcript).toHaveAttribute("data-session-sequence", "1061");
+  await expect(
+    transcript.locator(".assistant-message.is-streaming").last(),
+  ).toContainText("[stream 60/60]");
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __yggPerformanceProbe?: { running: boolean };
+            }
+          ).__yggPerformanceProbe?.running,
+      ),
+    )
+    .toBe(false);
+
+  const position = await scroll.evaluate((element) => ({
+    top: element.scrollTop,
+    maximum: element.scrollHeight - element.clientHeight,
+  }));
+  const performanceProbe = await page.evaluate(async () => {
+    await new Promise<void>((resolve) =>
+      window.requestAnimationFrame(() =>
+        window.requestAnimationFrame(() => resolve()),
+      ),
+    );
+    const probeWindow = window as typeof window & {
+      __yggPerformanceProbe?: {
+        frameTimestamps: number[];
+        longTaskObservationSupported: boolean;
+        longTasks: number[];
+        running: boolean;
+        startedAt: number;
+        streamCompletedAt?: number;
+        samplingCompletedAt?: number;
+      };
+    };
+    const probe = probeWindow.__yggPerformanceProbe;
+    if (!probe) return null;
+    probe.running = false;
+    const steadyFrameTimestamps =
+      probe.streamCompletedAt === undefined
+        ? []
+        : probe.frameTimestamps.filter(
+            (timestamp) => timestamp >= probe.streamCompletedAt!,
+          );
+    const firstFrame = steadyFrameTimestamps.at(0);
+    const lastFrame = steadyFrameTimestamps.at(-1);
+    const frameElapsedMs =
+      firstFrame === undefined || lastFrame === undefined
+        ? 0
+        : lastFrame - firstFrame;
+    const frameGaps = probe.frameTimestamps
+      .slice(1)
+      .map((timestamp, index) => timestamp - probe.frameTimestamps[index]!);
+    return {
+      elapsedMs:
+        (probe.samplingCompletedAt ?? performance.now()) - probe.startedAt,
+      streamElapsedMs:
+        (probe.streamCompletedAt ?? performance.now()) - probe.startedAt,
+      frameCount: probe.frameTimestamps.length,
+      frameElapsedMs,
+      steadyFramesPerSecond:
+        frameElapsedMs > 0
+          ? ((steadyFrameTimestamps.length - 1) * 1_000) / frameElapsedMs
+          : 0,
+      maximumFrameGapMs: Math.max(0, ...frameGaps),
+      longTaskObservationSupported: probe.longTaskObservationSupported,
+      longTaskCount: probe.longTasks.length,
+      maximumLongTaskMs: Math.max(0, ...probe.longTasks),
+    };
+  });
+  await testInfo.attach("performance-delta-burst.json", {
+    body: JSON.stringify(performanceProbe, null, 2),
+    contentType: "application/json",
+  });
+
+  expect(manualScrollPosition.maximum - manualScrollPosition.top).toBeGreaterThan(
+    1_000,
+  );
+  expect(position.maximum - position.top).toBeGreaterThan(1_000);
+  expect(position.top).toBeLessThan(position.maximum / 4);
+  expect(performanceProbe?.frameCount).toBeGreaterThanOrEqual(80);
+  expect(performanceProbe?.steadyFramesPerSecond).toBeGreaterThanOrEqual(55);
+  expect(performanceProbe?.streamElapsedMs).toBeLessThan(1_000);
+  expect(performanceProbe?.longTaskObservationSupported).toBe(true);
+  expect(performanceProbe?.longTaskCount).toBe(0);
+  expect(performanceProbe?.maximumLongTaskMs).toBeLessThanOrEqual(50);
+  await expect(page.getByRole("button", { name: "Jump to latest" })).toBeVisible();
+});
+
+test("matches the settled 1,000-item performance viewport", async (
+  { page },
+  testInfo,
+) => {
+  test.skip(testInfo.project.name !== "desktop");
+  test.skip(
+    process.platform !== "darwin",
+    "The checked-in visual baseline targets the macOS desktop host.",
+  );
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/?transport=fixture&fixture=performance");
+
+  const conversation = page.getByRole("region", { name: "Conversation" });
+  const transcript = conversation.locator(".transcript");
+  await expect(transcript).toHaveAttribute("data-item-count", "1000");
+  await page.evaluate(() => document.fonts.ready);
+  await conversation.locator(".transcript-scroll").evaluate((element) => {
+    element.scrollTop = 0;
+    element.dispatchEvent(new Event("scroll"));
+  });
+
+  await expect(conversation).toHaveScreenshot("performance-settled.png", {
+    animations: "disabled",
+    caret: "hide",
+  });
 });
 
 test("resizes the desktop activity pane and remembers its width", async (
@@ -418,11 +716,20 @@ test("opens an output into the dominant preview inspector", async (
 ) => {
   await selectSession(page, "Review release readiness");
   await ensureActivityOpen(page);
-  await page
-    .locator(".activity-rail")
-    .getByRole("button", { name: /Release pulse/ })
-    .click();
+  await releasePulseArtifact(page).click();
   await expect(page.getByLabel("Release pulse inspector")).toBeVisible();
+  if (testInfo.project.name !== "desktop") {
+    await expect
+      .poll(() =>
+        page
+          .getByLabel("Release pulse inspector")
+          .evaluate((element) => ({
+            opacity: getComputedStyle(element).opacity,
+            animation: getComputedStyle(element).animationName,
+          })),
+      )
+      .toEqual({ opacity: "1", animation: "none" });
+  }
   await expect(page.getByTitle("Release pulse")).toBeVisible();
   await expect(page.getByText("Live preview")).toBeVisible();
   await page.screenshot({
@@ -431,6 +738,75 @@ test("opens an output into the dominant preview inspector", async (
   });
   await page.getByRole("button", { name: "Close inspector" }).click();
   await expect(page.getByLabel("Release pulse inspector")).toHaveCount(0);
+});
+
+test("matches the settled mobile inspector overlay", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile");
+  test.skip(
+    process.platform !== "darwin",
+    "The checked-in visual baseline targets the macOS mobile browser host.",
+  );
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await selectSession(page, "Review release readiness");
+  await ensureActivityOpen(page);
+  await releasePulseArtifact(page).click();
+
+  const inspector = page.getByLabel("Release pulse inspector");
+  await expect(inspector).toBeVisible();
+  await expect
+    .poll(() =>
+      inspector.evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return {
+          opacity: style.opacity,
+          visibility: style.visibility,
+          pointerEvents: style.pointerEvents,
+          position: style.position,
+          left: Math.round(bounds.left),
+          top: Math.round(bounds.top),
+          right: Math.round(bounds.right),
+          bottom: Math.round(bounds.bottom),
+        };
+      }),
+    )
+    .toEqual({
+      opacity: "1",
+      visibility: "visible",
+      pointerEvents: "auto",
+      position: "fixed",
+      left: 0,
+      top: 0,
+      right: viewportByProject.mobile.width,
+      bottom: viewportByProject.mobile.height,
+    });
+  await page.evaluate(() => document.fonts.ready);
+  await expect(inspector).toHaveScreenshot("mobile-inspector-settled.png", {
+    animations: "disabled",
+    caret: "hide",
+  });
+});
+
+test("matches the settled mobile completion review", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile");
+  test.skip(
+    process.platform !== "darwin",
+    "The checked-in visual baseline targets the macOS mobile browser host.",
+  );
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await selectSession(page, "Review release readiness");
+  const review = page.locator(".completion-review:visible").first();
+  await expect(review).toBeVisible();
+  await review.scrollIntoViewIfNeeded();
+  await page.evaluate(() => document.fonts.ready);
+  await expect(review).toHaveScreenshot("completion-review-settled.png", {
+    animations: "disabled",
+    caret: "hide",
+  });
 });
 
 test("keeps the activity rail and dominant viewer usable at 1024px", async (
@@ -455,7 +831,10 @@ test("keeps the activity rail and dominant viewer usable at 1024px", async (
     )
     .toEqual({ composerUsable: true, railExact: true });
 
-  await rail.getByRole("button", { name: /Release pulse/ }).click();
+  await rail
+    .locator(".resource-list")
+    .getByRole("button", { name: /Release pulse/ })
+    .click();
   const inspector = page.getByLabel("Release pulse inspector");
   await expect(inspector).toBeVisible();
   await expect
@@ -472,9 +851,7 @@ test("returns focus to a visible activity trigger after closing an inspector", a
   test.skip(testInfo.project.name !== "desktop");
   await selectSession(page, "Review release readiness");
   await ensureActivityOpen(page);
-  const output = page
-    .locator(".activity-rail")
-    .getByRole("button", { name: /Release pulse/ });
+  const output = releasePulseArtifact(page);
   await output.focus();
   await output.press("Enter");
   const activityTrigger = page.getByRole("button", { name: "Open activity" });
@@ -566,11 +943,11 @@ test("honors reduced motion for live status animation", async (
   test.skip(testInfo.project.name !== "desktop");
   await page.emulateMedia({ reducedMotion: "reduce" });
   await selectSession(page, "Refine onboarding preview");
-  const spinner = page.locator(".spin").first();
-  await expect(spinner).toBeVisible();
+  const liveDot = page.locator(".live-dots i").first();
+  await expect(liveDot).toBeVisible();
   await expect
     .poll(() =>
-      spinner.evaluate((element) => {
+      liveDot.evaluate((element) => {
         const style = getComputedStyle(element);
         const duration = style.animationDuration.trim();
         const durationMs = duration.endsWith("ms")
@@ -601,10 +978,7 @@ test("preserves core flows at a 200-percent equivalent reflow", async (
     page.getByText("The candidate is ready for review.", { exact: false }),
   ).toBeVisible();
   await ensureActivityOpen(page);
-  await page
-    .locator(".activity-rail")
-    .getByRole("button", { name: /Release pulse/ })
-    .click();
+  await releasePulseArtifact(page).click();
   await expect(page.getByLabel("Release pulse inspector")).toBeVisible();
   await page.getByRole("button", { name: "Close inspector" }).click();
   await expect(page.getByLabel("Release pulse inspector")).toHaveCount(0);
@@ -641,10 +1015,7 @@ test("does not make outbound requests or overflow the viewport", async ({
   await page.reload();
   await selectSession(page, "Review release readiness");
   await ensureActivityOpen(page);
-  await page
-    .locator(".activity-rail")
-    .getByRole("button", { name: /Release pulse/ })
-    .click();
+  await releasePulseArtifact(page).click();
   await expect(page.getByTitle("Release pulse")).toBeVisible();
   await expectNoViewportOverflow(page);
   expect(external).toEqual([]);

@@ -10,17 +10,26 @@ mod actor;
 mod attachment;
 mod bounds;
 mod command;
+mod document_ingest;
+mod document_store;
 mod embedded_web;
 mod error;
 mod event;
 mod ids;
 mod journal;
 mod model;
+mod prompt_context;
+mod project_registry;
+mod repository_context;
 mod resource;
+mod runtime_status;
 mod service;
 mod supervisor;
+mod test_results;
 mod theme;
+mod transcript_search;
 mod transport;
+mod trusted_files;
 
 pub use actor::{
     ActorConfig, ActorError, ActorView, CommandAdmission, SessionActor, SessionActorCore,
@@ -37,7 +46,18 @@ pub use bounds::{
 };
 pub use command::{
     AckDisposition, AttachmentRef, CommandAck, HostAckDisposition, HostCommand, HostCommandAck,
-    HostCommandEnvelope, PromptInput, RequestAnswer, SessionCommand, SessionCommandEnvelope,
+    HostCommandEnvelope, PermanentDeleteConfirmation, PromptInput, RequestAnswer, SessionCommand,
+    SessionCommandEnvelope,
+};
+pub use document_ingest::{
+    ingest_document, DocumentIngestError, DocumentMediaType, DocumentProvenance,
+    ExtractionFidelity, IngestedDocument, MAX_DOCUMENT_FILE_BYTES, MAX_DOCUMENT_TEXT_BYTES,
+    MAX_PDF_NESTING_DEPTH, MAX_PDF_OBJECTS, MAX_PDF_PAGES, MAX_PDF_STREAM_DECOMPRESSED_BYTES,
+    MAX_PDF_TOTAL_DECOMPRESSED_BYTES,
+};
+pub use document_store::{
+    DocumentId, DocumentPromptContext, DocumentReference, DocumentStore, DocumentStoreError,
+    StoredDocument, MAX_DOCUMENTS_PER_PROMPT, MAX_STORED_DOCUMENTS_PER_SESSION,
 };
 pub use error::{ErrorCode, SanitizedError};
 pub use event::{
@@ -50,15 +70,37 @@ pub use ids::{
 };
 pub use journal::{EventJournal, JournalConfig, JournalError};
 pub use model::{
-    ActorOwnerState, ArtifactKind, ArtifactRef, AttachmentPolicy, AttentionState, AuthorityProfile,
-    CatalogCursor, ContextUsage, FileChange, HostBootstrap, HostCapabilities, HostDescriptor,
-    InputModality, ItemLifecycle, ItemPayload, ModelSelection, ModelSummary, PendingRequest,
-    PlanStep, PlanStepState, PreviewRef, ProjectSummary, RequestKind, RequestState, RunOutcome,
-    SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionCursor, SessionItem,
-    SessionLiveState, SessionSnapshot, SessionSummary, SourceKind, SourceRef, UsageSnapshot,
+    ActivityPhase, ActivityPhaseSummary, ActorOwnerState, ArtifactKind, ArtifactRef,
+    AttachmentPolicy, AttentionState, AuthorityProfile, CatalogCursor, CompletionReview,
+    ContextUsage, ConversationBranchOperation, ConversationBranchProvenance, EvidenceCoverage,
+    FileChange, HostBootstrap, HostCapabilities, HostDescriptor, InputModality, ItemLifecycle,
+    ItemPayload, ModelSelection, ModelSummary, PendingRequest,
+    PlanStep, PlanStepState, PreviewRef, ProjectCatalog, ProjectSummary, RequestKind, RequestState,
+    RunOutcome, SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph,
+    SessionCatalogState, SessionCursor, SessionItem, SessionLiveState, SessionRetention,
+    SessionSnapshot, SessionSummary, SourceKind, SourceRef,
+    ToolActivity, ToolActivityStatus, ToolKind, ToolResultSummary, UsageSnapshot,
     UserMessageDelivery,
 };
+pub use prompt_context::{
+    compose_prompt_text, ComposedPromptText, PromptContextError,
+    MAX_AUXILIARY_PROMPT_CONTEXT_BYTES, MAX_DOCUMENT_CONTEXT_BYTES,
+    MAX_PROJECT_FILE_CONTEXT_BYTES,
+};
+pub use project_registry::{
+    ProjectId as RegistryProjectId, ProjectRegistry, ProjectRegistryError, ProjectRoot,
+    ProjectState as RegistryProjectState, ProjectSummary as RegistryProjectSummary,
+    MAX_PROJECTS as MAX_REGISTERED_PROJECTS, MAX_REGISTRY_STATE_BYTES,
+};
+pub use repository_context::{
+    refresh_repository_context, ContextRefreshState, ContextRefreshStatus,
+    FolderInstructionContext, FolderInstructionFile, GitBranchState, GitRepositoryContext,
+    GitWorktreeState, InstructionLoadError, InstructionLoadErrorCode, InstructionOrigin,
+    InstructionStateSource, RepositoryContextError, RepositoryContextLoader,
+    RepositoryContextSnapshot, RepositoryStateSource, RepositoryTrust,
+};
 pub use resource::{ResourceReference, ResourceStore, ResourceStoreError};
+pub use runtime_status::*;
 pub use service::{
     CreateSessionRequest, DriverCommandOutcome, DriverFinalizer, FinalizeCompletion,
     FinalizeDecision, HostService, ServiceError, SessionDriver, SessionSeed, StoredResource,
@@ -69,7 +111,32 @@ pub use theme::{
     ColorScheme, SemanticRole, ThemeColor, ThemeDensity, ThemeDto, ThemeMotion, ThemeOption,
     ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
 };
+pub use test_results::{
+    decode_structured_test_results, parse_test_output, ReportedTestCounts, StructuredTestCase,
+    StructuredTestResults, StructuredTestSuite, TestCommandOutcome, TestCommandStatus,
+    TestEvidenceCoverage, TestFramework, TestOutputInput, TestParseCoverage, TestResultDecodeError,
+    TestResultParseError, TestResultParser, TestStatus, TestVerificationOutcome,
+    MAX_REPORTED_TESTS, MAX_STRUCTURED_TEST_RESULTS_BYTES, MAX_TEST_CASES,
+    MAX_TEST_CASES_PER_SUITE, MAX_TEST_LABEL_BYTES, MAX_TEST_OUTPUT_BYTES,
+    MAX_TEST_OUTPUT_LINE_BYTES, MAX_TEST_OUTPUT_LINES, MAX_TEST_RESULT_LABEL_BYTES,
+    MAX_TEST_SUITES, MAX_TEST_SUMMARIES,
+};
+pub use transcript_search::{
+    SearchDocument, SearchDocumentKind, SearchError, SearchFilter, SearchHit, SearchMatchRange,
+    TranscriptSearchIndex, TranscriptSearchLimits, TranscriptSearchRequest,
+    TranscriptSearchResult, TranscriptSearchStats, MAX_SEARCH_DOCUMENTS,
+    MAX_SEARCH_DOCUMENTS_PER_SESSION, MAX_SEARCH_DOCUMENT_TEXT_BYTES,
+    MAX_SEARCH_INDEXED_TEXT_BYTES, MAX_SEARCH_POSTINGS, MAX_SEARCH_QUERY_CHARS,
+    MAX_SEARCH_QUERY_TERMS, MAX_SEARCH_RESULTS, MAX_SEARCH_SNIPPET_CHARS,
+    MAX_SEARCH_TERMS_PER_DOCUMENT, MAX_SEARCH_TERM_CHARS, MAX_SEARCH_UNIQUE_TERMS,
+};
 pub use transport::{LoopbackConfig, LoopbackServer, TransportError};
+pub use trusted_files::{
+    FileEntryId, TrustedFileContext, TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary,
+    TrustedFileKind, TrustedFileRead, TrustedFileSearchHit, TrustedFileSearchResult,
+    TrustedProjectFiles, MAX_TRUSTED_FILE_BYTES, MAX_TRUSTED_FILE_CONTEXT_BYTES,
+    MAX_TRUSTED_FILES_PER_CONTEXT,
+};
 
 /// Current experimental wire-protocol major.
 pub const PROTOCOL_VERSION: u16 = 1;

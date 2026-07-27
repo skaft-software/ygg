@@ -1,4 +1,6 @@
 import {
+  Bell,
+  BellOff,
   Check,
   ChevronRight,
   FolderClock,
@@ -16,6 +18,10 @@ interface SettingsViewProps {
   selectedThemeId: string;
   selectionAvailable: boolean;
   onThemeChange: (themeId: string) => void;
+  notificationsSupported: boolean;
+  notificationsEnabled: boolean;
+  notificationPermission: NotificationPermission | "unsupported";
+  onNotificationsChange: (enabled: boolean) => Promise<boolean>;
 }
 
 const fontStacks = [
@@ -68,6 +74,10 @@ export function SettingsView({
   selectedThemeId,
   selectionAvailable,
   onThemeChange,
+  notificationsSupported,
+  notificationsEnabled,
+  notificationPermission,
+  onNotificationsChange,
 }: SettingsViewProps) {
   const [fontStackId, setFontStackId] = useState(() => {
     const stored = localStorage.getItem("ygg.ui.font");
@@ -75,6 +85,10 @@ export function SettingsView({
   });
   const [uiSize, setUiSize] = useState(
     () => Number(localStorage.getItem("ygg.ui.size") ?? "13"),
+  );
+  const [notificationPending, setNotificationPending] = useState(false);
+  const [notificationMessage, setNotificationMessage] = useState<string | null>(
+    null,
   );
 
   useEffect(() => {
@@ -228,6 +242,71 @@ export function SettingsView({
             </span>
             <FolderClock aria-hidden="true" />
           </div>
+        </div>
+      </section>
+
+      <section
+        className="settings-section"
+        aria-labelledby="notifications-title"
+      >
+        <div className="settings-section-heading">
+          <Bell aria-hidden="true" />
+          <div>
+            <h2 id="notifications-title">Background attention</h2>
+            <p>
+              Opt in to device notifications when a background session
+              finishes, fails, or needs your input.
+            </p>
+          </div>
+        </div>
+        <div className="settings-rows">
+          <button
+            type="button"
+            className="settings-toggle-row"
+            role="switch"
+            aria-checked={notificationsEnabled}
+            disabled={!notificationsSupported || notificationPending}
+            onClick={() => {
+              setNotificationPending(true);
+              setNotificationMessage(null);
+              void onNotificationsChange(!notificationsEnabled)
+                .then((enabled) => {
+                  if (!enabled && !notificationsEnabled) {
+                    setNotificationMessage(
+                      notificationPermission === "denied"
+                        ? "Notifications are blocked in browser settings."
+                        : "Notification permission was not granted.",
+                    );
+                  }
+                })
+                .finally(() => setNotificationPending(false));
+            }}
+          >
+            <span>
+              <strong>
+                {notificationsEnabled
+                  ? "Notifications enabled"
+                  : "Notify me about background work"}
+              </strong>
+              <small>
+                {!notificationsSupported
+                  ? "Notifications are unavailable in this browser."
+                  : notificationPermission === "denied"
+                    ? "Blocked by browser settings."
+                    : "Session titles only; no prompt or tool content is included."}
+              </small>
+            </span>
+            {notificationsEnabled ? (
+              <Bell aria-hidden="true" />
+            ) : (
+              <BellOff aria-hidden="true" />
+            )}
+          </button>
+          {notificationMessage ? (
+            <p className="settings-inline-message" role="status">
+              {notificationMessage}
+            </p>
+          ) : null}
         </div>
       </section>
     </main>

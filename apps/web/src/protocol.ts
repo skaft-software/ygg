@@ -60,8 +60,90 @@ export interface ThemeOption {
 export interface ProjectSummary {
   id: string;
   name: string;
-  pathLabel: string;
   trusted: boolean;
+  archived: boolean;
+  available: boolean;
+  isDefault: boolean;
+  sessionCount: number;
+  liveSessionCount: number;
+}
+
+export interface ProjectCatalog {
+  host: {
+    id: string;
+    name: string;
+  };
+  catalogRevision: number;
+  lifecycleMutationsSupported: boolean;
+  importSupported: boolean;
+  projects: ProjectSummary[];
+}
+
+export type ContextRefreshState =
+  | "current"
+  | "partial"
+  | "notApplicable"
+  | "unavailable"
+  | "timedOut";
+
+export interface ContextRefreshStatus {
+  state: ContextRefreshState;
+  refreshedAtUnixMs: number;
+  durationMs: number;
+  truncated: boolean;
+}
+
+export interface InstructionOrigin {
+  relativePath: string;
+  scope: string;
+}
+
+export type InstructionLoadErrorCode =
+  | "directoryUnavailable"
+  | "unsupportedName"
+  | "symlinkRejected"
+  | "notRegularFile"
+  | "hardLinkRejected"
+  | "fileTooLarge"
+  | "aggregateLimitReached"
+  | "changedDuringRead"
+  | "invalidUtf8"
+  | "binaryContent"
+  | "discoveryLimitReached";
+
+export interface RepositoryContextSnapshot {
+  projectId: string;
+  trust: "verified";
+  repository: {
+    source: "gitStatusPorcelainV2";
+    refresh: ContextRefreshStatus;
+    worktree: "present" | "notRepository" | "unknown";
+    head?: string;
+    branchState: "named" | "detached" | "unborn" | "unknown";
+    branch?: string;
+    dirty?: boolean;
+    ahead?: number;
+    behind?: number;
+  };
+  instructions: {
+    source: "projectAgentsMdV1";
+    refresh: ContextRefreshStatus;
+    files: Array<{
+      origin: InstructionOrigin;
+      precedence: number;
+      byteLen: number;
+      sha256: string;
+      summary: string;
+      visibleContent: string;
+      contentTruncated: boolean;
+    }>;
+    errors: Array<{
+      origin?: InstructionOrigin;
+      code: InstructionLoadErrorCode;
+    }>;
+    omittedErrors: number;
+    loadedBytes: number;
+  };
 }
 
 export interface ModelSummary {
@@ -84,6 +166,13 @@ export interface SessionSummary {
   updatedAt: string;
   pinned: boolean;
   archived: boolean;
+  lifecycle: "active" | "archived" | "trash";
+  retention?: {
+    trashedAtMs: number;
+    purgeAfterMs: number;
+    permanentDeleteRequiresConfirmation: true;
+  };
+  forkedFrom?: ConversationBranchProvenance;
   unread: boolean;
   modelId: string;
   attentionCount: number;
@@ -116,7 +205,12 @@ export interface HostBootstrap {
     pairDevices: boolean;
     sessionMetadata: boolean;
     sessionBranches: boolean;
+    conversationBranching: boolean;
+    sessionTrash: boolean;
     sessionExport: boolean;
+    documents: boolean;
+    trustedProjectFiles: boolean;
+    transcriptSearch: boolean;
     themeSelection: boolean;
     steer: boolean;
     followUp: boolean;
@@ -130,9 +224,105 @@ export interface AttachmentPolicy {
   maxTotalBytes: number;
 }
 
+export interface DocumentReference {
+  id: string;
+  displayName: string;
+  mediaType: "text/plain" | "text/markdown" | "application/pdf";
+  sourceByteCount: number;
+  extractedTextByteCount: number;
+  sha256: string;
+  fidelity: "exactUtf8" | "pdfTextOnlyPartial";
+  pageCount?: number;
+  createdAtMs: number;
+}
+
+export type TrustedFileKind =
+  | "documentation"
+  | "source"
+  | "configuration"
+  | "text";
+
+export interface TrustedFileEntry {
+  id: string;
+  relativePath: string;
+  displayName: string;
+  kind: TrustedFileKind;
+  byteLen: number;
+}
+
+export interface TrustedFileIndexSummary {
+  indexedFiles: number;
+  ignoredEntries: number;
+  truncated: boolean;
+}
+
+export interface TrustedFileCatalog {
+  summary: TrustedFileIndexSummary;
+  files: TrustedFileEntry[];
+}
+
+export interface TrustedFileSearchHit {
+  entry: TrustedFileEntry;
+  snippet: string;
+  line?: number;
+}
+
+export interface TrustedFileSearchResult {
+  hits: TrustedFileSearchHit[];
+  truncated: boolean;
+  scannedBytes: number;
+}
+
+export interface TrustedFileRead {
+  entry: TrustedFileEntry;
+  text: string;
+  sha256: string;
+}
+
+export type TranscriptSearchKind =
+  | "user"
+  | "assistant"
+  | "tool"
+  | "error"
+  | "attachment";
+
+export interface TranscriptSearchRequest {
+  query: string;
+  filter: {
+    sessionId?: string;
+    kinds?: TranscriptSearchKind[];
+  };
+  limit: number;
+}
+
+export interface SearchMatchRange {
+  startChar: number;
+  endChar: number;
+}
+
+export interface TranscriptSearchHit {
+  sessionId: string;
+  itemId: string;
+  kind: TranscriptSearchKind;
+  sessionTitle: string;
+  snippet: string;
+  matchRanges: SearchMatchRange[];
+  titleMatchRanges: SearchMatchRange[];
+  timestampMs: number;
+  score: number;
+}
+
+export interface TranscriptSearchResult {
+  hits: TranscriptSearchHit[];
+  truncated: boolean;
+}
+
 interface ItemBase {
   id: string;
+  runId?: string;
   turnId: string;
+  providerAttempt?: number;
+  durableEntryId?: string;
   createdAt: string;
   state: ItemState;
 }
@@ -141,7 +331,10 @@ export interface UserMessageItem extends ItemBase {
   kind: "user_message";
   content: string;
   attachments?: AttachmentRef[];
+  documents?: DocumentReference[];
+  projectFiles?: TrustedFileEntry[];
   delivery?: "submit" | "steer" | "followUp";
+  branchProvenance?: ConversationBranchProvenance;
 }
 
 export interface AssistantMessageItem extends ItemBase {
@@ -158,22 +351,56 @@ export interface ReasoningItem extends ItemBase {
 export type ActionKind =
   | "command"
   | "file_read"
+  | "file_search"
   | "file_write"
   | "web_search"
+  | "skill"
   | "preview"
   | "analysis";
 
-export interface ActionItem extends ItemBase {
-  kind: "action";
+export type ActivityPhase =
+  | "investigated"
+  | "changed"
+  | "verified"
+  | "produced"
+  | "other";
+
+export type ActionStatus =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "stopped";
+
+export interface ActionPresentation {
   actionKind: ActionKind;
+  phase: ActivityPhase;
+  status: ActionStatus;
+  rawToolName: string;
   label: string;
+  summary?: string;
   target?: string;
   detail?: string;
+  cwd?: string;
+  commandPreview?: string;
+  exitCode?: number;
+  signal?: number;
+  startedAt?: string;
+  completedAt?: string;
   durationMs?: number;
+  outputSummary?: string;
+  outputHandle?: string;
+  observedOutputBytes: number;
+  droppedOutputBytes: number;
+  changedPaths: string[];
+  sourceIds: string[];
+  outputIds: string[];
+}
+
+export interface ActionItem extends ItemBase, ActionPresentation {
+  kind: "action";
+  originItemId?: string;
   additions?: number;
   deletions?: number;
-  sourceIds?: string[];
-  outputIds?: string[];
   diffHandle?: string;
   resultHandle?: string;
 }
@@ -200,6 +427,88 @@ export interface RunOutcomeItem extends ItemBase {
   outcome: "done" | "failed" | "stopped";
   durationMs: number;
   summary: string;
+  review: CompletionReview;
+}
+
+export interface ActivityPhaseSummary {
+  phase: ActivityPhase;
+  actionCount: number;
+  succeededCount: number;
+  failedCount: number;
+  stoppedCount: number;
+}
+
+export type TestFramework =
+  | "cargoLibtest"
+  | "vitest"
+  | "jest"
+  | "pytest"
+  | "goTest";
+
+export type TestStatus = "passed" | "failed" | "skipped" | "error";
+
+export interface ReportedTestCounts {
+  total?: number;
+  passed?: number;
+  failed?: number;
+  skipped?: number;
+  errors?: number;
+}
+
+export interface StructuredTestCase {
+  name: string;
+  status: TestStatus;
+}
+
+export interface StructuredTestSuite {
+  name: string;
+  status?: TestStatus;
+  reported: ReportedTestCounts;
+  cases: StructuredTestCase[];
+}
+
+export interface StructuredTestResults {
+  originItemId: string;
+  framework: TestFramework;
+  parser:
+    | "cargoLibtestTextV1"
+    | "vitestTextV1"
+    | "jestTextV1"
+    | "pytestTextV1"
+    | "goTestTextV1";
+  command: {
+    status: "succeeded" | "failed" | "stopped";
+    exitCode?: number;
+    signal?: number;
+  };
+  verification: "passed" | "failed" | "stopped" | "inconclusive";
+  reported: ReportedTestCounts;
+  reportedSuites: ReportedTestCounts;
+  summaryCount: number;
+  suites: StructuredTestSuite[];
+  coverage: {
+    inputTruncated: boolean;
+    recordsTruncated: boolean;
+    unsupportedSummaryFields: boolean;
+    summaries: "none" | "partial" | "complete";
+    cases: "none" | "partial" | "complete";
+  };
+}
+
+export interface CompletionReview {
+  summary: string;
+  durationMs: number;
+  actionCount: number;
+  phases: ActivityPhaseSummary[];
+  changedFileItemIds: string[];
+  verificationActionItemIds: string[];
+  failedActionItemIds: string[];
+  warningActionItemIds: string[];
+  sourceIds: string[];
+  outputIds: string[];
+  testResults: StructuredTestResults[];
+  evidenceCoverage: "none" | "partial" | "complete";
+  openQuestions: string[];
 }
 
 export type TranscriptItem =
@@ -283,6 +592,27 @@ export interface SessionBranchGraph {
   truncated: boolean;
 }
 
+export type ConversationBranchOperation =
+  | "editUserTurn"
+  | "retryResponse"
+  | "forkSession";
+
+export interface BranchModelSelection {
+  provider: string;
+  model: string;
+  reasoning: ReasoningEffort;
+}
+
+export interface ConversationBranchProvenance {
+  operation: ConversationBranchOperation;
+  sourceSessionId: string;
+  sourceEntryId: string;
+  originatingUserEntryId?: string;
+  modelOverride?: BranchModelSelection;
+  externalEffectsPreserved: true;
+  warning: string;
+}
+
 export interface SessionSnapshot {
   sessionId: string;
   actorGeneration: number;
@@ -362,14 +692,33 @@ export type SessionEvent =
       itemId: string;
     }
   | {
-      type: "item.tool_result";
+      type: "item.activity";
+      sessionId: string;
+      actorGeneration?: number;
+      sequence: number;
+      itemId: string;
+      activity: ActionPresentation;
+    }
+  | {
+      type: "item.activity_result";
       sessionId: string;
       actorGeneration?: number;
       sequence: number;
       itemId: string;
       resultItemId: string;
-      detail: string;
-      state: ItemState;
+      result: Pick<
+        ActionPresentation,
+        | "status"
+        | "summary"
+        | "exitCode"
+        | "signal"
+        | "completedAt"
+        | "durationMs"
+        | "outputSummary"
+        | "outputHandle"
+        | "observedOutputBytes"
+        | "droppedOutputBytes"
+      >;
     }
   | {
       type: "session.branchEntriesAppended";
@@ -423,10 +772,44 @@ export type ClientCommand =
     }
   | {
       id: string;
+      type: "project.import";
+      candidateId: string;
+      displayName?: string;
+    }
+  | {
+      id: string;
+      type: "project.rename";
+      projectId: string;
+      displayName: string;
+    }
+  | {
+      id: string;
+      type: "project.setDefault";
+      projectId: string;
+    }
+  | {
+      id: string;
+      type: "project.clearDefault";
+    }
+  | {
+      id: string;
+      type: "project.setTrust";
+      projectId: string;
+      trusted: boolean;
+    }
+  | {
+      id: string;
+      type: "project.archive";
+      projectId: string;
+    }
+  | {
+      id: string;
       type: "session.submit";
       sessionId: string;
       prompt: string;
       attachments: AttachmentRef[];
+      documentIds?: string[];
+      projectFileIds?: string[];
     }
   | {
       id: string;
@@ -434,6 +817,8 @@ export type ClientCommand =
       sessionId: string;
       prompt: string;
       attachments: AttachmentRef[];
+      documentIds?: string[];
+      projectFileIds?: string[];
     }
   | {
       id: string;
@@ -441,6 +826,8 @@ export type ClientCommand =
       sessionId: string;
       prompt: string;
       attachments: AttachmentRef[];
+      documentIds?: string[];
+      projectFileIds?: string[];
     }
   | {
       id: string;
@@ -481,6 +868,46 @@ export type ClientCommand =
     }
   | {
       id: string;
+      type: "session.editUserTurn";
+      sessionId: string;
+      sourceUserEntryId: string;
+      prompt: string;
+      attachments: AttachmentRef[];
+      documentIds?: string[];
+      projectFileIds?: string[];
+    }
+  | {
+      id: string;
+      type: "session.retryResponse";
+      sessionId: string;
+      sourceAssistantEntryId: string;
+      modelId?: string;
+      reasoning?: ReasoningEffort;
+    }
+  | {
+      id: string;
+      type: "session.forkConversation";
+      sessionId: string;
+      entryId: string;
+    }
+  | {
+      id: string;
+      type: "session.setLifecycle";
+      sessionId: string;
+      lifecycle: "active" | "archived" | "trash";
+    }
+  | {
+      id: string;
+      type: "session.deletePermanently";
+      sessionId: string;
+      confirmation: {
+        sessionId: string;
+        trashedAtMs: number;
+        phrase: string;
+      };
+    }
+  | {
+      id: string;
       type: "approval.resolve";
       sessionId: string;
       requestId: string;
@@ -501,11 +928,31 @@ export type ClientCommand =
       themeId: string;
     };
 
+export type CommandErrorCode =
+  | "incompatibleProtocol"
+  | "invalidCommand"
+  | "commandIdConflict"
+  | "staleGeneration"
+  | "notFound"
+  | "alreadyResolved"
+  | "replayGap"
+  | "payloadTooLarge"
+  | "unauthorized"
+  | "invalidBoundary"
+  | "locked"
+  | "unavailable"
+  | "internal";
+
 export interface CommandAck {
   commandId: string;
   accepted: boolean;
   error?: string;
+  errorCode?: CommandErrorCode;
+  retryable?: boolean;
+  currentGeneration?: number;
   createdSessionId?: string;
+  project?: ProjectSummary;
+  catalogChanged?: boolean;
 }
 
 export interface ConnectedDevice {

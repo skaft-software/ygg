@@ -29,9 +29,10 @@ use tokio::task::JoinHandle;
 
 use crate::embedded_web::WebBundle;
 use crate::{
-    AttachmentError, HostCommandEnvelope, HostService, ProtocolValidation, SanitizedError,
-    ServiceError, SessionCommandEnvelope, SessionCursor, SessionId, SessionSupervisor,
-    SupervisorError, MAX_ATTACHMENT_FILE_BYTES, MAX_COMMAND_BYTES, PROTOCOL_VERSION,
+    AttachmentError, FileEntryId, HostCommandEnvelope, HostService, ProjectId,
+    ProtocolValidation, SanitizedError, ServiceError, SessionCommandEnvelope, SessionCursor,
+    SessionId, SessionSupervisor, SupervisorError, MAX_ATTACHMENT_FILE_BYTES, MAX_COMMAND_BYTES,
+    MAX_DOCUMENT_FILE_BYTES, PROTOCOL_VERSION,
 };
 
 const MAX_QUERY_BYTES: usize = 4 * 1024;
@@ -303,11 +304,45 @@ struct AttachmentUploadQuery {
     display_name: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DocumentUploadQuery {
+    display_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrustedFileListQuery {
+    #[serde(default = "default_file_list_limit")]
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrustedFileSearchQuery {
+    query: String,
+    #[serde(default = "default_file_search_limit")]
+    limit: usize,
+}
+
+fn default_file_list_limit() -> usize {
+    200
+}
+
+fn default_file_search_limit() -> usize {
+    50
+}
+
 fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
     Router::new()
         .route("/", get(index::<H>))
         .route("/__ygg/launch/{token}", get(exchange_launch_token::<H>))
         .route("/api/v1/bootstrap", get(bootstrap::<H>))
+        .route("/api/v1/projects", get(project_catalog::<H>))
+        .route(
+            "/api/v1/projects/{project_id}/context",
+            get(repository_context::<H>),
+        )
         .route("/api/v1/sessions/{session_id}", get(session_snapshot::<H>))
         .route(
             "/api/v1/sessions/{session_id}/replay",
@@ -326,11 +361,33 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
             post(session_command::<H>).layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES)),
         )
         .route(
+            "/api/v1/search",
+            post(transcript_search::<H>).layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES)),
+        )
+        .route(
             "/api/v1/attachments",
             post(ingest_attachment::<H>)
                 .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_FILE_BYTES + 1)),
         )
         .route("/api/v1/attachments/{handle}", get(attachment_content::<H>))
+        .route(
+            "/api/v1/sessions/{session_id}/documents",
+            get(list_documents::<H>)
+                .post(ingest_document::<H>)
+                .layer(DefaultBodyLimit::max(MAX_DOCUMENT_FILE_BYTES + 1)),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/files",
+            get(list_trusted_files::<H>),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/files/search",
+            get(search_trusted_files::<H>),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/files/{entry_id}",
+            get(read_trusted_file::<H>),
+        )
         .route(
             "/api/v1/sessions/{session_id}/resources/{handle}",
             get(resource_content::<H>),
@@ -343,6 +400,220 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
             secure_request::<H>,
         ))
         .with_state(state)
+}
+
+async fn ingest_document<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_session_id): Path<String>,
+    query: Result<Query<DocumentUploadQuery>, axum::extract::rejection::QueryRejection>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    if !state.supervisor.document_ingest_supported() {
+        return service_error_response(ServiceError::Unavailable);
+    }
+    let session_id = match SessionId::new(raw_session_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_request(),
+    };
+    let media_type = match headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+    {
+        Some("text/plain" | "text/markdown" | "application/pdf") => headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned(),
+        _ => {
+            return error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                SanitizedError::public(
+                    crate::ErrorCode::InvalidCommand,
+                    "Only UTF-8 text, Markdown, and ordinary PDF documents are accepted.",
+                ),
+            )
+        }
+    };
+    let mut stream = body.into_data_stream();
+    let mut bytes = BytesMut::with_capacity(
+        headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or_default()
+            .min(MAX_DOCUMENT_FILE_BYTES),
+    );
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => return invalid_request(),
+        };
+        if bytes
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > MAX_DOCUMENT_FILE_BYTES)
+        {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                SanitizedError::public(
+                    crate::ErrorCode::PayloadTooLarge,
+                    "The document exceeds the host limit.",
+                ),
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    match state
+        .supervisor
+        .ingest_document(
+            &session_id,
+            &query.display_name,
+            &media_type,
+            bytes.freeze(),
+        )
+        .await
+    {
+        Ok(reference) => Json(reference).into_response(),
+        Err(error) => service_error_response(error),
+    }
+}
+
+async fn list_documents<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_session_id): Path<String>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    let session_id = match SessionId::new(raw_session_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    match state.supervisor.list_documents(&session_id).await {
+        Ok(documents) => Json(documents).into_response(),
+        Err(error) => service_error_response(error),
+    }
+}
+
+async fn list_trusted_files<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_project_id): Path<String>,
+    query: Result<Query<TrustedFileListQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    if !state.supervisor.trusted_project_files_supported() {
+        return service_error_response(ServiceError::Unavailable);
+    }
+    let project_id = match ProjectId::new(raw_project_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_request(),
+    };
+    let summary = match state.supervisor.trusted_file_index(&project_id).await {
+        Ok(summary) => summary,
+        Err(error) => return service_error_response(error),
+    };
+    match state
+        .supervisor
+        .list_trusted_files(&project_id, query.limit)
+        .await
+    {
+        Ok(files) => Json(serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "summary": summary,
+            "files": files,
+        }))
+        .into_response(),
+        Err(error) => service_error_response(error),
+    }
+}
+
+async fn repository_context<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_project_id): Path<String>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    if !state.supervisor.repository_context_supported() {
+        return service_error_response(ServiceError::Unavailable);
+    }
+    let project_id = match ProjectId::new(raw_project_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    match state.supervisor.repository_context(&project_id).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => service_error_response(error),
+    }
+}
+
+async fn search_trusted_files<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_project_id): Path<String>,
+    query: Result<Query<TrustedFileSearchQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    let project_id = match ProjectId::new(raw_project_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_request(),
+    };
+    match state
+        .supervisor
+        .search_trusted_files(&project_id, &query.query, query.limit)
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => service_error_response(error),
+    }
+}
+
+async fn read_trusted_file<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path((raw_project_id, raw_entry_id)): Path<(String, String)>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    let project_id = match ProjectId::new(raw_project_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    let entry_id = match FileEntryId::parse(raw_entry_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    match state
+        .supervisor
+        .read_trusted_file(&project_id, &entry_id)
+        .await
+    {
+        Ok(file) => Json(file).into_response(),
+        Err(error) => service_error_response(error),
+    }
 }
 
 async fn ingest_attachment<H: HostService>(
@@ -773,6 +1044,16 @@ async fn bootstrap<H: HostService>(
     }
 }
 
+async fn project_catalog<H: HostService>(State(state): State<Arc<TransportState<H>>>) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    match state.supervisor.project_catalog().await {
+        Ok(catalog) => Json(catalog).into_response(),
+        Err(error) => supervisor_error_response(error),
+    }
+}
+
 async fn session_snapshot<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
     Path(raw_session_id): Path<String>,
@@ -850,6 +1131,26 @@ async fn session_command<H: HostService>(
     match state.supervisor.command(envelope, now_ms()).await {
         Ok(admission) => Json(admission.ack).into_response(),
         Err(error) => supervisor_error_response(error),
+    }
+}
+
+async fn transcript_search<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    payload: Result<Json<crate::TranscriptSearchRequest>, JsonRejection>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    if !state.supervisor.transcript_search_supported() {
+        return service_error_response(ServiceError::Unavailable);
+    }
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(_) => return invalid_request(),
+    };
+    match state.supervisor.search_transcripts(&request).await {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => service_error_response(error),
     }
 }
 
@@ -931,6 +1232,9 @@ async fn secure_request<H: HostService>(
     let headers = request.headers();
     let attachment_upload =
         request.method() == Method::POST && request.uri().path() == "/api/v1/attachments";
+    let document_upload = request.method() == Method::POST
+        && request.uri().path().starts_with("/api/v1/sessions/")
+        && request.uri().path().ends_with("/documents");
     let session_export = request.method() == Method::GET
         && request.uri().path().starts_with("/api/v1/sessions/")
         && request.uri().path().ends_with("/export");
@@ -982,6 +1286,8 @@ async fn secure_request<H: HostService>(
             .attachment_policy()
             .map(|policy| policy.max_file_bytes as usize)
             .unwrap_or(MAX_ATTACHMENT_FILE_BYTES)
+    } else if document_upload {
+        MAX_DOCUMENT_FILE_BYTES
     } else {
         MAX_COMMAND_BYTES
     };
@@ -1005,6 +1311,17 @@ async fn secure_request<H: HostService>(
                             .iter()
                             .any(|accepted| accepted == value)
                     })
+                } else if document_upload {
+                    value
+                        .split(';')
+                        .next()
+                        .map(str::trim)
+                        .is_some_and(|media_type| {
+                            matches!(
+                                media_type,
+                                "text/plain" | "text/markdown" | "application/pdf"
+                            )
+                        })
                 } else {
                     value
                         .split(';')
@@ -1085,6 +1402,67 @@ fn supervisor_error_response(error: SupervisorError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             SanitizedError::internal(),
         ),
+    }
+}
+
+fn service_error_response(error: ServiceError) -> Response {
+    match error {
+        ServiceError::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            SanitizedError::public(
+                crate::ErrorCode::NotFound,
+                "The requested local resource was not found.",
+            ),
+        ),
+        ServiceError::Unauthorized => error_response(
+            StatusCode::FORBIDDEN,
+            SanitizedError::public(
+                crate::ErrorCode::Unauthorized,
+                "Explicit project trust is required for this operation.",
+            ),
+        ),
+        ServiceError::InvalidBoundary => error_response(
+            StatusCode::BAD_REQUEST,
+            SanitizedError::public(
+                crate::ErrorCode::InvalidCommand,
+                "The requested local resource operation is invalid.",
+            ),
+        ),
+        ServiceError::PayloadTooLarge => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            SanitizedError::public(
+                crate::ErrorCode::PayloadTooLarge,
+                "The requested local resource exceeds its bounded limit.",
+            ),
+        ),
+        ServiceError::Unavailable => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            SanitizedError::public(
+                crate::ErrorCode::Unavailable,
+                "The requested local resource is temporarily unavailable.",
+            )
+            .with_retryable(true),
+        ),
+        ServiceError::CorruptResource => error_response(
+            StatusCode::GONE,
+            SanitizedError::public(
+                crate::ErrorCode::Unavailable,
+                "The requested local resource is no longer available.",
+            ),
+        ),
+        ServiceError::Locked => error_response(
+            StatusCode::CONFLICT,
+            SanitizedError::public(
+                crate::ErrorCode::Locked,
+                "The requested local resource is currently locked.",
+            ),
+        ),
+        ServiceError::InvalidSeed | ServiceError::OwnerLost | ServiceError::Internal => {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                SanitizedError::internal(),
+            )
+        }
     }
 }
 
@@ -1561,6 +1939,9 @@ mod tests {
                 modified_at_ms: generation,
                 pinned: false,
                 archived: false,
+                lifecycle: crate::SessionCatalogState::Active,
+                retention: None,
+                forked_from: None,
                 provisional,
                 live_state: SessionLiveState::Idle,
                 attention: AttentionState::None,
@@ -1780,6 +2161,24 @@ mod tests {
         let cookie = set_cookie.split(';').next().unwrap();
         let reused = request(address, exchange_request(address, &server.launch_token)).await;
         assert!(reused.starts_with("HTTP/1.1 401"));
+
+        let project_catalog = request(
+            address,
+            authenticated_get_request(address, "/api/v1/projects", cookie),
+        )
+        .await;
+        assert!(project_catalog.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&project_catalog)["protocol"], 1);
+        assert_eq!(
+            response_json(&project_catalog)["host"]["id"],
+            "host-transport-test"
+        );
+        assert_eq!(
+            response_json(&project_catalog)["lifecycleMutationsSupported"],
+            false
+        );
+        assert_eq!(response_json(&project_catalog)["importSupported"], false);
+        assert_eq!(host.creates.load(Ordering::Relaxed), 0);
 
         let first = request(
             address,

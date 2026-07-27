@@ -109,6 +109,187 @@ describe("HTTP Ygg transport", () => {
     );
   });
 
+  it("uses the typed repository, document, trusted-file, and transcript routes", async () => {
+    const document = {
+      id: "doc_11111111111111111111111111111111",
+      displayName: "notes & plan.md",
+      mediaType: "text/markdown",
+      sourceByteCount: 12,
+      extractedTextByteCount: 12,
+      sha256: "a".repeat(64),
+      fidelity: "exactUtf8",
+      createdAtMs: 1_753_626_615_000,
+    };
+    const entry = {
+      id: "file_22222222222222222222222222222222",
+      relativePath: "docs/release plan.md",
+      displayName: "release plan.md",
+      kind: "documentation",
+      byteLen: 24,
+    };
+    const repositoryContext = {
+      projectId: "project/one",
+      trust: "verified",
+      repository: {
+        source: "gitStatusPorcelainV2",
+        refresh: {
+          state: "current",
+          refreshedAtUnixMs: 1_753_626_615_000,
+          durationMs: 8,
+          truncated: false,
+        },
+        worktree: "present",
+        head: "0123456789abcdef0123456789abcdef01234567",
+        branchState: "named",
+        branch: "feature/safe-context",
+        dirty: false,
+        ahead: 0,
+        behind: 0,
+      },
+      instructions: {
+        source: "projectAgentsMdV1",
+        refresh: {
+          state: "current",
+          refreshedAtUnixMs: 1_753_626_615_001,
+          durationMs: 2,
+          truncated: false,
+        },
+        files: [],
+        errors: [],
+        omittedErrors: 0,
+        loadedBytes: 0,
+      },
+    };
+    const transcriptResult = {
+      hits: [
+        {
+          sessionId: "session/two",
+          itemId: "item-tool",
+          kind: "tool",
+          sessionTitle: "Release check",
+          snippet: "cargo test passed",
+          matchRanges: [{ startChar: 6, endChar: 10 }],
+          titleMatchRanges: [],
+          timestampMs: 1_753_626_615_002,
+          score: 100,
+        },
+      ],
+      truncated: false,
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(repositoryContext))
+      .mockResolvedValueOnce(jsonResponse(document))
+      .mockResolvedValueOnce(jsonResponse([document]))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          protocol: 1,
+          files: [entry],
+          summary: {
+            indexedFiles: 1,
+            ignoredEntries: 2,
+            truncated: false,
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          hits: [{ entry, snippet: "release plan", line: 7 }],
+          truncated: false,
+          scannedBytes: 24,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          entry,
+          text: "# Release plan\n",
+          sha256: "b".repeat(64),
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse(transcriptResult));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+    const upload = new File(["# Safe plan\n"], "notes & plan.md", {
+      type: "text/markdown",
+    });
+    const searchRequest = {
+      query: "test",
+      filter: { sessionId: "session/two", kinds: ["tool" as const] },
+      limit: 25,
+    };
+
+    await expect(
+      transport.getRepositoryContext("project/one"),
+    ).resolves.toEqual(repositoryContext);
+    await expect(
+      transport.ingestDocument("session/one", upload),
+    ).resolves.toEqual(document);
+    await expect(
+      transport.listDocuments("session/one"),
+    ).resolves.toEqual([document]);
+    await expect(
+      transport.getTrustedFiles("project/one"),
+    ).resolves.toMatchObject({ files: [entry] });
+    await expect(
+      transport.searchTrustedFiles("project/one", "release & plan"),
+    ).resolves.toMatchObject({
+      hits: [{ entry, snippet: "release plan", line: 7 }],
+    });
+    await expect(
+      transport.readTrustedFile(
+        "project/one",
+        "file/22222222222222222222222222222222",
+      ),
+    ).resolves.toMatchObject({ entry, text: "# Release plan\n" });
+    await expect(
+      transport.searchTranscripts(searchRequest),
+    ).resolves.toEqual(transcriptResult);
+
+    expect(fetchMock.mock.calls[0]).toEqual([
+      "/api/v1/projects/project%2Fone/context",
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    ]);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "/api/v1/sessions/session%2Fone/documents?displayName=notes%20%26%20plan.md",
+    );
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "text/markdown",
+      },
+      body: upload,
+    });
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      "/api/v1/sessions/session%2Fone/documents",
+    );
+    expect(fetchMock.mock.calls[3]?.[0]).toBe(
+      "/api/v1/projects/project%2Fone/files",
+    );
+    expect(fetchMock.mock.calls[4]?.[0]).toBe(
+      "/api/v1/projects/project%2Fone/files/search?query=release%20%26%20plan",
+    );
+    expect(fetchMock.mock.calls[5]?.[0]).toBe(
+      "/api/v1/projects/project%2Fone/files/file%2F22222222222222222222222222222222",
+    );
+    expect(fetchMock.mock.calls[6]).toEqual([
+      "/api/v1/search",
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(searchRequest),
+      },
+    ]);
+  });
+
   it("fixture checkout replaces the selected transcript instead of merging branches", async () => {
     const transport = new FixtureTransport();
     await transport.connect();

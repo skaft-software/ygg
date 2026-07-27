@@ -4,7 +4,12 @@ import type {
   AssistantMessageItem,
   SessionSnapshot,
 } from "./protocol";
-import { reduceSessionEvent, SessionSequenceGapError } from "./reducer";
+import {
+  primeSessionItemIndex,
+  reduceSessionEvent,
+  reduceSessionEvents,
+  SessionSequenceGapError,
+} from "./reducer";
 
 const base: SessionSnapshot = {
   sessionId: "session-1",
@@ -68,6 +73,160 @@ describe("reduceSessionEvent", () => {
       content: "I am working.",
       state: "committed",
     });
+  });
+
+  it("coalesces adjacent streaming deltas without changing sequence semantics", () => {
+    const started = reduceSessionEvent(base, {
+      type: "item.started",
+      sessionId: "session-1",
+      sequence: 5,
+      item: {
+        id: "assistant-batch",
+        turnId: "turn-batch",
+        kind: "assistant_message",
+        content: "Start",
+        state: "streaming",
+        createdAt: base.startedAt,
+      },
+    });
+
+    const next = reduceSessionEvents(started, [
+      {
+        type: "item.delta",
+        sessionId: "session-1",
+        sequence: 6,
+        itemId: "assistant-batch",
+        field: "content",
+        delta: " one",
+      },
+      {
+        type: "item.delta",
+        sessionId: "session-1",
+        sequence: 7,
+        itemId: "assistant-batch",
+        field: "content",
+        delta: " two",
+      },
+      {
+        type: "item.delta",
+        sessionId: "session-1",
+        sequence: 8,
+        itemId: "assistant-batch",
+        field: "content",
+        delta: "Replacement",
+        replace: true,
+      },
+      {
+        type: "item.delta",
+        sessionId: "session-1",
+        sequence: 9,
+        itemId: "assistant-batch",
+        field: "content",
+        delta: " tail",
+      },
+    ]);
+
+    expect(next.sequence).toBe(9);
+    expect(next.items[0]).toMatchObject({
+      id: "assistant-batch",
+      content: "Replacement tail",
+    });
+  });
+
+  it("uses the primed item index for a 1,000-item delta burst", () => {
+    const items: AssistantMessageItem[] = Array.from(
+      { length: 1_000 },
+      (_, index) => ({
+        id: `assistant-${index}`,
+        turnId: `turn-${index}`,
+        kind: "assistant_message",
+        content: index === 999 ? "" : `Committed ${index}`,
+        state: index === 999 ? "streaming" : "committed",
+        createdAt: base.startedAt,
+      }),
+    );
+    const snapshot: SessionSnapshot = {
+      ...base,
+      sequence: 10,
+      items,
+    };
+    primeSessionItemIndex(snapshot);
+    Object.defineProperties(items, {
+      findIndex: {
+        configurable: true,
+        value: () => {
+          throw new Error("delta performed a linear findIndex scan");
+        },
+      },
+      map: {
+        configurable: true,
+        value: () => {
+          throw new Error("delta mapped the full transcript");
+        },
+      },
+    });
+
+    const events = Array.from({ length: 60 }, (_, index) => ({
+      type: "item.delta" as const,
+      sessionId: snapshot.sessionId,
+      sequence: snapshot.sequence + index + 1,
+      itemId: "assistant-999",
+      field: "content" as const,
+      delta: `chunk-${index + 1} `,
+    }));
+    const next = reduceSessionEvents(snapshot, events);
+
+    expect(next.sequence).toBe(70);
+    expect(next.items[0]).toBe(items[0]);
+    expect(next.items[998]).toBe(items[998]);
+    expect(next.items[999]).toMatchObject({
+      content: events.map((event) => event.delta).join(""),
+    });
+  });
+
+  it("does not coalesce across another ordered event", () => {
+    const started = reduceSessionEvent(base, {
+      type: "item.started",
+      sessionId: "session-1",
+      sequence: 5,
+      item: {
+        id: "assistant-ordered",
+        turnId: "turn-ordered",
+        kind: "assistant_message",
+        content: "",
+        state: "streaming",
+        createdAt: base.startedAt,
+      },
+    });
+
+    const next = reduceSessionEvents(started, [
+      {
+        type: "item.delta",
+        sessionId: "session-1",
+        sequence: 6,
+        itemId: "assistant-ordered",
+        field: "content",
+        delta: "Before",
+      },
+      {
+        type: "session.updated",
+        sessionId: "session-1",
+        sequence: 7,
+        patch: { title: "Middle event" },
+      },
+      {
+        type: "item.delta",
+        sessionId: "session-1",
+        sequence: 8,
+        itemId: "assistant-ordered",
+        field: "content",
+        delta: " after",
+      },
+    ]);
+
+    expect(next.sequence).toBe(8);
+    expect(next.title).toBe("Middle event");
+    expect(next.items[0]).toMatchObject({ content: "Before after" });
   });
 
   it("ignores duplicate and stale events", () => {
@@ -226,21 +385,36 @@ describe("reduceSessionEvent", () => {
       turnId: "turn-tool",
       kind: "action",
       actionKind: "command",
+      phase: "verified",
+      status: "running",
+      rawToolName: "bash",
       label: "shell",
       detail: "Running tests",
+      observedOutputBytes: 0,
+      droppedOutputBytes: 0,
+      changedPaths: [],
+      sourceIds: [],
+      outputIds: [],
       state: "streaming",
       createdAt: "2026-07-26T12:00:01.000Z",
     };
     const snapshot = { ...base, items: [action] };
 
     const next = reduceSessionEvent(snapshot, {
-      type: "item.tool_result",
+      type: "item.activity_result",
       sessionId: "session-1",
       sequence: 5,
       itemId: "tool-call-1",
       resultItemId: "tool-result-1",
-      detail: "43 tests passed",
-      state: "committed",
+      result: {
+        status: "succeeded",
+        summary: "43 tests passed",
+        completedAt: "2026-07-26T12:00:02.000Z",
+        durationMs: 1_000,
+        outputSummary: "43 tests passed",
+        observedOutputBytes: 1_024,
+        droppedOutputBytes: 0,
+      },
     });
 
     expect(next.sequence).toBe(5);
@@ -249,6 +423,7 @@ describe("reduceSessionEvent", () => {
         id: "tool-call-1",
         label: "shell",
         detail: "43 tests passed",
+        status: "succeeded",
         state: "committed",
       }),
     ]);

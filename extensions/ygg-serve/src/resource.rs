@@ -23,6 +23,9 @@ const MAX_SESSION_RESOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 16 * 1024;
 const MAX_BINDING_BYTES: u64 = 16 * 1024;
 const MAX_RECORD_BYTES: u64 = 256 * 1024;
+const MAX_RUN_RECORD_BYTES: u64 = 512 * 1024;
+const MAX_RUN_RECORD_COUNT: usize = 16_384;
+const MAX_RUN_RECORD_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_COMMIT_BYTES: u64 = 64 * 1024;
 const MAX_COMMIT_BINDINGS: usize = 64;
 const METADATA_VERSION: u16 = 1;
@@ -147,6 +150,7 @@ struct StoreInner {
     metadata: PathBuf,
     bindings: PathBuf,
     records: PathBuf,
+    run_records: PathBuf,
     commits: PathBuf,
     index: Mutex<StoreIndex>,
 }
@@ -176,16 +180,19 @@ impl ResourceStore {
         let metadata = root.join("metadata");
         let bindings = root.join("bindings");
         let records = root.join("records");
+        let run_records = root.join("run-records");
         let commits = root.join("commits");
         ensure_private_directory(&blobs)?;
         ensure_private_directory(&metadata)?;
         ensure_private_directory(&bindings)?;
         ensure_private_directory(&records)?;
+        ensure_private_directory(&run_records)?;
         ensure_private_directory(&commits)?;
         cleanup_temporary_files(&blobs);
         cleanup_temporary_files(&metadata);
         cleanup_temporary_files(&bindings);
         cleanup_temporary_files(&records);
+        cleanup_temporary_files(&run_records);
         cleanup_temporary_files(&commits);
 
         let mut candidates = BTreeMap::new();
@@ -275,6 +282,7 @@ impl ResourceStore {
                 metadata,
                 bindings,
                 records,
+                run_records,
                 commits,
                 index: Mutex::new(index),
             }),
@@ -451,6 +459,68 @@ impl ResourceStore {
             bytes: Bytes::from(bytes),
             sha256: stored.sha256,
         })
+    }
+
+    /// Persists one immutable adapter-owned run/review projection.
+    ///
+    /// Run records intentionally contain only already-redacted public DTOs and
+    /// stable attribution metadata. They are keyed by the durable run-outcome
+    /// entry and never exposed through the opaque resource endpoint.
+    pub fn persist_run_record(
+        &self,
+        session_id: &SessionId,
+        durable_entry_id: &DurableEntryId,
+        bytes: &[u8],
+    ) -> Result<(), ResourceStoreError> {
+        if bytes.is_empty()
+            || bytes.len() as u64 > MAX_RUN_RECORD_BYTES
+            || serde_json::from_slice::<serde_json::Value>(bytes).is_err()
+        {
+            return Err(ResourceStoreError::InvalidBoundary);
+        }
+        let file_key = run_record_file_key(session_id, durable_entry_id);
+        let path = self.inner.run_records.join(format!("{file_key}.json"));
+        match read_regular_file(&path, MAX_RUN_RECORD_BYTES) {
+            Ok(existing) if existing == bytes => return Ok(()),
+            Ok(_) => return Err(ResourceStoreError::Storage),
+            Err(ResourceStoreError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let mut count = 0usize;
+        let mut total = 0u64;
+        let entries =
+            std::fs::read_dir(&self.inner.run_records).map_err(|_| ResourceStoreError::Storage)?;
+        for entry in entries {
+            let entry = entry.map_err(|_| ResourceStoreError::Storage)?;
+            let metadata = entry.metadata().map_err(|_| ResourceStoreError::Storage)?;
+            if metadata.is_file() {
+                count = count.saturating_add(1);
+                total = total.saturating_add(metadata.len());
+            }
+        }
+        if count >= MAX_RUN_RECORD_COUNT
+            || total
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|size| size > MAX_RUN_RECORD_TOTAL_BYTES)
+        {
+            return Err(ResourceStoreError::QuotaExceeded);
+        }
+        atomic_write(&self.inner.run_records, &path, bytes)
+    }
+
+    /// Loads one immutable adapter-owned run/review projection.
+    pub fn run_record(
+        &self,
+        session_id: &SessionId,
+        durable_entry_id: &DurableEntryId,
+    ) -> Result<Bytes, ResourceStoreError> {
+        let file_key = run_record_file_key(session_id, durable_entry_id);
+        let path = self.inner.run_records.join(format!("{file_key}.json"));
+        let bytes = read_regular_file(&path, MAX_RUN_RECORD_BYTES)?;
+        if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+            return Err(ResourceStoreError::Corrupt);
+        }
+        Ok(Bytes::from(bytes))
     }
 
     /// Commits one adapter-owned evidence record after all resource bindings.
@@ -953,6 +1023,17 @@ fn record_file_key(session_id: &SessionId, durable_entry_id: &DurableEntryId) ->
     sha256_hex(format!("{}\0{}", session_id.as_str(), durable_entry_id.as_str()).as_bytes())
 }
 
+fn run_record_file_key(session_id: &SessionId, durable_entry_id: &DurableEntryId) -> String {
+    sha256_hex(
+        format!(
+            "run\0{}\0{}",
+            session_id.as_str(),
+            durable_entry_id.as_str()
+        )
+        .as_bytes(),
+    )
+}
+
 fn rollback_uncommitted_tool_locked(
     inner: &StoreInner,
     index: &mut StoreIndex,
@@ -1156,6 +1237,59 @@ mod tests {
                 .content(&wrong_session, &reference.handle)
                 .unwrap_err(),
             ResourceStoreError::NotFound
+        );
+    }
+
+    #[test]
+    fn semantic_run_records_are_immutable_bounded_and_session_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new("session-run-record").unwrap();
+        let outcome_id = DurableEntryId::new("entry-run-outcome").unwrap();
+        let bytes = br#"{"version":1,"runId":"run-stable","durationMs":250}"#;
+        let store = ResourceStore::open(directory.path()).unwrap();
+        store
+            .persist_run_record(&session_id, &outcome_id, bytes)
+            .unwrap();
+        store
+            .persist_run_record(&session_id, &outcome_id, bytes)
+            .unwrap();
+        assert_eq!(
+            store.run_record(&session_id, &outcome_id).unwrap(),
+            Bytes::from_static(bytes)
+        );
+        assert_eq!(
+            store
+                .persist_run_record(
+                    &session_id,
+                    &outcome_id,
+                    br#"{"version":1,"runId":"different"}"#,
+                )
+                .unwrap_err(),
+            ResourceStoreError::Storage
+        );
+        drop(store);
+
+        let reopened = ResourceStore::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened.run_record(&session_id, &outcome_id).unwrap(),
+            Bytes::from_static(bytes)
+        );
+        assert_eq!(
+            reopened
+                .run_record(&SessionId::new("session-other").unwrap(), &outcome_id,)
+                .unwrap_err(),
+            ResourceStoreError::NotFound
+        );
+        let oversized = vec![b'x'; MAX_RUN_RECORD_BYTES as usize + 1];
+        assert_eq!(
+            reopened
+                .persist_run_record(
+                    &session_id,
+                    &DurableEntryId::new("entry-oversized").unwrap(),
+                    &oversized,
+                )
+                .unwrap_err(),
+            ResourceStoreError::InvalidBoundary
         );
     }
 

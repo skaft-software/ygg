@@ -40,6 +40,14 @@ pub struct SessionMeta {
     pub pinned: bool,
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub archived: bool,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub trashed_at_ms: Option<u64>,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub purge_after_ms: Option<u64>,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub forked_from_session_id: Option<String>,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub forked_from_entry_id: Option<String>,
     pub modified: SystemTime,
 }
 
@@ -56,7 +64,26 @@ pub struct SessionUserMetadata {
     pub pinned: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trashed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_entry_id: Option<String>,
 }
+
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionStorageLifecycle {
+    Active,
+    Archived,
+    Trash,
+}
+
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+pub const SESSION_TRASH_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug)]
 struct SessionCandidate {
@@ -502,6 +529,7 @@ enum SummaryRecord {
     Head {
         id: EntryId,
     },
+    RootHead {},
     Checkpoint {
         prompt: EntryId,
         head: EntryId,
@@ -622,6 +650,33 @@ fn sanitize_session_tags(tags: &[String]) -> anyhow::Result<Vec<String>> {
         }
     }
     Ok(sanitized)
+}
+
+fn validate_session_metadata(metadata: &SessionUserMetadata) -> anyhow::Result<()> {
+    if metadata.trashed_at_ms.is_some() != metadata.purge_after_ms.is_some()
+        || metadata
+            .trashed_at_ms
+            .zip(metadata.purge_after_ms)
+            .is_some_and(|(trashed, purge)| trashed == 0 || purge <= trashed)
+        || metadata.trashed_at_ms.is_some() && !metadata.archived
+    {
+        anyhow::bail!("invalid session trash retention metadata");
+    }
+    match (
+        metadata.forked_from_session_id.as_deref(),
+        metadata.forked_from_entry_id.as_deref(),
+    ) {
+        (None, None) => Ok(()),
+        (Some(session), Some(entry))
+            if session_id_is_valid(session)
+                && !entry.is_empty()
+                && entry.len() <= 256
+                && !entry.chars().any(char::is_control) =>
+        {
+            Ok(())
+        }
+        _ => anyhow::bail!("invalid session fork provenance metadata"),
+    }
 }
 
 pub(crate) fn absolute_read_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -810,6 +865,9 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                 }
                 head = Some(id);
             }
+            SummaryRecord::RootHead {} => {
+                head = None;
+            }
             SummaryRecord::Checkpoint {
                 prompt,
                 head: checkpoint_head,
@@ -947,6 +1005,10 @@ impl SessionStore {
             tags: metadata.tags,
             pinned: metadata.pinned,
             archived: metadata.archived,
+            trashed_at_ms: metadata.trashed_at_ms,
+            purge_after_ms: metadata.purge_after_ms,
+            forked_from_session_id: metadata.forked_from_session_id,
+            forked_from_entry_id: metadata.forked_from_entry_id,
             modified,
         })
     }
@@ -1004,7 +1066,7 @@ impl SessionStore {
         let parsed: SessionUserMetadata = serde_json::from_slice(&bytes).map_err(|error| {
             anyhow::anyhow!("invalid session metadata {}: {error}", path.display())
         })?;
-        Ok(SessionUserMetadata {
+        let metadata = SessionUserMetadata {
             name: parsed
                 .name
                 .as_deref()
@@ -1014,7 +1076,13 @@ impl SessionStore {
             tags: sanitize_session_tags(&parsed.tags)?,
             pinned: parsed.pinned,
             archived: parsed.archived,
-        })
+            trashed_at_ms: parsed.trashed_at_ms,
+            purge_after_ms: parsed.purge_after_ms,
+            forked_from_session_id: parsed.forked_from_session_id,
+            forked_from_entry_id: parsed.forked_from_entry_id,
+        };
+        validate_session_metadata(&metadata)?;
+        Ok(metadata)
     }
 
     /// Atomically replace user-owned catalog metadata. The target session must exist.
@@ -1030,7 +1098,12 @@ impl SessionStore {
             tags: sanitize_session_tags(&metadata.tags)?,
             pinned: metadata.pinned,
             archived: metadata.archived,
+            trashed_at_ms: metadata.trashed_at_ms,
+            purge_after_ms: metadata.purge_after_ms,
+            forked_from_session_id: metadata.forked_from_session_id.clone(),
+            forked_from_entry_id: metadata.forked_from_entry_id.clone(),
         };
+        validate_session_metadata(&metadata)?;
         let bytes = serde_json::to_vec_pretty(&metadata)?;
         if bytes.len() > MAX_SESSION_METADATA_BYTES {
             anyhow::bail!("session metadata exceeds {MAX_SESSION_METADATA_BYTES} bytes");
@@ -1064,8 +1137,130 @@ impl SessionStore {
     pub fn set_archived(&self, id: &str, archived: bool) -> anyhow::Result<SessionUserMetadata> {
         let mut metadata = self.load_metadata(id)?;
         metadata.archived = archived;
+        metadata.trashed_at_ms = None;
+        metadata.purge_after_ms = None;
         self.save_metadata(id, &metadata)?;
         Ok(metadata)
+    }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn set_lifecycle(
+        &self,
+        id: &str,
+        lifecycle: SessionStorageLifecycle,
+        changed_at_ms: u64,
+    ) -> anyhow::Result<SessionUserMetadata> {
+        if changed_at_ms == 0 {
+            anyhow::bail!("session lifecycle timestamp must be positive");
+        }
+        let mut metadata = self.load_metadata(id)?;
+        match lifecycle {
+            SessionStorageLifecycle::Active => {
+                metadata.archived = false;
+                metadata.trashed_at_ms = None;
+                metadata.purge_after_ms = None;
+            }
+            SessionStorageLifecycle::Archived => {
+                metadata.archived = true;
+                metadata.trashed_at_ms = None;
+                metadata.purge_after_ms = None;
+            }
+            SessionStorageLifecycle::Trash => {
+                metadata.archived = true;
+                metadata.pinned = false;
+                if metadata.trashed_at_ms.is_none() {
+                    metadata.trashed_at_ms = Some(changed_at_ms);
+                    metadata.purge_after_ms =
+                        changed_at_ms.checked_add(SESSION_TRASH_RETENTION_MS);
+                }
+                if metadata.purge_after_ms.is_none() {
+                    anyhow::bail!("session trash retention timestamp overflow");
+                }
+            }
+        }
+        self.save_metadata(id, &metadata)?;
+        Ok(metadata)
+    }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn set_fork_provenance(
+        &self,
+        id: &str,
+        source_session_id: &str,
+        source_entry_id: &str,
+    ) -> anyhow::Result<SessionUserMetadata> {
+        if !session_id_is_valid(source_session_id)
+            || source_entry_id.is_empty()
+            || source_entry_id.len() > 256
+            || source_entry_id.chars().any(char::is_control)
+        {
+            anyhow::bail!("invalid session fork provenance");
+        }
+        let mut metadata = self.load_metadata(id)?;
+        metadata.forked_from_session_id = Some(source_session_id.to_owned());
+        metadata.forked_from_entry_id = Some(source_entry_id.to_owned());
+        self.save_metadata(id, &metadata)?;
+        Ok(metadata)
+    }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn delete_permanently(
+        &self,
+        id: &str,
+        expected_trashed_at_ms: u64,
+    ) -> anyhow::Result<()> {
+        let metadata = self.load_metadata(id)?;
+        if metadata.trashed_at_ms != Some(expected_trashed_at_ms) {
+            anyhow::bail!("session trash confirmation is stale");
+        }
+        let session_path = self.path_by_id(id)?;
+        let metadata_path = self.metadata_path(id)?;
+        let suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed);
+        let staged_session = self.dir.join(format!(".delete-{id}-{suffix:016x}"));
+        let staged_metadata = self
+            .metadata_dir()
+            .join(format!(".delete-{id}-{suffix:016x}"));
+
+        std::fs::rename(&session_path, &staged_session)?;
+        let metadata_present = metadata_path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_file());
+        if metadata_present {
+            if let Err(error) = std::fs::rename(&metadata_path, &staged_metadata) {
+                let _ = std::fs::rename(&staged_session, &session_path);
+                return Err(error.into());
+            }
+        }
+        if let Err(error) = std::fs::remove_file(&staged_session) {
+            if metadata_present {
+                let _ = std::fs::rename(&staged_metadata, &metadata_path);
+            }
+            let _ = std::fs::rename(&staged_session, &session_path);
+            return Err(error.into());
+        }
+        if metadata_present {
+            std::fs::remove_file(&staged_metadata)?;
+        }
+        Ok(())
+    }
+
+    /// Removes a just-created session and sidecar during a higher-level
+    /// transaction rollback. This is intentionally not a user-facing delete
+    /// path and must only be used before the new session is acknowledged.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn discard_unacknowledged(&self, id: &str) -> anyhow::Result<()> {
+        let session_path = self.path_by_id(id)?;
+        std::fs::remove_file(session_path)?;
+        let metadata_path = self.metadata_path(id)?;
+        match metadata_path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                std::fs::remove_file(metadata_path)?;
+            }
+            Ok(_) => anyhow::bail!("session metadata path is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 }
 
@@ -1135,6 +1330,131 @@ mod tests {
         assert!(listed[0].pinned);
         assert!(listed[0].archived);
         assert_eq!(std::fs::read(path).unwrap(), session_bytes);
+    }
+
+    #[test]
+    fn trash_lifecycle_is_recoverable_and_preserves_its_retention_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("lifecycle.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("recover me".into())],
+            })))
+            .unwrap();
+        drop(session);
+        store.set_pinned("lifecycle", true).unwrap();
+
+        let trashed = store
+            .set_lifecycle("lifecycle", SessionStorageLifecycle::Trash, 1_000)
+            .unwrap();
+        assert!(trashed.archived);
+        assert!(!trashed.pinned);
+        assert_eq!(trashed.trashed_at_ms, Some(1_000));
+        assert_eq!(
+            trashed.purge_after_ms,
+            Some(1_000 + SESSION_TRASH_RETENTION_MS)
+        );
+
+        let repeated = store
+            .set_lifecycle("lifecycle", SessionStorageLifecycle::Trash, 9_000)
+            .unwrap();
+        assert_eq!(repeated.trashed_at_ms, trashed.trashed_at_ms);
+        assert_eq!(repeated.purge_after_ms, trashed.purge_after_ms);
+        let listed = store.list();
+        assert_eq!(listed[0].trashed_at_ms, Some(1_000));
+        assert_eq!(
+            listed[0].purge_after_ms,
+            Some(1_000 + SESSION_TRASH_RETENTION_MS)
+        );
+
+        let restored = store
+            .set_lifecycle("lifecycle", SessionStorageLifecycle::Active, 10_000)
+            .unwrap();
+        assert!(!restored.archived);
+        assert_eq!(restored.trashed_at_ms, None);
+        assert_eq!(restored.purge_after_ms, None);
+
+        let archived = store
+            .set_lifecycle(
+                "lifecycle",
+                SessionStorageLifecycle::Archived,
+                11_000,
+            )
+            .unwrap();
+        assert!(archived.archived);
+        assert_eq!(archived.trashed_at_ms, None);
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn permanent_delete_requires_the_current_trash_confirmation() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("delete-me.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("delete me".into())],
+            })))
+            .unwrap();
+        drop(session);
+        store
+            .set_lifecycle("delete-me", SessionStorageLifecycle::Trash, 2_000)
+            .unwrap();
+        let metadata_path = store.metadata_path("delete-me").unwrap();
+
+        let error = store.delete_permanently("delete-me", 1_999).unwrap_err();
+        assert!(error.to_string().contains("confirmation is stale"));
+        assert!(path.is_file());
+        assert!(metadata_path.is_file());
+
+        store.delete_permanently("delete-me", 2_000).unwrap();
+        assert!(!path.exists());
+        assert!(!metadata_path.exists());
+        assert!(store.path_by_id("delete-me").is_err());
+    }
+
+    #[test]
+    fn fork_provenance_round_trips_as_an_atomic_pair() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("fork.jsonl");
+        let mut session = Session::create(path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("fork".into())],
+            })))
+            .unwrap();
+        drop(session);
+
+        let metadata = store
+            .set_fork_provenance("fork", "source-session", "0042")
+            .unwrap();
+        assert_eq!(
+            metadata.forked_from_session_id.as_deref(),
+            Some("source-session")
+        );
+        assert_eq!(metadata.forked_from_entry_id.as_deref(), Some("0042"));
+        let listed = store.list();
+        assert_eq!(
+            listed[0].forked_from_session_id.as_deref(),
+            Some("source-session")
+        );
+        assert_eq!(listed[0].forked_from_entry_id.as_deref(), Some("0042"));
+
+        let invalid = SessionUserMetadata {
+            forked_from_session_id: Some("source-session".into()),
+            ..SessionUserMetadata::default()
+        };
+        assert!(store.save_metadata("fork", &invalid).is_err());
     }
 
     #[test]

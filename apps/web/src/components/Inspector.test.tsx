@@ -1,6 +1,12 @@
 /// <reference types="vite/client" />
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fixtureSessions } from "../fixtures";
 import { Inspector } from "./Inspector";
@@ -98,6 +104,70 @@ describe("resource inspector", () => {
         screen.getByText("This resource is no longer available."),
       ).toBeVisible(),
     );
+  });
+
+  it("switches between unified and split diffs with bounded hunk navigation", async () => {
+    const diff = [
+      "--- a/src/theme.ts",
+      "+++ b/src/theme.ts",
+      "@@ -1,2 +1,2 @@",
+      "-old first",
+      "+new first",
+      " shared",
+      "@@ -10 +10 @@",
+      "-old second",
+      "+new second",
+      "",
+    ].join("\n");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(diff, {
+          status: 200,
+          headers: {
+            "Content-Length": String(
+              new TextEncoder().encode(diff).byteLength,
+            ),
+          },
+        }),
+      ),
+    );
+
+    render(
+      <Inspector
+        session={structuredClone(fixtureSessions["session-live"]!)}
+        selection={{
+          type: "resource",
+          handle: "resource-two-hunks",
+          title: "theme changes",
+          presentation: "diff",
+        }}
+        closing={false}
+        modal={false}
+        previewsAvailable={false}
+        resourceContentUrl={(sessionId, handle) =>
+          `/api/v1/sessions/${sessionId}/resources/${handle}`
+        }
+        onRestoreFocus={() => {}}
+        onClose={() => {}}
+      />,
+    );
+
+    expect(await screen.findByText("Change 1 of 2")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Split" }));
+    expect(screen.getByRole("button", { name: "Split" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByText("old first")).toHaveClass("is-deletion");
+    expect(screen.getByText("new first")).toHaveClass("is-addition");
+
+    fireEvent.click(screen.getByRole("button", { name: "Next change" }));
+    expect(screen.getByText("Change 2 of 2")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Next change" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Previous change" }),
+    ).toBeEnabled();
   });
 
   it("bounds pathological tiny-line diffs without hiding the download", async () => {

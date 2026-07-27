@@ -1,15 +1,20 @@
 import {
+  Archive,
+  ArchiveRestore,
+  Folder,
   Laptop,
-  LoaderCircle,
   Menu,
   MessageSquarePlus,
   PanelLeftClose,
   Search,
   Settings,
+  Trash2,
   X,
 } from "lucide-react";
 import {
   type CSSProperties,
+  type ReactNode,
+  memo,
   useEffect,
   useRef,
   useState,
@@ -22,14 +27,28 @@ interface SidebarProps {
   sessions: SessionSummary[];
   models: ModelSummary[];
   selectedSessionId: string | null;
-  surface: "session" | "settings" | "devices";
+  surface: "session" | "projects" | "settings" | "devices";
   devicesAvailable: boolean;
   onRestoreFocus: () => void;
   onClose: () => void;
   onNewSession: () => void;
   onSelectSession: (sessionId: string) => void;
+  onRestoreSession: (sessionId: string) => void;
+  sessionTrashAvailable?: boolean;
+  onSetSessionLifecycle?: (
+    sessionId: string,
+    lifecycle: SessionSummary["lifecycle"],
+  ) => void | Promise<void>;
+  onDeleteSessionPermanently?: (
+    sessionId: string,
+    trashedAtMs: number,
+    phrase: string,
+  ) => void | Promise<void>;
   onOpenDevices: () => void;
+  onOpenProjects: () => void;
   onOpenSettings: () => void;
+  transcriptSearchAvailable?: boolean;
+  onOpenTranscriptSearch?: () => void;
 }
 
 const sessionStatusLabel: Record<SessionSummary["status"], string> = {
@@ -96,11 +115,9 @@ function SessionRow({
       </span>
       {session.status === "working" || session.status === "disconnected" ? (
         <span
-          className="session-loader"
+          className="session-status-dot"
           aria-label={sessionStatusLabel[session.status]}
-        >
-          <LoaderCircle className="spin" aria-hidden="true" />
-        </span>
+        />
       ) : session.attentionCount > 0 || session.unread ? (
         <span
           className="session-unread"
@@ -121,12 +138,14 @@ function SessionSection({
   models,
   selectedSessionId,
   onSelectSession,
+  renderControls,
 }: {
   title: string;
   sessions: SessionSummary[];
   models: Map<string, ModelSummary>;
   selectedSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
+  renderControls?: (session: SessionSummary) => ReactNode;
 }) {
   if (sessions.length === 0) return null;
   return (
@@ -135,21 +154,42 @@ function SessionSection({
         <h2 id={`section-${title}`}>{title}</h2>
       </div>
       <div className="session-list">
-        {sessions.map((session) => (
-          <SessionRow
-            key={session.id}
-            session={session}
-            model={models.get(session.modelId)}
-            selected={session.id === selectedSessionId}
-            onSelect={() => onSelectSession(session.id)}
-          />
-        ))}
+        {sessions.map((session) => {
+          const controls = renderControls?.(session);
+          return (
+            <div
+              className={`session-row-shell ${controls ? "has-actions" : ""}`}
+              key={session.id}
+            >
+              <SessionRow
+                session={session}
+                model={models.get(session.modelId)}
+                selected={session.id === selectedSessionId}
+                onSelect={() => onSelectSession(session.id)}
+              />
+              {controls}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
 }
 
-export function Sidebar({
+function errorMessage(error: unknown): string {
+  return error instanceof Error && error.message
+    ? error.message
+    : "The host could not complete this session change.";
+}
+
+function purgeLabel(purgeAfterMs: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(purgeAfterMs));
+}
+
+function SidebarView({
   open,
   blocked,
   sessions,
@@ -161,8 +201,15 @@ export function Sidebar({
   onClose,
   onNewSession,
   onSelectSession,
+  onRestoreSession,
+  sessionTrashAvailable = false,
+  onSetSessionLifecycle,
+  onDeleteSessionPermanently,
   onOpenDevices,
+  onOpenProjects,
   onOpenSettings,
+  transcriptSearchAvailable = false,
+  onOpenTranscriptSearch,
 }: SidebarProps) {
   const sidebarRef = useRef<HTMLElement>(null);
   const onCloseRef = useRef(onClose);
@@ -226,18 +273,228 @@ export function Sidebar({
     };
   }, [blocked, onRestoreFocus, open]);
   const [query, setQuery] = useState("");
+  const [selectedView, setSelectedView] =
+    useState<SessionSummary["lifecycle"]>("active");
+  const [pendingSessionId, setPendingSessionId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<{
+    sessionId: string;
+    message: string;
+  } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<{
+    sessionId: string;
+    trashedAtMs: number;
+  } | null>(null);
+  const [deletePhrase, setDeletePhrase] = useState("");
+  const view =
+    selectedView === "trash" && !sessionTrashAvailable
+      ? "active"
+      : selectedView;
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const visibleSessions = sessions.filter(
     (session) =>
-      !session.archived &&
+      session.lifecycle === view &&
       (!normalizedQuery ||
         session.title.toLocaleLowerCase().includes(normalizedQuery) ||
         session.preview.toLocaleLowerCase().includes(normalizedQuery)),
   );
-  const pinned = visibleSessions.filter((session) => session.pinned);
+  const pinned =
+    view === "active"
+      ? visibleSessions.filter((session) => session.pinned)
+      : [];
   const pinnedIds = new Set(pinned.map((session) => session.id));
   const recent = visibleSessions.filter((session) => !pinnedIds.has(session.id));
   const modelsById = new Map(models.map((model) => [model.id, model]));
+  const archiveCount = sessions.filter(
+    (session) => session.lifecycle === "archived",
+  ).length;
+  const trashCount = sessions.filter(
+    (session) => session.lifecycle === "trash",
+  ).length;
+
+  const selectView = (nextView: SessionSummary["lifecycle"]) => {
+    setSelectedView(nextView);
+    setQuery("");
+    setActionError(null);
+    setDeleteTarget(null);
+    setDeletePhrase("");
+  };
+
+  const setLifecycle = async (
+    session: SessionSummary,
+    lifecycle: SessionSummary["lifecycle"],
+  ) => {
+    setPendingSessionId(session.id);
+    setActionError(null);
+    try {
+      if (onSetSessionLifecycle) {
+        await onSetSessionLifecycle(session.id, lifecycle);
+      } else if (lifecycle === "active") {
+        await onRestoreSession(session.id);
+      } else {
+        return;
+      }
+    } catch (error) {
+      setActionError({ sessionId: session.id, message: errorMessage(error) });
+    } finally {
+      setPendingSessionId(null);
+    }
+  };
+
+  const beginPermanentDelete = (session: SessionSummary) => {
+    if (!session.retention) return;
+    setActionError(null);
+    setDeletePhrase("");
+    setDeleteTarget({
+      sessionId: session.id,
+      trashedAtMs: session.retention.trashedAtMs,
+    });
+  };
+
+  const deletePermanently = async (session: SessionSummary) => {
+    const retention = session.retention;
+    const expectedPhrase = `permanently delete ${session.id}`;
+    if (
+      !retention ||
+      !onDeleteSessionPermanently ||
+      deleteTarget?.sessionId !== session.id ||
+      deleteTarget.trashedAtMs !== retention.trashedAtMs ||
+      deletePhrase !== expectedPhrase
+    ) {
+      return;
+    }
+    setPendingSessionId(session.id);
+    setActionError(null);
+    try {
+      await onDeleteSessionPermanently(
+        session.id,
+        deleteTarget.trashedAtMs,
+        deletePhrase,
+      );
+      setDeleteTarget(null);
+      setDeletePhrase("");
+    } catch (error) {
+      setActionError({ sessionId: session.id, message: errorMessage(error) });
+    } finally {
+      setPendingSessionId(null);
+    }
+  };
+
+  const renderSessionControls = (session: SessionSummary) => {
+    if (view === "active") return null;
+    const pending = pendingSessionId === session.id;
+    const retention = session.retention;
+    const expectedPhrase = `permanently delete ${session.id}`;
+    const confirmingDelete =
+      view === "trash" &&
+      retention !== undefined &&
+      deleteTarget?.sessionId === session.id &&
+      deleteTarget.trashedAtMs === retention.trashedAtMs;
+
+    return (
+      <>
+        <div className="session-row-actions">
+          <button
+            type="button"
+            className="session-row-restore"
+            onClick={() => void setLifecycle(session, "active")}
+            aria-label={`Restore session ${session.title}`}
+            title="Restore session"
+            disabled={pending}
+          >
+            <ArchiveRestore aria-hidden="true" />
+          </button>
+          {view === "archived" &&
+          sessionTrashAvailable &&
+          onSetSessionLifecycle ? (
+            <button
+              type="button"
+              className="session-row-trash"
+              onClick={() => void setLifecycle(session, "trash")}
+              aria-label={`Move session ${session.title} to trash`}
+              title="Move to trash"
+              disabled={pending}
+            >
+              <Trash2 aria-hidden="true" />
+            </button>
+          ) : null}
+          {view === "trash" &&
+          retention &&
+          onDeleteSessionPermanently ? (
+            <button
+              type="button"
+              className="session-row-trash"
+              onClick={() => beginPermanentDelete(session)}
+              aria-label={`Permanently delete session ${session.title}`}
+              title="Permanently delete"
+              aria-expanded={confirmingDelete}
+              disabled={pending}
+            >
+              <Trash2 aria-hidden="true" />
+            </button>
+          ) : null}
+        </div>
+        {retention ? (
+          <p className="session-retention">
+            Automatic purge{" "}
+            <time dateTime={new Date(retention.purgeAfterMs).toISOString()}>
+              {purgeLabel(retention.purgeAfterMs)}
+            </time>
+          </p>
+        ) : null}
+        {confirmingDelete ? (
+          <div
+            className="session-delete-confirmation"
+            role="group"
+            aria-label={`Permanent deletion confirmation for ${session.title}`}
+          >
+            <p>
+              This cannot be undone. Type{" "}
+              <code>{expectedPhrase}</code> to delete now.
+            </p>
+            <label>
+              <span className="sr-only">
+                Confirmation phrase for {session.title}
+              </span>
+              <input
+                type="text"
+                value={deletePhrase}
+                onChange={(event) => setDeletePhrase(event.target.value)}
+                aria-label={`Confirmation phrase for ${session.title}`}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+            <div className="session-delete-actions">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => {
+                  setDeleteTarget(null);
+                  setDeletePhrase("");
+                }}
+                disabled={pending}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="session-delete-danger"
+                onClick={() => void deletePermanently(session)}
+                disabled={pending || deletePhrase !== expectedPhrase}
+              >
+                Delete permanently
+              </button>
+            </div>
+          </div>
+        ) : null}
+        {actionError?.sessionId === session.id ? (
+          <p className="session-action-error" role="alert">
+            {actionError.message}
+          </p>
+        ) : null}
+      </>
+    );
+  };
 
   return (
     <>
@@ -281,12 +538,76 @@ export function Sidebar({
               type="search"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search sessions"
+              placeholder={
+                view === "archived"
+                  ? "Search archive"
+                  : view === "trash"
+                    ? "Search trash"
+                    : "Search sessions"
+              }
             />
           </label>
+          {transcriptSearchAvailable && onOpenTranscriptSearch ? (
+            <button
+              type="button"
+              className="sidebar-transcript-search"
+              onClick={onOpenTranscriptSearch}
+            >
+              <Search aria-hidden="true" />
+              <span>Search conversation contents</span>
+            </button>
+          ) : null}
+          <div
+            className="sidebar-lifecycle-tabs"
+            role="tablist"
+            aria-label="Session groups"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={view === "active"}
+              aria-controls="sidebar-session-list"
+              className={view === "active" ? "is-selected" : ""}
+              onClick={() => selectView("active")}
+            >
+              <MessageSquarePlus aria-hidden="true" />
+              <span>Active</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={view === "archived"}
+              aria-controls="sidebar-session-list"
+              className={view === "archived" ? "is-selected" : ""}
+              onClick={() => selectView("archived")}
+            >
+              <Archive aria-hidden="true" />
+              <span>Archive</span>
+              {archiveCount > 0 ? <em>{archiveCount}</em> : null}
+            </button>
+            {sessionTrashAvailable ? (
+              <button
+                type="button"
+                role="tab"
+                aria-selected={view === "trash"}
+                aria-controls="sidebar-session-list"
+                className={view === "trash" ? "is-selected" : ""}
+                onClick={() => selectView("trash")}
+              >
+                <Trash2 aria-hidden="true" />
+                <span>Trash</span>
+                {trashCount > 0 ? <em>{trashCount}</em> : null}
+              </button>
+            ) : null}
+          </div>
         </nav>
 
-        <div className="sidebar-scroll">
+        <div
+          className="sidebar-scroll"
+          id="sidebar-session-list"
+          role="tabpanel"
+          aria-label={`${view === "archived" ? "Archive" : view === "trash" ? "Trash" : "Active"} sessions`}
+        >
           {visibleSessions.length === 0 ? (
             <div className="sidebar-empty">
               {normalizedQuery ? (
@@ -295,7 +616,13 @@ export function Sidebar({
                 <Menu aria-hidden="true" />
               )}
               <span>
-                {normalizedQuery ? "No matching sessions" : "No sessions yet"}
+                {normalizedQuery
+                  ? "No matching sessions"
+                  : view === "archived"
+                    ? "Archive is empty"
+                    : view === "trash"
+                      ? "Trash is empty"
+                      : "No sessions yet"}
               </span>
             </div>
           ) : (
@@ -308,17 +635,33 @@ export function Sidebar({
                 onSelectSession={onSelectSession}
               />
               <SessionSection
-                title="Recents"
+                title={
+                  view === "archived"
+                    ? "Archived"
+                    : view === "trash"
+                      ? "Trash"
+                      : "Recents"
+                }
                 sessions={recent}
                 models={modelsById}
                 selectedSessionId={selectedSessionId}
                 onSelectSession={onSelectSession}
+                renderControls={
+                  view === "active" ? undefined : renderSessionControls
+                }
               />
             </>
           )}
         </div>
 
         <footer className="sidebar-footer">
+          <button
+            className={`sidebar-destination ${surface === "projects" ? "is-selected" : ""}`}
+            onClick={onOpenProjects}
+          >
+            <Folder aria-hidden="true" />
+            <strong>Projects</strong>
+          </button>
           {devicesAvailable ? (
             <button
               className={`sidebar-destination ${surface === "devices" ? "is-selected" : ""}`}
@@ -340,3 +683,5 @@ export function Sidebar({
     </>
   );
 }
+
+export const Sidebar = memo(SidebarView);

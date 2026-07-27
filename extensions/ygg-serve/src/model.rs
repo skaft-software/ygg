@@ -2,18 +2,15 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
 use crate::bounds::{
-    validate_json, validate_public_text, validate_serialized_size, ProtocolValidation,
-    ValidationError, MAX_BOOTSTRAP_BYTES, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
-    MAX_SNAPSHOT_BYTES,
+    validate_public_text, validate_serialized_size, ProtocolValidation, ValidationError,
+    MAX_BOOTSTRAP_BYTES, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES, MAX_SNAPSHOT_BYTES,
 };
 use crate::{
     ArtifactId, DurableEntryId, HostId, ItemId, ProjectId, RequestId, RunId, SessionId, SourceId,
     ThemeId, ThemeOption, TurnId, PROTOCOL_VERSION,
 };
+use serde::{Deserialize, Serialize};
 
 const MAX_PROJECTS: usize = 256;
 const MAX_SESSION_SUMMARIES: usize = 2_000;
@@ -97,6 +94,15 @@ pub struct HostCapabilities {
     /// Bounded ingest policy when attachments are available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment_policy: Option<AttachmentPolicy>,
+    /// Bounded text, Markdown, and PDF document ingest is available.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub documents: bool,
+    /// Root-confined trusted-project file browsing and context selection is available.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trusted_project_files: bool,
+    /// Authenticated search over durable, already-redacted transcript projections is available.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcript_search: bool,
     /// Live preview targets are supported.
     pub previews: bool,
     /// A connected-device/pairing surface is available.
@@ -105,6 +111,14 @@ pub struct HostCapabilities {
     pub session_metadata: bool,
     /// Durable branch graph inspection and idle-boundary checkout are available.
     pub session_branches: bool,
+    /// Edit, retry-with-model, and new-session conversation branching are
+    /// available with durable provenance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conversation_branching: bool,
+    /// Recoverable trash, retention metadata, and confirmed permanent delete
+    /// are available.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_trash: bool,
     /// Authenticated, redacted portable session downloads are available.
     pub session_export: bool,
     /// LAN connected clients are supported.
@@ -153,10 +167,15 @@ impl Default for HostCapabilities {
             opaque_resources: false,
             attachments: false,
             attachment_policy: None,
+            documents: false,
+            trusted_project_files: false,
+            transcript_search: false,
             previews: false,
             connected_devices: false,
             session_metadata: false,
             session_branches: false,
+            conversation_branching: false,
+            session_trash: false,
             session_export: false,
             // Capability advertisements describe the transport that is
             // actually running. The transport-neutral backend does not imply
@@ -178,10 +197,37 @@ pub struct ProjectSummary {
     pub name: String,
     /// Whether the host trusts the project's roots.
     pub trusted: bool,
-    /// Number of durable sessions.
+    /// Whether the project has been archived and is no longer selectable.
+    pub archived: bool,
+    /// Whether the exact imported directory identity is currently available.
+    pub available: bool,
+    /// Whether this project is selected when a create command omits a project.
+    pub is_default: bool,
+    /// Number of sessions with a durable project association.
     pub session_count: u32,
     /// Number of currently live sessions.
     pub live_session_count: u32,
+}
+
+/// Session-free project catalog used for trust onboarding.
+///
+/// Unlike [`HostBootstrap`], this response never creates or opens a session,
+/// so an untrusted launch workspace can safely render its onboarding surface.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectCatalog {
+    /// Protocol major.
+    pub protocol: u16,
+    /// Host identity needed to target an idempotent host command.
+    pub host: HostDescriptor,
+    /// Current host catalog revision.
+    pub catalog_cursor: CatalogCursor,
+    /// Whether rename/default/trust/revoke/archive mutations are available.
+    pub lifecycle_mutations_supported: bool,
+    /// Whether a host-native folder picker can mint opaque import candidates.
+    pub import_supported: bool,
+    /// Bounded path-free project summaries.
+    pub projects: Vec<ProjectSummary>,
 }
 
 /// Strong session state derived from owner events.
@@ -344,6 +390,18 @@ pub struct SessionSummary {
     pub pinned: bool,
     /// Archived state.
     pub archived: bool,
+    /// Explicit catalog lifecycle. `archived` remains on the wire for
+    /// protocol-v1 clients but must agree with this stronger state.
+    #[serde(default)]
+    pub lifecycle: SessionCatalogState,
+    /// Trash retention metadata, present only while the session is recoverable
+    /// from trash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<SessionRetention>,
+    /// Durable provenance when this session was forked from another committed
+    /// conversation checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<ConversationBranchProvenance>,
     /// Fresh host-allocated session not yet promoted into durable Recents.
     pub provisional: bool,
     /// Strong live state.
@@ -354,6 +412,65 @@ pub struct SessionSummary {
     pub owner: ActorOwnerState,
     /// Model shown in compact metadata.
     pub model: ModelSelection,
+}
+
+/// Durable catalog lifecycle for a session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionCatalogState {
+    /// Selectable in the ordinary recent-session catalog.
+    #[default]
+    Active,
+    /// Hidden from recents but retained indefinitely.
+    Archived,
+    /// Recoverable until its retention deadline.
+    Trash,
+}
+
+/// Host-owned trash retention metadata.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionRetention {
+    /// Host timestamp when the session entered trash.
+    pub trashed_at_ms: u64,
+    /// Earliest host timestamp at which automatic purge is permitted.
+    pub purge_after_ms: u64,
+    /// Permanent deletion always requires an exact, fresh confirmation.
+    pub permanent_delete_requires_confirmation: bool,
+}
+
+/// User-facing conversation branch operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConversationBranchOperation {
+    /// An earlier user turn was replaced on a sibling branch.
+    EditUserTurn,
+    /// An assistant response was retried from its originating user checkpoint.
+    RetryResponse,
+    /// A committed checkpoint was copied into a genuinely new session.
+    ForkSession,
+}
+
+/// Durable, path-free provenance for edit, retry, and new-session forks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationBranchProvenance {
+    /// Operation that created this branch.
+    pub operation: ConversationBranchOperation,
+    /// Source session.
+    pub source_session_id: SessionId,
+    /// Exact source entry selected by the user.
+    pub source_entry_id: DurableEntryId,
+    /// Originating user checkpoint for retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub originating_user_entry_id: Option<DurableEntryId>,
+    /// Explicit alternate model, if one was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_override: Option<ModelSelection>,
+    /// Always true: transcript branching does not undo external side effects.
+    pub external_effects_preserved: bool,
+    /// Explicit product warning explaining that boundary.
+    pub warning: String,
 }
 
 /// One durable entry in the complete preserved session graph.
@@ -456,6 +573,9 @@ pub struct FileChange {
     pub result_handle: Option<String>,
     /// Safe relative/display path.
     pub display_path: String,
+    /// Semantic tool activity that produced the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_item_id: Option<ItemId>,
     /// Added lines when known.
     pub additions: u32,
     /// Removed lines when known.
@@ -571,6 +691,228 @@ pub enum RunOutcome {
     Failed,
 }
 
+/// Stable semantic classification for one tool activity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolKind {
+    /// Read a local or remote resource.
+    Read,
+    /// Search local content.
+    Search,
+    /// Edit an existing file.
+    Edit,
+    /// Write or replace a file.
+    Write,
+    /// Run a bounded shell command.
+    Command,
+    /// Consult the web through a host tool.
+    Web,
+    /// Read or apply a Ygg skill/resource.
+    Skill,
+    /// Extension or unknown tool with no argument-derived public detail.
+    Other,
+}
+
+/// Deterministic high-level phase used to group tool activity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ActivityPhase {
+    /// Read/search/resource inspection.
+    Investigated,
+    /// Workspace mutation.
+    Changed,
+    /// Test, check, build, lint, or other recognized verification.
+    Verified,
+    /// A user-facing output was produced.
+    Produced,
+    /// Activity that cannot be classified safely.
+    Other,
+}
+
+/// Public lifecycle of one tool activity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolActivityStatus {
+    /// Tool execution is in progress.
+    Running,
+    /// Tool execution completed successfully.
+    Succeeded,
+    /// Tool execution completed with failure.
+    Failed,
+    /// Tool execution stopped before a terminal tool result was available.
+    Stopped,
+}
+
+/// Bounded, argument-free semantic projection of one tool call.
+///
+/// Raw tool arguments, progress output, and result bodies are deliberately
+/// absent from the public protocol. Opaque output handles may be added by the
+/// host only after a separately authenticated, redacted log is stored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolActivity {
+    /// Normalized, bounded protocol tool name.
+    pub raw_tool_name: String,
+    /// Stable semantic class.
+    pub kind: ToolKind,
+    /// Deterministic review phase.
+    pub phase: ActivityPhase,
+    /// Current public lifecycle.
+    pub status: ToolActivityStatus,
+    /// Short user-facing action title.
+    pub title: String,
+    /// Optional bounded semantic status; never stdout/stderr.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Validated workspace-relative path or sanitized remote target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Validated workspace-relative command working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Safe preview for an allowlisted command shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_preview: Option<String>,
+    /// Process exit code when deterministically parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Process signal number when deterministically parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Host timestamp captured when execution started.
+    pub started_at_ms: u64,
+    /// Host timestamp captured when execution settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+    /// Frozen elapsed execution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Bounded semantic outcome; never raw tool output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_summary: Option<String>,
+    /// Optional authenticated handle for a separately stored redacted log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_handle: Option<String>,
+    /// Raw output bytes observed and intentionally not forwarded.
+    #[serde(default)]
+    pub observed_output_bytes: u64,
+    /// Output bytes dropped before the adapter observed them.
+    #[serde(default)]
+    pub dropped_output_bytes: u64,
+    /// Validated changed paths linked to this action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_paths: Vec<String>,
+    /// Deterministic consulted-source links.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_ids: Vec<SourceId>,
+    /// Deterministic produced-output links.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_ids: Vec<ArtifactId>,
+}
+
+/// Durable semantic projection of a tool result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolResultSummary {
+    /// Item identity of the matching tool activity.
+    pub tool_call_item_id: ItemId,
+    /// Terminal public lifecycle.
+    pub status: ToolActivityStatus,
+    /// Short terminal summary.
+    pub summary: String,
+    /// Bounded semantic outcome; never raw output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_summary: Option<String>,
+    /// Optional authenticated handle for a separately stored redacted log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_handle: Option<String>,
+    /// Process exit code when deterministically parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Process signal number when deterministically parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// Host timestamp captured when execution settled.
+    pub completed_at_ms: u64,
+    /// Frozen elapsed execution time.
+    pub duration_ms: u64,
+    /// Raw output bytes observed and intentionally not forwarded.
+    #[serde(default)]
+    pub observed_output_bytes: u64,
+    /// Output bytes dropped before the adapter observed them.
+    #[serde(default)]
+    pub dropped_output_bytes: u64,
+}
+
+/// How completely deterministic evidence covers a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EvidenceCoverage {
+    /// No source/change/output evidence was captured.
+    None,
+    /// Some facts are linked, or shell/extension mutation cannot be ruled out.
+    Partial,
+    /// Every relevant built-in action has deterministic linked evidence.
+    Complete,
+}
+
+/// Aggregate counts for one deterministic activity phase.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActivityPhaseSummary {
+    /// Phase identity.
+    pub phase: ActivityPhase,
+    /// Total actions in the phase.
+    pub action_count: u32,
+    /// Successfully completed actions.
+    pub succeeded_count: u32,
+    /// Failed actions.
+    pub failed_count: u32,
+    /// Stopped actions.
+    pub stopped_count: u32,
+}
+
+/// Structured, factual completion review for one run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompletionReview {
+    /// Short deterministic terminal summary.
+    pub summary: String,
+    /// Frozen end-to-end run duration.
+    pub duration_ms: u64,
+    /// Number of tool activities.
+    pub action_count: u32,
+    /// Deterministic phase aggregates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<ActivityPhaseSummary>,
+    /// File-change transcript items.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_file_item_ids: Vec<ItemId>,
+    /// Recognized verification action items.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verification_action_item_ids: Vec<ItemId>,
+    /// Failed action items.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_action_item_ids: Vec<ItemId>,
+    /// Non-fatal warning action items.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warning_action_item_ids: Vec<ItemId>,
+    /// Consulted source identities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_ids: Vec<SourceId>,
+    /// Produced output identities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_ids: Vec<ArtifactId>,
+    /// Deterministically parsed test evidence linked to originating command items.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_results: Vec<crate::StructuredTestResults>,
+    /// Explicit evidence completeness.
+    pub evidence_coverage: EvidenceCoverage,
+    /// Host-proven open questions. Empty when none can be determined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_questions: Vec<String>,
+}
+
 /// How a live user message was delivered to the running agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -599,9 +941,18 @@ pub enum ItemPayload {
         /// Host-ingested attachments.
         #[serde(default)]
         attachments: Vec<crate::AttachmentRef>,
+        /// Uploaded document references resolved by the host for this turn.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        documents: Vec<crate::DocumentReference>,
+        /// Trusted project-file snapshots resolved by the host for this turn.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        project_files: Vec<crate::TrustedFileEntry>,
         /// Live delivery semantics, omitted when durable history cannot prove them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delivery: Option<UserMessageDelivery>,
+        /// Durable edit/retry provenance for a conversation branch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_provenance: Option<ConversationBranchProvenance>,
     },
     /// Visible assistant response.
     AssistantMessage {
@@ -613,28 +964,10 @@ pub enum ItemPayload {
         /// Complete or provisional reasoning text.
         text: String,
     },
-    /// Structured tool invocation.
-    ToolCall {
-        /// Tool name.
-        name: String,
-        /// Inert bounded arguments.
-        arguments: Value,
-        /// Latest bounded live progress.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        progress: Option<String>,
-        /// Bytes omitted by the producer's bounded progress buffer.
-        #[serde(default)]
-        dropped_progress_bytes: u64,
-    },
-    /// Structured tool result.
-    ToolResult {
-        /// Item identity of the call.
-        tool_call_item_id: ItemId,
-        /// Bounded textual result.
-        content: String,
-        /// Failure indicator.
-        is_error: bool,
-    },
+    /// Bounded semantic tool invocation.
+    ToolCall(ToolActivity),
+    /// Bounded semantic tool result.
+    ToolResult(ToolResultSummary),
     /// Deterministic plan.
     Plan {
         /// Plan steps.
@@ -660,6 +993,8 @@ pub enum ItemPayload {
         /// Optional public explanation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        /// Deterministic completion review.
+        review: CompletionReview,
     },
 }
 
@@ -867,7 +1202,57 @@ impl ProtocolValidation for AttachmentPolicy {
 
 impl ProtocolValidation for ProjectSummary {
     fn validate(&self) -> Result<(), ValidationError> {
-        validate_public_text("project.name", &self.name, 256, false)
+        validate_public_text("project.name", &self.name, 256, false)?;
+        if self.archived && (self.trusted || self.is_default || self.live_session_count != 0) {
+            return Err(ValidationError::new(
+                "project",
+                "archived projects must be untrusted, non-default, and have no live sessions",
+            ));
+        }
+        if self.live_session_count > self.session_count {
+            return Err(ValidationError::new(
+                "project.live_session_count",
+                "must not exceed the durable session count",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolValidation for ProjectCatalog {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.protocol != PROTOCOL_VERSION {
+            return Err(ValidationError::new(
+                "project_catalog.protocol",
+                format!("must equal protocol major {PROTOCOL_VERSION}"),
+            ));
+        }
+        self.host.validate()?;
+        if self.projects.len() > MAX_PROJECTS {
+            return Err(ValidationError::new(
+                "project_catalog.projects",
+                format!("exceeds the {MAX_PROJECTS}-project limit"),
+            ));
+        }
+        let mut project_ids = BTreeSet::new();
+        let mut defaults = 0usize;
+        for project in &self.projects {
+            project.validate()?;
+            if !project_ids.insert(project.id.clone()) {
+                return Err(ValidationError::new(
+                    "project_catalog.projects",
+                    "contains a duplicate project ID",
+                ));
+            }
+            defaults += usize::from(project.is_default);
+        }
+        if defaults > 1 {
+            return Err(ValidationError::new(
+                "project_catalog.projects",
+                "contains more than one default project",
+            ));
+        }
+        validate_serialized_size("project_catalog", self, MAX_BOOTSTRAP_BYTES)
     }
 }
 
@@ -946,7 +1331,97 @@ impl ProtocolValidation for SessionSummary {
         for tag in &self.tags {
             validate_public_text("session.tag", tag, 64, false)?;
         }
+        match (self.lifecycle, self.archived, self.retention.as_ref()) {
+            (SessionCatalogState::Active, false, None)
+            | (SessionCatalogState::Archived, true, None)
+            | (SessionCatalogState::Trash, true, Some(_)) => {}
+            _ => {
+                return Err(ValidationError::new(
+                    "session.lifecycle",
+                    "does not agree with archived and retention state",
+                ))
+            }
+        }
+        if let Some(retention) = &self.retention {
+            retention.validate()?;
+        }
+        if let Some(provenance) = &self.forked_from {
+            provenance.validate()?;
+            if provenance.operation != ConversationBranchOperation::ForkSession {
+                return Err(ValidationError::new(
+                    "session.forked_from.operation",
+                    "must be forkSession for session-level provenance",
+                ));
+            }
+        }
         self.model.validate()
+    }
+}
+
+impl ProtocolValidation for SessionRetention {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.trashed_at_ms == 0 || self.purge_after_ms <= self.trashed_at_ms {
+            return Err(ValidationError::new(
+                "session.retention",
+                "requires a positive trash time and a later purge deadline",
+            ));
+        }
+        if !self.permanent_delete_requires_confirmation {
+            return Err(ValidationError::new(
+                "session.retention.permanent_delete_requires_confirmation",
+                "must be true",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolValidation for ConversationBranchProvenance {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if let Some(model) = &self.model_override {
+            model.validate()?;
+        }
+        if !self.external_effects_preserved {
+            return Err(ValidationError::new(
+                "conversation_branch.external_effects_preserved",
+                "must explicitly preserve external effects",
+            ));
+        }
+        validate_public_text(
+            "conversation_branch.warning",
+            &self.warning,
+            2 * 1024,
+            false,
+        )?;
+        let normalized_warning = self.warning.to_ascii_lowercase();
+        if !normalized_warning.contains("external")
+            || !normalized_warning.contains("not rolled back")
+        {
+            return Err(ValidationError::new(
+                "conversation_branch.warning",
+                "must explain that external effects are not rolled back",
+            ));
+        }
+        match self.operation {
+            ConversationBranchOperation::EditUserTurn
+            | ConversationBranchOperation::ForkSession
+                if self.originating_user_entry_id.is_some() || self.model_override.is_some() =>
+            {
+                Err(ValidationError::new(
+                    "conversation_branch",
+                    "originating user and model override are only valid for response retries",
+                ))
+            }
+            ConversationBranchOperation::RetryResponse
+                if self.originating_user_entry_id.is_none() =>
+            {
+                Err(ValidationError::new(
+                    "conversation_branch.originating_user_entry_id",
+                    "is required for response retries",
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -968,6 +1443,251 @@ impl ProtocolValidation for FileChange {
             validate_public_text("file_change.result_handle", handle, 256, false)?;
         }
         validate_public_text("file_change.display_path", &self.display_path, 1024, false)
+    }
+}
+
+impl ProtocolValidation for ToolActivity {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_public_text("item.tool.raw_tool_name", &self.raw_tool_name, 128, false)?;
+        validate_public_text("item.tool.title", &self.title, 512, false)?;
+        if let Some(summary) = &self.summary {
+            validate_public_text("item.tool.summary", summary, 2 * 1024, true)?;
+        }
+        if let Some(target) = &self.target {
+            validate_public_text("item.tool.target", target, 1024, false)?;
+        }
+        if let Some(cwd) = &self.cwd {
+            validate_public_text("item.tool.cwd", cwd, 1024, false)?;
+        }
+        if let Some(command) = &self.command_preview {
+            validate_public_text("item.tool.command_preview", command, 1024, false)?;
+        }
+        if let Some(summary) = &self.output_summary {
+            validate_public_text("item.tool.output_summary", summary, 2 * 1024, true)?;
+        }
+        if let Some(handle) = &self.output_handle {
+            validate_public_text("item.tool.output_handle", handle, 512, false)?;
+        }
+        if self.started_at_ms == 0 {
+            return Err(ValidationError::new(
+                "item.tool.started_at_ms",
+                "must be non-zero",
+            ));
+        }
+        if self.exit_code.is_some() && self.signal.is_some() {
+            return Err(ValidationError::new(
+                "item.tool.exit",
+                "exit_code and signal are mutually exclusive",
+            ));
+        }
+        match self.status {
+            ToolActivityStatus::Running
+                if self.completed_at_ms.is_some() || self.duration_ms.is_some() =>
+            {
+                return Err(ValidationError::new(
+                    "item.tool.status",
+                    "running activity must not have terminal timing",
+                ));
+            }
+            ToolActivityStatus::Succeeded
+            | ToolActivityStatus::Failed
+            | ToolActivityStatus::Stopped
+                if self.completed_at_ms.is_none() || self.duration_ms.is_none() =>
+            {
+                return Err(ValidationError::new(
+                    "item.tool.status",
+                    "terminal activity requires completed_at_ms and duration_ms",
+                ));
+            }
+            _ => {}
+        }
+        if self
+            .completed_at_ms
+            .is_some_and(|completed| completed < self.started_at_ms)
+        {
+            return Err(ValidationError::new(
+                "item.tool.completed_at_ms",
+                "must not precede started_at_ms",
+            ));
+        }
+        if self.changed_paths.len() > MAX_RESOURCES
+            || self.source_ids.len() > MAX_RESOURCES
+            || self.artifact_ids.len() > MAX_RESOURCES
+        {
+            return Err(ValidationError::new(
+                "item.tool.links",
+                format!("exceeds the {MAX_RESOURCES}-link limit"),
+            ));
+        }
+        let mut paths = BTreeSet::new();
+        for path in &self.changed_paths {
+            validate_public_text("item.tool.changed_path", path, 1024, false)?;
+            if !paths.insert(path) {
+                return Err(ValidationError::new(
+                    "item.tool.changed_paths",
+                    "contains a duplicate path",
+                ));
+            }
+        }
+        if self.source_ids.iter().collect::<BTreeSet<_>>().len() != self.source_ids.len()
+            || self.artifact_ids.iter().collect::<BTreeSet<_>>().len() != self.artifact_ids.len()
+        {
+            return Err(ValidationError::new(
+                "item.tool.links",
+                "contains a duplicate identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolValidation for ToolResultSummary {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.status == ToolActivityStatus::Running {
+            return Err(ValidationError::new(
+                "item.tool_result.status",
+                "must be terminal",
+            ));
+        }
+        validate_public_text("item.tool_result.summary", &self.summary, 512, false)?;
+        if let Some(summary) = &self.output_summary {
+            validate_public_text("item.tool_result.output_summary", summary, 2 * 1024, true)?;
+        }
+        if let Some(handle) = &self.output_handle {
+            validate_public_text("item.tool_result.output_handle", handle, 512, false)?;
+        }
+        if self.completed_at_ms == 0 {
+            return Err(ValidationError::new(
+                "item.tool_result.completed_at_ms",
+                "must be non-zero",
+            ));
+        }
+        if self.exit_code.is_some() && self.signal.is_some() {
+            return Err(ValidationError::new(
+                "item.tool_result.exit",
+                "exit_code and signal are mutually exclusive",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolValidation for CompletionReview {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_public_text(
+            "item.completion_review.summary",
+            &self.summary,
+            2 * 1024,
+            false,
+        )?;
+        if self.phases.len() > 16 {
+            return Err(ValidationError::new(
+                "item.completion_review.phases",
+                "exceeds the 16-phase limit",
+            ));
+        }
+        let mut phases = BTreeSet::new();
+        let mut counted_actions = 0u64;
+        for phase in &self.phases {
+            if !phases.insert(phase.phase) {
+                return Err(ValidationError::new(
+                    "item.completion_review.phases",
+                    "contains a duplicate phase",
+                ));
+            }
+            let terminal = u64::from(phase.succeeded_count)
+                .saturating_add(u64::from(phase.failed_count))
+                .saturating_add(u64::from(phase.stopped_count));
+            if terminal > u64::from(phase.action_count) {
+                return Err(ValidationError::new(
+                    "item.completion_review.phases",
+                    "terminal counts exceed action_count",
+                ));
+            }
+            counted_actions = counted_actions.saturating_add(u64::from(phase.action_count));
+        }
+        if counted_actions != u64::from(self.action_count) {
+            return Err(ValidationError::new(
+                "item.completion_review.action_count",
+                "must equal the phase action total",
+            ));
+        }
+        for (field, count) in [
+            (
+                "item.completion_review.changed_file_item_ids",
+                self.changed_file_item_ids.len(),
+            ),
+            (
+                "item.completion_review.verification_action_item_ids",
+                self.verification_action_item_ids.len(),
+            ),
+            (
+                "item.completion_review.failed_action_item_ids",
+                self.failed_action_item_ids.len(),
+            ),
+            (
+                "item.completion_review.warning_action_item_ids",
+                self.warning_action_item_ids.len(),
+            ),
+            ("item.completion_review.source_ids", self.source_ids.len()),
+            ("item.completion_review.output_ids", self.output_ids.len()),
+            (
+                "item.completion_review.test_results",
+                self.test_results.len(),
+            ),
+        ] {
+            if count > MAX_RESOURCES {
+                return Err(ValidationError::new(
+                    field,
+                    format!("exceeds the {MAX_RESOURCES}-link limit"),
+                ));
+            }
+        }
+        let mut test_origins = BTreeSet::new();
+        for result in &self.test_results {
+            if !test_origins.insert(result.origin_item_id.clone()) {
+                return Err(ValidationError::new(
+                    "item.completion_review.test_results",
+                    "contains duplicate originating command items",
+                ));
+            }
+            if !self
+                .verification_action_item_ids
+                .contains(&result.origin_item_id)
+            {
+                return Err(ValidationError::new(
+                    "item.completion_review.test_results",
+                    "must link to a verification action item",
+                ));
+            }
+            let encoded = serde_json::to_vec(result).map_err(|_| {
+                ValidationError::new(
+                    "item.completion_review.test_results",
+                    "could not be encoded",
+                )
+            })?;
+            crate::decode_structured_test_results(&encoded).map_err(|_| {
+                ValidationError::new(
+                    "item.completion_review.test_results",
+                    "contains invalid structured test evidence",
+                )
+            })?;
+        }
+        if self.open_questions.len() > 64 {
+            return Err(ValidationError::new(
+                "item.completion_review.open_questions",
+                "exceeds the 64-question limit",
+            ));
+        }
+        for question in &self.open_questions {
+            validate_public_text(
+                "item.completion_review.open_question",
+                question,
+                2 * 1024,
+                true,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1001,7 +1721,12 @@ impl ProtocolValidation for ItemPayload {
     fn validate(&self) -> Result<(), ValidationError> {
         match self {
             Self::UserMessage {
-                text, attachments, ..
+                text,
+                attachments,
+                documents,
+                project_files,
+                branch_provenance,
+                ..
             } => {
                 validate_public_text("item.user.text", text, MAX_PROMPT_BYTES, true)?;
                 if attachments.len() > 32 {
@@ -1013,6 +1738,55 @@ impl ProtocolValidation for ItemPayload {
                 for attachment in attachments {
                     attachment.validate()?;
                 }
+                if documents.len() > crate::MAX_DOCUMENTS_PER_PROMPT {
+                    return Err(ValidationError::new(
+                        "item.user.documents",
+                        "exceeds the uploaded-document limit",
+                    ));
+                }
+                for document in documents {
+                    validate_public_text(
+                        "item.user.document.display_name",
+                        &document.display_name,
+                        512,
+                        false,
+                    )?;
+                    validate_public_text(
+                        "item.user.document.sha256",
+                        &document.sha256,
+                        64,
+                        false,
+                    )?;
+                }
+                if project_files.len() > crate::MAX_TRUSTED_FILES_PER_CONTEXT {
+                    return Err(ValidationError::new(
+                        "item.user.project_files",
+                        "exceeds the trusted project-file limit",
+                    ));
+                }
+                for file in project_files {
+                    validate_public_text(
+                        "item.user.project_file.relative_path",
+                        &file.relative_path,
+                        2_048,
+                        false,
+                    )?;
+                    validate_public_text(
+                        "item.user.project_file.display_name",
+                        &file.display_name,
+                        512,
+                        false,
+                    )?;
+                }
+                if let Some(provenance) = branch_provenance {
+                    provenance.validate()?;
+                    if provenance.operation == ConversationBranchOperation::ForkSession {
+                        return Err(ValidationError::new(
+                            "item.user.branch_provenance.operation",
+                            "forkSession provenance belongs on the session",
+                        ));
+                    }
+                }
             }
             Self::AssistantMessage { text } => {
                 validate_public_text("item.assistant.text", text, MAX_ITEM_TEXT_BYTES, true)?;
@@ -1020,31 +1794,8 @@ impl ProtocolValidation for ItemPayload {
             Self::Reasoning { text } => {
                 validate_public_text("item.reasoning.text", text, MAX_ITEM_TEXT_BYTES, true)?;
             }
-            Self::ToolCall {
-                name,
-                arguments,
-                progress,
-                ..
-            } => {
-                validate_public_text("item.tool.name", name, 128, false)?;
-                validate_json("item.tool.arguments", arguments, 256 * 1024)?;
-                if let Some(progress) = progress {
-                    validate_public_text(
-                        "item.tool.progress",
-                        progress,
-                        MAX_ITEM_TEXT_BYTES,
-                        true,
-                    )?;
-                }
-            }
-            Self::ToolResult { content, .. } => {
-                validate_public_text(
-                    "item.tool_result.content",
-                    content,
-                    MAX_ITEM_TEXT_BYTES,
-                    true,
-                )?;
-            }
+            Self::ToolCall(activity) => activity.validate()?,
+            Self::ToolResult(result) => result.validate()?,
             Self::Plan { steps } => {
                 if steps.len() > MAX_PLAN_STEPS {
                     return Err(ValidationError::new(
@@ -1063,10 +1814,13 @@ impl ProtocolValidation for ItemPayload {
             Self::Compaction { reason } => {
                 validate_public_text("item.compaction.reason", reason, 4096, true)?;
             }
-            Self::RunOutcome { message, .. } => {
+            Self::RunOutcome {
+                message, review, ..
+            } => {
                 if let Some(message) = message {
                     validate_public_text("item.run_outcome.message", message, 8192, true)?;
                 }
+                review.validate()?;
             }
         }
         Ok(())
@@ -1373,6 +2127,7 @@ impl ProtocolValidation for HostBootstrap {
             ));
         }
         let mut project_ids = BTreeSet::new();
+        let mut default_projects = 0usize;
         for project in &self.projects {
             project.validate()?;
             if !project_ids.insert(project.id.clone()) {
@@ -1381,10 +2136,27 @@ impl ProtocolValidation for HostBootstrap {
                     "contains a duplicate project ID",
                 ));
             }
+            default_projects += usize::from(project.is_default);
+        }
+        if default_projects > 1 {
+            return Err(ValidationError::new(
+                "bootstrap.projects",
+                "contains more than one default project",
+            ));
         }
         let mut session_ids = BTreeSet::new();
         for session in &self.sessions {
             session.validate()?;
+            if session
+                .project_id
+                .as_ref()
+                .is_some_and(|project_id| !project_ids.contains(project_id))
+            {
+                return Err(ValidationError::new(
+                    "bootstrap.sessions.project_id",
+                    "must identify an advertised project",
+                ));
+            }
             if !session_ids.insert(session.id.clone()) {
                 return Err(ValidationError::new(
                     "bootstrap.sessions",
@@ -1462,7 +2234,10 @@ mod tests {
             let encoded = serde_json::to_value(ItemPayload::UserMessage {
                 text: "hello".into(),
                 attachments: Vec::new(),
+                documents: Vec::new(),
+                project_files: Vec::new(),
                 delivery: Some(delivery),
+                branch_provenance: None,
             })
             .unwrap();
             assert_eq!(encoded["data"]["delivery"], expected);
@@ -1488,5 +2263,128 @@ mod tests {
         let mut complete = graph;
         complete.truncated = false;
         assert!(complete.validate().is_err());
+    }
+
+    fn branch_provenance(
+        operation: ConversationBranchOperation,
+    ) -> ConversationBranchProvenance {
+        ConversationBranchProvenance {
+            operation,
+            source_session_id: SessionId::new("source-session").unwrap(),
+            source_entry_id: DurableEntryId::new("source-entry").unwrap(),
+            originating_user_entry_id: None,
+            model_override: None,
+            external_effects_preserved: true,
+            warning:
+                "Conversation history changed; external effects are preserved and not rolled back."
+                    .into(),
+        }
+    }
+
+    fn session_summary(lifecycle: SessionCatalogState) -> SessionSummary {
+        let (archived, retention) = match lifecycle {
+            SessionCatalogState::Active => (false, None),
+            SessionCatalogState::Archived => (true, None),
+            SessionCatalogState::Trash => (
+                true,
+                Some(SessionRetention {
+                    trashed_at_ms: 10,
+                    purge_after_ms: 20,
+                    permanent_delete_requires_confirmation: true,
+                }),
+            ),
+        };
+        SessionSummary {
+            id: SessionId::new("session").unwrap(),
+            project_id: None,
+            title: "Session".into(),
+            tags: Vec::new(),
+            created_at_ms: 1,
+            modified_at_ms: 2,
+            pinned: false,
+            archived,
+            lifecycle,
+            retention,
+            forked_from: None,
+            provisional: false,
+            live_state: SessionLiveState::Idle,
+            attention: AttentionState::None,
+            owner: ActorOwnerState::Inactive,
+            model: ModelSelection {
+                provider: "provider".into(),
+                model: "model".into(),
+                reasoning: "high".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn lifecycle_validation_keeps_trash_recoverable_and_confirmation_guarded() {
+        for lifecycle in [
+            SessionCatalogState::Active,
+            SessionCatalogState::Archived,
+            SessionCatalogState::Trash,
+        ] {
+            session_summary(lifecycle).validate().unwrap();
+        }
+
+        let mut missing_retention = session_summary(SessionCatalogState::Trash);
+        missing_retention.retention = None;
+        assert!(missing_retention.validate().is_err());
+
+        let mut unsafe_delete = session_summary(SessionCatalogState::Trash);
+        unsafe_delete
+            .retention
+            .as_mut()
+            .unwrap()
+            .permanent_delete_requires_confirmation = false;
+        assert!(unsafe_delete.validate().is_err());
+
+        let mut inconsistent_archive = session_summary(SessionCatalogState::Active);
+        inconsistent_archive.archived = true;
+        assert!(inconsistent_archive.validate().is_err());
+    }
+
+    #[test]
+    fn branch_provenance_distinguishes_edit_retry_and_new_session_forks() {
+        let edit = branch_provenance(ConversationBranchOperation::EditUserTurn);
+        edit.validate().unwrap();
+        let item = ItemPayload::UserMessage {
+            text: "edited prompt".into(),
+            attachments: Vec::new(),
+            documents: Vec::new(),
+            project_files: Vec::new(),
+            delivery: Some(UserMessageDelivery::Submit),
+            branch_provenance: Some(edit),
+        };
+        item.validate().unwrap();
+
+        let mut retry = branch_provenance(ConversationBranchOperation::RetryResponse);
+        retry.originating_user_entry_id =
+            Some(DurableEntryId::new("originating-user").unwrap());
+        retry.model_override = Some(ModelSelection {
+            provider: "alternate-provider".into(),
+            model: "alternate-model".into(),
+            reasoning: "high".into(),
+        });
+        retry.validate().unwrap();
+
+        let mut fork = session_summary(SessionCatalogState::Active);
+        fork.forked_from = Some(branch_provenance(
+            ConversationBranchOperation::ForkSession,
+        ));
+        fork.validate().unwrap();
+
+        let mut misleading = branch_provenance(ConversationBranchOperation::EditUserTurn);
+        misleading.warning = "Everything was reverted.".into();
+        assert!(misleading.validate().is_err());
+
+        let mut edit_with_model = branch_provenance(ConversationBranchOperation::EditUserTurn);
+        edit_with_model.model_override = Some(ModelSelection {
+            provider: "provider".into(),
+            model: "model".into(),
+            reasoning: "high".into(),
+        });
+        assert!(edit_with_model.validate().is_err());
     }
 }

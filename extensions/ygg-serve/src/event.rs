@@ -9,8 +9,8 @@ use crate::bounds::{
 use crate::{
     ArtifactRef, AuthorityProfile, CatalogCursor, DurableEntryId, ItemId, ItemLifecycle,
     ModelSelection, PendingRequest, RunId, SessionBranchEntry, SessionCursor, SessionId,
-    SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, SourceRef, UsageSnapshot,
-    PROTOCOL_VERSION,
+    SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, SourceRef, ToolActivity,
+    UsageSnapshot, PROTOCOL_VERSION,
 };
 
 const MAX_BRANCH_DELTA_ENTRIES: usize = 128;
@@ -34,12 +34,10 @@ pub enum ItemDelta {
         /// Exact UTF-8 suffix.
         append: String,
     },
-    /// Replace bounded live tool progress.
-    ToolProgress {
-        /// Latest retained progress text.
-        text: String,
-        /// Total producer-dropped bytes.
-        dropped_bytes: u64,
+    /// Replace the complete bounded semantic tool projection.
+    ToolActivity {
+        /// Argument-free semantic state.
+        activity: ToolActivity,
     },
 }
 
@@ -316,12 +314,7 @@ impl ProtocolValidation for ItemDelta {
             Self::ReasoningText { append } => {
                 validate_public_text("event.delta.reasoning", append, MAX_PUBLIC_TEXT_BYTES, true)
             }
-            Self::ToolProgress { text, .. } => validate_public_text(
-                "event.delta.tool_progress",
-                text,
-                MAX_PUBLIC_TEXT_BYTES,
-                true,
-            ),
+            Self::ToolActivity { activity } => activity.validate(),
         }
     }
 }

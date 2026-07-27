@@ -7,16 +7,17 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use ygg_serve_backend::{
-    ActorOwnerState, AttachmentPolicy, AttentionState, AuthorityProfile, CatalogCursor,
-    ColorScheme, CommandId, ContextUsage, DeviceId, DurableEntryId, EventEnvelope, EventPayload,
-    HostAckDisposition, HostBootstrap, HostCapabilities, HostCommand, HostCommandAck,
-    HostCommandEnvelope, HostDescriptor, HostId, InputModality, ItemDelta, ItemId, ItemLifecycle,
-    ItemPayload, ModelSelection, ModelSummary, ProjectId, ProjectSummary, PromptInput,
-    ProtocolValidation, RunId, SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph,
-    SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId, SessionItem,
-    SessionLiveState, SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity, ThemeDto, ThemeId,
-    ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TurnId,
-    UsageSnapshot, UserMessageDelivery,
+    ActivityPhase, ActivityPhaseSummary, ActorOwnerState, AttachmentPolicy, AttentionState,
+    AuthorityProfile, CatalogCursor, ColorScheme, CommandId, CompletionReview, ContextUsage,
+    DeviceId, DurableEntryId, EventEnvelope, EventPayload, EvidenceCoverage, HostAckDisposition,
+    HostBootstrap, HostCapabilities, HostCommand, HostCommandAck, HostCommandEnvelope,
+    HostDescriptor, HostId, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
+    ModelSelection, ModelSummary, ProjectCatalog, ProjectId, ProjectSummary, PromptInput,
+    ProtocolValidation, RunId, RunOutcome, SessionBranchEntry, SessionBranchEntryKind,
+    SessionBranchGraph, SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId,
+    SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity,
+    ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
+    ToolActivity, ToolActivityStatus, ToolKind, TurnId, UsageSnapshot, UserMessageDelivery,
 };
 
 fn model_selection() -> ModelSelection {
@@ -52,7 +53,10 @@ fn live_control_item() -> SessionItem {
         payload: ItemPayload::UserMessage {
             text: "Change direction".into(),
             attachments: Vec::new(),
+            documents: Vec::new(),
+            project_files: Vec::new(),
             delivery: Some(UserMessageDelivery::Steer),
+            branch_provenance: None,
         },
     }
 }
@@ -152,10 +156,15 @@ fn bootstrap() -> HostBootstrap {
             opaque_resources: true,
             attachments: true,
             attachment_policy: Some(AttachmentPolicy::image_defaults()),
+            documents: false,
+            trusted_project_files: false,
+            transcript_search: false,
             previews: true,
             connected_devices: false,
             session_metadata: true,
             session_branches: true,
+            conversation_branching: true,
+            session_trash: true,
             session_export: true,
             lan_clients: false,
             terminal: false,
@@ -184,6 +193,9 @@ fn bootstrap() -> HostBootstrap {
             id: ProjectId::new("project-ygg").unwrap(),
             name: "ygg".into(),
             trusted: true,
+            archived: false,
+            available: true,
+            is_default: true,
             session_count: 1,
             live_session_count: 1,
         }],
@@ -196,6 +208,9 @@ fn bootstrap() -> HostBootstrap {
             modified_at_ms: 1_721_000_000_042,
             pinned: false,
             archived: false,
+            lifecycle: ygg_serve_backend::SessionCatalogState::Active,
+            retention: None,
+            forked_from: None,
             provisional: false,
             live_state: SessionLiveState::Idle,
             attention: AttentionState::None,
@@ -224,6 +239,96 @@ fn event() -> EventEnvelope {
     )
 }
 
+fn semantic_tool_event() -> EventEnvelope {
+    EventEnvelope::new(
+        SessionId::new("session-demo").unwrap(),
+        SessionCursor {
+            actor_generation: 3,
+            sequence: 44,
+        },
+        1_721_000_000_350,
+        EventPayload::ItemDelta {
+            item_id: ItemId::new("item-tool-cargo-test").unwrap(),
+            delta: ItemDelta::ToolActivity {
+                activity: ToolActivity {
+                    raw_tool_name: "bash".into(),
+                    kind: ToolKind::Command,
+                    phase: ActivityPhase::Verified,
+                    status: ToolActivityStatus::Succeeded,
+                    title: "Run cargo test".into(),
+                    summary: Some("Completed".into()),
+                    target: None,
+                    cwd: Some(".".into()),
+                    command_preview: Some("cargo test".into()),
+                    exit_code: Some(0),
+                    signal: None,
+                    started_at_ms: 1_721_000_000_100,
+                    completed_at_ms: Some(1_721_000_000_350),
+                    duration_ms: Some(250),
+                    output_summary: Some("Verification completed".into()),
+                    output_handle: None,
+                    observed_output_bytes: 4_096,
+                    dropped_output_bytes: 128,
+                    changed_paths: Vec::new(),
+                    source_ids: Vec::new(),
+                    artifact_ids: Vec::new(),
+                },
+            },
+        },
+    )
+}
+
+fn completion_review_item() -> SessionItem {
+    SessionItem {
+        id: ItemId::new("item-run-outcome").unwrap(),
+        run_id: Some(RunId::new("run-stable-1").unwrap()),
+        turn_id: Some(TurnId::new("turn-stable-2").unwrap()),
+        provider_attempt: None,
+        lifecycle: ItemLifecycle::Committed,
+        durable_entry_id: Some(DurableEntryId::new("entry-run-outcome").unwrap()),
+        payload: ItemPayload::RunOutcome {
+            outcome: RunOutcome::Completed,
+            message: None,
+            review: CompletionReview {
+                summary:
+                    "Completed 2 actions, 1 changed file, 1 verification, 0 failures, 0 warnings, and 1 output."
+                        .into(),
+                duration_ms: 1_250,
+                action_count: 2,
+                phases: vec![
+                    ActivityPhaseSummary {
+                        phase: ActivityPhase::Changed,
+                        action_count: 1,
+                        succeeded_count: 1,
+                        failed_count: 0,
+                        stopped_count: 0,
+                    },
+                    ActivityPhaseSummary {
+                        phase: ActivityPhase::Verified,
+                        action_count: 1,
+                        succeeded_count: 1,
+                        failed_count: 0,
+                        stopped_count: 0,
+                    },
+                ],
+                changed_file_item_ids: vec![ItemId::new("item-file-change").unwrap()],
+                verification_action_item_ids: vec![
+                    ItemId::new("item-tool-cargo-test").unwrap(),
+                ],
+                failed_action_item_ids: Vec::new(),
+                warning_action_item_ids: Vec::new(),
+                source_ids: Vec::new(),
+                output_ids: vec![
+                    ygg_serve_backend::ArtifactId::new("artifact-report").unwrap(),
+                ],
+                test_results: Vec::new(),
+                evidence_coverage: EvidenceCoverage::Partial,
+                open_questions: Vec::new(),
+            },
+        },
+    }
+}
+
 fn session_command() -> SessionCommandEnvelope {
     SessionCommandEnvelope::new(
         HostId::new("host-demo").unwrap(),
@@ -241,6 +346,8 @@ fn session_command() -> SessionCommandEnvelope {
                     media_type: "image/png".into(),
                     byte_len: 98_765,
                 }],
+                document_ids: Vec::new(),
+                project_file_ids: Vec::new(),
             },
         },
     )
@@ -268,8 +375,33 @@ fn host_ack() -> HostCommandAck {
         acknowledged_at_ms: 1_721_000_000_061,
         catalog_cursor: CatalogCursor(8),
         disposition: HostAckDisposition::Accepted {
-            created_session_id: SessionId::new("session-created").unwrap(),
+            created_session_id: Some(SessionId::new("session-created").unwrap()),
+            project: None,
+            catalog_changed: false,
         },
+    }
+}
+
+fn project_catalog() -> ProjectCatalog {
+    ProjectCatalog {
+        protocol: 1,
+        host: HostDescriptor {
+            id: HostId::new("host-demo").unwrap(),
+            name: "Local Ygg".into(),
+        },
+        catalog_cursor: CatalogCursor(9),
+        lifecycle_mutations_supported: true,
+        import_supported: false,
+        projects: vec![ProjectSummary {
+            id: ProjectId::new("project-ygg").unwrap(),
+            name: "ygg".into(),
+            trusted: true,
+            archived: false,
+            available: true,
+            is_default: true,
+            session_count: 1,
+            live_session_count: 1,
+        }],
     }
 }
 
@@ -312,6 +444,22 @@ fn dotted_event_golden_contract() {
 }
 
 #[test]
+fn semantic_tool_event_golden_contract() {
+    assert_golden(
+        semantic_tool_event(),
+        include_str!("../fixtures/semantic-tool-event.json"),
+    );
+}
+
+#[test]
+fn completion_review_golden_contract() {
+    assert_golden(
+        completion_review_item(),
+        include_str!("../fixtures/completion-review-item.json"),
+    );
+}
+
+#[test]
 fn session_command_golden_contract() {
     assert_golden(
         session_command(),
@@ -328,5 +476,13 @@ fn host_command_and_ack_golden_contract() {
     assert_golden(
         host_ack(),
         include_str!("../fixtures/host-command-ack.json"),
+    );
+}
+
+#[test]
+fn project_catalog_golden_contract() {
+    assert_golden(
+        project_catalog(),
+        include_str!("../fixtures/project-catalog.json"),
     );
 }

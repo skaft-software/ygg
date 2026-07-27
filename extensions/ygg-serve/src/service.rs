@@ -8,9 +8,12 @@ use tokio::sync::oneshot;
 
 use crate::{
     AttachmentError, AttachmentPolicy, AttachmentRef, AuthorityProfile, HostCapabilities,
-    HostDescriptor, ModelSelection, ModelSummary, ProjectId, ProjectSummary, RunId, SanitizedError,
-    SessionCommand, SessionSnapshot, SessionSummary, StoredAttachment, ThemeId, ThemeOption,
-    TimestampedEvent,
+    DocumentReference, FileEntryId, HostDescriptor, ModelSelection, ModelSummary, ProjectId,
+    PermanentDeleteConfirmation, ProjectSummary, RunId, SanitizedError, SessionCatalogState,
+    SessionCommand, SessionId, SessionSnapshot, SessionSummary,
+    RepositoryContextSnapshot, StoredAttachment, ThemeId, ThemeOption, TimestampedEvent, TrustedFileEntry,
+    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileIndexSummary, TrustedFileRead,
+    TrustedFileSearchResult,
 };
 
 /// Immutable, path-free content behind one host-minted opaque resource handle.
@@ -78,6 +81,8 @@ impl SessionSeed {
 pub struct DriverCommandOutcome {
     /// Run admitted by the command when available.
     pub run_id: Option<RunId>,
+    /// Genuinely new durable session created by a conversation fork.
+    pub created_session_id: Option<SessionId>,
     /// Immediate public events. Long-running streams arrive through
     /// [`SessionDriver::next_event`].
     pub events: Vec<TimestampedEvent>,
@@ -175,6 +180,7 @@ impl DriverCommandOutcome {
     pub fn with_events(events: Vec<TimestampedEvent>) -> Self {
         Self {
             run_id: None,
+            created_session_id: None,
             events,
             replacement: None,
         }
@@ -184,6 +190,7 @@ impl DriverCommandOutcome {
     pub fn run(run_id: RunId, events: Vec<TimestampedEvent>) -> Self {
         Self {
             run_id: Some(run_id),
+            created_session_id: None,
             events,
             replacement: None,
         }
@@ -197,6 +204,7 @@ impl DriverCommandOutcome {
         (
             Self {
                 run_id: None,
+                created_session_id: None,
                 events: Vec::new(),
                 replacement: Some(ProjectionReplacement {
                     seed,
@@ -209,6 +217,16 @@ impl DriverCommandOutcome {
                 completion: Some(completion),
             },
         )
+    }
+
+    /// Creates an outcome for a committed new-session conversation fork.
+    pub fn fork(created_session_id: SessionId) -> Self {
+        Self {
+            run_id: None,
+            created_session_id: Some(created_session_id),
+            events: Vec::new(),
+            replacement: None,
+        }
     }
 }
 
@@ -353,6 +371,97 @@ pub trait HostService: Send + Sync + 'static {
         Err(AttachmentError::Unavailable)
     }
 
+    /// Whether text/Markdown/PDF document ingest is available.
+    fn document_ingest_supported(&self) -> bool {
+        false
+    }
+
+    /// Ingests one immutable document for an authoritative project/session binding.
+    async fn ingest_document(
+        &self,
+        _session_id: &crate::SessionId,
+        _display_name: &str,
+        _media_type: &str,
+        _bytes: Bytes,
+    ) -> Result<DocumentReference, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Lists path-free uploaded documents owned by one session.
+    async fn list_documents(
+        &self,
+        _session_id: &crate::SessionId,
+    ) -> Result<Vec<DocumentReference>, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Whether root-confined trusted-project file browsing is available.
+    fn trusted_project_files_supported(&self) -> bool {
+        false
+    }
+
+    /// Returns the bounded trusted-file index status for one project.
+    async fn trusted_file_index(
+        &self,
+        _project_id: &ProjectId,
+    ) -> Result<TrustedFileIndexSummary, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Lists safe project-relative file metadata.
+    async fn list_trusted_files(
+        &self,
+        _project_id: &ProjectId,
+        _limit: usize,
+    ) -> Result<Vec<TrustedFileEntry>, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Searches safe project-relative file names and bounded text.
+    async fn search_trusted_files(
+        &self,
+        _project_id: &ProjectId,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<TrustedFileSearchResult, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Reads one immutable trusted-file snapshot by opaque entry identity.
+    async fn read_trusted_file(
+        &self,
+        _project_id: &ProjectId,
+        _entry_id: &FileEntryId,
+    ) -> Result<TrustedFileRead, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Whether authenticated search over durable public transcript projections is available.
+    fn transcript_search_supported(&self) -> bool {
+        false
+    }
+
+    /// Searches durable, already-redacted transcript projections.
+    async fn search_transcripts(
+        &self,
+        _request: &TranscriptSearchRequest,
+    ) -> Result<TranscriptSearchResult, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Whether trusted repository and folder-instruction context is available.
+    fn repository_context_supported(&self) -> bool {
+        false
+    }
+
+    /// Refreshes path-free Git and folder-instruction context for one trusted project.
+    async fn repository_context(
+        &self,
+        _project_id: &ProjectId,
+    ) -> Result<RepositoryContextSnapshot, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
     /// Returns one immutable opaque resource for an authenticated session request.
     ///
     /// Handles are minted and registered by the trusted host. Transports must
@@ -407,6 +516,92 @@ pub trait HostService: Send + Sync + 'static {
 
     /// Lists bounded project summaries.
     async fn list_projects(&self) -> Result<Vec<ProjectSummary>, ServiceError>;
+
+    /// Whether authenticated project import and lifecycle mutations are
+    /// supported by this concrete host/platform.
+    fn project_lifecycle_mutations_supported(&self) -> bool {
+        false
+    }
+
+    /// Whether a host-native picker can mint opaque import candidates.
+    fn project_import_supported(&self) -> bool {
+        false
+    }
+
+    /// Consumes an opaque host-minted selection as an initially untrusted
+    /// project. Browser-authored paths are never accepted at this boundary.
+    async fn import_project(
+        &self,
+        _candidate_id: &str,
+        _display_name: Option<&str>,
+    ) -> Result<ProjectSummary, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Renames one project without changing its root authority.
+    async fn rename_project(
+        &self,
+        _project_id: &ProjectId,
+        _display_name: &str,
+    ) -> Result<ProjectSummary, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Makes one active project the default.
+    async fn set_default_project(
+        &self,
+        _project_id: &ProjectId,
+    ) -> Result<ProjectSummary, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Clears the project default.
+    async fn clear_default_project(&self) -> Result<(), ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Grants or revokes explicit execution trust.
+    async fn set_project_trust(
+        &self,
+        _project_id: &ProjectId,
+        _trusted: bool,
+    ) -> Result<ProjectSummary, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Archives a project and revokes trust.
+    async fn archive_project(
+        &self,
+        _project_id: &ProjectId,
+    ) -> Result<ProjectSummary, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Whether recoverable session trash and confirmed permanent deletion are
+    /// supported by this host.
+    fn session_trash_supported(&self) -> bool {
+        false
+    }
+
+    /// Changes one durable session's catalog lifecycle after its graphical
+    /// owner has quiesced.
+    async fn set_session_lifecycle(
+        &self,
+        _session_id: &SessionId,
+        _lifecycle: SessionCatalogState,
+        _changed_at_ms: u64,
+    ) -> Result<SessionSummary, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Permanently deletes one trashed session after exact confirmation.
+    async fn delete_session_permanently(
+        &self,
+        _session_id: &SessionId,
+        _confirmation: &PermanentDeleteConfirmation,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
 
     /// Lists bounded session summaries without replaying every transcript.
     async fn list_sessions(&self) -> Result<Vec<SessionSummary>, ServiceError>;

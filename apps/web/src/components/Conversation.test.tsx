@@ -2,14 +2,232 @@
 
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SessionDraftStore } from "../drafts";
 import { fixtureBootstrap, fixtureSessions } from "../fixtures";
+import type { CompletionReview } from "../protocol";
 import { Conversation } from "./Conversation";
 
 const noOp = async () => {};
+class MemoryStorage implements Storage {
+  private readonly values = new Map<string, string>();
+
+  get length() {
+    return this.values.size;
+  }
+
+  clear() {
+    this.values.clear();
+  }
+
+  getItem(key: string) {
+    return this.values.get(key) ?? null;
+  }
+
+  key(index: number) {
+    return Array.from(this.values.keys())[index] ?? null;
+  }
+
+  removeItem(key: string) {
+    this.values.delete(key);
+  }
+
+  setItem(key: string, value: string) {
+    this.values.set(key, value);
+  }
+}
+const completionReview = (
+  summary: string,
+  durationMs: number,
+): CompletionReview => ({
+  summary,
+  durationMs,
+  actionCount: 0,
+  phases: [],
+  changedFileItemIds: [],
+  verificationActionItemIds: [],
+  failedActionItemIds: [],
+  warningActionItemIds: [],
+  sourceIds: [],
+  outputIds: [],
+  testResults: [],
+  evidenceCoverage: "none",
+  openQuestions: [],
+});
 
 describe("conversation composer", () => {
-  afterEach(cleanup);
+  beforeEach(() => {
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: new MemoryStorage(),
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    window.localStorage.clear();
+  });
+
+  it("wires host document and trusted-file context into the composer", async () => {
+    const user = userEvent.setup();
+    const onListProjectFiles = vi.fn().mockResolvedValue({
+      summary: { indexedFiles: 0, ignoredEntries: 0, truncated: false },
+      files: [],
+    });
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+        onIngestAttachment={vi.fn()}
+        onIngestDocument={vi.fn()}
+        onListProjectFiles={onListProjectFiles}
+        onSearchProjectFiles={vi.fn()}
+        onReadProjectFile={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Context" }));
+
+    expect(
+      screen.getByRole("dialog", { name: "Add prompt context" }),
+    ).toBeVisible();
+    await waitFor(() => expect(onListProjectFiles).toHaveBeenCalledOnce());
+  });
+
+  it("edits, retries with a model, and forks only from durable checkpoints", async () => {
+    const user = userEvent.setup();
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    session.items = [
+      {
+        id: "branch-user",
+        turnId: "branch-turn",
+        durableEntryId: "entry-user",
+        kind: "user_message",
+        content: "Original request",
+        state: "committed",
+        createdAt: session.startedAt,
+      },
+      {
+        id: "branch-assistant",
+        turnId: "branch-turn",
+        durableEntryId: "entry-assistant",
+        kind: "assistant_message",
+        content: "Original response",
+        state: "committed",
+        createdAt: session.startedAt,
+      },
+    ];
+    const onEditUserTurn = vi.fn().mockResolvedValue(undefined);
+    const onRetryResponse = vi.fn().mockResolvedValue(undefined);
+    const onForkConversation = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+        onEditUserTurn={onEditUserTurn}
+        onRetryResponse={onRetryResponse}
+        onForkConversation={onForkConversation}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Edit this turn" }));
+    expect(
+      screen.getByText("External effects are preserved."),
+    ).toBeVisible();
+    const replacement = screen.getByLabelText("Replacement message");
+    await user.clear(replacement);
+    await user.type(replacement, "Replacement request");
+    await user.click(
+      screen.getByRole("button", { name: "Create edited branch" }),
+    );
+    expect(onEditUserTurn).toHaveBeenCalledWith(
+      "entry-user",
+      "Replacement request",
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: "Retry response with another model",
+      }),
+    );
+    await user.selectOptions(
+      screen.getByLabelText("Model"),
+      "gpt-5.4",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Retry with model" }),
+    );
+    expect(onRetryResponse).toHaveBeenCalledWith(
+      "entry-assistant",
+      expect.objectContaining({ id: "gpt-5.4" }),
+    );
+
+    await user.click(
+      screen.getAllByRole("button", {
+        name: "Fork conversation here",
+      })[0]!,
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Fork conversation" }),
+    );
+    expect(onForkConversation).toHaveBeenCalledWith("entry-user");
+  });
+
+  it("restores an independent text and uploaded-attachment draft", () => {
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    const bootstrap = structuredClone(fixtureBootstrap);
+    new SessionDraftStore(window.localStorage).save(
+      bootstrap.host.id,
+      session.sessionId,
+      {
+        text: "Resume this exact draft",
+        delivery: "submit",
+        attachments: [
+          {
+            id: "attachment-draft",
+            handle: "attachment-handle",
+            name: "notes.md",
+            mediaType: "text/markdown",
+            size: 128,
+          },
+        ],
+        updatedAt: new Date().toISOString(),
+      },
+    );
+
+    render(
+      <Conversation
+        session={session}
+        bootstrap={bootstrap}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    expect(screen.getByLabelText("Message ygg")).toHaveValue(
+      "Resume this exact draft",
+    );
+    expect(screen.getByText("notes.md")).toBeVisible();
+  });
 
   it("keeps the draft and surfaces a rejected send", async () => {
     const user = userEvent.setup();
@@ -40,6 +258,38 @@ describe("conversation composer", () => {
     expect(composer).toHaveValue("Keep this draft");
   });
 
+  it("retries a recoverable send with the same idempotency key", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Network unavailable"))
+      .mockResolvedValueOnce(undefined);
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={onSubmit}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    await user.type(screen.getByLabelText("Message ygg"), "Retry safely");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByText("Connection interrupted")).toBeVisible();
+    const firstKey = onSubmit.mock.calls[0]?.[3];
+    expect(firstKey).toEqual(expect.any(String));
+
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+    expect(onSubmit.mock.calls[1]?.[3]).toBe(firstKey);
+    expect(screen.getByLabelText("Message ygg")).toHaveValue("");
+  });
+
   it("queues by default and keeps Steer in a themed secondary menu", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);
@@ -67,7 +317,14 @@ describe("conversation composer", () => {
     await user.type(screen.getByLabelText("Message ygg"), "Queue this");
     await user.click(screen.getByRole("button", { name: "Queue follow-up" }));
 
-    expect(onSubmit).toHaveBeenCalledWith("Queue this", [], "followUp");
+    expect(onSubmit).toHaveBeenCalledWith(
+      "Queue this",
+      [],
+      "followUp",
+      expect.any(String),
+      [],
+      [],
+    );
 
     await user.click(delivery);
     expect(
@@ -181,6 +438,7 @@ describe("conversation composer", () => {
       outcome: "done",
       durationMs: 0,
       summary: "Run completed",
+      review: completionReview("Run completed", 0),
       state: "committed",
       createdAt: new Date().toISOString(),
     });
@@ -236,6 +494,43 @@ describe("conversation composer", () => {
     expect(screen.getByText("<script>alert('no')</script>")).toBeVisible();
   });
 
+  it("defers Markdown parsing until a streaming response is committed", async () => {
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    session.items.push({
+      id: "assistant-streaming-markdown",
+      turnId: "turn-streaming-markdown",
+      kind: "assistant_message",
+      content: "## Streaming heading",
+      state: "streaming",
+      createdAt: new Date().toISOString(),
+    });
+    const props = {
+      bootstrap: structuredClone(fixtureBootstrap),
+      onSubmit: noOp,
+      onInterrupt: noOp,
+      onConfigure: noOp,
+      onResolveApproval: noOp,
+      onResolveUserInput: noOp,
+      onOpenOutput: () => {},
+      onOpenSource: () => {},
+    };
+    const { rerender } = render(<Conversation session={session} {...props} />);
+
+    expect(
+      screen.queryByRole("heading", { name: "Streaming heading" }),
+    ).toBeNull();
+    expect(screen.getByText("## Streaming heading")).toBeVisible();
+
+    const committed = structuredClone(session);
+    const response = committed.items.at(-1);
+    if (response) response.state = "committed";
+    rerender(<Conversation session={committed} {...props} />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Streaming heading" }),
+    ).toBeVisible();
+  });
+
   it("copies a completed assistant response and confirms it quietly", async () => {
     const user = userEvent.setup();
     const writeText = vi
@@ -289,7 +584,9 @@ describe("conversation composer", () => {
       <Conversation session={session} {...props} />,
     );
 
-    const workingSummary = screen.getByRole("button", { name: /Working/ });
+    const workingSummary = screen.getByRole("button", {
+      name: /Checking the narrow layout/,
+    });
     expect(workingSummary).toHaveAttribute("aria-expanded", "true");
     expect(workingSummary.querySelector(".work-group-glyph")).toBeNull();
 
@@ -303,11 +600,13 @@ describe("conversation composer", () => {
     );
     completed.items.push({
       id: "live-outcome",
+      runId: "run-live",
       turnId: "live-turn",
       kind: "run_outcome",
       outcome: "done",
       durationMs: 4_500,
       summary: "Work completed",
+      review: completionReview("Work completed", 4_500),
       state: "committed",
       createdAt: new Date().toISOString(),
     });
@@ -334,8 +633,16 @@ describe("conversation composer", () => {
         turnId: "turn-evidence",
         kind: "action",
         actionKind: "file_write",
+        phase: "changed",
+        status: "running",
+        rawToolName: "apply_patch",
         label: "Changed file",
         target: "src/theme.ts",
+        observedOutputBytes: 0,
+        droppedOutputBytes: 0,
+        changedPaths: ["src/theme.ts"],
+        sourceIds: [],
+        outputIds: [],
         additions: 8,
         deletions: 3,
         diffHandle: "resource-diff",

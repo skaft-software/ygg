@@ -1,0 +1,42 @@
+[
+  {
+    "sessionId": "session-visible",
+    "itemId": "user-1",
+    "kind": "user",
+    "sessionTitle": "Reconnect review",
+    "text": "Please verify the reconnect behavior.",
+    "timestampMs": 1
+  },
+  {
+    "sessionId": "session-visible",
+    "itemId": "assistant-1",
+    "kind": "assistant",
+    "sessionTitle": "Reconnect review",
+    "text": "The reconnect path now replays durable events.",
+    "timestampMs": 2
+  },
+  {
+    "sessionId": "session-visible",
+    "itemId": "tool-1",
+    "kind": "tool",
+    "sessionTitle": "Reconnect review",
+    "text": "Reconnect integration tests passed.",
+    "timestampMs": 3
+  },
+  {
+    "sessionId": "session-visible",
+    "itemId": "error-1",
+    "kind": "error",
+    "sessionTitle": "Reconnect review",
+    "text": "A prior reconnect attempt timed out.",
+    "timestampMs": 4
+  },
+  {
+    "sessionId": "session-visible",
+    "itemId": "attachment-1",
+    "kind": "attachment",
+    "sessionTitle": "Reconnect review",
+    "text": "reconnect-notes.md: approved visible document text",
+    "timestampMs": 5
+  }
+]

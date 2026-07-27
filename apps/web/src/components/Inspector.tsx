@@ -7,7 +7,7 @@ import {
   LoaderCircle,
   X,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getFixturePreviewMarkup } from "../fixtures";
 import type { OutputRef, PreviewRef, SessionSnapshot, SourceRef } from "../protocol";
 
@@ -52,29 +52,224 @@ function boundedDiffLines(text: string): {
   return { lines, truncated: start < text.length };
 }
 
+interface SplitDiffRow {
+  kind: "context" | "change" | "hunk" | "meta";
+  oldNumber?: number;
+  newNumber?: number;
+  oldText?: string;
+  newText?: string;
+  hunkIndex?: number;
+}
+
+function splitDiffRows(lines: string[]): SplitDiffRow[] {
+  const rows: SplitDiffRow[] = [];
+  let oldNumber = 0;
+  let newNumber = 0;
+  let hunkIndex = -1;
+  let removals: Array<{ number: number; text: string }> = [];
+  let additions: Array<{ number: number; text: string }> = [];
+  const flushChanges = () => {
+    const count = Math.max(removals.length, additions.length);
+    for (let index = 0; index < count; index += 1) {
+      const removal = removals[index];
+      const addition = additions[index];
+      rows.push({
+        kind: "change",
+        oldNumber: removal?.number,
+        newNumber: addition?.number,
+        oldText: removal?.text,
+        newText: addition?.text,
+      });
+    }
+    removals = [];
+    additions = [];
+  };
+
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      flushChanges();
+      const coordinates = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      oldNumber = Number(coordinates?.[1] ?? 0);
+      newNumber = Number(coordinates?.[2] ?? 0);
+      hunkIndex += 1;
+      rows.push({
+        kind: "hunk",
+        oldText: line,
+        newText: line,
+        hunkIndex,
+      });
+      continue;
+    }
+    if (line.startsWith("-") && !line.startsWith("---")) {
+      removals.push({ number: oldNumber, text: line.slice(1) });
+      oldNumber += 1;
+      continue;
+    }
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      additions.push({ number: newNumber, text: line.slice(1) });
+      newNumber += 1;
+      continue;
+    }
+
+    flushChanges();
+    if (line.startsWith(" ")) {
+      rows.push({
+        kind: "context",
+        oldNumber,
+        newNumber,
+        oldText: line.slice(1),
+        newText: line.slice(1),
+      });
+      oldNumber += 1;
+      newNumber += 1;
+    } else {
+      rows.push({ kind: "meta", oldText: line, newText: line });
+    }
+  }
+  flushChanges();
+  return rows;
+}
+
 function DiffPreview({ text }: { text: string }) {
-  const preview = boundedDiffLines(text);
+  const preview = useMemo(() => boundedDiffLines(text), [text]);
+  const [mode, setMode] = useState<"unified" | "split">("unified");
+  const [activeHunk, setActiveHunk] = useState(0);
+  const hunks = useMemo(
+    () =>
+      preview.lines.flatMap((line, lineIndex) =>
+        line.startsWith("@@") ? [{ label: line, lineIndex }] : [],
+      ),
+    [preview.lines],
+  );
+  const splitRows = useMemo(
+    () => splitDiffRows(preview.lines),
+    [preview.lines],
+  );
+  const hunkByLine = useMemo(
+    () => new Map(hunks.map((hunk, index) => [hunk.lineIndex, index])),
+    [hunks],
+  );
+  const visitHunk = (index: number) => {
+    const next = Math.max(0, Math.min(index, hunks.length - 1));
+    setActiveHunk(next);
+    document
+      .getElementById(`diff-hunk-${next}`)
+      ?.scrollIntoView?.({ block: "center" });
+  };
+
   return (
     <>
-      <pre className="opaque-resource-text is-diff">
-        {preview.lines.map((line, index) => (
-          <span
-            key={index}
-            className={
-              line.startsWith("+") && !line.startsWith("+++")
-                ? "is-addition"
-                : line.startsWith("-") && !line.startsWith("---")
-                  ? "is-deletion"
-                  : line.startsWith("@@")
-                    ? "is-hunk"
-                    : undefined
-            }
+      <div className="diff-toolbar" aria-label="Diff controls">
+        <div className="diff-mode" role="group" aria-label="Diff layout">
+          <button
+            type="button"
+            aria-pressed={mode === "unified"}
+            onClick={() => setMode("unified")}
           >
-            {line || " "}
-            {"\n"}
-          </span>
-        ))}
-      </pre>
+            Unified
+          </button>
+          <button
+            type="button"
+            aria-pressed={mode === "split"}
+            onClick={() => setMode("split")}
+          >
+            Split
+          </button>
+        </div>
+        {hunks.length ? (
+          <div className="diff-hunk-navigation">
+            <button
+              type="button"
+              disabled={activeHunk === 0}
+              onClick={() => visitHunk(activeHunk - 1)}
+              aria-label="Previous change"
+            >
+              Previous
+            </button>
+            <span aria-live="polite">
+              Change {activeHunk + 1} of {hunks.length}
+            </span>
+            <button
+              type="button"
+              disabled={activeHunk === hunks.length - 1}
+              onClick={() => visitHunk(activeHunk + 1)}
+              aria-label="Next change"
+            >
+              Next
+            </button>
+          </div>
+        ) : null}
+      </div>
+      {mode === "unified" ? (
+        <pre className="opaque-resource-text is-diff">
+          {preview.lines.map((line, index) => {
+            const hunkIndex = hunkByLine.get(index);
+            return (
+              <span
+                key={index}
+                id={
+                  hunkIndex === undefined
+                    ? undefined
+                    : `diff-hunk-${hunkIndex}`
+                }
+                className={
+                  line.startsWith("+") && !line.startsWith("+++")
+                    ? "is-addition"
+                    : line.startsWith("-") && !line.startsWith("---")
+                      ? "is-deletion"
+                      : line.startsWith("@@")
+                        ? "is-hunk"
+                        : undefined
+                }
+              >
+                {line || " "}
+                {"\n"}
+              </span>
+            );
+          })}
+        </pre>
+      ) : (
+        <div className="split-diff-scroll">
+          <table className="split-diff">
+            <thead className="sr-only">
+              <tr>
+                <th>Old line</th>
+                <th>Before</th>
+                <th>New line</th>
+                <th>After</th>
+              </tr>
+            </thead>
+            <tbody>
+              {splitRows.map((row, index) =>
+                row.kind === "hunk" || row.kind === "meta" ? (
+                  <tr
+                    key={index}
+                    id={
+                      row.hunkIndex === undefined
+                        ? undefined
+                        : `diff-hunk-${row.hunkIndex}`
+                    }
+                    className={`is-${row.kind}`}
+                  >
+                    <td colSpan={4}>{row.oldText || " "}</td>
+                  </tr>
+                ) : (
+                  <tr key={index} className={`is-${row.kind}`}>
+                    <td className="line-number">{row.oldNumber ?? ""}</td>
+                    <td className={row.oldText === undefined ? "is-empty" : "is-deletion"}>
+                      {row.oldText ?? ""}
+                    </td>
+                    <td className="line-number">{row.newNumber ?? ""}</td>
+                    <td className={row.newText === undefined ? "is-empty" : "is-addition"}>
+                      {row.newText ?? ""}
+                    </td>
+                  </tr>
+                ),
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
       {preview.truncated ? (
         <p className="opaque-resource-truncation" role="status">
           Preview limited to the first {maxRenderedDiffLines.toLocaleString()}{" "}

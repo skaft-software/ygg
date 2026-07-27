@@ -1,0 +1,8 @@
+ ❯ src/math.test.ts (3 tests | 1 failed) 5ms
+   ✓ adds numbers (1ms)
+   × rejects division by zero (2ms)
+   ↓ waits for integration service
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed | 1 skipped (3)
+   Duration  238ms

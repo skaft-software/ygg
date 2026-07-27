@@ -4,6 +4,8 @@ import hostBootstrapGolden from "../../../extensions/ygg-serve/fixtures/host-boo
 import hostCommandAckGolden from "../../../extensions/ygg-serve/fixtures/host-command-ack.json";
 import hostCommandGolden from "../../../extensions/ygg-serve/fixtures/host-command.json";
 import liveUserDeliveryGolden from "../../../extensions/ygg-serve/fixtures/live-user-delivery.json";
+import completionReviewItemGolden from "../../../extensions/ygg-serve/fixtures/completion-review-item.json";
+import semanticToolEventGolden from "../../../extensions/ygg-serve/fixtures/semantic-tool-event.json";
 import sessionCommandGolden from "../../../extensions/ygg-serve/fixtures/session-command.json";
 import sessionSnapshotGolden from "../../../extensions/ygg-serve/fixtures/session-snapshot.json";
 import {
@@ -12,11 +14,60 @@ import {
   projectEventEnvelope,
   projectHostBootstrap,
   projectHostStreamEvent,
+  projectProjectCatalog,
+  projectRepositoryContext,
   projectSessionSnapshot,
   WireContractError,
 } from "./wire";
 
 const clone = <T,>(value: T): T => structuredClone(value);
+
+const repositoryContextWire = () => ({
+  projectId: "prj_safe",
+  trust: "verified",
+  repository: {
+    source: "gitStatusPorcelainV2",
+    refresh: {
+      state: "current",
+      refreshedAtUnixMs: 1_753_626_615_000,
+      durationMs: 17,
+      truncated: false,
+    },
+    worktree: "present",
+    head: "0123456789abcdef0123456789abcdef01234567",
+    branchState: "named",
+    branch: "feature/context",
+    dirty: true,
+    ahead: 2,
+    behind: 1,
+  },
+  instructions: {
+    source: "projectAgentsMdV1",
+    refresh: {
+      state: "current",
+      refreshedAtUnixMs: 1_753_626_615_001,
+      durationMs: 4,
+      truncated: false,
+    },
+    files: [
+      {
+        origin: {
+          relativePath: "apps/web/AGENTS.md",
+          scope: "apps/web",
+        },
+        precedence: 1,
+        byteLen: 46,
+        sha256: "a".repeat(64),
+        summary: "# Web instructions",
+        visibleContent: "# Web instructions\nKeep changes focused.",
+        contentTruncated: false,
+      },
+    ],
+    errors: [],
+    omittedErrors: 0,
+    loadedBytes: 46,
+  },
+});
 
 describe("authoritative Rust wire contract", () => {
   it("projects the complete host bootstrap and embedded selected session", () => {
@@ -105,9 +156,18 @@ describe("authoritative Rust wire contract", () => {
         payload: {
           type: "toolCall",
           data: {
-            name: "read",
-            arguments: { path: "src/theme.ts" },
-            droppedProgressBytes: 0,
+            rawToolName: "read",
+            kind: "read",
+            phase: "investigated",
+            status: "succeeded",
+            title: "Read source file",
+            summary: "Read src/theme.ts",
+            target: "src/theme.ts",
+            startedAtMs: 1_721_000_000_040,
+            completedAtMs: 1_721_000_000_041,
+            durationMs: 1,
+            observedOutputBytes: 128,
+            droppedOutputBytes: 0,
           },
         },
       },
@@ -235,6 +295,279 @@ describe("authoritative Rust wire contract", () => {
         event: eventEnvelopeGolden,
       }),
     ).toEqual({ hostSequence: 12, event });
+  });
+
+  it("projects the exact semantic activity and completion-review goldens", () => {
+    expect(projectEventEnvelope(semanticToolEventGolden)).toMatchObject({
+      type: "item.activity",
+      sessionId: "session-demo",
+      sequence: 44,
+      itemId: "item-tool-cargo-test",
+      activity: {
+        rawToolName: "bash",
+        actionKind: "command",
+        phase: "verified",
+        status: "succeeded",
+        label: "Run cargo test",
+        commandPreview: "cargo test",
+        exitCode: 0,
+        durationMs: 250,
+        outputSummary: "Verification completed",
+        observedOutputBytes: 4096,
+        droppedOutputBytes: 128,
+      },
+    });
+
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const snapshot = clone(sessionSnapshotGolden) as unknown as {
+      items: unknown[];
+    };
+    snapshot.items.push(completionReviewItemGolden);
+    expect(
+      projectSessionSnapshot(snapshot, {
+        summary: bootstrap.sessions[0],
+        models: bootstrap.models,
+      }).items.at(-1),
+    ).toMatchObject({
+      id: "item-run-outcome",
+      runId: "run-stable-1",
+      kind: "run_outcome",
+      outcome: "done",
+      review: {
+        actionCount: 2,
+        changedFileItemIds: ["item-file-change"],
+        verificationActionItemIds: ["item-tool-cargo-test"],
+        outputIds: ["artifact-report"],
+        evidenceCoverage: "partial",
+      },
+    });
+  });
+
+  it("strictly projects structured test evidence in a completion review", () => {
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const snapshot = clone(sessionSnapshotGolden) as unknown as {
+      items: unknown[];
+    };
+    snapshot.items.push({
+      id: "item-run-with-tests",
+      runId: "run-tests",
+      turnId: "turn-tests",
+      lifecycle: "committed",
+      durableEntryId: "entry-run-with-tests",
+      payload: {
+        type: "runOutcome",
+        data: {
+          outcome: "completed",
+          review: {
+            summary: "Supported reporter evidence was parsed.",
+            durationMs: 980,
+            actionCount: 1,
+            phases: [],
+            changedFileItemIds: [],
+            verificationActionItemIds: ["item-vitest"],
+            failedActionItemIds: [],
+            warningActionItemIds: [],
+            sourceIds: [],
+            outputIds: [],
+            evidenceCoverage: "complete",
+            openQuestions: [],
+            testResults: [
+              {
+                originItemId: "item-vitest",
+                framework: "vitest",
+                parser: "vitestTextV1",
+                command: { status: "succeeded", exitCode: 0 },
+                verification: "passed",
+                reported: {
+                  total: 3,
+                  passed: 3,
+                  failed: 0,
+                  skipped: 0,
+                },
+                reportedSuites: {
+                  total: 1,
+                  passed: 1,
+                  failed: 0,
+                },
+                summaryCount: 1,
+                suites: [
+                  {
+                    name: "src/wire.test.ts",
+                    status: "passed",
+                    reported: {
+                      total: 3,
+                      passed: 3,
+                      failed: 0,
+                    },
+                    cases: [
+                      { name: "rejects unknown keys", status: "passed" },
+                    ],
+                  },
+                ],
+                coverage: {
+                  inputTruncated: false,
+                  recordsTruncated: false,
+                  unsupportedSummaryFields: false,
+                  summaries: "complete",
+                  cases: "partial",
+                },
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    const outcome = projectSessionSnapshot(snapshot, {
+      summary: bootstrap.sessions[0],
+      models: bootstrap.models,
+    }).items.at(-1);
+    expect(outcome).toMatchObject({
+      kind: "run_outcome",
+      review: {
+        testResults: [
+          {
+            originItemId: "item-vitest",
+            framework: "vitest",
+            verification: "passed",
+            reported: { total: 3, passed: 3, failed: 0, skipped: 0 },
+            suites: [
+              {
+                name: "src/wire.test.ts",
+                status: "passed",
+                cases: [
+                  {
+                    name: "rejects unknown keys",
+                    status: "passed",
+                  },
+                ],
+              },
+            ],
+            coverage: {
+              summaries: "complete",
+              cases: "partial",
+            },
+          },
+        ],
+      },
+    });
+  });
+
+  it("rejects unknown or malformed nested structured test evidence", () => {
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const snapshot = clone(sessionSnapshotGolden) as unknown as {
+      items: unknown[];
+    };
+    const result = {
+      originItemId: "item-vitest",
+      framework: "vitest",
+      parser: "vitestTextV1",
+      command: { status: "succeeded", exitCode: 0 },
+      verification: "passed",
+      reported: { total: 1, passed: 1 },
+      reportedSuites: { total: 1, passed: 1 },
+      summaryCount: 1,
+      suites: [
+        {
+          name: "src/wire.test.ts",
+          reported: { total: 1, passed: 1 },
+          cases: [{ name: "safe case", status: "passed" }],
+        },
+      ],
+      coverage: {
+        inputTruncated: false,
+        recordsTruncated: false,
+        unsupportedSummaryFields: false,
+        summaries: "complete",
+        cases: "complete",
+      },
+    };
+    const item = (testResult: unknown) => ({
+      id: "item-run-with-tests",
+      turnId: "turn-tests",
+      lifecycle: "committed",
+      payload: {
+        type: "runOutcome",
+        data: {
+          outcome: "completed",
+          review: {
+            summary: "Test evidence",
+            durationMs: 1,
+            actionCount: 1,
+            evidenceCoverage: "complete",
+            testResults: [testResult],
+          },
+        },
+      },
+    });
+
+    snapshot.items.push(
+      item({
+        ...result,
+        suites: [{ ...result.suites[0], hostPath: "/private/repo" }],
+      }),
+    );
+    expect(() =>
+      projectSessionSnapshot(snapshot, {
+        summary: bootstrap.sessions[0],
+        models: bootstrap.models,
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        name: "WireContractError",
+        path: expect.stringContaining("testResults[0].suites[0].hostPath"),
+      }),
+    );
+
+    snapshot.items.splice(
+      -1,
+      1,
+      item({ ...result, reported: { total: -1 } }),
+    );
+    expect(() =>
+      projectSessionSnapshot(snapshot, {
+        summary: bootstrap.sessions[0],
+        models: bootstrap.models,
+      }),
+    ).toThrow(/testResults\[0\]\.reported\.total/);
+  });
+
+  it("strictly projects path-free repository context", () => {
+    expect(projectRepositoryContext(repositoryContextWire())).toEqual(
+      repositoryContextWire(),
+    );
+
+    const unknown = repositoryContextWire() as ReturnType<
+      typeof repositoryContextWire
+    > & {
+      repository: ReturnType<
+        typeof repositoryContextWire
+      >["repository"] & { rootPath: string };
+    };
+    unknown.repository.rootPath = "/Users/example/project";
+    expect(() => projectRepositoryContext(unknown)).toThrowError(
+      expect.objectContaining({
+        name: "WireContractError",
+        path: "repositoryContext.repository.rootPath",
+      }),
+    );
+  });
+
+  it.each([
+    "/Users/example/project/AGENTS.md",
+    "../AGENTS.md",
+    "apps\\web\\AGENTS.md",
+    "C:/workspace/AGENTS.md",
+  ])("rejects path-bearing instruction origin %s", (relativePath) => {
+    const context = repositoryContextWire();
+    context.instructions.files[0]!.origin.relativePath = relativePath;
+    expect(() => projectRepositoryContext(context)).toThrowError(
+      expect.objectContaining({
+        name: "WireContractError",
+        path:
+          "repositoryContext.instructions.files[0].origin.relativePath",
+      }),
+    );
   });
 
   it("preserves live user-message delivery semantics", () => {
@@ -623,15 +956,26 @@ describe("authoritative Rust wire contract", () => {
     const toolCall = {
       id: "tool-call-1",
       turnId: "turn-tool",
+      providerAttempt: 2,
       lifecycle: "committed",
       durableEntryId: "entry-tool-call",
       payload: {
         type: "toolCall",
         data: {
-          name: "shell",
-          arguments: { command: "npm test" },
-          progress: "Running tests",
-          droppedProgressBytes: 0,
+          rawToolName: "shell",
+          kind: "command",
+          phase: "verified",
+          status: "succeeded",
+          title: "Run tests",
+          summary: "Verification completed",
+          commandPreview: "npm test",
+          exitCode: 0,
+          startedAtMs: 1_721_000_000_100,
+          completedAtMs: 1_721_000_001_100,
+          durationMs: 1_000,
+          outputSummary: "43 tests passed",
+          observedOutputBytes: 2_048,
+          droppedOutputBytes: 0,
         },
       },
     };
@@ -644,8 +988,14 @@ describe("authoritative Rust wire contract", () => {
         type: "toolResult",
         data: {
           toolCallItemId: "tool-call-1",
-          content: "43 tests passed",
-          isError: false,
+          status: "succeeded",
+          summary: "43 tests passed",
+          outputSummary: "43 tests passed",
+          exitCode: 0,
+          completedAtMs: 1_721_000_001_100,
+          durationMs: 1_000,
+          observedOutputBytes: 2_048,
+          droppedOutputBytes: 0,
         },
       },
     };
@@ -663,8 +1013,11 @@ describe("authoritative Rust wire contract", () => {
       expect.objectContaining({
         id: "tool-call-1",
         kind: "action",
-        label: "shell",
+        providerAttempt: 2,
+        durableEntryId: "entry-tool-call",
+        label: "Run tests",
         detail: "43 tests passed",
+        status: "succeeded",
         state: "committed",
       }),
     ]);
@@ -679,14 +1032,21 @@ describe("authoritative Rust wire contract", () => {
       data: { item: toolResult },
     };
     expect(projectEventEnvelope(resultEvent)).toMatchObject({
-      type: "item.tool_result",
+      type: "item.activity_result",
       sessionId: "session-demo",
       actorGeneration: 3,
       sequence: 44,
       itemId: "tool-call-1",
       resultItemId: "tool-result-1",
-      detail: "43 tests passed",
-      state: "committed",
+      result: {
+        status: "succeeded",
+        summary: "43 tests passed",
+        outputSummary: "43 tests passed",
+        exitCode: 0,
+        durationMs: 1_000,
+        observedOutputBytes: 2_048,
+        droppedOutputBytes: 0,
+      },
     });
   });
 
@@ -838,6 +1198,168 @@ describe("authoritative Rust wire contract", () => {
     });
   });
 
+  it("encodes conversation branches, trash lifecycle, and durable provenance", () => {
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const context = {
+      hostId: "host-demo",
+      deviceId: "device-browser",
+      issuedAtMs: 1_721_000_000_054,
+      actorGenerationBySession: { "session-demo": 3 },
+      modelIdBySession: { "session-demo": "gpt-5.6" },
+      models: bootstrap.models,
+    };
+
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-edit",
+          type: "session.editUserTurn",
+          sessionId: "session-demo",
+          sourceUserEntryId: "entry-user",
+          prompt: "Replacement turn",
+          attachments: [],
+        },
+        context,
+      ),
+    ).toMatchObject({
+      expectedActorGeneration: 3,
+      command: {
+        type: "session.editUserTurn",
+        data: {
+          sourceUserEntryId: "entry-user",
+          input: { text: "Replacement turn", attachments: [] },
+        },
+      },
+    });
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-retry-model",
+          type: "session.retryResponse",
+          sessionId: "session-demo",
+          sourceAssistantEntryId: "entry-assistant",
+          modelId: "gpt-5.6",
+          reasoning: "medium",
+        },
+        context,
+      ),
+    ).toMatchObject({
+      command: {
+        type: "session.retryResponse",
+        data: {
+          sourceAssistantEntryId: "entry-assistant",
+          model: {
+            provider: "openai",
+            model: "gpt-5.6",
+            reasoning: "medium",
+          },
+        },
+      },
+    });
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-fork",
+          type: "session.forkConversation",
+          sessionId: "session-demo",
+          entryId: "entry-assistant",
+        },
+        context,
+      ),
+    ).toMatchObject({
+      command: {
+        type: "session.forkConversation",
+        data: { entryId: "entry-assistant" },
+      },
+    });
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-trash",
+          type: "session.setLifecycle",
+          sessionId: "session-demo",
+          lifecycle: "trash",
+        },
+        context,
+      ),
+    ).toMatchObject({
+      command: {
+        type: "session.setLifecycle",
+        data: { sessionId: "session-demo", lifecycle: "trash" },
+      },
+    });
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-delete",
+          type: "session.deletePermanently",
+          sessionId: "session-demo",
+          confirmation: {
+            sessionId: "session-demo",
+            trashedAtMs: 1_721_000_000_000,
+            phrase: "permanently delete session-demo",
+          },
+        },
+        context,
+      ),
+    ).toMatchObject({
+      command: {
+        type: "session.deletePermanently",
+        data: {
+          sessionId: "session-demo",
+          confirmation: {
+            sessionId: "session-demo",
+            trashedAtMs: 1_721_000_000_000,
+            phrase: "permanently delete session-demo",
+          },
+        },
+      },
+    });
+
+    const event = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    event.cursor.sequence = 46;
+    event.event = {
+      type: "item.committed",
+      data: {
+        item: {
+          id: "item-edited-user",
+          turnId: "turn-edited",
+          lifecycle: "committed",
+          durableEntryId: "entry-edited-user",
+          payload: {
+            type: "userMessage",
+            data: {
+              text: "Replacement turn",
+              attachments: [],
+              branchProvenance: {
+                operation: "editUserTurn",
+                sourceSessionId: "session-demo",
+                sourceEntryId: "entry-user",
+                externalEffectsPreserved: true,
+                warning:
+                  "External side effects from the earlier transcript are preserved.",
+              },
+            },
+          },
+        },
+      },
+    };
+    expect(projectEventEnvelope(event)).toMatchObject({
+      type: "item.committed",
+      item: {
+        kind: "user_message",
+        branchProvenance: {
+          operation: "editUserTurn",
+          sourceEntryId: "entry-user",
+          externalEffectsPreserved: true,
+        },
+      },
+    });
+  });
+
   it("decodes the exact host acknowledgement golden and session acks", () => {
     expect(decodeWireCommandAck(hostCommandAckGolden)).toEqual({
       commandId: "command-create",
@@ -857,6 +1379,154 @@ describe("authoritative Rust wire contract", () => {
       commandId: "command-submit",
       accepted: true,
       createdSessionId: undefined,
+    });
+    expect(
+      decodeWireCommandAck({
+        protocol: 1,
+        sessionId: "session-demo",
+        commandId: "command-retry",
+        acknowledgedAtMs: 1_721_000_000_052,
+        cursor: { actorGeneration: 4, sequence: 0 },
+        disposition: {
+          status: "rejected",
+          error: {
+            code: "staleGeneration",
+            message: "The session generation changed.",
+            retryable: true,
+            currentGeneration: 4,
+          },
+        },
+      }),
+    ).toEqual({
+      commandId: "command-retry",
+      accepted: false,
+      error: "The session generation changed.",
+      errorCode: "staleGeneration",
+      retryable: true,
+      currentGeneration: 4,
+    });
+    expect(
+      decodeWireCommandAck({
+        protocol: 1,
+        sessionId: "session-demo",
+        commandId: "command-fork",
+        acknowledgedAtMs: 1_721_000_000_053,
+        cursor: { actorGeneration: 3, sequence: 44 },
+        disposition: {
+          status: "accepted",
+          createdSessionId: "session-forked",
+        },
+      }),
+    ).toEqual({
+      commandId: "command-fork",
+      accepted: true,
+      createdSessionId: "session-forked",
+    });
+  });
+
+  it("projects the path-free project catalog and exact lifecycle commands", () => {
+    const project = {
+      id: "prj_11111111111111111111111111111111",
+      name: "ygg",
+      trusted: false,
+      archived: false,
+      available: true,
+      isDefault: false,
+      sessionCount: 2,
+      liveSessionCount: 0,
+    };
+    expect(
+      projectProjectCatalog({
+        protocol: 1,
+        host: { id: "host-demo", name: "Local Mac" },
+        catalogCursor: 9,
+        lifecycleMutationsSupported: true,
+        importSupported: false,
+        projects: [project],
+      }),
+    ).toEqual({
+      host: { id: "host-demo", name: "Local Mac" },
+      catalogRevision: 9,
+      lifecycleMutationsSupported: true,
+      importSupported: false,
+      projects: [project],
+    });
+
+    const context = {
+      hostId: "host-demo",
+      deviceId: "device-browser",
+      issuedAtMs: 1_721_000_000_060,
+      actorGenerationBySession: {},
+      modelIdBySession: {},
+      models: [],
+    };
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-trust",
+          type: "project.setTrust",
+          projectId: project.id,
+          trusted: true,
+        },
+        context,
+      ),
+    ).toEqual({
+      protocol: 1,
+      hostId: "host-demo",
+      deviceId: "device-browser",
+      commandId: "command-trust",
+      issuedAtMs: 1_721_000_000_060,
+      command: {
+        type: "project.setTrust",
+        data: { projectId: project.id, trusted: true },
+      },
+    });
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-import",
+          type: "project.import",
+          candidateId: "candidate-host-picker-1",
+        },
+        context,
+      ),
+    ).toMatchObject({
+      command: {
+        type: "project.import",
+        data: { candidateId: "candidate-host-picker-1" },
+      },
+    });
+    expect(
+      JSON.stringify(
+        encodeClientCommand(
+          {
+            id: "command-import",
+            type: "project.import",
+            candidateId: "candidate-host-picker-1",
+          },
+          context,
+        ),
+      ),
+    ).not.toMatch(/root|path/i);
+
+    expect(
+      decodeWireCommandAck({
+        protocol: 1,
+        hostId: "host-demo",
+        commandId: "command-trust",
+        acknowledgedAtMs: 1_721_000_000_061,
+        catalogCursor: 10,
+        disposition: {
+          status: "accepted",
+          project: { ...project, trusted: true },
+        },
+      }),
+    ).toEqual({
+      commandId: "command-trust",
+      accepted: true,
+      createdSessionId: undefined,
+      project: { ...project, trusted: true },
+      catalogChanged: undefined,
     });
   });
 

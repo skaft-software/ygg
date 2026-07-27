@@ -282,20 +282,30 @@ impl SessionActorCore {
         let (ack, published) = match result {
             Ok(outcome) => {
                 let run_id = outcome.run_id.clone();
+                let created_session_id = outcome.created_session_id.clone();
                 match self
                     .publish_driver_outcome(outcome, acknowledged_at_ms)
                     .await
                 {
-                    Ok(published) => (
-                        CommandAck::accepted(
-                            self.session_id.clone(),
-                            command.command_id.clone(),
-                            acknowledged_at_ms,
-                            self.view.snapshot.cursor,
-                            run_id,
-                        ),
-                        published,
-                    ),
+                    Ok(published) => {
+                        let ack = match created_session_id {
+                            Some(created_session_id) => CommandAck::accepted_fork(
+                                self.session_id.clone(),
+                                command.command_id.clone(),
+                                acknowledged_at_ms,
+                                self.view.snapshot.cursor,
+                                created_session_id,
+                            ),
+                            None => CommandAck::accepted(
+                                self.session_id.clone(),
+                                command.command_id.clone(),
+                                acknowledged_at_ms,
+                                self.view.snapshot.cursor,
+                                run_id,
+                            ),
+                        };
+                        (ack, published)
+                    }
                     Err(OutcomePublicationError::Rejected) => (
                         CommandAck::rejected(
                             self.session_id.clone(),
@@ -356,7 +366,13 @@ impl SessionActorCore {
                 ));
             }
         }
-        if matches!(command.command, SessionCommand::Checkout { .. })
+        if matches!(
+            command.command,
+            SessionCommand::Checkout { .. }
+                | SessionCommand::EditUserTurn { .. }
+                | SessionCommand::RetryResponse { .. }
+                | SessionCommand::ForkConversation { .. }
+        )
             && (self.view.snapshot.active_run_id.is_some()
                 || !self.view.snapshot.pending_requests.is_empty()
                 || !matches!(
@@ -384,6 +400,51 @@ impl SessionActorCore {
                 return Err(SanitizedError::public(
                     ErrorCode::InvalidBoundary,
                     "That session checkpoint is not available for checkout.",
+                ));
+            }
+        }
+        let required_kind = match &command.command {
+            SessionCommand::EditUserTurn {
+                source_user_entry_id,
+                ..
+            } => Some((source_user_entry_id, crate::SessionBranchEntryKind::UserMessage)),
+            SessionCommand::RetryResponse {
+                source_assistant_entry_id,
+                ..
+            } => Some((
+                source_assistant_entry_id,
+                crate::SessionBranchEntryKind::AssistantMessage,
+            )),
+            SessionCommand::ForkConversation { entry_id } => {
+                let available = self
+                    .view
+                    .snapshot
+                    .branches
+                    .entries
+                    .iter()
+                    .any(|entry| &entry.entry_id == entry_id && entry.checkoutable);
+                if !available {
+                    return Err(SanitizedError::public(
+                        ErrorCode::InvalidBoundary,
+                        "That committed checkpoint is not available to fork.",
+                    ));
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some((entry_id, kind)) = required_kind {
+            let available = self
+                .view
+                .snapshot
+                .branches
+                .entries
+                .iter()
+                .any(|entry| &entry.entry_id == entry_id && entry.kind == kind);
+            if !available {
+                return Err(SanitizedError::public(
+                    ErrorCode::InvalidBoundary,
+                    "The selected conversation entry is not available for this operation.",
                 ));
             }
         }
@@ -464,6 +525,7 @@ impl SessionActorCore {
         let prepared = (|| -> Result<(SessionSeed, EventJournal, EventEnvelope), ActorError> {
             if !outcome.events.is_empty()
                 || outcome.run_id.is_some()
+                || outcome.created_session_id.is_some()
                 || outcome.events.len() > MAX_DRIVER_OUTCOME_EVENTS
             {
                 return Err(ActorError::InvalidProjection(
@@ -617,6 +679,12 @@ fn reduce_summary(summary: &mut SessionSummary, snapshot: &SessionSnapshot, even
         }
         if let Some(archived) = archived {
             summary.archived = *archived;
+            summary.lifecycle = if *archived {
+                crate::SessionCatalogState::Archived
+            } else {
+                crate::SessionCatalogState::Active
+            };
+            summary.retention = None;
         }
     }
     summary.live_state = snapshot.live_state;
@@ -729,19 +797,8 @@ fn reduce_snapshot(snapshot: &mut SessionSnapshot, event: &EventPayload) -> Resu
                 | (ItemPayload::Reasoning { text }, ItemDelta::ReasoningText { append }) => {
                     text.push_str(append);
                 }
-                (
-                    ItemPayload::ToolCall {
-                        progress,
-                        dropped_progress_bytes,
-                        ..
-                    },
-                    ItemDelta::ToolProgress {
-                        text,
-                        dropped_bytes,
-                    },
-                ) => {
-                    *progress = Some(text.clone());
-                    *dropped_progress_bytes = *dropped_bytes;
+                (ItemPayload::ToolCall(current), ItemDelta::ToolActivity { activity }) => {
+                    *current = activity.clone()
                 }
                 _ => {
                     return Err(ActorError::InvalidProjection(
@@ -838,6 +895,7 @@ enum ActorMessage {
         after: SessionCursor,
         response: oneshot::Sender<ReplayResponse>,
     },
+    Retire,
 }
 
 /// Handle to one serialized session actor.
@@ -934,6 +992,11 @@ impl SessionActorHandle {
             .map_err(|_| ActorError::Closed)?;
         receiver.await.map_err(|_| ActorError::Closed)
     }
+
+    /// Fences new work and asks this exact owner to stop and quiesce.
+    pub(crate) async fn retire(&self) {
+        let _ = self.sender.send(ActorMessage::Retire).await;
+    }
 }
 
 /// Spawns serialized ownership for one concrete [`SessionDriver`].
@@ -997,6 +1060,7 @@ impl SessionActor {
                     Input::Message(Some(ActorMessage::Replay { after, response })) => {
                         let _ = response.send(core.replay_after(after));
                     }
+                    Input::Message(Some(ActorMessage::Retire)) => break,
                     Input::Message(None) => break,
                     Input::DriverEvent(Some(event)) => {
                         if let Ok(event) = core.publish(event) {
@@ -1052,9 +1116,10 @@ impl From<ActorError> for SanitizedError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AckDisposition, ContextUsage, DurableEntryId, ItemId, ModelSelection, PendingRequest,
-        RequestId, RequestKind, RequestState, SessionBranchEntry, SessionBranchEntryKind,
-        SessionBranchGraph, SessionId, SessionItem, SessionLiveState,
+        AckDisposition, ActivityPhase, ContextUsage, DurableEntryId, ItemId, ModelSelection,
+        PendingRequest, PromptInput, RequestId, RequestKind, RequestState, RunId, SessionBranchEntry,
+        SessionBranchEntryKind, SessionBranchGraph, SessionId, SessionItem, SessionLiveState,
+        ToolActivity, ToolActivityStatus, ToolKind, TurnId,
     };
 
     use super::*;
@@ -1076,6 +1141,9 @@ mod tests {
                 modified_at_ms: 0,
                 pinned: false,
                 archived: false,
+                lifecycle: crate::SessionCatalogState::Active,
+                retention: None,
+                forked_from: None,
                 provisional: true,
                 live_state: SessionLiveState::Idle,
                 attention: AttentionState::None,
@@ -1224,6 +1292,18 @@ mod tests {
             SessionCommand::Checkout {
                 entry_id: DurableEntryId::new("entry-root").unwrap(),
             },
+        )
+    }
+
+    fn branch_command(command_id: &str, command: SessionCommand) -> SessionCommandEnvelope {
+        SessionCommandEnvelope::new(
+            HostId::new("host-test").unwrap(),
+            DeviceId::new("device-test").unwrap(),
+            SessionId::new("session-actor").unwrap(),
+            CommandId::new(command_id).unwrap(),
+            1,
+            Some(1),
+            command,
         )
     }
 
@@ -1602,6 +1682,124 @@ mod tests {
         }
     }
 
+    #[test]
+    fn edit_retry_and_fork_require_idle_committed_entries_of_the_right_kind() {
+        let replacement = PromptInput {
+            text: "replacement".into(),
+            attachments: Vec::new(),
+            document_ids: Vec::new(),
+            project_file_ids: Vec::new(),
+        };
+        let commands = [
+            branch_command(
+                "command-edit",
+                SessionCommand::EditUserTurn {
+                    source_user_entry_id: DurableEntryId::new("entry-root").unwrap(),
+                    input: replacement.clone(),
+                },
+            ),
+            branch_command(
+                "command-retry",
+                SessionCommand::RetryResponse {
+                    source_assistant_entry_id: DurableEntryId::new("entry-old-head").unwrap(),
+                    model: None,
+                },
+            ),
+            branch_command(
+                "command-fork",
+                SessionCommand::ForkConversation {
+                    entry_id: DurableEntryId::new("entry-old-head").unwrap(),
+                },
+            ),
+        ];
+        let core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            checkout_seed(),
+            ActorConfig::default(),
+        )
+        .unwrap();
+        for command in &commands {
+            core.preflight_command(command).unwrap();
+        }
+
+        let wrong_edit = branch_command(
+            "command-wrong-edit",
+            SessionCommand::EditUserTurn {
+                source_user_entry_id: DurableEntryId::new("entry-old-head").unwrap(),
+                input: replacement,
+            },
+        );
+        let wrong_retry = branch_command(
+            "command-wrong-retry",
+            SessionCommand::RetryResponse {
+                source_assistant_entry_id: DurableEntryId::new("entry-root").unwrap(),
+                model: None,
+            },
+        );
+        assert_eq!(
+            core.preflight_command(&wrong_edit).unwrap_err().code,
+            ErrorCode::InvalidBoundary
+        );
+        assert_eq!(
+            core.preflight_command(&wrong_retry).unwrap_err().code,
+            ErrorCode::InvalidBoundary
+        );
+
+        let mut working = core;
+        working.view.snapshot.live_state = SessionLiveState::Working;
+        working.view.summary.live_state = SessionLiveState::Working;
+        for command in &commands {
+            assert_eq!(
+                working.preflight_command(command).unwrap_err().code,
+                ErrorCode::InvalidBoundary
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_fork_ack_returns_only_the_new_session_and_is_idempotent() {
+        let mut core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            checkout_seed(),
+            ActorConfig::default(),
+        )
+        .unwrap();
+        let command = branch_command(
+            "command-fork-ack",
+            SessionCommand::ForkConversation {
+                entry_id: DurableEntryId::new("entry-old-head").unwrap(),
+            },
+        );
+        let duplicate = command.clone();
+        let created = SessionId::new("session-created").unwrap();
+        let admission = core
+            .admit_command(command, 90, {
+                let created = created.clone();
+                move |command| async move {
+                    assert!(matches!(command, SessionCommand::ForkConversation { .. }));
+                    Ok(DriverCommandOutcome::fork(created))
+                }
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            admission.ack.disposition,
+            AckDisposition::Accepted {
+                run_id: None,
+                created_session_id: Some(ref session_id),
+            } if session_id == &created
+        ));
+
+        let repeated = core
+            .admit_command(duplicate, 91, |_| async {
+                panic!("a cached conversation fork must never create another session")
+            })
+            .await
+            .unwrap();
+        assert!(repeated.cached);
+        assert_eq!(repeated.ack, admission.ack);
+    }
+
     #[tokio::test]
     async fn free_form_request_answers_are_consumed_without_secret_retention() {
         let mut core = SessionActorCore::new(
@@ -1704,5 +1902,91 @@ mod tests {
         ));
         assert!(admission.published.is_empty());
         assert_eq!(core.snapshot().cursor, SessionCursor::zero(1));
+    }
+
+    #[test]
+    fn semantic_tool_delta_replay_matches_the_live_snapshot_without_raw_output() {
+        let mut core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            seed(),
+            ActorConfig::default(),
+        )
+        .unwrap();
+        let running = ToolActivity {
+            raw_tool_name: "bash".into(),
+            kind: ToolKind::Command,
+            phase: ActivityPhase::Verified,
+            status: ToolActivityStatus::Running,
+            title: "Run cargo test".into(),
+            summary: Some("Running".into()),
+            target: None,
+            cwd: Some(".".into()),
+            command_preview: Some("cargo test".into()),
+            exit_code: None,
+            signal: None,
+            started_at_ms: 100,
+            completed_at_ms: None,
+            duration_ms: None,
+            output_summary: None,
+            output_handle: None,
+            observed_output_bytes: 0,
+            dropped_output_bytes: 0,
+            changed_paths: Vec::new(),
+            source_ids: Vec::new(),
+            artifact_ids: Vec::new(),
+        };
+        let item_id = ItemId::new("item-semantic-tool").unwrap();
+        let started = core
+            .publish(TimestampedEvent::new(
+                100,
+                EventPayload::ItemStarted {
+                    item: SessionItem {
+                        id: item_id.clone(),
+                        run_id: Some(RunId::new("run-semantic-tool").unwrap()),
+                        turn_id: Some(TurnId::new("turn-semantic-tool").unwrap()),
+                        provider_attempt: Some(1),
+                        lifecycle: ItemLifecycle::Provisional,
+                        durable_entry_id: None,
+                        payload: ItemPayload::ToolCall(running.clone()),
+                    },
+                },
+            ))
+            .unwrap();
+        let mut replayed = core.snapshot();
+        let mut completed = running;
+        completed.status = ToolActivityStatus::Succeeded;
+        completed.summary = Some("Completed".into());
+        completed.completed_at_ms = Some(350);
+        completed.duration_ms = Some(250);
+        completed.exit_code = Some(0);
+        completed.output_summary = Some("Verification completed".into());
+        completed.observed_output_bytes = 4_096;
+        let settled = core
+            .publish(TimestampedEvent::new(
+                350,
+                EventPayload::ItemDelta {
+                    item_id,
+                    delta: ItemDelta::ToolActivity {
+                        activity: completed,
+                    },
+                },
+            ))
+            .unwrap();
+        let ReplayResponse::Events {
+            events, through, ..
+        } = core.replay_after(started.cursor)
+        else {
+            panic!("retained semantic delta should replay");
+        };
+        assert_eq!(events, vec![settled.clone()]);
+        assert_eq!(through, settled.cursor);
+        for event in events {
+            reduce_snapshot(&mut replayed, &event.event).unwrap();
+            replayed.cursor = event.cursor;
+        }
+        assert_eq!(replayed, core.snapshot());
+        let serialized = serde_json::to_string(&settled).unwrap();
+        assert!(!serialized.contains("stdout"));
+        assert!(!serialized.contains("arguments"));
     }
 }

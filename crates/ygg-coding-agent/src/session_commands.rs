@@ -811,6 +811,10 @@ mod tests {
             tags: vec!["safe".into()],
             pinned: false,
             archived: false,
+            trashed_at_ms: None,
+            purge_after_ms: None,
+            forked_from_session_id: None,
+            forked_from_entry_id: None,
             modified: now,
         };
 
@@ -834,6 +838,10 @@ mod tests {
             tags: Vec::new(),
             pinned: false,
             archived: false,
+            trashed_at_ms: None,
+            purge_after_ms: None,
+            forked_from_session_id: None,
+            forked_from_entry_id: None,
             modified: now,
         };
 
@@ -1434,6 +1442,10 @@ mod tests {
             tags: vec!["rust".into(), "local-model".into()],
             pinned: false,
             archived: false,
+            trashed_at_ms: None,
+            purge_after_ms: None,
+            forked_from_session_id: None,
+            forked_from_entry_id: None,
             modified: UNIX_EPOCH,
         };
         for query in ["compiler", "local-model", "2026-07", "project"] {

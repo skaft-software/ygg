@@ -1,0 +1,8 @@
+Running unittests /Users/alice/private/ygg/src/lib.rs (target/debug/deps/ygg)
+
+running 3 tests
+test parses_normal_case ... ok
+test case(/Users/alice/private/ygg/src/secret.rs::does_not_leak_paths) ... ok
+test auth_token=sk-example-not-a-real-secret-value ... ignored
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s

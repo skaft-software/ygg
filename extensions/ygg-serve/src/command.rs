@@ -10,13 +10,18 @@ use crate::bounds::{
 };
 use crate::{
     AuthorityProfile, CatalogCursor, CommandId, DeviceId, DurableEntryId, ErrorCode, HostId,
-    ModelSelection, ProjectId, RequestId, RunId, SanitizedError, SessionCursor, SessionId,
-    PROTOCOL_VERSION,
+    DocumentId, FileEntryId, ModelSelection, ProjectId, RequestId, RunId, SanitizedError,
+    SessionCatalogState, SessionCursor, SessionId, PROTOCOL_VERSION,
 };
 
 /// Host-scoped commands that do not target an existing session actor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    content = "data",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum HostCommand {
     /// Create a fresh provisional session.
     #[serde(rename = "host.createSession")]
@@ -30,6 +35,77 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<ModelSelection>,
     },
+    /// Import a host-selected directory as an initially untrusted project.
+    ///
+    /// The browser can only return an opaque, short-lived candidate minted by
+    /// a host-native folder picker. It never submits or receives a host path.
+    #[serde(rename = "project.import")]
+    ImportProject {
+        /// Opaque host-owned folder-selection capability.
+        candidate_id: String,
+        /// Optional bounded display label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
+    /// Rename one project without changing filesystem authority.
+    #[serde(rename = "project.rename")]
+    RenameProject {
+        /// Opaque project identity.
+        project_id: ProjectId,
+        /// New bounded public label.
+        display_name: String,
+    },
+    /// Select the default project for future create commands.
+    #[serde(rename = "project.setDefault")]
+    SetDefaultProject {
+        /// Opaque project identity.
+        project_id: ProjectId,
+    },
+    /// Clear the current project default.
+    #[serde(rename = "project.clearDefault")]
+    ClearDefaultProject,
+    /// Explicitly grant or revoke execution trust.
+    #[serde(rename = "project.setTrust")]
+    SetProjectTrust {
+        /// Opaque project identity.
+        project_id: ProjectId,
+        /// True grants trust; false immediately fences active owners.
+        trusted: bool,
+    },
+    /// Archive a project and immediately revoke its execution trust.
+    #[serde(rename = "project.archive")]
+    ArchiveProject {
+        /// Opaque project identity.
+        project_id: ProjectId,
+    },
+    /// Move a durable session between active, archive, and recoverable trash.
+    #[serde(rename = "session.setLifecycle")]
+    SetSessionLifecycle {
+        /// Opaque session identity.
+        session_id: SessionId,
+        /// Requested catalog state.
+        lifecycle: SessionCatalogState,
+    },
+    /// Permanently delete a trashed session after an exact fresh confirmation.
+    #[serde(rename = "session.deletePermanently")]
+    DeleteSessionPermanently {
+        /// Opaque session identity.
+        session_id: SessionId,
+        /// Exact confirmation bound to the current trash generation.
+        confirmation: PermanentDeleteConfirmation,
+    },
+}
+
+/// Exact confirmation required for permanent session deletion.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PermanentDeleteConfirmation {
+    /// Session identity repeated to prevent cross-row confirmation reuse.
+    pub session_id: SessionId,
+    /// Exact host trash timestamp currently shown to the user.
+    pub trashed_at_ms: u64,
+    /// Must equal `permanently delete <session-id>`.
+    pub phrase: String,
 }
 
 /// Device-scoped idempotent host command envelope.
@@ -81,7 +157,14 @@ pub enum HostAckDisposition {
     /// Command completed at the host boundary.
     Accepted {
         /// Session allocated by a create command.
-        created_session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_session_id: Option<SessionId>,
+        /// Updated path-free project summary for a project mutation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<crate::ProjectSummary>,
+        /// A path-free catalog changed without one natural project result.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        catalog_changed: bool,
     },
     /// Command was rejected before mutation.
     Rejected {
@@ -123,7 +206,34 @@ impl HostCommandAck {
             command_id,
             acknowledged_at_ms,
             catalog_cursor,
-            disposition: HostAckDisposition::Accepted { created_session_id },
+            disposition: HostAckDisposition::Accepted {
+                created_session_id: Some(created_session_id),
+                project: None,
+                catalog_changed: false,
+            },
+        }
+    }
+
+    /// Accepted project mutation acknowledgement.
+    pub fn accepted_project(
+        host_id: HostId,
+        command_id: CommandId,
+        acknowledged_at_ms: u64,
+        catalog_cursor: CatalogCursor,
+        project: Option<crate::ProjectSummary>,
+    ) -> Self {
+        let catalog_changed = project.is_none();
+        Self {
+            protocol: PROTOCOL_VERSION,
+            host_id,
+            command_id,
+            acknowledged_at_ms,
+            catalog_cursor,
+            disposition: HostAckDisposition::Accepted {
+                created_session_id: None,
+                project,
+                catalog_changed,
+            },
         }
     }
 
@@ -172,6 +282,12 @@ pub struct PromptInput {
     /// Authenticated host-ingested attachments.
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
+    /// Uploaded documents already bound to this project/session by the host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub document_ids: Vec<DocumentId>,
+    /// Immutable snapshots selected from the trusted project-file index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_file_ids: Vec<FileEntryId>,
 }
 
 /// Typed answer to one opaque public request.
@@ -281,6 +397,29 @@ pub enum SessionCommand {
         /// Exact preserved Ygg entry identity.
         entry_id: DurableEntryId,
     },
+    /// Replace an earlier committed user turn on a sibling durable branch.
+    #[serde(rename = "session.editUserTurn")]
+    EditUserTurn {
+        /// Exact committed user entry being replaced.
+        source_user_entry_id: DurableEntryId,
+        /// Replacement input.
+        input: PromptInput,
+    },
+    /// Retry an assistant response from its originating user checkpoint.
+    #[serde(rename = "session.retryResponse")]
+    RetryResponse {
+        /// Exact committed assistant entry being retried.
+        source_assistant_entry_id: DurableEntryId,
+        /// Optional explicit alternate model and reasoning selection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelSelection>,
+    },
+    /// Copy a committed checkpoint into a genuinely new durable session.
+    #[serde(rename = "session.forkConversation")]
+    ForkConversation {
+        /// Exact committed checkpoint copied into the new session.
+        entry_id: DurableEntryId,
+    },
 }
 
 /// Idempotent session command envelope.
@@ -346,6 +485,9 @@ pub enum AckDisposition {
         /// Run created/admitted by this command when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_id: Option<RunId>,
+        /// New session created by a conversation fork.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_session_id: Option<SessionId>,
     },
     /// Command was rejected before or at the driver boundary.
     Rejected {
@@ -387,7 +529,31 @@ impl CommandAck {
             command_id,
             acknowledged_at_ms,
             cursor,
-            disposition: AckDisposition::Accepted { run_id },
+            disposition: AckDisposition::Accepted {
+                run_id,
+                created_session_id: None,
+            },
+        }
+    }
+
+    /// Accepted acknowledgement for a new-session conversation fork.
+    pub fn accepted_fork(
+        session_id: SessionId,
+        command_id: CommandId,
+        acknowledged_at_ms: u64,
+        cursor: SessionCursor,
+        created_session_id: SessionId,
+    ) -> Self {
+        Self {
+            protocol: PROTOCOL_VERSION,
+            session_id,
+            command_id,
+            acknowledged_at_ms,
+            cursor,
+            disposition: AckDisposition::Accepted {
+                run_id: None,
+                created_session_id: Some(created_session_id),
+            },
         }
     }
 
@@ -454,10 +620,14 @@ impl ProtocolValidation for AttachmentRef {
 impl ProtocolValidation for PromptInput {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_public_text("command.input.text", &self.text, MAX_PROMPT_BYTES, true)?;
-        if self.text.trim().is_empty() && self.attachments.is_empty() {
+        if self.text.trim().is_empty()
+            && self.attachments.is_empty()
+            && self.document_ids.is_empty()
+            && self.project_file_ids.is_empty()
+        {
             return Err(ValidationError::new(
                 "command.input",
-                "requires text or at least one attachment",
+                "requires text, an attachment, an uploaded document, or a project file",
             ));
         }
         if self.attachments.len() > crate::MAX_ATTACHMENT_COUNT {
@@ -497,6 +667,42 @@ impl ProtocolValidation for PromptInput {
                 ));
             }
         }
+        if self.document_ids.len() > crate::MAX_DOCUMENTS_PER_PROMPT {
+            return Err(ValidationError::new(
+                "command.input.document_ids",
+                format!(
+                    "exceeds the {}-document limit",
+                    crate::MAX_DOCUMENTS_PER_PROMPT
+                ),
+            ));
+        }
+        let mut document_ids = BTreeSet::new();
+        for document_id in &self.document_ids {
+            if !document_ids.insert(document_id.as_str()) {
+                return Err(ValidationError::new(
+                    "command.input.document_ids",
+                    "contains a duplicate document ID",
+                ));
+            }
+        }
+        if self.project_file_ids.len() > crate::MAX_TRUSTED_FILES_PER_CONTEXT {
+            return Err(ValidationError::new(
+                "command.input.project_file_ids",
+                format!(
+                    "exceeds the {}-file limit",
+                    crate::MAX_TRUSTED_FILES_PER_CONTEXT
+                ),
+            ));
+        }
+        let mut project_file_ids = BTreeSet::new();
+        for entry_id in &self.project_file_ids {
+            if !project_file_ids.insert(entry_id.as_str()) {
+                return Err(ValidationError::new(
+                    "command.input.project_file_ids",
+                    "contains a duplicate project-file ID",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -518,7 +724,8 @@ impl ProtocolValidation for SessionCommandEnvelope {
         match &self.command {
             SessionCommand::SubmitPrompt { input }
             | SessionCommand::Steer { input }
-            | SessionCommand::FollowUp { input } => input.validate()?,
+            | SessionCommand::FollowUp { input }
+            | SessionCommand::EditUserTurn { input, .. } => input.validate()?,
             SessionCommand::Abort { .. } => {}
             SessionCommand::AnswerRequest { answer, .. } => match answer {
                 RequestAnswer::Approval { .. } => {}
@@ -542,7 +749,13 @@ impl ProtocolValidation for SessionCommandEnvelope {
             }
             SessionCommand::SetPinned { .. }
             | SessionCommand::SetArchived { .. }
-            | SessionCommand::Checkout { .. } => {}
+            | SessionCommand::Checkout { .. }
+            | SessionCommand::ForkConversation { .. } => {}
+            SessionCommand::RetryResponse { model, .. } => {
+                if let Some(model) = model {
+                    model.validate()?;
+                }
+            }
         }
         validate_serialized_size("command", self, MAX_COMMAND_BYTES)
     }
@@ -562,6 +775,47 @@ impl ProtocolValidation for HostCommandEnvelope {
                     model.validate()?;
                 }
             }
+            HostCommand::ImportProject {
+                candidate_id,
+                display_name,
+            } => {
+                validate_public_text("host_command.candidate_id", candidate_id, 256, false)?;
+                if candidate_id.is_empty()
+                    || !candidate_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+                    })
+                {
+                    return Err(ValidationError::new(
+                        "host_command.candidate_id",
+                        "must be an opaque host-issued identifier",
+                    ));
+                }
+                if let Some(display_name) = display_name {
+                    validate_public_text("host_command.display_name", display_name, 160, false)?;
+                }
+            }
+            HostCommand::RenameProject { display_name, .. } => {
+                validate_public_text("host_command.display_name", display_name, 160, false)?;
+            }
+            HostCommand::SetDefaultProject { .. }
+            | HostCommand::ClearDefaultProject
+            | HostCommand::SetProjectTrust { .. }
+            | HostCommand::ArchiveProject { .. }
+            | HostCommand::SetSessionLifecycle { .. } => {}
+            HostCommand::DeleteSessionPermanently {
+                session_id,
+                confirmation,
+            } => {
+                if &confirmation.session_id != session_id
+                    || confirmation.trashed_at_ms == 0
+                    || confirmation.phrase != format!("permanently delete {}", session_id.as_str())
+                {
+                    return Err(ValidationError::new(
+                        "host_command.confirmation",
+                        "must exactly confirm the target session and current trash timestamp",
+                    ));
+                }
+            }
         }
         validate_serialized_size("host_command", self, MAX_COMMAND_BYTES)
     }
@@ -575,8 +829,19 @@ impl ProtocolValidation for CommandAck {
                 format!("must equal protocol major {PROTOCOL_VERSION}"),
             ));
         }
-        if let AckDisposition::Rejected { error } = &self.disposition {
-            error.validate()?;
+        match &self.disposition {
+            AckDisposition::Accepted {
+                run_id,
+                created_session_id,
+            } => {
+                if run_id.is_some() && created_session_id.is_some() {
+                    return Err(ValidationError::new(
+                        "ack.disposition",
+                        "cannot contain both a run and a created session",
+                    ));
+                }
+            }
+            AckDisposition::Rejected { error } => error.validate()?,
         }
         validate_serialized_size("ack", self, MAX_COMMAND_BYTES)
     }
@@ -590,8 +855,26 @@ impl ProtocolValidation for HostCommandAck {
                 format!("must equal protocol major {PROTOCOL_VERSION}"),
             ));
         }
-        if let HostAckDisposition::Rejected { error } = &self.disposition {
-            error.validate()?;
+        match &self.disposition {
+            HostAckDisposition::Accepted {
+                created_session_id,
+                project,
+                catalog_changed,
+            } => {
+                let result_count = usize::from(created_session_id.is_some())
+                    + usize::from(project.is_some())
+                    + usize::from(*catalog_changed);
+                if result_count != 1 {
+                    return Err(ValidationError::new(
+                        "host_ack.disposition",
+                        "must contain exactly one created session, updated project, or catalog change",
+                    ));
+                }
+                if let Some(project) = project {
+                    project.validate()?;
+                }
+            }
+            HostAckDisposition::Rejected { error } => error.validate()?,
         }
         validate_serialized_size("host_ack", self, MAX_COMMAND_BYTES)
     }
@@ -619,6 +902,16 @@ mod tests {
         )
     }
 
+    fn host_command(command_id: &str, command: HostCommand) -> HostCommandEnvelope {
+        HostCommandEnvelope::new(
+            HostId::new("host-test").unwrap(),
+            DeviceId::new("device-test").unwrap(),
+            CommandId::new(command_id).unwrap(),
+            1,
+            command,
+        )
+    }
+
     fn attachment(index: usize, byte_len: u64) -> AttachmentRef {
         AttachmentRef {
             handle: format!("handle-{index}"),
@@ -635,6 +928,8 @@ mod tests {
             attachments: (0..crate::MAX_ATTACHMENT_COUNT)
                 .map(|index| attachment(index, 1))
                 .collect(),
+            document_ids: Vec::new(),
+            project_file_ids: Vec::new(),
         };
         eight.validate().unwrap();
         let exact_total = PromptInput {
@@ -642,6 +937,8 @@ mod tests {
             attachments: (0..4)
                 .map(|index| attachment(index, crate::MAX_ATTACHMENT_FILE_BYTES as u64))
                 .collect(),
+            document_ids: Vec::new(),
+            project_file_ids: Vec::new(),
         };
         exact_total.validate().unwrap();
     }
@@ -653,18 +950,24 @@ mod tests {
             attachments: (0..=crate::MAX_ATTACHMENT_COUNT)
                 .map(|index| attachment(index, 1))
                 .collect(),
+            document_ids: Vec::new(),
+            project_file_ids: Vec::new(),
         };
         assert!(over_count.validate().is_err());
 
         let zero = PromptInput {
             text: "zero".into(),
             attachments: vec![attachment(0, 0)],
+            document_ids: Vec::new(),
+            project_file_ids: Vec::new(),
         };
         assert!(zero.validate().is_err());
 
         let over_file = PromptInput {
             text: "large".into(),
             attachments: vec![attachment(0, crate::MAX_ATTACHMENT_FILE_BYTES as u64 + 1)],
+            document_ids: Vec::new(),
+            project_file_ids: Vec::new(),
         };
         assert!(over_file.validate().is_err());
 
@@ -677,6 +980,8 @@ mod tests {
                 attachment(3, crate::MAX_ATTACHMENT_FILE_BYTES as u64),
                 attachment(4, 1),
             ],
+            document_ids: Vec::new(),
+            project_file_ids: Vec::new(),
         };
         assert!(over_total.validate().is_err());
 
@@ -684,6 +989,8 @@ mod tests {
         let duplicates = PromptInput {
             text: "duplicate".into(),
             attachments: vec![duplicate.clone(), duplicate],
+            document_ids: Vec::new(),
+            project_file_ids: Vec::new(),
         };
         assert!(duplicates.validate().is_err());
     }
@@ -740,5 +1047,184 @@ mod tests {
         )
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn conversation_branch_commands_have_exact_validated_wire_contracts() {
+        let commands = [
+            (
+                session_command(
+                    "command-edit",
+                    SessionCommand::EditUserTurn {
+                        source_user_entry_id: DurableEntryId::new("entry-user").unwrap(),
+                        input: PromptInput {
+                            text: "replacement".into(),
+                            attachments: Vec::new(),
+                            document_ids: Vec::new(),
+                            project_file_ids: Vec::new(),
+                        },
+                    },
+                ),
+                "session.editUserTurn",
+            ),
+            (
+                session_command(
+                    "command-retry",
+                    SessionCommand::RetryResponse {
+                        source_assistant_entry_id: DurableEntryId::new("entry-assistant").unwrap(),
+                        model: Some(ModelSelection {
+                            provider: "openai".into(),
+                            model: "gpt-test".into(),
+                            reasoning: "high".into(),
+                        }),
+                    },
+                ),
+                "session.retryResponse",
+            ),
+            (
+                session_command(
+                    "command-fork",
+                    SessionCommand::ForkConversation {
+                        entry_id: DurableEntryId::new("entry-checkpoint").unwrap(),
+                    },
+                ),
+                "session.forkConversation",
+            ),
+        ];
+
+        for (envelope, expected_type) in commands {
+            envelope.validate().unwrap();
+            let value = serde_json::to_value(&envelope).unwrap();
+            assert_eq!(value["command"]["type"], expected_type);
+            assert_eq!(
+                serde_json::from_value::<SessionCommandEnvelope>(value).unwrap(),
+                envelope
+            );
+        }
+
+        let ack = CommandAck::accepted_fork(
+            SessionId::new("source-session").unwrap(),
+            CommandId::new("command-fork").unwrap(),
+            7,
+            SessionCursor {
+                actor_generation: 1,
+                sequence: 11,
+            },
+            SessionId::new("created-session").unwrap(),
+        );
+        ack.validate().unwrap();
+        let value = serde_json::to_value(&ack).unwrap();
+        assert_eq!(
+            value["disposition"]["createdSessionId"],
+            "created-session"
+        );
+        assert!(value["disposition"].get("runId").is_none());
+    }
+
+    #[test]
+    fn trash_and_permanent_delete_are_bound_to_exact_session_generation() {
+        let lifecycle = host_command(
+            "command-trash",
+            HostCommand::SetSessionLifecycle {
+                session_id: SessionId::new("session-trash").unwrap(),
+                lifecycle: SessionCatalogState::Trash,
+            },
+        );
+        lifecycle.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&lifecycle).unwrap()["command"],
+            serde_json::json!({
+                "type": "session.setLifecycle",
+                "data": {
+                    "sessionId": "session-trash",
+                    "lifecycle": "trash"
+                }
+            })
+        );
+
+        let valid = host_command(
+            "command-delete",
+            HostCommand::DeleteSessionPermanently {
+                session_id: SessionId::new("session-trash").unwrap(),
+                confirmation: PermanentDeleteConfirmation {
+                    session_id: SessionId::new("session-trash").unwrap(),
+                    trashed_at_ms: 42,
+                    phrase: "permanently delete session-trash".into(),
+                },
+            },
+        );
+        valid.validate().unwrap();
+
+        for confirmation in [
+            PermanentDeleteConfirmation {
+                session_id: SessionId::new("other-session").unwrap(),
+                trashed_at_ms: 42,
+                phrase: "permanently delete session-trash".into(),
+            },
+            PermanentDeleteConfirmation {
+                session_id: SessionId::new("session-trash").unwrap(),
+                trashed_at_ms: 0,
+                phrase: "permanently delete session-trash".into(),
+            },
+            PermanentDeleteConfirmation {
+                session_id: SessionId::new("session-trash").unwrap(),
+                trashed_at_ms: 42,
+                phrase: "delete session-trash".into(),
+            },
+        ] {
+            assert!(host_command(
+                "command-invalid-delete",
+                HostCommand::DeleteSessionPermanently {
+                    session_id: SessionId::new("session-trash").unwrap(),
+                    confirmation,
+                },
+            )
+            .validate()
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn project_import_accepts_only_an_opaque_host_candidate() {
+        let envelope = HostCommandEnvelope::new(
+            HostId::new("host-test").unwrap(),
+            DeviceId::new("device-test").unwrap(),
+            CommandId::new("command-import").unwrap(),
+            1,
+            HostCommand::ImportProject {
+                candidate_id: "candidate-opaque-1".into(),
+                display_name: Some("Project".into()),
+            },
+        );
+        envelope.validate().unwrap();
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(
+            value["command"],
+            serde_json::json!({
+                "type": "project.import",
+                "data": {
+                    "candidateId": "candidate-opaque-1",
+                    "displayName": "Project"
+                }
+            })
+        );
+        assert!(
+            serde_json::from_value::<HostCommandEnvelope>(serde_json::json!({
+                "protocol": 1,
+                "hostId": "host-test",
+                "deviceId": "device-test",
+                "commandId": "command-import",
+                "issuedAtMs": 1,
+                "command": {
+                    "type": "project.import",
+                    "data": {
+                        "candidateId": "candidate-opaque-1",
+                        "rootPath": "/private/host/path"
+                    }
+                }
+            }))
+            .is_err(),
+            "an arbitrary browser-authored host path must be rejected, not ignored"
+        );
     }
 }

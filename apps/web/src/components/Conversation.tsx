@@ -8,18 +8,19 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronUp,
-  CircleStop,
   Copy,
   Download,
   ExternalLink,
   File,
   FileDiff,
   FileText,
+  GitFork,
   Globe2,
   LoaderCircle,
   Maximize2,
   Minus,
   Paperclip,
+  Pencil,
   Plus,
   RefreshCw,
   Search,
@@ -32,21 +33,28 @@ import {
 } from "lucide-react";
 import {
   Suspense,
+  type ComponentProps,
   type CSSProperties,
   type ChangeEvent,
   type KeyboardEvent,
   type ReactNode,
   lazy,
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
+import { CommandRejectedError } from "../command-error";
+import { SessionDraftStore } from "../drafts";
 import type {
   ActionItem,
+  ActivityPhase,
   AttachmentRef,
   AuthorityProfile,
+  DocumentReference,
   HostBootstrap,
   ModelSummary,
   OutputRef,
@@ -54,7 +62,17 @@ import type {
   SessionSnapshot,
   SourceRef,
   TranscriptItem,
+  TrustedFileCatalog,
+  TrustedFileEntry,
+  TrustedFileRead,
+  TrustedFileSearchResult,
 } from "../protocol";
+import { CompletionReview } from "./CompletionReview";
+import {
+  ConversationBranchDialog,
+  type ConversationBranchAction,
+} from "./ConversationBranchDialog";
+import { PromptContextPicker } from "./PromptContextPicker";
 import { TuiSplashLogo } from "./TuiSplashLogo";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage"));
@@ -66,6 +84,9 @@ interface ConversationProps {
     prompt: string,
     attachments: AttachmentRef[],
     activeDelivery?: "steer" | "followUp",
+    idempotencyKey?: string,
+    documents?: DocumentReference[],
+    projectFiles?: TrustedFileEntry[],
   ) => Promise<void>;
   onInterrupt: () => Promise<void>;
   onConfigure: (patch: {
@@ -91,17 +112,152 @@ interface ConversationProps {
     presentation: "text" | "diff" | "image",
   ) => void;
   onIngestAttachment?: (file: File) => Promise<AttachmentRef>;
+  onIngestDocument?: (file: File) => Promise<DocumentReference>;
+  onListProjectFiles?: () => Promise<TrustedFileCatalog>;
+  onSearchProjectFiles?: (
+    query: string,
+  ) => Promise<TrustedFileSearchResult>;
+  onReadProjectFile?: (entryId: string) => Promise<TrustedFileRead>;
+  onEditUserTurn?: (entryId: string, text: string) => Promise<void>;
+  onRetryResponse?: (
+    entryId: string,
+    model?: { id: string; reasoning: ReasoningEffort },
+  ) => Promise<void>;
+  onForkConversation?: (entryId: string) => Promise<void>;
   attachmentContentUrl?: (handle: string) => string;
 }
 
 type DraftAttachment = {
   localId: string;
-  file: File;
+  file?: File;
   previewUrl?: string;
   status: "uploading" | "uploaded" | "failed";
   reference?: AttachmentRef;
   error?: string;
 };
+
+type SubmissionFailure = {
+  kind: "connection" | "provider" | "session" | "rejected";
+  title: string;
+  message: string;
+  retryable: boolean;
+};
+
+function classifySubmissionFailure(error: unknown): SubmissionFailure {
+  const message =
+    error instanceof Error
+      ? error.message
+      : "ygg could not send this message.";
+  if (error instanceof CommandRejectedError) {
+    if (
+      error.code === "staleGeneration" ||
+      error.code === "replayGap" ||
+      error.code === "locked" ||
+      error.code === "invalidBoundary" ||
+      error.code === "alreadyResolved"
+    ) {
+      return {
+        kind: "session",
+        title: "Session state changed",
+        message,
+        retryable: error.retryable,
+      };
+    }
+    if (error.code === "unavailable" || error.code === "internal") {
+      return {
+        kind: "provider",
+        title: "Provider or host unavailable",
+        message,
+        retryable: error.retryable,
+      };
+    }
+    if (error.code === "incompatibleProtocol") {
+      return {
+        kind: "connection",
+        title: "Host protocol changed",
+        message,
+        retryable: error.retryable,
+      };
+    }
+    return {
+      kind: "rejected",
+      title: "Message was not accepted",
+      message,
+      retryable: error.retryable,
+    };
+  }
+  const normalized = message.toLocaleLowerCase();
+  if (
+    normalized.includes("fetch") ||
+    normalized.includes("network") ||
+    normalized.includes("connect") ||
+    normalized.includes("unavailable")
+  ) {
+    return {
+      kind: "connection",
+      title: "Connection interrupted",
+      message,
+      retryable: true,
+    };
+  }
+  if (
+    normalized.includes("provider") ||
+    normalized.includes("model") ||
+    normalized.includes("rate limit")
+  ) {
+    return {
+      kind: "provider",
+      title: "Provider did not accept the request",
+      message,
+      retryable: true,
+    };
+  }
+  if (
+    normalized.includes("session") ||
+    normalized.includes("generation") ||
+    normalized.includes("working") ||
+    normalized.includes("stale")
+  ) {
+    return {
+      kind: "session",
+      title: "Session state changed",
+      message,
+      retryable: true,
+    };
+  }
+  return {
+    kind: "rejected",
+    title: "Message was not accepted",
+    message,
+    retryable: false,
+  };
+}
+
+function draftAttachmentName(attachment: DraftAttachment): string {
+  return attachment.file?.name ?? attachment.reference?.name ?? "Attachment";
+}
+
+function draftAttachmentMediaType(attachment: DraftAttachment): string {
+  return (
+    attachment.file?.type ??
+    attachment.reference?.mediaType ??
+    "application/octet-stream"
+  );
+}
+
+function draftAttachmentSize(attachment: DraftAttachment): number {
+  return attachment.file?.size ?? attachment.reference?.size ?? 0;
+}
+
+function browserDraftStore(): SessionDraftStore {
+  try {
+    return new SessionDraftStore(
+      typeof window === "undefined" ? undefined : window.localStorage,
+    );
+  } catch {
+    return new SessionDraftStore();
+  }
+}
 
 function extensionLabel(name: string): string {
   const extension = name.split(".").at(-1);
@@ -328,8 +484,10 @@ function AttachmentPreviewDialog({
 const actionIcons: Record<ActionItem["actionKind"], ReactNode> = {
   command: <TerminalSquare aria-hidden="true" />,
   file_read: <FileText aria-hidden="true" />,
+  file_search: <Search aria-hidden="true" />,
   file_write: <FileDiff aria-hidden="true" />,
   web_search: <Search aria-hidden="true" />,
+  skill: <BrainCircuit aria-hidden="true" />,
   preview: <Globe2 aria-hidden="true" />,
   analysis: <ScanSearch aria-hidden="true" />,
 };
@@ -365,16 +523,6 @@ const providerAccents: Array<[string, string]> = [
   ["tencent", "#5cb9ff"],
   ["allenai", "#f0529c"],
 ];
-
-const thinkingIntensity: Record<string, number> = {
-  off: 0,
-  minimal: 0.2,
-  low: 0.35,
-  medium: 0.5,
-  high: 0.7,
-  xhigh: 0.85,
-  max: 1,
-};
 
 function balancedAccent(source: string, targetLuminance: number): string {
   const match = /^#([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(source);
@@ -426,11 +574,25 @@ function formatDuration(durationMs: number): string {
   return `${minutes}m ${seconds % 60}s`;
 }
 
+const phaseLabels: Record<ActivityPhase, string> = {
+  investigated: "Investigated",
+  changed: "Changed",
+  verified: "Verified",
+  produced: "Produced",
+  other: "Other work",
+};
+
+const livePhaseLabels: Record<ActivityPhase, string> = {
+  investigated: "Investigating",
+  changed: "Making changes",
+  verified: "Verifying",
+  produced: "Producing output",
+  other: "Executing",
+};
+
 function LiveDots() {
   return (
     <span className="live-dots" aria-hidden="true">
-      <i />
-      <i />
       <i />
     </span>
   );
@@ -461,6 +623,8 @@ function ActionCell({
   onOpenResource,
   availableOutputs,
   availableSources,
+  outputsByOrigin,
+  sourcesByOrigin,
 }: {
   item: ActionItem;
   animate: boolean;
@@ -469,19 +633,17 @@ function ActionCell({
   onOpenResource: ConversationProps["onOpenResource"];
   availableOutputs: ReadonlyMap<string, OutputRef>;
   availableSources: ReadonlyMap<string, SourceRef>;
+  outputsByOrigin: ReadonlyMap<string, readonly OutputRef[]>;
+  sourcesByOrigin: ReadonlyMap<string, readonly SourceRef[]>;
 }) {
   const isStreaming = item.state === "streaming";
   const sourceIds = new Set([
     ...(item.sourceIds ?? []),
-    ...Array.from(availableSources.values())
-      .filter((source) => source.originItemId === item.id)
-      .map((source) => source.id),
+    ...(sourcesByOrigin.get(item.id) ?? []).map((source) => source.id),
   ]);
   const outputIds = new Set([
     ...(item.outputIds ?? []),
-    ...Array.from(availableOutputs.values())
-      .filter((output) => output.originItemId === item.id)
-      .map((output) => output.id),
+    ...(outputsByOrigin.get(item.id) ?? []).map((output) => output.id),
   ]);
   const sources = Array.from(sourceIds)
     .map((id) => availableSources.get(id))
@@ -492,6 +654,7 @@ function ActionCell({
   return (
     <details
       className={`action-cell ${animate ? "is-entering" : ""}`}
+      data-status={item.status}
       open={isStreaming}
     >
       <summary>
@@ -517,10 +680,78 @@ function ActionCell({
             {formatDuration(item.durationMs)}
           </span>
         ) : null}
+        {item.status === "failed" ? (
+          <AlertTriangle
+            className="action-status-icon"
+            aria-label="Action failed"
+          />
+        ) : null}
         <ChevronDown className="disclosure-chevron" aria-hidden="true" />
       </summary>
       <div className="action-detail">
-        {item.detail ? <p>{item.detail}</p> : null}
+        {item.outputSummary ?? item.summary ?? item.detail ? (
+          <p>{item.outputSummary ?? item.summary ?? item.detail}</p>
+        ) : null}
+        {item.commandPreview ? (
+          <pre className="action-command">
+            <code>{item.commandPreview}</code>
+          </pre>
+        ) : null}
+        <dl className="action-metadata">
+          <div>
+            <dt>Status</dt>
+            <dd>{item.status}</dd>
+          </div>
+          {item.cwd ? (
+            <div>
+              <dt>Working directory</dt>
+              <dd>
+                <code>{item.cwd}</code>
+              </dd>
+            </div>
+          ) : null}
+          {typeof item.exitCode === "number" ? (
+            <div>
+              <dt>Exit</dt>
+              <dd>{item.exitCode}</dd>
+            </div>
+          ) : null}
+          {typeof item.signal === "number" ? (
+            <div>
+              <dt>Signal</dt>
+              <dd>{item.signal}</dd>
+            </div>
+          ) : null}
+          {item.observedOutputBytes > 0 ? (
+            <div>
+              <dt>Observed output</dt>
+              <dd>{item.observedOutputBytes.toLocaleString()} bytes</dd>
+            </div>
+          ) : null}
+          {item.droppedOutputBytes > 0 ? (
+            <div data-warning="true">
+              <dt>Truncated</dt>
+              <dd>{item.droppedOutputBytes.toLocaleString()} bytes omitted</dd>
+            </div>
+          ) : null}
+        </dl>
+        {item.outputHandle && onOpenResource ? (
+          <div className="action-links">
+            <button
+              onClick={() =>
+                onOpenResource(
+                  item.outputHandle!,
+                  `${item.label} output`,
+                  "text",
+                )
+              }
+              aria-label={`Open full output for ${item.label}`}
+            >
+              <TerminalSquare aria-hidden="true" />
+              Open full output
+            </button>
+          </div>
+        ) : null}
         {(item.diffHandle || item.resultHandle) && onOpenResource ? (
           <div className="action-links">
             {item.diffHandle ? (
@@ -697,9 +928,17 @@ function UserInputCard({
 function AssistantMessage({
   item,
   animate,
+  branchingAvailable,
+  onRetry,
+  onRetryWithModel,
+  onFork,
 }: {
   item: Extract<TranscriptItem, { kind: "assistant_message" }>;
   animate: boolean;
+  branchingAvailable: boolean;
+  onRetry: () => void;
+  onRetryWithModel: () => void;
+  onFork: () => void;
 }) {
   const [copyState, setCopyState] = useState<
     "idle" | "copied" | "failed"
@@ -736,7 +975,9 @@ function AssistantMessage({
       className={`assistant-message ${item.state === "streaming" ? "is-streaming" : ""} ${animate ? "is-entering" : ""}`}
       aria-live={item.state === "streaming" ? "polite" : undefined}
     >
-      {item.content ? (
+      {item.content && item.state === "streaming" ? (
+        <div className="message-copy">{item.content}</div>
+      ) : item.content ? (
         <Suspense fallback={<div className="message-copy">{item.content}</div>}>
           <MarkdownMessage content={item.content} />
         </Suspense>
@@ -773,15 +1014,43 @@ function AssistantMessage({
               ? "Response copied"
               : copyState === "failed"
                 ? "Could not copy response"
-                : ""}
+              : ""}
           </span>
+          {branchingAvailable ? (
+            <>
+              <button
+                type="button"
+                onClick={onRetry}
+                aria-label="Retry response"
+                title="Retry response"
+              >
+                <RefreshCw aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                onClick={onRetryWithModel}
+                aria-label="Retry response with another model"
+                title="Retry with another model"
+              >
+                <Zap aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                onClick={onFork}
+                aria-label="Fork conversation here"
+                title="Fork into a new session"
+              >
+                <GitFork aria-hidden="true" />
+              </button>
+            </>
+          ) : null}
         </div>
       ) : null}
     </article>
   );
 }
 
-function TranscriptItemView({
+const TranscriptItemView = memo(function TranscriptItemView({
   item,
   animate,
   onResolveApproval,
@@ -791,8 +1060,15 @@ function TranscriptItemView({
   onOpenResource,
   availableOutputs,
   availableSources,
+  outputsByOrigin,
+  sourcesByOrigin,
   attachmentContentUrl,
   onPreviewAttachment,
+  conversationBranching = false,
+  onEditUserTurn = () => {},
+  onRetryResponse = () => {},
+  onRetryResponseWithModel = () => {},
+  onForkConversation = () => {},
 }: {
   item: TranscriptItem;
   animate: boolean;
@@ -803,18 +1079,46 @@ function TranscriptItemView({
   onOpenResource: ConversationProps["onOpenResource"];
   availableOutputs: ReadonlyMap<string, OutputRef>;
   availableSources: ReadonlyMap<string, SourceRef>;
+  outputsByOrigin: ReadonlyMap<string, readonly OutputRef[]>;
+  sourcesByOrigin: ReadonlyMap<string, readonly SourceRef[]>;
   attachmentContentUrl?: (handle: string) => string;
   onPreviewAttachment: (
     source: string,
     name: string,
     trigger: HTMLElement,
   ) => void;
+  conversationBranching?: boolean;
+  onEditUserTurn?: (
+    item: Extract<TranscriptItem, { kind: "user_message" }>,
+  ) => void;
+  onRetryResponse?: (
+    item: Extract<TranscriptItem, { kind: "assistant_message" }>,
+  ) => void;
+  onRetryResponseWithModel?: (
+    item: Extract<TranscriptItem, { kind: "assistant_message" }>,
+  ) => void;
+  onForkConversation?: (item: TranscriptItem) => void;
 }) {
   switch (item.kind) {
     case "user_message": {
       return (
         <article className={`user-message ${animate ? "is-entering" : ""}`}>
           <div className="message-copy">{item.content}</div>
+          {item.branchProvenance ? (
+            <div className="conversation-branch-provenance">
+              <GitFork aria-hidden="true" />
+              <span>
+                <strong>
+                  {item.branchProvenance.operation === "editUserTurn"
+                    ? "Edited-turn branch"
+                    : item.branchProvenance.operation === "retryResponse"
+                      ? "Retried-response branch"
+                      : "Forked conversation"}
+                </strong>
+                <small>{item.branchProvenance.warning}</small>
+              </span>
+            </div>
+          ) : null}
           {item.attachments?.length ? (
             <div
               className="message-attachments"
@@ -867,6 +1171,34 @@ function TranscriptItemView({
               })}
             </div>
           ) : null}
+          {item.documents?.length || item.projectFiles?.length ? (
+            <div className="message-context" aria-label="Referenced context">
+              {item.documents?.map((document) => (
+                <span key={document.id}>
+                  <FileText aria-hidden="true" />
+                  <span>
+                    <strong>{document.displayName}</strong>
+                    <small>
+                      {document.mediaType === "application/pdf"
+                        ? "Uploaded PDF"
+                        : document.mediaType === "text/markdown"
+                          ? "Uploaded Markdown"
+                          : "Uploaded text"}
+                    </small>
+                  </span>
+                </span>
+              ))}
+              {item.projectFiles?.map((file) => (
+                <span key={file.id}>
+                  <File aria-hidden="true" />
+                  <span>
+                    <strong>{file.relativePath}</strong>
+                    <small>Trusted project snapshot</small>
+                  </span>
+                </span>
+              ))}
+            </div>
+          ) : null}
           {item.state === "streaming" ? (
             <span
               className="user-message-state"
@@ -882,12 +1214,47 @@ function TranscriptItemView({
                     : "Pending delivery"}
             </span>
           ) : null}
+          {conversationBranching &&
+          item.state !== "streaming" &&
+          item.durableEntryId ? (
+            <div className="message-actions branch-message-actions">
+              <button
+                type="button"
+                onClick={() => onEditUserTurn(item)}
+                aria-label="Edit this turn"
+                title="Edit this turn"
+              >
+                <Pencil aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                onClick={() => onForkConversation(item)}
+                aria-label="Fork conversation here"
+                title="Fork into a new session"
+              >
+                <GitFork aria-hidden="true" />
+              </button>
+            </div>
+          ) : null}
         </article>
       );
     }
 
     case "assistant_message":
-      return <AssistantMessage item={item} animate={animate} />;
+      return (
+        <AssistantMessage
+          item={item}
+          animate={animate}
+          branchingAvailable={
+            conversationBranching &&
+            item.state !== "streaming" &&
+            Boolean(item.durableEntryId)
+          }
+          onRetry={() => onRetryResponse(item)}
+          onRetryWithModel={() => onRetryResponseWithModel(item)}
+          onFork={() => onForkConversation(item)}
+        />
+      );
 
     case "reasoning":
       return (
@@ -918,6 +1285,8 @@ function TranscriptItemView({
           onOpenResource={onOpenResource}
           availableOutputs={availableOutputs}
           availableSources={availableSources}
+          outputsByOrigin={outputsByOrigin}
+          sourcesByOrigin={sourcesByOrigin}
         />
       );
 
@@ -982,31 +1351,116 @@ function TranscriptItemView({
 
     case "run_outcome":
       return (
-        <div
-          className={`run-outcome is-${item.outcome} ${animate ? "is-entering" : ""}`}
-        >
-          <span>
-            {item.outcome === "done" ? (
-              <Check aria-hidden="true" />
-            ) : item.outcome === "failed" ? (
-              <AlertTriangle aria-hidden="true" />
-            ) : (
-              <CircleStop aria-hidden="true" />
-            )}
-          </span>
-          <strong>{item.summary}</strong>
-          {item.durationMs > 0 ? (
-            <em>Worked for {formatDuration(item.durationMs)}</em>
-          ) : null}
-        </div>
+        <CompletionReview
+          outcome={item}
+          actions={[]}
+          outputs={availableOutputs}
+          onOpenOutput={onOpenOutput}
+          onOpenResource={onOpenResource}
+        />
       );
   }
+});
+
+function AnchoredTranscriptItem(
+  props: ComponentProps<typeof TranscriptItemView>,
+) {
+  return (
+    <div
+      id={`transcript-item-${props.item.id}`}
+      className="transcript-item-anchor"
+      data-item-id={props.item.id}
+      tabIndex={-1}
+    >
+      <TranscriptItemView {...props} />
+    </div>
+  );
 }
 
 type WorkItem = Extract<
   TranscriptItem,
   { kind: "action" | "reasoning" }
 >;
+
+interface PhaseWorkGroup {
+  id: string;
+  phase: ActivityPhase;
+  items: WorkItem[];
+}
+
+function phaseWorkGroups(items: readonly WorkItem[]): PhaseWorkGroup[] {
+  const groups: PhaseWorkGroup[] = [];
+  let currentPhase: ActivityPhase | undefined;
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index]!;
+    const nextAction = items
+      .slice(index)
+      .find((candidate): candidate is ActionItem => candidate.kind === "action");
+    const phase =
+      item.kind === "action"
+        ? item.phase
+        : currentPhase ?? nextAction?.phase ?? "investigated";
+    const current = groups.at(-1);
+    if (!current || current.phase !== phase) {
+      groups.push({
+        id: `${phase}-${item.id}`,
+        phase,
+        items: [item],
+      });
+    } else {
+      current.items.push(item);
+    }
+    currentPhase = phase;
+  }
+  return groups;
+}
+
+type PhaseEntry =
+  | { kind: "item"; item: WorkItem }
+  | { kind: "command_batch"; id: string; items: ActionItem[] };
+
+function aggregatePhaseEntries(items: readonly WorkItem[]): PhaseEntry[] {
+  const entries: PhaseEntry[] = [];
+  let index = 0;
+  while (index < items.length) {
+    const item = items[index]!;
+    if (
+      item.kind === "action" &&
+      item.actionKind === "command" &&
+      item.status !== "running"
+    ) {
+      const commands: ActionItem[] = [item];
+      let nextIndex = index + 1;
+      while (nextIndex < items.length) {
+        const candidate = items[nextIndex]!;
+        if (
+          candidate.kind !== "action" ||
+          candidate.actionKind !== "command" ||
+          candidate.status === "running" ||
+          candidate.rawToolName !== item.rawToolName
+        ) {
+          break;
+        }
+        commands.push(candidate);
+        nextIndex += 1;
+      }
+      if (commands.length > 1) {
+        entries.push({
+          kind: "command_batch",
+          id: `commands-${commands[0]!.id}`,
+          items: commands,
+        });
+      } else {
+        entries.push({ kind: "item", item });
+      }
+      index = nextIndex;
+      continue;
+    }
+    entries.push({ kind: "item", item });
+    index += 1;
+  }
+  return entries;
+}
 
 type TranscriptRow =
   | { kind: "item"; item: TranscriptItem }
@@ -1017,17 +1471,21 @@ type TranscriptRow =
       outcome?: Extract<TranscriptItem, { kind: "run_outcome" }>;
     };
 
+function workIdentity(item: TranscriptItem): string {
+  return item.runId ? `run:${item.runId}` : `turn:${item.turnId}`;
+}
+
 function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
-  const lastWorkIndexByTurn = new Map<string, number>();
-  const outcomeByTurn = new Map<
+  const lastWorkIndexByRun = new Map<string, number>();
+  const outcomeByRun = new Map<
     string,
     Extract<TranscriptItem, { kind: "run_outcome" }>
   >();
   items.forEach((item, index) => {
     if (item.kind === "action" || item.kind === "reasoning") {
-      lastWorkIndexByTurn.set(item.turnId, index);
+      lastWorkIndexByRun.set(workIdentity(item), index);
     } else if (item.kind === "run_outcome") {
-      outcomeByTurn.set(item.turnId, item);
+      outcomeByRun.set(workIdentity(item), item);
     }
   });
 
@@ -1037,12 +1495,12 @@ function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
     const item = items[index]!;
     if (item.kind === "action" || item.kind === "reasoning") {
       const workItems: WorkItem[] = [];
-      const turnId = item.turnId;
+      const identity = workIdentity(item);
       let lastIndex = index;
       while (lastIndex < items.length) {
         const candidate = items[lastIndex]!;
         if (
-          candidate.turnId !== turnId ||
+          workIdentity(candidate) !== identity ||
           (candidate.kind !== "action" && candidate.kind !== "reasoning")
         ) {
           break;
@@ -1051,19 +1509,19 @@ function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
         lastIndex += 1;
       }
       const ownsOutcome =
-        lastWorkIndexByTurn.get(turnId) === lastIndex - 1;
+        lastWorkIndexByRun.get(identity) === lastIndex - 1;
       rows.push({
         kind: "work",
         id: `work-${workItems[0]!.id}`,
         items: workItems,
-        outcome: ownsOutcome ? outcomeByTurn.get(turnId) : undefined,
+        outcome: ownsOutcome ? outcomeByRun.get(identity) : undefined,
       });
       index = lastIndex;
       continue;
     }
     if (
       item.kind === "run_outcome" &&
-      lastWorkIndexByTurn.has(item.turnId)
+      lastWorkIndexByRun.has(workIdentity(item))
     ) {
       index += 1;
       continue;
@@ -1076,6 +1534,7 @@ function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
 
 interface WorkGroupProps {
   row: Extract<TranscriptRow, { kind: "work" }>;
+  reviewActions: readonly ActionItem[];
   initialItemIds: ReadonlySet<string>;
   onResolveApproval: ConversationProps["onResolveApproval"];
   onResolveUserInput: ConversationProps["onResolveUserInput"];
@@ -1084,6 +1543,8 @@ interface WorkGroupProps {
   onOpenResource: ConversationProps["onOpenResource"];
   availableOutputs: ReadonlyMap<string, OutputRef>;
   availableSources: ReadonlyMap<string, SourceRef>;
+  outputsByOrigin: ReadonlyMap<string, readonly OutputRef[]>;
+  sourcesByOrigin: ReadonlyMap<string, readonly SourceRef[]>;
   attachmentContentUrl?: (handle: string) => string;
   onPreviewAttachment: (
     source: string,
@@ -1092,8 +1553,9 @@ interface WorkGroupProps {
   ) => void;
 }
 
-function WorkGroup({
+const WorkGroup = memo(function WorkGroup({
   row,
+  reviewActions,
   initialItemIds,
   onResolveApproval,
   onResolveUserInput,
@@ -1102,10 +1564,13 @@ function WorkGroup({
   onOpenResource,
   availableOutputs,
   availableSources,
+  outputsByOrigin,
+  sourcesByOrigin,
   attachmentContentUrl,
   onPreviewAttachment,
 }: WorkGroupProps) {
-  const live = row.items.some((item) => item.state === "streaming");
+  const liveItem = row.items.find((item) => item.state === "streaming");
+  const live = Boolean(liveItem);
   const [userOpen, setUserOpen] = useState(false);
   const itemDuration = row.items.reduce(
     (total, item) =>
@@ -1113,12 +1578,22 @@ function WorkGroup({
     0,
   );
   const duration = row.outcome?.durationMs || itemDuration;
-  const label = live
-    ? "Working…"
+  const currentPhase =
+    liveItem?.kind === "action"
+      ? liveItem.phase
+      : [...row.items]
+          .reverse()
+          .find((item): item is ActionItem => item.kind === "action")?.phase ??
+        "investigated";
+  const label = liveItem
+    ? `${livePhaseLabels[currentPhase]} · ${
+        liveItem.kind === "reasoning" ? liveItem.summary : liveItem.label
+      }`
     : duration > 0
       ? `Worked for ${formatDuration(duration)}`
       : "Work details";
   const open = live || userOpen;
+  const phases = phaseWorkGroups(row.items);
 
   return (
     <section
@@ -1150,27 +1625,127 @@ function WorkGroup({
       </button>
       <div className="work-group-content-clip" aria-hidden={!open}>
         <div className="work-group-content">
-          {row.items.map((item) => (
-            <TranscriptItemView
-              key={item.id}
-              item={item}
-              animate={!initialItemIds.has(item.id)}
-              onResolveApproval={onResolveApproval}
-              onResolveUserInput={onResolveUserInput}
-              onOpenOutput={onOpenOutput}
-              onOpenSource={onOpenSource}
-              onOpenResource={onOpenResource}
-              availableOutputs={availableOutputs}
-              availableSources={availableSources}
-              attachmentContentUrl={attachmentContentUrl}
-              onPreviewAttachment={onPreviewAttachment}
-            />
+          {phases.map((phase) => (
+            <section
+              className={`activity-phase ${phase.items.some((item) => item.state === "streaming") ? "is-live" : ""}`}
+              key={phase.id}
+              aria-label={`${phaseLabels[phase.phase]} phase`}
+            >
+              <header>
+                <span>{phaseLabels[phase.phase]}</span>
+                <em>
+                  {
+                    phase.items.filter((item) => item.kind === "action")
+                      .length
+                  }
+                </em>
+              </header>
+              <div>
+                {aggregatePhaseEntries(phase.items).map((entry) =>
+                  entry.kind === "command_batch" ? (
+                    <details className="command-batch" key={entry.id}>
+                      <summary>
+                        <TerminalSquare aria-hidden="true" />
+                        <span>
+                          Ran {entry.items.length}{" "}
+                          {entry.items[0]!.rawToolName} commands
+                        </span>
+                        <em>
+                          {
+                            entry.items.filter(
+                              (item) => item.status === "succeeded",
+                            ).length
+                          }{" "}
+                          succeeded
+                        </em>
+                        <ChevronDown
+                          className="disclosure-chevron"
+                          aria-hidden="true"
+                        />
+                      </summary>
+                      <div>
+                        {entry.items.map((item) => (
+                          <AnchoredTranscriptItem
+                            key={item.id}
+                            item={item}
+                            animate={false}
+                            onResolveApproval={onResolveApproval}
+                            onResolveUserInput={onResolveUserInput}
+                            onOpenOutput={onOpenOutput}
+                            onOpenSource={onOpenSource}
+                            onOpenResource={onOpenResource}
+                            availableOutputs={availableOutputs}
+                            availableSources={availableSources}
+                            outputsByOrigin={outputsByOrigin}
+                            sourcesByOrigin={sourcesByOrigin}
+                            attachmentContentUrl={attachmentContentUrl}
+                            onPreviewAttachment={onPreviewAttachment}
+                          />
+                        ))}
+                      </div>
+                    </details>
+                  ) : (
+                    <AnchoredTranscriptItem
+                      key={entry.item.id}
+                      item={entry.item}
+                      animate={!initialItemIds.has(entry.item.id)}
+                      onResolveApproval={onResolveApproval}
+                      onResolveUserInput={onResolveUserInput}
+                      onOpenOutput={onOpenOutput}
+                      onOpenSource={onOpenSource}
+                      onOpenResource={onOpenResource}
+                      availableOutputs={availableOutputs}
+                      availableSources={availableSources}
+                      outputsByOrigin={outputsByOrigin}
+                      sourcesByOrigin={sourcesByOrigin}
+                      attachmentContentUrl={attachmentContentUrl}
+                      onPreviewAttachment={onPreviewAttachment}
+                    />
+                  ),
+                )}
+              </div>
+            </section>
           ))}
         </div>
       </div>
+      {row.outcome ? (
+        <CompletionReview
+          outcome={row.outcome}
+          actions={reviewActions}
+          outputs={availableOutputs}
+          onOpenOutput={onOpenOutput}
+          onOpenResource={onOpenResource}
+        />
+      ) : null}
     </section>
   );
-}
+}, (previous, next) => {
+  if (
+    previous.row.id !== next.row.id ||
+    previous.row.outcome !== next.row.outcome ||
+    previous.reviewActions !== next.reviewActions ||
+    previous.row.items.length !== next.row.items.length
+  ) {
+    return false;
+  }
+  for (let index = 0; index < previous.row.items.length; index += 1) {
+    if (previous.row.items[index] !== next.row.items[index]) return false;
+  }
+  return (
+    previous.initialItemIds === next.initialItemIds &&
+    previous.onResolveApproval === next.onResolveApproval &&
+    previous.onResolveUserInput === next.onResolveUserInput &&
+    previous.onOpenOutput === next.onOpenOutput &&
+    previous.onOpenSource === next.onOpenSource &&
+    previous.onOpenResource === next.onOpenResource &&
+    previous.availableOutputs === next.availableOutputs &&
+    previous.availableSources === next.availableSources &&
+    previous.outputsByOrigin === next.outputsByOrigin &&
+    previous.sourcesByOrigin === next.sourcesByOrigin &&
+    previous.attachmentContentUrl === next.attachmentContentUrl &&
+    previous.onPreviewAttachment === next.onPreviewAttachment
+  );
+});
 
 function EmptySession({
   attachments,
@@ -1887,7 +2462,12 @@ function Composer({
   onInterrupt,
   onConfigure,
   onIngestAttachment,
+  onIngestDocument,
+  onListProjectFiles,
+  onSearchProjectFiles,
+  onReadProjectFile,
   onPreviewAttachment,
+  attachmentContentUrl,
 }: Pick<
   ConversationProps,
   | "session"
@@ -1896,6 +2476,11 @@ function Composer({
   | "onInterrupt"
   | "onConfigure"
   | "onIngestAttachment"
+  | "onIngestDocument"
+  | "onListProjectFiles"
+  | "onSearchProjectFiles"
+  | "onReadProjectFile"
+  | "attachmentContentUrl"
 > & {
   onPreviewAttachment: (
     source: string,
@@ -1903,26 +2488,54 @@ function Composer({
     trigger: HTMLElement,
   ) => void;
 }) {
-  const [prompt, setPrompt] = useState("");
-  const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
+  const [draftStore] = useState(browserDraftStore);
+  const [restoredDraft] = useState(() =>
+    draftStore.load(bootstrap.host.id, session.sessionId),
+  );
+  const [prompt, setPrompt] = useState(restoredDraft?.text ?? "");
+  const [attachments, setAttachments] = useState<DraftAttachment[]>(() =>
+    (restoredDraft?.attachments ?? []).map((reference) => ({
+      localId: `restored-${reference.id}`,
+      status: "uploaded",
+      reference,
+    })),
+  );
+  const [documents, setDocuments] = useState<DocumentReference[]>([]);
+  const [projectFiles, setProjectFiles] = useState<TrustedFileEntry[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [activeDelivery, setActiveDelivery] = useState<
     "steer" | "followUp"
-  >(bootstrap.capabilities.followUp ? "followUp" : "steer");
+  >(() => {
+    if (
+      restoredDraft?.delivery === "followUp" &&
+      bootstrap.capabilities.followUp
+    ) {
+      return "followUp";
+    }
+    if (restoredDraft?.delivery === "steer" && bootstrap.capabilities.steer) {
+      return "steer";
+    }
+    return bootstrap.capabilities.followUp ? "followUp" : "steer";
+  });
   const [submitting, setSubmitting] = useState(false);
-  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<SubmissionFailure | null>(
+    null,
+  );
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
   const attachmentsRef = useRef<DraftAttachment[]>([]);
+  const promptRef = useRef(prompt);
   const mountedRef = useRef(true);
+  const pendingCommandRef = useRef<{
+    id: string;
+    signature: string;
+  } | null>(null);
   const isWorking =
     Boolean(session.activeRunId) ||
     session.status === "working" ||
     session.status === "needs_attention";
-  const isModelWorking =
-    Boolean(session.activeRunId) || session.status === "working";
   const activeModel = bootstrap.models.find(
     (model) => model.id === session.modelId,
   );
@@ -1931,15 +2544,12 @@ function Composer({
   const modelAccent =
     providerAccents.find(([provider]) => providerKey.includes(provider))?.[1] ??
     "var(--theme-pigment)";
-  const intensity = thinkingIntensity[session.reasoning] ?? 0.5;
   const reasoningOptions =
     bootstrap.models.find((model) => model.id === session.modelId)?.reasoning ??
     [session.reasoning];
   const composerStyle = {
     "--model-accent-light": balancedAccent(modelAccent, 0.11),
     "--model-accent-dark": balancedAccent(modelAccent, 0.27),
-    "--thinking-intensity": intensity,
-    "--thinking-opacity": 0.4 + intensity * 0.55,
   } as CSSProperties;
   const attachmentPolicy = bootstrap.capabilities.attachmentPolicy;
   const modelAcceptsAttachments =
@@ -1951,8 +2561,17 @@ function Composer({
       onIngestAttachment &&
       modelAcceptsAttachments,
   );
+  const documentsAvailable = Boolean(
+    bootstrap.capabilities.documents && onIngestDocument,
+  );
+  const projectFilesAvailable = Boolean(
+    bootstrap.capabilities.trustedProjectFiles &&
+      onListProjectFiles &&
+      onSearchProjectFiles &&
+      onReadProjectFile,
+  );
   const hasStagedImages = attachments.some((attachment) =>
-    (attachment.file.type || "application/octet-stream").startsWith("image/"),
+    draftAttachmentMediaType(attachment).startsWith("image/"),
   );
   const attachmentsPending = attachments.some(
     (attachment) => attachment.status === "uploading",
@@ -1964,7 +2583,10 @@ function Composer({
     attachment.reference ? [attachment.reference] : [],
   );
   const canSubmit =
-    (Boolean(prompt.trim()) || uploadedAttachments.length > 0) &&
+    (Boolean(prompt.trim()) ||
+      uploadedAttachments.length > 0 ||
+      documents.length > 0 ||
+      projectFiles.length > 0) &&
     !attachmentsPending &&
     !attachmentsFailed;
 
@@ -1998,6 +2620,37 @@ function Composer({
   }, [attachments]);
 
   useEffect(() => {
+    promptRef.current = prompt;
+  }, [prompt]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const references = attachments.flatMap((attachment) =>
+        attachment.reference ? [attachment.reference] : [],
+      );
+      if (!prompt && references.length === 0) {
+        draftStore.clear(bootstrap.host.id, session.sessionId);
+        return;
+      }
+      draftStore.save(bootstrap.host.id, session.sessionId, {
+        text: prompt,
+        delivery: isWorking ? activeDelivery : "submit",
+        attachments: references,
+        updatedAt: new Date().toISOString(),
+      });
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [
+    activeDelivery,
+    attachments,
+    bootstrap.host.id,
+    draftStore,
+    isWorking,
+    prompt,
+    session.sessionId,
+  ]);
+
+  useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
@@ -2026,6 +2679,20 @@ function Composer({
     const value = prompt;
     const submittedAttachments = attachments;
     const submittedReferences = uploadedAttachments;
+    const commandSignature = JSON.stringify({
+      text: value,
+      delivery: isWorking ? activeDelivery : "submit",
+      attachments: submittedReferences.map((attachment) => attachment.id),
+      documents: documents.map((document) => document.id),
+      projectFiles: projectFiles.map((file) => file.id),
+    });
+    if (pendingCommandRef.current?.signature !== commandSignature) {
+      pendingCommandRef.current = {
+        id: crypto.randomUUID(),
+        signature: commandSignature,
+      };
+    }
+    const idempotencyKey = pendingCommandRef.current.id;
     setSubmitting(true);
     setSubmitError(null);
     try {
@@ -2033,7 +2700,11 @@ function Composer({
         value,
         submittedReferences,
         isWorking ? activeDelivery : undefined,
+        idempotencyKey,
+        documents,
+        projectFiles,
       );
+      pendingCommandRef.current = null;
       setPrompt((current) => (current === value ? "" : current));
       const submittedIds = new Set(
         submittedAttachments.map((attachment) => attachment.localId),
@@ -2044,12 +2715,18 @@ function Composer({
       setAttachments((current) =>
         current.filter((attachment) => !submittedIds.has(attachment.localId)),
       );
+      setDocuments([]);
+      setProjectFiles([]);
+      if (
+        promptRef.current === value &&
+        attachmentsRef.current.every((attachment) =>
+          submittedIds.has(attachment.localId),
+        )
+      ) {
+        draftStore.clear(bootstrap.host.id, session.sessionId);
+      }
     } catch (error) {
-      setSubmitError(
-        error instanceof Error
-          ? error.message
-          : "ygg could not send this message.",
-      );
+      setSubmitError(classifySubmissionFailure(error));
     } finally {
       setSubmitting(false);
     }
@@ -2063,7 +2740,7 @@ function Composer({
   };
 
   const uploadAttachment = async (attachment: DraftAttachment) => {
-    if (!onIngestAttachment) return;
+    if (!onIngestAttachment || !attachment.file) return;
     try {
       const reference = await onIngestAttachment(attachment.file);
       if (!mountedRef.current) return;
@@ -2098,7 +2775,7 @@ function Composer({
     setAttachmentError(null);
     const accepted: DraftAttachment[] = [];
     let totalBytes = attachments.reduce(
-      (total, attachment) => total + attachment.file.size,
+      (total, attachment) => total + draftAttachmentSize(attachment),
       0,
     );
     for (const file of files) {
@@ -2159,6 +2836,35 @@ function Composer({
     });
   };
 
+  const uploadDocument = async (file: File) => {
+    if (!onIngestDocument || !documentsAvailable) {
+      throw new Error("Document ingest is not available.");
+    }
+    if (documents.length >= 8) {
+      throw new Error("You can attach up to 8 documents.");
+    }
+    if (file.size === 0 || file.size > 16 * 1024 * 1024) {
+      throw new Error(`${file.name} exceeds the document upload limit.`);
+    }
+    const reference = await onIngestDocument(file);
+    setDocuments((current) =>
+      current.some((document) => document.id === reference.id)
+        ? current
+        : [...current, reference],
+    );
+    return reference;
+  };
+
+  const toggleProjectFile = (file: TrustedFileEntry) => {
+    setProjectFiles((current) =>
+      current.some((entry) => entry.id === file.id)
+        ? current.filter((entry) => entry.id !== file.id)
+        : current.length >= 20
+          ? current
+          : [...current, file],
+    );
+  };
+
   return (
     <div
       className={`composer-wrap ${draggingFiles ? "is-dragging-files" : ""}`}
@@ -2196,24 +2902,9 @@ function Composer({
       }}
     >
       <div
-        className={`composer ${isWorking ? "is-working" : ""} ${isModelWorking ? "is-model-working" : ""}`}
+        className={`composer ${isWorking ? "is-working" : ""}`}
         style={composerStyle}
       >
-        {isModelWorking ? (
-          <span className="composer-running-edge" aria-hidden="true">
-            <svg preserveAspectRatio="none">
-              <rect
-                className="composer-running-edge-chase"
-                x="1"
-                y="1"
-                width="calc(100% - 2px)"
-                height="calc(100% - 2px)"
-                rx="17"
-                pathLength="100"
-              />
-            </svg>
-          </span>
-        ) : null}
         {draggingFiles ? (
           <div className="attachment-drop-overlay" aria-hidden="true">
             <Paperclip />
@@ -2222,32 +2913,41 @@ function Composer({
         ) : null}
         {attachments.length ? (
           <div className="composer-attachments" aria-label="Attached files">
-            {attachments.map((attachment) => (
-              <div
-                className={`composer-attachment is-${attachment.status}`}
-                key={attachment.localId}
-              >
-                {attachment.previewUrl ? (
+            {attachments.map((attachment) => {
+              const name = draftAttachmentName(attachment);
+              const restoredPreview =
+                !attachment.previewUrl &&
+                attachment.reference?.handle &&
+                draftAttachmentMediaType(attachment).startsWith("image/")
+                  ? attachmentContentUrl?.(attachment.reference.handle)
+                  : undefined;
+              const previewUrl = attachment.previewUrl ?? restoredPreview;
+              return (
+                <div
+                  className={`composer-attachment is-${attachment.status}`}
+                  key={attachment.localId}
+                >
+                  {previewUrl ? (
                   <button
                     className="composer-attachment-preview"
                     onClick={(event) =>
                       onPreviewAttachment(
-                        attachment.previewUrl!,
-                        attachment.file.name,
+                        previewUrl,
+                        name,
                         event.currentTarget,
                       )
                     }
-                    aria-label={`Click to preview ${attachment.file.name}`}
+                    aria-label={`Click to preview ${name}`}
                   >
-                    <img src={attachment.previewUrl} alt="" />
+                    <img src={previewUrl} alt="" />
                   </button>
                 ) : (
                   <span className="attachment-extension" aria-hidden="true">
-                    {extensionLabel(attachment.file.name)}
+                    {extensionLabel(name)}
                   </span>
                 )}
                 <span className="composer-attachment-copy">
-                  <strong>{attachment.file.name}</strong>
+                  <strong>{name}</strong>
                   <small aria-live="polite" aria-atomic="true">
                     {attachment.status === "uploading"
                       ? "Uploading…"
@@ -2256,7 +2956,7 @@ function Composer({
                         : "Ready"}
                   </small>
                 </span>
-                {attachment.status === "failed" ? (
+                {attachment.status === "failed" && attachment.file ? (
                   <button
                     className="attachment-retry"
                     onClick={() => {
@@ -2273,7 +2973,7 @@ function Composer({
                       );
                       void uploadAttachment(attachment);
                     }}
-                    aria-label={`Retry ${attachment.file.name}`}
+                    aria-label={`Retry ${name}`}
                   >
                     <RefreshCw aria-hidden="true" />
                   </button>
@@ -2281,12 +2981,13 @@ function Composer({
                 <button
                   className="attachment-remove"
                   onClick={() => removeAttachment(attachment.localId)}
-                  aria-label={`Remove ${attachment.file.name}`}
+                  aria-label={`Remove ${name}`}
                 >
                   <X aria-hidden="true" />
                 </button>
-              </div>
-            ))}
+                </div>
+              );
+            })}
           </div>
         ) : null}
         <textarea
@@ -2336,6 +3037,37 @@ function Composer({
                 </button>
               </>
             ) : null}
+            <PromptContextPicker
+              documents={documents}
+              projectFiles={projectFiles}
+              documentsAvailable={documentsAvailable}
+              projectFilesAvailable={projectFilesAvailable}
+              onUploadDocument={uploadDocument}
+              onRemoveDocument={(documentId) =>
+                setDocuments((current) =>
+                  current.filter((document) => document.id !== documentId),
+                )
+              }
+              onToggleProjectFile={toggleProjectFile}
+              onListProjectFiles={() =>
+                onListProjectFiles?.() ??
+                Promise.reject(
+                  new Error("Project-file browsing is not available."),
+                )
+              }
+              onSearchProjectFiles={(query) =>
+                onSearchProjectFiles?.(query) ??
+                Promise.reject(
+                  new Error("Project-file search is not available."),
+                )
+              }
+              onReadProjectFile={(entryId) =>
+                onReadProjectFile?.(entryId) ??
+                Promise.reject(
+                  new Error("Project-file preview is not available."),
+                )
+              }
+            />
             <ModelPicker
               models={bootstrap.models}
               value={session.modelId}
@@ -2432,9 +3164,38 @@ function Composer({
           </div>
         </div>
         {submitError ? (
-          <p id="composer-send-error" className="composer-error" role="alert">
-            {submitError}
-          </p>
+          <div
+            id="composer-send-error"
+            className="composer-recovery"
+            role="alert"
+            data-kind={submitError.kind}
+          >
+            <span>
+              <strong>{submitError.title}</strong>
+              <small>{submitError.message}</small>
+            </span>
+            <div>
+              {submitError.retryable ? (
+                <button
+                  type="button"
+                  disabled={submitting || !canSubmit}
+                  onClick={() => void submit()}
+                >
+                  Retry
+                </button>
+              ) : null}
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => {
+                  pendingCommandRef.current = null;
+                  setSubmitError(null);
+                }}
+              >
+                Cancel retry
+              </button>
+            </div>
+          </div>
         ) : null}
         {attachmentError ? (
           <p className="composer-error" role="alert">
@@ -2445,6 +3206,30 @@ function Composer({
     </div>
   );
 }
+
+const MemoizedComposer = memo(Composer, (previous, next) => {
+  const previousSession = previous.session;
+  const nextSession = next.session;
+  return (
+    previousSession.sessionId === nextSession.sessionId &&
+    previousSession.status === nextSession.status &&
+    previousSession.activeRunId === nextSession.activeRunId &&
+    previousSession.modelId === nextSession.modelId &&
+    previousSession.reasoning === nextSession.reasoning &&
+    previousSession.authority === nextSession.authority &&
+    previousSession.items.length === nextSession.items.length &&
+    previous.bootstrap === next.bootstrap &&
+    previous.onSubmit === next.onSubmit &&
+    previous.onInterrupt === next.onInterrupt &&
+    previous.onConfigure === next.onConfigure &&
+    previous.onIngestAttachment === next.onIngestAttachment &&
+    previous.onIngestDocument === next.onIngestDocument &&
+    previous.onListProjectFiles === next.onListProjectFiles &&
+    previous.onSearchProjectFiles === next.onSearchProjectFiles &&
+    previous.onReadProjectFile === next.onReadProjectFile &&
+    previous.onPreviewAttachment === next.onPreviewAttachment
+  );
+});
 
 export function Conversation({
   session,
@@ -2458,6 +3243,13 @@ export function Conversation({
   onOpenSource,
   onOpenResource,
   onIngestAttachment,
+  onIngestDocument,
+  onListProjectFiles,
+  onSearchProjectFiles,
+  onReadProjectFile,
+  onEditUserTurn,
+  onRetryResponse,
+  onForkConversation,
   attachmentContentUrl,
 }: ConversationProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -2467,27 +3259,107 @@ export function Conversation({
     name: string;
     trigger: HTMLElement;
   } | null>(null);
+  const [branchAction, setBranchAction] =
+    useState<ConversationBranchAction | null>(null);
   const [initialItemIds] = useState(
     () => new Set(session.items.map((item) => item.id)),
   );
   const shouldStickRef = useRef(true);
+  const scrollFrameRef = useRef<number | null>(null);
   const resourcesAvailable = bootstrap.capabilities.resources;
-  const availableOutputs = new Map(
-    (resourcesAvailable ? session.outputs : []).map((output) => [
-      output.id,
-      output,
-    ]),
+  const availableOutputs = useMemo(
+    () =>
+      new Map(
+        (resourcesAvailable ? session.outputs : []).map((output) => [
+          output.id,
+          output,
+        ]),
+      ),
+    [resourcesAvailable, session.outputs],
   );
-  const availableSources = new Map(
-    (resourcesAvailable ? session.sources : []).map((source) => [
-      source.id,
-      source,
-    ]),
+  const availableSources = useMemo(
+    () =>
+      new Map(
+        (resourcesAvailable ? session.sources : []).map((source) => [
+          source.id,
+          source,
+        ]),
+      ),
+    [resourcesAvailable, session.sources],
   );
-  const rows = transcriptRows(session.items);
+  const outputsByOrigin = useMemo(() => {
+    const byOrigin = new Map<string, OutputRef[]>();
+    for (const output of availableOutputs.values()) {
+      if (!output.originItemId) continue;
+      const current = byOrigin.get(output.originItemId) ?? [];
+      current.push(output);
+      byOrigin.set(output.originItemId, current);
+    }
+    return byOrigin;
+  }, [availableOutputs]);
+  const sourcesByOrigin = useMemo(() => {
+    const byOrigin = new Map<string, SourceRef[]>();
+    for (const source of availableSources.values()) {
+      if (!source.originItemId) continue;
+      const current = byOrigin.get(source.originItemId) ?? [];
+      current.push(source);
+      byOrigin.set(source.originItemId, current);
+    }
+    return byOrigin;
+  }, [availableSources]);
+  const rows = useMemo(() => transcriptRows(session.items), [session.items]);
+  const actionsByRun = useMemo(() => {
+    const byRun = new Map<string, ActionItem[]>();
+    for (const item of session.items) {
+      if (item.kind !== "action") continue;
+      const identity = workIdentity(item);
+      const current = byRun.get(identity) ?? [];
+      current.push(item);
+      byRun.set(identity, current);
+    }
+    return byRun;
+  }, [session.items]);
+  const previewAttachment = useCallback(
+    (source: string, name: string, trigger: HTMLElement) => {
+      setAttachmentPreview({ source, name, trigger });
+    },
+    [],
+  );
+  const requestEditUserTurn = useCallback(
+    (item: Extract<TranscriptItem, { kind: "user_message" }>) => {
+      if (!item.durableEntryId) return;
+      setBranchAction({
+        kind: "edit",
+        item,
+        entryId: item.durableEntryId,
+      });
+    },
+    [],
+  );
+  const requestRetryResponse = useCallback(
+    (
+      item: Extract<TranscriptItem, { kind: "assistant_message" }>,
+      withModel: boolean,
+    ) => {
+      if (!item.durableEntryId) return;
+      setBranchAction({
+        kind: "retry",
+        entryId: item.durableEntryId,
+        withModel,
+      });
+    },
+    [],
+  );
+  const requestForkConversation = useCallback((item: TranscriptItem) => {
+    if (!item.durableEntryId) return;
+    setBranchAction({ kind: "fork", entryId: item.durableEntryId });
+  }, []);
   const selectedModel = bootstrap.models.find(
     (model) => model.id === session.modelId,
   );
+  const conversationBranching =
+    bootstrap.capabilities.conversationBranching &&
+    Boolean(onEditUserTurn && onRetryResponse && onForkConversation);
   const selectedModelKey =
     `${selectedModel?.provider ?? ""} ${selectedModel?.id ?? ""}`.toLowerCase();
   const selectedModelAccent =
@@ -2542,11 +3414,19 @@ export function Conversation({
     };
   }, [session.sessionId]);
 
+  const scheduleFollowToBottom = useCallback(() => {
+    if (scrollFrameRef.current !== null) return;
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      const element = scrollRef.current;
+      if (!element || !shouldStickRef.current) return;
+      element.scrollTop = element.scrollHeight;
+    });
+  }, []);
+
   useLayoutEffect(() => {
-    const element = scrollRef.current;
-    if (!element || !shouldStickRef.current) return;
-    element.scrollTop = element.scrollHeight;
-  }, [session.items, session.sessionId]);
+    scheduleFollowToBottom();
+  }, [scheduleFollowToBottom, session.items, session.sessionId]);
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -2558,21 +3438,25 @@ export function Conversation({
     ) {
       return;
     }
-    let frame = 0;
     const observer = new ResizeObserver(() => {
       if (!shouldStickRef.current) return;
-      window.cancelAnimationFrame(frame);
-      frame = window.requestAnimationFrame(() => {
-        element.scrollTop = element.scrollHeight;
-      });
+      scheduleFollowToBottom();
     });
     observer.observe(element);
     observer.observe(transcript);
     return () => {
-      window.cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [session.sessionId]);
+  }, [scheduleFollowToBottom, session.sessionId]);
+
+  useEffect(
+    () => () => {
+      if (scrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(scrollFrameRef.current);
+      }
+    },
+    [],
+  );
 
   const jumpToLive = () => {
     const element = scrollRef.current;
@@ -2602,6 +3486,8 @@ export function Conversation({
       <div className="transcript-scroll" ref={scrollRef}>
         <div
           className={`transcript ${session.items.length === 0 ? "is-empty" : ""}`}
+          data-item-count={session.items.length}
+          data-session-sequence={session.sequence}
         >
           {session.items.length === 0 ? (
             <EmptySession
@@ -2622,6 +3508,14 @@ export function Conversation({
                 <WorkGroup
                   key={row.id}
                   row={row}
+                  reviewActions={
+                    row.outcome
+                      ? (actionsByRun.get(workIdentity(row.outcome)) ?? [])
+                      : row.items.filter(
+                          (item): item is ActionItem =>
+                            item.kind === "action",
+                        )
+                  }
                   initialItemIds={initialItemIds}
                   onResolveApproval={onResolveApproval}
                   onResolveUserInput={onResolveUserInput}
@@ -2630,13 +3524,13 @@ export function Conversation({
                   onOpenResource={onOpenResource}
                   availableOutputs={availableOutputs}
                   availableSources={availableSources}
+                  outputsByOrigin={outputsByOrigin}
+                  sourcesByOrigin={sourcesByOrigin}
                   attachmentContentUrl={attachmentContentUrl}
-                  onPreviewAttachment={(source, name, trigger) =>
-                    setAttachmentPreview({ source, name, trigger })
-                  }
+                  onPreviewAttachment={previewAttachment}
                 />
               ) : (
-                <TranscriptItemView
+                <AnchoredTranscriptItem
                   key={row.item.id}
                   item={row.item}
                   animate={!initialItemIds.has(row.item.id)}
@@ -2647,10 +3541,19 @@ export function Conversation({
                   onOpenResource={onOpenResource}
                   availableOutputs={availableOutputs}
                   availableSources={availableSources}
+                  outputsByOrigin={outputsByOrigin}
+                  sourcesByOrigin={sourcesByOrigin}
                   attachmentContentUrl={attachmentContentUrl}
-                  onPreviewAttachment={(source, name, trigger) =>
-                    setAttachmentPreview({ source, name, trigger })
+                  onPreviewAttachment={previewAttachment}
+                  conversationBranching={conversationBranching}
+                  onEditUserTurn={requestEditUserTurn}
+                  onRetryResponse={(item) =>
+                    requestRetryResponse(item, false)
                   }
+                  onRetryResponseWithModel={(item) =>
+                    requestRetryResponse(item, true)
+                  }
+                  onForkConversation={requestForkConversation}
                 />
               ),
             )
@@ -2663,7 +3566,7 @@ export function Conversation({
           Jump to latest
         </button>
       ) : null}
-      <Composer
+      <MemoizedComposer
         key={session.sessionId}
         session={session}
         bootstrap={bootstrap}
@@ -2671,9 +3574,12 @@ export function Conversation({
         onInterrupt={onInterrupt}
         onConfigure={onConfigure}
         onIngestAttachment={onIngestAttachment}
-        onPreviewAttachment={(source, name, trigger) =>
-          setAttachmentPreview({ source, name, trigger })
-        }
+        onIngestDocument={onIngestDocument}
+        onListProjectFiles={onListProjectFiles}
+        onSearchProjectFiles={onSearchProjectFiles}
+        onReadProjectFile={onReadProjectFile}
+        attachmentContentUrl={attachmentContentUrl}
+        onPreviewAttachment={previewAttachment}
       />
       {attachmentPreview ? (
         <AttachmentPreviewDialog
@@ -2681,6 +3587,21 @@ export function Conversation({
           source={attachmentPreview.source}
           name={attachmentPreview.name}
           onClose={closeAttachmentPreview}
+        />
+      ) : null}
+      {branchAction &&
+      onEditUserTurn &&
+      onRetryResponse &&
+      onForkConversation ? (
+        <ConversationBranchDialog
+          action={branchAction}
+          models={bootstrap.models}
+          currentModelId={session.modelId}
+          currentReasoning={session.reasoning}
+          onEdit={onEditUserTurn}
+          onRetry={onRetryResponse}
+          onFork={onForkConversation}
+          onClose={() => setBranchAction(null)}
         />
       ) : null}
     </section>
