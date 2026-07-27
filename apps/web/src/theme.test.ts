@@ -35,9 +35,9 @@ describe("stored type preferences", () => {
     const style = document.documentElement.style;
     expect(style.getPropertyValue("--font-body")).toBe("13px");
     expect(style.getPropertyValue("--font-meta")).toBe("12px");
-    expect(style.getPropertyValue("--font-chat")).toBe("14px");
-    expect(style.getPropertyValue("--font-prompt")).toBe("16px");
-    expect(style.getPropertyValue("--font-display")).toBe("16px");
+    expect(style.getPropertyValue("--font-chat")).toBe("15px");
+    expect(style.getPropertyValue("--font-prompt")).toBe("15px");
+    expect(style.getPropertyValue("--font-display")).toBe("15px");
   });
 
   it("resolves the real host catalog through semantic role tokens", () => {
@@ -97,12 +97,13 @@ describe("stored type preferences", () => {
       },
     };
 
-    applyTheme(theme);
+    applyTheme(theme, "signal-noir");
 
     const style = document.documentElement.style;
     expect(style.getPropertyValue("--theme-pigment")).toBe("rgb(181 44 58)");
     expect(style.getPropertyValue("--theme-foreground")).toBe("rgb(188 188 188)");
     expect(style.getPropertyValue("--theme-muted")).toBe("rgb(138 138 138)");
+    expect(document.documentElement.dataset.theme).toBe("signal-noir");
     expect(document.documentElement.dataset.colorScheme).toBe("dark");
   });
 

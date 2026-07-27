@@ -11,9 +11,15 @@ const MAX_ASSET_BYTES: u64 = 32 * 1024 * 1024;
 const INDEX_HTML: &[u8] = include_bytes!("../web/index.html");
 const APP_CSS: &[u8] = include_bytes!("../web/assets/app.css");
 const APP_JS: &[u8] = include_bytes!("../web/assets/app.js");
+const MARKDOWN_JS: &[u8] = include_bytes!("../web/assets/chunk-MarkdownMessage.js");
 const SHA256_SUMS: &str = include_str!("../web/SHA256SUMS");
 const BUNDLE_SHA256: &str = include_str!("../web/bundle.sha256");
-const PAYLOAD_PATHS: [&str; 3] = ["assets/app.css", "assets/app.js", "index.html"];
+const PAYLOAD_PATHS: [&str; 4] = [
+    "assets/app.css",
+    "assets/app.js",
+    "assets/chunk-MarkdownMessage.js",
+    "index.html",
+];
 
 /// One immutable web response body and its declared media type.
 pub(crate) struct WebAsset {
@@ -27,6 +33,7 @@ pub(crate) struct WebBundle {
     index_html: Bytes,
     app_css: Bytes,
     app_js: Bytes,
+    markdown_js: Bytes,
     bundle_sha256: String,
 }
 
@@ -37,6 +44,7 @@ impl WebBundle {
             Bytes::from_static(INDEX_HTML),
             Bytes::from_static(APP_CSS),
             Bytes::from_static(APP_JS),
+            Bytes::from_static(MARKDOWN_JS),
             SHA256_SUMS,
             BUNDLE_SHA256,
         )
@@ -62,15 +70,24 @@ impl WebBundle {
         let index_html = read_asset(&root, "index.html")?;
         let app_css = read_asset(&root, "assets/app.css")?;
         let app_js = read_asset(&root, "assets/app.js")?;
-        let sums = canonical_sums(&index_html, &app_css, &app_js);
+        let markdown_js = read_asset(&root, "assets/chunk-MarkdownMessage.js")?;
+        let sums = canonical_sums(&index_html, &app_css, &app_js, &markdown_js);
         let bundle_sha256 = sha256_hex(sums.as_bytes());
-        Self::from_parts(index_html, app_css, app_js, &sums, &bundle_sha256)
+        Self::from_parts(
+            index_html,
+            app_css,
+            app_js,
+            markdown_js,
+            &sums,
+            &bundle_sha256,
+        )
     }
 
     fn from_parts(
         index_html: Bytes,
         app_css: Bytes,
         app_js: Bytes,
+        markdown_js: Bytes,
         sums: &str,
         bundle_sha256: &str,
     ) -> io::Result<Self> {
@@ -80,12 +97,12 @@ impl WebBundle {
         }
 
         let hashes = parse_sums(sums)?;
-        for ((path, expected), bytes) in
-            PAYLOAD_PATHS
-                .iter()
-                .zip(hashes.iter())
-                .zip([&app_css, &app_js, &index_html])
-        {
+        for ((path, expected), bytes) in PAYLOAD_PATHS.iter().zip(hashes.iter()).zip([
+            &app_css,
+            &app_js,
+            &markdown_js,
+            &index_html,
+        ]) {
             if sha256_hex(bytes) != *expected {
                 return Err(invalid_data(format!(
                     "{path} does not match its declared SHA-256"
@@ -97,6 +114,7 @@ impl WebBundle {
             index_html,
             app_css,
             app_js,
+            markdown_js,
             bundle_sha256: bundle_sha256.to_owned(),
         })
     }
@@ -107,6 +125,9 @@ impl WebBundle {
             "index.html" => (&self.index_html, "text/html; charset=utf-8"),
             "assets/app.css" => (&self.app_css, "text/css; charset=utf-8"),
             "assets/app.js" => (&self.app_js, "text/javascript; charset=utf-8"),
+            "assets/chunk-MarkdownMessage.js" => {
+                (&self.markdown_js, "text/javascript; charset=utf-8")
+            }
             _ => return None,
         };
         Some(WebAsset {
@@ -168,10 +189,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn canonical_sums(index_html: &[u8], app_css: &[u8], app_js: &[u8]) -> String {
+fn canonical_sums(index_html: &[u8], app_css: &[u8], app_js: &[u8], markdown_js: &[u8]) -> String {
     PAYLOAD_PATHS
         .iter()
-        .zip([app_css, app_js, index_html])
+        .zip([app_css, app_js, markdown_js, index_html])
         .map(|(path, bytes)| format!("{}  {path}\n", sha256_hex(bytes)))
         .collect()
 }
@@ -254,6 +275,7 @@ mod tests {
         fs::write(root.join("index.html"), INDEX_HTML).unwrap();
         fs::write(root.join("assets/app.css"), APP_CSS).unwrap();
         fs::write(root.join("assets/app.js"), APP_JS).unwrap();
+        fs::write(root.join("assets/chunk-MarkdownMessage.js"), MARKDOWN_JS).unwrap();
     }
 
     #[test]
@@ -271,6 +293,14 @@ mod tests {
         assert_eq!(
             bundle.asset("assets/app.js").unwrap().bytes.as_ref(),
             APP_JS
+        );
+        assert_eq!(
+            bundle
+                .asset("assets/chunk-MarkdownMessage.js")
+                .unwrap()
+                .bytes
+                .as_ref(),
+            MARKDOWN_JS
         );
         assert!(bundle.asset("assets/app.js.map").is_none());
     }

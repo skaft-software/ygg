@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, oneshot, Mutex};
 
@@ -20,6 +21,7 @@ const HOST_EVENT_BROADCAST_CAPACITY: usize = 4_096;
 const MAX_FRESH_PROVISIONAL_OWNERS: usize = 64;
 const MAX_ACTIVE_SESSION_OWNERS: usize = 512;
 const MAX_BOOTSTRAP_SESSION_SUMMARIES: usize = 2_000;
+const DEFAULT_QUARANTINE_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Supervisor configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +30,12 @@ pub struct SupervisorConfig {
     pub actor: ActorConfig,
     /// Requested initial authority for fresh sessions.
     pub fresh_session_authority: AuthorityProfile,
+    /// Maximum time one open request waits for a retired owner to quiesce.
+    ///
+    /// Expiry is retryable and does not release the ownership fence. The
+    /// background observer keeps the quarantined owner registered until its
+    /// driver proves that every durable writer has stopped.
+    pub quarantine_wait_timeout: Duration,
 }
 
 impl Default for SupervisorConfig {
@@ -37,6 +45,7 @@ impl Default for SupervisorConfig {
             // Preserve Ygg's current default. HostService may clamp the remote
             // selection ceiling without changing local Agent defaults.
             fresh_session_authority: AuthorityProfile::FullAccess,
+            quarantine_wait_timeout: DEFAULT_QUARANTINE_WAIT_TIMEOUT,
         }
     }
 }
@@ -169,31 +178,50 @@ impl<H: HostService> SessionSupervisor<H> {
             Lead,
             Wait(oneshot::Receiver<Result<SessionActorHandle, SupervisorError>>),
             Return(SessionActorHandle),
+            Quarantined(SessionActorHandle),
         }
 
-        let begin = {
-            let mut state = self.state.lock().await;
-            if let Some(existing) = state.actors.get(session_id) {
-                Begin::Return(existing.clone())
-            } else if let Some(waiters) = state.session_openings.get_mut(session_id) {
-                let (sender, receiver) = oneshot::channel();
-                waiters.push(sender);
-                Begin::Wait(receiver)
-            } else {
-                state
-                    .session_openings
-                    .insert(session_id.clone(), Vec::new());
-                Begin::Lead
+        loop {
+            let begin = {
+                let mut state = self.state.lock().await;
+                if state
+                    .actors
+                    .get(session_id)
+                    .is_some_and(|handle| handle.is_closed() && handle.is_quiesced())
+                {
+                    state.actors.remove(session_id);
+                }
+                if let Some(existing) = state.actors.get(session_id) {
+                    if existing.is_closed() {
+                        Begin::Quarantined(existing.clone())
+                    } else {
+                        Begin::Return(existing.clone())
+                    }
+                } else if let Some(waiters) = state.session_openings.get_mut(session_id) {
+                    let (sender, receiver) = oneshot::channel();
+                    waiters.push(sender);
+                    Begin::Wait(receiver)
+                } else {
+                    state
+                        .session_openings
+                        .insert(session_id.clone(), Vec::new());
+                    Begin::Lead
+                }
+            };
+            match begin {
+                Begin::Return(handle) => return Ok(handle),
+                Begin::Wait(receiver) => {
+                    return receiver
+                        .await
+                        .map_err(|_| SupervisorError::Service(ServiceError::Unavailable))?
+                }
+                Begin::Quarantined(handle) => {
+                    tokio::time::timeout(self.config.quarantine_wait_timeout, handle.quiesced())
+                        .await
+                        .map_err(|_| SupervisorError::Service(ServiceError::Unavailable))?;
+                }
+                Begin::Lead => break,
             }
-        };
-        match begin {
-            Begin::Return(handle) => return Ok(handle),
-            Begin::Wait(receiver) => {
-                return receiver
-                    .await
-                    .map_err(|_| SupervisorError::Service(ServiceError::Unavailable))?
-            }
-            Begin::Lead => {}
         }
 
         // The owned task survives cancellation of the initiating request, so
@@ -224,20 +252,37 @@ impl<H: HostService> SessionSupervisor<H> {
             .into_iter()
             .map(|summary| (summary.id.clone(), summary))
             .collect::<BTreeMap<_, _>>();
-        let (selected, active_views) = {
+        // Catalog reads are adapter-owned asynchronous boundaries. Revalidate
+        // ownership only after both complete so a driver that retired during
+        // either call cannot contribute a stale selected snapshot.
+        let selected = self.open_session(selected_session_id).await?;
+        let active = {
             let state = self.state.lock().await;
-            let selected = state
+            let selected_is_current = state
                 .actors
                 .get(selected_session_id)
-                .cloned()
-                .ok_or(ServiceError::NotFound)?;
-            let active_views = state
+                .is_some_and(|current| current.same_actor(&selected) && !current.is_closed());
+            if !selected_is_current {
+                return Err(ServiceError::Unavailable.into());
+            }
+            state
                 .actors
                 .values()
-                .map(SessionActorHandle::view)
-                .collect::<Vec<_>>();
-            (selected, active_views)
+                .filter(|handle| !handle.is_closed())
+                .cloned()
+                .collect::<Vec<_>>()
         };
+        let selected_view = selected.view();
+        if selected.is_closed() {
+            return Err(ServiceError::Unavailable.into());
+        }
+        let active_views = active
+            .into_iter()
+            .filter_map(|handle| {
+                let view = handle.view();
+                (!handle.is_closed()).then_some(view)
+            })
+            .collect::<Vec<_>>();
         for view in active_views {
             summaries.insert(view.summary.id.clone(), view.summary);
         }
@@ -265,7 +310,12 @@ impl<H: HostService> SessionSupervisor<H> {
             sessions.truncate(MAX_BOOTSTRAP_SESSION_SUMMARIES);
         }
 
-        let selected_view = selected.view();
+        // This is the bootstrap's ownership linearization point. A close
+        // observed here makes the caller retry through the quarantine-aware
+        // open path instead of returning the retired actor's projection.
+        if selected.is_closed() {
+            return Err(ServiceError::Unavailable.into());
+        }
         let bootstrap = HostBootstrap {
             protocol: PROTOCOL_VERSION,
             host: self.host.descriptor(),
@@ -437,9 +487,18 @@ impl<H: HostService> SessionSupervisor<H> {
     /// Reads one authenticated opaque resource without interpreting its handle.
     pub async fn resource_content(
         &self,
+        session_id: &crate::SessionId,
         handle: &str,
     ) -> Result<crate::StoredResource, crate::ServiceError> {
-        self.host.resource_content(handle).await
+        self.host.resource_content(session_id, handle).await
+    }
+
+    /// Produces one authenticated, redacted portable session download.
+    pub async fn session_export(
+        &self,
+        session_id: &crate::SessionId,
+    ) -> Result<bytes::Bytes, crate::ServiceError> {
+        self.host.session_export(session_id).await
     }
 
     /// Subscribes to the ordered live stream across all hosted sessions.
@@ -500,7 +559,17 @@ impl<H: HostService> SessionSupervisor<H> {
         }
 
         let mut state = self.state.lock().await;
+        if state
+            .actors
+            .get(session_id)
+            .is_some_and(|handle| handle.is_closed() && handle.is_quiesced())
+        {
+            state.actors.remove(session_id);
+        }
         if let Some(existing) = state.actors.get(session_id) {
+            if existing.is_closed() {
+                return Err(SupervisorError::Service(ServiceError::Unavailable));
+            }
             return Ok(existing.clone());
         }
         if state.actors.len() >= MAX_ACTIVE_SESSION_OWNERS {
@@ -671,6 +740,21 @@ impl<H: HostService> SessionSupervisor<H> {
             }
         });
 
+        let observed = handle.clone();
+        let session_id = handle.session_id().clone();
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            observed.closed().await;
+            observed.quiesced().await;
+            let mut state = state.lock().await;
+            let remove = state.actors.get(&session_id).is_some_and(|current| {
+                current.same_actor(&observed) && current.is_closed() && current.is_quiesced()
+            });
+            if remove {
+                state.actors.remove(&session_id);
+            }
+        });
+
         let mut events = handle.subscribe_events();
         let sender = self.host_events.clone();
         let order = Arc::clone(&self.host_event_order);
@@ -795,7 +879,7 @@ fn session_activity_rank(state: crate::SessionLiveState) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
 
     use async_trait::async_trait;
@@ -817,9 +901,18 @@ mod tests {
         seeds: Arc<StdMutex<BTreeMap<SessionId, SessionSeed>>>,
         dispatches: Arc<StdMutex<BTreeMap<SessionId, usize>>>,
         opens: Arc<AtomicUsize>,
+        fail_next_finalization: Arc<AtomicBool>,
+        never_quiesce: Arc<AtomicBool>,
         create_barrier: Option<Arc<tokio::sync::Barrier>>,
         create_entered: Option<Arc<tokio::sync::Barrier>>,
         create_release: Option<Arc<tokio::sync::Barrier>>,
+        open_gate_armed: Arc<AtomicBool>,
+        open_entered: Option<Arc<tokio::sync::Barrier>>,
+        open_release: Option<Arc<tokio::sync::Barrier>>,
+        list_projects_entered: Option<Arc<tokio::sync::Barrier>>,
+        list_projects_release: Option<Arc<tokio::sync::Barrier>>,
+        list_sessions_entered: Option<Arc<tokio::sync::Barrier>>,
+        list_sessions_release: Option<Arc<tokio::sync::Barrier>>,
     }
 
     impl MockHost {
@@ -829,9 +922,18 @@ mod tests {
                 seeds: Arc::new(StdMutex::new(BTreeMap::new())),
                 dispatches: Arc::new(StdMutex::new(BTreeMap::new())),
                 opens: Arc::new(AtomicUsize::new(0)),
+                fail_next_finalization: Arc::new(AtomicBool::new(false)),
+                never_quiesce: Arc::new(AtomicBool::new(false)),
                 create_barrier: None,
                 create_entered: None,
                 create_release: None,
+                open_gate_armed: Arc::new(AtomicBool::new(false)),
+                open_entered: None,
+                open_release: None,
+                list_projects_entered: None,
+                list_projects_release: None,
+                list_sessions_entered: None,
+                list_sessions_release: None,
             }
         }
 
@@ -853,6 +955,46 @@ mod tests {
                 },
                 entered,
                 release,
+            )
+        }
+
+        fn with_gated_open() -> (Self, Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>) {
+            let entered = Arc::new(tokio::sync::Barrier::new(2));
+            let release = Arc::new(tokio::sync::Barrier::new(2));
+            (
+                Self {
+                    open_entered: Some(Arc::clone(&entered)),
+                    open_release: Some(Arc::clone(&release)),
+                    ..Self::new()
+                },
+                entered,
+                release,
+            )
+        }
+
+        fn with_gated_catalog() -> (
+            Self,
+            Arc<tokio::sync::Barrier>,
+            Arc<tokio::sync::Barrier>,
+            Arc<tokio::sync::Barrier>,
+            Arc<tokio::sync::Barrier>,
+        ) {
+            let projects_entered = Arc::new(tokio::sync::Barrier::new(2));
+            let projects_release = Arc::new(tokio::sync::Barrier::new(2));
+            let sessions_entered = Arc::new(tokio::sync::Barrier::new(2));
+            let sessions_release = Arc::new(tokio::sync::Barrier::new(2));
+            (
+                Self {
+                    list_projects_entered: Some(Arc::clone(&projects_entered)),
+                    list_projects_release: Some(Arc::clone(&projects_release)),
+                    list_sessions_entered: Some(Arc::clone(&sessions_entered)),
+                    list_sessions_release: Some(Arc::clone(&sessions_release)),
+                    ..Self::new()
+                },
+                projects_entered,
+                projects_release,
+                sessions_entered,
+                sessions_release,
             )
         }
 
@@ -894,6 +1036,7 @@ mod tests {
                     actor_generation: 1,
                     cursor: SessionCursor::zero(1),
                     durable_head: None,
+                    branches: crate::SessionBranchGraph::default(),
                     live_state: SessionLiveState::Idle,
                     active_run_id: None,
                     model,
@@ -911,6 +1054,8 @@ mod tests {
     struct MockDriver {
         seed: SessionSeed,
         dispatches: Arc<StdMutex<BTreeMap<SessionId, usize>>>,
+        fail_next_finalization: Arc<AtomicBool>,
+        never_quiesce: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -923,6 +1068,16 @@ mod tests {
             &mut self,
             command: SessionCommand,
         ) -> Result<DriverCommandOutcome, ServiceError> {
+            if self.fail_next_finalization.swap(false, Ordering::AcqRel) {
+                let (outcome, mut finalizer) =
+                    DriverCommandOutcome::guarded_replace(self.seed.clone());
+                tokio::spawn(async move {
+                    if finalizer.decision().await.is_ok() {
+                        let _ = finalizer.complete(Err(ServiceError::Internal));
+                    }
+                });
+                return Ok(outcome);
+            }
             let input = match command {
                 SessionCommand::SubmitPrompt { input } => input,
                 SessionCommand::Rename { title } => {
@@ -1013,6 +1168,12 @@ mod tests {
                 ],
             ))
         }
+
+        async fn shutdown(&mut self) {
+            if self.never_quiesce.load(Ordering::Acquire) {
+                std::future::pending::<()>().await;
+            }
+        }
     }
 
     #[async_trait]
@@ -1074,17 +1235,31 @@ mod tests {
         }
 
         async fn list_projects(&self) -> Result<Vec<crate::ProjectSummary>, ServiceError> {
-            Ok(Vec::new())
+            let projects = Vec::new();
+            if let Some(entered) = &self.list_projects_entered {
+                entered.wait().await;
+            }
+            if let Some(release) = &self.list_projects_release {
+                release.wait().await;
+            }
+            Ok(projects)
         }
 
         async fn list_sessions(&self) -> Result<Vec<crate::SessionSummary>, ServiceError> {
-            Ok(self
+            let sessions = self
                 .seeds
                 .lock()
                 .unwrap()
                 .values()
                 .map(|seed| seed.summary.clone())
-                .collect())
+                .collect();
+            if let Some(entered) = &self.list_sessions_entered {
+                entered.wait().await;
+            }
+            if let Some(release) = &self.list_sessions_release {
+                release.wait().await;
+            }
+            Ok(sessions)
         }
 
         async fn create_session(
@@ -1108,11 +1283,21 @@ mod tests {
             Ok(MockDriver {
                 seed,
                 dispatches: Arc::clone(&self.dispatches),
+                fail_next_finalization: Arc::clone(&self.fail_next_finalization),
+                never_quiesce: Arc::clone(&self.never_quiesce),
             })
         }
 
         async fn open_session(&self, session_id: &SessionId) -> Result<Self::Driver, ServiceError> {
             self.opens.fetch_add(1, Ordering::Relaxed);
+            if self.open_gate_armed.swap(false, Ordering::AcqRel) {
+                if let Some(entered) = &self.open_entered {
+                    entered.wait().await;
+                }
+                if let Some(release) = &self.open_release {
+                    release.wait().await;
+                }
+            }
             let seed = self
                 .seeds
                 .lock()
@@ -1123,6 +1308,8 @@ mod tests {
             Ok(MockDriver {
                 seed,
                 dispatches: Arc::clone(&self.dispatches),
+                fail_next_finalization: Arc::clone(&self.fail_next_finalization),
+                never_quiesce: Arc::clone(&self.never_quiesce),
             })
         }
     }
@@ -1491,6 +1678,269 @@ mod tests {
         assert_eq!(first.session_id(), second.session_id());
         assert_eq!(host.opens.load(Ordering::Relaxed), 1);
         assert_eq!(supervisor.active_session_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn quarantined_owner_wait_is_bounded_without_releasing_the_fence() {
+        let host = Arc::new(MockHost::new());
+        let seed = host
+            .create_session(CreateSessionRequest {
+                project_id: None,
+                provisional: false,
+                authority: AuthorityProfile::FullAccess,
+                model: None,
+            })
+            .await
+            .unwrap()
+            .seed();
+        let session_id = seed.summary.id;
+        let supervisor = SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig {
+                quarantine_wait_timeout: Duration::from_millis(20),
+                ..SupervisorConfig::default()
+            },
+        );
+        let original = supervisor.open_session(&session_id).await.unwrap();
+        assert_eq!(host.opens.load(Ordering::Relaxed), 1);
+
+        host.never_quiesce.store(true, Ordering::Release);
+        host.fail_next_finalization.store(true, Ordering::Release);
+        assert!(matches!(
+            original
+                .command(
+                    command(session_id.clone(), "command-never-quiesces", "retire owner",),
+                    20,
+                )
+                .await,
+            Err(ActorError::Closed)
+        ));
+        original.closed().await;
+        assert!(!original.is_quiesced());
+
+        let opens_before_retry = host.opens.load(Ordering::Relaxed);
+        let retry = tokio::time::timeout(
+            Duration::from_millis(200),
+            supervisor.open_session(&session_id),
+        )
+        .await
+        .expect("quarantine wait must be bounded");
+        assert!(matches!(
+            retry,
+            Err(SupervisorError::Service(ServiceError::Unavailable))
+        ));
+        assert_eq!(
+            host.opens.load(Ordering::Relaxed),
+            opens_before_retry,
+            "a timed-out caller must not construct a replacement driver"
+        );
+        assert_eq!(
+            supervisor.active_session_count().await,
+            1,
+            "the never-quiesced owner remains registered as the durable fence"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_reopens_after_selected_owner_closes_during_catalog_listing() {
+        let (host, projects_entered, projects_release, sessions_entered, sessions_release) =
+            MockHost::with_gated_catalog();
+        let host = Arc::new(host);
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig {
+                quarantine_wait_timeout: Duration::from_millis(20),
+                ..SupervisorConfig::default()
+            },
+        ));
+        let original = supervisor.create_fresh_session(None).await.unwrap();
+        let session_id = original.session_id().clone();
+        let bootstrap = {
+            let supervisor = Arc::clone(&supervisor);
+            let session_id = session_id.clone();
+            tokio::spawn(async move { supervisor.bootstrap(&session_id).await })
+        };
+
+        projects_entered.wait().await;
+        projects_release.wait().await;
+        sessions_entered.wait().await;
+
+        host.fail_next_finalization.store(true, Ordering::Release);
+        assert!(matches!(
+            original
+                .command(
+                    command(
+                        session_id.clone(),
+                        "command-close-during-bootstrap",
+                        "retire owner",
+                    ),
+                    20,
+                )
+                .await,
+            Err(ActorError::Closed)
+        ));
+        original.closed().await;
+        original.quiesced().await;
+        {
+            let mut seeds = host.seeds.lock().unwrap();
+            let refreshed = seeds.get_mut(&session_id).unwrap();
+            refreshed.summary.title = "Refreshed after catalog race".into();
+            refreshed.summary.modified_at_ms = 99;
+            refreshed.snapshot.actor_generation = 2;
+            refreshed.snapshot.cursor = SessionCursor::zero(2);
+        }
+        sessions_release.wait().await;
+
+        let bootstrap = tokio::time::timeout(Duration::from_secs(1), bootstrap)
+            .await
+            .expect("bootstrap must not retain the closed selected actor")
+            .unwrap()
+            .unwrap();
+        assert_eq!(host.opens.load(Ordering::Relaxed), 1);
+        assert_eq!(bootstrap.selected_session.actor_generation, 2);
+        assert_eq!(bootstrap.selected_session.cursor, SessionCursor::zero(2));
+        assert_eq!(
+            bootstrap
+                .sessions
+                .iter()
+                .find(|summary| summary.id == session_id)
+                .unwrap()
+                .title,
+            "Refreshed after catalog race"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_does_not_overlay_a_closed_unquiesced_actor_summary() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig {
+                quarantine_wait_timeout: Duration::from_millis(20),
+                ..SupervisorConfig::default()
+            },
+        );
+        let selected = supervisor.create_fresh_session(None).await.unwrap();
+        let retired = supervisor.create_fresh_session(None).await.unwrap();
+        let retired_id = retired.session_id().clone();
+        let rename = SessionCommandEnvelope::new(
+            HostId::new("host-mock").unwrap(),
+            DeviceId::new("device-mock").unwrap(),
+            retired_id.clone(),
+            CommandId::new("command-transient-title").unwrap(),
+            1,
+            Some(1),
+            SessionCommand::Rename {
+                title: "Transient actor-only title".into(),
+            },
+        );
+        retired.command(rename, 10).await.unwrap();
+        assert_eq!(retired.view().summary.title, "Transient actor-only title");
+
+        host.never_quiesce.store(true, Ordering::Release);
+        host.fail_next_finalization.store(true, Ordering::Release);
+        assert!(matches!(
+            retired
+                .command(
+                    command(
+                        retired_id.clone(),
+                        "command-close-overlay-owner",
+                        "retire owner",
+                    ),
+                    20,
+                )
+                .await,
+            Err(ActorError::Closed)
+        ));
+        retired.closed().await;
+        assert!(!retired.is_quiesced());
+
+        let bootstrap = supervisor.bootstrap(selected.session_id()).await.unwrap();
+        assert_eq!(
+            bootstrap
+                .sessions
+                .iter()
+                .find(|summary| summary.id == retired_id)
+                .unwrap()
+                .title,
+            "Fresh session",
+            "closed actor state must not override the durable catalog summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reopen_after_owner_closes_installs_one_refreshed_actor() {
+        let (host, entered, release) = MockHost::with_gated_open();
+        let host = Arc::new(host);
+        let request = CreateSessionRequest {
+            project_id: None,
+            provisional: false,
+            authority: AuthorityProfile::FullAccess,
+            model: None,
+        };
+        let seed = host.create_session(request).await.unwrap().seed();
+        let session_id = seed.summary.id;
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig::default(),
+        ));
+        let original = supervisor.open_session(&session_id).await.unwrap();
+        assert_eq!(host.opens.load(Ordering::Relaxed), 1);
+
+        host.fail_next_finalization.store(true, Ordering::Release);
+        assert!(matches!(
+            original
+                .command(
+                    command(session_id.clone(), "command-close-owner", "close"),
+                    20,
+                )
+                .await,
+            Err(ActorError::Closed)
+        ));
+        original.closed().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while supervisor.active_session_count().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed actor must be proactively evicted");
+
+        {
+            let mut seeds = host.seeds.lock().unwrap();
+            let refreshed = seeds.get_mut(&session_id).unwrap();
+            refreshed.summary.title = "Refreshed durable session".into();
+            refreshed.summary.modified_at_ms = 99;
+            refreshed.snapshot.actor_generation = 2;
+            refreshed.snapshot.cursor = SessionCursor::zero(2);
+        }
+
+        let opens_before_reopen = host.opens.load(Ordering::Relaxed);
+        host.open_gate_armed.store(true, Ordering::Release);
+        let first_reopen = {
+            let supervisor = Arc::clone(&supervisor);
+            let session_id = session_id.clone();
+            tokio::spawn(async move { supervisor.open_session(&session_id).await })
+        };
+        entered.wait().await;
+        let second_reopen = {
+            let supervisor = Arc::clone(&supervisor);
+            let session_id = session_id.clone();
+            tokio::spawn(async move { supervisor.open_session(&session_id).await })
+        };
+        tokio::task::yield_now().await;
+        release.wait().await;
+
+        let (first_reopen, second_reopen) = tokio::join!(first_reopen, second_reopen);
+        let first_reopen = first_reopen.unwrap().unwrap();
+        let second_reopen = second_reopen.unwrap().unwrap();
+        assert!(first_reopen.same_actor(&second_reopen));
+        assert_eq!(host.opens.load(Ordering::Relaxed) - opens_before_reopen, 1);
+        assert_eq!(supervisor.active_session_count().await, 1);
+        let refreshed = first_reopen.view();
+        assert_eq!(refreshed.summary.title, "Refreshed durable session");
+        assert_eq!(refreshed.snapshot.actor_generation, 2);
+        assert_eq!(refreshed.snapshot.cursor, SessionCursor::zero(2));
     }
 
     #[tokio::test]

@@ -35,7 +35,7 @@ export interface YggTransport {
   send(command: ClientCommand): Promise<CommandAck>;
   ingestAttachment(file: File): Promise<AttachmentRef>;
   attachmentContentUrl(handle: string): string;
-  resourceContentUrl(handle: string): string;
+  resourceContentUrl(sessionId: string, handle: string): string;
   subscribe(listener: EventListener): () => void;
   subscribeConnection?(listener: ConnectionListener): () => void;
   close(): void;
@@ -123,8 +123,8 @@ export class FixtureTransport implements YggTransport {
     return url;
   }
 
-  resourceContentUrl(handle: string): string {
-    return `/api/v1/resources/${encodeURIComponent(handle)}`;
+  resourceContentUrl(sessionId: string, handle: string): string {
+    return `/api/v1/sessions/${encodeURIComponent(sessionId)}/resources/${encodeURIComponent(handle)}`;
   }
 
   private emit(event: SessionEvent): void {
@@ -188,13 +188,25 @@ export class FixtureTransport implements YggTransport {
           ),
         };
       } else if (event.type === "session.resources") {
+        const mergeById = <T extends { id: string }>(
+          currentItems: T[],
+          incomingItems: T[] | undefined,
+        ): T[] => {
+          if (!incomingItems) return currentItems;
+          if (!event.merge) return clone(incomingItems);
+          const merged = new Map(
+            currentItems.map((item) => [item.id, item]),
+          );
+          for (const item of incomingItems) merged.set(item.id, clone(item));
+          return [...merged.values()];
+        };
         this.sessions[event.sessionId] = {
           ...current,
           sequence: event.sequence,
-          progress: clone(event.progress ?? current.progress),
-          sources: clone(event.sources ?? current.sources),
-          outputs: clone(event.outputs ?? current.outputs),
-          previews: clone(event.previews ?? current.previews),
+          progress: mergeById(current.progress, event.progress),
+          sources: mergeById(current.sources, event.sources),
+          outputs: mergeById(current.outputs, event.outputs),
+          previews: mergeById(current.previews, event.previews),
         };
       }
     }
@@ -241,6 +253,7 @@ export class FixtureTransport implements YggTransport {
         authority: command.authority,
         contextPercent: 0,
         startedAt: now,
+        branches: { entries: [], truncated: false },
         items: [],
         progress: [],
         sources: [],
@@ -508,6 +521,83 @@ export class FixtureTransport implements YggTransport {
       return { commandId: command.id, accepted: true };
     }
 
+    if (command.type === "session.checkout") {
+      if (
+        snapshot.activeRunId !== undefined ||
+        !["idle", "done", "failed", "stopped"].includes(snapshot.status)
+      ) {
+        return {
+          commandId: command.id,
+          accepted: false,
+          error:
+            "A session branch can only be checked out after current work finishes.",
+        };
+      }
+      const target = snapshot.branches.entries.find(
+        (entry) =>
+          entry.entryId === command.entryId && entry.checkoutable,
+      );
+      if (!target) {
+        return {
+          commandId: command.id,
+          accepted: false,
+          error: "That session checkpoint is not available for checkout.",
+        };
+      }
+      const sequence = snapshot.sequence + 1;
+      let items = snapshot.items;
+      let progress = snapshot.progress;
+      let sources = snapshot.sources;
+      let outputs = snapshot.outputs;
+      let previews = snapshot.previews;
+      if (command.sessionId === "session-done") {
+        const rootItem = snapshot.items.find((item) => item.id === "done-user");
+        if (target.entryId === "entry-release-question") {
+          items = rootItem ? [rootItem] : [];
+          progress = [];
+          sources = [];
+          outputs = [];
+          previews = [];
+        } else if (target.entryId === "entry-release-draft") {
+          items = [
+            ...(rootItem ? [rootItem] : []),
+            {
+              id: "done-draft",
+              turnId: "done-turn",
+              kind: "assistant_message",
+              content:
+                "The initial release assessment is ready, but the focused checks and review artifact have not been completed yet.",
+              state: "committed",
+              createdAt: snapshot.startedAt,
+            },
+          ];
+          progress = [];
+          sources = [];
+          outputs = [];
+          previews = [];
+        }
+      }
+      this.sessions[command.sessionId] = {
+        ...snapshot,
+        sequence,
+        status: "idle",
+        branches: { ...snapshot.branches, head: target.entryId },
+        items,
+        progress,
+        sources,
+        outputs,
+        previews,
+      };
+      this.emit({
+        type: "session.projectionReplaced",
+        sessionId: command.sessionId,
+        actorGeneration: snapshot.actorGeneration,
+        sequence,
+        durableHead: target.entryId,
+      });
+      return { commandId: command.id, accepted: true };
+    }
+
     if (command.type === "approval.resolve") {
       const item = snapshot.items.find(
         (candidate) =>
@@ -592,6 +682,10 @@ export class HttpTransport implements YggTransport {
     string,
     { actorGeneration: number; sequence: number }
   >();
+  private replacementBarrierBySession = new Map<
+    string,
+    { actorGeneration: number; sequence: number }
+  >();
   private selectedSessionCache: SessionSnapshot | null = null;
   private encodedCommands = new Map<
     string,
@@ -638,6 +732,8 @@ export class HttpTransport implements YggTransport {
     if (this.selectedSessionCache?.sessionId === sessionId) {
       const cached = this.selectedSessionCache;
       this.selectedSessionCache = null;
+      this.assertSnapshotPastReplacementBarrier(cached);
+      this.rememberSnapshot(cached);
       return clone(cached);
     }
     const response = await fetch(
@@ -655,6 +751,7 @@ export class HttpTransport implements YggTransport {
       summary: this.summaries.get(sessionId),
       models: this.models,
     });
+    this.assertSnapshotPastReplacementBarrier(snapshot);
     this.rememberSnapshot(snapshot);
     return snapshot;
   }
@@ -769,8 +866,8 @@ export class HttpTransport implements YggTransport {
     return `/api/v1/attachments/${encodeURIComponent(handle)}`;
   }
 
-  resourceContentUrl(handle: string): string {
-    return `/api/v1/resources/${encodeURIComponent(handle)}`;
+  resourceContentUrl(sessionId: string, handle: string): string {
+    return `/api/v1/sessions/${encodeURIComponent(sessionId)}/resources/${encodeURIComponent(handle)}`;
   }
 
   subscribe(listener: EventListener): () => void {
@@ -799,6 +896,7 @@ export class HttpTransport implements YggTransport {
     this.socket?.close();
     this.socket = null;
     this.bufferedEvents = [];
+    this.replacementBarrierBySession.clear();
     this.listeners.clear();
     this.connectionListeners.clear();
   }
@@ -866,10 +964,57 @@ export class HttpTransport implements YggTransport {
     for (const listener of this.listeners) listener(event);
   }
 
+  private cursorAtOrAfter(
+    cursor: { actorGeneration: number; sequence: number },
+    required: { actorGeneration: number; sequence: number },
+  ): boolean {
+    return (
+      cursor.actorGeneration > required.actorGeneration ||
+      (cursor.actorGeneration === required.actorGeneration &&
+        cursor.sequence >= required.sequence)
+    );
+  }
+
+  private assertSnapshotPastReplacementBarrier(
+    snapshot: SessionSnapshot,
+  ): void {
+    const required = this.replacementBarrierBySession.get(snapshot.sessionId);
+    if (
+      required &&
+      !this.cursorAtOrAfter(
+        {
+          actorGeneration: snapshot.actorGeneration,
+          sequence: snapshot.sequence,
+        },
+        required,
+      )
+    ) {
+      throw new Error(
+        "Session snapshot predates the required projection replacement.",
+      );
+    }
+  }
+
   private rememberSnapshot(snapshot: SessionSnapshot): void {
     this.actorGenerationBySession[snapshot.sessionId] =
       snapshot.actorGeneration;
     this.modelIdBySession[snapshot.sessionId] = snapshot.modelId;
+    const required = this.replacementBarrierBySession.get(snapshot.sessionId);
+    if (
+      required &&
+      !this.cursorAtOrAfter(
+        {
+          actorGeneration: snapshot.actorGeneration,
+          sequence: snapshot.sequence,
+        },
+        required,
+      )
+    ) {
+      return;
+    }
+    if (required) {
+      this.replacementBarrierBySession.delete(snapshot.sessionId);
+    }
     this.cursorBySession.set(snapshot.sessionId, {
       actorGeneration: snapshot.actorGeneration,
       sequence: snapshot.sequence,
@@ -889,6 +1034,25 @@ export class HttpTransport implements YggTransport {
     const generation = event.actorGeneration;
     if (generation !== undefined) {
       this.actorGenerationBySession[event.sessionId] = generation;
+    }
+    if (event.type === "session.projectionReplaced") {
+      const required = {
+        actorGeneration:
+          generation ??
+          this.actorGenerationBySession[event.sessionId] ??
+          this.cursorBySession.get(event.sessionId)?.actorGeneration ??
+          0,
+        sequence: event.sequence,
+      };
+      const existing = this.replacementBarrierBySession.get(event.sessionId);
+      if (!existing || this.cursorAtOrAfter(required, existing)) {
+        this.replacementBarrierBySession.set(event.sessionId, required);
+      }
+    }
+    if (
+      generation !== undefined &&
+      !this.replacementBarrierBySession.has(event.sessionId)
+    ) {
       this.cursorBySession.set(event.sessionId, {
         actorGeneration: generation,
         sequence: event.sequence,
@@ -974,7 +1138,10 @@ export class HttpTransport implements YggTransport {
           this.rememberEvent(event);
           this.dispatch(event);
         }
-        if (replay.events.length === 0) {
+        if (
+          replay.events.length === 0 &&
+          !this.replacementBarrierBySession.has(sessionId)
+        ) {
           this.actorGenerationBySession[sessionId] = replay.actorGeneration;
           this.cursorBySession.set(sessionId, {
             actorGeneration: replay.actorGeneration,
@@ -993,6 +1160,10 @@ let volatileLoopbackDeviceId: string | undefined;
 export type TransportMode = "fixture" | "live";
 
 export function transportModeFromSearch(search: string): TransportMode {
+  // Fixture transport is a development-only surface. Keep this compile-time
+  // guard here, at the mode boundary, so a production URL can never opt back
+  // into simulated sessions with a query parameter.
+  if (!import.meta.env.DEV) return "live";
   return new URLSearchParams(search).get("transport") === "fixture"
     ? "fixture"
     : "live";
@@ -1030,7 +1201,10 @@ export function resolveClientDeviceId(): string | undefined {
 export function createTransport(
   mode = transportModeFromSearch(window.location.search),
 ): YggTransport {
-  if (mode === "fixture") {
+  // Vite folds import.meta.env.DEV to false for production builds. That makes
+  // FixtureTransport and its fixture-data imports unreachable and removable
+  // from the production dependency graph.
+  if (import.meta.env.DEV && mode === "fixture") {
     return new FixtureTransport();
   }
   return new HttpTransport(resolveClientDeviceId());

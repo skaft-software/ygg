@@ -5,13 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/check-production-boundary.mjs",
     "typecheck": "tsc -b --pretty false",
     "lint": "eslint .",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "test:e2e:live": "playwright test -c playwright.live.config.ts",
     "check:fonts": "node scripts/check-font-sizes.mjs",
     "check:external": "node scripts/check-external-requests.mjs",
+    "check:production-boundary": "node scripts/check-production-boundary.mjs",
     "bundle:sync": "node scripts/sync-embedded.mjs --write",
     "bundle:check": "node scripts/sync-embedded.mjs --check"
   },
@@ -19,8 +21,8 @@
     "lucide-react": "1.27.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
-    "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

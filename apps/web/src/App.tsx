@@ -1,7 +1,9 @@
 import {
   Archive,
   ChevronDown,
+  Download,
   Folder,
+  GitBranch,
   Menu,
   MoreHorizontal,
   PanelRight,
@@ -12,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  type CSSProperties,
   type RefObject,
   useCallback,
   useEffect,
@@ -29,14 +32,18 @@ import {
 import { SettingsView } from "./components/Settings";
 import { Sidebar } from "./components/Sidebar";
 import { YggGlyph } from "./components/YggGlyph";
-import type { SessionStatus } from "./protocol";
+import type { SessionSnapshot, SessionStatus } from "./protocol";
 import {
   sessionIdFromPathname,
   YggStore,
   useYggStore,
 } from "./store";
 import { applyStoredTypePreferences, applyTheme } from "./theme";
-import { createTransport, transportModeFromSearch } from "./transport";
+import {
+  createTransport,
+  type TransportConnectionState,
+  transportModeFromSearch,
+} from "./transport";
 
 type Surface = "session" | "settings" | "devices";
 
@@ -52,12 +59,50 @@ const statusLabel: Record<SessionStatus, string> = {
 
 const transportMode = transportModeFromSearch(window.location.search);
 const store = new YggStore(createTransport(transportMode));
+const activityPaneStorageKey = "ygg.ui.activity-width";
+const inspectorPaneStorageKey = "ygg.ui.inspector-width";
+
+function storedPaneWidth(key: string, fallback: number): number {
+  try {
+    const value = Number(window.localStorage.getItem(key));
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function persistPaneWidth(key: string, value: number) {
+  try {
+    window.localStorage.setItem(key, String(Math.round(value)));
+  } catch {
+    // A hardened browser may disable storage; resizing still works in memory.
+  }
+}
 
 function FixtureModeLabel() {
-  if (transportMode !== "fixture") return null;
+  if (!import.meta.env.DEV || transportMode !== "fixture") return null;
   return (
     <div className="fixture-mode-label" role="status">
       Demo data · responses and actions are simulated
+    </div>
+  );
+}
+
+function ConnectionBanner({
+  connection,
+}: {
+  connection: TransportConnectionState;
+}) {
+  if (connection === "connected") return null;
+  return (
+    <div className="connection-banner" role="status">
+      <RefreshCw className="spin" aria-hidden="true" />
+      <span>
+        {connection === "reconnecting"
+          ? "Connection interrupted. Reconnecting to ygg…"
+          : "Connecting to local ygg…"}
+      </span>
+      <small>Your current session remains visible while ygg reconnects.</small>
     </div>
   );
 }
@@ -72,7 +117,13 @@ function LoadingState() {
   );
 }
 
-function ErrorState({ message }: { message: string }) {
+function ErrorState({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry?: () => void;
+}) {
   return (
     <div className="app-error" role="alert">
       <div className="error-mark">
@@ -80,9 +131,13 @@ function ErrorState({ message }: { message: string }) {
       </div>
       <h1>ygg could not connect</h1>
       <p>{message}</p>
-      <button className="primary-button" onClick={() => window.location.reload()}>
+      {onRetry ? <small>Retrying automatically in the background.</small> : null}
+      <button
+        className="primary-button"
+        onClick={onRetry ?? (() => window.location.reload())}
+      >
         <RefreshCw aria-hidden="true" />
-        Try again
+        Try now
       </button>
     </div>
   );
@@ -90,6 +145,7 @@ function ErrorState({ message }: { message: string }) {
 
 interface HeaderProps {
   sidebarOpen: boolean;
+  sessionId: string;
   sessionTitle: string;
   projectName: string;
   status: SessionStatus;
@@ -97,6 +153,9 @@ interface HeaderProps {
   activityOpen: boolean;
   pinned: boolean;
   sessionActionsAvailable: boolean;
+  metadataActionsAvailable: boolean;
+  branchHistoryAvailable: boolean;
+  sessionExportAvailable: boolean;
   activityButtonRef: RefObject<HTMLButtonElement | null>;
   sidebarButtonRef: RefObject<HTMLButtonElement | null>;
   onOpenSidebar: () => void;
@@ -104,10 +163,12 @@ interface HeaderProps {
   onRename: (title: string) => void;
   onPin: (pinned: boolean) => void;
   onArchive: () => void;
+  onOpenBranchHistory: () => void;
 }
 
-function SessionHeader({
+export function SessionHeader({
   sidebarOpen,
+  sessionId,
   sessionTitle,
   projectName,
   status,
@@ -115,6 +176,9 @@ function SessionHeader({
   activityOpen,
   pinned,
   sessionActionsAvailable,
+  metadataActionsAvailable,
+  branchHistoryAvailable,
+  sessionExportAvailable,
   activityButtonRef,
   sidebarButtonRef,
   onOpenSidebar,
@@ -122,6 +186,7 @@ function SessionHeader({
   onRename,
   onPin,
   onArchive,
+  onOpenBranchHistory,
 }: HeaderProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -232,34 +297,61 @@ function SessionHeader({
                   tabIndex={-1}
                 />
                 <div className="session-menu" role="menu">
-                  <button
-                    role="menuitem"
-                    onClick={() => {
-                      setDraftTitle(sessionTitle);
-                      renameFinishedRef.current = false;
-                      setRenaming(true);
-                      setMenuOpen(false);
-                    }}
-                  >
-                    <Pencil aria-hidden="true" />
-                    Rename
-                  </button>
-                  <button role="menuitem" onClick={() => onPin(!pinned)}>
-                    {pinned ? (
-                      <PinOff aria-hidden="true" />
-                    ) : (
-                      <Pin aria-hidden="true" />
-                    )}
-                    {pinned ? "Unpin" : "Pin"}
-                  </button>
-                  <button
-                    className="danger-row"
-                    role="menuitem"
-                    onClick={onArchive}
-                  >
-                    <Archive aria-hidden="true" />
-                    Archive
-                  </button>
+                  {branchHistoryAvailable ? (
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuOpen(false);
+                        onOpenBranchHistory();
+                      }}
+                    >
+                      <GitBranch aria-hidden="true" />
+                      Session history
+                    </button>
+                  ) : null}
+                  {sessionExportAvailable ? (
+                    <a
+                      role="menuitem"
+                      href={`/api/v1/sessions/${encodeURIComponent(sessionId)}/export`}
+                      download
+                      onClick={() => setMenuOpen(false)}
+                    >
+                      <Download aria-hidden="true" />
+                      Download safe export
+                    </a>
+                  ) : null}
+                  {metadataActionsAvailable ? (
+                    <>
+                      <button
+                        role="menuitem"
+                        onClick={() => {
+                          setDraftTitle(sessionTitle);
+                          renameFinishedRef.current = false;
+                          setRenaming(true);
+                          setMenuOpen(false);
+                        }}
+                      >
+                        <Pencil aria-hidden="true" />
+                        Rename
+                      </button>
+                      <button role="menuitem" onClick={() => onPin(!pinned)}>
+                        {pinned ? (
+                          <PinOff aria-hidden="true" />
+                        ) : (
+                          <Pin aria-hidden="true" />
+                        )}
+                        {pinned ? "Unpin" : "Pin"}
+                      </button>
+                      <button
+                        className="danger-row"
+                        role="menuitem"
+                        onClick={onArchive}
+                      >
+                        <Archive aria-hidden="true" />
+                        Archive
+                      </button>
+                    </>
+                  ) : null}
                 </div>
               </>
             ) : null}
@@ -267,6 +359,144 @@ function SessionHeader({
         ) : null}
       </div>
     </header>
+  );
+}
+
+function BranchHistorySheet({
+  session,
+  onClose,
+  onCheckout,
+}: {
+  session: SessionSnapshot;
+  onClose: () => void;
+  onCheckout: (entryId: string) => Promise<void>;
+}) {
+  const [pending, setPending] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const byId = useMemo(
+    () => new Map(session.branches.entries.map((entry) => [entry.entryId, entry])),
+    [session.branches.entries],
+  );
+  const activeAncestry = useMemo(() => {
+    const active = new Set<string>();
+    let cursor = session.branches.head;
+    while (cursor && !active.has(cursor)) {
+      active.add(cursor);
+      cursor = byId.get(cursor)?.parentEntryId;
+    }
+    return active;
+  }, [byId, session.branches.head]);
+  const currentCheckpoint = useMemo(() => {
+    let cursor = session.branches.head;
+    while (cursor) {
+      const entry = byId.get(cursor);
+      if (!entry) return undefined;
+      if (entry.checkoutable) return entry.entryId;
+      cursor = entry.parentEntryId;
+    }
+    return undefined;
+  }, [byId, session.branches.head]);
+  const visibleEntries = session.branches.entries.filter(
+    (entry) => entry.checkoutable,
+  );
+  const checkoutDisabled =
+    session.activeRunId !== undefined ||
+    !["idle", "done", "failed", "stopped"].includes(session.status);
+
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="branch-sheet-backdrop" role="presentation">
+      <section
+        className="branch-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="branch-sheet-title"
+      >
+        <header>
+          <div>
+            <span className="branch-sheet-glyph" aria-hidden="true">
+              <GitBranch />
+            </span>
+            <div>
+              <h2 id="branch-sheet-title">Session history</h2>
+              <p>Choose where the conversation should continue.</p>
+            </div>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close history">
+            <X aria-hidden="true" />
+          </button>
+        </header>
+        <div className="branch-history-list">
+          {visibleEntries.length ? (
+            [...visibleEntries].reverse().map((entry) => {
+              const current = entry.entryId === currentCheckpoint;
+              const active = activeAncestry.has(entry.entryId);
+              return (
+                <article
+                  className={`branch-history-row ${active ? "is-active" : ""}`}
+                  key={entry.entryId}
+                >
+                  <span className="branch-history-node" aria-hidden="true" />
+                  <div>
+                    <strong>{entry.label}</strong>
+                    <small>
+                      {entry.kind === "userMessage"
+                        ? "Your message"
+                        : entry.kind === "compaction"
+                          ? "Context checkpoint"
+                          : "ygg response"}
+                      {current ? " · Current" : ""}
+                    </small>
+                  </div>
+                  <button
+                    disabled={current || checkoutDisabled || pending !== null}
+                    onClick={() => {
+                      setPending(entry.entryId);
+                      setError(null);
+                      void onCheckout(entry.entryId)
+                        .then(onClose)
+                        .catch((reason: unknown) => {
+                          setPending(null);
+                          setError(
+                            reason instanceof Error
+                              ? reason.message
+                              : "ygg could not switch checkpoints.",
+                          );
+                        });
+                    }}
+                  >
+                    {pending === entry.entryId
+                      ? "Switching…"
+                      : current
+                        ? "Current"
+                        : "Switch here"}
+                  </button>
+                </article>
+              );
+            })
+          ) : (
+            <p className="branch-history-empty">History appears after the first message.</p>
+          )}
+        </div>
+        <footer>
+          <p>
+            This changes the conversation state. Files, commands, and other side
+            effects are not rolled back.
+            {session.branches.truncated
+              ? " Older checkpoints are not shown in this recent-history view."
+              : ""}
+          </p>
+          {error ? <span role="alert">{error}</span> : null}
+        </footer>
+      </section>
+    </div>
   );
 }
 
@@ -310,12 +540,20 @@ export default function App() {
     () => window.matchMedia("(min-width: 1280px)").matches,
   );
   const [activityOpen, setActivityOpen] = useState(false);
+  const [branchHistoryOpen, setBranchHistoryOpen] = useState(false);
   const [inspector, setInspector] = useState<InspectorSelection | null>(null);
+  const [inspectorClosing, setInspectorClosing] = useState(false);
+  const [activityPaneWidth, setActivityPaneWidth] = useState(() =>
+    storedPaneWidth(activityPaneStorageKey, 320),
+  );
+  const [inspectorPaneWidth, setInspectorPaneWidth] = useState(() =>
+    storedPaneWidth(inspectorPaneStorageKey, 720),
+  );
   const [surface, setSurface] = useState<Surface>("session");
-  const activitySeenRef = useRef(new Map<string, boolean>());
-  const activityDismissedRef = useRef(new Set<string>());
   const activityButtonRef = useRef<HTMLButtonElement>(null);
   const sidebarButtonRef = useRef<HTMLButtonElement>(null);
+  const inspectorCloseTimerRef = useRef<number | null>(null);
+  const paneResizeCleanupRef = useRef<(() => void) | null>(null);
   const restoreActivityFocus = useCallback(() => {
     const restore = () => activityButtonRef.current?.focus();
     restore();
@@ -327,28 +565,57 @@ export default function App() {
     window.requestAnimationFrame(restore);
   }, []);
   const closeActivity = useCallback(() => {
-    if (state.selectedSessionId) {
-      activityDismissedRef.current.add(state.selectedSessionId);
-    }
     setActivityOpen(false);
     restoreActivityFocus();
-  }, [restoreActivityFocus, state.selectedSessionId]);
+  }, [restoreActivityFocus]);
   const closeInspector = useCallback(() => {
-    setInspector(null);
-    restoreActivityFocus();
+    if (inspectorCloseTimerRef.current !== null) return;
+    setInspectorClosing(true);
+    inspectorCloseTimerRef.current = window.setTimeout(() => {
+      inspectorCloseTimerRef.current = null;
+      setInspector(null);
+      setInspectorClosing(false);
+      restoreActivityFocus();
+    }, 180);
   }, [restoreActivityFocus]);
   const closeSidebar = useCallback(() => {
     setSidebarOpen(false);
     restoreSidebarFocus();
   }, [restoreSidebarFocus]);
-  const modalWorkspaceOpen =
-    !wideLayout && (activityOpen || Boolean(inspector));
 
   useEffect(() => {
     applyStoredTypePreferences();
     void store.initialize();
-    return () => store.dispose();
+    return () => {
+      if (inspectorCloseTimerRef.current !== null) {
+        window.clearTimeout(inspectorCloseTimerRef.current);
+      }
+      paneResizeCleanupRef.current?.();
+      store.dispose();
+    };
   }, []);
+
+  useEffect(() => {
+    if (!state.error || state.bootstrap) return;
+    let cancelled = false;
+    let delay = 1_000;
+    let timer = 0;
+    const retry = () => {
+      timer = window.setTimeout(() => {
+        if (cancelled) return;
+        void store.initialize().finally(() => {
+          if (cancelled || store.getSnapshot().ready) return;
+          delay = Math.min(delay * 2, 8_000);
+          retry();
+        });
+      }, delay);
+    };
+    retry();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [state.bootstrap, state.error]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -375,30 +642,16 @@ export default function App() {
   const activityAvailable = Boolean(
     session &&
       (session.progress.length ||
-        session.items.some(
-          (item) => item.kind === "action" || item.kind === "reasoning",
-        ) ||
         (state.bootstrap?.capabilities.resources &&
           (session.outputs.length || session.sources.length))),
   );
+  const visibleActivityOpen = activityOpen && activityAvailable;
+  const modalWorkspaceOpen =
+    branchHistoryOpen ||
+    (!wideLayout && (visibleActivityOpen || Boolean(inspector)));
 
   useEffect(() => {
-    if (!session) return;
-    const alreadySeen = activitySeenRef.current.get(session.sessionId) ?? false;
-    activitySeenRef.current.set(session.sessionId, activityAvailable);
-    if (
-      activityAvailable &&
-      !alreadySeen &&
-      wideLayout &&
-      !inspector &&
-      !activityDismissedRef.current.has(session.sessionId)
-    ) {
-      setActivityOpen(true);
-    }
-  }, [activityAvailable, inspector, session, wideLayout]);
-
-  useEffect(() => {
-    if (selectedTheme) applyTheme(selectedTheme.theme);
+    if (selectedTheme) applyTheme(selectedTheme.theme, selectedTheme.id);
   }, [selectedTheme]);
 
   useEffect(() => {
@@ -420,42 +673,154 @@ export default function App() {
   }, []);
 
   const openOutput = (outputId: string) => {
+    if (inspectorCloseTimerRef.current !== null) {
+      window.clearTimeout(inspectorCloseTimerRef.current);
+      inspectorCloseTimerRef.current = null;
+    }
+    setInspectorClosing(false);
     setActivityOpen(false);
     setInspector({ type: "output", id: outputId });
   };
   const openSource = (sourceId: string) => {
+    if (inspectorCloseTimerRef.current !== null) {
+      window.clearTimeout(inspectorCloseTimerRef.current);
+      inspectorCloseTimerRef.current = null;
+    }
+    setInspectorClosing(false);
     setActivityOpen(false);
     setInspector({ type: "source", id: sourceId });
   };
+  const openResource = (
+    handle: string,
+    title: string,
+    presentation: "text" | "diff" | "image",
+  ) => {
+    if (inspectorCloseTimerRef.current !== null) {
+      window.clearTimeout(inspectorCloseTimerRef.current);
+      inspectorCloseTimerRef.current = null;
+    }
+    setInspectorClosing(false);
+    setActivityOpen(false);
+    setInspector({ type: "resource", handle, title, presentation });
+  };
+
+  const paneBounds = useCallback(
+    (kind: "activity" | "inspector") => {
+      const sidebarWidth = sidebarOpen ? 264 : 0;
+      if (kind === "activity") {
+        return {
+          min: 280,
+          max: Math.max(
+            280,
+            Math.min(440, window.innerWidth - sidebarWidth - 520),
+          ),
+        };
+      }
+      return {
+        min: 520,
+        max: Math.max(520, window.innerWidth - sidebarWidth - 380),
+      };
+    },
+    [sidebarOpen],
+  );
+
+  const resizePaneBy = useCallback(
+    (kind: "activity" | "inspector", delta: number) => {
+      const bounds = paneBounds(kind);
+      const current =
+        kind === "activity" ? activityPaneWidth : inspectorPaneWidth;
+      const next = Math.max(bounds.min, Math.min(bounds.max, current + delta));
+      if (kind === "activity") {
+        setActivityPaneWidth(next);
+        persistPaneWidth(activityPaneStorageKey, next);
+      } else {
+        setInspectorPaneWidth(next);
+        persistPaneWidth(inspectorPaneStorageKey, next);
+      }
+    },
+    [activityPaneWidth, inspectorPaneWidth, paneBounds],
+  );
+
+  const beginPaneResize = useCallback(
+    (kind: "activity" | "inspector", startX: number) => {
+      paneResizeCleanupRef.current?.();
+      const bounds = paneBounds(kind);
+      const startWidth =
+        kind === "activity" ? activityPaneWidth : inspectorPaneWidth;
+      let nextWidth = startWidth;
+      const onMove = (event: PointerEvent) => {
+        nextWidth = Math.max(
+          bounds.min,
+          Math.min(bounds.max, startWidth + startX - event.clientX),
+        );
+        if (kind === "activity") setActivityPaneWidth(nextWidth);
+        else setInspectorPaneWidth(nextWidth);
+      };
+      const cleanup = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        window.removeEventListener("blur", finish);
+        document.documentElement.classList.remove("is-resizing-pane");
+        paneResizeCleanupRef.current = null;
+      };
+      const finish = () => {
+        cleanup();
+        persistPaneWidth(
+          kind === "activity"
+            ? activityPaneStorageKey
+            : inspectorPaneStorageKey,
+          nextWidth,
+        );
+      };
+      paneResizeCleanupRef.current = cleanup;
+      document.documentElement.classList.add("is-resizing-pane");
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+      window.addEventListener("blur", finish);
+    },
+    [activityPaneWidth, inspectorPaneWidth, paneBounds],
+  );
 
   const appClass = useMemo(
     () =>
       [
         "app-shell",
         sidebarOpen ? "has-sidebar" : "",
-        activityOpen && !inspector ? "has-activity" : "",
+        visibleActivityOpen && !inspector ? "has-activity" : "",
         inspector ? "has-inspector" : "",
         `surface-${surface}`,
       ]
         .filter(Boolean)
         .join(" "),
-    [activityOpen, inspector, sidebarOpen, surface],
+    [inspector, sidebarOpen, surface, visibleActivityOpen],
   );
+  const appStyle = {
+    "--activity-width": `${activityPaneWidth}px`,
+    "--inspector-width": `${inspectorPaneWidth}px`,
+  } as CSSProperties;
 
   if (state.connecting) return <LoadingState />;
-  if (state.error) return <ErrorState message={state.error} />;
+  if (state.error) {
+    return (
+      <ErrorState
+        message={state.error}
+        onRetry={() => void store.initialize()}
+      />
+    );
+  }
   if (!state.bootstrap || !session) return <ErrorState message="No session was selected." />;
 
   return (
-    <div className={appClass}>
+    <div className={appClass} style={appStyle}>
       <Sidebar
         open={sidebarOpen}
         blocked={modalWorkspaceOpen}
         sessions={state.bootstrap.sessions}
+        models={state.bootstrap.models}
         selectedSessionId={state.selectedSessionId}
         surface={surface}
-        hostName={state.bootstrap.host.name}
-        connection={state.connection}
         devicesAvailable={state.bootstrap.capabilities.connectedDevices}
         onRestoreFocus={restoreSidebarFocus}
         onClose={closeSidebar}
@@ -468,7 +833,9 @@ export default function App() {
         onSelectSession={(sessionId) => {
           setSurface("session");
           setInspector(null);
-          setActivityOpen(false);
+          if (sessionId !== state.selectedSessionId) {
+            setActivityOpen(false);
+          }
           void store.selectSession(sessionId);
           if (window.matchMedia("(max-width: 760px)").matches) {
             setSidebarOpen(false);
@@ -499,26 +866,34 @@ export default function App() {
         >
           <SessionHeader
             sidebarOpen={sidebarOpen}
+            sessionId={session.sessionId}
             sessionTitle={session.title}
             projectName={project?.name ?? "Local project"}
             status={session.status}
             activityAvailable={activityAvailable}
-            activityOpen={activityOpen}
+            activityOpen={visibleActivityOpen}
             pinned={selectedSummary?.pinned ?? false}
             sessionActionsAvailable={
+              state.bootstrap.capabilities.sessionMetadata ||
+              state.bootstrap.capabilities.sessionBranches ||
+              state.bootstrap.capabilities.sessionExport
+            }
+            metadataActionsAvailable={
               state.bootstrap.capabilities.sessionMetadata
+            }
+            branchHistoryAvailable={
+              state.bootstrap.capabilities.sessionBranches &&
+              session.branches.entries.some((entry) => entry.checkoutable)
+            }
+            sessionExportAvailable={
+              state.bootstrap.capabilities.sessionExport
             }
             activityButtonRef={activityButtonRef}
             sidebarButtonRef={sidebarButtonRef}
             onOpenSidebar={() => setSidebarOpen(true)}
             onToggleActivity={() => {
               setInspector(null);
-              setActivityOpen((open) => {
-                if (open) {
-                  activityDismissedRef.current.add(session.sessionId);
-                }
-                return !open;
-              });
+              setActivityOpen((open) => !open);
             }}
             onRename={(title) => void store.rename(title)}
             onPin={(pinned) => {
@@ -531,8 +906,10 @@ export default function App() {
                 }
               })();
             }}
+            onOpenBranchHistory={() => setBranchHistoryOpen(true)}
           />
           <FixtureModeLabel />
+          <ConnectionBanner connection={state.connection} />
           <Conversation
             key={session.sessionId}
             session={session}
@@ -550,6 +927,11 @@ export default function App() {
             }
             onOpenOutput={openOutput}
             onOpenSource={openSource}
+            onOpenResource={
+              state.bootstrap.capabilities.resources
+                ? openResource
+                : undefined
+            }
             onIngestAttachment={(file) => store.ingestAttachment(file)}
             attachmentContentUrl={(handle) =>
               store.attachmentContentUrl(handle)
@@ -569,6 +951,7 @@ export default function App() {
             onOpenSidebar={() => setSidebarOpen(true)}
             sidebarButtonRef={sidebarButtonRef}
           />
+          <ConnectionBanner connection={state.connection} />
           <FixtureModeLabel />
           {surface === "settings" ? (
             <SettingsView
@@ -595,10 +978,43 @@ export default function App() {
 
       {surface === "session" && session ? (
         <>
+          {wideLayout && ((visibleActivityOpen && !inspector) || inspector) ? (
+            <div
+              className="pane-resize-handle"
+              role="separator"
+              aria-label={
+                inspector ? "Resize inspector" : "Resize session activity"
+              }
+              aria-orientation="vertical"
+              aria-valuemin={inspector ? 520 : 280}
+              aria-valuemax={paneBounds(inspector ? "inspector" : "activity").max}
+              aria-valuenow={
+                inspector ? inspectorPaneWidth : activityPaneWidth
+              }
+              tabIndex={0}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                beginPaneResize(
+                  inspector ? "inspector" : "activity",
+                  event.clientX,
+                );
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
+                  return;
+                }
+                event.preventDefault();
+                resizePaneBy(
+                  inspector ? "inspector" : "activity",
+                  event.key === "ArrowLeft" ? 16 : -16,
+                );
+              }}
+            />
+          ) : null}
           <ActivityRail
             session={session}
             open={
-              activityOpen &&
+              visibleActivityOpen &&
               !inspector &&
               !(mobileLayout && sidebarOpen)
             }
@@ -612,13 +1028,23 @@ export default function App() {
           <Inspector
             session={session}
             selection={inspector}
+            closing={inspectorClosing}
             modal={!wideLayout}
             previewsAvailable={state.bootstrap.capabilities.previews}
-            resourceContentUrl={(handle) => store.resourceContentUrl(handle)}
+            resourceContentUrl={(sessionId, handle) =>
+              store.resourceContentUrl(sessionId, handle)
+            }
             onRestoreFocus={restoreActivityFocus}
             onClose={closeInspector}
           />
         </>
+      ) : null}
+      {surface === "session" && session && branchHistoryOpen ? (
+        <BranchHistorySheet
+          session={session}
+          onClose={() => setBranchHistoryOpen(false)}
+          onCheckout={(entryId) => store.checkoutBranch(entryId)}
+        />
       ) : null}
     </div>
   );

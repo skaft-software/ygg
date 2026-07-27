@@ -12,10 +12,11 @@ use ygg_serve_backend::{
     HostAckDisposition, HostBootstrap, HostCapabilities, HostCommand, HostCommandAck,
     HostCommandEnvelope, HostDescriptor, HostId, InputModality, ItemDelta, ItemId, ItemLifecycle,
     ItemPayload, ModelSelection, ModelSummary, ProjectId, ProjectSummary, PromptInput,
-    ProtocolValidation, RunId, SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId,
-    SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity,
-    ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
-    TurnId, UsageSnapshot, UserMessageDelivery,
+    ProtocolValidation, RunId, SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph,
+    SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId, SessionItem,
+    SessionLiveState, SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity, ThemeDto, ThemeId,
+    ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TurnId,
+    UsageSnapshot, UserMessageDelivery,
 };
 
 fn model_selection() -> ModelSelection {
@@ -65,6 +66,17 @@ fn snapshot() -> SessionSnapshot {
             sequence: 42,
         },
         durable_head: Some(DurableEntryId::new("entry-42").unwrap()),
+        branches: SessionBranchGraph {
+            head: Some(DurableEntryId::new("entry-42").unwrap()),
+            entries: vec![SessionBranchEntry {
+                entry_id: DurableEntryId::new("entry-42").unwrap(),
+                parent_entry_id: None,
+                kind: SessionBranchEntryKind::AssistantMessage,
+                checkoutable: true,
+                label: "Ready.".into(),
+            }],
+            truncated: false,
+        },
         live_state: SessionLiveState::Idle,
         active_run_id: None,
         model: model_selection(),
@@ -143,6 +155,8 @@ fn bootstrap() -> HostBootstrap {
             previews: true,
             connected_devices: false,
             session_metadata: true,
+            session_branches: true,
+            session_export: true,
             lan_clients: false,
             terminal: false,
             child_agents: false,

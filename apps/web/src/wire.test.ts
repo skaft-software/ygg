@@ -3,6 +3,7 @@ import eventEnvelopeGolden from "../../../extensions/ygg-serve/fixtures/event-en
 import hostBootstrapGolden from "../../../extensions/ygg-serve/fixtures/host-bootstrap.json";
 import hostCommandAckGolden from "../../../extensions/ygg-serve/fixtures/host-command-ack.json";
 import hostCommandGolden from "../../../extensions/ygg-serve/fixtures/host-command.json";
+import liveUserDeliveryGolden from "../../../extensions/ygg-serve/fixtures/live-user-delivery.json";
 import sessionCommandGolden from "../../../extensions/ygg-serve/fixtures/session-command.json";
 import sessionSnapshotGolden from "../../../extensions/ygg-serve/fixtures/session-snapshot.json";
 import {
@@ -12,7 +13,6 @@ import {
   projectHostBootstrap,
   projectHostStreamEvent,
   projectSessionSnapshot,
-  UnsupportedWireCommandError,
   WireContractError,
 } from "./wire";
 
@@ -59,6 +59,20 @@ describe("authoritative Rust wire contract", () => {
       kind: "assistant_message",
       content: "Ready.",
     });
+    expect(bootstrap.capabilities.sessionBranches).toBe(true);
+    expect(bootstrap.capabilities.sessionExport).toBe(true);
+    expect(selectedSession.branches).toEqual({
+      head: "entry-42",
+      entries: [
+        {
+          entryId: "entry-42",
+          kind: "assistantMessage",
+          checkoutable: true,
+          label: "Ready.",
+        },
+      ],
+      truncated: false,
+    });
   });
 
   it("projects the standalone session snapshot against the model catalog", () => {
@@ -74,6 +88,132 @@ describe("authoritative Rust wire contract", () => {
     expect(snapshot.contextPercent).toBe(0);
     expect(snapshot.title).toBe("New session");
     expect(snapshot.items).toHaveLength(1);
+  });
+
+  it("rehydrates durable evidence origins and exact file handles from a snapshot", () => {
+    const durable = clone(sessionSnapshotGolden) as unknown as {
+      items: unknown[];
+      sources?: unknown[];
+      artifacts?: unknown[];
+    };
+    durable.items.push(
+      {
+        id: "item-tool-read",
+        turnId: "turn-evidence",
+        lifecycle: "committed",
+        durableEntryId: "entry-tool",
+        payload: {
+          type: "toolCall",
+          data: {
+            name: "read",
+            arguments: { path: "src/theme.ts" },
+            droppedProgressBytes: 0,
+          },
+        },
+      },
+      {
+        id: "item-file-change",
+        turnId: "turn-evidence",
+        lifecycle: "committed",
+        durableEntryId: "entry-result",
+        payload: {
+          type: "fileChange",
+          data: {
+            handle: "resource-diff",
+            resultHandle: "resource-result",
+            displayPath: "src/theme.ts",
+            additions: 8,
+            deletions: 3,
+          },
+        },
+      },
+    );
+    durable.sources = [
+      {
+        id: "source-theme",
+        kind: "file",
+        title: "src/theme.ts",
+        handle: "resource-source",
+        originItemId: "item-tool-read",
+        consultedAtMs: 1_721_000_000_044,
+        cited: false,
+        available: true,
+      },
+    ];
+    durable.artifacts = [
+      {
+        id: "artifact-theme",
+        kind: "file",
+        name: "theme.ts",
+        mediaType: "text/plain",
+        handle: "resource-result",
+        byteLen: 128,
+        originItemId: "item-tool-read",
+        available: true,
+      },
+    ];
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const snapshot = projectSessionSnapshot(durable, {
+      summary: bootstrap.sessions[0],
+      models: bootstrap.models,
+    });
+
+    expect(snapshot.sources[0]).toMatchObject({
+      id: "source-theme",
+      handle: "resource-source",
+      originItemId: "item-tool-read",
+    });
+    expect(snapshot.outputs[0]).toMatchObject({
+      id: "artifact-theme",
+      handle: "resource-result",
+      originItemId: "item-tool-read",
+    });
+    expect(
+      snapshot.items.find((item) => item.id === "item-file-change"),
+    ).toMatchObject({
+      kind: "action",
+      diffHandle: "resource-diff",
+      resultHandle: "resource-result",
+    });
+  });
+
+  it("accepts omitted branch parents only when truncation is explicit", () => {
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const summary = bootstrap.sessions[0];
+    const truncated = {
+      ...clone(sessionSnapshotGolden),
+      durableHead: "entry-recent",
+      branches: {
+        head: "entry-recent",
+        entries: [
+          {
+            entryId: "entry-recent",
+            parentEntryId: "entry-omitted",
+            kind: "assistantMessage",
+            checkoutable: true,
+            label: "Recent answer",
+          },
+        ],
+        truncated: true,
+      },
+    };
+    expect(
+      projectSessionSnapshot(truncated, {
+        summary,
+        models: bootstrap.models,
+      }).branches.truncated,
+    ).toBe(true);
+
+    const complete = {
+      ...truncated,
+      branches: { ...truncated.branches, truncated: false },
+    };
+    expect(() =>
+      projectSessionSnapshot(complete, {
+        summary,
+        models: bootstrap.models,
+      }),
+    ).toThrow(/parent outside the preserved graph/);
   });
 
   it("projects the sequenced event and nested host stream envelope", () => {
@@ -95,6 +235,30 @@ describe("authoritative Rust wire contract", () => {
         event: eventEnvelopeGolden,
       }),
     ).toEqual({ hostSequence: 12, event });
+  });
+
+  it("preserves live user-message delivery semantics", () => {
+    const queued = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    queued.cursor.sequence = 44;
+    queued.event = {
+      type: "item.started",
+      data: {
+        item: liveUserDeliveryGolden,
+      },
+    };
+
+    expect(projectEventEnvelope(queued)).toMatchObject({
+      type: "item.started",
+      item: {
+        kind: "user_message",
+        content: "Change direction",
+        state: "streaming",
+        delivery: "steer",
+      },
+    });
   });
 
   it("projects complete cross-client catalog summary changes", () => {
@@ -144,6 +308,7 @@ describe("authoritative Rust wire contract", () => {
           kind: "file",
           title: "theme.ts",
           handle: "resource-source-theme",
+          originItemId: "item-tool-theme",
           consultedAtMs: 1_721_000_000_044,
           cited: false,
           available: true,
@@ -156,6 +321,7 @@ describe("authoritative Rust wire contract", () => {
         {
           id: "source-theme",
           handle: "resource-source-theme",
+          originItemId: "item-tool-theme",
           available: true,
         },
       ],
@@ -175,6 +341,7 @@ describe("authoritative Rust wire contract", () => {
           name: "report.md",
           mediaType: "text/markdown",
           handle: "resource-artifact-report",
+          originItemId: "item-tool-report",
           byteLen: 128,
           available: true,
         },
@@ -186,6 +353,7 @@ describe("authoritative Rust wire contract", () => {
         {
           id: "artifact-report",
           handle: "resource-artifact-report",
+          originItemId: "item-tool-report",
           mimeType: "text/markdown",
           available: true,
         },
@@ -193,7 +361,49 @@ describe("authoritative Rust wire contract", () => {
     });
   });
 
-  it("advances durable-head cursors without inventing a UI mutation", () => {
+  it("preserves exact diff and resulting-file handles", () => {
+    const changed = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    changed.cursor.sequence = 46;
+    changed.event = {
+      type: "item.committed",
+      data: {
+        item: {
+          id: "item-file-change",
+          turnId: "turn-change",
+          lifecycle: "committed",
+          durableEntryId: "entry-change",
+          payload: {
+            type: "fileChange",
+            data: {
+              handle: "resource-exact-diff",
+              resultHandle: "resource-exact-result",
+              displayPath: "src/theme.ts",
+              additions: 8,
+              deletions: 3,
+            },
+          },
+        },
+      },
+    };
+
+    expect(projectEventEnvelope(changed)).toMatchObject({
+      type: "item.committed",
+      item: {
+        kind: "action",
+        actionKind: "file_write",
+        target: "src/theme.ts",
+        additions: 8,
+        deletions: 3,
+        diffHandle: "resource-exact-diff",
+        resultHandle: "resource-exact-result",
+      },
+    });
+  });
+
+  it("projects the exact durable branch head", () => {
     const durable = clone(eventEnvelopeGolden) as unknown as {
       cursor: { sequence: number };
       event: unknown;
@@ -205,11 +415,11 @@ describe("authoritative Rust wire contract", () => {
     };
 
     expect(projectEventEnvelope(durable)).toEqual({
-      type: "session.updated",
+      type: "session.durableHeadChanged",
       sessionId: "session-demo",
       actorGeneration: 3,
       sequence: 44,
-      patch: {},
+      durableHead: "entry-44",
     });
   });
 
@@ -233,6 +443,81 @@ describe("authoritative Rust wire contract", () => {
         status: "needs_attention",
         activeRunId: "run-live",
       },
+    });
+  });
+
+  it("projects and encodes durable session metadata changes", () => {
+    const metadata = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    metadata.cursor.sequence = 44;
+    metadata.event = {
+      type: "session.metadataChanged",
+      data: {
+        title: "Renamed session",
+        pinned: true,
+        archived: false,
+      },
+    };
+    expect(projectEventEnvelope(metadata)).toEqual({
+      type: "session.updated",
+      sessionId: "session-demo",
+      actorGeneration: 3,
+      sequence: 44,
+      patch: { title: "Renamed session" },
+    });
+
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const context = {
+      hostId: "host-demo",
+      deviceId: "device-browser",
+      issuedAtMs: 1_721_000_000_060,
+      actorGenerationBySession: { "session-demo": 3 },
+      modelIdBySession: { "session-demo": "gpt-5.6" },
+      models: bootstrap.models,
+    };
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-rename",
+          type: "session.rename",
+          sessionId: "session-demo",
+          title: "Renamed session",
+        },
+        context,
+      ),
+    ).toMatchObject({
+      command: {
+        type: "session.rename",
+        data: { title: "Renamed session" },
+      },
+    });
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-pin",
+          type: "session.pin",
+          sessionId: "session-demo",
+          pinned: true,
+        },
+        context,
+      ),
+    ).toMatchObject({
+      command: { type: "session.pin", data: { pinned: true } },
+    });
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-archive",
+          type: "session.archive",
+          sessionId: "session-demo",
+          archived: true,
+        },
+        context,
+      ),
+    ).toMatchObject({
+      command: { type: "session.archive", data: { archived: true } },
     });
   });
 
@@ -507,6 +792,52 @@ describe("authoritative Rust wire contract", () => {
     });
   });
 
+  it("encodes the exact durable checkout command and replacement signal", () => {
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const context = {
+      hostId: "host-demo",
+      deviceId: "device-browser",
+      issuedAtMs: 1_721_000_000_053,
+      actorGenerationBySession: { "session-demo": 3 },
+      modelIdBySession: { "session-demo": "gpt-5.6" },
+      models: bootstrap.models,
+    };
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-checkout",
+          type: "session.checkout",
+          sessionId: "session-demo",
+          entryId: "entry-17",
+        },
+        context,
+      ),
+    ).toMatchObject({
+      expectedActorGeneration: 3,
+      command: {
+        type: "session.checkout",
+        data: { entryId: "entry-17" },
+      },
+    });
+
+    const replacement = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    replacement.cursor.sequence = 44;
+    replacement.event = {
+      type: "session.projectionReplaced",
+      data: { durableEntryId: "entry-17" },
+    };
+    expect(projectEventEnvelope(replacement)).toEqual({
+      type: "session.projectionReplaced",
+      sessionId: "session-demo",
+      actorGeneration: 3,
+      sequence: 44,
+      durableHead: "entry-17",
+    });
+  });
+
   it("decodes the exact host acknowledgement golden and session acks", () => {
     expect(decodeWireCommandAck(hostCommandAckGolden)).toEqual({
       commandId: "command-create",
@@ -560,7 +891,7 @@ describe("authoritative Rust wire contract", () => {
     );
   });
 
-  it("fails honestly for UI commands absent from the Rust contract", () => {
+  it("fails honestly for approval scopes absent from the Rust contract", () => {
     const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
     const context = {
       hostId: "host-demo",
@@ -571,17 +902,6 @@ describe("authoritative Rust wire contract", () => {
       models: bootstrap.models,
     };
 
-    expect(() =>
-      encodeClientCommand(
-        {
-          id: "command-pin",
-          type: "session.pin",
-          sessionId: "session-demo",
-          pinned: true,
-        },
-        context,
-      ),
-    ).toThrow(UnsupportedWireCommandError);
     expect(() =>
       encodeClientCommand(
         {

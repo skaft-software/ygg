@@ -5,6 +5,9 @@ import {
   BrainCircuit,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
   CircleStop,
   Copy,
   Download,
@@ -25,6 +28,7 @@ import {
   ShieldCheck,
   TerminalSquare,
   X,
+  Zap,
 } from "lucide-react";
 import {
   Suspense,
@@ -45,11 +49,13 @@ import type {
   AuthorityProfile,
   HostBootstrap,
   ModelSummary,
+  OutputRef,
   ReasoningEffort,
   SessionSnapshot,
+  SourceRef,
   TranscriptItem,
 } from "../protocol";
-import { YggGlyph } from "./YggGlyph";
+import { TuiSplashLogo } from "./TuiSplashLogo";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage"));
 
@@ -79,6 +85,11 @@ interface ConversationProps {
   ) => Promise<void>;
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
+  onOpenResource?: (
+    handle: string,
+    title: string,
+    presentation: "text" | "diff" | "image",
+  ) => void;
   onIngestAttachment?: (file: File) => Promise<AttachmentRef>;
   attachmentContentUrl?: (handle: string) => string;
 }
@@ -415,28 +426,69 @@ function formatDuration(durationMs: number): string {
   return `${minutes}m ${seconds % 60}s`;
 }
 
+function LiveDots() {
+  return (
+    <span className="live-dots" aria-hidden="true">
+      <i />
+      <i />
+      <i />
+    </span>
+  );
+}
+
+function useExitPresence(open: boolean, durationMs = 170) {
+  const [retain, setRetain] = useState(open);
+
+  useEffect(() => {
+    if (open) {
+      if (retain) return;
+      const frame = window.requestAnimationFrame(() => setRetain(true));
+      return () => window.cancelAnimationFrame(frame);
+    }
+    if (!retain) return;
+    const timer = window.setTimeout(() => setRetain(false), durationMs);
+    return () => window.clearTimeout(timer);
+  }, [durationMs, open, retain]);
+
+  return { present: open || retain, closing: !open && retain };
+}
+
 function ActionCell({
   item,
   animate,
   onOpenOutput,
   onOpenSource,
-  availableOutputIds,
-  availableSourceIds,
+  onOpenResource,
+  availableOutputs,
+  availableSources,
 }: {
   item: ActionItem;
   animate: boolean;
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
-  availableOutputIds: ReadonlySet<string>;
-  availableSourceIds: ReadonlySet<string>;
+  onOpenResource: ConversationProps["onOpenResource"];
+  availableOutputs: ReadonlyMap<string, OutputRef>;
+  availableSources: ReadonlyMap<string, SourceRef>;
 }) {
   const isStreaming = item.state === "streaming";
-  const sourceIds = item.sourceIds?.filter((id) =>
-    availableSourceIds.has(id),
-  );
-  const outputIds = item.outputIds?.filter((id) =>
-    availableOutputIds.has(id),
-  );
+  const sourceIds = new Set([
+    ...(item.sourceIds ?? []),
+    ...Array.from(availableSources.values())
+      .filter((source) => source.originItemId === item.id)
+      .map((source) => source.id),
+  ]);
+  const outputIds = new Set([
+    ...(item.outputIds ?? []),
+    ...Array.from(availableOutputs.values())
+      .filter((output) => output.originItemId === item.id)
+      .map((output) => output.id),
+  ]);
+  const sources = Array.from(sourceIds)
+    .map((id) => availableSources.get(id))
+    .filter((source): source is SourceRef => Boolean(source));
+  const outputs = Array.from(outputIds)
+    .map((id) => availableOutputs.get(id))
+    .filter((output): output is OutputRef => Boolean(output));
   return (
     <details
       className={`action-cell ${animate ? "is-entering" : ""}`}
@@ -445,7 +497,7 @@ function ActionCell({
       <summary>
         <span className={`action-glyph ${isStreaming ? "is-live" : ""}`}>
           {isStreaming ? (
-            <LoaderCircle className="spin" aria-hidden="true" />
+            <LiveDots />
           ) : (
             actionIcons[item.actionKind]
           )}
@@ -469,22 +521,64 @@ function ActionCell({
       </summary>
       <div className="action-detail">
         {item.detail ? <p>{item.detail}</p> : null}
-        {sourceIds?.length ? (
+        {(item.diffHandle || item.resultHandle) && onOpenResource ? (
           <div className="action-links">
-            {sourceIds.map((sourceId) => (
-              <button key={sourceId} onClick={() => onOpenSource(sourceId)}>
+            {item.diffHandle ? (
+              <button
+                onClick={() =>
+                  onOpenResource(
+                    item.diffHandle!,
+                    `${item.target ?? "File"} changes`,
+                    "diff",
+                  )
+                }
+                aria-label={`View changes to ${item.target ?? "file"}`}
+              >
+                <FileDiff aria-hidden="true" />
+                View diff
+              </button>
+            ) : null}
+            {item.resultHandle ? (
+              <button
+                onClick={() =>
+                  onOpenResource(
+                    item.resultHandle!,
+                    item.target ?? "Changed file",
+                    "text",
+                  )
+                }
+                aria-label={`View resulting ${item.target ?? "file"}`}
+              >
+                <FileText aria-hidden="true" />
+                View file
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        {sources?.length ? (
+          <div className="action-links">
+            {sources.map((source) => (
+              <button
+                key={source.id}
+                onClick={() => onOpenSource(source.id)}
+                aria-label={`Open source ${source.title}`}
+              >
                 <File aria-hidden="true" />
-                Open source
+                {source.title}
               </button>
             ))}
           </div>
         ) : null}
-        {outputIds?.length ? (
+        {outputs?.length ? (
           <div className="action-links">
-            {outputIds.map((outputId) => (
-              <button key={outputId} onClick={() => onOpenOutput(outputId)}>
+            {outputs.map((output) => (
+              <button
+                key={output.id}
+                onClick={() => onOpenOutput(output.id)}
+                aria-label={`Open output ${output.title}`}
+              >
                 <ExternalLink aria-hidden="true" />
-                Open output
+                {output.title}
               </button>
             ))}
           </div>
@@ -694,8 +788,9 @@ function TranscriptItemView({
   onResolveUserInput,
   onOpenOutput,
   onOpenSource,
-  availableOutputIds,
-  availableSourceIds,
+  onOpenResource,
+  availableOutputs,
+  availableSources,
   attachmentContentUrl,
   onPreviewAttachment,
 }: {
@@ -705,8 +800,9 @@ function TranscriptItemView({
   onResolveUserInput: ConversationProps["onResolveUserInput"];
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
-  availableOutputIds: ReadonlySet<string>;
-  availableSourceIds: ReadonlySet<string>;
+  onOpenResource: ConversationProps["onOpenResource"];
+  availableOutputs: ReadonlyMap<string, OutputRef>;
+  availableSources: ReadonlyMap<string, SourceRef>;
   attachmentContentUrl?: (handle: string) => string;
   onPreviewAttachment: (
     source: string,
@@ -771,6 +867,21 @@ function TranscriptItemView({
               })}
             </div>
           ) : null}
+          {item.state === "streaming" ? (
+            <span
+              className="user-message-state"
+              role="status"
+              data-delivery={item.delivery}
+            >
+              {item.delivery === "followUp"
+                ? "Queued follow-up"
+                : item.delivery === "steer"
+                  ? "Steering active run"
+                  : item.delivery === "submit"
+                    ? "Sending"
+                    : "Pending delivery"}
+            </span>
+          ) : null}
         </article>
       );
     }
@@ -786,7 +897,7 @@ function TranscriptItemView({
         >
           <summary>
             {item.state === "streaming" ? (
-              <LoaderCircle className="spin" aria-hidden="true" />
+              <LiveDots />
             ) : (
               <BrainCircuit aria-hidden="true" />
             )}
@@ -804,8 +915,9 @@ function TranscriptItemView({
           animate={animate}
           onOpenOutput={onOpenOutput}
           onOpenSource={onOpenSource}
-          availableOutputIds={availableOutputIds}
-          availableSourceIds={availableSourceIds}
+          onOpenResource={onOpenResource}
+          availableOutputs={availableOutputs}
+          availableSources={availableSources}
         />
       );
 
@@ -969,8 +1081,9 @@ interface WorkGroupProps {
   onResolveUserInput: ConversationProps["onResolveUserInput"];
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
-  availableOutputIds: ReadonlySet<string>;
-  availableSourceIds: ReadonlySet<string>;
+  onOpenResource: ConversationProps["onOpenResource"];
+  availableOutputs: ReadonlyMap<string, OutputRef>;
+  availableSources: ReadonlyMap<string, SourceRef>;
   attachmentContentUrl?: (handle: string) => string;
   onPreviewAttachment: (
     source: string,
@@ -986,8 +1099,9 @@ function WorkGroup({
   onResolveUserInput,
   onOpenOutput,
   onOpenSource,
-  availableOutputIds,
-  availableSourceIds,
+  onOpenResource,
+  availableOutputs,
+  availableSources,
   attachmentContentUrl,
   onPreviewAttachment,
 }: WorkGroupProps) {
@@ -1020,18 +1134,17 @@ function WorkGroup({
           if (!live) setUserOpen((current) => !current);
         }}
       >
-        <span className="work-group-glyph">
-          <span className="work-group-status is-working">
-            <LoaderCircle className="spin" aria-hidden="true" />
+        {!live ? (
+          <span className="work-group-glyph">
+            <span className="work-group-status is-finished">
+              {row.outcome?.outcome === "failed" ? (
+                <AlertTriangle aria-hidden="true" />
+              ) : (
+                <Check aria-hidden="true" />
+              )}
+            </span>
           </span>
-          <span className="work-group-status is-finished">
-            {row.outcome?.outcome === "failed" ? (
-              <AlertTriangle aria-hidden="true" />
-            ) : (
-              <Check aria-hidden="true" />
-            )}
-          </span>
-        </span>
+        ) : null}
         <span>{label}</span>
         <ChevronDown aria-hidden="true" />
       </button>
@@ -1046,8 +1159,9 @@ function WorkGroup({
               onResolveUserInput={onResolveUserInput}
               onOpenOutput={onOpenOutput}
               onOpenSource={onOpenSource}
-              availableOutputIds={availableOutputIds}
-              availableSourceIds={availableSourceIds}
+              onOpenResource={onOpenResource}
+              availableOutputs={availableOutputs}
+              availableSources={availableSources}
               attachmentContentUrl={attachmentContentUrl}
               onPreviewAttachment={onPreviewAttachment}
             />
@@ -1058,11 +1172,17 @@ function WorkGroup({
   );
 }
 
-function EmptySession({ attachments }: { attachments: boolean }) {
+function EmptySession({
+  attachments,
+  modelAccent,
+}: {
+  attachments: boolean;
+  modelAccent: string;
+}) {
   return (
     <div className="empty-session">
       <div className="empty-session-mark" aria-hidden="true">
-        <YggGlyph />
+        <TuiSplashLogo modelAccent={modelAccent} />
       </div>
       <h1>What can I take off your plate?</h1>
       <p>
@@ -1077,79 +1197,109 @@ function EmptySession({ attachments }: { attachments: boolean }) {
 function ReasoningPowerSlider({
   options,
   value,
+  formatValue,
+  showLabel = true,
   disabled,
   onChange,
 }: {
   options: ReasoningEffort[];
   value: ReasoningEffort;
+  formatValue?: (value: ReasoningEffort) => string;
+  showLabel?: boolean;
   disabled: boolean;
   onChange: (value: ReasoningEffort) => void;
 }) {
-  const selectedIndex = Math.max(0, options.indexOf(value));
+  const [draftValue, setDraftValue] = useState(value);
+  const [dragging, setDragging] = useState(false);
+  const pendingValueRef = useRef<ReasoningEffort | null>(null);
+  const pendingTimerRef = useRef<number | null>(null);
+  const latestValueRef = useRef(value);
+  const selectedValue = options.includes(draftValue) ? draftValue : value;
+  const selectedIndex = Math.max(0, options.indexOf(selectedValue));
   const lastIndex = Math.max(0, options.length - 1);
   const position = lastIndex ? (selectedIndex / lastIndex) * 100 : 0;
-  const [burst, setBurst] = useState(0);
   const wheelDeltaRef = useRef(0);
   const isMax = selectedIndex === lastIndex && lastIndex > 0;
-  const isFast =
-    !isMax &&
-    /fast|high|xhigh/i.test(options[selectedIndex] ?? "") &&
+  const visibleValue = formatValue?.(selectedValue) ?? selectedValue;
+  const isOverdrive =
+    /^(?:high|xhigh|max)$/i.test(options[selectedIndex] ?? "") &&
     selectedIndex > 0;
+
+  useEffect(() => {
+    latestValueRef.current = value;
+  }, [value]);
+
+  useEffect(() => {
+    if (
+      pendingValueRef.current &&
+      value !== pendingValueRef.current &&
+      options.includes(draftValue)
+    ) {
+      return;
+    }
+    pendingValueRef.current = null;
+    if (pendingTimerRef.current !== null) {
+      window.clearTimeout(pendingTimerRef.current);
+      pendingTimerRef.current = null;
+    }
+    setDraftValue(value);
+  }, [draftValue, options, value]);
+
+  useEffect(
+    () => () => {
+      if (pendingTimerRef.current !== null) {
+        window.clearTimeout(pendingTimerRef.current);
+      }
+    },
+    [],
+  );
 
   const selectIndex = (index: number) => {
     const nextIndex = Math.max(0, Math.min(lastIndex, index));
     const next = options[nextIndex];
-    if (!next || next === value || disabled) return;
-    if (nextIndex === lastIndex) setBurst((current) => current + 1);
+    if (!next || next === selectedValue || disabled) return;
+    setDraftValue(next);
+    pendingValueRef.current = next;
+    if (pendingTimerRef.current !== null) {
+      window.clearTimeout(pendingTimerRef.current);
+    }
+    pendingTimerRef.current = window.setTimeout(() => {
+      pendingValueRef.current = null;
+      pendingTimerRef.current = null;
+      setDraftValue(latestValueRef.current);
+    }, 1_000);
     onChange(next);
   };
 
   return (
     <div className="reasoning-power-control">
-      <span className="reasoning-power-label" aria-hidden="true">
-        {value}
-      </span>
+      {showLabel ? (
+        <span className="reasoning-power-label" aria-hidden="true">
+          {visibleValue}
+        </span>
+      ) : null}
       <div className="power-slider-container">
         <div
           className="power-slider-root"
           data-max={isMax}
-          data-fast={isFast}
+          data-overdrive={isOverdrive}
+          data-dragging={dragging || undefined}
           data-disabled={disabled || undefined}
           style={{ "--power-position": `${position}%` } as CSSProperties}
         >
           <div className="power-slider-track" aria-hidden="true">
             <span className="power-slider-range" />
-            {isMax ? <span className="power-slider-max-fill" /> : null}
-            {isFast ? (
+            <span className="power-slider-max-fill" />
+            {isOverdrive ? (
               <span className="power-slider-fast-particles">
-                {Array.from({ length: 14 }, (_, index) => (
+                {Array.from({ length: 10 }, (_, index) => (
                   <i key={index} />
                 ))}
               </span>
             ) : null}
-            <span className="power-slider-ticks">
-              {options.map((option, index) => (
-                <i
-                  key={option}
-                  data-selected={index <= selectedIndex}
-                  style={
-                    {
-                      "--tick-position": `${lastIndex ? (index / lastIndex) * 100 : 50}%`,
-                    } as CSSProperties
-                  }
-                />
-              ))}
-            </span>
           </div>
           <span className="power-slider-thumb-rail" aria-hidden="true">
             <span className="power-slider-thumb" />
-            {burst ? (
-              <span className="power-slider-burst" key={burst}>
-                {Array.from({ length: 16 }, (_, index) => (
-                  <i key={index} />
-                ))}
-              </span>
-            ) : null}
           </span>
           <input
             className="power-slider-input"
@@ -1160,7 +1310,11 @@ function ReasoningPowerSlider({
             value={selectedIndex}
             disabled={disabled || lastIndex === 0}
             aria-label="Reasoning effort"
-            aria-valuetext={value}
+            aria-valuetext={visibleValue}
+            onPointerDown={() => setDragging(true)}
+            onPointerUp={() => setDragging(false)}
+            onPointerCancel={() => setDragging(false)}
+            onBlur={() => setDragging(false)}
             onChange={(event) => selectIndex(Number(event.target.value))}
             onWheel={(event) => {
               if (disabled) return;
@@ -1186,21 +1340,53 @@ function providerLabel(provider: string): string {
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+function preciseEffortLabel(value: ReasoningEffort): string {
+  if (value.toLowerCase() === "xhigh") return "Extra high";
+  return value
+    .replaceAll(/[-_]/g, " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function abstractEffortLabel(
+  options: ReasoningEffort[],
+  value: ReasoningEffort,
+): string {
+  const selectedIndex = Math.max(0, options.indexOf(value));
+  if (options.length > 1 && selectedIndex === options.length - 1) {
+    return "Max";
+  }
+  return preciseEffortLabel(value);
+}
+
+function compactModelLabel(name: string): string {
+  return name.replace(/^(?:Claude|OpenAI)\s+/i, "");
+}
+
 function ModelPicker({
   models,
   value,
+  reasoningOptions,
+  reasoning,
   disabled,
   hasStagedImages,
   onChange,
+  onReasoningChange,
 }: {
   models: ModelSummary[];
   value: string;
+  reasoningOptions: ReasoningEffort[];
+  reasoning: ReasoningEffort;
   disabled: boolean;
   hasStagedImages: boolean;
   onChange: (modelId: string) => void;
+  onReasoningChange: (reasoning: ReasoningEffort) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [view, setView] = useState<
+    "simple" | "advanced" | "models" | "effort"
+  >("simple");
   const [query, setQuery] = useState("");
+  const popoverPresence = useExitPresence(open);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
@@ -1220,14 +1406,9 @@ function ModelPicker({
   });
   const localModels = filteredModels.filter((model) => model.local);
   const remoteModels = filteredModels.filter((model) => !model.local);
-
-  const close = (restoreFocus = true) => {
-    setOpen(false);
-    setQuery("");
-    if (restoreFocus) {
-      triggerRef.current?.focus();
-    }
-  };
+  const simpleEffort = abstractEffortLabel(reasoningOptions, reasoning);
+  const exactEffort = preciseEffortLabel(reasoning);
+  const isMax = simpleEffort === "Max";
 
   useEffect(() => {
     if (!open) return;
@@ -1239,24 +1420,49 @@ function ModelPicker({
         !triggerRef.current?.contains(target)
       ) {
         setOpen(false);
-        setQuery("");
       }
     };
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
       setOpen(false);
-      setQuery("");
       window.requestAnimationFrame(() => triggerRef.current?.focus());
     };
     document.addEventListener("pointerdown", onPointerDown);
     document.addEventListener("keydown", onKeyDown);
-    window.requestAnimationFrame(() => searchRef.current?.focus());
     return () => {
       document.removeEventListener("pointerdown", onPointerDown);
       document.removeEventListener("keydown", onKeyDown);
     };
   }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    window.requestAnimationFrame(() => {
+      if (view === "models") {
+        searchRef.current?.focus();
+        return;
+      }
+      popoverRef.current
+        ?.querySelector<HTMLElement>("[data-autofocus]")
+        ?.focus();
+    });
+  }, [open, view]);
+
+  useEffect(() => {
+    if (popoverPresence.present) return;
+    const frame = window.requestAnimationFrame(() => {
+      setQuery("");
+      setView("simple");
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [popoverPresence.present]);
+
+  useEffect(() => {
+    if (!disabled || !open) return;
+    const frame = window.requestAnimationFrame(() => setOpen(false));
+    return () => window.cancelAnimationFrame(frame);
+  }, [disabled, open]);
 
   const focusOption = (from: HTMLElement, direction: 1 | -1) => {
     const options = Array.from(
@@ -1277,7 +1483,7 @@ function ModelPicker({
 
   const choose = (modelId: string) => {
     if (modelId !== value) onChange(modelId);
-    close();
+    setView("advanced");
   };
 
   const renderGroup = (label: string, groupModels: ModelSummary[]) => {
@@ -1328,14 +1534,155 @@ function ModelPicker({
     );
   };
 
+  const renderSimpleView = () => (
+    <div className="model-picker-overview">
+      <button
+        type="button"
+        className="model-picker-advanced-toggle"
+        data-autofocus
+        onClick={() => setView("advanced")}
+      >
+        <span>Advanced</span>
+        <ChevronRight aria-hidden="true" />
+        <Zap aria-hidden="true" />
+      </button>
+      <ReasoningPowerSlider
+        options={reasoningOptions}
+        value={reasoning}
+        formatValue={(effort) =>
+          abstractEffortLabel(reasoningOptions, effort)
+        }
+        showLabel={false}
+        disabled={disabled}
+        onChange={onReasoningChange}
+      />
+    </div>
+  );
+
+  const renderAdvancedView = () => (
+    <div className="model-picker-advanced-panel">
+      <button
+        type="button"
+        className="model-picker-setting-row"
+        data-autofocus
+        onClick={() => setView("models")}
+      >
+        <span>Model</span>
+        <strong>
+          {activeModel?.name ?? value}
+          <ChevronRight aria-hidden="true" />
+        </strong>
+      </button>
+      <button
+        type="button"
+        className="model-picker-setting-row"
+        onClick={() => setView("effort")}
+      >
+        <span>Effort</span>
+        <strong>
+          {exactEffort}
+          <ChevronRight aria-hidden="true" />
+        </strong>
+      </button>
+      <button
+        type="button"
+        className="model-picker-advanced-toggle is-expanded"
+        onClick={() => setView("simple")}
+      >
+        <span>Advanced</span>
+        <ChevronUp aria-hidden="true" />
+      </button>
+    </div>
+  );
+
+  const renderModelView = () => (
+    <>
+      <button
+        type="button"
+        className="model-picker-back"
+        onClick={() => setView("advanced")}
+      >
+        <ChevronLeft aria-hidden="true" />
+        <strong>Model</strong>
+      </button>
+      <label className="model-picker-search">
+        <Search aria-hidden="true" />
+        <span className="sr-only">Search models</span>
+        <input
+          ref={searchRef}
+          value={query}
+          placeholder="Search models"
+          aria-label="Search models"
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "ArrowDown") return;
+            event.preventDefault();
+            const firstOption =
+              popoverRef.current?.querySelector<HTMLButtonElement>(
+                'button[role="option"]',
+              );
+            firstOption?.focus();
+          }}
+        />
+      </label>
+      <div
+        className="model-picker-list"
+        role="listbox"
+        aria-label="Available models"
+      >
+        {renderGroup("On this device", localModels)}
+        {renderGroup("Connected providers", remoteModels)}
+        {!filteredModels.length ? (
+          <p className="model-picker-empty">No matching models</p>
+        ) : null}
+      </div>
+    </>
+  );
+
+  const renderEffortView = () => (
+    <>
+      <button
+        type="button"
+        className="model-picker-back"
+        data-autofocus
+        onClick={() => setView("advanced")}
+      >
+        <ChevronLeft aria-hidden="true" />
+        <strong>Effort</strong>
+      </button>
+      <div
+        className="model-picker-effort-list"
+        role="listbox"
+        aria-label="Exact effort levels"
+      >
+        {reasoningOptions.map((option) => (
+          <button
+            key={option}
+            type="button"
+            role="option"
+            aria-selected={option === reasoning}
+            className={option === reasoning ? "is-selected" : undefined}
+            onClick={() => {
+              if (option !== reasoning) onReasoningChange(option);
+              setView("advanced");
+            }}
+          >
+            <span>{preciseEffortLabel(option)}</span>
+            {option === reasoning ? <Check aria-hidden="true" /> : null}
+          </button>
+        ))}
+      </div>
+    </>
+  );
+
   return (
     <div className="model-picker">
       <button
         ref={triggerRef}
         type="button"
         className="model-picker-trigger"
-        aria-label="Model"
-        aria-haspopup="listbox"
+        aria-label={`Model and effort: ${activeModel?.name ?? value}, ${simpleEffort}`}
+        aria-haspopup="dialog"
         aria-expanded={open}
         data-value={value}
         disabled={disabled}
@@ -1344,51 +1691,28 @@ function ModelPicker({
         {activeModel?.local ? (
           <span className="local-model-dot" aria-hidden="true" />
         ) : null}
-        <span>{activeModel?.name ?? value}</span>
+        <span>{compactModelLabel(activeModel?.name ?? value)}</span>
+        <span
+          className={`model-picker-trigger-effort ${isMax ? "is-max" : ""}`}
+        >
+          {simpleEffort}
+        </span>
         <ChevronDown aria-hidden="true" />
       </button>
-      {open ? (
+      {popoverPresence.present ? (
         <div
           ref={popoverRef}
-          className="model-picker-popover"
+          className={`model-picker-popover ${popoverPresence.closing ? "is-closing" : ""}`}
           role="dialog"
-          aria-label="Choose a model"
+          aria-label="Model and effort"
+          aria-hidden={popoverPresence.closing || undefined}
+          inert={popoverPresence.closing}
+          data-view={view}
         >
-          <div className="model-picker-heading">
-            <strong>Choose a model</strong>
-            <small>{eligibleModels.length} available</small>
-          </div>
-          <label className="model-picker-search">
-            <Search aria-hidden="true" />
-            <span className="sr-only">Search models</span>
-            <input
-              ref={searchRef}
-              value={query}
-              placeholder="Search models"
-              aria-label="Search models"
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key !== "ArrowDown") return;
-                event.preventDefault();
-                const firstOption =
-                  popoverRef.current?.querySelector<HTMLButtonElement>(
-                    'button[role="option"]',
-                  );
-                firstOption?.focus();
-              }}
-            />
-          </label>
-          <div
-            className="model-picker-list"
-            role="listbox"
-            aria-label="Available models"
-          >
-            {renderGroup("On this device", localModels)}
-            {renderGroup("Connected providers", remoteModels)}
-            {!filteredModels.length ? (
-              <p className="model-picker-empty">No matching models</p>
-            ) : null}
-          </div>
+          {view === "simple" ? renderSimpleView() : null}
+          {view === "advanced" ? renderAdvancedView() : null}
+          {view === "models" ? renderModelView() : null}
+          {view === "effort" ? renderEffortView() : null}
         </div>
       ) : null}
     </div>
@@ -1413,6 +1737,7 @@ function ComposerMenu<T extends string>({
   onChange: (value: T) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const popoverPresence = useExitPresence(open);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   const activeOption =
@@ -1502,12 +1827,14 @@ function ComposerMenu<T extends string>({
         </span>
         <ChevronDown aria-hidden="true" />
       </button>
-      {open ? (
+      {popoverPresence.present ? (
         <div
           ref={popoverRef}
-          className="composer-menu-popover"
+          className={`composer-menu-popover ${popoverPresence.closing ? "is-closing" : ""}`}
           role="menu"
           aria-label={label}
+          aria-hidden={popoverPresence.closing || undefined}
+          inert={popoverPresence.closing}
         >
           <span className="composer-menu-heading">{label}</span>
           {options.map((option) => (
@@ -1594,6 +1921,8 @@ function Composer({
     Boolean(session.activeRunId) ||
     session.status === "working" ||
     session.status === "needs_attention";
+  const isModelWorking =
+    Boolean(session.activeRunId) || session.status === "working";
   const activeModel = bootstrap.models.find(
     (model) => model.id === session.modelId,
   );
@@ -1867,9 +2196,24 @@ function Composer({
       }}
     >
       <div
-        className={`composer ${isWorking ? "is-working" : ""}`}
+        className={`composer ${isWorking ? "is-working" : ""} ${isModelWorking ? "is-model-working" : ""}`}
         style={composerStyle}
       >
+        {isModelWorking ? (
+          <span className="composer-running-edge" aria-hidden="true">
+            <svg preserveAspectRatio="none">
+              <rect
+                className="composer-running-edge-chase"
+                x="1"
+                y="1"
+                width="calc(100% - 2px)"
+                height="calc(100% - 2px)"
+                rx="17"
+                pathLength="100"
+              />
+            </svg>
+          </span>
+        ) : null}
         {draggingFiles ? (
           <div className="attachment-drop-overlay" aria-hidden="true">
             <Paperclip />
@@ -1995,15 +2339,14 @@ function Composer({
             <ModelPicker
               models={bootstrap.models}
               value={session.modelId}
+              reasoningOptions={reasoningOptions}
+              reasoning={session.reasoning}
               disabled={isWorking}
               hasStagedImages={hasStagedImages}
               onChange={(modelId) => void onConfigure({ modelId })}
-            />
-            <ReasoningPowerSlider
-              options={reasoningOptions}
-              value={session.reasoning}
-              disabled={isWorking}
-              onChange={(reasoning) => void onConfigure({ reasoning })}
+              onReasoningChange={(reasoning) =>
+                void onConfigure({ reasoning })
+              }
             />
             <ComposerMenu
               label="Authority"
@@ -2066,24 +2409,26 @@ function Composer({
                 onClick={() => void onInterrupt()}
                 aria-label="Stop ygg"
               >
-                <CircleStop aria-hidden="true" />
+                <span className="stop-glyph" aria-hidden="true" />
               </button>
             ) : null}
-            <button
-              className="submit-button"
-              onClick={() => void submit()}
-              disabled={submitting || !canSubmit}
-              aria-disabled={submitting || !canSubmit}
-              aria-label={
-                isWorking
-                  ? activeDelivery === "steer"
-                    ? "Steer active run"
-                    : "Queue follow-up"
-                  : "Send message"
-              }
-            >
-              <ArrowUp aria-hidden="true" />
-            </button>
+            {!isWorking || canSubmit ? (
+              <button
+                className="submit-button"
+                onClick={() => void submit()}
+                disabled={submitting || !canSubmit}
+                aria-disabled={submitting || !canSubmit}
+                aria-label={
+                  isWorking
+                    ? activeDelivery === "steer"
+                      ? "Steer active run"
+                      : "Queue follow-up"
+                    : "Send message"
+                }
+              >
+                <ArrowUp aria-hidden="true" />
+              </button>
+            ) : null}
           </div>
         </div>
         {submitError ? (
@@ -2111,6 +2456,7 @@ export function Conversation({
   onResolveUserInput,
   onOpenOutput,
   onOpenSource,
+  onOpenResource,
   onIngestAttachment,
   attachmentContentUrl,
 }: ConversationProps) {
@@ -2126,25 +2472,74 @@ export function Conversation({
   );
   const shouldStickRef = useRef(true);
   const resourcesAvailable = bootstrap.capabilities.resources;
-  const availableOutputIds = new Set(
-    resourcesAvailable ? session.outputs.map((output) => output.id) : [],
+  const availableOutputs = new Map(
+    (resourcesAvailable ? session.outputs : []).map((output) => [
+      output.id,
+      output,
+    ]),
   );
-  const availableSourceIds = new Set(
-    resourcesAvailable ? session.sources.map((source) => source.id) : [],
+  const availableSources = new Map(
+    (resourcesAvailable ? session.sources : []).map((source) => [
+      source.id,
+      source,
+    ]),
   );
   const rows = transcriptRows(session.items);
+  const selectedModel = bootstrap.models.find(
+    (model) => model.id === session.modelId,
+  );
+  const selectedModelKey =
+    `${selectedModel?.provider ?? ""} ${selectedModel?.id ?? ""}`.toLowerCase();
+  const selectedModelAccent =
+    providerAccents.find(([provider]) =>
+      selectedModelKey.includes(provider),
+    )?.[1] ?? "#16876d";
 
   useEffect(() => {
     const element = scrollRef.current;
     if (!element) return;
+    shouldStickRef.current = true;
+    setShowJump(false);
     const onScroll = () => {
       const distance =
         element.scrollHeight - element.scrollTop - element.clientHeight;
-      shouldStickRef.current = distance < 120;
-      setShowJump(distance >= 180);
+      shouldStickRef.current = distance < 24;
+      setShowJump(distance >= 96);
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0) shouldStickRef.current = false;
+    };
+    const onTouchStart = () => {
+      shouldStickRef.current = false;
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      const target = event.target;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLElement && target.isContentEditable)
+      ) {
+        return;
+      }
+      if (
+        event.key === "ArrowUp" ||
+        event.key === "PageUp" ||
+        event.key === "Home"
+      ) {
+        shouldStickRef.current = false;
+      }
     };
     element.addEventListener("scroll", onScroll, { passive: true });
-    return () => element.removeEventListener("scroll", onScroll);
+    element.addEventListener("wheel", onWheel, { passive: true });
+    element.addEventListener("touchstart", onTouchStart, { passive: true });
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      element.removeEventListener("scroll", onScroll);
+      element.removeEventListener("wheel", onWheel);
+      element.removeEventListener("touchstart", onTouchStart);
+      document.removeEventListener("keydown", onKeyDown);
+    };
   }, [session.sessionId]);
 
   useLayoutEffect(() => {
@@ -2153,9 +2548,37 @@ export function Conversation({
     element.scrollTop = element.scrollHeight;
   }, [session.items, session.sessionId]);
 
+  useEffect(() => {
+    const element = scrollRef.current;
+    const transcript = element?.firstElementChild;
+    if (
+      !element ||
+      !(transcript instanceof HTMLElement) ||
+      typeof ResizeObserver === "undefined"
+    ) {
+      return;
+    }
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      if (!shouldStickRef.current) return;
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        element.scrollTop = element.scrollHeight;
+      });
+    });
+    observer.observe(element);
+    observer.observe(transcript);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [session.sessionId]);
+
   const jumpToLive = () => {
     const element = scrollRef.current;
     if (!element) return;
+    shouldStickRef.current = true;
+    setShowJump(false);
     const reduceMotion =
       window.matchMedia("(prefers-reduced-motion: reduce)").matches ||
       document.documentElement.dataset.motion === "reduced" ||
@@ -2182,16 +2605,16 @@ export function Conversation({
         >
           {session.items.length === 0 ? (
             <EmptySession
+              key={session.sessionId}
               attachments={
                 bootstrap.capabilities.attachments &&
                 bootstrap.capabilities.attachmentIngest &&
                 Boolean(bootstrap.capabilities.attachmentPolicy) &&
                 Boolean(
-                  bootstrap.models
-                    .find((model) => model.id === session.modelId)
-                    ?.inputModalities.includes("image"),
+                  selectedModel?.inputModalities.includes("image"),
                 )
               }
+              modelAccent={selectedModelAccent}
             />
           ) : (
             rows.map((row) =>
@@ -2204,8 +2627,9 @@ export function Conversation({
                   onResolveUserInput={onResolveUserInput}
                   onOpenOutput={onOpenOutput}
                   onOpenSource={onOpenSource}
-                  availableOutputIds={availableOutputIds}
-                  availableSourceIds={availableSourceIds}
+                  onOpenResource={onOpenResource}
+                  availableOutputs={availableOutputs}
+                  availableSources={availableSources}
                   attachmentContentUrl={attachmentContentUrl}
                   onPreviewAttachment={(source, name, trigger) =>
                     setAttachmentPreview({ source, name, trigger })
@@ -2220,8 +2644,9 @@ export function Conversation({
                   onResolveUserInput={onResolveUserInput}
                   onOpenOutput={onOpenOutput}
                   onOpenSource={onOpenSource}
-                  availableOutputIds={availableOutputIds}
-                  availableSourceIds={availableSourceIds}
+                  onOpenResource={onOpenResource}
+                  availableOutputs={availableOutputs}
+                  availableSources={availableSources}
                   attachmentContentUrl={attachmentContentUrl}
                   onPreviewAttachment={(source, name, trigger) =>
                     setAttachmentPreview({ source, name, trigger })

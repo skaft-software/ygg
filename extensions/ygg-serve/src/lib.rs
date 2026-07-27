@@ -16,6 +16,7 @@ mod event;
 mod ids;
 mod journal;
 mod model;
+mod resource;
 mod service;
 mod supervisor;
 mod theme;
@@ -53,12 +54,15 @@ pub use model::{
     CatalogCursor, ContextUsage, FileChange, HostBootstrap, HostCapabilities, HostDescriptor,
     InputModality, ItemLifecycle, ItemPayload, ModelSelection, ModelSummary, PendingRequest,
     PlanStep, PlanStepState, PreviewRef, ProjectSummary, RequestKind, RequestState, RunOutcome,
-    SessionCursor, SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, SourceKind,
-    SourceRef, UsageSnapshot, UserMessageDelivery,
+    SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionCursor, SessionItem,
+    SessionLiveState, SessionSnapshot, SessionSummary, SourceKind, SourceRef, UsageSnapshot,
+    UserMessageDelivery,
 };
+pub use resource::{ResourceReference, ResourceStore, ResourceStoreError};
 pub use service::{
-    CreateSessionRequest, DriverCommandOutcome, HostService, ServiceError, SessionDriver,
-    SessionSeed, StoredResource, MAX_DRIVER_OUTCOME_EVENTS,
+    CreateSessionRequest, DriverCommandOutcome, DriverFinalizer, FinalizeCompletion,
+    FinalizeDecision, HostService, ServiceError, SessionDriver, SessionSeed, StoredResource,
+    MAX_DRIVER_OUTCOME_EVENTS,
 };
 pub use supervisor::{HostCommandAdmission, SessionSupervisor, SupervisorConfig, SupervisorError};
 pub use theme::{

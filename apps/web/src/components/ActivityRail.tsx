@@ -1,14 +1,11 @@
 import {
-  BrainCircuit,
   Check,
   ChevronDown,
   Circle,
   File,
   FileText,
   Globe2,
-  LoaderCircle,
   PanelRightClose,
-  TerminalSquare,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type {
@@ -41,10 +38,20 @@ const sourceIcon = (source: SourceRef) => {
   return <File aria-hidden="true" />;
 };
 
+function LiveDots() {
+  return (
+    <span className="live-dots" aria-hidden="true">
+      <i />
+      <i />
+      <i />
+    </span>
+  );
+}
+
 function StepGlyph({ step }: { step: ProgressStep }) {
   if (step.status === "completed") return <Check aria-hidden="true" />;
   if (step.status === "in_progress") {
-    return <LoaderCircle className="spin" aria-hidden="true" />;
+    return <LiveDots />;
   }
   return <Circle aria-hidden="true" />;
 }
@@ -62,7 +69,6 @@ export function ActivityRail({
   const railRef = useRef<HTMLElement>(null);
   const [openSections, setOpenSections] = useState({
     progress: true,
-    activity: true,
     artifacts: true,
     context: true,
   });
@@ -108,9 +114,6 @@ export function ActivityRail({
   const completeCount = session.progress.filter(
     (step) => step.status === "completed",
   ).length;
-  const liveWork = session.items
-    .filter((item) => item.kind === "action" || item.kind === "reasoning")
-    .slice(-8);
 
   return (
     <aside
@@ -155,56 +158,6 @@ export function ActivityRail({
                       {step.status === "in_progress"
                         ? step.activeForm
                         : step.content}
-                    </span>
-                  </li>
-                ))}
-              </ol>
-            </details>
-          </section>
-        ) : null}
-
-        {liveWork.length ? (
-          <section className="rail-section" aria-labelledby="activity-heading">
-            <details
-              open={openSections.activity}
-              onToggle={(event) => {
-                const open = event.currentTarget.open;
-                setOpenSections((current) => ({
-                  ...current,
-                  activity: open,
-                }));
-              }}
-            >
-              <summary>
-                <span id="activity-heading">Activity</span>
-                <em>
-                  {liveWork.some((item) => item.state === "streaming")
-                    ? "Live"
-                    : liveWork.length}
-                </em>
-                <ChevronDown aria-hidden="true" />
-              </summary>
-              <ol className="live-activity-list">
-                {liveWork.map((item) => (
-                  <li key={item.id} data-state={item.state}>
-                    <span>
-                      {item.state === "streaming" ? (
-                        <LoaderCircle className="spin" aria-hidden="true" />
-                      ) : item.kind === "reasoning" ? (
-                        <BrainCircuit aria-hidden="true" />
-                      ) : (
-                        <TerminalSquare aria-hidden="true" />
-                      )}
-                    </span>
-                    <span>
-                      <strong>
-                        {item.kind === "reasoning"
-                          ? item.summary
-                          : item.label}
-                      </strong>
-                      {item.kind === "action" && item.target ? (
-                        <code>{item.target}</code>
-                      ) : null}
                     </span>
                   </li>
                 ))}

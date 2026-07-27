@@ -15,7 +15,7 @@ case "$binary" in
         ;;
 esac
 if [ ! -x "$binary" ]; then
-    echo "installed Ygg binary is not executable: $binary" >&2
+    echo "installed ygg binary is not executable: $binary" >&2
     exit 2
 fi
 
@@ -60,12 +60,12 @@ server_pid=$!
 launch_url=
 attempt=0
 while [ "$attempt" -lt 100 ]; do
-    launch_url=$(sed -n 's/^Open Ygg once: //p' "$server_log" | sed -n '1p')
+    launch_url=$(sed -n 's/^Open ygg once: //p' "$server_log" | sed -n '1p')
     if [ -n "$launch_url" ]; then
         break
     fi
     if ! kill -0 "$server_pid" >/dev/null 2>&1; then
-        echo "installed Ygg exited before publishing its launch URL" >&2
+        echo "installed ygg exited before publishing its launch URL" >&2
         sed -E 's#(/__ygg/launch/)[0-9a-f]{64}#\1<redacted>#g' "$server_log" >&2
         exit 1
     fi
@@ -73,12 +73,12 @@ while [ "$attempt" -lt 100 ]; do
     sleep 0.1
 done
 if [ -z "$launch_url" ]; then
-    echo "installed Ygg did not publish a launch URL in time" >&2
+    echo "installed ygg did not publish a launch URL in time" >&2
     exit 1
 fi
 if ! printf '%s\n' "$launch_url" \
     | grep -Eq '^http://127\.0\.0\.1:[0-9]+/__ygg/launch/[0-9a-f]{64}$'; then
-    echo "installed Ygg published a malformed or non-loopback launch URL" >&2
+    echo "installed ygg published a malformed or non-loopback launch URL" >&2
     exit 1
 fi
 
@@ -127,10 +127,22 @@ curl -fsS \
     --dump-header "$work_directory/app-css.headers" \
     --output "$work_directory/download/assets/app.css" \
     "$origin/assets/app.css"
+curl -fsS \
+    --noproxy '*' \
+    --proto '=http' \
+    --connect-timeout 2 \
+    --max-time 10 \
+    --cookie "$cookie_jar" \
+    --dump-header "$work_directory/markdown-chunk.headers" \
+    --output "$work_directory/download/assets/chunk-MarkdownMessage.js" \
+    "$origin/assets/chunk-MarkdownMessage.js"
 
 cmp "$work_directory/download/index.html" "$expected_directory/index.html"
 cmp "$work_directory/download/assets/app.js" "$expected_directory/assets/app.js"
 cmp "$work_directory/download/assets/app.css" "$expected_directory/assets/app.css"
+cmp \
+    "$work_directory/download/assets/chunk-MarkdownMessage.js" \
+    "$expected_directory/assets/chunk-MarkdownMessage.js"
 
 (
     cd "$work_directory/download"
@@ -144,16 +156,21 @@ cmp "$work_directory/download/assets/app.css" "$expected_directory/assets/app.cs
 tr -d '\r' <"$work_directory/index.headers" >"$work_directory/index.headers.clean"
 tr -d '\r' <"$work_directory/app-js.headers" >"$work_directory/app-js.headers.clean"
 tr -d '\r' <"$work_directory/app-css.headers" >"$work_directory/app-css.headers.clean"
+tr -d '\r' \
+    <"$work_directory/markdown-chunk.headers" \
+    >"$work_directory/markdown-chunk.headers.clean"
 bundle_sha256=$(cat "$expected_directory/bundle.sha256")
-expected_csp="content-security-policy: default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; img-src 'self' data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+expected_csp="content-security-policy: default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
 
 grep -Fxi "content-type: text/html; charset=utf-8" "$work_directory/index.headers.clean" >/dev/null
 grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/app-js.headers.clean" >/dev/null
 grep -Fxi "content-type: text/css; charset=utf-8" "$work_directory/app-css.headers.clean" >/dev/null
+grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/markdown-chunk.headers.clean" >/dev/null
 for headers in \
     "$work_directory/index.headers.clean" \
     "$work_directory/app-js.headers.clean" \
-    "$work_directory/app-css.headers.clean"
+    "$work_directory/app-css.headers.clean" \
+    "$work_directory/markdown-chunk.headers.clean"
 do
     grep -Fxi "cache-control: no-store" "$headers" >/dev/null
     grep -Fxi "x-content-type-options: nosniff" "$headers" >/dev/null
@@ -163,8 +180,8 @@ do
 done
 
 if grep -Fq "graphical shell is not bundled" "$work_directory/download/index.html"; then
-    echo "installed Ygg served the retired placeholder shell" >&2
+    echo "installed ygg served the retired placeholder shell" >&2
     exit 1
 fi
 
-printf 'installed Ygg served the checked web bundle %s\n' "$bundle_sha256"
+printf 'installed ygg served the checked web bundle %s\n' "$bundle_sha256"

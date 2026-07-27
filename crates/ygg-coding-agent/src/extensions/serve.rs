@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -14,8 +16,8 @@ use sexy_tui_rs::{Color as TuiColor, TextStyle as TuiTextStyle};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use ygg_agent::{
-    AgentEvent, Entry, EntryValue, FinishReason, InputPart, OutputChannel, RunControl, Session,
-    SessionRunOutcome, SessionRunOutcomeStatus, ToolOutput, ToolProgress, UserInput,
+    AgentEvent, Entry, EntryId, EntryValue, FinishReason, InputPart, OutputChannel, RunControl,
+    Session, SessionRunOutcome, SessionRunOutcomeStatus, ToolOutput, ToolProgress, UserInput,
 };
 use ygg_ai::{
     AssistantPart, ImageSource, Media, Message, Modality, Model, ModelCatalog, ModelId,
@@ -25,19 +27,20 @@ use ygg_serve_backend::{
     ActorOwnerState, ArtifactId, ArtifactKind, ArtifactRef, AttachmentError, AttachmentFingerprint,
     AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState, AuthorityProfile,
     ColorScheme, ContextUsage, CreateSessionRequest, DriverCommandOutcome, DurableEntryId,
-    EventPayload, FileChange, HostCapabilities, HostDescriptor, HostId, HostService, InputModality,
-    ItemDelta, ItemId, ItemLifecycle, ItemPayload, LoopbackConfig, LoopbackServer, ModelSelection,
-    ModelSummary, PendingRequest, ProjectId, ProjectSummary, PromptInput, ProtocolValidation,
-    RequestAnswer, RequestId, RequestKind, RequestState, RunId, SemanticRole, ServiceError,
-    SessionCommand, SessionCursor, SessionDriver, SessionId, SessionItem, SessionLiveState,
-    SessionSeed, SessionSnapshot, SessionSummary, SessionSupervisor, SourceId, SourceKind,
-    SourceRef, StoredAttachment, StoredResource, SupervisorConfig, ThemeColor, ThemeDensity,
-    ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
-    TimestampedEvent, TurnId, UsageSnapshot, UserMessageDelivery, MAX_ITEM_TEXT_BYTES,
-    MAX_PROMPT_BYTES,
+    EventPayload, FileChange, FinalizeCompletion, FinalizeDecision, HostCapabilities,
+    HostDescriptor, HostId, HostService, InputModality, ItemDelta, ItemId, ItemLifecycle,
+    ItemPayload, LoopbackConfig, LoopbackServer, ModelSelection, ModelSummary, PendingRequest,
+    ProjectId, ProjectSummary, PromptInput, ProtocolValidation, RequestAnswer, RequestId,
+    RequestKind, RequestState, RunId, SemanticRole, ServiceError, SessionBranchEntry,
+    SessionBranchEntryKind, SessionBranchGraph, SessionCommand, SessionCursor, SessionDriver,
+    SessionId, SessionItem, SessionLiveState, SessionSeed, SessionSnapshot, SessionSummary,
+    SessionSupervisor, SourceId, SourceKind, SourceRef, StoredAttachment, StoredResource,
+    SupervisorConfig, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
+    ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, TurnId, UsageSnapshot,
+    UserMessageDelivery, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
 };
 
-use crate::app::bootstrap::{build_app, LaunchSelection, SessionSelection};
+use crate::app::bootstrap::{build_app, rebuild_app, LaunchSelection, SessionSelection};
 use crate::app::{reasoning_label, supported_levels, App, Reconfig};
 use crate::config::{self, Config};
 use crate::resources::compose_instructions;
@@ -47,110 +50,12 @@ const DRIVER_MAILBOX_CAPACITY: usize = 64;
 const DRIVER_EVENT_CAPACITY: usize = 512;
 const MAX_GRAPHICAL_MODELS: usize = 256;
 const MAX_PROJECTED_SESSION_ITEMS: usize = 9_000;
+const MAX_PROJECTED_BRANCH_ENTRIES: usize = 2_048;
+const MAX_BRANCH_DELTA_ENTRIES: usize = 128;
+const MAX_GRAPHICAL_SESSION_EXPORT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OPAQUE_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_OPAQUE_RESOURCE_COUNT: usize = 2_048;
-const MAX_OPAQUE_RESOURCE_TOTAL_BYTES: usize = 256 * 1024 * 1024;
-const OPAQUE_RESOURCE_HANDLE_BYTES: usize = 32;
 
 static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Default)]
-struct OpaqueResourceIndex {
-    resources: HashMap<String, StoredResource>,
-    total_bytes: usize,
-}
-
-/// Process-local immutable resource snapshots.
-///
-/// A client can only dereference a random host-minted handle through the
-/// authenticated loopback route. Paths and URLs are never accepted by that
-/// route, and every registered snapshot is independently bounded.
-#[derive(Clone, Default)]
-struct OpaqueResourceRegistry {
-    index: Arc<Mutex<OpaqueResourceIndex>>,
-}
-
-impl OpaqueResourceRegistry {
-    fn register(
-        &self,
-        display_name: &str,
-        media_type: &str,
-        bytes: bytes::Bytes,
-    ) -> Result<(String, StoredResource), ServiceError> {
-        if bytes.len() > MAX_OPAQUE_RESOURCE_BYTES || !safe_media_type(media_type) {
-            return Err(ServiceError::InvalidBoundary);
-        }
-        let display_name = safe_resource_name(display_name)?;
-        let sha256 = stable_hash(&bytes);
-        let mut index = self.index.lock().map_err(|_| ServiceError::Internal)?;
-        if index.resources.len() >= MAX_OPAQUE_RESOURCE_COUNT
-            || index
-                .total_bytes
-                .checked_add(bytes.len())
-                .is_none_or(|total| total > MAX_OPAQUE_RESOURCE_TOTAL_BYTES)
-        {
-            return Err(ServiceError::Unavailable);
-        }
-        let handle = loop {
-            let mut random = [0u8; OPAQUE_RESOURCE_HANDLE_BYTES];
-            getrandom::fill(&mut random).map_err(|_| ServiceError::Internal)?;
-            let candidate = random
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            if !index.resources.contains_key(&candidate) {
-                break candidate;
-            }
-        };
-        let resource = StoredResource {
-            display_name,
-            media_type: media_type.to_owned(),
-            bytes,
-            sha256,
-        };
-        index.total_bytes = index.total_bytes.saturating_add(resource.bytes.len());
-        index.resources.insert(handle.clone(), resource.clone());
-        Ok((handle, resource))
-    }
-
-    fn content(&self, handle: &str) -> Result<StoredResource, ServiceError> {
-        if handle.len() != OPAQUE_RESOURCE_HANDLE_BYTES * 2
-            || !handle
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(ServiceError::NotFound);
-        }
-        self.index
-            .lock()
-            .map_err(|_| ServiceError::Internal)?
-            .resources
-            .get(handle)
-            .cloned()
-            .ok_or(ServiceError::NotFound)
-    }
-}
-
-fn safe_media_type(value: &str) -> bool {
-    value.contains('/')
-        && value.len() <= 255
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'+' | b'-' | b'.'))
-}
-
-fn safe_resource_name(value: &str) -> Result<String, ServiceError> {
-    let normalized = value.replace('\\', "/");
-    let basename = normalized.rsplit('/').next().unwrap_or_default().trim();
-    if basename.is_empty() || matches!(basename, "." | "..") {
-        return Err(ServiceError::InvalidBoundary);
-    }
-    let basename = ygg_serve_backend::sanitize_public_text(basename, 512, false);
-    if basename.is_empty() {
-        return Err(ServiceError::InvalidBoundary);
-    }
-    Ok(basename)
-}
 
 pub async fn run(
     config: Config,
@@ -267,7 +172,12 @@ struct YggHost {
     themes: Vec<ThemeOption>,
     selected_theme_id: ThemeId,
     attachments: Option<AttachmentStore>,
-    resources: OpaqueResourceRegistry,
+    resources: Option<ygg_serve_backend::ResourceStore>,
+    serve_state_dir: PathBuf,
+    #[cfg(test)]
+    checkout_hooks: Arc<Mutex<VecDeque<CheckoutTestHooks>>>,
+    #[cfg(test)]
+    open_count: Arc<AtomicU64>,
 }
 
 impl YggHost {
@@ -305,6 +215,15 @@ impl YggHost {
                 None
             }
         };
+        let resources = match ygg_serve_backend::ResourceStore::open(&state_dir) {
+            Ok(store) => Some(store),
+            Err(_) => {
+                crate::output::stderr_line(
+                    "warning: secure evidence storage is unavailable; durable sources and outputs are disabled",
+                );
+                None
+            }
+        };
         Ok(Self {
             config,
             catalog: boot.catalog,
@@ -315,7 +234,12 @@ impl YggHost {
             themes,
             selected_theme_id,
             attachments,
-            resources: OpaqueResourceRegistry::default(),
+            resources,
+            serve_state_dir: state_dir,
+            #[cfg(test)]
+            checkout_hooks: Arc::new(Mutex::new(VecDeque::new())),
+            #[cfg(test)]
+            open_count: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -369,9 +293,10 @@ impl YggHost {
         let session_id = session_id_from_path(&session_path)?;
         let generation = next_actor_generation();
         let selection = selection_for_model(&resolved, &reasoning, &self.config);
+        let project_id = request.project_id.or_else(|| Some(self.project_id.clone()));
         let seed = empty_seed(
             session_id,
-            request.project_id.or_else(|| Some(self.project_id.clone())),
+            project_id.clone(),
             selection.clone(),
             request.authority,
             generation,
@@ -389,8 +314,11 @@ impl YggHost {
             available_models: self.models.clone(),
             actor_generation: generation,
             session_id: seed.summary.id.clone(),
+            project_id,
             attachments: self.attachments.clone(),
             resources: self.resources.clone(),
+            #[cfg(test)]
+            checkout_hooks: CheckoutTestHooks::default(),
         };
         Ok(YggSessionDriver::spawn(seed, plan, 0))
     }
@@ -399,6 +327,8 @@ impl YggHost {
         &self,
         session_id: &SessionId,
     ) -> Result<YggSessionDriver, ServiceError> {
+        #[cfg(test)]
+        self.open_count.fetch_add(1, Ordering::Relaxed);
         let path = self
             .sessions
             .path_by_id(session_id.as_str())
@@ -417,6 +347,7 @@ impl YggHost {
                 generation,
                 meta: session_meta_for_id(&self.sessions, session_id),
                 attachment_store: self.attachments.as_ref(),
+                resource_store: self.resources.as_ref(),
             },
         )?;
         let reasoning =
@@ -434,12 +365,60 @@ impl YggHost {
             available_models: self.models.clone(),
             actor_generation: generation,
             session_id: session_id.clone(),
+            project_id: Some(self.project_id.clone()),
             attachments: self.attachments.clone(),
             resources: self.resources.clone(),
+            #[cfg(test)]
+            checkout_hooks: self
+                .checkout_hooks
+                .lock()
+                .map_err(|_| ServiceError::Internal)?
+                .pop_front()
+                .unwrap_or_default(),
         };
         let known_entries = session.entries().len();
         Ok(YggSessionDriver::spawn(seed, plan, known_entries))
     }
+}
+
+fn export_session_bytes(
+    sessions: &SessionStore,
+    session_id: &SessionId,
+    serve_state_dir: &Path,
+    max_bytes: usize,
+) -> Result<bytes::Bytes, ServiceError> {
+    sessions
+        .path_by_id(session_id.as_str())
+        .map_err(|_| ServiceError::NotFound)?;
+    let serve_state_dir = serve_state_dir
+        .canonicalize()
+        .map_err(|_| ServiceError::Internal)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".session-export-")
+        .tempdir_in(&serve_state_dir)
+        .map_err(|_| ServiceError::Internal)?;
+    let destination = temporary.path().join("session.json");
+    let report = crate::session_commands::export_portable(
+        sessions,
+        session_id.as_str(),
+        Some(destination),
+        temporary.path(),
+        false,
+        false,
+    )
+    .map_err(|_| ServiceError::Internal)?;
+    if report.included_secrets {
+        return Err(ServiceError::Internal);
+    }
+    let bytes =
+        match ygg_agent::secure_fs::read_regular_file_bounded(&report.destination, max_bytes) {
+            Ok(bytes) => bytes,
+            Err(ygg_agent::secure_fs::SecureFileError::TooLarge { .. }) => {
+                return Err(ServiceError::PayloadTooLarge)
+            }
+            Err(_) => return Err(ServiceError::Internal),
+        };
+    Ok(bytes::Bytes::from(bytes))
 }
 
 #[async_trait]
@@ -454,12 +433,14 @@ impl HostService for YggHost {
         let attachment_policy = self.attachments.as_ref().map(AttachmentStore::policy);
         HostCapabilities {
             concurrent_sessions: true,
-            opaque_resources: true,
+            opaque_resources: self.resources.is_some(),
             attachments: attachment_policy.is_some(),
             attachment_policy,
             previews: false,
             connected_devices: false,
             session_metadata: true,
+            session_branches: true,
+            session_export: true,
             lan_clients: false,
             terminal: false,
             child_agents: false,
@@ -489,8 +470,32 @@ impl HostService for YggHost {
             .content(handle)
     }
 
-    async fn resource_content(&self, handle: &str) -> Result<StoredResource, ServiceError> {
-        self.resources.content(handle)
+    async fn resource_content(
+        &self,
+        session_id: &SessionId,
+        handle: &str,
+    ) -> Result<StoredResource, ServiceError> {
+        self.resources
+            .as_ref()
+            .ok_or(ServiceError::Unavailable)?
+            .content(session_id, handle)
+            .map_err(resource_store_service_error)
+    }
+
+    async fn session_export(&self, session_id: &SessionId) -> Result<bytes::Bytes, ServiceError> {
+        let sessions = self.sessions.clone();
+        let session_id = session_id.clone();
+        let serve_state_dir = self.serve_state_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            export_session_bytes(
+                &sessions,
+                &session_id,
+                &serve_state_dir,
+                MAX_GRAPHICAL_SESSION_EXPORT_BYTES,
+            )
+        })
+        .await
+        .map_err(|_| ServiceError::Internal)?
     }
 
     fn authority_ceiling(&self) -> AuthorityProfile {
@@ -568,15 +573,16 @@ impl HostService for YggHost {
 
 struct YggSessionDriver {
     seed: SessionSeed,
-    commands: mpsc::Sender<WorkerCommand>,
+    commands: Option<mpsc::Sender<WorkerCommand>>,
     events: mpsc::Receiver<TimestampedEvent>,
+    worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl YggSessionDriver {
     fn spawn(seed: SessionSeed, plan: WorkerPlan, known_entries: usize) -> Self {
         let (commands, command_receiver) = mpsc::channel(DRIVER_MAILBOX_CAPACITY);
         let (event_sender, events) = mpsc::channel(DRIVER_EVENT_CAPACITY);
-        tokio::spawn(run_worker(
+        let worker = tokio::spawn(run_worker(
             plan,
             command_receiver,
             event_sender,
@@ -584,8 +590,9 @@ impl YggSessionDriver {
         ));
         Self {
             seed,
-            commands,
+            commands: Some(commands),
             events,
+            worker: Some(worker),
         }
     }
 }
@@ -602,6 +609,8 @@ impl SessionDriver for YggSessionDriver {
     ) -> Result<DriverCommandOutcome, ServiceError> {
         let (response, receiver) = oneshot::channel();
         self.commands
+            .as_ref()
+            .ok_or(ServiceError::OwnerLost)?
             .send(WorkerCommand { command, response })
             .await
             .map_err(|_| ServiceError::Unavailable)?;
@@ -610,6 +619,14 @@ impl SessionDriver for YggSessionDriver {
 
     async fn next_event(&mut self) -> Option<TimestampedEvent> {
         self.events.recv().await
+    }
+
+    async fn shutdown(&mut self) {
+        self.commands.take();
+        self.events.close();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.await;
+        }
     }
 }
 
@@ -626,8 +643,27 @@ struct WorkerPlan {
     available_models: Vec<ModelSummary>,
     actor_generation: u64,
     session_id: SessionId,
+    project_id: Option<ProjectId>,
     attachments: Option<AttachmentStore>,
-    resources: OpaqueResourceRegistry,
+    resources: Option<ygg_serve_backend::ResourceStore>,
+    #[cfg(test)]
+    checkout_hooks: CheckoutTestHooks,
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct CheckoutTestHooks {
+    rollback_gate: Option<CheckoutRollbackGate>,
+    corrupt_replacement_identity: bool,
+    fail_seed_after_checkout: bool,
+    fail_rollback: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CheckoutRollbackGate {
+    entered: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
 }
 
 enum PrivateResponse {
@@ -644,6 +680,14 @@ struct PrivateRequest {
 struct ProjectedToolCall {
     name: String,
     arguments: serde_json::Value,
+}
+
+struct CompletedToolEvidence {
+    tool_call_id: String,
+    tool_item_id: ItemId,
+    turn_id: TurnId,
+    tool: ProjectedToolCall,
+    output: ToolOutput,
 }
 
 struct PendingUserItem {
@@ -664,6 +708,7 @@ struct ProjectionState {
     completed_reasoning_items: VecDeque<Option<ItemId>>,
     tool_items: HashMap<String, ItemId>,
     tool_calls: HashMap<String, ProjectedToolCall>,
+    pending_tool_evidence: VecDeque<CompletedToolEvidence>,
     tool_progress: HashMap<String, (String, u64)>,
     private_requests: HashMap<RequestId, PrivateRequest>,
     pending_attachments: VecDeque<Vec<AttachmentRef>>,
@@ -685,6 +730,7 @@ impl ProjectionState {
             completed_reasoning_items: VecDeque::new(),
             tool_items: HashMap::new(),
             tool_calls: HashMap::new(),
+            pending_tool_evidence: VecDeque::new(),
             tool_progress: HashMap::new(),
             private_requests: HashMap::new(),
             pending_attachments: VecDeque::new(),
@@ -797,6 +843,152 @@ async fn run_worker(
                             }))
                             .await;
                         app = Some(owned_app);
+                    }
+                }
+            }
+            SessionCommand::Checkout { entry_id } => {
+                let mut owned_app = match app.take() {
+                    Some(app) => app,
+                    None => match build_worker_app(&plan) {
+                        Ok(app) => app,
+                        Err(_) => {
+                            let _ = message.response.send(Err(ServiceError::Internal));
+                            continue;
+                        }
+                    },
+                };
+                let path = owned_app.agent.session().path().to_owned();
+                let Some(previous_head) = owned_app.agent.session().head() else {
+                    app = Some(owned_app);
+                    let _ = message.response.send(Err(ServiceError::InvalidBoundary));
+                    continue;
+                };
+                if owned_app
+                    .agent
+                    .session_mut()
+                    .checkout(EntryId(entry_id.as_str().to_owned()))
+                    .is_err()
+                {
+                    app = Some(owned_app);
+                    let _ = message.response.send(Err(ServiceError::InvalidBoundary));
+                    continue;
+                }
+
+                let selection = SessionSelection::OpenExisting(path.clone());
+                let rebuilt =
+                    match rebuild_app(owned_app, None, None, None, Some(selection.clone())) {
+                        Ok(rebuilt) => rebuilt,
+                        Err(_) => {
+                            match checkout_rejection_after_rollback(
+                                restore_checkout_owner(&path, previous_head, &plan),
+                                ServiceError::Internal,
+                            ) {
+                                Ok((restored, rejection)) => {
+                                    app = Some(restored);
+                                    let _ = message.response.send(Err(rejection));
+                                    continue;
+                                }
+                                Err(owner_lost) => {
+                                    app = None;
+                                    let _ = message.response.send(Err(owner_lost));
+                                    break;
+                                }
+                            }
+                        }
+                    };
+                let model = selection_for_model(&rebuilt.model, &rebuilt.reasoning, &plan.config);
+                let replacement = seed_from_session(
+                    rebuilt.agent.session(),
+                    plan.session_id.clone(),
+                    SessionSeedOptions {
+                        project_id: plan.project_id.clone(),
+                        model,
+                        authority: plan.authority,
+                        generation: plan.actor_generation,
+                        meta: session_meta_for_id(&plan.sessions, &plan.session_id),
+                        attachment_store: plan.attachments.as_ref(),
+                        resource_store: plan.resources.as_ref(),
+                    },
+                );
+                #[cfg(test)]
+                let mut replacement = replacement;
+                #[cfg(test)]
+                {
+                    if plan.checkout_hooks.fail_seed_after_checkout {
+                        replacement = Err(ServiceError::InvalidSeed);
+                    } else if plan.checkout_hooks.corrupt_replacement_identity {
+                        if let Ok(seed) = replacement.as_mut() {
+                            let wrong =
+                                SessionId::new("test-corrupt-replacement").expect("test ID");
+                            seed.summary.id = wrong.clone();
+                            seed.snapshot.session_id = wrong;
+                        }
+                    }
+                }
+                match replacement {
+                    Ok(seed) => {
+                        let (outcome, mut finalizer) = DriverCommandOutcome::guarded_replace(seed);
+                        let _ = message.response.send(Ok(outcome));
+                        match finalizer.decision().await {
+                            Ok(FinalizeDecision::Commit) => {
+                                plan.launch.model = rebuilt.model.spec.id.clone();
+                                plan.launch.reasoning = rebuilt.reasoning.clone();
+                                plan.launch.reasoning_mode = rebuilt.reasoning_mode;
+                                plan.launch.session = selection;
+                                projection.begin_run();
+                                projection.known_entries = rebuilt.agent.session().entries().len();
+                                app = Some(rebuilt);
+                                let _ = finalizer.complete(Ok(FinalizeCompletion::Committed));
+                            }
+                            Ok(FinalizeDecision::Rollback) => {
+                                wait_for_checkout_rollback_gate(&plan).await;
+                                match rollback_checkout_candidate(
+                                    rebuilt,
+                                    &path,
+                                    previous_head,
+                                    &plan,
+                                ) {
+                                    Ok(restored) => {
+                                        app = Some(restored);
+                                        let _ =
+                                            finalizer.complete(Ok(FinalizeCompletion::RolledBack));
+                                    }
+                                    Err(_) => {
+                                        app = None;
+                                        let _ = finalizer.complete(Err(ServiceError::OwnerLost));
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                wait_for_checkout_rollback_gate(&plan).await;
+                                app = rollback_checkout_candidate(
+                                    rebuilt,
+                                    &path,
+                                    previous_head,
+                                    &plan,
+                                )
+                                .ok();
+                                if app.is_none() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        match checkout_rejection_after_rollback(
+                            rollback_checkout_candidate(rebuilt, &path, previous_head, &plan),
+                            error,
+                        ) {
+                            Ok((restored, rejection)) => {
+                                app = Some(restored);
+                                let _ = message.response.send(Err(rejection));
+                            }
+                            Err(owner_lost) => {
+                                app = None;
+                                let _ = message.response.send(Err(owner_lost));
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -981,6 +1173,7 @@ fn reconfiguration_outcome(
         model: selection,
         authority,
     })];
+    let branch_start = projection.known_entries;
     for item in project_new_entries(
         app.agent.session(),
         projection,
@@ -990,16 +1183,7 @@ fn reconfiguration_outcome(
     )? {
         events.push(event(EventPayload::ItemCommitted { item }));
     }
-    let durable_entry_id = app
-        .agent
-        .session()
-        .head()
-        .map(|head| DurableEntryId::new(head.0))
-        .transpose()
-        .map_err(|_| ServiceError::Internal)?;
-    events.push(event(EventPayload::SessionDurableHeadChanged {
-        durable_entry_id,
-    }));
+    events.extend(branch_delta_events(app.agent.session(), branch_start)?);
     Ok(DriverCommandOutcome::with_events(events))
 }
 
@@ -1008,6 +1192,7 @@ fn persist_idle_selection(
     projection: &mut ProjectionState,
     selection: ModelSelection,
 ) -> Result<DriverCommandOutcome, ServiceError> {
+    let branch_start = projection.known_entries;
     let (path, session, newly_created) = match &plan.launch.session {
         SessionSelection::CreateNew(path) => (
             path.clone(),
@@ -1040,19 +1225,13 @@ fn persist_idle_selection(
         return Err(ServiceError::Internal);
     }
     projection.known_entries = session.entries().len();
-    let durable_entry_id = session
-        .head()
-        .map(|head| DurableEntryId::new(head.0))
-        .transpose()
-        .map_err(|_| ServiceError::Internal)?;
     plan.launch.session = SessionSelection::OpenExisting(path);
-    Ok(DriverCommandOutcome::with_events(vec![
-        event(EventPayload::SessionSettingsChanged {
-            model: selection,
-            authority: plan.authority,
-        }),
-        event(EventPayload::SessionDurableHeadChanged { durable_entry_id }),
-    ]))
+    let mut events = vec![event(EventPayload::SessionSettingsChanged {
+        model: selection,
+        authority: plan.authority,
+    })];
+    events.extend(branch_delta_events(&session, branch_start)?);
+    Ok(DriverCommandOutcome::with_events(events))
 }
 
 fn rename_session_outcome(
@@ -1097,6 +1276,55 @@ fn ensure_durable_session(plan: &WorkerPlan) -> Result<(), ServiceError> {
             Err(ServiceError::InvalidBoundary)
         }
     }
+}
+
+fn restore_session_head(path: &std::path::Path, head: EntryId) -> Result<(), ServiceError> {
+    let mut session = Session::open(path).map_err(|_| ServiceError::Internal)?;
+    session.checkout(head).map_err(|_| ServiceError::Internal)
+}
+
+fn rollback_checkout_candidate(
+    mut candidate: App,
+    path: &Path,
+    previous_head: EntryId,
+    plan: &WorkerPlan,
+) -> Result<App, ServiceError> {
+    candidate.executable_extensions.shutdown_blocking();
+    drop(candidate);
+    restore_checkout_owner(path, previous_head, plan)
+}
+
+fn restore_checkout_owner(
+    path: &Path,
+    previous_head: EntryId,
+    plan: &WorkerPlan,
+) -> Result<App, ServiceError> {
+    #[cfg(test)]
+    if plan.checkout_hooks.fail_rollback {
+        return Err(ServiceError::Internal);
+    }
+    restore_session_head(path, previous_head)?;
+    build_worker_app(plan).map_err(|_| ServiceError::Internal)
+}
+
+#[cfg(test)]
+async fn wait_for_checkout_rollback_gate(plan: &WorkerPlan) {
+    if let Some(gate) = &plan.checkout_hooks.rollback_gate {
+        gate.entered.wait().await;
+        gate.release.wait().await;
+    }
+}
+
+#[cfg(not(test))]
+async fn wait_for_checkout_rollback_gate(_plan: &WorkerPlan) {}
+
+fn checkout_rejection_after_rollback<T>(
+    rollback: Result<T, ServiceError>,
+    rejection: ServiceError,
+) -> Result<(T, ServiceError), ServiceError> {
+    rollback
+        .map(|owner| (owner, rejection))
+        .map_err(|_| ServiceError::OwnerLost)
 }
 
 fn session_metadata_outcome(
@@ -1206,6 +1434,16 @@ fn attachment_service_error(error: AttachmentError) -> ServiceError {
         | AttachmentError::TooLarge
         | AttachmentError::NotFound
         | AttachmentError::MetadataMismatch => ServiceError::InvalidBoundary,
+    }
+}
+
+fn resource_store_service_error(error: ygg_serve_backend::ResourceStoreError) -> ServiceError {
+    match error {
+        ygg_serve_backend::ResourceStoreError::InvalidBoundary => ServiceError::InvalidBoundary,
+        ygg_serve_backend::ResourceStoreError::QuotaExceeded => ServiceError::Unavailable,
+        ygg_serve_backend::ResourceStoreError::NotFound => ServiceError::NotFound,
+        ygg_serve_backend::ResourceStoreError::Corrupt => ServiceError::CorruptResource,
+        ygg_serve_backend::ResourceStoreError::Storage => ServiceError::Internal,
     }
 }
 
@@ -1350,6 +1588,30 @@ async fn start_and_drive_run(
         }
     }
     drop(run);
+    if let Some(resources) = plan.resources.as_ref() {
+        let completed = std::mem::take(&mut projection.pending_tool_evidence);
+        for completed in completed {
+            for payload in project_tool_evidence(
+                app.agent.session(),
+                &plan.config.workspace,
+                resources,
+                &plan.session_id,
+                &run_id,
+                &completed.turn_id,
+                &completed.tool_call_id,
+                &completed.tool_item_id,
+                &completed.tool,
+                &completed.output,
+            ) {
+                events
+                    .send(event(payload))
+                    .await
+                    .map_err(|_| ServiceError::Unavailable)?;
+            }
+        }
+    } else {
+        projection.pending_tool_evidence.clear();
+    }
     app.agent.set_system_prompt(app.system.clone());
     app.agent
         .record_run_outcome(SessionRunOutcome {
@@ -1362,6 +1624,7 @@ async fn start_and_drive_run(
         })
         .map_err(|_| ServiceError::Internal)?;
 
+    let branch_start = projection.known_entries;
     let committed = project_new_entries(
         app.agent.session(),
         projection,
@@ -1386,19 +1649,12 @@ async fn start_and_drive_run(
             .map_err(|_| ServiceError::Unavailable)?;
     }
     projection.pending_attachments.clear();
-    let durable_entry_id = app
-        .agent
-        .session()
-        .head()
-        .map(|head| DurableEntryId::new(head.0))
-        .transpose()
-        .map_err(|_| ServiceError::Internal)?;
-    events
-        .send(event(EventPayload::SessionDurableHeadChanged {
-            durable_entry_id,
-        }))
-        .await
-        .map_err(|_| ServiceError::Unavailable)?;
+    for branch_event in branch_delta_events(app.agent.session(), branch_start)? {
+        events
+            .send(branch_event)
+            .await
+            .map_err(|_| ServiceError::Unavailable)?;
+    }
     expire_private_requests(projection, events, plan.actor_generation).await?;
     events
         .send(event(EventPayload::SessionStateChanged {
@@ -1755,27 +2011,21 @@ async fn project_agent_event(
                     .await
                     .map_err(|_| ServiceError::Unavailable)?;
             }
-            if let (Some(tool), Some(tool_item_id), Ok(output)) = (
-                projection.tool_calls.get(&id.0),
-                projection.tool_items.get(&id.0),
+            if let (Some(_), Some(tool), Some(tool_item_id), Ok(output)) = (
+                plan.resources.as_ref(),
+                projection.tool_calls.get(&id.0).cloned(),
+                projection.tool_items.get(&id.0).cloned(),
                 result.as_ref(),
             ) {
-                for payload in project_tool_evidence(
-                    &plan.config.workspace,
-                    &plan.resources,
-                    &plan.session_id,
-                    run_id,
-                    &projection.turn_id(run_id)?,
-                    &id.0,
-                    tool_item_id,
-                    tool,
-                    output,
-                ) {
-                    events
-                        .send(event(payload))
-                        .await
-                        .map_err(|_| ServiceError::Unavailable)?;
-                }
+                projection
+                    .pending_tool_evidence
+                    .push_back(CompletedToolEvidence {
+                        tool_call_id: id.0,
+                        tool_item_id,
+                        turn_id: projection.turn_id(run_id)?,
+                        tool,
+                        output: output.clone(),
+                    });
             }
         }
         AgentEvent::TurnFinished {
@@ -1827,10 +2077,61 @@ struct WorkspaceFileSnapshot {
     artifact_kind: ArtifactKind,
 }
 
+const STORED_EVIDENCE_VERSION: u16 = 1;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredToolEvidence {
+    version: u16,
+    session_id: String,
+    tool_call_id: String,
+    call_entry_id: String,
+    result_entry_id: String,
+    entries: Vec<StoredEvidenceEntry>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum StoredEvidenceEntry {
+    Source {
+        item_id: String,
+        source_id: String,
+        source_kind: SourceKind,
+        title: String,
+        handle: String,
+        consulted_at_ms: u64,
+    },
+    FileChange {
+        item_id: String,
+        diff_handle: String,
+        result_handle: String,
+        display_path: String,
+        additions: u32,
+        deletions: u32,
+    },
+    Artifact {
+        item_id: String,
+        artifact_id: String,
+        artifact_kind: ArtifactKind,
+        name: String,
+        media_type: String,
+        handle: String,
+        byte_len: u64,
+        content_hash: String,
+    },
+}
+
+struct EvidenceProjection {
+    items: Vec<SessionItem>,
+    sources: Vec<SourceRef>,
+    artifacts: Vec<ArtifactRef>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_tool_evidence(
+    session: &Session,
     workspace: &Path,
-    resources: &OpaqueResourceRegistry,
+    resources: &ygg_serve_backend::ResourceStore,
     session_id: &SessionId,
     run_id: &RunId,
     turn_id: &TurnId,
@@ -1839,56 +2140,90 @@ fn project_tool_evidence(
     tool: &ProjectedToolCall,
     output: &ToolOutput,
 ) -> Vec<EventPayload> {
-    let identity =
-        stable_hash(format!("{}\0{}\0{}", session_id.as_str(), tool_call_id, tool.name).as_bytes());
+    match project_tool_evidence_inner(
+        session,
+        workspace,
+        resources,
+        session_id,
+        run_id,
+        turn_id,
+        tool_call_id,
+        tool_item_id,
+        tool,
+        output,
+    ) {
+        Ok(events) => events,
+        Err(_) => {
+            let _ = resources.rollback_uncommitted_tool_resources(session_id, tool_call_id);
+            Vec::new()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_tool_evidence_inner(
+    session: &Session,
+    workspace: &Path,
+    resources: &ygg_serve_backend::ResourceStore,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turn_id: &TurnId,
+    tool_call_id: &str,
+    tool_item_id: &ItemId,
+    tool: &ProjectedToolCall,
+    output: &ToolOutput,
+) -> Result<Vec<EventPayload>, ServiceError> {
+    let (call_entry_id, result_entry_id) =
+        durable_tool_anchor(session, tool_call_id).ok_or(ServiceError::InvalidBoundary)?;
+    let identity = stable_hash(
+        format!(
+            "{}\0{}\0{}\0{}",
+            session_id.as_str(),
+            call_entry_id.as_str(),
+            result_entry_id.as_str(),
+            tool_call_id
+        )
+        .as_bytes(),
+    );
     let Some(short_identity) = identity.get(..24) else {
-        return Vec::new();
+        return Err(ServiceError::Internal);
     };
 
-    match tool.name.as_str() {
+    let entries = match tool.name.as_str() {
         "read" => {
             let Some(path) = tool
                 .arguments
                 .get("path")
                 .and_then(serde_json::Value::as_str)
             else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
             let Some(snapshot) = snapshot_workspace_file(workspace, path) else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
-            let Ok((handle, _)) =
-                resources.register(&snapshot.display_name, snapshot.media_type, snapshot.bytes)
-            else {
-                return Vec::new();
-            };
-            let Ok(id) = SourceId::new(format!("source-{short_identity}")) else {
-                return Vec::new();
-            };
-            let source = SourceRef {
-                id,
-                kind: SourceKind::File,
+            if trusted_output_hash(&output.text).as_deref()
+                != Some(stable_hash(&snapshot.bytes).as_str())
+            {
+                return Ok(Vec::new());
+            }
+            let stored = resources
+                .register(
+                    session_id,
+                    tool_call_id,
+                    "source",
+                    &snapshot.display_name,
+                    snapshot.media_type,
+                    snapshot.bytes,
+                )
+                .map_err(resource_store_service_error)?;
+            vec![StoredEvidenceEntry::Source {
+                item_id: format!("item-source-{short_identity}"),
+                source_id: format!("source-{short_identity}"),
+                source_kind: SourceKind::File,
                 title: snapshot.display_path,
-                handle,
-                origin_item_id: Some(tool_item_id.clone()),
+                handle: stored.handle,
                 consulted_at_ms: now_ms(),
-                cited: false,
-                available: true,
-            };
-            let Some(item) = provisional_evidence_item(
-                format!("item-source-{short_identity}"),
-                run_id,
-                turn_id,
-                ItemPayload::Source(source.clone()),
-            ) else {
-                return Vec::new();
-            };
-            vec![
-                EventPayload::SourceUpserted {
-                    source: source.clone(),
-                },
-                EventPayload::ItemStarted { item },
-            ]
+            }]
         }
         "read_skill_resource" => {
             let title = tool
@@ -1896,40 +2231,24 @@ fn project_tool_evidence(
                 .get("resource_path")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("skill resource");
-            let Ok((handle, _)) = resources.register(
-                title,
-                "text/plain",
-                bytes::Bytes::copy_from_slice(output.text.as_bytes()),
-            ) else {
-                return Vec::new();
-            };
-            let Ok(id) = SourceId::new(format!("source-{short_identity}")) else {
-                return Vec::new();
-            };
-            let source = SourceRef {
-                id,
-                kind: SourceKind::Resource,
+            let stored = resources
+                .register(
+                    session_id,
+                    tool_call_id,
+                    "source",
+                    title,
+                    "text/plain",
+                    bytes::Bytes::copy_from_slice(output.text.as_bytes()),
+                )
+                .map_err(resource_store_service_error)?;
+            vec![StoredEvidenceEntry::Source {
+                item_id: format!("item-source-{short_identity}"),
+                source_id: format!("source-{short_identity}"),
+                source_kind: SourceKind::Resource,
                 title: bounded_text(title, 512),
-                handle,
-                origin_item_id: Some(tool_item_id.clone()),
+                handle: stored.handle,
                 consulted_at_ms: now_ms(),
-                cited: false,
-                available: true,
-            };
-            let Some(item) = provisional_evidence_item(
-                format!("item-source-{short_identity}"),
-                run_id,
-                turn_id,
-                ItemPayload::Source(source.clone()),
-            ) else {
-                return Vec::new();
-            };
-            vec![
-                EventPayload::SourceUpserted {
-                    source: source.clone(),
-                },
-                EventPayload::ItemStarted { item },
-            ]
+            }]
         }
         "edit" | "write" => {
             let Some(path) = tool
@@ -1937,31 +2256,61 @@ fn project_tool_evidence(
                 .get("path")
                 .and_then(serde_json::Value::as_str)
             else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
             let Some(snapshot) = snapshot_workspace_file(workspace, path) else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
-            let byte_len = snapshot.bytes.len() as u64;
-            let Ok((handle, stored)) =
-                resources.register(&snapshot.display_name, snapshot.media_type, snapshot.bytes)
-            else {
-                return Vec::new();
+            let snapshot_hash = stable_hash(&snapshot.bytes);
+            if trusted_output_hash(&output.text).as_deref() != Some(snapshot_hash.as_str()) {
+                return Ok(Vec::new());
+            }
+            let write_created = tool.name == "write" && output_reports_created(&output.text);
+            if tool.name == "write" && output.text.contains("\n(no change)") {
+                return Ok(Vec::new());
+            }
+            let diff = if write_created {
+                let Some(content) = tool
+                    .arguments
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return Ok(Vec::new());
+                };
+                creation_diff(&snapshot.display_path, content)
+            } else {
+                let Some(detail) = output.text.splitn(3, '\n').nth(2) else {
+                    return Ok(Vec::new());
+                };
+                if !detail.starts_with("--- ") {
+                    return Ok(Vec::new());
+                }
+                detail.to_owned()
             };
-            let Ok(id) = ArtifactId::new(format!("artifact-{short_identity}")) else {
-                return Vec::new();
-            };
-            let artifact = ArtifactRef {
-                id,
-                kind: snapshot.artifact_kind,
-                name: snapshot.display_name,
-                media_type: snapshot.media_type.to_owned(),
-                handle: handle.clone(),
-                byte_len,
-                content_hash: Some(stored.sha256),
-                origin_item_id: Some(tool_item_id.clone()),
-                available: true,
-            };
+            if diff.is_empty() || diff.len() > MAX_OPAQUE_RESOURCE_BYTES {
+                return Ok(Vec::new());
+            }
+            let diff_name = format!("{}.diff", snapshot.display_name);
+            let stored_diff = resources
+                .register(
+                    session_id,
+                    tool_call_id,
+                    "diff",
+                    &diff_name,
+                    "text/plain",
+                    bytes::Bytes::from(diff.clone()),
+                )
+                .map_err(resource_store_service_error)?;
+            let stored_result = resources
+                .register(
+                    session_id,
+                    tool_call_id,
+                    "result",
+                    &snapshot.display_name,
+                    snapshot.media_type,
+                    snapshot.bytes,
+                )
+                .map_err(resource_store_service_error)?;
             let (additions, deletions) = if tool.name == "edit" {
                 (
                     line_count(
@@ -1978,61 +2327,259 @@ fn project_tool_evidence(
                     ),
                 )
             } else {
-                // A write may create or replace. The structured event does not
-                // retain the pre-write file, so claiming a diff would be false.
-                (0, 0)
+                diff_line_counts(&diff)
             };
-            let file_change = FileChange {
-                handle,
+            let mut entries = vec![StoredEvidenceEntry::FileChange {
+                item_id: format!("item-file-change-{short_identity}"),
+                diff_handle: stored_diff.handle,
+                result_handle: stored_result.handle.clone(),
                 display_path: snapshot.display_path,
                 additions,
                 deletions,
-            };
-            let Some(change_item) = provisional_evidence_item(
-                format!("item-file-change-{short_identity}"),
-                run_id,
-                turn_id,
-                ItemPayload::FileChange(file_change),
-            ) else {
-                return Vec::new();
-            };
-            let Some(artifact_item) = provisional_evidence_item(
-                format!("item-artifact-{short_identity}"),
-                run_id,
-                turn_id,
-                ItemPayload::Artifact(artifact.clone()),
-            ) else {
-                return Vec::new();
-            };
-            vec![
-                EventPayload::ItemStarted { item: change_item },
-                EventPayload::ArtifactUpserted {
-                    artifact: artifact.clone(),
-                },
-                EventPayload::ItemStarted {
-                    item: artifact_item,
-                },
-            ]
+            }];
+            if write_created && is_deliverable_artifact(snapshot.artifact_kind) {
+                entries.push(StoredEvidenceEntry::Artifact {
+                    item_id: format!("item-artifact-{short_identity}"),
+                    artifact_id: format!("artifact-{short_identity}"),
+                    artifact_kind: snapshot.artifact_kind,
+                    name: snapshot.display_name,
+                    media_type: snapshot.media_type.to_owned(),
+                    handle: stored_result.handle,
+                    byte_len: stored_result.byte_len,
+                    content_hash: stored_result.sha256,
+                });
+            }
+            entries
         }
-        _ => Vec::new(),
+        _ => return Ok(Vec::new()),
+    };
+
+    let record = StoredToolEvidence {
+        version: STORED_EVIDENCE_VERSION,
+        session_id: session_id.as_str().to_owned(),
+        tool_call_id: tool_call_id.to_owned(),
+        call_entry_id: call_entry_id.as_str().to_owned(),
+        result_entry_id: result_entry_id.as_str().to_owned(),
+        entries,
+    };
+    let record_bytes = serde_json::to_vec(&record).map_err(|_| ServiceError::Internal)?;
+    resources
+        .persist_record(session_id, &result_entry_id, tool_call_id, &record_bytes)
+        .map_err(resource_store_service_error)?;
+    let projection = project_stored_evidence(
+        resources,
+        session_id,
+        &record,
+        Some(run_id.clone()),
+        Some(turn_id.clone()),
+        Some(tool_item_id.clone()),
+    )?;
+    let mut events = Vec::new();
+    for source in projection.sources {
+        events.push(EventPayload::SourceUpserted { source });
     }
+    for artifact in projection.artifacts {
+        events.push(EventPayload::ArtifactUpserted { artifact });
+    }
+    for item in projection.items {
+        events.push(EventPayload::ItemCommitted { item });
+    }
+    Ok(events)
 }
 
-fn provisional_evidence_item(
-    id: String,
-    run_id: &RunId,
-    turn_id: &TurnId,
-    payload: ItemPayload,
-) -> Option<SessionItem> {
-    Some(SessionItem {
-        id: ItemId::new(id).ok()?,
-        run_id: Some(run_id.clone()),
-        turn_id: Some(turn_id.clone()),
-        provider_attempt: None,
-        lifecycle: ItemLifecycle::Provisional,
-        durable_entry_id: None,
-        payload,
-    })
+fn durable_tool_anchor(
+    session: &Session,
+    tool_call_id: &str,
+) -> Option<(DurableEntryId, DurableEntryId)> {
+    let mut cursor = session.head_ref();
+    let mut result_entry_id = None;
+    while let Some(entry_id) = cursor {
+        let entry = session.entry(entry_id)?;
+        match &entry.value {
+            EntryValue::Message(Message::User(message))
+                if result_entry_id.is_none()
+                    && message.content.iter().any(|part| {
+                        matches!(
+                            part,
+                            UserPart::ToolResult(result)
+                                if result.tool_call_id.0 == tool_call_id && !result.is_error
+                        )
+                    }) =>
+            {
+                result_entry_id = DurableEntryId::new(entry.id.0.clone()).ok();
+            }
+            EntryValue::Message(Message::Assistant(message))
+                if result_entry_id.is_some()
+                    && message.content.iter().any(|part| {
+                        matches!(
+                            part,
+                            AssistantPart::ToolCall(call) if call.id.0 == tool_call_id
+                        )
+                    }) =>
+            {
+                return Some((
+                    DurableEntryId::new(entry.id.0.clone()).ok()?,
+                    result_entry_id?,
+                ));
+            }
+            _ => {}
+        }
+        cursor = entry.parent.as_ref();
+    }
+    None
+}
+
+fn trusted_output_hash(text: &str) -> Option<String> {
+    text.split_ascii_whitespace()
+        .find_map(|token| token.strip_prefix("hash="))
+        .filter(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(str::to_owned)
+}
+
+fn output_reports_created(text: &str) -> bool {
+    text.lines()
+        .nth(1)
+        .is_some_and(|line| line.contains("  created hash="))
+}
+
+fn creation_diff(path: &str, content: &str) -> String {
+    let total = content.lines().count();
+    let mut diff = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{total} @@\n");
+    for line in content.lines() {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    diff
+}
+
+fn diff_line_counts(diff: &str) -> (u32, u32) {
+    let additions = diff
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count()
+        .min(u32::MAX as usize) as u32;
+    let deletions = diff
+        .lines()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .count()
+        .min(u32::MAX as usize) as u32;
+    (additions, deletions)
+}
+
+fn is_deliverable_artifact(kind: ArtifactKind) -> bool {
+    matches!(
+        kind,
+        ArtifactKind::Site
+            | ArtifactKind::Document
+            | ArtifactKind::Spreadsheet
+            | ArtifactKind::Presentation
+    )
+}
+
+fn project_stored_evidence(
+    resources: &ygg_serve_backend::ResourceStore,
+    session_id: &SessionId,
+    record: &StoredToolEvidence,
+    run_id: Option<RunId>,
+    turn_id: Option<TurnId>,
+    origin_item_id: Option<ItemId>,
+) -> Result<EvidenceProjection, ServiceError> {
+    if record.version != STORED_EVIDENCE_VERSION
+        || record.session_id != session_id.as_str()
+        || record.entries.is_empty()
+    {
+        return Err(ServiceError::InvalidSeed);
+    }
+    let durable_entry_id = DurableEntryId::new(record.result_entry_id.clone())
+        .map_err(|_| ServiceError::InvalidSeed)?;
+    let mut projection = EvidenceProjection {
+        items: Vec::new(),
+        sources: Vec::new(),
+        artifacts: Vec::new(),
+    };
+    for entry in &record.entries {
+        let (item_id, payload) = match entry {
+            StoredEvidenceEntry::Source {
+                item_id,
+                source_id,
+                source_kind,
+                title,
+                handle,
+                consulted_at_ms,
+            } => {
+                let source = SourceRef {
+                    id: SourceId::new(source_id.clone()).map_err(|_| ServiceError::InvalidSeed)?,
+                    kind: *source_kind,
+                    title: bounded_text(title, 512),
+                    handle: handle.clone(),
+                    origin_item_id: origin_item_id.clone(),
+                    consulted_at_ms: *consulted_at_ms,
+                    cited: false,
+                    available: resources.content(session_id, handle).is_ok(),
+                };
+                projection.sources.push(source.clone());
+                (item_id, ItemPayload::Source(source))
+            }
+            StoredEvidenceEntry::FileChange {
+                item_id,
+                diff_handle,
+                result_handle,
+                display_path,
+                additions,
+                deletions,
+            } => (
+                item_id,
+                ItemPayload::FileChange(FileChange {
+                    handle: diff_handle.clone(),
+                    result_handle: Some(result_handle.clone()),
+                    display_path: bounded_text(display_path, 1024),
+                    additions: *additions,
+                    deletions: *deletions,
+                }),
+            ),
+            StoredEvidenceEntry::Artifact {
+                item_id,
+                artifact_id,
+                artifact_kind,
+                name,
+                media_type,
+                handle,
+                byte_len,
+                content_hash,
+            } => {
+                let artifact = ArtifactRef {
+                    id: ArtifactId::new(artifact_id.clone())
+                        .map_err(|_| ServiceError::InvalidSeed)?,
+                    kind: *artifact_kind,
+                    name: bounded_text(name, 512),
+                    media_type: media_type.clone(),
+                    handle: handle.clone(),
+                    byte_len: *byte_len,
+                    content_hash: Some(content_hash.clone()),
+                    origin_item_id: origin_item_id.clone(),
+                    available: resources.content(session_id, handle).is_ok(),
+                };
+                projection.artifacts.push(artifact.clone());
+                (item_id, ItemPayload::Artifact(artifact))
+            }
+        };
+        projection.items.push(SessionItem {
+            id: ItemId::new(item_id.clone()).map_err(|_| ServiceError::InvalidSeed)?,
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+            provider_attempt: None,
+            lifecycle: ItemLifecycle::Committed,
+            durable_entry_id: Some(durable_entry_id.clone()),
+            payload,
+        });
+    }
+    Ok(projection)
 }
 
 fn snapshot_workspace_file(workspace: &Path, requested: &str) -> Option<WorkspaceFileSnapshot> {
@@ -2095,14 +2642,33 @@ fn snapshot_workspace_file(workspace: &Path, requested: &str) -> Option<Workspac
     Some(WorkspaceFileSnapshot {
         display_path,
         display_name,
-        media_type: if std::str::from_utf8(&bytes).is_ok() {
-            "text/plain"
-        } else {
-            "application/octet-stream"
-        },
+        media_type: workspace_media_type(&extension, &bytes),
         artifact_kind: artifact_kind_for_extension(&extension),
         bytes: bytes::Bytes::from(bytes),
     })
+}
+
+fn workspace_media_type(extension: &str, bytes: &[u8]) -> &'static str {
+    if std::str::from_utf8(bytes).is_err() {
+        return match extension {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "pdf" => "application/pdf",
+            _ => "application/octet-stream",
+        };
+    }
+    match extension {
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "jsx" | "mjs" | "cjs" => "text/javascript",
+        "json" => "application/json",
+        "md" | "markdown" => "text/markdown",
+        "csv" => "text/csv",
+        "svg" => "image/svg+xml",
+        _ => "text/plain",
+    }
 }
 
 fn artifact_kind_for_extension(extension: &str) -> ArtifactKind {
@@ -2404,6 +2970,125 @@ fn project_new_entries(
     }
     projection.known_entries = entries.len();
     Ok(items)
+}
+
+fn branch_graph(session: &Session) -> Result<SessionBranchGraph, ServiceError> {
+    let all_entries = session.entries();
+    let head = session.head();
+    let mut selected_indices = (all_entries
+        .len()
+        .saturating_sub(MAX_PROJECTED_BRANCH_ENTRIES)
+        ..all_entries.len())
+        .collect::<Vec<_>>();
+    if let Some(head) = head.as_ref() {
+        let head_index = all_entries
+            .iter()
+            .position(|entry| &entry.id == head)
+            .ok_or(ServiceError::InvalidSeed)?;
+        if !selected_indices.contains(&head_index) {
+            if selected_indices.len() == MAX_PROJECTED_BRANCH_ENTRIES {
+                selected_indices.remove(0);
+            }
+            selected_indices.push(head_index);
+            selected_indices.sort_unstable();
+        }
+    }
+    Ok(SessionBranchGraph {
+        head: head
+            .map(|head| DurableEntryId::new(head.0))
+            .transpose()
+            .map_err(|_| ServiceError::InvalidSeed)?,
+        entries: selected_indices
+            .iter()
+            .map(|index| project_branch_entry(&all_entries[*index]))
+            .collect::<Result<_, _>>()?,
+        truncated: selected_indices.len() < all_entries.len(),
+    })
+}
+
+fn branch_delta_events(
+    session: &Session,
+    start: usize,
+) -> Result<Vec<TimestampedEvent>, ServiceError> {
+    let entries = session.entries();
+    if start > entries.len() {
+        return Err(ServiceError::InvalidSeed);
+    }
+    let mut events = entries[start..]
+        .chunks(MAX_BRANCH_DELTA_ENTRIES)
+        .map(|chunk| {
+            Ok(event(EventPayload::SessionBranchEntriesAppended {
+                entries: chunk
+                    .iter()
+                    .map(project_branch_entry)
+                    .collect::<Result<_, _>>()?,
+            }))
+        })
+        .collect::<Result<Vec<_>, ServiceError>>()?;
+    let durable_entry_id = session
+        .head()
+        .map(|head| DurableEntryId::new(head.0))
+        .transpose()
+        .map_err(|_| ServiceError::Internal)?;
+    events.push(event(EventPayload::SessionDurableHeadChanged {
+        durable_entry_id,
+    }));
+    Ok(events)
+}
+
+fn project_branch_entry(entry: &Entry) -> Result<SessionBranchEntry, ServiceError> {
+    let kind = match &entry.value {
+        EntryValue::Message(Message::User(_)) => SessionBranchEntryKind::UserMessage,
+        EntryValue::Message(Message::Assistant(_)) => SessionBranchEntryKind::AssistantMessage,
+        EntryValue::Compaction { .. } => SessionBranchEntryKind::Compaction,
+        _ => SessionBranchEntryKind::Internal,
+    };
+    Ok(SessionBranchEntry {
+        entry_id: DurableEntryId::new(entry.id.0.clone()).map_err(|_| ServiceError::InvalidSeed)?,
+        parent_entry_id: entry
+            .parent
+            .as_ref()
+            .map(|parent| DurableEntryId::new(parent.0.clone()))
+            .transpose()
+            .map_err(|_| ServiceError::InvalidSeed)?,
+        checkoutable: kind != SessionBranchEntryKind::Internal,
+        kind,
+        label: branch_entry_label(entry),
+    })
+}
+
+fn branch_entry_label(entry: &Entry) -> String {
+    let candidate = match &entry.value {
+        EntryValue::Message(Message::User(message)) => entry
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.display_text.as_deref())
+            .or_else(|| {
+                message.content.iter().find_map(|part| match part {
+                    UserPart::Text(text) => Some(text.as_str()),
+                    UserPart::Media(_) | UserPart::ToolResult(_) => None,
+                })
+            })
+            .unwrap_or("User input"),
+        EntryValue::Message(Message::Assistant(message)) => message
+            .content
+            .iter()
+            .find_map(|part| match part {
+                AssistantPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("Assistant response"),
+        EntryValue::Config { .. } => "Internal session state",
+        EntryValue::Compaction { .. } => "Compaction",
+        EntryValue::ResponsesTurn { .. }
+        | EntryValue::ResponsesCompaction { .. }
+        | EntryValue::PromptTemplateSelected { .. }
+        | EntryValue::SkillActivated { .. }
+        | EntryValue::SkillResourceRead { .. }
+        | EntryValue::SkillDeactivated { .. } => "Internal session state",
+    };
+    let first_line = candidate.lines().find(|line| !line.trim().is_empty());
+    bounded_text(first_line.unwrap_or("Session entry"), 256)
 }
 
 fn attachment_refs_for_entry(
@@ -2717,6 +3402,67 @@ fn item_id_for_entry(entry: &Entry, part: usize) -> Result<ItemId, ServiceError>
         .map_err(|_| ServiceError::InvalidSeed)
 }
 
+fn rehydrate_stored_evidence(
+    resources: &ygg_serve_backend::ResourceStore,
+    session: &Session,
+    session_id: &SessionId,
+    result_entry: &Entry,
+    active_entry_ids: &std::collections::BTreeSet<&str>,
+    tool_items: &HashMap<String, ItemId>,
+) -> Option<EvidenceProjection> {
+    let durable_result_id = DurableEntryId::new(result_entry.id.0.clone()).ok()?;
+    let bytes = resources.record(session_id, &durable_result_id).ok()?;
+    let record = serde_json::from_slice::<StoredToolEvidence>(&bytes).ok()?;
+    if record.version != STORED_EVIDENCE_VERSION
+        || record.session_id != session_id.as_str()
+        || record.result_entry_id != result_entry.id.0
+        || !active_entry_ids.contains(record.call_entry_id.as_str())
+        || !result_entry_has_successful_tool_result(result_entry, &record.tool_call_id)
+    {
+        return None;
+    }
+    let call_entry = session.entry(&EntryId(record.call_entry_id.clone()))?;
+    if !entry_has_tool_call(call_entry, &record.tool_call_id) {
+        return None;
+    }
+    project_stored_evidence(
+        resources,
+        session_id,
+        &record,
+        None,
+        None,
+        tool_items.get(&record.tool_call_id).cloned(),
+    )
+    .ok()
+}
+
+fn result_entry_has_successful_tool_result(entry: &Entry, tool_call_id: &str) -> bool {
+    matches!(
+        &entry.value,
+        EntryValue::Message(Message::User(message))
+            if message.content.iter().any(|part| {
+                matches!(
+                    part,
+                    UserPart::ToolResult(result)
+                        if result.tool_call_id.0 == tool_call_id && !result.is_error
+                )
+            })
+    )
+}
+
+fn entry_has_tool_call(entry: &Entry, tool_call_id: &str) -> bool {
+    matches!(
+        &entry.value,
+        EntryValue::Message(Message::Assistant(message))
+            if message.content.iter().any(|part| {
+                matches!(
+                    part,
+                    AssistantPart::ToolCall(call) if call.id.0 == tool_call_id
+                )
+            })
+    )
+}
+
 struct SessionSeedOptions<'a> {
     project_id: Option<ProjectId>,
     model: ModelSelection,
@@ -2724,6 +3470,7 @@ struct SessionSeedOptions<'a> {
     generation: u64,
     meta: Option<SessionMeta>,
     attachment_store: Option<&'a AttachmentStore>,
+    resource_store: Option<&'a ygg_serve_backend::ResourceStore>,
 }
 
 fn seed_from_session(
@@ -2738,6 +3485,7 @@ fn seed_from_session(
         generation,
         meta,
         attachment_store,
+        resource_store,
     } = options;
     let mut chain = Vec::new();
     let mut cursor = session.head_ref();
@@ -2747,7 +3495,13 @@ fn seed_from_session(
         cursor = entry.parent.as_ref();
     }
     chain.reverse();
+    let active_entry_ids = chain
+        .iter()
+        .map(|entry| entry.id.0.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
     let mut items = Vec::new();
+    let mut sources = Vec::new();
+    let mut artifacts = Vec::new();
     let mut tool_items = HashMap::new();
     let mut pending_attachments = VecDeque::new();
     for entry in chain {
@@ -2759,6 +3513,20 @@ fn seed_from_session(
         )?;
         let projected = project_entry(entry, None, None, None, None, &mut tool_items, attachments)?;
         items.extend(projected);
+        if let Some(projection) = resource_store.and_then(|store| {
+            rehydrate_stored_evidence(
+                store,
+                session,
+                &session_id,
+                entry,
+                &active_entry_ids,
+                &tool_items,
+            )
+        }) {
+            items.extend(projection.items);
+            sources.extend(projection.sources);
+            artifacts.extend(projection.artifacts);
+        }
     }
     if items.len() > MAX_PROJECTED_SESSION_ITEMS {
         items = items.split_off(items.len() - MAX_PROJECTED_SESSION_ITEMS);
@@ -2788,15 +3556,13 @@ fn seed_from_session(
         owner: ActorOwnerState::Hosted,
         model: model.clone(),
     };
+    let branches = branch_graph(session)?;
     let snapshot = SessionSnapshot {
         session_id,
         actor_generation: generation,
         cursor: SessionCursor::zero(generation),
-        durable_head: session
-            .head()
-            .map(|head| DurableEntryId::new(head.0))
-            .transpose()
-            .map_err(|_| ServiceError::InvalidSeed)?,
+        durable_head: branches.head.clone(),
+        branches,
         live_state: SessionLiveState::Idle,
         active_run_id: None,
         model,
@@ -2804,8 +3570,8 @@ fn seed_from_session(
         context: ContextUsage::default(),
         items,
         pending_requests: Vec::new(),
-        sources: Vec::new(),
-        artifacts: Vec::new(),
+        sources,
+        artifacts,
     };
     let seed = SessionSeed { summary, snapshot };
     seed.validate()?;
@@ -2841,6 +3607,7 @@ fn empty_seed(
             actor_generation: generation,
             cursor: SessionCursor::zero(generation),
             durable_head: None,
+            branches: SessionBranchGraph::default(),
             live_state: SessionLiveState::Idle,
             active_run_id: None,
             model,
@@ -3412,9 +4179,14 @@ fn system_time_ms(time: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use ygg_agent::EntryMetadata;
     use ygg_ai::{AssistantMessage, Protocol, UserMessage};
-    use ygg_serve_backend::{CatalogCursor, HostBootstrap, PROTOCOL_VERSION};
+    use ygg_serve_backend::{
+        AckDisposition, ActorConfig, ActorError, CatalogCursor, CommandId, DeviceId, HostBootstrap,
+        SessionActorCore, SessionCommandEnvelope, SessionSupervisor, SupervisorConfig,
+        SupervisorError, PROTOCOL_VERSION,
+    };
 
     fn serve_test_config(directory: &Path) -> Config {
         Config {
@@ -3460,6 +4232,64 @@ mod tests {
         }
     }
 
+    fn worker_checkout_fixture(
+        directory: &Path,
+        session_name: &str,
+    ) -> (YggHost, SessionId, DurableEntryId, DurableEntryId, PathBuf) {
+        let mut config = serve_test_config(directory);
+        config.model = Some(ModelId("gpt-4o-mini".into()));
+        config.model_explicit = true;
+        let host = YggHost::new(config).unwrap();
+        let session_id = SessionId::new(session_name).unwrap();
+        std::fs::create_dir_all(host.sessions.dir()).unwrap();
+        let path = host.sessions.dir().join(format!("{session_name}.jsonl"));
+        let mut session = Session::create(&path).unwrap();
+        let root = session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("root prompt".into())],
+            })))
+            .unwrap();
+        let old_head = session
+            .append(EntryValue::Config {
+                model: Some("gpt-4o-mini".into()),
+                reasoning: Some("off".into()),
+                reasoning_mode: Some("standard".into()),
+            })
+            .unwrap();
+        session.checkout(root).unwrap();
+        let target = session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("alternate prompt".into())],
+            })))
+            .unwrap();
+        session.checkout(old_head.clone()).unwrap();
+        (
+            host,
+            session_id,
+            DurableEntryId::new(old_head.0).unwrap(),
+            DurableEntryId::new(target.0).unwrap(),
+            path,
+        )
+    }
+
+    fn checkout_envelope(
+        host: &YggHost,
+        session_id: &SessionId,
+        generation: u64,
+        command_id: &str,
+        target: DurableEntryId,
+    ) -> SessionCommandEnvelope {
+        SessionCommandEnvelope::new(
+            host.descriptor.id.clone(),
+            DeviceId::new("device-worker-test").unwrap(),
+            session_id.clone(),
+            CommandId::new(command_id).unwrap(),
+            1,
+            Some(generation),
+            SessionCommand::Checkout { entry_id: target },
+        )
+    }
+
     fn png() -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
         bytes.extend_from_slice(&13u32.to_be_bytes());
@@ -3470,6 +4300,37 @@ mod tests {
         bytes.extend_from_slice(b"IEND");
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         bytes
+    }
+
+    fn session_with_successful_tool_result(
+        path: &Path,
+        call_id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+        output: &str,
+    ) -> Session {
+        let mut session = Session::create(path).unwrap();
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::ToolCall(ygg_ai::ToolCall {
+                    id: ToolCallId(call_id.to_owned()),
+                    name: name.to_owned(),
+                    arguments_json: serde_json::to_string(&arguments).unwrap(),
+                })],
+                model: ModelId("test-model".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::ToolResult(ygg_ai::ToolResult {
+                    tool_call_id: ToolCallId(call_id.to_owned()),
+                    content: vec![ToolResultPart::Text(output.to_owned())],
+                    is_error: false,
+                })],
+            })))
+            .unwrap();
+        session
     }
 
     #[test]
@@ -3544,8 +4405,9 @@ mod tests {
     fn successful_read_mints_openable_path_free_source_evidence() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::create_dir(workspace.path().join("src")).unwrap();
-        std::fs::write(workspace.path().join("src/lib.rs"), b"pub fn ygg() {}\n").unwrap();
-        let registry = OpaqueResourceRegistry::default();
+        let content = b"pub fn ygg() {}\n";
+        std::fs::write(workspace.path().join("src/lib.rs"), content).unwrap();
+        let registry = ygg_serve_backend::ResourceStore::open(workspace.path()).unwrap();
         let session_id = SessionId::new("session-evidence").unwrap();
         let run_id = RunId::new("run-evidence").unwrap();
         let turn_id = TurnId::new("turn-evidence").unwrap();
@@ -3554,8 +4416,20 @@ mod tests {
             name: "read".into(),
             arguments: serde_json::json!({"path": "src/lib.rs"}),
         };
+        let output = format!(
+            "src/lib.rs:1-1/1 hash={}\n1: pub fn ygg() {{}}\ntruncated=false",
+            stable_hash(content)
+        );
+        let session = session_with_successful_tool_result(
+            &workspace.path().join("read-session.jsonl"),
+            "call-read",
+            "read",
+            tool.arguments.clone(),
+            &output,
+        );
 
         let events = project_tool_evidence(
+            &session,
             workspace.path(),
             &registry,
             &session_id,
@@ -3564,7 +4438,7 @@ mod tests {
             "call-read",
             &tool_item_id,
             &tool,
-            &ToolOutput::new("1: pub fn ygg() {}"),
+            &ToolOutput::new(output),
         );
         assert_eq!(events.len(), 2);
         let EventPayload::SourceUpserted { source } = &events[0] else {
@@ -3574,17 +4448,97 @@ mod tests {
         assert_eq!(source.kind, SourceKind::File);
         assert_eq!(source.origin_item_id.as_ref(), Some(&tool_item_id));
         assert_eq!(
-            registry.content(&source.handle).unwrap().bytes,
+            registry.content(&session_id, &source.handle).unwrap().bytes,
             bytes::Bytes::from_static(b"pub fn ygg() {}\n")
         );
         assert!(!source.handle.contains("src"));
     }
 
     #[test]
+    fn durable_evidence_rehydrates_only_on_the_active_branch() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("notes.txt"), b"durable evidence\n").unwrap();
+        let session_path = workspace.path().join("branch-evidence.jsonl");
+        let session_id = SessionId::new("branch-evidence").unwrap();
+        let tool = ProjectedToolCall {
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "notes.txt"}),
+        };
+        let output = format!(
+            "notes.txt:1-1/1 hash={}\n1: durable evidence\ntruncated=false",
+            stable_hash(b"durable evidence\n")
+        );
+        let mut session = session_with_successful_tool_result(
+            &session_path,
+            "call-branch-read",
+            "read",
+            tool.arguments.clone(),
+            &output,
+        );
+        let call_entry = session.entries()[0].id.clone();
+        let result_entry = session.entries()[1].id.clone();
+        let store = ygg_serve_backend::ResourceStore::open(workspace.path()).unwrap();
+        let events = project_tool_evidence(
+            &session,
+            workspace.path(),
+            &store,
+            &session_id,
+            &RunId::new("run-branch-evidence").unwrap(),
+            &TurnId::new("turn-branch-evidence").unwrap(),
+            "call-branch-read",
+            &ItemId::new("item-call-branch-read").unwrap(),
+            &tool,
+            &ToolOutput::new(output),
+        );
+        assert_eq!(events.len(), 2);
+        drop(store);
+
+        let store = ygg_serve_backend::ResourceStore::open(workspace.path()).unwrap();
+        let seed_for = |session: &Session| {
+            seed_from_session(
+                session,
+                session_id.clone(),
+                SessionSeedOptions {
+                    project_id: None,
+                    model: ModelSelection {
+                        provider: "test".into(),
+                        model: "test-model".into(),
+                        reasoning: "off".into(),
+                    },
+                    authority: AuthorityProfile::FullAccess,
+                    generation: 1,
+                    meta: None,
+                    attachment_store: None,
+                    resource_store: Some(&store),
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(seed_for(&session).snapshot.sources.len(), 1);
+
+        session.checkout(call_entry).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("alternate branch".into())],
+            })))
+            .unwrap();
+        assert!(seed_for(&session).snapshot.sources.is_empty());
+
+        session.checkout(result_entry).unwrap();
+        let restored = seed_for(&session);
+        assert_eq!(restored.snapshot.sources.len(), 1);
+        assert!(restored
+            .snapshot
+            .items
+            .iter()
+            .any(|item| matches!(item.payload, ItemPayload::Source(_))));
+    }
+
+    #[test]
     fn resource_projection_rejects_outside_workspace_and_snapshots_successful_edits() {
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
-        let registry = OpaqueResourceRegistry::default();
+        let registry = ygg_serve_backend::ResourceStore::open(workspace.path()).unwrap();
         let session_id = SessionId::new("session-evidence").unwrap();
         let run_id = RunId::new("run-evidence").unwrap();
         let turn_id = TurnId::new("turn-evidence").unwrap();
@@ -3593,7 +4547,15 @@ mod tests {
             name: "read".into(),
             arguments: serde_json::json!({"path": outside.path()}),
         };
+        let outside_session = session_with_successful_tool_result(
+            &workspace.path().join("outside-session.jsonl"),
+            "call-outside",
+            "read",
+            outside_tool.arguments.clone(),
+            "secret",
+        );
         assert!(project_tool_evidence(
+            &outside_session,
             workspace.path(),
             &registry,
             &session_id,
@@ -3615,7 +4577,19 @@ mod tests {
                 "new": "after\nsecond\n"
             }),
         };
+        let output = format!(
+            "ok modified=1\nnotes.md  +2 -1 hash={}\n--- a/notes.md\n+++ b/notes.md\n@@ -1,1 +1,2 @@\n-before\n+after\n+second\n",
+            stable_hash(b"after\nsecond\n")
+        );
+        let edit_session = session_with_successful_tool_result(
+            &workspace.path().join("edit-session.jsonl"),
+            "call-edit",
+            "edit",
+            edit.arguments.clone(),
+            &output,
+        );
         let events = project_tool_evidence(
+            &edit_session,
             workspace.path(),
             &registry,
             &session_id,
@@ -3624,10 +4598,10 @@ mod tests {
             "call-edit",
             &tool_item_id,
             &edit,
-            &ToolOutput::new("ok modified=1"),
+            &ToolOutput::new(output),
         );
-        assert_eq!(events.len(), 3);
-        let EventPayload::ItemStarted { item } = &events[0] else {
+        assert_eq!(events.len(), 1);
+        let EventPayload::ItemCommitted { item } = &events[0] else {
             panic!("first edit event was not a file change");
         };
         let ItemPayload::FileChange(change) = &item.payload else {
@@ -3635,14 +4609,173 @@ mod tests {
         };
         assert_eq!(change.display_path, "notes.md");
         assert_eq!((change.additions, change.deletions), (2, 1));
-        let EventPayload::ArtifactUpserted { artifact } = &events[1] else {
-            panic!("second edit event was not an artifact");
-        };
-        assert_eq!(artifact.kind, ArtifactKind::Document);
+        assert!(change.result_handle.is_some());
         assert_eq!(
-            registry.content(&artifact.handle).unwrap().bytes,
+            registry.content(&session_id, &change.handle).unwrap().bytes,
+            bytes::Bytes::from_static(
+                b"--- a/notes.md\n+++ b/notes.md\n@@ -1,1 +1,2 @@\n-before\n+after\n+second\n"
+            )
+        );
+        assert_eq!(
+            registry
+                .content(&session_id, change.result_handle.as_deref().unwrap())
+                .unwrap()
+                .bytes,
             bytes::Bytes::from_static(b"after\nsecond\n")
         );
+    }
+
+    #[test]
+    fn evidence_projection_rolls_back_when_the_second_resource_cannot_stage() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("empty.txt"), b"").unwrap();
+        let store = ygg_serve_backend::ResourceStore::open(workspace.path()).unwrap();
+        let session_id = SessionId::new("session-partial-evidence").unwrap();
+        let tool = ProjectedToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({"path": "empty.txt", "content": ""}),
+        };
+        let output = format!(
+            "ok\nempty.txt  created hash={}\n--- /dev/null\n+++ b/empty.txt\n@@ -0,0 +1,0 @@\n",
+            stable_hash(b"")
+        );
+        let session = session_with_successful_tool_result(
+            &workspace.path().join("partial-evidence.jsonl"),
+            "call-partial-write",
+            "write",
+            tool.arguments.clone(),
+            &output,
+        );
+
+        assert!(project_tool_evidence(
+            &session,
+            workspace.path(),
+            &store,
+            &session_id,
+            &RunId::new("run-partial-evidence").unwrap(),
+            &TurnId::new("turn-partial-evidence").unwrap(),
+            "call-partial-write",
+            &ItemId::new("item-partial-evidence").unwrap(),
+            &tool,
+            &ToolOutput::new(output),
+        )
+        .is_empty());
+
+        let replacement = store
+            .register(
+                &session_id,
+                "call-partial-write",
+                "diff",
+                "replacement.diff",
+                "text/plain",
+                bytes::Bytes::from_static(b"rollback freed this binding"),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .content(&session_id, &replacement.handle)
+                .unwrap()
+                .bytes,
+            bytes::Bytes::from_static(b"rollback freed this binding")
+        );
+    }
+
+    #[test]
+    fn only_created_deliverables_are_promoted_to_artifacts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = ygg_serve_backend::ResourceStore::open(workspace.path()).unwrap();
+        let session_id = SessionId::new("session-artifact-semantics").unwrap();
+        let run_id = RunId::new("run-artifact-semantics").unwrap();
+        let turn_id = TurnId::new("turn-artifact-semantics").unwrap();
+        let tool_item_id = ItemId::new("item-tool-write").unwrap();
+
+        std::fs::write(workspace.path().join("report.md"), b"# Report\n").unwrap();
+        let created = ProjectedToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({"path": "report.md", "content": "# Report\n"}),
+        };
+        let created_output = format!(
+            "ok\nreport.md  created hash={}\n--- /dev/null\n+++ b/report.md\n@@ -0,0 +1,1 @@\n+# Report\n",
+            stable_hash(b"# Report\n")
+        );
+        let mut created_session = session_with_successful_tool_result(
+            &workspace.path().join("created-artifact.jsonl"),
+            "call-write-created",
+            "write",
+            created.arguments.clone(),
+            &created_output,
+        );
+        let created_events = project_tool_evidence(
+            &created_session,
+            workspace.path(),
+            &store,
+            &session_id,
+            &run_id,
+            &turn_id,
+            "call-write-created",
+            &tool_item_id,
+            &created,
+            &ToolOutput::new(created_output),
+        );
+        assert!(created_events
+            .iter()
+            .any(|event| matches!(event, EventPayload::ArtifactUpserted { artifact } if artifact.kind == ArtifactKind::Document)));
+
+        std::fs::write(workspace.path().join("report.md"), b"# Revised\n").unwrap();
+        let replaced = ProjectedToolCall {
+            name: "write".into(),
+            arguments: serde_json::json!({"path": "report.md", "content": "# Revised\n"}),
+        };
+        let replaced_output = format!(
+            "ok\nreport.md  replaced hash={}\n--- a/report.md\n+++ b/report.md\n@@ -1,1 +1,1 @@\n-# Report\n+# Revised\n",
+            stable_hash(b"# Revised\n")
+        );
+        created_session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::ToolCall(ygg_ai::ToolCall {
+                    id: ToolCallId("call-write-replaced".into()),
+                    name: "write".into(),
+                    arguments_json: serde_json::to_string(&replaced.arguments).unwrap(),
+                })],
+                model: ModelId("test-model".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+        created_session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::ToolResult(ygg_ai::ToolResult {
+                    tool_call_id: ToolCallId("call-write-replaced".into()),
+                    content: vec![ToolResultPart::Text(replaced_output.clone())],
+                    is_error: false,
+                })],
+            })))
+            .unwrap();
+        let replaced_events = project_tool_evidence(
+            &created_session,
+            workspace.path(),
+            &store,
+            &session_id,
+            &run_id,
+            &turn_id,
+            "call-write-replaced",
+            &tool_item_id,
+            &replaced,
+            &ToolOutput::new(replaced_output),
+        );
+        assert!(replaced_events
+            .iter()
+            .all(|event| !matches!(event, EventPayload::ArtifactUpserted { .. })));
+        assert!(replaced_events.iter().any(|event| {
+            matches!(
+                event,
+                EventPayload::ItemCommitted {
+                    item: SessionItem {
+                        payload: ItemPayload::FileChange(_),
+                        ..
+                    }
+                }
+            )
+        }));
     }
 
     #[test]
@@ -3665,8 +4798,10 @@ mod tests {
             available_models: Vec::new(),
             actor_generation: 1,
             session_id,
+            project_id: None,
             attachments: None,
-            resources: OpaqueResourceRegistry::default(),
+            resources: None,
+            checkout_hooks: CheckoutTestHooks::default(),
         };
         let mut projection = ProjectionState::new(0);
 
@@ -3680,7 +4815,34 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(first.events.len(), 2);
+        assert!(matches!(
+            first.events.as_slice(),
+            [
+                TimestampedEvent {
+                    payload: EventPayload::SessionSettingsChanged {
+                        model,
+                        authority: AuthorityProfile::FullAccess,
+                    },
+                    ..
+                },
+                TimestampedEvent {
+                    payload: EventPayload::SessionBranchEntriesAppended { entries },
+                    ..
+                },
+                TimestampedEvent {
+                    payload: EventPayload::SessionDurableHeadChanged {
+                        durable_entry_id: Some(head),
+                    },
+                    ..
+                },
+            ] if model.provider == "test"
+                && model.model == "selected-model"
+                && model.reasoning == "high"
+                && entries.len() == 1
+                && entries[0].kind == SessionBranchEntryKind::Internal
+                && !entries[0].checkoutable
+                && entries[0].entry_id == *head
+        ));
         assert!(matches!(
             plan.launch.session,
             SessionSelection::OpenExisting(ref path) if path == &session_path
@@ -3713,6 +4875,389 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn rejected_guarded_checkout_restores_durable_head_and_reopened_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("checkout-rollback.jsonl");
+        let session_id = SessionId::new("checkout-rollback").unwrap();
+        let model = ModelSelection {
+            provider: "test".into(),
+            model: "test-model".into(),
+            reasoning: "off".into(),
+        };
+        let mut session = Session::create(&path).unwrap();
+        let root = session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("question".into())],
+            })))
+            .unwrap();
+        let previous_head = session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("answer".into())],
+                model: ModelId("test-model".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+        let actor_seed = seed_from_session(
+            &session,
+            session_id.clone(),
+            SessionSeedOptions {
+                project_id: None,
+                model: model.clone(),
+                authority: AuthorityProfile::FullAccess,
+                generation: 1,
+                meta: None,
+                attachment_store: None,
+                resource_store: None,
+            },
+        )
+        .unwrap();
+        session.checkout(root.clone()).unwrap();
+        drop(session);
+
+        let mut invalid_replacement = actor_seed.clone();
+        let wrong_session = SessionId::new("checkout-rollback-wrong").unwrap();
+        invalid_replacement.summary.id = wrong_session.clone();
+        invalid_replacement.snapshot.session_id = wrong_session;
+        let (outcome, mut finalizer) = DriverCommandOutcome::guarded_replace(invalid_replacement);
+        let restored_before_rejection = Arc::new(AtomicBool::new(false));
+        let worker_restored = Arc::clone(&restored_before_rejection);
+        let worker_path = path.clone();
+        let worker_head = previous_head.clone();
+        let worker = tokio::spawn(async move {
+            assert_eq!(
+                finalizer.decision().await.unwrap(),
+                FinalizeDecision::Rollback
+            );
+            restore_session_head(&worker_path, worker_head.clone()).unwrap();
+            let reopened = Session::open_read_only(&worker_path).unwrap();
+            assert_eq!(reopened.head(), Some(worker_head));
+            worker_restored.store(true, AtomicOrdering::Release);
+            finalizer
+                .complete(Ok(FinalizeCompletion::RolledBack))
+                .unwrap();
+        });
+
+        let host_id = HostId::new("host-test").unwrap();
+        let mut actor =
+            SessionActorCore::new(host_id.clone(), actor_seed.clone(), ActorConfig::default())
+                .unwrap();
+        let command = SessionCommandEnvelope::new(
+            host_id,
+            DeviceId::new("device-test").unwrap(),
+            session_id.clone(),
+            CommandId::new("command-checkout-rollback").unwrap(),
+            1,
+            Some(1),
+            SessionCommand::Checkout {
+                entry_id: DurableEntryId::new(root.0).unwrap(),
+            },
+        );
+        let admission = actor
+            .admit_command(command, 10, |_| async { Ok(outcome) })
+            .await
+            .unwrap();
+        assert!(matches!(
+            admission.ack.disposition,
+            AckDisposition::Rejected { .. }
+        ));
+        assert!(restored_before_rejection.load(AtomicOrdering::Acquire));
+        assert_eq!(actor.snapshot(), actor_seed.snapshot);
+        worker.await.unwrap();
+
+        let reopened = Session::open_read_only(&path).unwrap();
+        assert_eq!(reopened.head(), Some(previous_head.clone()));
+        let restored = seed_from_session(
+            &reopened,
+            session_id,
+            SessionSeedOptions {
+                project_id: None,
+                model,
+                authority: AuthorityProfile::FullAccess,
+                generation: 1,
+                meta: None,
+                attachment_store: None,
+                resource_store: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            restored.snapshot.durable_head,
+            Some(DurableEntryId::new(previous_head.0).unwrap())
+        );
+        assert!(restored.snapshot.items.iter().any(|item| {
+            matches!(
+                &item.payload,
+                ItemPayload::AssistantMessage { text } if text == "answer"
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn production_worker_quarantines_reopen_until_late_rollback_settles() {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, session_id, old_head, target, path) =
+            worker_checkout_fixture(directory.path(), "worker-quarantine");
+        let gate = CheckoutRollbackGate {
+            entered: Arc::new(tokio::sync::Barrier::new(2)),
+            release: Arc::new(tokio::sync::Barrier::new(2)),
+        };
+        host.checkout_hooks
+            .lock()
+            .unwrap()
+            .push_back(CheckoutTestHooks {
+                rollback_gate: Some(gate.clone()),
+                corrupt_replacement_identity: true,
+                ..CheckoutTestHooks::default()
+            });
+        let host = Arc::new(host);
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig {
+                actor: ActorConfig {
+                    finalize_timeout: std::time::Duration::from_millis(20),
+                    ..ActorConfig::default()
+                },
+                ..SupervisorConfig::default()
+            },
+        ));
+        let original = supervisor.open_session(&session_id).await.unwrap();
+        assert_eq!(host.open_count.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(
+            original.view().snapshot.durable_head,
+            Some(old_head.clone())
+        );
+        let envelope = checkout_envelope(
+            &host,
+            &session_id,
+            original.view().snapshot.actor_generation,
+            "command-worker-quarantine",
+            target,
+        );
+        let command = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move { supervisor.command(envelope, 10).await })
+        };
+        gate.entered.wait().await;
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), command)
+                .await
+                .expect("actor finalization timeout")
+                .unwrap(),
+            Err(SupervisorError::Actor(ActorError::Closed))
+        ));
+
+        let mut first_reopen = {
+            let supervisor = Arc::clone(&supervisor);
+            let session_id = session_id.clone();
+            tokio::spawn(async move { supervisor.open_session(&session_id).await })
+        };
+        let mut second_reopen = {
+            let supervisor = Arc::clone(&supervisor);
+            let session_id = session_id.clone();
+            tokio::spawn(async move { supervisor.open_session(&session_id).await })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(60), &mut first_reopen,)
+                .await
+                .is_err(),
+            "the old durable writer must fence reopen"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(60), &mut second_reopen,)
+                .await
+                .is_err(),
+            "concurrent reopen must join the same ownership quarantine"
+        );
+        assert_eq!(host.open_count.load(AtomicOrdering::Relaxed), 1);
+
+        gate.release.wait().await;
+        let (first_reopen, second_reopen) = tokio::join!(first_reopen, second_reopen);
+        let first_reopen = first_reopen.unwrap().unwrap();
+        let second_reopen = second_reopen.unwrap().unwrap();
+        assert_eq!(host.open_count.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(
+            first_reopen.view().snapshot.durable_head,
+            Some(old_head.clone())
+        );
+        assert_eq!(
+            second_reopen.view().snapshot.durable_head,
+            Some(old_head.clone())
+        );
+        assert_eq!(
+            Session::open_read_only(path).unwrap().head(),
+            Some(EntryId(old_head.as_str().to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn production_worker_rolls_back_injected_seed_failure_before_rejection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, session_id, old_head, target, path) =
+            worker_checkout_fixture(directory.path(), "worker-seed-rollback");
+        host.checkout_hooks
+            .lock()
+            .unwrap()
+            .push_back(CheckoutTestHooks {
+                fail_seed_after_checkout: true,
+                ..CheckoutTestHooks::default()
+            });
+        let host = Arc::new(host);
+        let supervisor = SessionSupervisor::new(Arc::clone(&host), SupervisorConfig::default());
+        let handle = supervisor.open_session(&session_id).await.unwrap();
+        let envelope = checkout_envelope(
+            &host,
+            &session_id,
+            handle.view().snapshot.actor_generation,
+            "command-worker-seed-rollback",
+            target,
+        );
+        let admission = supervisor.command(envelope, 10).await.unwrap();
+        assert!(matches!(
+            admission.ack.disposition,
+            AckDisposition::Rejected { .. }
+        ));
+        assert_eq!(handle.view().snapshot.durable_head, Some(old_head.clone()));
+        assert_eq!(
+            Session::open_read_only(path).unwrap().head(),
+            Some(EntryId(old_head.as_str().to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn production_worker_rollback_failure_retires_owner_without_ack() {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, session_id, old_head, target, path) =
+            worker_checkout_fixture(directory.path(), "worker-rollback-loss");
+        host.checkout_hooks
+            .lock()
+            .unwrap()
+            .push_back(CheckoutTestHooks {
+                fail_seed_after_checkout: true,
+                fail_rollback: true,
+                ..CheckoutTestHooks::default()
+            });
+        let host = Arc::new(host);
+        let supervisor = SessionSupervisor::new(Arc::clone(&host), SupervisorConfig::default());
+        let handle = supervisor.open_session(&session_id).await.unwrap();
+        let envelope = checkout_envelope(
+            &host,
+            &session_id,
+            handle.view().snapshot.actor_generation,
+            "command-worker-rollback-loss",
+            target.clone(),
+        );
+        assert!(matches!(
+            supervisor.command(envelope, 10).await,
+            Err(SupervisorError::Actor(ActorError::Closed))
+        ));
+
+        let reopened = supervisor.open_session(&session_id).await.unwrap();
+        let final_disk_head = Session::open_read_only(path).unwrap().head().unwrap();
+        let final_durable_head = DurableEntryId::new(final_disk_head.0).unwrap();
+        assert_eq!(host.open_count.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(
+            reopened.view().snapshot.durable_head,
+            Some(final_durable_head.clone())
+        );
+        assert_ne!(final_durable_head, old_head);
+    }
+
+    #[test]
+    fn failed_pre_guard_checkout_rollback_is_fatal_owner_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let rollback = restore_session_head(
+            &directory.path().join("missing-session.jsonl"),
+            EntryId("previous-head".into()),
+        );
+        assert_eq!(
+            checkout_rejection_after_rollback(rollback, ServiceError::InvalidSeed),
+            Err(ServiceError::OwnerLost)
+        );
+    }
+
+    #[test]
+    fn branch_projection_is_bounded_and_always_preserves_the_selected_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bounded-branches.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        let mut first = None;
+        for index in 0..(MAX_PROJECTED_BRANCH_ENTRIES + 2) {
+            let entry = session
+                .append(EntryValue::Message(Message::User(UserMessage {
+                    content: vec![UserPart::Text(format!("message {index}"))],
+                })))
+                .unwrap();
+            first.get_or_insert(entry);
+        }
+        let first = first.unwrap();
+        session.checkout(first.clone()).unwrap();
+
+        let graph = branch_graph(&session).unwrap();
+        assert!(graph.truncated);
+        assert_eq!(graph.entries.len(), MAX_PROJECTED_BRANCH_ENTRIES);
+        assert_eq!(
+            graph.head,
+            Some(DurableEntryId::new(first.0.clone()).unwrap())
+        );
+        assert!(graph
+            .entries
+            .iter()
+            .any(|entry| entry.entry_id.as_str() == first.0));
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn graphical_session_export_is_redacted_bounded_and_cleans_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let session_dir = directory.path().join("sessions");
+        let sessions = SessionStore::new(&session_dir, workspace.path());
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let session_path = sessions.dir().join("safe-export.jsonl");
+        let mut session = Session::create(&session_path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("sk-1234567890123456".into())],
+            })))
+            .unwrap();
+        drop(session);
+        let session_id = SessionId::new("safe-export").unwrap();
+        let serve_state_dir = directory.path().join("serve-state");
+        std::fs::create_dir(&serve_state_dir).unwrap();
+
+        let exported = export_session_bytes(
+            &sessions,
+            &session_id,
+            &serve_state_dir,
+            MAX_GRAPHICAL_SESSION_EXPORT_BYTES,
+        )
+        .unwrap();
+        let exported: serde_json::Value = serde_json::from_slice(&exported).unwrap();
+        assert_eq!(exported["format"], "ygg-session-export");
+        assert_eq!(exported["redacted"], true);
+        let serialized = exported.to_string();
+        assert!(serialized.contains("[REDACTED]"));
+        assert!(!serialized.contains("sk-1234567890123456"));
+        assert_eq!(std::fs::read_dir(&serve_state_dir).unwrap().count(), 0);
+
+        assert_eq!(
+            export_session_bytes(&sessions, &session_id, &serve_state_dir, 16),
+            Err(ServiceError::PayloadTooLarge)
+        );
+        assert_eq!(std::fs::read_dir(&serve_state_dir).unwrap().count(), 0);
+        assert_eq!(
+            export_session_bytes(
+                &sessions,
+                &SessionId::new("missing-export").unwrap(),
+                &serve_state_dir,
+                MAX_GRAPHICAL_SESSION_EXPORT_BYTES,
+            ),
+            Err(ServiceError::NotFound)
+        );
+        assert_eq!(std::fs::read_dir(&serve_state_dir).unwrap().count(), 0);
+    }
+
     #[test]
     fn session_metadata_mutations_are_durable_and_emit_exact_patches() {
         let directory = tempfile::tempdir().unwrap();
@@ -3740,8 +5285,10 @@ mod tests {
             available_models: Vec::new(),
             actor_generation: 1,
             session_id: SessionId::new("metadata-session").unwrap(),
+            project_id: None,
             attachments: None,
-            resources: OpaqueResourceRegistry::default(),
+            resources: None,
+            checkout_hooks: CheckoutTestHooks::default(),
         };
 
         let renamed = rename_session_outcome(&plan, "  Renamed session  ").unwrap();
@@ -3936,6 +5483,7 @@ mod tests {
                 generation: 2,
                 meta: None,
                 attachment_store: None,
+                resource_store: None,
             },
         )
         .unwrap();
@@ -4074,6 +5622,7 @@ mod tests {
                 generation: 2,
                 meta: None,
                 attachment_store: None,
+                resource_store: None,
             },
         )
         .unwrap();

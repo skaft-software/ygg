@@ -22,6 +22,8 @@
     "previews": true,
     "connectedDevices": false,
     "sessionMetadata": true,
+    "sessionBranches": true,
+    "sessionExport": true,
     "lanClients": false,
     "terminal": false,
     "childAgents": false
@@ -121,6 +123,18 @@
       "sequence": 42
     },
     "durableHead": "entry-42",
+    "branches": {
+      "head": "entry-42",
+      "entries": [
+        {
+          "entryId": "entry-42",
+          "kind": "assistantMessage",
+          "checkoutable": true,
+          "label": "Ready."
+        }
+      ],
+      "truncated": false
+    },
     "liveState": "idle",
     "model": {
       "provider": "openai",

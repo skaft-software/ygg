@@ -9,10 +9,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, Request, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
-    COOKIE, ETAG, HOST, LOCATION, ORIGIN, REFERRER_POLICY, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
+    COOKIE, ETAG, HOST, LOCATION, ORIGIN, RANGE, REFERRER_POLICY, SET_COOKIE, TRANSFER_ENCODING,
+    X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -38,6 +39,7 @@ const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 8 * 1024;
 const RATE_LIMIT_REQUESTS: usize = 240;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_ATTACHMENT_UPLOADS: usize = 4;
+const MAX_CONCURRENT_SESSION_EXPORTS: usize = 1;
 const X_YGG_WEB_BUNDLE: HeaderName = HeaderName::from_static("x-ygg-web-bundle");
 
 /// Loopback listener configuration.
@@ -105,6 +107,7 @@ impl LoopbackServer {
             allowed_authorities: AllowedAuthorities::new(address),
             rate_limiter: RateLimiter::default(),
             attachment_uploads: Arc::new(Semaphore::new(MAX_CONCURRENT_ATTACHMENT_UPLOADS)),
+            session_exports: Arc::new(Semaphore::new(MAX_CONCURRENT_SESSION_EXPORTS)),
             web_bundle,
         });
         let router = build_router(state);
@@ -175,6 +178,7 @@ struct TransportState<H: HostService> {
     allowed_authorities: AllowedAuthorities,
     rate_limiter: RateLimiter,
     attachment_uploads: Arc<Semaphore>,
+    session_exports: Arc<Semaphore>,
     web_bundle: WebBundle,
 }
 
@@ -310,6 +314,10 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
             get(session_replay::<H>),
         )
         .route(
+            "/api/v1/sessions/{session_id}/export",
+            get(session_export::<H>),
+        )
+        .route(
             "/api/v1/commands/host",
             post(host_command::<H>).layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES)),
         )
@@ -323,7 +331,10 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_FILE_BYTES + 1)),
         )
         .route("/api/v1/attachments/{handle}", get(attachment_content::<H>))
-        .route("/api/v1/resources/{handle}", get(resource_content::<H>))
+        .route(
+            "/api/v1/sessions/{session_id}/resources/{handle}",
+            get(resource_content::<H>),
+        )
         .route("/api/v1/events", any(events_socket::<H>))
         .route("/{*asset}", get(static_asset::<H>))
         .fallback(not_found)
@@ -448,14 +459,23 @@ async fn attachment_content<H: HostService>(
 
 async fn resource_content<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
-    Path(handle): Path<String>,
+    Path((raw_session_id, handle)): Path<(String, String)>,
 ) -> Response {
     if !state.rate_limiter.admit() {
         return rate_limited();
     }
-    match state.supervisor.resource_content(&handle).await {
+    let session_id = match SessionId::new(raw_session_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    match state
+        .supervisor
+        .resource_content(&session_id, &handle)
+        .await
+    {
         Ok(resource) => {
-            let content_type = match HeaderValue::from_str(&resource.media_type) {
+            let (served_media_type, inline) = safe_inline_resource(&resource);
+            let content_type = match HeaderValue::from_str(served_media_type) {
                 Ok(value) => value,
                 Err(_) => {
                     return error_response(
@@ -473,16 +493,11 @@ async fn resource_content<H: HostService>(
                     )
                 }
             };
-            let disposition = match inline_content_disposition(&resource.display_name) {
-                Ok(value) => value,
-                Err(_) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        SanitizedError::internal(),
-                    )
-                }
-            };
-            let etag = match HeaderValue::from_str(&format!("\"{}\"", resource.sha256)) {
+            let disposition = match if inline {
+                inline_content_disposition(&resource.display_name)
+            } else {
+                attachment_content_disposition(&resource.display_name)
+            } {
                 Ok(value) => value,
                 Err(_) => {
                     return error_response(
@@ -496,10 +511,10 @@ async fn resource_content<H: HostService>(
                     (CONTENT_TYPE, content_type),
                     (CONTENT_LENGTH, content_length),
                     (CONTENT_DISPOSITION, disposition),
-                    (ETAG, etag),
+                    (CACHE_CONTROL, HeaderValue::from_static("no-store")),
                     (
-                        CACHE_CONTROL,
-                        HeaderValue::from_static("private, max-age=31536000, immutable"),
+                        HeaderName::from_static("cross-origin-resource-policy"),
+                        HeaderValue::from_static("same-origin"),
                     ),
                 ],
                 resource.bytes,
@@ -524,6 +539,115 @@ async fn resource_content<H: HostService>(
                 "Opaque resources are temporarily unavailable.",
             )
             .with_retryable(true),
+        ),
+        Err(ServiceError::CorruptResource) => error_response(
+            StatusCode::GONE,
+            SanitizedError::public(
+                crate::ErrorCode::Unavailable,
+                "The resource is no longer available.",
+            ),
+        ),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SanitizedError::internal(),
+        ),
+    }
+}
+
+async fn session_export<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_session_id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    if query.is_some() {
+        return invalid_request();
+    }
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    let session_id = match SessionId::new(raw_session_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    let permit = match Arc::clone(&state.session_exports).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                SanitizedError::public(
+                    crate::ErrorCode::Unavailable,
+                    "A session export is already in progress.",
+                )
+                .with_retryable(true),
+            )
+        }
+    };
+    let exported = state.supervisor.session_export(&session_id).await;
+    drop(permit);
+    match exported {
+        Ok(bytes) => {
+            let content_length = match HeaderValue::from_str(&bytes.len().to_string()) {
+                Ok(value) => value,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        SanitizedError::internal(),
+                    )
+                }
+            };
+            let disposition = match session_export_content_disposition(&session_id) {
+                Ok(value) => value,
+                Err(_) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        SanitizedError::internal(),
+                    )
+                }
+            };
+            (
+                [
+                    (
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/json; charset=utf-8"),
+                    ),
+                    (CONTENT_LENGTH, content_length),
+                    (CONTENT_DISPOSITION, disposition),
+                    (CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                    (X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
+                    (REFERRER_POLICY, HeaderValue::from_static("no-referrer")),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(ServiceError::NotFound) => error_response(
+            StatusCode::NOT_FOUND,
+            SanitizedError::public(
+                crate::ErrorCode::NotFound,
+                "The requested session was not found.",
+            ),
+        ),
+        Err(ServiceError::Unauthorized) => error_response(
+            StatusCode::FORBIDDEN,
+            SanitizedError::public(
+                crate::ErrorCode::Unauthorized,
+                "This session export is not authorized.",
+            ),
+        ),
+        Err(ServiceError::Unavailable) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            SanitizedError::public(
+                crate::ErrorCode::Unavailable,
+                "Session export is temporarily unavailable.",
+            )
+            .with_retryable(true),
+        ),
+        Err(ServiceError::PayloadTooLarge) => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            SanitizedError::public(
+                crate::ErrorCode::PayloadTooLarge,
+                "The redacted session export exceeds the download limit.",
+            ),
         ),
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -807,6 +931,12 @@ async fn secure_request<H: HostService>(
     let headers = request.headers();
     let attachment_upload =
         request.method() == Method::POST && request.uri().path() == "/api/v1/attachments";
+    let session_export = request.method() == Method::GET
+        && request.uri().path().starts_with("/api/v1/sessions/")
+        && request.uri().path().ends_with("/export");
+    let resource_request = matches!(request.method(), &Method::GET | &Method::HEAD)
+        && request.uri().path().starts_with("/api/v1/sessions/")
+        && request.uri().path().contains("/resources/");
     let host_allowed = headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
@@ -828,7 +958,24 @@ async fn secure_request<H: HostService>(
     let query_allowed = request
         .uri()
         .query()
-        .is_none_or(|query| query.len() <= MAX_QUERY_BYTES);
+        .is_none_or(|query| session_export || query.len() <= MAX_QUERY_BYTES);
+    let export_has_query = session_export && request.uri().query().is_some();
+    let export_has_body = session_export
+        && (headers.contains_key(TRANSFER_ENCODING)
+            || headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length != 0));
+    let resource_has_forbidden_shape = resource_request
+        && (request.uri().query().is_some()
+            || headers.contains_key(RANGE)
+            || headers.contains_key(TRANSFER_ENCODING)
+            || headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length != 0));
     let content_length_limit = if attachment_upload {
         state
             .supervisor
@@ -878,6 +1025,8 @@ async fn secure_request<H: HostService>(
         )
     } else if !api_authenticated {
         authentication_required()
+    } else if export_has_query || export_has_body || resource_has_forbidden_shape {
+        invalid_request()
     } else if !query_allowed || !content_length_allowed {
         error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1041,6 +1190,59 @@ fn inline_content_disposition(
     HeaderValue::from_str(&format!("inline; filename=\"{safe}\""))
 }
 
+fn attachment_content_disposition(
+    display_name: &str,
+) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    let safe = display_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || matches!(character, ' ' | '.' | '-' | '_' | '(' | ')')
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    HeaderValue::from_str(&format!("attachment; filename=\"{safe}\""))
+}
+
+fn safe_inline_resource(resource: &crate::StoredResource) -> (&'static str, bool) {
+    match resource.media_type.as_str() {
+        "text/plain" if std::str::from_utf8(&resource.bytes).is_ok() => ("text/plain", true),
+        "image/png" if resource.bytes.starts_with(b"\x89PNG\r\n\x1a\n") => ("image/png", true),
+        "image/jpeg"
+            if resource.bytes.starts_with(&[0xff, 0xd8, 0xff])
+                && resource.bytes.ends_with(&[0xff, 0xd9]) =>
+        {
+            ("image/jpeg", true)
+        }
+        "image/gif"
+            if resource.bytes.starts_with(b"GIF87a") || resource.bytes.starts_with(b"GIF89a") =>
+        {
+            ("image/gif", true)
+        }
+        "image/webp"
+            if resource.bytes.len() >= 12
+                && resource.bytes.starts_with(b"RIFF")
+                && resource.bytes.get(8..12) == Some(b"WEBP") =>
+        {
+            ("image/webp", true)
+        }
+        _ => ("application/octet-stream", false),
+    }
+}
+
+fn session_export_content_disposition(
+    session_id: &SessionId,
+) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"ygg-session-{}.json\"",
+        session_id.as_str()
+    ))
+}
+
 fn error_response(status: StatusCode, error: SanitizedError) -> Response {
     (
         status,
@@ -1104,6 +1306,7 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use tokio::sync::Notify;
 
     use crate::{
         ActorOwnerState, AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState,
@@ -1125,6 +1328,8 @@ mod tests {
         seeds: Arc<Mutex<BTreeMap<SessionId, SessionSeed>>>,
         attachments: AttachmentStore,
         _attachment_root: Arc<tempfile::TempDir>,
+        export_started: Arc<Notify>,
+        export_release: Arc<Notify>,
     }
 
     impl MockHost {
@@ -1138,6 +1343,8 @@ mod tests {
                 seeds: Arc::new(Mutex::new(BTreeMap::new())),
                 attachments,
                 _attachment_root: attachment_root,
+                export_started: Arc::new(Notify::new()),
+                export_release: Arc::new(Notify::new()),
             }
         }
 
@@ -1180,6 +1387,7 @@ mod tests {
             HostCapabilities {
                 attachments: true,
                 attachment_policy: Some(AttachmentPolicy::image_defaults()),
+                session_export: true,
                 ..HostCapabilities::default()
             }
         }
@@ -1204,16 +1412,52 @@ mod tests {
             self.attachments.content(handle)
         }
 
-        async fn resource_content(&self, handle: &str) -> Result<StoredResource, ServiceError> {
-            if handle != "opaque-resource-test" {
+        async fn resource_content(
+            &self,
+            session_id: &SessionId,
+            handle: &str,
+        ) -> Result<StoredResource, ServiceError> {
+            if session_id.as_str() != "session-resource-test" {
                 return Err(ServiceError::NotFound);
             }
-            Ok(StoredResource {
-                display_name: "evidence.txt".into(),
-                media_type: "text/plain".into(),
-                bytes: bytes::Bytes::from_static(b"structured evidence"),
-                sha256: "eea41f02aac250f283eb2f77556760364cfcce0e4522b126fdbe21469aaa756e".into(),
-            })
+            match handle {
+                "opaque-resource-test" => Ok(StoredResource {
+                    display_name: "evidence.txt".into(),
+                    media_type: "text/plain".into(),
+                    bytes: bytes::Bytes::from_static(b"structured evidence"),
+                    sha256: "eea41f02aac250f283eb2f77556760364cfcce0e4522b126fdbe21469aaa756e"
+                        .into(),
+                }),
+                "active-html-test" => Ok(StoredResource {
+                    display_name: "preview.html".into(),
+                    media_type: "text/html".into(),
+                    bytes: bytes::Bytes::from_static(b"<script>alert(1)</script>"),
+                    sha256: "3a86d1ad640f1586c7f9e7ff31e42a009f41f7f609f732875c41226d3f3a5583"
+                        .into(),
+                }),
+                "corrupt-resource-test" => Err(ServiceError::CorruptResource),
+                _ => Err(ServiceError::NotFound),
+            }
+        }
+
+        async fn session_export(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<bytes::Bytes, ServiceError> {
+            match session_id.as_str() {
+                "missing-export" => Err(ServiceError::NotFound),
+                "oversized-export" => Err(ServiceError::PayloadTooLarge),
+                "blocked-export" => {
+                    self.export_started.notify_one();
+                    self.export_release.notified().await;
+                    Ok(bytes::Bytes::from_static(
+                        br#"{"format":"ygg-session-export","redacted":true}"#,
+                    ))
+                }
+                _ => Ok(bytes::Bytes::from_static(
+                    br#"{"format":"ygg-session-export","redacted":true}"#,
+                )),
+            }
         }
 
         fn authority_profiles(&self) -> Vec<AuthorityProfile> {
@@ -1328,6 +1572,7 @@ mod tests {
                 actor_generation: generation.max(1),
                 cursor: SessionCursor::zero(generation.max(1)),
                 durable_head: None,
+                branches: crate::SessionBranchGraph::default(),
                 live_state: SessionLiveState::Idle,
                 active_run_id: None,
                 model,
@@ -1480,9 +1725,19 @@ mod tests {
     #[test]
     fn static_asset_allowlist_excludes_dotfiles_and_source_maps() {
         assert!(safe_relative_path(FilePath::new("assets/app.js")));
+        assert!(safe_relative_path(FilePath::new(
+            "assets/chunk-MarkdownMessage.js"
+        )));
         let bundle = WebBundle::embedded().unwrap();
         assert_eq!(
             bundle.asset("assets/app.js").unwrap().media_type,
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            bundle
+                .asset("assets/chunk-MarkdownMessage.js")
+                .unwrap()
+                .media_type,
             "text/javascript; charset=utf-8"
         );
         assert!(!safe_relative_path(FilePath::new(".git/config")));
@@ -1660,6 +1915,20 @@ mod tests {
             javascript.split_once("\r\n\r\n").unwrap().1.as_bytes(),
             include_bytes!("../web/assets/app.js")
         );
+        let markdown = request(
+            address,
+            get_request(address, "/assets/chunk-MarkdownMessage.js"),
+        )
+        .await;
+        assert!(markdown.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            response_header(&markdown, "content-type"),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            markdown.split_once("\r\n\r\n").unwrap().1.as_bytes(),
+            include_bytes!("../web/assets/chunk-MarkdownMessage.js")
+        );
         let source_map = request(address, get_request(address, "/assets/app.js.map")).await;
         assert!(source_map.starts_with("HTTP/1.1 404"));
         server.shutdown().await.unwrap();
@@ -1819,6 +2088,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_export_is_authenticated_redacted_bounded_and_single_flight() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig::default(),
+        ));
+        let server = LoopbackServer::start(
+            supervisor,
+            LoopbackConfig {
+                port: 0,
+                web_root: None,
+            },
+        )
+        .await
+        .unwrap();
+        let address = server.address();
+        let path = "/api/v1/sessions/safe-export/export";
+
+        let unauthenticated = request(address, get_request(address, path)).await;
+        assert!(unauthenticated.starts_with("HTTP/1.1 401"));
+        let forbidden_host = request(
+            address,
+            format!("GET {path} HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert!(forbidden_host.starts_with("HTTP/1.1 403"));
+
+        let exchanged = request(address, exchange_request(address, &server.launch_token)).await;
+        let cookie = response_header(&exchanged, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let cross_origin = request(
+            address,
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nOrigin: https://attacker.example\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(cross_origin.starts_with("HTTP/1.1 403"));
+
+        let with_query = request(
+            address,
+            authenticated_get_request(address, &format!("{path}?raw=true"), cookie),
+        )
+        .await;
+        assert!(with_query.starts_with("HTTP/1.1 400"));
+        let with_body = request(
+            address,
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            ),
+        )
+        .await;
+        assert!(with_body.starts_with("HTTP/1.1 400"));
+        let invalid_id = request(
+            address,
+            authenticated_get_request(address, "/api/v1/sessions/bad$id/export", cookie),
+        )
+        .await;
+        assert!(invalid_id.starts_with("HTTP/1.1 400"));
+
+        let exported = request(address, authenticated_get_request(address, path, cookie)).await;
+        assert!(exported.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            response_header(&exported, "content-type"),
+            Some("application/json; charset=utf-8")
+        );
+        assert_eq!(
+            response_header(&exported, "content-disposition"),
+            Some("attachment; filename=\"ygg-session-safe-export.json\"")
+        );
+        assert_eq!(
+            response_header(&exported, "cache-control"),
+            Some("no-store")
+        );
+        assert_eq!(
+            response_header(&exported, "x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response_header(&exported, "referrer-policy"),
+            Some("no-referrer")
+        );
+        assert_eq!(response_header(&exported, "etag"), None);
+        let body = exported.split_once("\r\n\r\n").unwrap().1;
+        assert_eq!(
+            response_header(&exported, "content-length"),
+            Some(body.len().to_string().as_str())
+        );
+        assert_eq!(body, r#"{"format":"ygg-session-export","redacted":true}"#);
+        assert!(!body.contains("includeSecrets"));
+
+        let missing = request(
+            address,
+            authenticated_get_request(address, "/api/v1/sessions/missing-export/export", cookie),
+        )
+        .await;
+        assert!(missing.starts_with("HTTP/1.1 404"));
+        let oversized = request(
+            address,
+            authenticated_get_request(address, "/api/v1/sessions/oversized-export/export", cookie),
+        )
+        .await;
+        assert!(oversized.starts_with("HTTP/1.1 413"));
+
+        let blocked_request =
+            authenticated_get_request(address, "/api/v1/sessions/blocked-export/export", cookie);
+        let blocked = tokio::spawn(request(address, blocked_request));
+        host.export_started.notified().await;
+        let busy = request(address, authenticated_get_request(address, path, cookie)).await;
+        assert!(busy.starts_with("HTTP/1.1 503"));
+        host.export_release.notify_one();
+        assert!(blocked.await.unwrap().starts_with("HTTP/1.1 200"));
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn opaque_resource_transport_requires_auth_and_never_interprets_handles() {
         let host = Arc::new(MockHost::new());
         let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
@@ -1832,7 +2221,7 @@ mod tests {
         .await
         .unwrap();
         let address = server.address();
-        let path = "/api/v1/resources/opaque-resource-test";
+        let path = "/api/v1/sessions/session-resource-test/resources/opaque-resource-test";
 
         let unauthenticated = request(address, get_request(address, path)).await;
         assert!(unauthenticated.starts_with("HTTP/1.1 401"));
@@ -1853,13 +2242,19 @@ mod tests {
             response_header(&content, "content-disposition"),
             Some("inline; filename=\"evidence.txt\"")
         );
+        assert_eq!(response_header(&content, "cache-control"), Some("no-store"));
+        assert_eq!(response_header(&content, "etag"), None);
         assert_eq!(
-            response_header(&content, "cache-control"),
-            Some("private, max-age=31536000, immutable")
+            response_header(&content, "cross-origin-resource-policy"),
+            Some("same-origin")
         );
         assert_eq!(
-            response_header(&content, "etag"),
-            Some("\"eea41f02aac250f283eb2f77556760364cfcce0e4522b126fdbe21469aaa756e\"")
+            response_header(&content, "x-content-type-options"),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response_header(&content, "referrer-policy"),
+            Some("no-referrer")
         );
         assert_eq!(
             content.split_once("\r\n\r\n").unwrap().1,
@@ -1868,10 +2263,72 @@ mod tests {
 
         let traversal = request(
             address,
-            authenticated_get_request(address, "/api/v1/resources/..%2Fsecret", cookie),
+            authenticated_get_request(
+                address,
+                "/api/v1/sessions/session-resource-test/resources/..%2Fsecret",
+                cookie,
+            ),
         )
         .await;
         assert!(traversal.starts_with("HTTP/1.1 404"));
+        let wrong_session = request(
+            address,
+            authenticated_get_request(
+                address,
+                "/api/v1/sessions/session-wrong/resources/opaque-resource-test",
+                cookie,
+            ),
+        )
+        .await;
+        assert!(wrong_session.starts_with("HTTP/1.1 404"));
+
+        let active = request(
+            address,
+            authenticated_get_request(
+                address,
+                "/api/v1/sessions/session-resource-test/resources/active-html-test",
+                cookie,
+            ),
+        )
+        .await;
+        assert!(active.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            response_header(&active, "content-type"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            response_header(&active, "content-disposition"),
+            Some("attachment; filename=\"preview.html\"")
+        );
+
+        let corrupt = request(
+            address,
+            authenticated_get_request(
+                address,
+                "/api/v1/sessions/session-resource-test/resources/corrupt-resource-test",
+                cookie,
+            ),
+        )
+        .await;
+        assert!(corrupt.starts_with("HTTP/1.1 410"));
+
+        for forbidden in [
+            format!(
+                "GET {path}?download=1 HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            ),
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nRange: bytes=0-3\r\nConnection: close\r\n\r\n"
+            ),
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx"
+            ),
+            format!(
+                "HEAD {path}?download=1 HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            ),
+        ] {
+            let response = request(address, forbidden).await;
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        }
         server.shutdown().await.unwrap();
     }
 }

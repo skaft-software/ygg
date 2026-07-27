@@ -12,7 +12,9 @@ import type {
 } from "./protocol";
 import {
   reduceSessionEvent,
+  SessionBranchGraphError,
   SessionGenerationMismatchError,
+  SessionProjectionReplacementRequiredError,
   SessionSequenceGapError,
 } from "./reducer";
 import {
@@ -176,6 +178,7 @@ export class YggStore {
   private selectionGeneration = 0;
   private selectionAbort: AbortController | null = null;
   private resyncing = new Set<string>();
+  private deferredDuringResync = new Map<string, SessionEvent[]>();
   private createSessionTail: Promise<void> = Promise.resolve();
   private disposed = false;
 
@@ -242,10 +245,33 @@ export class YggStore {
         changed = true;
         continue;
       }
+      if (this.resyncing.has(event.sessionId)) {
+        const deferred = this.deferredDuringResync.get(event.sessionId) ?? [];
+        deferred.push(event);
+        this.deferredDuringResync.set(event.sessionId, deferred);
+        continue;
+      }
       const current = next.sessions[event.sessionId];
       let updated = current;
 
-      if (event.type === "session.snapshot") {
+      if (event.type === "session.projectionReplaced") {
+        const incomingGeneration =
+          event.actorGeneration ?? current?.actorGeneration;
+        const stale =
+          current !== undefined &&
+          incomingGeneration !== undefined &&
+          (incomingGeneration < current.actorGeneration ||
+            (incomingGeneration === current.actorGeneration &&
+              event.sequence <= current.sequence));
+        if (!stale) {
+          void this.resyncSession(event.sessionId, {
+            actorGeneration: incomingGeneration ?? 0,
+            sequence: event.sequence,
+          });
+        }
+        continue;
+      }
+      if (event.type === "session.snapshot" && !current) {
         if (
           event.snapshot.sessionId === event.sessionId &&
           event.snapshot.sequence === event.sequence
@@ -258,7 +284,9 @@ export class YggStore {
         } catch (error) {
           if (
             error instanceof SessionSequenceGapError ||
-            error instanceof SessionGenerationMismatchError
+            error instanceof SessionGenerationMismatchError ||
+            error instanceof SessionBranchGraphError ||
+            error instanceof SessionProjectionReplacementRequiredError
           ) {
             void this.resyncSession(event.sessionId);
             continue;
@@ -307,33 +335,85 @@ export class YggStore {
     if (changed) this.publish(next);
   }
 
-  private async resyncSession(sessionId: string): Promise<void> {
+  private async resyncSession(
+    sessionId: string,
+    required?: { actorGeneration: number; sequence: number },
+  ): Promise<void> {
     if (this.resyncing.has(sessionId)) return;
     this.resyncing.add(sessionId);
+    let installed = false;
+    let retryDelay = 50;
     try {
-      const snapshot = await this.transport.getSession(sessionId);
-      const bootstrap = this.state.bootstrap;
-      const summaries = bootstrap?.sessions.map((summary) =>
-        summary.id === sessionId
-          ? {
-              ...summary,
-              title: snapshot.title,
-              status: snapshot.status,
-              modelId: snapshot.modelId,
-              preview: latestAssistant(snapshot) || summary.preview,
-            }
-          : summary,
-      );
-      this.publish({
-        ...this.state,
-        bootstrap:
-          bootstrap && summaries ? { ...bootstrap, sessions: summaries } : bootstrap,
-        sessions: { ...this.state.sessions, [sessionId]: snapshot },
-      });
-    } catch {
-      // The transport reconnect path will replay or deliver a newer snapshot.
+      while (!this.disposed && !installed) {
+        try {
+          const snapshot = await this.transport.getSession(sessionId);
+          const current = this.state.sessions[sessionId];
+          const predates = (
+            cursor: { actorGeneration: number; sequence: number },
+            minimum: { actorGeneration: number; sequence: number },
+          ) =>
+            cursor.actorGeneration < minimum.actorGeneration ||
+            (cursor.actorGeneration === minimum.actorGeneration &&
+              cursor.sequence < minimum.sequence);
+          if (
+            (required &&
+              predates(
+                {
+                  actorGeneration: snapshot.actorGeneration,
+                  sequence: snapshot.sequence,
+                },
+                required,
+              )) ||
+            (current &&
+              predates(
+                {
+                  actorGeneration: snapshot.actorGeneration,
+                  sequence: snapshot.sequence,
+                },
+                {
+                  actorGeneration: current.actorGeneration,
+                  sequence: current.sequence,
+                },
+              ))
+          ) {
+            throw new Error("Session resync returned a stale projection.");
+          }
+          const bootstrap = this.state.bootstrap;
+          const summaries = bootstrap?.sessions.map((summary) =>
+            summary.id === sessionId
+              ? {
+                  ...summary,
+                  title: snapshot.title,
+                  status: snapshot.status,
+                  modelId: snapshot.modelId,
+                  preview: latestAssistant(snapshot) || summary.preview,
+                }
+              : summary,
+          );
+          this.publish({
+            ...this.state,
+            bootstrap:
+              bootstrap && summaries
+                ? { ...bootstrap, sessions: summaries }
+                : bootstrap,
+            sessions: { ...this.state.sessions, [sessionId]: snapshot },
+          });
+          installed = true;
+        } catch {
+          if (this.disposed) break;
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, retryDelay);
+          });
+          retryDelay = Math.min(2_000, retryDelay * 2);
+        }
+      }
     } finally {
       this.resyncing.delete(sessionId);
+      const deferred = this.deferredDuringResync.get(sessionId) ?? [];
+      this.deferredDuringResync.delete(sessionId);
+      if (installed) {
+        for (const event of deferred) this.queueEvent(event);
+      }
     }
   }
 
@@ -348,6 +428,8 @@ export class YggStore {
 
   async initialize(): Promise<void> {
     this.disposed = false;
+    this.unsubscribeTransport?.();
+    this.unsubscribeConnection?.();
     this.unsubscribeTransport = this.transport.subscribe((event) => {
       this.queueEvent(event);
     });
@@ -402,8 +484,8 @@ export class YggStore {
     return this.transport.attachmentContentUrl(handle);
   }
 
-  resourceContentUrl(handle: string): string {
-    return this.transport.resourceContentUrl(handle);
+  resourceContentUrl(sessionId: string, handle: string): string {
+    return this.transport.resourceContentUrl(sessionId, handle);
   }
 
   async selectSession(
@@ -641,6 +723,34 @@ export class YggStore {
     return true;
   }
 
+  async checkoutBranch(entryId: string): Promise<void> {
+    const session = this.selectedSession;
+    if (!session) return;
+    if (
+      session.activeRunId !== undefined ||
+      !["idle", "done", "failed", "stopped"].includes(session.status)
+    ) {
+      throw new Error(
+        "A session branch can only be checked out after current work finishes.",
+      );
+    }
+    const target = session.branches.entries.find(
+      (entry) => entry.entryId === entryId && entry.checkoutable,
+    );
+    if (!target) {
+      throw new Error("That session checkpoint is not available for checkout.");
+    }
+    const ack = await this.sendCommand({
+      id: commandId(),
+      type: "session.checkout",
+      sessionId: session.sessionId,
+      entryId,
+    });
+    if (!ack.accepted) {
+      throw new Error(ack.error ?? "The ygg host rejected this branch checkout.");
+    }
+  }
+
   async resolveApproval(
     requestId: string,
     decision: "allowed_once" | "allowed_session" | "denied",
@@ -702,6 +812,7 @@ export class YggStore {
     }
     this.animationFrame = null;
     this.queuedEvents = [];
+    this.deferredDuringResync.clear();
     this.unsubscribeTransport?.();
     this.unsubscribeConnection?.();
     this.transport.close();

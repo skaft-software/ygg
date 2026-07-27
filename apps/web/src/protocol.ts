@@ -115,6 +115,8 @@ export interface HostBootstrap {
     attachmentIngest: boolean;
     pairDevices: boolean;
     sessionMetadata: boolean;
+    sessionBranches: boolean;
+    sessionExport: boolean;
     themeSelection: boolean;
     steer: boolean;
     followUp: boolean;
@@ -139,6 +141,7 @@ export interface UserMessageItem extends ItemBase {
   kind: "user_message";
   content: string;
   attachments?: AttachmentRef[];
+  delivery?: "submit" | "steer" | "followUp";
 }
 
 export interface AssistantMessageItem extends ItemBase {
@@ -171,6 +174,8 @@ export interface ActionItem extends ItemBase {
   deletions?: number;
   sourceIds?: string[];
   outputIds?: string[];
+  diffHandle?: string;
+  resultHandle?: string;
 }
 
 export interface ApprovalItem extends ItemBase {
@@ -216,6 +221,7 @@ export interface ProgressStep {
 export interface SourceRef {
   id: string;
   handle?: string;
+  originItemId?: string;
   kind: "file" | "web" | "attachment" | "documentation";
   title: string;
   subtitle: string;
@@ -228,6 +234,7 @@ export interface SourceRef {
 export interface OutputRef {
   id: string;
   handle?: string;
+  originItemId?: string;
   kind: "file" | "image" | "site" | "document";
   title: string;
   subtitle: string;
@@ -256,6 +263,26 @@ export interface AttachmentRef {
   size: number;
 }
 
+export type SessionBranchEntryKind =
+  | "userMessage"
+  | "assistantMessage"
+  | "compaction"
+  | "internal";
+
+export interface SessionBranchEntry {
+  entryId: string;
+  parentEntryId?: string;
+  kind: SessionBranchEntryKind;
+  checkoutable: boolean;
+  label: string;
+}
+
+export interface SessionBranchGraph {
+  head?: string;
+  entries: SessionBranchEntry[];
+  truncated: boolean;
+}
+
 export interface SessionSnapshot {
   sessionId: string;
   actorGeneration: number;
@@ -269,6 +296,7 @@ export interface SessionSnapshot {
   authority: AuthorityProfile;
   contextPercent: number;
   startedAt: string;
+  branches: SessionBranchGraph;
   items: TranscriptItem[];
   progress: ProgressStep[];
   sources: SourceRef[];
@@ -342,6 +370,27 @@ export type SessionEvent =
       resultItemId: string;
       detail: string;
       state: ItemState;
+    }
+  | {
+      type: "session.branchEntriesAppended";
+      sessionId: string;
+      actorGeneration?: number;
+      sequence: number;
+      entries: SessionBranchEntry[];
+    }
+  | {
+      type: "session.durableHeadChanged";
+      sessionId: string;
+      actorGeneration?: number;
+      sequence: number;
+      durableHead?: string;
+    }
+  | {
+      type: "session.projectionReplaced";
+      sessionId: string;
+      actorGeneration?: number;
+      sequence: number;
+      durableHead?: string;
     }
   | {
       type: "session.resources";
@@ -423,6 +472,12 @@ export type ClientCommand =
       type: "session.archive";
       sessionId: string;
       archived: boolean;
+    }
+  | {
+      id: string;
+      type: "session.checkout";
+      sessionId: string;
+      entryId: string;
     }
   | {
       id: string;

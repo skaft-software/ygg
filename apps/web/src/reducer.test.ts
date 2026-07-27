@@ -18,6 +18,7 @@ const base: SessionSnapshot = {
   authority: "readOnly",
   contextPercent: 12,
   startedAt: "2026-07-26T12:00:00.000Z",
+  branches: { entries: [], truncated: false },
   items: [],
   progress: [],
   sources: [],
@@ -96,6 +97,106 @@ describe("reduceSessionEvent", () => {
     });
 
     expect(next).toEqual(replacement);
+  });
+
+  it("replaces every projected collection without retaining the old branch", () => {
+    const oldItem: AssistantMessageItem = {
+      id: "old-item",
+      turnId: "old-turn",
+      kind: "assistant_message",
+      content: "Old branch",
+      state: "committed",
+      createdAt: base.startedAt,
+    };
+    const current = {
+      ...base,
+      items: [oldItem],
+      sources: [
+        {
+          id: "old-source",
+          kind: "file" as const,
+          title: "old.ts",
+          subtitle: "Old",
+          consultedAt: base.startedAt,
+          iconLabel: "TS",
+        },
+      ],
+      branches: {
+        head: "entry-old",
+        entries: [
+          {
+            entryId: "entry-old",
+            kind: "assistantMessage" as const,
+            checkoutable: true,
+            label: "Old branch",
+          },
+        ],
+        truncated: false,
+      },
+    };
+    const replacement = {
+      ...base,
+      sequence: 5,
+      status: "idle" as const,
+      items: [],
+      sources: [],
+      outputs: [],
+      previews: [],
+      progress: [],
+      branches: {
+        head: "entry-root",
+        entries: [
+          {
+            entryId: "entry-root",
+            kind: "userMessage" as const,
+            checkoutable: true,
+            label: "Root",
+          },
+        ],
+        truncated: false,
+      },
+    };
+
+    const next = reduceSessionEvent(current, {
+      type: "session.snapshot",
+      sessionId: "session-1",
+      actorGeneration: 1,
+      sequence: 5,
+      snapshot: replacement,
+    });
+
+    expect(next).toEqual(replacement);
+    expect(next.items).toEqual([]);
+    expect(next.sources).toEqual([]);
+    expect(next.branches.entries.map((entry) => entry.entryId)).toEqual([
+      "entry-root",
+    ]);
+  });
+
+  it("accepts a higher actor generation with a reset sequence and ignores older generations", () => {
+    const nextGeneration = {
+      ...base,
+      actorGeneration: 2,
+      sequence: 1,
+      title: "New owner",
+    };
+    const replaced = reduceSessionEvent(base, {
+      type: "session.snapshot",
+      sessionId: "session-1",
+      actorGeneration: 2,
+      sequence: 1,
+      snapshot: nextGeneration,
+    });
+    expect(replaced).toEqual(nextGeneration);
+
+    const stale = reduceSessionEvent(replaced, {
+      type: "session.updated",
+      sessionId: "session-1",
+      actorGeneration: 1,
+      sequence: 99,
+      patch: { title: "Stale owner" },
+    });
+    expect(stale).toBe(replaced);
   });
 
   it("retracts only the rejected provisional item", () => {

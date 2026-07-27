@@ -90,6 +90,120 @@ describe("HTTP Ygg transport", () => {
     expect(transportModeFromSearch("?transport=fixture-preview")).toBe("live");
   });
 
+  it("scopes opaque resource URLs to the owning session", () => {
+    expect(
+      new FixtureTransport().resourceContentUrl(
+        "session with space",
+        "resource/handle",
+      ),
+    ).toBe(
+      "/api/v1/sessions/session%20with%20space/resources/resource%2Fhandle",
+    );
+    expect(
+      new HttpTransport("device-browser").resourceContentUrl(
+        "session-demo",
+        "resource-handle",
+      ),
+    ).toBe(
+      "/api/v1/sessions/session-demo/resources/resource-handle",
+    );
+  });
+
+  it("fixture checkout replaces the selected transcript instead of merging branches", async () => {
+    const transport = new FixtureTransport();
+    await transport.connect();
+    const events: unknown[] = [];
+    transport.subscribe((event) => events.push(event));
+
+    await transport.send({
+      id: "command-fixture-checkout",
+      type: "session.checkout",
+      sessionId: "session-done",
+      entryId: "entry-release-draft",
+    });
+    const replacement = await transport.getSession("session-done");
+
+    expect(replacement.branches.head).toBe("entry-release-draft");
+    expect(replacement.items.map((item) => item.id)).toEqual([
+      "done-user",
+      "done-draft",
+    ]);
+    expect(replacement.sources).toEqual([]);
+    expect(replacement.outputs).toEqual([]);
+    expect(replacement.previews).toEqual([]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "session.projectionReplaced",
+        durableHead: "entry-release-draft",
+      }),
+    );
+    transport.close();
+  });
+
+  it("fixture resource upserts merge by identity without losing prior evidence", async () => {
+    const transport = new FixtureTransport();
+    await transport.connect();
+    const sessionId = "session-fresh";
+    const emit = (
+      transport as unknown as {
+        emit: (event: {
+          type: "session.resources";
+          sessionId: string;
+          sequence: number;
+          merge: true;
+          sources: Array<{
+            id: string;
+            kind: "file";
+            title: string;
+            subtitle: string;
+            consultedAt: string;
+            iconLabel: string;
+          }>;
+        }) => void;
+      }
+    ).emit.bind(transport);
+
+    emit({
+      type: "session.resources",
+      sessionId,
+      sequence: 90,
+      merge: true,
+      sources: [
+        {
+          id: "source-one",
+          kind: "file",
+          title: "one.ts",
+          subtitle: "Consulted",
+          consultedAt: new Date(0).toISOString(),
+          iconLabel: "SRC",
+        },
+      ],
+    });
+    emit({
+      type: "session.resources",
+      sessionId,
+      sequence: 91,
+      merge: true,
+      sources: [
+        {
+          id: "source-two",
+          kind: "file",
+          title: "two.ts",
+          subtitle: "Consulted",
+          consultedAt: new Date(0).toISOString(),
+          iconLabel: "SRC",
+        },
+      ],
+    });
+
+    expect(
+      (await transport.getSession(sessionId)).sources.map(
+        (source) => source.id,
+      ),
+    ).toEqual(["source-one", "source-two"]);
+    transport.close();
+  });
+
   it("persists a valid non-empty loopback device identity", () => {
     const first = resolveClientDeviceId();
     const second = resolveClientDeviceId();
@@ -313,6 +427,67 @@ describe("HTTP Ygg transport", () => {
     transport.close();
   });
 
+  it("keeps a projection replacement behind the replay cursor until a fresh snapshot installs", async () => {
+    const replacementEnvelope = structuredClone(eventEnvelopeGolden) as {
+      cursor: { actorGeneration: number; sequence: number };
+      event: unknown;
+      [key: string]: unknown;
+    };
+    replacementEnvelope.cursor.sequence = 43;
+    replacementEnvelope.event = {
+      type: "session.projectionReplaced",
+      data: { durableEntryId: "entry-42" },
+    };
+    const staleSnapshot = structuredClone(hostBootstrapGolden.selectedSession);
+    const freshSnapshot = structuredClone(hostBootstrapGolden.selectedSession);
+    freshSnapshot.cursor.sequence = 43;
+    const replay = {
+      type: "events",
+      after: { actorGeneration: 3, sequence: 42 },
+      through: { actorGeneration: 3, sequence: 43 },
+      events: [replacementEnvelope],
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(hostBootstrapGolden))
+      .mockResolvedValueOnce(jsonResponse(staleSnapshot))
+      .mockResolvedValueOnce(jsonResponse(replay))
+      .mockResolvedValueOnce(jsonResponse(hostBootstrapGolden))
+      .mockResolvedValueOnce(jsonResponse(freshSnapshot));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+    await transport.connect();
+    await transport.getSession("session-demo");
+
+    FakeWebSocket.instances[0]?.emit(
+      "message",
+      new MessageEvent("message", {
+        data: JSON.stringify({
+          protocol: 1,
+          hostSequence: 11,
+          event: replacementEnvelope,
+        }),
+      }),
+    );
+    await expect(transport.getSession("session-demo")).rejects.toThrow(
+      "predates the required projection replacement",
+    );
+
+    FakeWebSocket.instances[0]?.emit("close", new Event("close"));
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2), {
+      timeout: 1_000,
+    });
+    FakeWebSocket.instances[1]?.emit("open", new Event("open"));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      "/api/v1/sessions/session-demo/replay?actorGeneration=3&sequence=42",
+    );
+
+    const fresh = await transport.getSession("session-demo");
+    expect(fresh.sequence).toBe(43);
+    transport.close();
+  });
+
   it("refreshes catalog changes missed while the socket was closed", async () => {
     const replay = {
       type: "events",
@@ -365,6 +540,7 @@ describe("HTTP Ygg transport", () => {
     createdSnapshot.actorGeneration = 4;
     createdSnapshot.cursor = { actorGeneration: 4, sequence: 0 };
     delete createdSnapshot.durableHead;
+    createdSnapshot.branches = { entries: [], truncated: false };
     createdSnapshot.items = [];
     const fetchMock = vi
       .fn<typeof fetch>()

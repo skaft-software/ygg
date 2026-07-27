@@ -186,6 +186,7 @@ mod tests {
             actor_generation: cursor.actor_generation,
             cursor,
             durable_head: None,
+            branches: crate::SessionBranchGraph::default(),
             live_state: SessionLiveState::Idle,
             active_run_id: None,
             model: ModelSelection {

@@ -12,6 +12,8 @@ import type {
   PreviewRef,
   ProgressStep,
   ReasoningEffort,
+  SessionBranchEntry,
+  SessionBranchGraph,
   SessionEvent,
   SessionSnapshot,
   SessionStatus,
@@ -562,7 +564,10 @@ function projectSource(value: unknown, path: string): SourceRef {
     "resource",
     "other",
   ] as const);
-  optionalString(source.originItemId, `${path}.originItemId`);
+  const originItemId = optionalString(
+    source.originItemId,
+    `${path}.originItemId`,
+  );
   boolean(source.cited, `${path}.cited`);
   boolean(source.available, `${path}.available`);
   string(source.handle, `${path}.handle`);
@@ -570,6 +575,7 @@ function projectSource(value: unknown, path: string): SourceRef {
   return {
     id: string(source.id, `${path}.id`),
     handle: string(source.handle, `${path}.handle`),
+    originItemId,
     kind:
       kind === "resource"
         ? "documentation"
@@ -608,12 +614,16 @@ function projectArtifact(value: unknown, path: string): OutputRef {
   ] as const);
   string(artifact.handle, `${path}.handle`);
   optionalString(artifact.contentHash, `${path}.contentHash`);
-  optionalString(artifact.originItemId, `${path}.originItemId`);
+  const originItemId = optionalString(
+    artifact.originItemId,
+    `${path}.originItemId`,
+  );
   boolean(artifact.available, `${path}.available`);
   const byteLen = number(artifact.byteLen, `${path}.byteLen`);
   return {
     id: string(artifact.id, `${path}.id`),
     handle: string(artifact.handle, `${path}.handle`),
+    originItemId,
     kind:
       kind === "image" || kind === "document" || kind === "site"
         ? kind
@@ -708,11 +718,21 @@ function projectItem(
       const data = object(payload.data, `${path}.payload.data`, [
         "text",
         "attachments",
+        "delivery",
       ]);
+      const delivery =
+        data.delivery === undefined
+          ? undefined
+          : enumeration(data.delivery, `${path}.payload.data.delivery`, [
+              "submit",
+              "steer",
+              "followUp",
+            ] as const);
       return {
         ...base,
         kind: "user_message",
         content: string(data.text, `${path}.payload.data.text`),
+        delivery,
         attachments: array(
           data.attachments ?? [],
           `${path}.payload.data.attachments`,
@@ -778,11 +798,19 @@ function projectItem(
     case "fileChange": {
       const data = object(payload.data, `${path}.payload.data`, [
         "handle",
+        "resultHandle",
         "displayPath",
         "additions",
         "deletions",
       ]);
-      string(data.handle, `${path}.payload.data.handle`);
+      const diffHandle = string(
+        data.handle,
+        `${path}.payload.data.handle`,
+      );
+      const resultHandle = optionalString(
+        data.resultHandle,
+        `${path}.payload.data.resultHandle`,
+      );
       return {
         ...base,
         kind: "action",
@@ -800,6 +828,8 @@ function projectItem(
           data.deletions,
           `${path}.payload.data.deletions`,
         ),
+        diffHandle,
+        resultHandle,
       };
     }
     case "compaction": {
@@ -971,6 +1001,98 @@ interface SnapshotContext {
   models?: readonly ModelSummary[];
 }
 
+function projectBranchEntry(
+  value: unknown,
+  path: string,
+): SessionBranchEntry {
+  const entry = object(value, path, [
+    "entryId",
+    "parentEntryId",
+    "kind",
+    "checkoutable",
+    "label",
+  ]);
+  const kind = enumeration(entry.kind, `${path}.kind`, [
+    "userMessage",
+    "assistantMessage",
+    "compaction",
+    "internal",
+  ] as const);
+  const checkoutable = boolean(
+    entry.checkoutable,
+    `${path}.checkoutable`,
+  );
+  if (kind === "internal" && checkoutable) {
+    throw new WireContractError(
+      `${path}.checkoutable`,
+      "must be false for internal entries",
+    );
+  }
+  return {
+    entryId: boundedString(entry.entryId, `${path}.entryId`, 512),
+    parentEntryId:
+      entry.parentEntryId === undefined
+        ? undefined
+        : boundedString(entry.parentEntryId, `${path}.parentEntryId`, 512),
+    kind,
+    checkoutable,
+    label: boundedString(entry.label, `${path}.label`, 256),
+  };
+}
+
+function projectBranchGraph(
+  value: unknown,
+  path: string,
+  durableHead: string | undefined,
+): SessionBranchGraph {
+  const graph = object(value, path, ["head", "entries", "truncated"]);
+  const head =
+    graph.head === undefined
+      ? undefined
+      : boundedString(graph.head, `${path}.head`, 512);
+  if (head !== durableHead) {
+    throw new WireContractError(
+      `${path}.head`,
+      "must match the snapshot durable head",
+    );
+  }
+  const rawEntries = array(graph.entries, `${path}.entries`);
+  if (rawEntries.length > 2_048) {
+    throw new WireContractError(`${path}.entries`, "has more than 2048 entries");
+  }
+  const truncated = boolean(graph.truncated, `${path}.truncated`);
+  const entries = rawEntries.map((entry, index) =>
+    projectBranchEntry(entry, `${path}.entries[${index}]`),
+  );
+  const ids = new Set<string>();
+  for (const entry of entries) {
+    if (ids.has(entry.entryId)) {
+      throw new WireContractError(
+        `${path}.entries`,
+        "contains duplicate entry IDs",
+      );
+    }
+    ids.add(entry.entryId);
+  }
+  if (!truncated) {
+    for (const entry of entries) {
+      if (entry.parentEntryId !== undefined && !ids.has(entry.parentEntryId)) {
+        throw new WireContractError(
+          `${path}.entries`,
+          "contains a parent outside the preserved graph",
+        );
+      }
+    }
+  }
+  if (head !== undefined && !ids.has(head)) {
+    throw new WireContractError(
+      `${path}.head`,
+      "must identify a preserved entry",
+    );
+  }
+  return { head, entries, truncated };
+}
+
 export function projectSessionSnapshot(
   value: unknown,
   context: SnapshotContext = {},
@@ -980,6 +1102,7 @@ export function projectSessionSnapshot(
     "actorGeneration",
     "cursor",
     "durableHead",
+    "branches",
     "liveState",
     "activeRunId",
     "model",
@@ -1009,7 +1132,15 @@ export function projectSessionSnapshot(
       "must match the snapshot actor generation",
     );
   }
-  optionalString(snapshot.durableHead, "sessionSnapshot.durableHead");
+  const durableHead = optionalString(
+    snapshot.durableHead,
+    "sessionSnapshot.durableHead",
+  );
+  const branches = projectBranchGraph(
+    snapshot.branches,
+    "sessionSnapshot.branches",
+    durableHead,
+  );
   const activeRunId = optionalString(
     snapshot.activeRunId,
     "sessionSnapshot.activeRunId",
@@ -1197,6 +1328,7 @@ export function projectSessionSnapshot(
         ? Math.min(100, Math.round((contextTokens / contextLimit) * 100))
         : 0,
     startedAt: context.summary?.updatedAt ?? iso(timestampMs),
+    branches,
     items: [...items, ...requests],
     progress,
     sources,
@@ -1241,6 +1373,9 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
       "lanClients",
       "terminal",
       "childAgents",
+      "sessionMetadata",
+      "sessionBranches",
+      "sessionExport",
     ],
   );
   boolean(
@@ -1253,6 +1388,18 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
   );
   boolean(capabilities.terminal, "hostBootstrap.capabilities.terminal");
   boolean(capabilities.childAgents, "hostBootstrap.capabilities.childAgents");
+  const sessionMetadata = boolean(
+    capabilities.sessionMetadata,
+    "hostBootstrap.capabilities.sessionMetadata",
+  );
+  const sessionBranches = boolean(
+    capabilities.sessionBranches,
+    "hostBootstrap.capabilities.sessionBranches",
+  );
+  const sessionExport = boolean(
+    capabilities.sessionExport,
+    "hostBootstrap.capabilities.sessionExport",
+  );
   const attachments = boolean(
     capabilities.attachments,
     "hostBootstrap.capabilities.attachments",
@@ -1423,11 +1570,12 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
         "hostBootstrap.capabilities.lanClients",
       ),
       // These describe UI paths that require more than a host capability bit.
-      // The HTTP service currently has no ingest, pairing, metadata, or theme
-      // mutation endpoint, so live mode must not advertise fixture behavior.
+      // Keep pairing disabled until an authenticated pairing lifecycle exists.
       attachmentIngest: attachments && attachmentPolicy !== undefined,
       pairDevices: false,
-      sessionMetadata: false,
+      sessionMetadata,
+      sessionBranches,
+      sessionExport,
       themeSelection: themes.length > 1,
       steer: true,
       followUp: true,
@@ -1620,20 +1768,81 @@ export function projectEventEnvelope(
         },
       };
     }
-    case "session.durableHeadChanged": {
+    case "session.metadataChanged": {
       const data = object(event.data, "event.event.data", [
-        "durableEntryId",
+        "title",
+        "pinned",
+        "archived",
       ]);
-      optionalString(
-        data.durableEntryId,
-        "event.event.data.durableEntryId",
-      );
+      const title =
+        data.title === undefined
+          ? undefined
+          : boundedString(data.title, "event.event.data.title", 120);
+      if (data.pinned !== undefined) {
+        boolean(data.pinned, "event.event.data.pinned");
+      }
+      if (data.archived !== undefined) {
+        boolean(data.archived, "event.event.data.archived");
+      }
       return {
         type: "session.updated",
         sessionId,
         actorGeneration,
         sequence,
-        patch: {},
+        patch: title === undefined ? {} : { title },
+      };
+    }
+    case "session.durableHeadChanged": {
+      const data = object(event.data, "event.event.data", [
+        "durableEntryId",
+      ]);
+      const durableHead = optionalString(
+        data.durableEntryId,
+        "event.event.data.durableEntryId",
+      );
+      return {
+        type: "session.durableHeadChanged",
+        sessionId,
+        actorGeneration,
+        sequence,
+        durableHead,
+      };
+    }
+    case "session.branchEntriesAppended": {
+      const data = object(event.data, "event.event.data", ["entries"]);
+      const entries = array(data.entries, "event.event.data.entries");
+      if (entries.length === 0 || entries.length > 128) {
+        throw new WireContractError(
+          "event.event.data.entries",
+          "must contain 1 to 128 entries",
+        );
+      }
+      return {
+        type: "session.branchEntriesAppended",
+        sessionId,
+        actorGeneration,
+        sequence,
+        entries: entries.map((entry, index) =>
+          projectBranchEntry(
+            entry,
+            `event.event.data.entries[${index}]`,
+          ),
+        ),
+      };
+    }
+    case "session.projectionReplaced": {
+      const data = object(event.data, "event.event.data", [
+        "durableEntryId",
+      ]);
+      return {
+        type: "session.projectionReplaced",
+        sessionId,
+        actorGeneration,
+        sequence,
+        durableHead: optionalString(
+          data.durableEntryId,
+          "event.event.data.durableEntryId",
+        ),
       };
     }
     case "item.started": {
@@ -2326,6 +2535,46 @@ export function encodeClientCommand(
       {
         type: "session.setAuthority",
         data: { authority: encodeAuthority(command.authority!) },
+      },
+      context,
+    );
+  }
+  if (command.type === "session.rename") {
+    return sessionEnvelope(
+      command,
+      {
+        type: "session.rename",
+        data: { title: command.title },
+      },
+      context,
+    );
+  }
+  if (command.type === "session.pin") {
+    return sessionEnvelope(
+      command,
+      {
+        type: "session.pin",
+        data: { pinned: command.pinned },
+      },
+      context,
+    );
+  }
+  if (command.type === "session.archive") {
+    return sessionEnvelope(
+      command,
+      {
+        type: "session.archive",
+        data: { archived: command.archived },
+      },
+      context,
+    );
+  }
+  if (command.type === "session.checkout") {
+    return sessionEnvelope(
+      command,
+      {
+        type: "session.checkout",
+        data: { entryId: command.entryId },
       },
       context,
     );

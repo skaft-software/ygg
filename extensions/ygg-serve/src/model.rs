@@ -18,6 +18,7 @@ use crate::{
 const MAX_PROJECTS: usize = 256;
 const MAX_SESSION_SUMMARIES: usize = 2_000;
 const MAX_SESSION_ITEMS: usize = 10_000;
+const MAX_BRANCH_ENTRIES: usize = 2_048;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_RESOURCES: usize = 2_048;
 const MAX_TAGS: usize = 32;
@@ -102,6 +103,10 @@ pub struct HostCapabilities {
     pub connected_devices: bool,
     /// Durable session rename, pin, and archive mutations are available.
     pub session_metadata: bool,
+    /// Durable branch graph inspection and idle-boundary checkout are available.
+    pub session_branches: bool,
+    /// Authenticated, redacted portable session downloads are available.
+    pub session_export: bool,
     /// LAN connected clients are supported.
     pub lan_clients: bool,
     /// Interactive PTY support; false for the first web release.
@@ -151,6 +156,8 @@ impl Default for HostCapabilities {
             previews: false,
             connected_devices: false,
             session_metadata: false,
+            session_branches: false,
+            session_export: false,
             // Capability advertisements describe the transport that is
             // actually running. The transport-neutral backend does not imply
             // an authenticated LAN listener.
@@ -349,6 +356,56 @@ pub struct SessionSummary {
     pub model: ModelSelection,
 }
 
+/// One durable entry in the complete preserved session graph.
+///
+/// Entries are deliberately path-free and carry only enough presentation
+/// text for a branch picker. The exact transcript for the selected head stays
+/// in [`SessionSnapshot::items`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionBranchEntry {
+    /// Exact durable Ygg entry identity.
+    pub entry_id: DurableEntryId,
+    /// Parent entry, or none for a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_entry_id: Option<DurableEntryId>,
+    /// Coarse presentation class. Internal nodes remain only to preserve
+    /// exact parent closure for visible conversation checkpoints.
+    pub kind: SessionBranchEntryKind,
+    /// Whether a user-facing client may offer this node as a checkout target.
+    pub checkoutable: bool,
+    /// Bounded human-readable branch picker label.
+    pub label: String,
+}
+
+/// Coarse, non-sensitive durable entry classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionBranchEntryKind {
+    /// User-authored conversation checkpoint.
+    UserMessage,
+    /// Assistant-authored conversation checkpoint.
+    AssistantMessage,
+    /// Deliberate transcript compaction checkpoint.
+    Compaction,
+    /// Configuration, provider state, skills, and structural nodes.
+    Internal,
+}
+
+/// Bounded durable branch projection plus the currently selected head.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionBranchGraph {
+    /// Exact active durable head, or none for a fresh empty session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<DurableEntryId>,
+    /// Recent preserved durable entries in append order.
+    pub entries: Vec<SessionBranchEntry>,
+    /// Whether older entries and parent links were intentionally omitted.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 /// Item persistence lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -392,8 +449,11 @@ pub struct PlanStep {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileChange {
-    /// Opaque host-owned file handle.
+    /// Opaque host-owned handle for the exact unified diff.
     pub handle: String,
+    /// Opaque host-owned handle for the exact post-change file snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_handle: Option<String>,
     /// Safe relative/display path.
     pub display_path: String,
     /// Added lines when known.
@@ -695,6 +755,8 @@ pub struct SessionSnapshot {
     /// Durable active head.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durable_head: Option<DurableEntryId>,
+    /// Bounded durable branching state.
+    pub branches: SessionBranchGraph,
     /// Strong live state.
     pub live_state: SessionLiveState,
     /// Active run.
@@ -902,6 +964,9 @@ impl ProtocolValidation for PlanStep {
 impl ProtocolValidation for FileChange {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_public_text("file_change.handle", &self.handle, 256, false)?;
+        if let Some(handle) = &self.result_handle {
+            validate_public_text("file_change.result_handle", handle, 256, false)?;
+        }
         validate_public_text("file_change.display_path", &self.display_path, 1024, false)
     }
 }
@@ -1058,6 +1123,71 @@ impl ProtocolValidation for PendingRequest {
     }
 }
 
+impl ProtocolValidation for SessionBranchEntry {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_public_text("snapshot.branches.entry.label", &self.label, 256, false)?;
+        if self.parent_entry_id.as_ref() == Some(&self.entry_id) {
+            return Err(ValidationError::new(
+                "snapshot.branches.entry.parent_entry_id",
+                "must not reference itself",
+            ));
+        }
+        if self.kind == SessionBranchEntryKind::Internal && self.checkoutable {
+            return Err(ValidationError::new(
+                "snapshot.branches.entry.checkoutable",
+                "internal branch nodes must not be user-checkoutable",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolValidation for SessionBranchGraph {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.entries.len() > MAX_BRANCH_ENTRIES {
+            return Err(ValidationError::new(
+                "snapshot.branches.entries",
+                format!("exceeds the {MAX_BRANCH_ENTRIES}-entry limit"),
+            ));
+        }
+        let mut branch_ids = BTreeSet::new();
+        for entry in &self.entries {
+            entry.validate()?;
+            if !branch_ids.insert(entry.entry_id.clone()) {
+                return Err(ValidationError::new(
+                    "snapshot.branches.entries",
+                    "contains a duplicate durable entry ID",
+                ));
+            }
+        }
+        if !self.truncated {
+            for entry in &self.entries {
+                if entry
+                    .parent_entry_id
+                    .as_ref()
+                    .is_some_and(|parent| !branch_ids.contains(parent))
+                {
+                    return Err(ValidationError::new(
+                        "snapshot.branches.entry.parent_entry_id",
+                        "must reference a preserved branch entry",
+                    ));
+                }
+            }
+        }
+        if self
+            .head
+            .as_ref()
+            .is_some_and(|head| !branch_ids.contains(head))
+        {
+            return Err(ValidationError::new(
+                "snapshot.branches.head",
+                "must reference a preserved branch entry",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ProtocolValidation for SessionSnapshot {
     fn validate(&self) -> Result<(), ValidationError> {
         if self.actor_generation == 0 {
@@ -1072,6 +1202,13 @@ impl ProtocolValidation for SessionSnapshot {
                 "must match the snapshot actor generation",
             ));
         }
+        if self.durable_head != self.branches.head {
+            return Err(ValidationError::new(
+                "snapshot.branches.head",
+                "must match the snapshot durable head",
+            ));
+        }
+        self.branches.validate()?;
         self.model.validate()?;
         if self.items.len() > MAX_SESSION_ITEMS {
             return Err(ValidationError::new(
@@ -1330,5 +1467,26 @@ mod tests {
             .unwrap();
             assert_eq!(encoded["data"]["delivery"], expected);
         }
+    }
+
+    #[test]
+    fn truncated_branch_projection_allows_an_omitted_parent_but_keeps_its_head() {
+        let head = DurableEntryId::new("entry-recent").unwrap();
+        let graph = SessionBranchGraph {
+            head: Some(head.clone()),
+            entries: vec![SessionBranchEntry {
+                entry_id: head,
+                parent_entry_id: Some(DurableEntryId::new("entry-omitted").unwrap()),
+                kind: SessionBranchEntryKind::AssistantMessage,
+                checkoutable: true,
+                label: "Recent answer".into(),
+            }],
+            truncated: true,
+        };
+        graph.validate().unwrap();
+
+        let mut complete = graph;
+        complete.truncated = false;
+        assert!(complete.validate().is_err());
     }
 }

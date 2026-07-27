@@ -26,7 +26,7 @@ async function selectSession(page: Page, title: string) {
 }
 
 async function ensureActivityOpen(page: Page) {
-  const rail = page.getByLabel("Session activity");
+  const rail = page.locator(".activity-rail");
   const opener = page.getByRole("button", { name: "Open activity" });
   await expect
     .poll(async () => (await rail.isVisible()) || (await opener.isVisible()))
@@ -86,22 +86,42 @@ test("opens in a fresh, quiet session with the standard composer", async ({
   await expect(
     page.getByRole("button", { name: "New session", exact: true }),
   ).toBeVisible();
+  await expect(page.locator(".brand-row .ygg-glyph")).toHaveCount(0);
+  await expect(page.locator(".local-identity")).toHaveCount(0);
+  await expect(page.getByText("Connected to local ygg")).toHaveCount(0);
   await expect(page.getByText("Pinned", { exact: true })).toBeVisible();
   await expect(page.getByText("Recents", { exact: true })).toBeVisible();
   await expect(page.getByLabel("Message ygg")).toBeVisible();
-  await expect(page.getByLabel("Model")).toHaveAttribute(
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const composer = document.querySelector(".composer")!;
+        return {
+          theme: document.documentElement.dataset.theme,
+          border: getComputedStyle(composer).borderColor,
+          shimmer: getComputedStyle(composer, "::before").animationName,
+        };
+      }),
+    )
+    .toEqual({
+      theme: "tidepool",
+      border: "rgba(0, 0, 0, 0)",
+      shimmer: "none",
+    });
+  await expect(page.getByRole("button", { name: /Model and effort/ })).toHaveAttribute(
     "data-value",
     "claude-sonnet-4-6",
   );
-  await expect(page.getByLabel("Session activity")).toBeHidden();
+  await expect(
+    page.locator(".activity-rail"),
+  ).toBeHidden();
 });
 
 test("keeps composer controls keyboard focusable with a visible focus ring", async ({
   page,
 }) => {
   const attach = page.getByRole("button", { name: "Add files or photos" });
-  const model = page.getByLabel("Model");
-  const reasoning = page.getByLabel("Reasoning effort");
+  const model = page.getByRole("button", { name: /Model and effort/ });
   const authority = page.getByLabel("Authority");
 
   await attach.focus();
@@ -118,9 +138,29 @@ test("keeps composer controls keyboard focusable with a visible focus ring", asy
     .toBe("solid 2px");
 
   await page.keyboard.press("Tab");
-  await expect(reasoning).toBeFocused();
-  await page.keyboard.press("Tab");
   await expect(authority).toBeFocused();
+});
+
+test("uses a model-colored loader and quiet blue activity dots", async ({
+  page,
+}) => {
+  const working = page.getByRole("button", {
+    name: /Refine onboarding preview, Working/,
+  });
+  await expect(working.locator(".session-loader .spin")).toBeVisible();
+  await expect(working).toHaveCSS("--session-model-color", "#10a37f");
+
+  const attention = page.getByRole("button", {
+    name: /Prepare signed macOS build, Needs attention/,
+  });
+  const attentionDot = attention.locator(".session-unread");
+  await expect(attentionDot).toBeVisible();
+  await expect(attentionDot).toHaveCSS("background-color", "rgb(110, 184, 255)");
+
+  const unread = page.getByRole("button", {
+    name: /Review release readiness, Done/,
+  });
+  await expect(unread.locator(".session-unread")).toBeVisible();
 });
 
 test("uploads an image, sends it without text, and restores thumbnail focus", async (
@@ -178,14 +218,59 @@ test("uses one keyboard-operable reasoning slider with static reduced motion", a
   testInfo,
 ) => {
   test.skip(testInfo.project.name !== "desktop");
+  await page.getByRole("button", { name: /Model and effort/ }).click();
   const slider = page.getByRole("slider", { name: "Reasoning effort" });
-  await expect(slider).toHaveAttribute("aria-valuetext", "high");
+  await expect(slider).toHaveAttribute("aria-valuetext", "Max");
+  await expect(page.locator(".power-slider-root")).toHaveAttribute(
+    "data-overdrive",
+    "true",
+  );
+  await expect(page.locator(".power-slider-fast-particles i")).toHaveCount(10);
+  await expect
+    .poll(() =>
+      page.evaluate(() => ({
+        particle: getComputedStyle(
+          document.querySelector(".power-slider-fast-particles i")!,
+        ).backgroundColor,
+        thumb: getComputedStyle(
+          document.querySelector(".power-slider-thumb")!,
+        ).backgroundColor,
+      })),
+    )
+    .toEqual({
+      particle: "rgb(255, 255, 255)",
+      thumb: "rgb(255, 255, 255)",
+    });
   await slider.press("ArrowLeft");
-  await expect(slider).toHaveAttribute("aria-valuetext", "medium");
+  await expect(slider).toHaveAttribute("aria-valuetext", "Medium");
+  await expect(page.locator(".power-slider-root")).toHaveAttribute(
+    "data-overdrive",
+    "false",
+  );
+  await expect(page.locator(".power-slider-fast-particles i")).toHaveCount(0);
   await slider.press("ArrowRight");
-  await expect(slider).toHaveAttribute("aria-valuetext", "high");
+  await expect(slider).toHaveAttribute("aria-valuetext", "Max");
   await expect(page.locator(".power-slider-max-fill")).toBeVisible();
-  await expect(page.locator(".power-slider-burst")).toBeVisible();
+  await expect(page.locator(".power-slider-burst")).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page
+        .locator(".power-slider-max-fill")
+        .evaluate((element) => {
+          const style = getComputedStyle(element);
+          const flow = getComputedStyle(element, "::after");
+          return {
+            background: style.backgroundImage,
+            animation: flow.animationName,
+            duration: flow.animationDuration,
+          };
+        }),
+    )
+    .toEqual({
+      background: expect.stringContaining("rgb(66, 207, 155)"),
+      animation: "power-rainbow-flow",
+      duration: "9s",
+    });
 
   await page.evaluate(() => {
     document.documentElement.dataset.motion = "none";
@@ -193,7 +278,7 @@ test("uses one keyboard-operable reasoning slider with static reduced motion", a
   await expect
     .poll(() =>
       page
-        .locator(".power-slider-burst i")
+        .locator(".power-slider-fast-particles i")
         .first()
         .evaluate((element) => getComputedStyle(element).animationDuration),
     )
@@ -209,9 +294,89 @@ test("shows typed work and a conditional activity rail", async ({ page }) => {
   await expect(
     conversation.getByText("Checking the narrow layout"),
   ).toBeVisible();
+  await expect
+    .poll(() =>
+      page.locator(".composer").evaluate((composer) => ({
+        border: getComputedStyle(composer).borderColor,
+        shimmer: getComputedStyle(composer, "::before").animationName,
+        perimeter: getComputedStyle(
+          composer.querySelector(".composer-running-edge-chase")!,
+        ).animationName,
+      })),
+    )
+    .toEqual({
+      border: "rgba(0, 0, 0, 0)",
+      shimmer: "none",
+      perimeter: "composer-ring-chase",
+    });
+  await expect(page.getByRole("button", { name: "Stop ygg" })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Queue follow-up" }),
+  ).toHaveCount(0);
   await ensureActivityOpen(page);
   await expect(page.getByText("Verifying keyboard and touch behavior")).toBeVisible();
   await expect(page.getByRole("button", { name: /Onboarding preview/ })).toBeVisible();
+});
+
+test("resizes the desktop activity pane and remembers its width", async (
+  { page },
+  testInfo,
+) => {
+  test.skip(testInfo.project.name !== "desktop");
+  await selectSession(page, "Refine onboarding preview");
+  await ensureActivityOpen(page);
+
+  const separator = page.getByRole("separator", {
+    name: "Resize session activity",
+  });
+  await expect(separator).toHaveAttribute("aria-valuenow", "320");
+  await separator.press("ArrowLeft");
+  await expect(separator).toHaveAttribute("aria-valuenow", "336");
+
+  await page.reload();
+  await selectSession(page, "Refine onboarding preview");
+  await ensureActivityOpen(page);
+  await expect(
+    page.getByRole("separator", { name: "Resize session activity" }),
+  ).toHaveAttribute("aria-valuenow", "336");
+});
+
+test("keeps the model picker inside the phone viewport", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "mobile" &&
+      testInfo.project.name !== "mobile-small",
+  );
+  const trigger = page.getByRole("button", { name: /Model and effort/ });
+  await trigger.click();
+  const picker = page.getByRole("dialog", { name: "Model and effort" });
+  await expect(picker).toBeVisible();
+  await expect
+    .poll(() =>
+      picker.evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        return {
+          left: Math.round(bounds.left),
+          right: Math.round(bounds.right),
+          bottom: Math.round(bounds.bottom),
+          viewportWidth: window.innerWidth,
+          viewportHeight: window.innerHeight,
+          position: getComputedStyle(element).position,
+        };
+      }),
+    )
+    .toEqual({
+      left: 8,
+      right: viewportByProject[testInfo.project.name].width - 8,
+      bottom: viewportByProject[testInfo.project.name].height - 8,
+      viewportWidth: viewportByProject[testInfo.project.name].width,
+      viewportHeight: viewportByProject[testInfo.project.name].height,
+      position: "fixed",
+    });
+  await page.keyboard.press("Escape");
+  await expect(picker).toHaveCount(0);
+  await expect(trigger).toBeFocused();
 });
 
 test("closes the session actions menu with Escape and restores its trigger", async (
@@ -238,7 +403,7 @@ test("treats the narrow activity rail as a dismissible keyboard overlay", async 
   await trigger.focus();
   await trigger.press("Enter");
 
-  const rail = page.getByLabel("Session activity");
+  const rail = page.locator(".activity-rail");
   const close = rail.getByRole("button", { name: "Close activity" });
   await expect(rail).toBeVisible();
   await expect(close).toBeFocused();
@@ -254,7 +419,7 @@ test("opens an output into the dominant preview inspector", async (
   await selectSession(page, "Review release readiness");
   await ensureActivityOpen(page);
   await page
-    .getByLabel("Session activity")
+    .locator(".activity-rail")
     .getByRole("button", { name: /Release pulse/ })
     .click();
   await expect(page.getByLabel("Release pulse inspector")).toBeVisible();
@@ -308,7 +473,7 @@ test("returns focus to a visible activity trigger after closing an inspector", a
   await selectSession(page, "Review release readiness");
   await ensureActivityOpen(page);
   const output = page
-    .getByLabel("Session activity")
+    .locator(".activity-rail")
     .getByRole("button", { name: /Release pulse/ });
   await output.focus();
   await output.press("Enter");
@@ -437,7 +602,7 @@ test("preserves core flows at a 200-percent equivalent reflow", async (
   ).toBeVisible();
   await ensureActivityOpen(page);
   await page
-    .getByLabel("Session activity")
+    .locator(".activity-rail")
     .getByRole("button", { name: /Release pulse/ })
     .click();
   await expect(page.getByLabel("Release pulse inspector")).toBeVisible();
@@ -477,7 +642,7 @@ test("does not make outbound requests or overflow the viewport", async ({
   await selectSession(page, "Review release readiness");
   await ensureActivityOpen(page);
   await page
-    .getByLabel("Session activity")
+    .locator(".activity-rail")
     .getByRole("button", { name: /Release pulse/ })
     .click();
   await expect(page.getByTitle("Release pulse")).toBeVisible();

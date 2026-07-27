@@ -3,22 +3,27 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::time::timeout;
 
 use crate::{
     ActorOwnerState, AttentionState, AuthorityProfile, CommandAck, CommandId, DeviceId,
-    DriverCommandOutcome, ErrorCode, EventEnvelope, EventJournal, EventPayload, HostId, ItemDelta,
-    ItemLifecycle, ItemPayload, JournalConfig, JournalError, ProtocolValidation, ReplayResponse,
-    RequestAnswer, RequestState, SanitizedError, ServiceError, SessionCommand,
-    SessionCommandEnvelope, SessionCursor, SessionDriver, SessionLiveState, SessionSeed,
-    SessionSnapshot, SessionSummary, TimestampedEvent, ValidationError, MAX_DRIVER_OUTCOME_EVENTS,
+    DriverCommandOutcome, ErrorCode, EventEnvelope, EventJournal, EventPayload, FinalizeCompletion,
+    FinalizeDecision, HostId, ItemDelta, ItemLifecycle, ItemPayload, JournalConfig, JournalError,
+    ProtocolValidation, ReplayResponse, RequestAnswer, RequestState, SanitizedError, ServiceError,
+    SessionCommand, SessionCommandEnvelope, SessionCursor, SessionDriver, SessionLiveState,
+    SessionSeed, SessionSnapshot, SessionSummary, TimestampedEvent, ValidationError,
+    MAX_DRIVER_OUTCOME_EVENTS,
 };
 
 const MAX_COMMAND_CACHE_CAPACITY: usize = 65_536;
 const MAX_MAILBOX_CAPACITY: usize = 4_096;
 const EVENT_BROADCAST_CAPACITY: usize = 2_048;
+const MAX_BRANCH_GRAPH_ENTRIES: usize = 2_048;
+const MAX_FINALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Actor bounds and authority ceiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +36,8 @@ pub struct ActorConfig {
     pub mailbox_capacity: usize,
     /// Maximum authority selectable through this actor.
     pub authority_ceiling: AuthorityProfile,
+    /// Maximum wait for a driver's durable/App finalization confirmation.
+    pub finalize_timeout: Duration,
 }
 
 impl Default for ActorConfig {
@@ -40,6 +47,7 @@ impl Default for ActorConfig {
             command_cache_capacity: 2_048,
             mailbox_capacity: 64,
             authority_ceiling: AuthorityProfile::FullAccess,
+            finalize_timeout: MAX_FINALIZE_TIMEOUT,
         }
     }
 }
@@ -93,6 +101,11 @@ struct CachedCommand {
     ack: CommandAck,
 }
 
+enum OutcomePublicationError {
+    Rejected,
+    Fatal(ActorError),
+}
+
 #[derive(Clone, PartialEq, Eq)]
 enum CachedCommandIdentity {
     Exact(Box<SessionCommandEnvelope>),
@@ -123,6 +136,7 @@ pub struct SessionActorCore {
     view: ActorView,
     journal: EventJournal,
     command_cache_capacity: usize,
+    finalize_timeout: Duration,
     command_cache: HashMap<CommandCacheKey, CachedCommand>,
     command_order: VecDeque<CommandCacheKey>,
 }
@@ -146,6 +160,11 @@ impl SessionActorCore {
                 "mailbox_capacity must be 1..={MAX_MAILBOX_CAPACITY}"
             )));
         }
+        if config.finalize_timeout.is_zero() || config.finalize_timeout > MAX_FINALIZE_TIMEOUT {
+            return Err(ActorError::InvalidConfiguration(format!(
+                "finalize_timeout must be greater than zero and at most {MAX_FINALIZE_TIMEOUT:?}"
+            )));
+        }
         seed.validate().map_err(|_| ActorError::InvalidSeed)?;
         if authority_rank(seed.snapshot.authority) > authority_rank(config.authority_ceiling) {
             return Err(ActorError::InvalidSeed);
@@ -164,6 +183,7 @@ impl SessionActorCore {
             },
             journal,
             command_cache_capacity: config.command_cache_capacity,
+            finalize_timeout: config.finalize_timeout,
             command_cache: HashMap::with_capacity(config.command_cache_capacity.min(4_096)),
             command_order: VecDeque::with_capacity(config.command_cache_capacity.min(4_096)),
         })
@@ -206,7 +226,7 @@ impl SessionActorCore {
         command: SessionCommandEnvelope,
         acknowledged_at_ms: u64,
         dispatch: F,
-    ) -> CommandAdmission
+    ) -> Result<CommandAdmission, ActorError>
     where
         F: FnOnce(SessionCommand) -> Fut,
         Fut: Future<Output = Result<DriverCommandOutcome, ServiceError>>,
@@ -220,13 +240,13 @@ impl SessionActorCore {
                 }
             };
             if is_duplicate {
-                return CommandAdmission {
+                return Ok(CommandAdmission {
                     ack: cached.ack.clone(),
                     cached: true,
                     published: Vec::new(),
-                };
+                });
             }
-            return CommandAdmission {
+            return Ok(CommandAdmission {
                 ack: CommandAck::rejected(
                     self.session_id.clone(),
                     command.command_id,
@@ -239,7 +259,7 @@ impl SessionActorCore {
                 ),
                 cached: false,
                 published: Vec::new(),
-            };
+            });
         }
 
         if let Err(error) = self.preflight_command(&command) {
@@ -251,47 +271,47 @@ impl SessionActorCore {
                 error,
             );
             self.cache_command(command, ack.clone());
-            return CommandAdmission {
+            return Ok(CommandAdmission {
                 ack,
                 cached: false,
                 published: Vec::new(),
-            };
+            });
         }
 
         let result = dispatch(command.command.clone()).await;
         let (ack, published) = match result {
-            Ok(outcome) if outcome.events.len() > MAX_DRIVER_OUTCOME_EVENTS => (
-                CommandAck::rejected(
-                    self.session_id.clone(),
-                    command.command_id.clone(),
-                    acknowledged_at_ms,
-                    self.view.snapshot.cursor,
-                    SanitizedError::internal(),
-                ),
-                Vec::new(),
-            ),
-            Ok(outcome) => match self.publish_batch(outcome.events) {
-                Ok(published) => (
-                    CommandAck::accepted(
-                        self.session_id.clone(),
-                        command.command_id.clone(),
-                        acknowledged_at_ms,
-                        self.view.snapshot.cursor,
-                        outcome.run_id,
+            Ok(outcome) => {
+                let run_id = outcome.run_id.clone();
+                match self
+                    .publish_driver_outcome(outcome, acknowledged_at_ms)
+                    .await
+                {
+                    Ok(published) => (
+                        CommandAck::accepted(
+                            self.session_id.clone(),
+                            command.command_id.clone(),
+                            acknowledged_at_ms,
+                            self.view.snapshot.cursor,
+                            run_id,
+                        ),
+                        published,
                     ),
-                    published,
-                ),
-                Err(_) => (
-                    CommandAck::rejected(
-                        self.session_id.clone(),
-                        command.command_id.clone(),
-                        acknowledged_at_ms,
-                        self.view.snapshot.cursor,
-                        SanitizedError::internal(),
+                    Err(OutcomePublicationError::Rejected) => (
+                        CommandAck::rejected(
+                            self.session_id.clone(),
+                            command.command_id.clone(),
+                            acknowledged_at_ms,
+                            self.view.snapshot.cursor,
+                            SanitizedError::internal(),
+                        ),
+                        Vec::new(),
                     ),
-                    Vec::new(),
-                ),
-            },
+                    Err(OutcomePublicationError::Fatal(error)) => {
+                        return Err(error);
+                    }
+                }
+            }
+            Err(ServiceError::OwnerLost) => return Err(ActorError::Closed),
             Err(error) => (
                 CommandAck::rejected(
                     self.session_id.clone(),
@@ -304,11 +324,11 @@ impl SessionActorCore {
             ),
         };
         self.cache_command(command, ack.clone());
-        CommandAdmission {
+        Ok(CommandAdmission {
             ack,
             cached: false,
             published,
-        }
+        })
     }
 
     fn preflight_command(&self, command: &SessionCommandEnvelope) -> Result<(), SanitizedError> {
@@ -333,6 +353,37 @@ impl SessionActorCore {
                 return Err(SanitizedError::public(
                     ErrorCode::Unauthorized,
                     "The requested authority exceeds this host's configured ceiling.",
+                ));
+            }
+        }
+        if matches!(command.command, SessionCommand::Checkout { .. })
+            && (self.view.snapshot.active_run_id.is_some()
+                || !self.view.snapshot.pending_requests.is_empty()
+                || !matches!(
+                    self.view.snapshot.live_state,
+                    SessionLiveState::Idle
+                        | SessionLiveState::Done
+                        | SessionLiveState::Failed
+                        | SessionLiveState::Stopped
+                ))
+        {
+            return Err(SanitizedError::public(
+                ErrorCode::InvalidBoundary,
+                "A session branch can only be checked out after current work finishes.",
+            ));
+        }
+        if let SessionCommand::Checkout { entry_id } = &command.command {
+            let checkoutable = self
+                .view
+                .snapshot
+                .branches
+                .entries
+                .iter()
+                .any(|entry| &entry.entry_id == entry_id && entry.checkoutable);
+            if !checkoutable {
+                return Err(SanitizedError::public(
+                    ErrorCode::InvalidBoundary,
+                    "That session checkpoint is not available for checkout.",
                 ));
             }
         }
@@ -395,6 +446,116 @@ impl SessionActorCore {
         self.view = replacement_view;
         self.journal = replacement_journal;
         Ok(published)
+    }
+
+    async fn publish_driver_outcome(
+        &mut self,
+        mut outcome: DriverCommandOutcome,
+        timestamp_ms: u64,
+    ) -> Result<Vec<EventEnvelope>, OutcomePublicationError> {
+        let Some(mut replacement) = outcome.replacement.take() else {
+            if outcome.events.len() > MAX_DRIVER_OUTCOME_EVENTS {
+                return Err(OutcomePublicationError::Rejected);
+            }
+            return self
+                .publish_batch(outcome.events)
+                .map_err(|_| OutcomePublicationError::Rejected);
+        };
+        let prepared = (|| -> Result<(SessionSeed, EventJournal, EventEnvelope), ActorError> {
+            if !outcome.events.is_empty()
+                || outcome.run_id.is_some()
+                || outcome.events.len() > MAX_DRIVER_OUTCOME_EVENTS
+            {
+                return Err(ActorError::InvalidProjection(
+                    "projection replacement must be the complete driver outcome".into(),
+                ));
+            }
+            let mut seed = replacement.seed.clone();
+            seed.validate().map_err(|_| ActorError::InvalidSeed)?;
+            if seed.snapshot.session_id != self.session_id
+                || seed.snapshot.actor_generation != self.generation
+            {
+                return Err(ActorError::InvalidProjection(
+                    "replacement projection identity changed".into(),
+                ));
+            }
+            let cursor = self
+                .view
+                .snapshot
+                .cursor
+                .checked_next()
+                .ok_or(ActorError::SequenceExhausted)?;
+            seed.snapshot.cursor = cursor;
+            seed.summary.owner = ActorOwnerState::Hosted;
+            seed.summary.live_state = seed.snapshot.live_state;
+            seed.summary.model = seed.snapshot.model.clone();
+            seed.validate().map_err(|_| ActorError::InvalidSeed)?;
+            if authority_rank(seed.snapshot.authority) > authority_rank(self.authority_ceiling) {
+                return Err(ActorError::InvalidProjection(
+                    "replacement authority exceeds host ceiling".into(),
+                ));
+            }
+            let event = EventEnvelope::new(
+                self.session_id.clone(),
+                cursor,
+                timestamp_ms,
+                EventPayload::SessionProjectionReplaced {
+                    durable_entry_id: seed.snapshot.durable_head.clone(),
+                },
+            );
+            event
+                .validate()
+                .map_err(|error| ActorError::InvalidProjection(error.to_string()))?;
+            let mut journal = self.journal.clone();
+            journal.append(event.clone())?;
+            Ok((seed, journal, event))
+        })();
+        let (seed, journal, event) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.finalize_replacement(
+                    &mut replacement,
+                    FinalizeDecision::Rollback,
+                    FinalizeCompletion::RolledBack,
+                )
+                .await
+                .map_err(OutcomePublicationError::Fatal)?;
+                let _ = error;
+                return Err(OutcomePublicationError::Rejected);
+            }
+        };
+        self.finalize_replacement(
+            &mut replacement,
+            FinalizeDecision::Commit,
+            FinalizeCompletion::Committed,
+        )
+        .await
+        .map_err(OutcomePublicationError::Fatal)?;
+        self.view = ActorView {
+            summary: seed.summary,
+            snapshot: seed.snapshot,
+        };
+        self.journal = journal;
+        Ok(vec![event])
+    }
+
+    async fn finalize_replacement(
+        &self,
+        replacement: &mut crate::service::ProjectionReplacement,
+        decision: FinalizeDecision,
+        expected: FinalizeCompletion,
+    ) -> Result<(), ActorError> {
+        let completion = replacement
+            .begin_finalize(decision)
+            .map_err(|_| ActorError::Closed)?;
+        let completion = timeout(self.finalize_timeout, completion)
+            .await
+            .map_err(|_| ActorError::Closed)?
+            .map_err(|_| ActorError::Closed)?;
+        match completion {
+            Ok(actual) if actual == expected => Ok(()),
+            Ok(_) | Err(_) => Err(ActorError::Closed),
+        }
     }
 
     fn cache_command(&mut self, command: SessionCommandEnvelope, ack: CommandAck) {
@@ -493,8 +654,51 @@ fn reduce_snapshot(snapshot: &mut SessionSnapshot, event: &EventPayload) -> Resu
         }
         EventPayload::SessionMetadataChanged { .. } => {}
         EventPayload::SessionDurableHeadChanged { durable_entry_id } => {
+            if durable_entry_id.as_ref().is_some_and(|head| {
+                !snapshot
+                    .branches
+                    .entries
+                    .iter()
+                    .any(|entry| &entry.entry_id == head)
+            }) {
+                return Err(ActorError::InvalidProjection(
+                    "durable head is missing from the branch graph".into(),
+                ));
+            }
             snapshot.durable_head = durable_entry_id.clone();
+            snapshot.branches.head = durable_entry_id.clone();
         }
+        EventPayload::SessionBranchEntriesAppended { entries } => {
+            snapshot.branches.entries.extend(entries.iter().cloned());
+            if snapshot.branches.entries.len() > MAX_BRANCH_GRAPH_ENTRIES {
+                let selected_head = snapshot.branches.head.as_ref().and_then(|head| {
+                    snapshot
+                        .branches
+                        .entries
+                        .iter()
+                        .find(|entry| &entry.entry_id == head)
+                        .cloned()
+                });
+                let split_at = snapshot
+                    .branches
+                    .entries
+                    .len()
+                    .saturating_sub(MAX_BRANCH_GRAPH_ENTRIES);
+                let mut recent = snapshot.branches.entries.split_off(split_at);
+                if let Some(selected_head) = selected_head {
+                    if !recent
+                        .iter()
+                        .any(|entry| entry.entry_id == selected_head.entry_id)
+                    {
+                        recent.remove(0);
+                        recent.insert(0, selected_head);
+                    }
+                }
+                snapshot.branches.entries = recent;
+                snapshot.branches.truncated = true;
+            }
+        }
+        EventPayload::SessionProjectionReplaced { .. } => {}
         EventPayload::ItemStarted { item } => {
             if let Some(existing) = snapshot.items.iter().position(|entry| entry.id == item.id) {
                 if snapshot.items[existing].lifecycle == ItemLifecycle::Committed {
@@ -554,7 +758,6 @@ fn reduce_snapshot(snapshot: &mut SessionSnapshot, event: &EventPayload) -> Resu
             } else {
                 snapshot.items.push(item.clone());
             }
-            snapshot.durable_head = item.durable_entry_id.clone();
         }
         EventPayload::ItemRetracted {
             item_id,
@@ -644,12 +847,46 @@ pub struct SessionActorHandle {
     sender: mpsc::Sender<ActorMessage>,
     view: watch::Receiver<Arc<ActorView>>,
     events: broadcast::Sender<EventEnvelope>,
+    quiesced: watch::Receiver<bool>,
 }
 
 impl SessionActorHandle {
     /// Session identity.
     pub fn session_id(&self) -> &crate::SessionId {
         &self.session_id
+    }
+
+    /// Whether the serialized actor task can no longer receive work.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    /// Whether two handles address the exact same actor channel.
+    pub(crate) fn same_actor(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+
+    /// Waits until this exact actor channel is closed.
+    pub(crate) async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
+    /// Whether the closed actor's driver and detached durable writer settled.
+    pub(crate) fn is_quiesced(&self) -> bool {
+        *self.quiesced.borrow()
+    }
+
+    /// Waits for the driver to quiesce after the actor mailbox closes.
+    pub(crate) async fn quiesced(&self) {
+        let mut quiesced = self.quiesced.clone();
+        while !*quiesced.borrow_and_update() {
+            if quiesced.changed().await.is_err() {
+                // A task failure without an explicit settled signal is not
+                // proof that a detached durable writer stopped. Keep the
+                // ownership fence closed.
+                std::future::pending::<()>().await;
+            }
+        }
     }
 
     /// Latest observable view.
@@ -716,6 +953,7 @@ impl SessionActor {
         let (view_sender, view) = watch::channel(Arc::new(core.view()));
         let (event_sender, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
         let task_event_sender = event_sender.clone();
+        let (quiesced_sender, quiesced) = watch::channel(false);
 
         tokio::spawn(async move {
             let mut core = core;
@@ -747,6 +985,9 @@ impl SessionActor {
                                 driver.dispatch(command)
                             })
                             .await;
+                        let Ok(admission) = admission else {
+                            break;
+                        };
                         for event in &admission.published {
                             let _ = task_event_sender.send(event.clone());
                         }
@@ -768,6 +1009,11 @@ impl SessionActor {
                     }
                 }
             }
+            receiver.close();
+            drop(receiver);
+            driver.shutdown().await;
+            drop(driver);
+            let _ = quiesced_sender.send(true);
         });
 
         Ok(SessionActorHandle {
@@ -775,6 +1021,7 @@ impl SessionActor {
             sender,
             view,
             events: event_sender,
+            quiesced,
         })
     }
 }
@@ -805,8 +1052,9 @@ impl From<ActorError> for SanitizedError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        AckDisposition, ContextUsage, DurableEntryId, ItemId, ModelSelection, RequestId, SessionId,
-        SessionItem, SessionLiveState,
+        AckDisposition, ContextUsage, DurableEntryId, ItemId, ModelSelection, PendingRequest,
+        RequestId, RequestKind, RequestState, SessionBranchEntry, SessionBranchEntryKind,
+        SessionBranchGraph, SessionId, SessionItem, SessionLiveState,
     };
 
     use super::*;
@@ -839,6 +1087,7 @@ mod tests {
                 actor_generation: 1,
                 cursor: SessionCursor::zero(1),
                 durable_head: None,
+                branches: crate::SessionBranchGraph::default(),
                 live_state: SessionLiveState::Idle,
                 active_run_id: None,
                 model,
@@ -852,8 +1101,134 @@ mod tests {
         }
     }
 
+    fn committed_message(item_id: &str, entry_id: &str, text: &str) -> SessionItem {
+        SessionItem {
+            id: ItemId::new(item_id).unwrap(),
+            run_id: None,
+            turn_id: None,
+            provider_attempt: None,
+            lifecycle: ItemLifecycle::Committed,
+            durable_entry_id: Some(DurableEntryId::new(entry_id).unwrap()),
+            payload: ItemPayload::AssistantMessage { text: text.into() },
+        }
+    }
+
+    fn checkout_seed() -> SessionSeed {
+        let mut seed = seed();
+        let root = DurableEntryId::new("entry-root").unwrap();
+        let old_head = DurableEntryId::new("entry-old-head").unwrap();
+        seed.summary.provisional = false;
+        seed.snapshot.durable_head = Some(old_head.clone());
+        seed.snapshot.branches = SessionBranchGraph {
+            head: Some(old_head.clone()),
+            entries: vec![
+                SessionBranchEntry {
+                    entry_id: root.clone(),
+                    parent_entry_id: None,
+                    kind: SessionBranchEntryKind::UserMessage,
+                    checkoutable: true,
+                    label: "Root prompt".into(),
+                },
+                SessionBranchEntry {
+                    entry_id: old_head,
+                    parent_entry_id: Some(root),
+                    kind: SessionBranchEntryKind::AssistantMessage,
+                    checkoutable: true,
+                    label: "Old answer".into(),
+                },
+            ],
+            truncated: false,
+        };
+        seed.snapshot.items = vec![committed_message(
+            "item-old-answer",
+            "entry-old-head",
+            "Old answer",
+        )];
+        seed
+    }
+
+    #[derive(Clone, Copy)]
+    enum FinalizerBehavior {
+        Mismatch,
+        Error,
+        Cancel,
+        Timeout,
+        OwnerLost,
+    }
+
+    struct FinalizingDriver {
+        seed: SessionSeed,
+        behavior: FinalizerBehavior,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionDriver for FinalizingDriver {
+        fn seed(&self) -> SessionSeed {
+            self.seed.clone()
+        }
+
+        async fn dispatch(
+            &mut self,
+            command: SessionCommand,
+        ) -> Result<DriverCommandOutcome, ServiceError> {
+            assert!(matches!(command, SessionCommand::Checkout { .. }));
+            if matches!(self.behavior, FinalizerBehavior::OwnerLost) {
+                return Err(ServiceError::OwnerLost);
+            }
+            let mut replacement = self.seed.clone();
+            let root = DurableEntryId::new("entry-root").unwrap();
+            replacement.snapshot.durable_head = Some(root.clone());
+            replacement.snapshot.branches.head = Some(root.clone());
+            replacement.snapshot.items =
+                vec![committed_message("item-root", "entry-root", "Root prompt")];
+            let (outcome, mut finalizer) = DriverCommandOutcome::guarded_replace(replacement);
+            let behavior = self.behavior;
+            tokio::spawn(async move {
+                if matches!(behavior, FinalizerBehavior::Cancel) {
+                    return;
+                }
+                let decision = finalizer.decision().await.unwrap();
+                assert_eq!(decision, FinalizeDecision::Commit);
+                match behavior {
+                    FinalizerBehavior::Mismatch => {
+                        let _ = finalizer.complete(Ok(FinalizeCompletion::RolledBack));
+                    }
+                    FinalizerBehavior::Error => {
+                        let _ = finalizer.complete(Err(ServiceError::Internal));
+                    }
+                    FinalizerBehavior::Timeout => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        let _ = finalizer.complete(Ok(FinalizeCompletion::Committed));
+                    }
+                    FinalizerBehavior::Cancel | FinalizerBehavior::OwnerLost => {
+                        unreachable!()
+                    }
+                }
+            });
+            Ok(outcome)
+        }
+
+        async fn next_event(&mut self) -> Option<TimestampedEvent> {
+            None
+        }
+    }
+
+    fn checkout_command(command_id: &str) -> SessionCommandEnvelope {
+        SessionCommandEnvelope::new(
+            HostId::new("host-test").unwrap(),
+            DeviceId::new("device-test").unwrap(),
+            SessionId::new("session-actor").unwrap(),
+            CommandId::new(command_id).unwrap(),
+            1,
+            Some(1),
+            SessionCommand::Checkout {
+                entry_id: DurableEntryId::new("entry-root").unwrap(),
+            },
+        )
+    }
+
     #[test]
-    fn committed_items_require_and_retain_exact_durable_identity() {
+    fn committed_items_and_branch_head_retain_exact_durable_identity() {
         let mut core = SessionActorCore::new(
             HostId::new("host-test").unwrap(),
             seed(),
@@ -874,6 +1249,27 @@ mod tests {
         core.publish(TimestampedEvent::new(
             1,
             EventPayload::ItemCommitted { item },
+        ))
+        .unwrap();
+        let entry_id = DurableEntryId::new("entry-1").unwrap();
+        core.publish(TimestampedEvent::new(
+            2,
+            EventPayload::SessionBranchEntriesAppended {
+                entries: vec![crate::SessionBranchEntry {
+                    entry_id: entry_id.clone(),
+                    parent_entry_id: None,
+                    kind: crate::SessionBranchEntryKind::AssistantMessage,
+                    checkoutable: true,
+                    label: "done".into(),
+                }],
+            },
+        ))
+        .unwrap();
+        core.publish(TimestampedEvent::new(
+            3,
+            EventPayload::SessionDurableHeadChanged {
+                durable_entry_id: Some(entry_id),
+            },
         ))
         .unwrap();
         assert_eq!(
@@ -934,6 +1330,279 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkout_atomically_replaces_projection_and_advances_once() {
+        let initial = checkout_seed();
+        let mut replacement = initial.clone();
+        let root = DurableEntryId::new("entry-root").unwrap();
+        replacement.snapshot.durable_head = Some(root.clone());
+        replacement.snapshot.branches.head = Some(root.clone());
+        replacement.snapshot.items =
+            vec![committed_message("item-root", "entry-root", "Root prompt")];
+        let mut core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            initial,
+            ActorConfig::default(),
+        )
+        .unwrap();
+        let command = checkout_command("command-checkout");
+        let duplicate_command = command.clone();
+
+        let admission = core
+            .admit_command(command, 50, move |command| {
+                let replacement = replacement.clone();
+                let root = root.clone();
+                async move {
+                    assert_eq!(command, SessionCommand::Checkout { entry_id: root });
+                    let (outcome, mut finalizer) =
+                        DriverCommandOutcome::guarded_replace(replacement);
+                    tokio::spawn(async move {
+                        assert_eq!(
+                            finalizer.decision().await.unwrap(),
+                            FinalizeDecision::Commit
+                        );
+                        finalizer
+                            .complete(Ok(FinalizeCompletion::Committed))
+                            .unwrap();
+                    });
+                    Ok(outcome)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            admission.ack.disposition,
+            AckDisposition::Accepted { .. }
+        ));
+        assert_eq!(admission.published.len(), 1);
+        assert!(matches!(
+            admission.published[0].event,
+            EventPayload::SessionProjectionReplaced { .. }
+        ));
+        assert_eq!(core.snapshot().cursor.sequence, 1);
+        assert_eq!(
+            core.snapshot().durable_head,
+            Some(DurableEntryId::new("entry-root").unwrap())
+        );
+        assert_eq!(
+            core.snapshot()
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["item-root"]
+        );
+        assert_eq!(core.snapshot().branches.entries.len(), 2);
+
+        let duplicate = core
+            .admit_command(duplicate_command, 99, |_| async {
+                panic!("an accepted checkout command must finalize exactly once")
+            })
+            .await
+            .unwrap();
+        assert!(duplicate.cached);
+        assert_eq!(duplicate.ack, admission.ack);
+        assert!(duplicate.published.is_empty());
+        assert_eq!(core.snapshot().cursor.sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_finalizer_completion_closes_the_actor_without_an_ack() {
+        for (index, behavior) in [
+            FinalizerBehavior::Mismatch,
+            FinalizerBehavior::Error,
+            FinalizerBehavior::Cancel,
+            FinalizerBehavior::Timeout,
+            FinalizerBehavior::OwnerLost,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let config = ActorConfig {
+                finalize_timeout: Duration::from_millis(20),
+                ..ActorConfig::default()
+            };
+            let handle = SessionActor::spawn(
+                HostId::new("host-test").unwrap(),
+                FinalizingDriver {
+                    seed: checkout_seed(),
+                    behavior,
+                },
+                config,
+            )
+            .unwrap();
+
+            assert!(matches!(
+                handle
+                    .command(
+                        checkout_command(&format!("command-fatal-finalizer-{index}")),
+                        50,
+                    )
+                    .await,
+                Err(ActorError::Closed)
+            ));
+            tokio::time::timeout(Duration::from_secs(1), handle.closed())
+                .await
+                .expect("fatal finalizer result must close the owner");
+            assert!(handle.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_actor_publication_rejects_the_guarded_driver_checkout() {
+        let initial = checkout_seed();
+        let before = initial.snapshot.clone();
+        let mut invalid_replacement = initial.clone();
+        let wrong_session = SessionId::new("session-other").unwrap();
+        invalid_replacement.summary.id = wrong_session.clone();
+        invalid_replacement.snapshot.session_id = wrong_session;
+        let (outcome, mut finalizer) = DriverCommandOutcome::guarded_replace(invalid_replacement);
+        let rollback = tokio::spawn(async move {
+            assert_eq!(
+                finalizer.decision().await.unwrap(),
+                FinalizeDecision::Rollback
+            );
+            finalizer
+                .complete(Ok(FinalizeCompletion::RolledBack))
+                .unwrap();
+        });
+        let mut core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            initial,
+            ActorConfig::default(),
+        )
+        .unwrap();
+        let command = SessionCommandEnvelope::new(
+            HostId::new("host-test").unwrap(),
+            DeviceId::new("device-test").unwrap(),
+            SessionId::new("session-actor").unwrap(),
+            CommandId::new("command-checkout-publication-fails").unwrap(),
+            1,
+            Some(1),
+            SessionCommand::Checkout {
+                entry_id: DurableEntryId::new("entry-root").unwrap(),
+            },
+        );
+
+        let admission = core
+            .admit_command(command, 50, |_| async { Ok(outcome) })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            admission.ack.error().map(|error| error.code),
+            Some(ErrorCode::Internal)
+        );
+        assert!(admission.published.is_empty());
+        rollback.await.unwrap();
+        assert_eq!(core.snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn checkout_refuses_pending_request_even_if_live_state_is_idle() {
+        let mut core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            checkout_seed(),
+            ActorConfig::default(),
+        )
+        .unwrap();
+        core.view.snapshot.pending_requests.push(PendingRequest {
+            id: RequestId::new("request-pending").unwrap(),
+            actor_generation: 1,
+            kind: RequestKind::UserInput {
+                prompt: "Choose".into(),
+                choices: Vec::new(),
+            },
+            state: RequestState::Pending,
+        });
+        let before = core.snapshot();
+        let command = SessionCommandEnvelope::new(
+            HostId::new("host-test").unwrap(),
+            DeviceId::new("device-test").unwrap(),
+            SessionId::new("session-actor").unwrap(),
+            CommandId::new("command-checkout-pending").unwrap(),
+            1,
+            Some(1),
+            SessionCommand::Checkout {
+                entry_id: DurableEntryId::new("entry-root").unwrap(),
+            },
+        );
+
+        let admission = core
+            .admit_command(command, 51, |_| async {
+                panic!("pending request checkout must not reach the driver")
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            admission.ack.error().map(|error| error.code),
+            Some(ErrorCode::InvalidBoundary)
+        );
+        assert!(admission.published.is_empty());
+        assert_eq!(core.snapshot(), before);
+    }
+
+    #[test]
+    fn checkout_accepts_only_connected_terminal_states() {
+        let checkout_command = || {
+            SessionCommandEnvelope::new(
+                HostId::new("host-test").unwrap(),
+                DeviceId::new("device-test").unwrap(),
+                SessionId::new("session-actor").unwrap(),
+                CommandId::new("command-checkout-state").unwrap(),
+                1,
+                Some(1),
+                SessionCommand::Checkout {
+                    entry_id: DurableEntryId::new("entry-root").unwrap(),
+                },
+            )
+        };
+        for state in [
+            SessionLiveState::Idle,
+            SessionLiveState::Done,
+            SessionLiveState::Failed,
+            SessionLiveState::Stopped,
+        ] {
+            let mut core = SessionActorCore::new(
+                HostId::new("host-test").unwrap(),
+                checkout_seed(),
+                ActorConfig::default(),
+            )
+            .unwrap();
+            core.view.summary.live_state = state;
+            core.view.snapshot.live_state = state;
+            assert!(
+                core.preflight_command(&checkout_command()).is_ok(),
+                "{state:?} should permit branch checkout"
+            );
+        }
+        for state in [
+            SessionLiveState::Working,
+            SessionLiveState::NeedsApproval,
+            SessionLiveState::NeedsInput,
+            SessionLiveState::Offline,
+            SessionLiveState::Locked,
+        ] {
+            let mut core = SessionActorCore::new(
+                HostId::new("host-test").unwrap(),
+                checkout_seed(),
+                ActorConfig::default(),
+            )
+            .unwrap();
+            core.view.summary.live_state = state;
+            core.view.snapshot.live_state = state;
+            assert_eq!(
+                core.preflight_command(&checkout_command())
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidBoundary,
+                "{state:?} must reject branch checkout"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn free_form_request_answers_are_consumed_without_secret_retention() {
         let mut core = SessionActorCore::new(
             HostId::new("host-test").unwrap(),
@@ -960,7 +1629,8 @@ mod tests {
             .admit_command(make_command("first secret"), 10, |_| async {
                 Ok(DriverCommandOutcome::default())
             })
-            .await;
+            .await
+            .unwrap();
         let key = (
             DeviceId::new("device-test").unwrap(),
             CommandId::new("command-secret").unwrap(),
@@ -974,7 +1644,8 @@ mod tests {
             .admit_command(make_command("first secret"), 99, |_| async {
                 panic!("a consumed device-scoped command must never dispatch twice")
             })
-            .await;
+            .await
+            .unwrap();
         assert!(retransmit.cached);
         assert_eq!(first.ack, retransmit.ack);
 
@@ -984,7 +1655,8 @@ mod tests {
                 100,
                 |_| async { panic!("a conflicting device-scoped command must never dispatch") },
             )
-            .await;
+            .await
+            .unwrap();
         assert!(!altered.cached);
         assert_eq!(
             altered.ack.error().map(|error| error.code),
@@ -1024,7 +1696,8 @@ mod tests {
                         .collect(),
                 ))
             })
-            .await;
+            .await
+            .unwrap();
         assert!(matches!(
             admission.ack.disposition,
             AckDisposition::Rejected { .. }

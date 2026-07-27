@@ -4,24 +4,85 @@ import {
   File,
   FileText,
   Globe2,
+  LoaderCircle,
   X,
 } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getFixturePreviewMarkup } from "../fixtures";
 import type { OutputRef, PreviewRef, SessionSnapshot, SourceRef } from "../protocol";
 
 export type InspectorSelection =
   | { type: "output"; id: string }
-  | { type: "source"; id: string };
+  | { type: "source"; id: string }
+  | {
+      type: "resource";
+      handle: string;
+      title: string;
+      presentation: "text" | "diff" | "image";
+    };
 
 interface InspectorProps {
   session: SessionSnapshot;
   selection: InspectorSelection | null;
+  closing: boolean;
   modal: boolean;
   previewsAvailable: boolean;
-  resourceContentUrl: (handle: string) => string;
+  resourceContentUrl: (sessionId: string, handle: string) => string;
   onRestoreFocus: () => void;
   onClose: () => void;
+}
+
+const maxRenderedDiffLines = 5_000;
+
+function boundedDiffLines(text: string): {
+  lines: string[];
+  truncated: boolean;
+} {
+  const lines: string[] = [];
+  let start = 0;
+  while (lines.length < maxRenderedDiffLines) {
+    const newline = text.indexOf("\n", start);
+    if (newline === -1) {
+      lines.push(text.slice(start));
+      return { lines, truncated: false };
+    }
+    lines.push(text.slice(start, newline));
+    start = newline + 1;
+  }
+  return { lines, truncated: start < text.length };
+}
+
+function DiffPreview({ text }: { text: string }) {
+  const preview = boundedDiffLines(text);
+  return (
+    <>
+      <pre className="opaque-resource-text is-diff">
+        {preview.lines.map((line, index) => (
+          <span
+            key={index}
+            className={
+              line.startsWith("+") && !line.startsWith("+++")
+                ? "is-addition"
+                : line.startsWith("-") && !line.startsWith("---")
+                  ? "is-deletion"
+                  : line.startsWith("@@")
+                    ? "is-hunk"
+                    : undefined
+            }
+          >
+            {line || " "}
+            {"\n"}
+          </span>
+        ))}
+      </pre>
+      {preview.truncated ? (
+        <p className="opaque-resource-truncation" role="status">
+          Preview limited to the first {maxRenderedDiffLines.toLocaleString()}{" "}
+          lines. Download the diff to inspect the rest.
+        </p>
+      ) : null}
+    </>
+  );
 }
 
 function PreviewToolbar({ preview }: { preview: PreviewRef }) {
@@ -36,7 +97,9 @@ function PreviewToolbar({ preview }: { preview: PreviewRef }) {
 }
 
 function WebPreview({ preview }: { preview: PreviewRef }) {
-  const fixtureMarkup = preview.fixtureId
+  // Fixture HTML exists only for local development and E2E. The compile-time
+  // guard lets the production bundler remove the resolver and its fixture data.
+  const fixtureMarkup = import.meta.env.DEV && preview.fixtureId
     ? getFixturePreviewMarkup(preview.fixtureId)
     : undefined;
   return (
@@ -90,13 +153,143 @@ function ResourceContent({
   title,
   mediaType,
   url,
-  image,
+  sessionId,
+  handle,
+  presentation = "text",
 }: {
   title: string;
   mediaType?: string;
   url: string;
-  image?: boolean;
+  sessionId: string;
+  handle: string;
+  presentation?: "text" | "diff" | "image";
 }) {
+  const [preview, setPreview] = useState<
+    | { state: "loading" }
+    | { state: "ready"; text: string }
+    | { state: "unavailable"; message: string }
+  >({ state: "loading" });
+  useEffect(() => {
+    if (presentation === "image") return;
+    const controller = new AbortController();
+    const maxPreviewBytes = 8 * 1024 * 1024;
+    const publish = (
+      next:
+        | { state: "ready"; text: string }
+        | { state: "unavailable"; message: string },
+    ) => {
+      if (!controller.signal.aborted) setPreview(next);
+    };
+    void (async () => {
+      try {
+        const response = await fetch(
+          `/api/v1/sessions/${encodeURIComponent(sessionId)}/resources/${encodeURIComponent(handle)}`,
+          {
+            credentials: "same-origin",
+            cache: "no-store",
+            redirect: "error",
+            signal: controller.signal,
+            headers: {
+              Accept: "text/plain, application/octet-stream;q=0.8",
+            },
+          },
+        );
+        if (!response.ok) {
+          const message =
+            response.status === 401
+              ? "Reconnect to ygg to inspect this resource."
+              : response.status === 404
+                ? "This resource is not part of the selected session."
+                : response.status === 410
+                  ? "This resource is no longer available."
+                  : "This resource could not be loaded.";
+          publish({ state: "unavailable", message });
+          return;
+        }
+        const declaredHeader = response.headers.get("content-length");
+        const declaredLength =
+          declaredHeader === null ? null : Number(declaredHeader);
+        if (
+          declaredLength !== null &&
+          Number.isFinite(declaredLength) &&
+          declaredLength > maxPreviewBytes
+        ) {
+          publish({
+            state: "unavailable",
+            message: "This file is too large to preview. Download it instead.",
+          });
+          return;
+        }
+        const reader = response.body?.getReader();
+        const chunks: Uint8Array[] = [];
+        let byteLength = 0;
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            byteLength += value.byteLength;
+            if (byteLength > maxPreviewBytes) {
+              await reader.cancel();
+              publish({
+                state: "unavailable",
+                message:
+                  "This file is too large to preview. Download it instead.",
+              });
+              return;
+            }
+            chunks.push(value);
+          }
+        } else {
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          if (bytes.byteLength > maxPreviewBytes) {
+            publish({
+              state: "unavailable",
+              message:
+                "This file is too large to preview. Download it instead.",
+            });
+            return;
+          }
+          chunks.push(bytes);
+          byteLength = bytes.byteLength;
+        }
+        const bytes = new Uint8Array(byteLength);
+        let offset = 0;
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        let text: string;
+        try {
+          text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        } catch {
+          publish({
+            state: "unavailable",
+            message: "This binary file is available to download.",
+          });
+          return;
+        }
+        if (bytes.includes(0)) {
+          publish({
+            state: "unavailable",
+            message: "This binary file is available to download.",
+          });
+          return;
+        }
+        publish({ state: "ready", text });
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        publish({
+          state: "unavailable",
+          message:
+            error instanceof TypeError
+              ? "The resource connection was interrupted."
+              : "This resource could not be loaded.",
+        });
+      }
+    })();
+    return () => controller.abort();
+  }, [handle, presentation, sessionId]);
+
   return (
     <section className="opaque-resource">
       <div className="opaque-resource-heading">
@@ -114,17 +307,24 @@ function ResourceContent({
           <span>Download</span>
         </a>
       </div>
-      {image ? (
+      {presentation === "image" ? (
         <div className="opaque-resource-image">
           <img src={url} alt={title} />
         </div>
+      ) : preview.state === "loading" ? (
+        <div className="opaque-resource-state" role="status">
+          <LoaderCircle className="is-spinning" aria-hidden="true" />
+          Loading resource…
+        </div>
+      ) : preview.state === "unavailable" ? (
+        <div className="opaque-resource-state" role="status">
+          <FileText aria-hidden="true" />
+          {preview.message}
+        </div>
+      ) : presentation === "diff" ? (
+        <DiffPreview text={preview.text} />
       ) : (
-        <iframe
-          title={`${title} content`}
-          src={url}
-          sandbox=""
-          referrerPolicy="no-referrer"
-        />
+        <pre className="opaque-resource-text">{preview.text}</pre>
       )}
     </section>
   );
@@ -133,9 +333,11 @@ function ResourceContent({
 function SourceInspector({
   source,
   resourceUrl,
+  sessionId,
 }: {
   source: SourceRef;
   resourceUrl?: string;
+  sessionId: string;
 }) {
   return (
     <div className="source-inspector">
@@ -155,6 +357,15 @@ function SourceInspector({
           <p>{source.subtitle}</p>
         </div>
       </div>
+      {resourceUrl ? (
+        <ResourceContent
+          key={resourceUrl}
+          title={source.title}
+          url={resourceUrl}
+          sessionId={sessionId}
+          handle={source.handle!}
+        />
+      ) : null}
       <section className="source-excerpt">
         <span>Why it appears here</span>
         <p>
@@ -169,9 +380,6 @@ function SourceInspector({
           <pre>{source.excerpt}</pre>
         </section>
       ) : null}
-      {resourceUrl ? (
-        <ResourceContent title={source.title} url={resourceUrl} />
-      ) : null}
     </div>
   );
 }
@@ -179,6 +387,7 @@ function SourceInspector({
 export function Inspector({
   session,
   selection,
+  closing,
   modal,
   previewsAvailable,
   resourceContentUrl,
@@ -254,21 +463,27 @@ export function Inspector({
   const preview = previewsAvailable && output?.previewId
     ? session.previews.find((candidate) => candidate.id === output.previewId)
     : undefined;
-  const title = output?.title ?? source?.title ?? "Inspector";
-  const resourceHandle = output?.handle ?? source?.handle;
+  const selectedResource =
+    selection.type === "resource" ? selection : undefined;
+  const title =
+    output?.title ?? source?.title ?? selectedResource?.title ?? "Inspector";
+  const resourceHandle =
+    output?.handle ?? source?.handle ?? selectedResource?.handle;
   const resourceAvailable = (output?.available ?? source?.available) !== false;
   const resourceUrl =
     resourceHandle && resourceAvailable
-      ? resourceContentUrl(resourceHandle)
+      ? resourceContentUrl(session.sessionId, resourceHandle)
       : undefined;
 
   return (
     <aside
       ref={inspectorRef}
-      className="inspector"
+      className={`inspector ${closing ? "is-closing" : "is-opening"}`}
       aria-label={`${title} inspector`}
+      aria-hidden={closing || undefined}
       aria-modal={modal ? true : undefined}
       role={modal ? "dialog" : undefined}
+      inert={closing}
     >
       <header className="inspector-header">
         <div className="inspector-title">
@@ -288,7 +503,12 @@ export function Inspector({
                 ? "Live preview"
                 : source
                   ? "Source"
-                  : output?.subtitle}
+                  : output?.subtitle ??
+                    (selectedResource?.presentation === "diff"
+                      ? "Unified diff"
+                      : selectedResource?.presentation === "image"
+                        ? "Image"
+                        : "Text resource")}
             </span>
           </div>
         </div>
@@ -304,16 +524,34 @@ export function Inspector({
         ) : output && resourceUrl ? (
           <div className="resource-preview">
             <ResourceContent
+              key={resourceUrl}
               title={output.title}
               mediaType={output.mimeType}
               url={resourceUrl}
-              image={output.kind === "image"}
+              sessionId={session.sessionId}
+              handle={output.handle!}
+              presentation={output.kind === "image" ? "image" : "text"}
             />
           </div>
         ) : output ? (
           <DocumentPreview output={output} />
         ) : source ? (
-          <SourceInspector source={source} resourceUrl={resourceUrl} />
+          <SourceInspector
+            source={source}
+            resourceUrl={resourceUrl}
+            sessionId={session.sessionId}
+          />
+        ) : selectedResource && resourceUrl ? (
+          <div className="resource-preview">
+            <ResourceContent
+              key={resourceUrl}
+              title={selectedResource.title}
+              url={resourceUrl}
+              sessionId={session.sessionId}
+              handle={selectedResource.handle}
+              presentation={selectedResource.presentation}
+            />
+          </div>
         ) : (
           <div className="preview-unavailable">
             <File aria-hidden="true" />

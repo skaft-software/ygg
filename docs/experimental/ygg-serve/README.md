@@ -49,6 +49,7 @@ the default; client authentication and agent authority are separate controls.
 
 See:
 
+- [Current state and fresh-context handoff](current-state.md)
 - [Architecture](architecture.md)
 - [LAN pairing](lan-pairing.md)
 - [Native delivery](native-delivery.md)

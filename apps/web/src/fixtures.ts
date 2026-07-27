@@ -267,6 +267,8 @@ export const fixtureBootstrap: HostBootstrap = {
     attachmentIngest: true,
     pairDevices: true,
     sessionMetadata: true,
+    sessionBranches: true,
+    sessionExport: false,
     themeSelection: true,
     steer: true,
     followUp: true,
@@ -286,6 +288,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     authority: "fullAccess",
     contextPercent: 0,
     startedAt: at(58),
+    branches: { entries: [], truncated: false },
     items: [],
     progress: [],
     sources: [],
@@ -304,6 +307,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     authority: "workspace",
     contextPercent: 36,
     startedAt: at(42),
+    branches: { entries: [], truncated: false },
     items: [
       {
         id: "live-user",
@@ -448,6 +452,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     authority: "readOnly",
     contextPercent: 21,
     startedAt: at(35),
+    branches: { entries: [], truncated: false },
     items: [
       {
         id: "attention-user",
@@ -538,6 +543,32 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     authority: "workspace",
     contextPercent: 48,
     startedAt: at(8),
+    branches: {
+      head: "entry-release-ready",
+      entries: [
+        {
+          entryId: "entry-release-question",
+          kind: "userMessage",
+          checkoutable: true,
+          label: "Review release readiness",
+        },
+        {
+          entryId: "entry-release-draft",
+          parentEntryId: "entry-release-question",
+          kind: "assistantMessage",
+          checkoutable: true,
+          label: "Initial release assessment",
+        },
+        {
+          entryId: "entry-release-ready",
+          parentEntryId: "entry-release-question",
+          kind: "assistantMessage",
+          checkoutable: true,
+          label: "Verified release assessment",
+        },
+      ],
+      truncated: false,
+    },
     items: [
       {
         id: "done-user",
@@ -698,6 +729,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     authority: "readOnly",
     contextPercent: 18,
     startedAt: at(2),
+    branches: { entries: [], truncated: false },
     items: [
       {
         id: "recent-user",

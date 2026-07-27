@@ -9,8 +9,9 @@ use crate::bounds::{
     MAX_COMMAND_BYTES, MAX_PROMPT_BYTES,
 };
 use crate::{
-    AuthorityProfile, CatalogCursor, CommandId, DeviceId, ErrorCode, HostId, ModelSelection,
-    ProjectId, RequestId, RunId, SanitizedError, SessionCursor, SessionId, PROTOCOL_VERSION,
+    AuthorityProfile, CatalogCursor, CommandId, DeviceId, DurableEntryId, ErrorCode, HostId,
+    ModelSelection, ProjectId, RequestId, RunId, SanitizedError, SessionCursor, SessionId,
+    PROTOCOL_VERSION,
 };
 
 /// Host-scoped commands that do not target an existing session actor.
@@ -274,6 +275,12 @@ pub enum SessionCommand {
         /// New archived state.
         archived: bool,
     },
+    /// Select an existing durable entry as the branch point for future work.
+    #[serde(rename = "session.checkout")]
+    Checkout {
+        /// Exact preserved Ygg entry identity.
+        entry_id: DurableEntryId,
+    },
 }
 
 /// Idempotent session command envelope.
@@ -533,7 +540,9 @@ impl ProtocolValidation for SessionCommandEnvelope {
             SessionCommand::Rename { title } => {
                 validate_public_text("command.title", title, 512, false)?;
             }
-            SessionCommand::SetPinned { .. } | SessionCommand::SetArchived { .. } => {}
+            SessionCommand::SetPinned { .. }
+            | SessionCommand::SetArchived { .. }
+            | SessionCommand::Checkout { .. } => {}
         }
         validate_serialized_size("command", self, MAX_COMMAND_BYTES)
     }
@@ -701,6 +710,15 @@ mod tests {
                     SessionCommand::SetArchived { archived: true },
                 ),
                 "session.archive",
+            ),
+            (
+                session_command(
+                    "command-checkout",
+                    SessionCommand::Checkout {
+                        entry_id: DurableEntryId::new("entry-17").unwrap(),
+                    },
+                ),
+                "session.checkout",
             ),
         ];
 

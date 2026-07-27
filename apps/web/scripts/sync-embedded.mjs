@@ -31,6 +31,10 @@ const assets = [
     mediaType: "text/javascript; charset=utf-8",
   },
   {
+    path: "assets/chunk-MarkdownMessage.js",
+    mediaType: "text/javascript; charset=utf-8",
+  },
+  {
     path: "index.html",
     mediaType: "text/html; charset=utf-8",
   },

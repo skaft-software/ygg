@@ -1,6 +1,4 @@
 import {
-  AlertCircle,
-  Circle,
   Laptop,
   LoaderCircle,
   Menu,
@@ -11,22 +9,20 @@ import {
   X,
 } from "lucide-react";
 import {
+  type CSSProperties,
   useEffect,
   useRef,
   useState,
 } from "react";
-import type { SessionSummary } from "../protocol";
-import type { TransportConnectionState } from "../transport";
-import { YggGlyph } from "./YggGlyph";
+import type { ModelSummary, SessionSummary } from "../protocol";
 
 interface SidebarProps {
   open: boolean;
   blocked: boolean;
   sessions: SessionSummary[];
+  models: ModelSummary[];
   selectedSessionId: string | null;
   surface: "session" | "settings" | "devices";
-  hostName: string;
-  connection: TransportConnectionState;
   devicesAvailable: boolean;
   onRestoreFocus: () => void;
   onClose: () => void;
@@ -46,22 +42,39 @@ const sessionStatusLabel: Record<SessionSummary["status"], string> = {
   disconnected: "Reconnecting",
 };
 
-function SessionStatusGlyph({ status }: { status: SessionSummary["status"] }) {
-  if (status === "working" || status === "disconnected") {
-    return <LoaderCircle className="spin" aria-hidden="true" />;
-  }
-  if (status === "needs_attention" || status === "failed") {
-    return <AlertCircle aria-hidden="true" />;
-  }
-  return <Circle aria-hidden="true" />;
+const modelAccents: Array<[string, string]> = [
+  ["openai", "#10a37f"],
+  ["anthropic", "#cc785c"],
+  ["google", "#34a853"],
+  ["xai", "#736cd3"],
+  ["meta", "#0089f4"],
+  ["mistral", "#fd6f00"],
+  ["deepseek", "#4263eb"],
+  ["alibaba", "#ff7018"],
+  ["minimax", "#eb3568"],
+  ["kimi", "#047afe"],
+  ["nvidia", "#86b737"],
+  ["cohere", "#d18ee2"],
+  ["amazon", "#ff9900"],
+  ["microsoft", "#0078d5"],
+];
+
+function modelAccent(model: ModelSummary | undefined): string {
+  const key = `${model?.provider ?? ""} ${model?.id ?? ""}`.toLowerCase();
+  return (
+    modelAccents.find(([candidate]) => key.includes(candidate))?.[1] ??
+    "var(--theme-pigment)"
+  );
 }
 
 function SessionRow({
   session,
+  model,
   selected,
   onSelect,
 }: {
   session: SessionSummary;
+  model: ModelSummary | undefined;
   selected: boolean;
   onSelect: () => void;
 }) {
@@ -72,21 +85,31 @@ function SessionRow({
       aria-current={selected ? "page" : undefined}
       aria-label={`Open session ${session.title}, ${sessionStatusLabel[session.status]}`}
       data-status={session.status}
+      style={
+        {
+          "--session-model-color": modelAccent(model),
+        } as CSSProperties
+      }
     >
-      <span className="session-status">
-        <SessionStatusGlyph status={session.status} />
-        <span className="sr-only">{sessionStatusLabel[session.status]}</span>
-      </span>
       <span className="session-row-copy">
         <span className="session-row-title">{session.title}</span>
       </span>
-      {session.attentionCount > 0 ? (
+      {session.status === "working" || session.status === "disconnected" ? (
         <span
-          className="attention-count"
-          aria-label={`${session.attentionCount} item needs attention`}
+          className="session-loader"
+          aria-label={sessionStatusLabel[session.status]}
         >
-          {session.attentionCount}
+          <LoaderCircle className="spin" aria-hidden="true" />
         </span>
+      ) : session.attentionCount > 0 || session.unread ? (
+        <span
+          className="session-unread"
+          aria-label={
+            session.attentionCount > 0
+              ? "Needs attention"
+              : "Unread activity"
+          }
+        />
       ) : null}
     </button>
   );
@@ -95,11 +118,13 @@ function SessionRow({
 function SessionSection({
   title,
   sessions,
+  models,
   selectedSessionId,
   onSelectSession,
 }: {
   title: string;
   sessions: SessionSummary[];
+  models: Map<string, ModelSummary>;
   selectedSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
 }) {
@@ -114,6 +139,7 @@ function SessionSection({
           <SessionRow
             key={session.id}
             session={session}
+            model={models.get(session.modelId)}
             selected={session.id === selectedSessionId}
             onSelect={() => onSelectSession(session.id)}
           />
@@ -127,10 +153,9 @@ export function Sidebar({
   open,
   blocked,
   sessions,
+  models,
   selectedSessionId,
   surface,
-  hostName,
-  connection,
   devicesAvailable,
   onRestoreFocus,
   onClose,
@@ -212,6 +237,7 @@ export function Sidebar({
   const pinned = visibleSessions.filter((session) => session.pinned);
   const pinnedIds = new Set(pinned.map((session) => session.id));
   const recent = visibleSessions.filter((session) => !pinnedIds.has(session.id));
+  const modelsById = new Map(models.map((model) => [model.id, model]));
 
   return (
     <>
@@ -229,7 +255,6 @@ export function Sidebar({
       >
         <header className="sidebar-header">
           <div className="brand-row">
-            <YggGlyph />
             <strong>ygg</strong>
           </div>
           <button className="icon-button sidebar-close" onClick={onClose}>
@@ -278,12 +303,14 @@ export function Sidebar({
               <SessionSection
                 title="Pinned"
                 sessions={pinned}
+                models={modelsById}
                 selectedSessionId={selectedSessionId}
                 onSelectSession={onSelectSession}
               />
               <SessionSection
                 title="Recents"
                 sessions={recent}
+                models={modelsById}
                 selectedSessionId={selectedSessionId}
                 onSelectSession={onSelectSession}
               />
@@ -308,24 +335,6 @@ export function Sidebar({
             <Settings aria-hidden="true" />
             <strong>Settings</strong>
           </button>
-          <div className="local-identity">
-            <span className="local-avatar" aria-hidden="true">Y</span>
-            <span>
-              <strong>{hostName}</strong>
-              <small
-                className="connection-label"
-                data-connection={connection}
-                role="status"
-              >
-                <span aria-hidden="true" />
-                {connection === "connected"
-                  ? "Connected to local ygg"
-                  : connection === "reconnecting"
-                    ? "Reconnecting to ygg…"
-                    : "Connecting to ygg…"}
-              </small>
-            </span>
-          </div>
         </footer>
       </aside>
     </>

@@ -8,9 +8,12 @@ use crate::bounds::{
 };
 use crate::{
     ArtifactRef, AuthorityProfile, CatalogCursor, DurableEntryId, ItemId, ItemLifecycle,
-    ModelSelection, PendingRequest, RunId, SessionCursor, SessionId, SessionItem, SessionLiveState,
-    SessionSnapshot, SessionSummary, SourceRef, UsageSnapshot, PROTOCOL_VERSION,
+    ModelSelection, PendingRequest, RunId, SessionBranchEntry, SessionCursor, SessionId,
+    SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, SourceRef, UsageSnapshot,
+    PROTOCOL_VERSION,
 };
+
+const MAX_BRANCH_DELTA_ENTRIES: usize = 128;
 
 /// Typed provisional item delta.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +82,22 @@ pub enum EventPayload {
     #[serde(rename = "session.durableHeadChanged")]
     SessionDurableHeadChanged {
         /// Exact current head, or none for an empty provisional session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        durable_entry_id: Option<DurableEntryId>,
+    },
+    /// Bounded append-only durable graph delta.
+    #[serde(rename = "session.branchEntriesAppended")]
+    SessionBranchEntriesAppended {
+        /// Newly preserved entries in append order.
+        entries: Vec<SessionBranchEntry>,
+    },
+    /// Signal that checkout atomically replaced the actor's projection.
+    ///
+    /// The complete replacement intentionally travels through the snapshot
+    /// endpoint rather than the smaller event journal.
+    #[serde(rename = "session.projectionReplaced")]
+    SessionProjectionReplaced {
+        /// Exact selected durable head after replacement.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         durable_entry_id: Option<DurableEntryId>,
     },
@@ -344,6 +363,18 @@ impl ProtocolValidation for EventPayload {
                 }
             }
             Self::SessionDurableHeadChanged { .. } => {}
+            Self::SessionBranchEntriesAppended { entries } => {
+                if entries.is_empty() || entries.len() > MAX_BRANCH_DELTA_ENTRIES {
+                    return Err(ValidationError::new(
+                        "event.branch_entries",
+                        format!("requires 1..={MAX_BRANCH_DELTA_ENTRIES} appended entries"),
+                    ));
+                }
+                for entry in entries {
+                    entry.validate()?;
+                }
+            }
+            Self::SessionProjectionReplaced { .. } => {}
             Self::ItemStarted { item } => {
                 item.validate()?;
                 if item.lifecycle != ItemLifecycle::Provisional {
@@ -475,5 +506,28 @@ impl ProtocolValidation for ReplayResponse {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{SessionBranchEntry, SessionBranchEntryKind};
+
+    use super::*;
+
+    #[test]
+    fn branch_delta_is_bounded_to_128_entries() {
+        let entries = (0..=MAX_BRANCH_DELTA_ENTRIES)
+            .map(|index| SessionBranchEntry {
+                entry_id: DurableEntryId::new(format!("entry-{index}")).unwrap(),
+                parent_entry_id: None,
+                kind: SessionBranchEntryKind::AssistantMessage,
+                checkoutable: true,
+                label: format!("Entry {index}"),
+            })
+            .collect();
+        assert!(EventPayload::SessionBranchEntriesAppended { entries }
+            .validate()
+            .is_err());
     }
 }

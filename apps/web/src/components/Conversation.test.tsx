@@ -80,7 +80,7 @@ describe("conversation composer", () => {
     expect(
       screen.queryByRole("menu", { name: "While ygg is working" }),
     ).toBeNull();
-    expect(delivery).toHaveFocus();
+    await waitFor(() => expect(delivery).toHaveFocus());
   });
 
   it("uses a themed authority menu with keyboard focus restoration", async () => {
@@ -136,22 +136,40 @@ describe("conversation composer", () => {
       />,
     );
 
-    const picker = screen.getByRole("button", { name: "Model" });
+    const picker = screen.getByRole("button", {
+      name: /Model and effort: Claude Sonnet 4\.6, Max/,
+    });
     expect(picker).toHaveAttribute("data-value", "claude-sonnet-4-6");
     expect(screen.queryByRole("combobox", { name: "Model" })).toBeNull();
 
     await user.click(picker);
     expect(
-      screen.getByRole("dialog", { name: "Choose a model" }),
+      screen.getByRole("dialog", { name: "Model and effort" }),
     ).toBeVisible();
+    expect(
+      screen.getByRole("slider", { name: "Reasoning effort" }),
+    ).toHaveAttribute("aria-valuetext", "Max");
+    expect(screen.queryByText("Speed", { exact: true })).toBeNull();
+    expect(screen.queryByText("Ultra", { exact: true })).toBeNull();
+    await user.click(screen.getByRole("button", { name: /Advanced/ }));
+    await user.click(
+      screen.getByRole("dialog", { name: "Model and effort" }).querySelector(
+        ".model-picker-setting-row",
+      )!,
+    );
     await user.type(screen.getByRole("textbox", { name: "Search models" }), "gpt");
     await user.click(screen.getByRole("option", { name: /GPT-5.4/ }));
 
     expect(onConfigure).toHaveBeenCalledWith({ modelId: "gpt-5.4" });
     expect(
-      screen.queryByRole("dialog", { name: "Choose a model" }),
-    ).toBeNull();
-    expect(picker).toHaveFocus();
+      screen.getByRole("button", { name: /^Model Claude Sonnet 4\.6/ }),
+    ).toBeVisible();
+    expect(screen.queryByText("Speed", { exact: true })).toBeNull();
+    await user.click(
+      screen.getByRole("button", { name: /^Effort High/ }),
+    );
+    await user.click(screen.getByRole("option", { name: "Low" }));
+    expect(onConfigure).toHaveBeenCalledWith({ reasoning: "low" });
   });
 
   it("omits unavailable run timing instead of claiming zero work", () => {
@@ -271,9 +289,9 @@ describe("conversation composer", () => {
       <Conversation session={session} {...props} />,
     );
 
-    expect(
-      screen.getByRole("button", { name: /Working/ }),
-    ).toHaveAttribute("aria-expanded", "true");
+    const workingSummary = screen.getByRole("button", { name: /Working/ });
+    expect(workingSummary).toHaveAttribute("aria-expanded", "true");
+    expect(workingSummary.querySelector(".work-group-glyph")).toBeNull();
 
     const completed = structuredClone(session);
     completed.status = "done";
@@ -302,6 +320,97 @@ describe("conversation composer", () => {
     ).toHaveAttribute("aria-hidden", "true");
     await user.click(summary);
     expect(summary).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("opens durable diffs, resulting files, and origin-linked evidence", async () => {
+    const user = userEvent.setup();
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    const timestamp = new Date().toISOString();
+    session.status = "working";
+    session.activeRunId = "run-evidence";
+    session.items = [
+      {
+        id: "item-tool",
+        turnId: "turn-evidence",
+        kind: "action",
+        actionKind: "file_write",
+        label: "Changed file",
+        target: "src/theme.ts",
+        additions: 8,
+        deletions: 3,
+        diffHandle: "resource-diff",
+        resultHandle: "resource-result",
+        state: "streaming",
+        createdAt: timestamp,
+      },
+    ];
+    session.sources = [
+      {
+        id: "source-theme",
+        handle: "resource-source",
+        originItemId: "item-tool",
+        kind: "file",
+        title: "theme.ts",
+        subtitle: "Consulted now",
+        consultedAt: timestamp,
+        iconLabel: "SRC",
+      },
+    ];
+    session.outputs = [
+      {
+        id: "output-theme",
+        handle: "resource-output",
+        originItemId: "item-tool",
+        kind: "file",
+        title: "theme.css",
+        subtitle: "128 bytes",
+        mimeType: "text/plain",
+        updatedAt: timestamp,
+      },
+    ];
+    const onOpenResource = vi.fn();
+    const onOpenSource = vi.fn();
+    const onOpenOutput = vi.fn();
+
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={onOpenOutput}
+        onOpenSource={onOpenSource}
+        onOpenResource={onOpenResource}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "View changes to src/theme.ts" }),
+    );
+    expect(onOpenResource).toHaveBeenLastCalledWith(
+      "resource-diff",
+      "src/theme.ts changes",
+      "diff",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "View resulting src/theme.ts" }),
+    );
+    expect(onOpenResource).toHaveBeenLastCalledWith(
+      "resource-result",
+      "src/theme.ts",
+      "text",
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Open source theme.ts" }),
+    );
+    expect(onOpenSource).toHaveBeenCalledWith("source-theme");
+    await user.click(
+      screen.getByRole("button", { name: "Open output theme.css" }),
+    );
+    expect(onOpenOutput).toHaveBeenCalledWith("output-theme");
   });
 
   it("zooms, resets, downloads, and closes an attached image preview", async () => {

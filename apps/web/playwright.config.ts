@@ -2,8 +2,14 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./tests",
+  testIgnore: ["**/live-host.spec.ts"],
   outputDir: "./test-results",
   fullyParallel: true,
+  // The fixture exercises animated, image, and responsive states against one
+  // local Vite server. Serial workers keep cold module transforms from
+  // starving unrelated browser actions and turning interaction checks into
+  // machine-load-dependent timeouts.
+  workers: 1,
   retries: 0,
   reporter: [["list"]],
   use: {

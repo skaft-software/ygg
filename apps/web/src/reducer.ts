@@ -1,4 +1,9 @@
-import type { SessionEvent, SessionSnapshot, TranscriptItem } from "./protocol";
+import type {
+  SessionBranchEntry,
+  SessionEvent,
+  SessionSnapshot,
+  TranscriptItem,
+} from "./protocol";
 
 export class SessionSequenceGapError extends Error {
   constructor(
@@ -26,6 +31,20 @@ export class SessionGenerationMismatchError extends Error {
   }
 }
 
+export class SessionBranchGraphError extends Error {
+  constructor(readonly sessionId: string, message: string) {
+    super(`Session ${sessionId} branch graph ${message}.`);
+    this.name = "SessionBranchGraphError";
+  }
+}
+
+export class SessionProjectionReplacementRequiredError extends Error {
+  constructor(readonly sessionId: string) {
+    super(`Session ${sessionId} requires a complete projection replacement.`);
+    this.name = "SessionProjectionReplacementRequiredError";
+  }
+}
+
 function upsertItem(
   items: TranscriptItem[],
   incoming: TranscriptItem,
@@ -38,6 +57,54 @@ function upsertItem(
   const next = [...items];
   next[existingIndex] = incoming;
   return next;
+}
+
+function appendBranchEntries(
+  snapshot: SessionSnapshot,
+  entries: SessionBranchEntry[],
+): SessionSnapshot["branches"] {
+  const ids = new Set(snapshot.branches.entries.map((entry) => entry.entryId));
+  for (const entry of entries) {
+    if (ids.has(entry.entryId)) {
+      throw new SessionBranchGraphError(
+        snapshot.sessionId,
+        `contains duplicate entry ${entry.entryId}`,
+      );
+    }
+    ids.add(entry.entryId);
+  }
+  for (const entry of entries) {
+    if (
+      !snapshot.branches.truncated &&
+      entry.parentEntryId !== undefined &&
+      !ids.has(entry.parentEntryId)
+    ) {
+      throw new SessionBranchGraphError(
+        snapshot.sessionId,
+        `is missing parent ${entry.parentEntryId}`,
+      );
+    }
+  }
+  const combined = [...snapshot.branches.entries, ...entries];
+  if (combined.length <= 2_048) {
+    return { ...snapshot.branches, entries: combined };
+  }
+  const selectedHead = combined.find(
+    (entry) => entry.entryId === snapshot.branches.head,
+  );
+  const recent = combined.slice(-2_048);
+  if (
+    selectedHead !== undefined &&
+    !recent.some((entry) => entry.entryId === selectedHead.entryId)
+  ) {
+    recent.shift();
+    recent.unshift(selectedHead);
+  }
+  return {
+    ...snapshot.branches,
+    entries: recent,
+    truncated: true,
+  };
 }
 
 export function reduceSessionEvent(
@@ -57,7 +124,13 @@ export function reduceSessionEvent(
     ) {
       return snapshot;
     }
-    if (event.sequence < snapshot.sequence) {
+    if (event.snapshot.actorGeneration < snapshot.actorGeneration) {
+      return snapshot;
+    }
+    if (
+      event.snapshot.actorGeneration === snapshot.actorGeneration &&
+      event.sequence < snapshot.sequence
+    ) {
       return snapshot;
     }
     return event.snapshot;
@@ -67,14 +140,16 @@ export function reduceSessionEvent(
     return snapshot;
   }
 
-  if (
-    event.actorGeneration !== undefined &&
-    event.actorGeneration !== snapshot.actorGeneration
-  ) {
+  const eventGeneration =
+    event.actorGeneration ?? snapshot.actorGeneration;
+  if (eventGeneration < snapshot.actorGeneration) {
+    return snapshot;
+  }
+  if (eventGeneration > snapshot.actorGeneration) {
     throw new SessionGenerationMismatchError(
       snapshot.sessionId,
       snapshot.actorGeneration,
-      event.actorGeneration,
+      eventGeneration,
     );
   }
 
@@ -93,6 +168,37 @@ export function reduceSessionEvent(
         ...event.patch,
         sequence: event.sequence,
       };
+
+    case "session.branchEntriesAppended":
+      return {
+        ...snapshot,
+        sequence: event.sequence,
+        branches: appendBranchEntries(snapshot, event.entries),
+      };
+
+    case "session.durableHeadChanged":
+      if (
+        event.durableHead !== undefined &&
+        !snapshot.branches.entries.some(
+          (entry) => entry.entryId === event.durableHead,
+        )
+      ) {
+        throw new SessionBranchGraphError(
+          snapshot.sessionId,
+          `cannot select missing head ${event.durableHead}`,
+        );
+      }
+      return {
+        ...snapshot,
+        sequence: event.sequence,
+        branches: {
+          ...snapshot.branches,
+          head: event.durableHead,
+        },
+      };
+
+    case "session.projectionReplaced":
+      throw new SessionProjectionReplacementRequiredError(snapshot.sessionId);
 
     case "item.started":
     case "item.committed":

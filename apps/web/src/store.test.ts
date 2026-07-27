@@ -60,8 +60,8 @@ class TestTransport implements YggTransport {
     return `/api/v1/attachments/${encodeURIComponent(handle)}`;
   }
 
-  resourceContentUrl(handle: string): string {
-    return `/api/v1/resources/${encodeURIComponent(handle)}`;
+  resourceContentUrl(sessionId: string, handle: string): string {
+    return `/api/v1/sessions/${encodeURIComponent(sessionId)}/resources/${encodeURIComponent(handle)}`;
   }
 
   subscribe(listener: (event: HostEvent) => void): () => void {
@@ -388,6 +388,169 @@ describe("YggStore", () => {
       ]),
     );
     expect(store.getSnapshot().selectedSessionId).toBe("session-created-2");
+    store.dispose();
+  });
+
+  it("refetches exactly once for projection replacement and never merges branches", async () => {
+    const transport = new TestTransport();
+    const oldItem = {
+      id: "old-branch-item",
+      turnId: "old-turn",
+      kind: "assistant_message" as const,
+      content: "Old branch",
+      state: "committed" as const,
+      createdAt: new Date().toISOString(),
+    };
+    const newItem = {
+      ...oldItem,
+      id: "new-branch-item",
+      content: "Selected branch",
+    };
+    const oldSnapshot = {
+      ...clone(fixtureSessions["session-fresh"]),
+      sequence: 1,
+      items: [oldItem],
+      branches: {
+        head: "entry-old",
+        entries: [
+          {
+            entryId: "entry-root",
+            kind: "userMessage" as const,
+            checkoutable: true,
+            label: "Root",
+          },
+          {
+            entryId: "entry-old",
+            parentEntryId: "entry-root",
+            kind: "assistantMessage" as const,
+            checkoutable: true,
+            label: "Old branch",
+          },
+        ],
+        truncated: false,
+      },
+    };
+    const replacement = {
+      ...oldSnapshot,
+      sequence: 2,
+      items: [newItem],
+      sources: [],
+      outputs: [],
+      branches: { ...oldSnapshot.branches, head: "entry-root" },
+    };
+    let loads = 0;
+    transport.sessionLoader = async () => {
+      loads += 1;
+      return clone(loads === 1 ? oldSnapshot : replacement);
+    };
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    transport.emit({
+      type: "session.projectionReplaced",
+      sessionId: "session-fresh",
+      actorGeneration: 1,
+      sequence: 2,
+      durableHead: "entry-root",
+    });
+    await nextFrame();
+    await nextFrame();
+
+    expect(loads).toBe(2);
+    expect(store.selectedSession?.items.map((item) => item.id)).toEqual([
+      "new-branch-item",
+    ]);
+    expect(store.selectedSession?.branches.head).toBe("entry-root");
+
+    transport.emit({
+      type: "session.projectionReplaced",
+      sessionId: "session-fresh",
+      actorGeneration: 1,
+      sequence: 2,
+      durableHead: "entry-root",
+    });
+    await nextFrame();
+    expect(loads).toBe(2);
+    store.dispose();
+  });
+
+  it("keeps retrying a replacement refetch until the required projection arrives", async () => {
+    const transport = new TestTransport();
+    const initial = {
+      ...clone(fixtureSessions["session-fresh"]),
+      sequence: 1,
+    };
+    const replacement = {
+      ...initial,
+      sequence: 2,
+      branches: {
+        head: "entry-root",
+        entries: [
+          {
+            entryId: "entry-root",
+            kind: "userMessage" as const,
+            checkoutable: true,
+            label: "Root",
+          },
+        ],
+        truncated: false,
+      },
+    };
+    let loads = 0;
+    transport.sessionLoader = async () => {
+      loads += 1;
+      if (loads === 1) return clone(initial);
+      if (loads === 2) throw new Error("snapshot is still being published");
+      return clone(replacement);
+    };
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    transport.emit({
+      type: "session.projectionReplaced",
+      sessionId: "session-fresh",
+      actorGeneration: 1,
+      sequence: 2,
+      durableHead: "entry-root",
+    });
+
+    await vi.waitFor(() =>
+      expect(store.selectedSession?.branches.head).toBe("entry-root"),
+    );
+    expect(loads).toBe(3);
+    store.dispose();
+  });
+
+  it("sends checkout for a checkoutable checkpoint after work has finished", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+    await store.selectSession("session-done");
+
+    await store.checkoutBranch("entry-release-draft");
+
+    expect(transport.commands.at(-1)).toMatchObject({
+      type: "session.checkout",
+      sessionId: "session-done",
+      entryId: "entry-release-draft",
+    });
+    store.dispose();
+  });
+
+  it("rejects checkout while the host is disconnected", async () => {
+    const transport = new TestTransport();
+    transport.sessionLoader = async (sessionId) => ({
+      ...clone(fixtureSessions[sessionId]),
+      status: "disconnected",
+    });
+    const store = new YggStore(transport);
+    await store.initialize();
+    await store.selectSession("session-done");
+
+    await expect(
+      store.checkoutBranch("entry-release-draft"),
+    ).rejects.toThrow("after current work finishes");
+    expect(transport.commands).toHaveLength(0);
     store.dispose();
   });
 });
