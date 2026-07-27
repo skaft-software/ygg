@@ -4314,58 +4314,6 @@ fn visual_col_to_offset(line: &str, col: usize) -> usize {
     byte_offset
 }
 
-#[allow(dead_code)]
-fn copy_offsets_to_visual_cols(
-    row_text: &str,
-    start_byte: usize,
-    end_byte: usize,
-) -> (usize, usize) {
-    let mut current_byte = 0;
-    let mut current_col = 0;
-    let mut start_col = 0;
-    let mut end_col = 0;
-    let mut found_start = false;
-    let mut found_end = false;
-
-    for grapheme in row_text.graphemes(true) {
-        let w = unicode_width::UnicodeWidthStr::width(grapheme);
-        if !found_start && current_byte >= start_byte {
-            start_col = current_col;
-            found_start = true;
-        }
-        if !found_end && current_byte >= end_byte {
-            end_col = current_col;
-            found_end = true;
-        }
-        current_byte += grapheme.len();
-        current_col += w;
-    }
-
-    if !found_start {
-        start_col = current_col;
-    }
-    if !found_end {
-        end_col = current_col;
-    }
-
-    (start_col, end_col)
-}
-
-#[allow(dead_code)]
-fn block_screen_indent(block: &TranscriptBlock, width: u16) -> usize {
-    match block {
-        TranscriptBlock::User { .. } => 2,
-        TranscriptBlock::Tool(_) => {
-            if width < 60 {
-                7
-            } else {
-                8
-            }
-        }
-        _ => 0,
-    }
-}
-
 fn newline_col_offset(text: &str, n: usize, col: u16) -> usize {
     let start_offset = newline_offset(text, n);
     let line = text.split('\n').nth(n).unwrap_or("");
@@ -4455,119 +4403,6 @@ fn selection_position_for_visual_cell(
     })
 }
 
-#[allow(dead_code)]
-fn style_selected_range(line: &str, start_col: usize, end_col: usize, theme: &YggTheme) -> String {
-    if matches!(
-        theme.capabilities().color,
-        crate::tui::terminal::ColorDepth::None
-    ) {
-        let plain = strip_terminal_sequences(line);
-        let start = visual_col_to_offset(&plain, start_col);
-        let end = visual_col_to_offset(&plain, end_col);
-        let prefix = &plain[..start];
-        let mid = &plain[start..end];
-        let suffix = &plain[end..];
-        return format!("{}[{}]{}", prefix, mid, suffix);
-    }
-
-    let tokens = sexy_tui_rs::terminal_tokens(line);
-    let mut output = String::new();
-    let mut col_index = 0;
-    let mut in_selection = false;
-
-    for token in tokens {
-        match token {
-            sexy_tui_rs::TerminalToken::Escape(seq) => {
-                if in_selection {
-                    output.push_str("\x1b[27m");
-                }
-                output.push_str(seq);
-                if in_selection {
-                    output.push_str("\x1b[7m");
-                }
-            }
-            sexy_tui_rs::TerminalToken::Text(val) => {
-                for grapheme in val.graphemes(true) {
-                    let w = unicode_width::UnicodeWidthStr::width(grapheme);
-                    let is_selected = col_index >= start_col && col_index < end_col;
-
-                    if is_selected && !in_selection {
-                        output.push_str("\x1b[7m");
-                        in_selection = true;
-                    } else if !is_selected && in_selection {
-                        output.push_str("\x1b[27m");
-                        in_selection = false;
-                    }
-
-                    output.push_str(grapheme);
-                    col_index += w;
-                }
-            }
-        }
-    }
-
-    if in_selection {
-        output.push_str("\x1b[27m");
-    }
-
-    output
-}
-
-/// Map a 0-indexed visual row within a transcript block to a byte offset in
-/// that block's copy text. The visual renderer wraps rich content at a
-/// block-type-specific width; this function replicates that wrapping so
-/// pointer selection lands on the correct semantic position.
-#[allow(dead_code)]
-fn visual_row_to_copy_offset(
-    block: &TranscriptBlock,
-    copy_text: &str,
-    local_row: usize,
-    width: u16,
-) -> usize {
-    if local_row == 0 {
-        return 0;
-    }
-
-    match block {
-        TranscriptBlock::Assistant(assistant) => {
-            if looks_like_diff(&assistant.text) {
-                // Diff rendering uses line-number columns and side-by-side
-                // layout; there is no simple wrapping correspondence.
-                // Fall back to newline-based indexing.
-                return newline_offset(copy_text, local_row);
-            }
-            wrapped_line_offset(copy_text, local_row, usize::from(width).max(1))
-        }
-        TranscriptBlock::Reasoning(_) => {
-            wrapped_line_offset(copy_text, local_row, usize::from(width).max(1))
-        }
-        TranscriptBlock::User { .. } => {
-            let inner_width = (width.saturating_sub(2) as usize).max(1);
-            wrapped_line_offset(copy_text, local_row, inner_width)
-        }
-        TranscriptBlock::Notice(_) | TranscriptBlock::Compaction(_) => {
-            let w = (width as usize).max(1);
-            wrapped_line_offset(copy_text, local_row, w)
-        }
-        TranscriptBlock::Outcome(_) => {
-            // Outcome blocks are always a single fitted line; any row
-            // beyond the first maps to the end of the block.
-            copy_text.len()
-        }
-        TranscriptBlock::Tool(_) => {
-            // Tool blocks have a structured header + optional detail panels
-            // that don't map neatly to wrapped copy text.  Fall back to
-            // newline-based indexing which is correct for the common
-            // one-line summary + output layout.
-            newline_offset(copy_text, local_row)
-        }
-        TranscriptBlock::Shell(_) => {
-            let w = (width as usize).max(1);
-            wrapped_line_offset(copy_text, local_row, w)
-        }
-    }
-}
-
 /// Byte-offset after `n` newline-delimited segments (current behaviour for
 /// blocks where wrapping correspondence is unavailable).
 fn newline_offset(text: &str, n: usize) -> usize {
@@ -4576,16 +4411,6 @@ fn newline_offset(text: &str, n: usize) -> usize {
         .map(str::len)
         .sum::<usize>()
         .min(text.len())
-}
-
-/// Byte-offset after `n` lines of `text` wrapped at `wrap_width`.  Uses the
-/// same ANSI-aware word-wrapper the visual renderer relies on so that line
-/// boundaries agree with what the user sees.
-#[allow(dead_code)]
-fn wrapped_line_offset(text: &str, n: usize, wrap_width: usize) -> usize {
-    let wrapped = wrap_text_with_ansi(text, wrap_width);
-    let count = n.min(wrapped.len());
-    wrapped.iter().take(count).map(|line| line.len()).sum()
 }
 
 fn append_viewport_chrome(lines: &mut Vec<String>, chrome: ShellChrome) {
