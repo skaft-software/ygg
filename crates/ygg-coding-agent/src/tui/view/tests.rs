@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use super::*;
+use crate::commands;
 
 struct EmulatedTerminal {
     size: Arc<Mutex<(u16, u16)>>,
