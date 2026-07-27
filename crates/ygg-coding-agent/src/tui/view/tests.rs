@@ -2,6 +2,9 @@ use std::collections::HashSet;
 
 use sexy_tui_rs::{Block, Inline};
 
+use super::bash_render::render_compact_bash_output;
+use super::surface_layout::compile_surface_plan;
+use super::tool_render::{tool_value_indent, without_redundant_tool_lead};
 use super::transcript_commit::{
     transcript_commit_cursor, transcript_commit_position, FINAL_COMMIT_SEGMENT,
 };

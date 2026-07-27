@@ -1,7 +1,8 @@
 use std::cell::Ref;
 use std::time::Instant;
 
-use super::{render_block_planned, render_welcome_card, ShellState};
+use super::transcript_render::render_block_planned;
+use super::{render_welcome_card, ShellState};
 
 /// Final block-local geometry shared by transcript rendering and semantic
 /// selection. Decorative rows and columns never enter copy offsets.

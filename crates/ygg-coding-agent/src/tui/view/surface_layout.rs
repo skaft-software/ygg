@@ -4,10 +4,9 @@ use crate::tui::theme::{
     ThemeSurfaceAlign, ThemeSurfaceChrome, ThemeSurfaceHeading, ThemeSurfaceWidth, YggTheme,
 };
 
+use super::transcript_cache::SurfaceGeometry;
 use super::transcript_selection::block_copy_text;
-use super::{
-    collapsed_reasoning_lines, transcript_transition_rows, SurfaceGeometry, TranscriptBlock,
-};
+use super::{collapsed_reasoning_lines, transcript_transition_rows, TranscriptBlock};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SurfacePlan<'a> {
