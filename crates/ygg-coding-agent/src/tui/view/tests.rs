@@ -4108,44 +4108,6 @@ fn assistant_markdown_uses_full_rich_pipeline_without_rewriting_source() {
 }
 
 #[test]
-fn verbose_reasoning_deltas_keep_complete_incremental_state() {
-    let theme = crate::tui::theme::test_theme();
-    let mut reasoning = AssistantBlock::streaming_reasoning("First complete thought.\n\n");
-    let initial_revision = reasoning.markdown.tail_revision();
-
-    for step in 0..256 {
-        reasoning.append_reasoning(&format!("Thought {step} stays visible.\n\n"));
-    }
-
-    assert!(
-        reasoning.markdown.tail_revision() >= initial_revision + 256,
-        "ordinary deltas must extend one incremental Markdown stream"
-    );
-    reasoning.reasoning_expanded = true;
-    let live = render_reasoning(&reasoning, &theme.reasoning_renderer(), &theme, 80, true)
-        .into_iter()
-        .map(|line| strip_terminal_sequences(&line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(live.contains("First complete thought."), "{live}");
-    assert!(live.contains("Thought 0 stays visible."), "{live}");
-    assert!(live.contains("Thought 255 stays visible."), "{live}");
-
-    reasoning.finish_reasoning();
-    let finished = render_reasoning(&reasoning, &theme.reasoning_renderer(), &theme, 80, true)
-        .into_iter()
-        .map(|line| strip_terminal_sequences(&line))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(finished.contains("First complete thought."), "{finished}");
-    assert!(finished.contains("Thought 0 stays visible."), "{finished}");
-    assert!(
-        finished.contains("Thought 255 stays visible."),
-        "{finished}"
-    );
-}
-
-#[test]
 fn reasoning_enabled_run_shows_fallback_before_provider_deltas() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
@@ -4425,57 +4387,6 @@ fn a_new_reasoning_event_retires_the_previous_ctrl_o_hint() {
 }
 
 #[test]
-fn collapsed_reasoning_label_is_plain_model_colored_text() {
-    let theme = crate::tui::theme::test_theme();
-    let reasoning = AssistantBlock::streaming_reasoning("## Verifying `implementation`")
-        .with_model_lab(Some(ModelLab::Alibaba));
-    let label = live_reasoning_label(&theme, &reasoning);
-    assert_eq!(strip_terminal_sequences(&label), "Verifying implementation");
-    assert!(!label.contains("\x1b[1m"), "{label:?}");
-    let accent = theme
-        .model_rgb(Some(ModelLab::Alibaba))
-        .expect("Alibaba model accent");
-    assert!(
-        label.contains(&format!(
-            "\x1b[38;2;{};{};{}m",
-            accent.0, accent.1, accent.2
-        )),
-        "reasoning label must retain the block model's accent: {label:?}"
-    );
-}
-
-#[test]
-fn collapsed_reasoning_shows_two_live_rows_and_no_settled_rows() {
-    let theme = crate::tui::theme::test_theme();
-    let renderer = theme.reasoning_renderer();
-    let mut reasoning =
-        AssistantBlock::streaming_reasoning("private").with_model_lab(Some(ModelLab::Alibaba));
-    let live = render_reasoning(&reasoning, &renderer, &theme, 80, false);
-    assert_eq!(live.len(), 2, "{live:?}");
-    assert!(strip_terminal_sequences(&live[0]).contains("• Thinking"));
-    assert!(strip_terminal_sequences(&live[1]).contains("└ (ctrl+o to expand)"));
-    assert!(!live[0].contains("\x1b[1m"), "{live:?}");
-    let accent = theme
-        .model_rgb(Some(ModelLab::Alibaba))
-        .expect("Alibaba model accent");
-    assert!(
-        live[0].contains(&format!(
-            "\x1b[38;2;{};{};{}m",
-            accent.0, accent.1, accent.2
-        )),
-        "reasoning label must retain the block model's accent: {live:?}"
-    );
-
-    reasoning.reasoning_elapsed = Some(Duration::from_millis(13_700));
-    reasoning.finish_reasoning();
-    let settled = render_reasoning(&reasoning, &renderer, &theme, 80, false);
-    assert!(
-        settled.is_empty(),
-        "finished reasoning leaves no trace when collapsed"
-    );
-}
-
-#[test]
 fn reasoning_heading_tracks_only_explicit_markdown_headings() {
     let mut reasoning = AssistantBlock::streaming_reasoning(
         "Body sentence must stay private.\n\n## Plan `carefully`\n\nMore private detail.",
@@ -4515,25 +4426,6 @@ fn reasoning_heading_handles_adjacent_bold_sections_split_across_deltas() {
     assert_eq!(reasoning.reasoning_heading.as_deref(), Some("Verify"));
     assert_eq!(reasoning.text, "**Plan****Verify**");
     assert!(!reasoning.markdown.raw_text().contains("****"));
-}
-
-#[test]
-fn collapsed_reasoning_has_ascii_fallback_and_width_bounded_rows() {
-    let theme =
-        crate::tui::theme::test_theme_with(crate::tui::terminal::TerminalCapabilities::test(
-            false,
-            false,
-            crate::tui::terminal::ColorDepth::None,
-        ));
-    let reasoning = AssistantBlock::streaming_reasoning(
-        "## A heading that is intentionally much wider than the viewport\n",
-    );
-    let lines = render_reasoning(&reasoning, &theme.reasoning_renderer(), &theme, 16, false);
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(lines[0].starts_with("* A heading"), "{lines:?}");
-    assert!(lines[1].starts_with("  `- (ctrl+o to"), "{lines:?}");
-    assert!(lines.iter().all(|line| visible_width(line) <= 16));
-    assert!(lines.iter().all(|line| !line.contains('\x1b')));
 }
 
 #[test]

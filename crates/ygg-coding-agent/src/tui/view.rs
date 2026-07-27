@@ -12,9 +12,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+#[cfg(test)]
+use sexy_tui_rs::strip_terminal_sequences;
 use sexy_tui_rs::{
-    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, Color,
-    CommitCursor, Component, FrameUpdate, RichRenderer, CURSOR_MARKER, TUI,
+    parse_markdown, visible_width, wrap_text_with_ansi, Color, CommitCursor, Component,
+    FrameUpdate, RichRenderer, CURSOR_MARKER, TUI,
 };
 use ygg_agent::{AgentEvent, EntryValue, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ModalitySet, Model, ModelId, ToolCallId, Usage};
@@ -48,6 +50,7 @@ use self::outcome_render::render_outcome;
 #[cfg(test)]
 use self::panel_render::render_panel;
 use self::panel_render::{filtered_indices, render_panel_with_limit};
+use self::reasoning_render::{collapsed_reasoning_lines, render_reasoning_on_surface};
 use self::status_telemetry::{
     output_tokens_per_second, status_telemetry, styled_status_text,
     usage_cache_hit_rate_basis_points,
@@ -1134,45 +1137,6 @@ pub(crate) fn semantic_separator(theme: &YggTheme) -> &str {
     theme.glyph("separator")
 }
 
-fn live_reasoning_label(theme: &YggTheme, reasoning: &AssistantBlock) -> String {
-    let label = reasoning.reasoning_heading.as_deref().unwrap_or("Thinking");
-    theme.model_fg(reasoning.model_lab, label)
-}
-
-fn collapsed_reasoning_lines(
-    theme: &YggTheme,
-    reasoning: &AssistantBlock,
-    include_margin_marker: bool,
-) -> Vec<String> {
-    // Finished reasoning leaves no trace in the collapsed transcript. Active
-    // reasoning occupies exactly two rows so heading updates cannot reflow the
-    // transcript around it.
-    if reasoning.finished {
-        Vec::new()
-    } else {
-        let label = live_reasoning_label(theme, reasoning);
-        let label = if include_margin_marker {
-            format!(
-                "{} {label}",
-                theme.model_fg(reasoning.model_lab, theme.glyph("bullet"))
-            )
-        } else {
-            label
-        };
-        let disclosure_indent = if include_margin_marker { "  " } else { "" };
-        vec![
-            label,
-            subdued_text(
-                theme,
-                &format!(
-                    "{disclosure_indent}{} (ctrl+o to expand)",
-                    theme.glyph("last_branch")
-                ),
-            ),
-        ]
-    }
-}
-
 /// A low-contrast annotation that remains readable without relying on a
 /// painted background. This is used for viewport chrome and secondary tool
 /// metadata, never for the answer itself.
@@ -1184,72 +1148,6 @@ fn understated_tool_output(theme: &YggTheme, text: &str) -> String {
     theme
         .role_rgb("muted")
         .map_or_else(|| text.to_owned(), |color| theme.rgb_fg(color, text))
-}
-
-#[cfg(test)]
-fn render_reasoning(
-    reasoning: &AssistantBlock,
-    renderer: &RichRenderer,
-    theme: &YggTheme,
-    width: u16,
-    show_reasoning: bool,
-) -> Vec<String> {
-    render_reasoning_on_surface(
-        reasoning,
-        renderer,
-        theme,
-        width,
-        show_reasoning,
-        None,
-        false,
-    )
-}
-
-fn render_reasoning_on_surface(
-    reasoning: &AssistantBlock,
-    renderer: &RichRenderer,
-    theme: &YggTheme,
-    width: u16,
-    show_reasoning: bool,
-    background: Option<Color>,
-    use_margin_marker: bool,
-) -> Vec<String> {
-    let marker = theme.glyph("reasoning");
-    let prefix_width = visible_width(marker).saturating_add(1);
-    if !reasoning.reasoning_expanded && !show_reasoning {
-        return collapsed_reasoning_lines(theme, reasoning, !use_margin_marker)
-            .into_iter()
-            .map(|line| {
-                let line = fit_line(&line, width);
-                if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
-                    strip_terminal_sequences(&line)
-                } else {
-                    line
-                }
-            })
-            .collect();
-    }
-    let content_width = width.saturating_sub(prefix_width as u16).max(1);
-    let lines = finish_transcript_block(reasoning.render_on_surface(
-        renderer,
-        theme,
-        content_width,
-        background,
-    ));
-
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            if line.is_empty() {
-                String::new()
-            } else if index == 0 {
-                fit_line(&format!("{} {line}", theme.fg("muted", marker)), width)
-            } else {
-                fit_line(&format!("{}{line}", " ".repeat(prefix_width)), width)
-            }
-        })
-        .collect()
 }
 
 fn finish_transcript_block(mut lines: Vec<String>) -> Vec<String> {
@@ -4438,6 +4336,7 @@ mod editor_layout;
 mod input_overlays;
 mod outcome_render;
 mod panel_render;
+mod reasoning_render;
 mod status_telemetry;
 mod surface_frame;
 mod surface_layout;
