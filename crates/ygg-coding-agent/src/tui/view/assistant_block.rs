@@ -8,8 +8,8 @@ use sexy_tui_rs::{
     StreamingRenderCache, UnifiedDiff,
 };
 
-use super::looks_like_diff;
 use super::terminal_text::sanitize_for_terminal;
+use super::tool_render::looks_like_diff;
 use crate::tui::theme::YggTheme;
 
 fn reasoning_markdown_projection(source: &str) -> String {

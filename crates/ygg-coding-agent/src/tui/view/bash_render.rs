@@ -3,10 +3,8 @@
 use sexy_tui_rs::{visible_width, RichRenderer};
 
 use super::terminal_text::sanitize_for_terminal;
-use super::{
-    fit_line, subdued_text, tool_value_indent_width, wrap_hanging, ToolPanel,
-    COMPACT_EXEC_OUTPUT_LINES,
-};
+use super::tool_render::tool_value_indent_width;
+use super::{fit_line, subdued_text, wrap_hanging, ToolPanel, COMPACT_EXEC_OUTPUT_LINES};
 use crate::tui::theme::YggTheme;
 
 fn tool_metadata(panel: &ToolPanel) -> Option<String> {
