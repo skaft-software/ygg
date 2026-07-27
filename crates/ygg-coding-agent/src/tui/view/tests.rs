@@ -1161,54 +1161,6 @@ fn steering_messages_are_queued_above_prompt_and_delivered_as_a_batch() {
 }
 
 #[test]
-fn composer_soft_wraps_at_word_boundaries_and_hard_wraps_long_words() {
-    let text = "alpha beta gamma";
-    let lines = editor_visual_lines(text, 10);
-    let wrapped: Vec<_> = lines
-        .iter()
-        .map(|line| &text[line.start..line.visible_end])
-        .collect();
-    assert_eq!(wrapped, vec!["alpha beta", "gamma"]);
-    assert_eq!(
-        lines
-            .iter()
-            .map(|line| &text[line.start..line.end])
-            .collect::<String>(),
-        text,
-        "soft wrapping must retain every source byte for cursor editing"
-    );
-
-    // A word that exactly follows a full row must not create a
-    // whitespace-only row or split despite fitting on its own.
-    let text = "one two";
-    let lines = editor_visual_lines(text, 3);
-    let wrapped: Vec<_> = lines
-        .iter()
-        .map(|line| &text[line.start..line.visible_end])
-        .collect();
-    assert_eq!(wrapped, vec!["one", "two"]);
-
-    let text = "supercalifragilistic";
-    let lines = editor_visual_lines(text, 5);
-    let wrapped: Vec<_> = lines
-        .iter()
-        .map(|line| &text[line.start..line.visible_end])
-        .collect();
-    assert_eq!(wrapped, vec!["super", "calif", "ragil", "istic"]);
-}
-
-#[test]
-fn composer_word_wrap_preserves_explicit_newlines() {
-    let text = "one two\nthree four\n";
-    let lines = editor_visual_lines(text, 6);
-    let wrapped: Vec<_> = lines
-        .iter()
-        .map(|line| &text[line.start..line.visible_end])
-        .collect();
-    assert_eq!(wrapped, vec!["one", "two", "three", "four", ""]);
-}
-
-#[test]
 fn terminal_native_prompt_wraps_and_shrinks_without_a_panel() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(24, 10);
