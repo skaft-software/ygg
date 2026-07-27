@@ -2,7 +2,67 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## 0.3.2-alpha — 2026-07-26 (experimental)
+## 0.3.2-alpha — 2026-07-27 (experimental)
+
+### Ygg Serve (experimental, feature-gated)
+
+- Added `ygg serve` subcommand with `--port`, `--no-open`, and `--web-root` flags.
+- Added `extensions/ygg-serve/` crate — frontend-neutral backend contracts for graphical clients:
+  - Bounded host, project, session, command, item, event, and replay DTOs.
+  - Host-authoritative model, authority, capability, and safe theme catalogs.
+  - Stable session cursors and exact durable entry identity.
+  - Deterministic session snapshot reducer.
+  - Bounded replay plus device-scoped command idempotency.
+  - Host-scoped idempotent fresh-session operation.
+  - `SessionActor` for serialized session ownership.
+  - `SessionSupervisor` preventing duplicate mutable owners.
+  - Loopback-only HTTP/WebSocket transport with one-use launch authentication, strict same-origin checks, bounded requests, and safe static assets.
+  - `HostService` / `SessionDriver` adapter traits for the real Ygg application.
+  - Immutable evidence store with SHA-256 verification, versioned metadata, commit manifests, restart recovery, and session scoping.
+  - Secure image attachment with MIME sniffing, byte limits, private persistent storage, thumbnails, and authenticated retrieval.
+  - Document ingestion (text and PDF with hostile-document limits).
+  - Structured test result parsing (cargo, pytest, vitest).
+  - Git repository context, project registry, trusted file management.
+  - Full-text transcript search index.
+  - Runtime status tracking with phases, activities, progress, sources, changes, and evidence coverage.
+  - Prompt context composition from documents and project files.
+  - Theme DTOs with color scheme, roles, density, motion, and typography.
+  - Golden JSON contract fixtures for the browser/native client boundary.
+- Added `apps/web/` crate — React 19 + TypeScript + Vite web frontend:
+  - Sidebar with pinned and recent sessions and client-side title/preview search.
+  - Transcript with Markdown and GitHub-Flavored Markdown rendering.
+  - User and assistant messages with grouped activity.
+  - Source, diff, and output openers in a dominant inspector.
+  - Image preview with paste, drop, and picker support.
+  - Approval and input interactions for terminal-gated operations.
+  - Compact run outcome and elapsed-time presentation.
+  - Composer with attachments, model selection, effort, authority, follow-up/steer, and send/stop.
+  - Ten projected Ygg themes with operating-system appearance support.
+  - Device-local font and size preferences.
+  - Settings, inspector, progress, artifacts, and context panels.
+  - Responsive desktop, tablet, and phone layouts.
+  - TUI-derived animated braille splash.
+  - Completion review with structured run outcomes.
+  - Conversation branching dialog.
+  - Transcript search UI.
+  - Playwright end-to-end test suite with visual regression snapshots.
+- Added feature-gated adapter in `crates/ygg-coding-agent/src/extensions/serve.rs` connecting real Ygg App to graphical host contracts.
+- Added boundary allowlist enforcement script (`scripts/check-ygg-serve-boundaries.sh`).
+- Added installed-binary smoke test (`scripts/smoke-ygg-serve-installed.sh`).
+
+### Added
+
+- `SessionRunOutcome` persistence — durable terminal state (Completed/Stopped/Failed) attached to frontend-owned run markers on entries.
+- `RootHead` session record variant — durable checkpoint before the first entry, creating a new root branch while preserving all existing roots and descendants.
+- `Agent::record_run_outcome()` — persist frontend-owned run terminal state after a `Run` is dropped.
+- Steering and follow-up inputs now use independent `display_text` metadata instead of inheriting the initial prompt's display text, so each submission renders its own message body after replay.
+- `ygg serve` subcommand with `--port`, `--no-open`, `--web-root`.
+
+### Documentation
+
+- Added `docs/experimental/ygg-serve/` directory with 7 documents:
+  - Architecture overview, LAN pairing specification, current-state handoff, P0/P1 delivery checklist, web acceptance spec, native delivery spec.
+- Refreshed README demo for v0.3.1-alpha and cache-busted the GIF asset.
 
 ### Changed
 
