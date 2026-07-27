@@ -4,6 +4,7 @@ use sexy_tui_rs::{Block, Inline};
 
 use super::*;
 use crate::commands;
+use crate::presentation::RunPhase;
 
 struct EmulatedTerminal {
     size: Arc<Mutex<(u16, u16)>>,
