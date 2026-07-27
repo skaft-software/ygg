@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write as IoWrite};
 use std::path::PathBuf;
@@ -80,6 +80,11 @@ use self::transcript_hydration::append_hydrated_items;
 use self::transcript_selection::{
     block_copy_text, selection_position_for_visual_cell, semantic_selected_text,
     TranscriptPosition, TranscriptSelection,
+};
+use self::viewport::{
+    max_scroll_for_available, max_scroll_from_bottom, overlay_lines, render_shell_viewport_at,
+    render_shell_viewport_update, transcript_lines, transcript_viewport_capacity,
+    transcript_viewport_capacity_for_state,
 };
 
 /// Default render cap — roughly 60 fps. Decorative shimmer uses the separate,
@@ -1717,151 +1722,6 @@ fn render_welcome_card(
     }
     lines.push(String::new());
     lines
-}
-
-fn transcript_lines(state: &ShellState, width: u16) -> Ref<'_, Vec<String>> {
-    state.rendered_transcript(width)
-}
-
-fn transcript_viewport_capacity(available: usize, scrolled: bool) -> usize {
-    if available == 0 {
-        return 0;
-    }
-    // Keep the transcript visually separate from the pinned surfaces whenever
-    // there is room. A scrolled viewport also owns one row for its navigation
-    // indicator, leaving every other row for semantic transcript content.
-    let breathing_row = 1;
-    // On a two-row transcript surface the navigation indicator temporarily
-    // occupies the breathing row so one semantic row remains inspectable.
-    let indicator_row = usize::from(scrolled && available > 2);
-    available.saturating_sub(breathing_row + indicator_row)
-}
-
-fn max_scroll_for_available(transcript_len: usize, available: usize) -> usize {
-    let live_capacity = transcript_viewport_capacity(available, false);
-    if live_capacity == 0 || transcript_len <= live_capacity {
-        0
-    } else {
-        let scrolled_capacity = transcript_viewport_capacity(available, true).max(1);
-        transcript_len.saturating_sub(scrolled_capacity)
-    }
-}
-
-fn max_scroll_from_bottom(state: &ShellState, width: u16) -> usize {
-    if state.overlay.is_some() {
-        return 0;
-    }
-    let chrome = shell_chrome(state, width, Instant::now());
-    max_scroll_for_available(transcript_lines(state, width).len(), chrome.transcript_rows)
-}
-
-fn transcript_viewport_capacity_for_state(state: &ShellState, width: u16) -> usize {
-    if state.overlay.is_some() {
-        return 0;
-    }
-    let chrome = shell_chrome(state, width, Instant::now());
-    let transcript = transcript_lines(state, width);
-    let maximum = max_scroll_for_available(transcript.len(), chrome.transcript_rows);
-    let scrolled = state.scroll_from_bottom.get().min(maximum) > 0;
-    transcript_viewport_capacity(chrome.transcript_rows, scrolled)
-}
-
-/// Wrap each logical overlay row independently and terminate its SGR state.
-/// Picker rows use the legacy closure-styled compatibility API, so each row is
-/// explicitly closed even though sexy-tui 0.2 now preserves extended colors
-/// safely across wraps.
-fn wrap_overlay_text(text: &str, width: usize) -> Vec<String> {
-    let mut wrapped = Vec::new();
-    for source_line in text.split('\n') {
-        if source_line.contains('\x1b') {
-            let terminated = format!("{source_line}\x1b[0m");
-            for line in wrap_text_with_ansi(&terminated, width.max(1)) {
-                wrapped.push(format!("{line}\x1b[0m"));
-            }
-        } else {
-            wrapped.extend(wrap_text_with_ansi(source_line, width.max(1)));
-        }
-    }
-    wrapped
-}
-
-fn overlay_lines(state: &ShellState, width: u16) -> Vec<String> {
-    let Some(overlay) = &state.overlay else {
-        return Vec::new();
-    };
-    match overlay {
-        ShellOverlay::Text(text) => wrap_overlay_text(text, usize::from(width).max(1)),
-        ShellOverlay::Context(report) => report.render(&state.theme, width),
-    }
-}
-
-fn transcript_viewport_lines(state: &ShellState, width: u16, available: usize) -> Vec<String> {
-    let transcript = transcript_lines(state, width);
-    let max_scroll = max_scroll_for_available(transcript.len(), available);
-    let scroll = state.scroll_from_bottom.get().min(max_scroll);
-    let scrolled = scroll > 0;
-    let capacity = transcript_viewport_capacity(available, scrolled);
-    let end = transcript.len().saturating_sub(scroll);
-    let start = end.saturating_sub(capacity);
-    let mut lines = transcript[start..end].to_vec();
-    drop(transcript);
-
-    if scrolled && lines.len() < available {
-        let new_output = if state.new_output_count == 0 {
-            String::new()
-        } else {
-            format!(
-                "{}{} new",
-                semantic_separator(&state.theme),
-                state.new_output_count
-            )
-        };
-        lines.push(fit_line(
-            &state.theme.fg(
-                "muted",
-                &format!("↑ {scroll} rows back{new_output} · PageDown returns to live"),
-            ),
-            width,
-        ));
-    }
-    lines
-}
-
-fn render_shell_viewport_at(state: &ShellState, width: u16, now: Instant) -> Vec<String> {
-    let chrome = shell_chrome(state, width, now);
-    let mut lines = if state.overlay.is_some() {
-        let mut overlay = overlay_lines(state, width);
-        overlay.truncate(chrome.transcript_rows);
-        overlay
-    } else {
-        transcript_viewport_lines(state, width, chrome.transcript_rows)
-    };
-    append_viewport_chrome(&mut lines, chrome);
-    lines
-}
-
-fn render_shell_viewport_update(
-    state: &ShellState,
-    width: u16,
-    now: Instant,
-    frame: &mut ShellFrameState,
-) -> FrameUpdate {
-    let repaint_theme = frame.initialized && frame.theme_epoch != state.theme_epoch;
-    let resized = frame.initialized && (frame.width != width || frame.height != state.size.1);
-    frame.initialized = true;
-    frame.width = width;
-    frame.height = state.size.1;
-    frame.theme_epoch = state.theme_epoch;
-    frame.transcript_epoch = state.transcript_epoch;
-    frame.verbose_tools = state.verbose_tools;
-    FrameUpdate {
-        stable_prefix: 0,
-        replacement: render_shell_viewport_at(state, width, now),
-        pinned: None,
-        resize_replay: None,
-        reanchor_viewport: repaint_theme || resized,
-        rebuild_scrollback: false,
-    }
 }
 
 fn native_overlay_prefix_len(transcript_len: usize, chrome: &ShellChrome) -> usize {
@@ -4156,6 +4016,7 @@ mod transcript_commit;
 mod transcript_history;
 mod transcript_hydration;
 mod transcript_selection;
+mod viewport;
 
 #[cfg(test)]
 mod tests;
