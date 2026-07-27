@@ -2,6 +2,9 @@ use std::collections::HashSet;
 
 use sexy_tui_rs::{Block, Inline};
 
+use super::transcript_commit::{
+    transcript_commit_cursor, transcript_commit_position, FINAL_COMMIT_SEGMENT,
+};
 use super::*;
 use crate::commands;
 use crate::presentation::RunPhase;
