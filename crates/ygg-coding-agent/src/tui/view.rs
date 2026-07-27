@@ -38,13 +38,14 @@ use crate::tui::theme::{
     ThemeSurfaceWidth, YggTheme,
 };
 
+pub use self::terminal_text::bounded_append;
+use self::terminal_text::{sanitize_extension_surface, sanitize_extension_tool_render_segments};
+pub(crate) use self::terminal_text::{sanitize_for_terminal, sanitized_editor};
 use self::transcript_history::{
     materialize_deferred_session_history, DeferredSessionHistory, NextTranscriptCommitId,
 };
 
-const MAX_PANEL_BYTES: usize = 64 * 1024;
 const MAX_OUTCOME_DETAIL_BYTES: usize = 4 * 1024;
-const MAX_EXTENSION_TOOL_RENDER_SEGMENTS: usize = 128;
 /// Default render cap — roughly 60 fps. Decorative shimmer uses the separate,
 /// deliberately slower cap below; input and streamed output stay on this path.
 const RENDER_INTERVAL: Duration = Duration::from_millis(16);
@@ -61,218 +62,9 @@ const EVENT_DOT_TOGGLE_INTERVAL: Duration = Duration::from_millis(450);
 /// Resize events are normally delivered by crossterm, but polling while idle
 /// also catches terminal-manager resizes that do not emit an event.
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const ELISION_MARKER: &str = "\n… older tool output elided …\n";
 /// A compact tool row keeps enough terminal context to recognize a result
 /// while preventing noisy output from swallowing the transcript.
 const COMPACT_EXEC_OUTPUT_LINES: usize = 5;
-
-/// Strip complete terminal sequences, replace remaining controls (except line
-/// feeds), and normalize CRLF so raw tool/provider output cannot execute
-/// terminal commands or leave color-protocol debris in the transcript.
-///
-/// NULL becomes `␀`, BEL becomes `␇`, and other C0/C1 controls become `·`.
-pub(crate) fn sanitize_for_terminal(raw: &str) -> String {
-    // Command output often carries color, OSC hyperlinks, or a charset reset.
-    // Remove complete terminal sequences as units: exposing only their ESC
-    // byte leaves artifacts such as `[32m` and `(B` in the transcript.
-    let stripped;
-    let raw = if raw
-        .chars()
-        .any(|character| character == '\x1b' || ('\u{0080}'..='\u{009f}').contains(&character))
-    {
-        stripped = strip_terminal_sequences(raw);
-        stripped.as_str()
-    } else {
-        raw
-    };
-
-    // Fast path: most tool output is clean text.
-    if raw
-        .chars()
-        .all(|character| !character.is_control() || character == '\n')
-    {
-        return raw.to_owned();
-    }
-
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\n' => out.push('\n'),
-            '\r' if chars.peek() == Some(&'\n') => {
-                chars.next();
-                out.push('\n');
-            }
-            '\r' => out.push('␍'),
-            '\t' => out.push_str("    "),
-            '\x00' => out.push('␀'),
-            '\x07' => out.push('␇'),
-            '\x1b' => {
-                // If the next char starts a CSI sequence (ESC [), swallow
-                // until the final byte so the terminal never sees a live
-                // escape. Render the whole thing as visible text.
-                out.push('␛');
-                if chars.peek() == Some(&'[') {
-                    out.push('[');
-                    chars.next();
-                    // Consume parameter bytes (0x30-0x3F) and intermediate
-                    // bytes (0x20-0x2F), then the final byte (0x40-0x7E).
-                    while let Some(&next) = chars.peek() {
-                        let b = next as u32;
-                        if (0x30..=0x3F).contains(&b) || (0x20..=0x2F).contains(&b) {
-                            out.push(next);
-                            chars.next();
-                        } else if (0x40..=0x7E).contains(&b) {
-                            out.push(next);
-                            chars.next();
-                            break;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-            c if c.is_control() => out.push('·'),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Normalize a process-supplied one-line semantic contribution at the TUI
-/// boundary. Extension text never gets to smuggle terminal controls or extra
-/// physical rows into persistent chrome, and an invalid role simply falls
-/// back to the conventional surface role.
-fn sanitize_extension_surface(
-    contribution: Option<(String, Option<String>)>,
-) -> Option<(String, Option<String>)> {
-    contribution.and_then(|(text, role)| {
-        let text = sanitize_for_terminal(&text).replace('\n', " ");
-        let text = text.trim().to_owned();
-        if text.is_empty() {
-            return None;
-        }
-        let role = role.and_then(|role| {
-            let role = role.trim();
-            (role.len() <= 96
-                && !role.is_empty()
-                && !role.starts_with('.')
-                && !role.ends_with('.')
-                && role
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
-            .then(|| role.to_owned())
-        });
-        Some((text, role))
-    })
-}
-
-fn bounded_plain_prefix(mut text: String, byte_budget: usize) -> String {
-    if text.len() <= byte_budget {
-        return text;
-    }
-    let mut end = byte_budget;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text
-}
-
-fn sanitize_extension_tool_render_segments(
-    segments: &[ygg_agent::extension_process::ToolRenderSegment],
-) -> Vec<ygg_agent::extension_process::ToolRenderSegment> {
-    let mut remaining = MAX_PANEL_BYTES;
-    let mut sanitized = Vec::new();
-    for segment in segments.iter().take(MAX_EXTENSION_TOOL_RENDER_SEGMENTS) {
-        if remaining == 0 {
-            break;
-        }
-        let text = bounded_plain_prefix(sanitize_for_terminal(&segment.text), remaining);
-        remaining = remaining.saturating_sub(text.len());
-        if text.is_empty() {
-            continue;
-        }
-        let style_role = segment.style_role.as_deref().and_then(|role| {
-            let role = sanitize_for_terminal(role).replace('\n', " ");
-            let role = bounded_plain_prefix(role.trim().to_owned(), 128);
-            (!role.is_empty()).then_some(role)
-        });
-        sanitized.push(ygg_agent::extension_process::ToolRenderSegment { text, style_role });
-    }
-    sanitized
-}
-
-fn visualize_editor_controls(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(character) = chars.next() {
-        match character {
-            '\n' => out.push('\n'),
-            '\r' if chars.peek() == Some(&'\n') => {
-                chars.next();
-                out.push('\n');
-            }
-            '\r' => out.push('␍'),
-            '\t' => out.push_str("    "),
-            '\x00' => out.push('␀'),
-            '\x07' => out.push('␇'),
-            '\x1b' => out.push('␛'),
-            control if control.is_control() => out.push('·'),
-            visible => out.push(visible),
-        }
-    }
-    out
-}
-
-pub(crate) fn sanitized_editor(raw: &str, cursor: usize) -> (String, usize) {
-    let mut cursor = cursor.min(raw.len());
-    while cursor > 0 && !raw.is_char_boundary(cursor) {
-        cursor -= 1;
-    }
-    // Composer input remains authoritative and editable. Unlike command logs,
-    // controls are visualized rather than removed so cursor offsets can map to
-    // every source byte without executing it.
-    let before = visualize_editor_controls(&raw[..cursor]);
-    let safe_cursor = before.len();
-    let after = visualize_editor_controls(&raw[cursor..]);
-    (before + &after, safe_cursor)
-}
-
-/// Append display output while retaining only the newest 64 KiB.
-pub fn bounded_append(existing: &mut String, additional: &str) {
-    let safe = sanitize_for_terminal(additional);
-    if existing.len().saturating_add(safe.len()) <= MAX_PANEL_BYTES {
-        existing.push_str(&safe);
-        return;
-    }
-
-    // Retain the newest bytes in place. The old implementation allocated a
-    // second combined String on every overflow event, which is a hot path for
-    // noisy tools; reserve once and shift only the retained tail.
-    let tail_budget = MAX_PANEL_BYTES.saturating_sub(ELISION_MARKER.len());
-    let mut additional_start = if safe.len() >= tail_budget {
-        safe.len() - tail_budget
-    } else {
-        0
-    };
-    while additional_start < safe.len() && !safe.is_char_boundary(additional_start) {
-        additional_start += 1;
-    }
-    let existing_budget = tail_budget.saturating_sub(safe.len() - additional_start);
-    let mut existing_start = existing.len().saturating_sub(existing_budget);
-    while existing_start < existing.len() && !existing.is_char_boundary(existing_start) {
-        existing_start += 1;
-    }
-
-    let final_len = ELISION_MARKER.len()
-        + existing.len().saturating_sub(existing_start)
-        + safe.len().saturating_sub(additional_start);
-    existing.replace_range(..existing_start, "");
-    existing.reserve(final_len.saturating_sub(existing.len()));
-    existing.insert_str(0, ELISION_MARKER);
-    existing.push_str(&safe[additional_start..]);
-}
 
 /// Output from an interactive `!` shell command, stored as a collapsible
 /// block so the transcript is not overwhelmed by long command output.
@@ -7864,6 +7656,7 @@ impl sexy_tui_rs::Terminal for TestTerminal {
     fn clear_screen(&mut self) {}
 }
 
+mod terminal_text;
 mod transcript_history;
 
 #[cfg(test)]
