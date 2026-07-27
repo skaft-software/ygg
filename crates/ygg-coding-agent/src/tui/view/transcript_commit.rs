@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use sexy_tui_rs::{CommitCursor, CommitPosition, PinnedFrame};
 
-use super::renderer_runtime::welcome_animating;
+use super::welcome_card::welcome_animating;
 use super::{ShellState, TranscriptBlock};
 
 pub(super) const FINAL_COMMIT_SEGMENT: u64 = u64::MAX;

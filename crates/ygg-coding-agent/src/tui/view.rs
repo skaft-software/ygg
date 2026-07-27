@@ -432,29 +432,6 @@ pub(crate) struct ShellState {
 }
 
 impl ShellState {
-    fn welcome_is_mutable(&self) -> bool {
-        self.startup_card_started_at.is_some()
-            && !self.transcript.iter().any(|block| {
-                matches!(
-                    block,
-                    TranscriptBlock::User { .. }
-                        | TranscriptBlock::Assistant(_)
-                        | TranscriptBlock::Reasoning(_)
-                        | TranscriptBlock::Tool(_)
-                        | TranscriptBlock::Shell(_)
-                        | TranscriptBlock::Outcome(_)
-                        | TranscriptBlock::Compaction(_)
-                )
-            })
-    }
-
-    fn restart_welcome_animation(&mut self) {
-        if self.welcome_is_mutable() {
-            self.startup_card_started_at = Some(Instant::now());
-            self.invalidate_transcript_layout();
-        }
-    }
-
     fn invalidate_transcript(&mut self) {
         self.transcript_cache.get_mut().dirty = true;
     }
@@ -1081,84 +1058,6 @@ fn render_prompt_box(state: &ShellState, width: u16, max_content_rows: usize) ->
         rendered.push(fit_line(&format!("{prefix}{content}"), width));
     }
     rendered
-}
-
-fn welcome_workspace(state: &ShellState) -> String {
-    let Some(path) = state.workspace.as_deref() else {
-        return "workspace unavailable".to_owned();
-    };
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        if let Ok(relative) = path.strip_prefix(home) {
-            return format!("~/{}", relative.display());
-        }
-    }
-    path.display().to_string()
-}
-
-fn render_welcome_card(
-    state: &ShellState,
-    width: u16,
-    max_rows: usize,
-    now: Instant,
-) -> Vec<String> {
-    let Some(started) = state.startup_card_started_at else {
-        return Vec::new();
-    };
-    if state.overlay.is_some() || width < 24 || max_rows < 7 {
-        return Vec::new();
-    }
-
-    const ROWS: usize = 6;
-    let elapsed = if state.theme.capabilities().animation && state.welcome_is_mutable() {
-        now.saturating_duration_since(started).as_secs_f32()
-    } else {
-        crate::tui::splash::DURATION
-    };
-    let logo_width = (usize::from(width) / 3).clamp(14, 24);
-    let adaptive_accent = state
-        .theme
-        .is_compiled_default()
-        .then(|| state.theme.model_rgb(state.model_lab))
-        .flatten();
-    let logo =
-        crate::tui::splash::render_logo(&state.theme, logo_width, ROWS, elapsed, adaptive_accent);
-
-    let model = if state.model_display.trim().is_empty() {
-        state.model.as_str()
-    } else {
-        state.model_display.as_str()
-    };
-    let model = if model.trim().is_empty() {
-        "selecting model…"
-    } else {
-        model
-    };
-    let text = [
-        format!(
-            "{} {}",
-            state.theme.bold(&state.theme.fg("model_accent", "ygg")),
-            state.theme.dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-        ),
-        String::new(),
-        state
-            .theme
-            .fg("foreground", &format!("{model} / {}", state.reasoning)),
-        state.theme.dim(&welcome_workspace(state)),
-        String::new(),
-        format!(
-            "{} {}",
-            state.theme.bold("Ctrl+D"),
-            state.theme.dim("to exit")
-        ),
-    ];
-
-    let mut lines = Vec::with_capacity(ROWS + 2);
-    lines.push(String::new());
-    for row in 0..ROWS {
-        lines.push(fit_line(&format!("  {}   {}", logo[row], text[row]), width));
-    }
-    lines.push(String::new());
-    lines
 }
 
 /// Full-screen terminal shell. It owns all terminal I/O and no Agent state.
@@ -2138,7 +2037,7 @@ impl InteractiveShell {
         state.model = model.to_owned();
         state.reasoning = reasoning.to_owned();
         if welcome_changed {
-            state.restart_welcome_animation();
+            welcome_card::restart_welcome_animation(&mut state);
         }
     }
 
@@ -3018,7 +2917,7 @@ impl InteractiveShell {
         state.model_compact_names = metadata.compact_names;
         state.price_display = price_display;
         state.prompt_color = Some(prompt_color);
-        state.restart_welcome_animation();
+        welcome_card::restart_welcome_animation(&mut state);
         if state.model_lab == Some(lab) {
             return;
         }
@@ -3246,6 +3145,7 @@ mod transcript_hydration;
 mod transcript_render;
 mod transcript_selection;
 mod viewport;
+mod welcome_card;
 
 #[cfg(test)]
 mod tests;

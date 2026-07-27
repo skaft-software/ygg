@@ -13,6 +13,7 @@ use super::native_scrollback::{
 };
 use super::transcript_history::materialize_deferred_session_history;
 use super::viewport::{render_shell_viewport_at, render_shell_viewport_update};
+use super::welcome_card::welcome_animating;
 use super::ShellState;
 use crate::tui::terminal::{TerminalSize, YggTerminal};
 
@@ -81,15 +82,6 @@ pub(super) fn shimmer_animating(state: &ShellState) -> bool {
     // approval waits deliberately leave the border still and do not need a
     // high-frequency repaint.
     crate::tui::composer_surface::phase_speed_for(Some(run.phase())) > 0.0
-}
-
-pub(super) fn welcome_animating(state: &ShellState, now: Instant) -> bool {
-    state.welcome_is_mutable()
-        && state.theme.capabilities().animation
-        && state.overlay.is_none()
-        && state.startup_card_started_at.is_some_and(|started| {
-            now.saturating_duration_since(started).as_secs_f32() < crate::tui::splash::DURATION
-        })
 }
 
 pub(super) fn event_dot_animating(state: &ShellState) -> bool {

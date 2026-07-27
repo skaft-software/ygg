@@ -751,18 +751,6 @@ fn markdown_transcript_renders_common_headings_lists_code_and_rules() {
 }
 
 #[test]
-fn welcome_card_shows_the_current_package_version() {
-    let shell = InteractiveShell::test_shell();
-    shell.state.borrow_mut().startup_card_started_at = Some(Instant::now());
-    let rendered = render_welcome_card(&shell.state.borrow(), 80, 10, Instant::now()).join("\n");
-    let rendered = strip_terminal_sequences(&rendered);
-    assert!(
-        rendered.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-        "{rendered}"
-    );
-}
-
-#[test]
 fn rich_text_renders_gfm_tables_tasks_links_and_fenced_code() {
     let theme = crate::tui::theme::test_theme();
     let rendered = markdown_lines(
