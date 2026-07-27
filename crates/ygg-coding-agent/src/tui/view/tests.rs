@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use sexy_tui_rs::{Block, Inline};
+
 use super::*;
 use crate::commands;
 
