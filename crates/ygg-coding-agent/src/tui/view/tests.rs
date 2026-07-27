@@ -8,6 +8,7 @@ use super::transcript_commit::{
 use super::*;
 use crate::commands;
 use crate::presentation::RunPhase;
+use crate::tui::theme::ThemeSurfaceHeading;
 
 struct EmulatedTerminal {
     size: Arc<Mutex<(u16, u16)>>,
