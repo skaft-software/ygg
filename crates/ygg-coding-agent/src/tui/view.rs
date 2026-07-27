@@ -41,16 +41,19 @@ use self::bash_render::{render_bash_row, render_compact_bash_output};
 use self::editor_layout::{
     editor_column, editor_layout, editor_offset_at_column, normalize_paste, EditorLayoutCache,
 };
+use self::input_overlays::input_slash_suggestions;
 #[cfg(test)]
 use self::input_overlays::render_slash_suggestions;
-use self::input_overlays::{
-    input_slash_suggestions, render_input_suggestions, render_pending_steering,
-};
 use self::outcome_render::render_outcome;
+use self::panel_render::filtered_indices;
 #[cfg(test)]
 use self::panel_render::render_panel;
-use self::panel_render::{filtered_indices, render_panel_with_limit};
 use self::reasoning_render::{collapsed_reasoning_lines, render_reasoning_on_surface};
+#[cfg(test)]
+use self::shell_chrome::responsive_identity;
+use self::shell_chrome::{
+    append_chrome, append_viewport_chrome, shell_chrome, shell_chrome_rows, ShellChrome,
+};
 use self::status_telemetry::{
     output_tokens_per_second, status_telemetry, styled_status_text,
     usage_cache_hit_rate_basis_points,
@@ -1744,156 +1747,6 @@ fn max_scroll_for_available(transcript_len: usize, available: usize) -> usize {
     }
 }
 
-fn responsive_identity(state: &ShellState, width: u16) -> String {
-    let wordmark = state.theme.bold(
-        &state
-            .theme
-            .fg("model_accent", state.theme.glyph("wordmark")),
-    );
-    if state.model.is_empty() {
-        return fit_line(&wordmark, width);
-    }
-    let provider = sanitize_for_terminal(&state.provider);
-    let model_name = if state.model_display.is_empty() {
-        &state.model
-    } else {
-        &state.model_display
-    };
-    let model = state
-        .theme
-        .fg("model_accent", &sanitize_for_terminal(model_name));
-    let separator = semantic_separator(&state.theme);
-    let reasoning = (!state.reasoning.is_empty() && state.reasoning != "off")
-        .then(|| format!("{separator}{}", sanitize_for_terminal(&state.reasoning)));
-    let provider_model = format!("{provider} / {model}");
-    let right = format!("{provider_model}{}", reasoning.clone().unwrap_or_default());
-    let wide_width = visible_width(&wordmark) + visible_width(&right) + 4;
-    if usize::from(width) >= 72 && wide_width <= usize::from(width) {
-        let gap =
-            usize::from(width).saturating_sub(visible_width(&wordmark) + visible_width(&right));
-        return format!("{wordmark}{}{right}", " ".repeat(gap));
-    }
-
-    let compact = format!(
-        "{wordmark}{separator}{}/{}{}",
-        provider,
-        model,
-        reasoning.unwrap_or_default()
-    );
-    if visible_width(&compact) <= usize::from(width) {
-        return compact;
-    }
-    let model_only = format!("{wordmark}{separator}{model}");
-    if visible_width(&model_only) <= usize::from(width) {
-        return model_only;
-    }
-    fit_line(&wordmark, width)
-}
-
-fn render_shell_header(state: &ShellState, width: u16) -> Vec<String> {
-    let layout = state.theme.layout_for_width(width);
-    let mut lines = Vec::with_capacity(2);
-    if layout.show_header {
-        lines.push(responsive_identity(state, width));
-    }
-    if let Some((text, role)) = state
-        .extension_header
-        .as_ref()
-        .filter(|(text, _)| !text.trim().is_empty())
-    {
-        let role = role.as_deref().unwrap_or("extension.header");
-        let inset = usize::from(layout.transcript_inset).min(usize::from(width));
-        let contribution = state
-            .theme
-            .apply_semantic_role(role, &sanitize_for_terminal(text));
-        lines.push(fit_line(
-            &format!("{}{contribution}", " ".repeat(inset)),
-            width,
-        ));
-    }
-    lines
-}
-
-#[derive(Clone)]
-struct ShellChrome {
-    header: Vec<String>,
-    composer: Vec<String>,
-    panel: Vec<String>,
-    pending: Vec<String>,
-    suggestions: Vec<String>,
-    error: Vec<String>,
-    transcript_rows: usize,
-}
-
-fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> ShellChrome {
-    let rows = usize::from(state.size.1.max(5));
-    let header = render_shell_header(state, width);
-    let mut error = state
-        .error
-        .as_ref()
-        .map(|error| {
-            let marker = state.theme.fg("error", state.theme.glyph("error"));
-            let first_prefix = format!("  {marker} ");
-            let continuation = " ".repeat(visible_width(&first_prefix));
-            let mut rendered = Vec::new();
-            for (index, source) in sanitize_for_terminal(error).split('\n').enumerate() {
-                if source.is_empty() {
-                    rendered.push(String::new());
-                    continue;
-                }
-                let prefix = if index == 0 {
-                    first_prefix.as_str()
-                } else {
-                    continuation.as_str()
-                };
-                rendered.extend(wrap_hanging(
-                    &state.theme.fg("foreground", source),
-                    prefix,
-                    &continuation,
-                    width,
-                ));
-            }
-            rendered
-        })
-        .unwrap_or_default();
-
-    // Render the new integrated composer surface (model status + input)
-    let composer = crate::tui::composer_surface::render_composer_surface(state, width, now);
-    if state.panel.is_some() {
-        // The focused picker must retain at least its filter row and cursor,
-        // even when a tiny terminal also has a wrapped error message.
-        let error_limit = rows.saturating_sub(
-            composer
-                .len()
-                .saturating_add(header.len())
-                .saturating_add(1),
-        );
-        error.truncate(error_limit);
-    }
-    let mut remaining = rows.saturating_sub(header.len() + error.len() + composer.len());
-
-    let panel = render_panel_with_limit(state, width, remaining);
-    remaining = remaining.saturating_sub(panel.len());
-
-    let suggestion_limit = remaining.min(10);
-    let suggestions = render_input_suggestions(state, width, suggestion_limit);
-    remaining = remaining.saturating_sub(suggestions.len());
-
-    let pending_limit = remaining.min(4);
-    let pending = render_pending_steering(state, width, pending_limit);
-    remaining = remaining.saturating_sub(pending.len());
-
-    ShellChrome {
-        header,
-        composer,
-        panel,
-        pending,
-        suggestions,
-        error,
-        transcript_rows: remaining,
-    }
-}
-
 fn max_scroll_from_bottom(state: &ShellState, width: u16) -> usize {
     if state.overlay.is_some() {
         return 0;
@@ -1930,20 +1783,6 @@ fn wrap_overlay_text(text: &str, width: usize) -> Vec<String> {
         }
     }
     wrapped
-}
-
-fn append_viewport_chrome(lines: &mut Vec<String>, chrome: ShellChrome) {
-    // Application-owned mode renders exactly one terminal viewport. The
-    // terminal-owned mode uses `append_chrome` below so committed transcript
-    // rows can enter native scrollback instead of being sliced away here.
-    lines.truncate(chrome.transcript_rows);
-    lines.resize(chrome.transcript_rows, String::new());
-    lines.extend(chrome.header);
-    lines.extend(chrome.error);
-    lines.extend(chrome.pending);
-    lines.extend(chrome.suggestions);
-    lines.extend(chrome.panel);
-    lines.extend(chrome.composer);
 }
 
 fn overlay_lines(state: &ShellState, width: u16) -> Vec<String> {
@@ -2023,37 +1862,6 @@ fn render_shell_viewport_update(
         reanchor_viewport: repaint_theme || resized,
         rebuild_scrollback: false,
     }
-}
-
-fn append_chrome(lines: &mut Vec<String>, chrome: ShellChrome, stable_prefix_rows: usize) {
-    // The default terminal-owned mode follows logical content height. Padding
-    // a short frame to terminal height would pin the composer to the bottom and
-    // create a large dead zone below the transcript. Once the frame naturally
-    // grows past the viewport, sexy-tui moves committed rows into native
-    // scrollback.
-    // `lines` may be only a lazy suffix, so its retained prefix still decides
-    // whether the transcript owns the single breathing row before chrome.
-    let complete_transcript_rows = stable_prefix_rows.saturating_add(lines.len());
-    if complete_transcript_rows > 0 {
-        lines.push(String::new());
-    }
-    lines.extend(chrome.header);
-    lines.extend(chrome.error);
-    lines.extend(chrome.pending);
-    lines.extend(chrome.suggestions);
-    lines.extend(chrome.panel);
-    lines.extend(chrome.composer);
-}
-
-fn shell_chrome_rows(chrome: &ShellChrome) -> usize {
-    chrome
-        .header
-        .len()
-        .saturating_add(chrome.error.len())
-        .saturating_add(chrome.pending.len())
-        .saturating_add(chrome.suggestions.len())
-        .saturating_add(chrome.panel.len())
-        .saturating_add(chrome.composer.len())
 }
 
 fn native_overlay_prefix_len(transcript_len: usize, chrome: &ShellChrome) -> usize {
@@ -4337,6 +4145,7 @@ mod input_overlays;
 mod outcome_render;
 mod panel_render;
 mod reasoning_render;
+mod shell_chrome;
 mod status_telemetry;
 mod surface_frame;
 mod surface_layout;
