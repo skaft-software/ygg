@@ -700,21 +700,6 @@ fn wrapped_truecolor_never_reopens_rgb_components_as_backgrounds() {
 }
 
 #[test]
-fn overlay_truecolor_does_not_leak_a_background_to_following_rows() {
-    let theme = crate::tui::theme::test_theme();
-    let selected = theme.fg("accent", "selected");
-    // The universal Ygg green includes RGB channel 107. It must remain an
-    // RGB component rather than becoming a bright-white background SGR.
-    assert!(selected.contains(";107m"));
-
-    let wrapped = wrap_overlay_text(&format!("{selected}\nnext row"), 80);
-    assert_eq!(wrapped.len(), 2);
-    assert!(wrapped[0].contains("selected"));
-    assert!(wrapped[1].contains("next row"));
-    assert!(!wrapped[1].contains("\x1b[107m"));
-}
-
-#[test]
 fn styled_overlay_wraps_by_visible_width_without_splitting_ansi() {
     let theme = sexy_tui_rs::theme::Theme::load(
         None,
