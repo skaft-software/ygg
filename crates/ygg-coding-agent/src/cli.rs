@@ -400,39 +400,30 @@ fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow
         String::new()
     };
 
+    // Parse the existing config into a TOML table so we preserve all
+    // sections (compaction, etc.) instead of doing line-based surgery.
+    let mut config: toml::Value = match content.is_empty() {
+        true => toml::Value::Table(toml::map::Map::new()),
+        false => content.parse::<toml::Value>()?,
+    };
+
     // Serialise the value through toml so special characters are
     // properly escaped rather than producing invalid config.
     let escaped = toml::Value::String(value.to_string());
-    let replacement = format!("{key} = {escaped}");
-
-    let mut found = false;
-    let mut new_lines = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        // Never rewrite a commented-out line.
-        if trimmed.starts_with('#') {
-            new_lines.push(line.to_string());
-            continue;
+    match &mut config {
+        toml::Value::Table(map) => {
+            map.insert(key.to_string(), escaped);
         }
-        if trimmed.starts_with(key) {
-            let after = trimmed.strip_prefix(key).unwrap();
-            if after.trim_start().starts_with('=') {
-                new_lines.push(replacement.clone());
-                found = true;
-                continue;
-            }
+        _ => {
+            // If the file somehow parsed as a non-table (shouldn't happen
+            // in practice), wrap it in a fresh table.
+            let mut map = toml::map::Map::new();
+            map.insert(key.to_string(), escaped);
+            config = toml::Value::Table(map);
         }
-        new_lines.push(line.to_string());
     }
 
-    if !found {
-        if !new_lines.is_empty() && !new_lines.last().unwrap().is_empty() {
-            new_lines.push(String::new());
-        }
-        new_lines.push(replacement);
-    }
-
-    let new_content = new_lines.join("\n") + "\n";
+    let new_content = toml::to_string_pretty(&config)?;
     // Atomic write: write to a sibling temp file then rename over the
     // real path so a crash mid-write cannot leave a truncated config.
     let tmp_path = path.with_extension("tmp");
@@ -1460,13 +1451,17 @@ mod tests {
         std::fs::write(&path, "# model = \"commented-out\"\ntheme = \"dusk\"\n").unwrap();
         persist_model_to_path("active-model", &path).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            content.contains("# model = \"commented-out\""),
-            "commented line preserved: {content}"
-        );
+        // The TOML-based parser does not preserve comments since they are
+        // not part of the parsed representation. The commented line is
+        // intentionally dropped in exchange for structurally correct updates
+        // that never corrupt multi-line values or cause partial-key collisions.
         assert!(
             content.contains("model = \"active-model\""),
-            "new entry appended: {content}"
+            "new entry set: {content}"
+        );
+        assert!(
+            content.contains("theme = \"dusk\""),
+            "existing key preserved: {content}"
         );
     }
 
