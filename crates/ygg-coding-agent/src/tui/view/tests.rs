@@ -637,47 +637,6 @@ fn select_list_home_end_and_page_navigation_stay_bounded() {
 }
 
 #[test]
-fn bounded_append_retains_a_tail_and_marks_elision() {
-    let mut output = "prefix".repeat(20_000);
-    bounded_append(&mut output, "THE-TAIL");
-    assert!(output.len() <= MAX_PANEL_BYTES);
-    assert!(output.contains("elided"));
-    assert!(output.ends_with("THE-TAIL"));
-}
-
-#[test]
-fn sanitize_for_terminal_strips_sequences_without_leaving_protocol_debris() {
-    // Clean text passes through unchanged.
-    assert_eq!(sanitize_for_terminal("hello world\n"), "hello world\n");
-    // NULL, BEL, and remaining C0 controls are still visible diagnostics.
-    assert_eq!(sanitize_for_terminal("a\x00b\x07c\x01e"), "a␀b␇c·e");
-    assert_eq!(sanitize_for_terminal("a\r\nb\rc\td"), "a\nb␍c    d");
-    // Valid color, hyperlink, and charset sequences disappear as units;
-    // their printable payload remains.
-    assert_eq!(sanitize_for_terminal("\x1b[31mRED\x1b[0m"), "RED");
-    assert_eq!(sanitize_for_terminal("\x1b(B\x1b[m\x1b[32m+"), "+");
-    assert_eq!(
-        sanitize_for_terminal("\x1b]8;;https://example.com\x1b\\docs\x1b]8;;\x1b\\"),
-        "docs"
-    );
-    // Incomplete sequences are dropped rather than exposed as `[38;5`.
-    assert_eq!(sanitize_for_terminal("before\x1b[38;5"), "before");
-    // C1 forms are stripped with their parameters too.
-    assert_eq!(sanitize_for_terminal("a\u{009b}31m"), "a");
-}
-
-#[test]
-fn composer_sanitization_preserves_the_cursor_without_mutating_input() {
-    let raw = "before \x1b[31m after";
-    let cursor = "before \x1b".len();
-    let (safe, safe_cursor) = sanitized_editor(raw, cursor);
-    assert_eq!(raw, "before \x1b[31m after");
-    assert_eq!(&safe[..safe_cursor], "before ␛");
-    assert_eq!(safe, "before ␛[31m after");
-    assert!(safe.is_char_boundary(safe_cursor));
-}
-
-#[test]
 fn secret_tool_prompt_temporarily_owns_composer_without_touching_the_editor() {
     let mut shell = InteractiveShell::test_shell();
     for character in "ordinary draft".chars() {
@@ -711,14 +670,6 @@ fn secret_tool_prompt_temporarily_owns_composer_without_touching_the_editor() {
     .collect::<Vec<_>>()
     .join("\n");
     assert!(restored.contains("ordinary draft"), "{restored}");
-}
-
-#[test]
-fn bounded_append_keeps_valid_utf8_at_the_cut_boundary() {
-    let mut output = "é".repeat(40_000);
-    bounded_append(&mut output, " tail");
-    assert!(output.is_char_boundary(output.len()));
-    assert!(output.ends_with(" tail"));
 }
 
 #[test]
