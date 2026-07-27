@@ -25,8 +25,8 @@ use crate::config::Config;
 use crate::hydrate::{hydrate_transcript_tail, TranscriptItem};
 use crate::presentation::{
     format_duration, summarize_tool, summarize_tool_with_workspace, tool_failure_reason,
-    tool_result_is_failure, ModelDisplayMetadata, PriceDisplay, RunId, RunOutcome, RunPhase,
-    RunTracker, ToolDisplay,
+    tool_result_is_failure, ModelDisplayMetadata, PriceDisplay, RunId, RunOutcome, RunTracker,
+    ToolDisplay,
 };
 use crate::tui::composer::{self, ComposedInput};
 use crate::tui::keymap::{EditAction, SlashMenuAction};
@@ -1345,10 +1345,6 @@ impl Component for ShellComponent {
     fn invalidate(&mut self) {
         *self.frame.get_mut() = ShellFrameState::default();
     }
-}
-
-fn branch_active(theme: &YggTheme) -> &str {
-    theme.glyph("branch")
 }
 
 fn prompt_marker(theme: &YggTheme) -> &str {
@@ -3054,57 +3050,6 @@ fn render_shell_header(state: &ShellState, width: u16) -> Vec<String> {
         ));
     }
     lines
-}
-
-#[allow(dead_code)]
-fn compact_active_summary(summary: &str) -> String {
-    summary
-        .split_whitespace()
-        .map(|part| {
-            if part.contains('/') || part.contains('\\') {
-                crate::presentation::compact_path(part)
-            } else {
-                part.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-#[allow(dead_code)]
-fn active_run_line(state: &ShellState, width: u16, now: Instant) -> Option<String> {
-    let run = state.run.current()?;
-    let label = match run.phase() {
-        RunPhase::Preparing { summary } => summary.clone(),
-        RunPhase::AwaitingProvider { provider } => format!("waiting for {provider}"),
-        RunPhase::Thinking => "thinking".into(),
-        RunPhase::StreamingResponse => "writing response".into(),
-        RunPhase::PreparingToolCall => "preparing tool call".into(),
-        RunPhase::RunningTool { summary } => {
-            if width < 60 {
-                compact_active_summary(summary)
-            } else {
-                summary.clone()
-            }
-        }
-        RunPhase::AwaitingApproval { prompt } => {
-            format!(
-                "approval required{}{prompt}",
-                semantic_separator(&state.theme)
-            )
-        }
-        RunPhase::Finished(_) => return None,
-    };
-    let marker = state.theme.fg("model_accent", branch_active(&state.theme));
-    let label = sanitize_for_terminal(&label);
-    let elapsed = format_duration(run.phase_elapsed_at(now));
-    Some(fit_line(
-        &format!(
-            "{marker} {label}{}{elapsed}",
-            semantic_separator(&state.theme)
-        ),
-        width,
-    ))
 }
 
 /// Calculate a nonzero output-generation rate from a token count and measured
