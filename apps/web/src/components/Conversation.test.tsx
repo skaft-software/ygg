@@ -68,6 +68,40 @@ describe("conversation composer", () => {
     window.localStorage.clear();
   });
 
+  it("executes /goal commands without sending them as prompts", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const onGoalCommand = vi.fn().mockResolvedValue("Goal set: ship the release");
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onGoalCommand={onGoalCommand}
+        onSubmit={onSubmit}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+      />,
+    );
+
+    const composer = screen.getByRole("textbox", { name: "Message ygg" });
+    await user.type(composer, "/goal ship the release");
+    await user.keyboard("{Enter}");
+
+    await waitFor(() =>
+      expect(onGoalCommand).toHaveBeenCalledWith({
+        type: "set",
+        objective: "ship the release",
+      }),
+    );
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(composer).toHaveValue("");
+    expect(screen.getByText("Goal set: ship the release")).toBeVisible();
+  });
+
   it("wires host document and trusted-file context into the composer", async () => {
     const user = userEvent.setup();
     const onListProjectFiles = vi.fn().mockResolvedValue({
