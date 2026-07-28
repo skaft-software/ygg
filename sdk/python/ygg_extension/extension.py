@@ -523,6 +523,8 @@ class Extension:
             raise RpcError(-32602, "command arguments must be an array")
         try:
             value = self._invoke(command.handler, arguments, self._context_from(request))
+        except RpcError:
+            raise
         except Exception as error:
             self.logger.error("command handler failed", command=name, error=str(error))
             raise RpcError(-32603, "internal error") from error

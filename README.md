@@ -545,7 +545,7 @@ Skills are explicit, inspectable capability packages. ygg discovers metadata, ac
 
 ### Executable extensions
 
-Extensions are JSON-RPC processes over bounded line-delimited frames. Discovery does not execute code. An extension must be enabled and its exact source must independently be trusted; a project configuration cannot grant trust to itself. Replacement processes must handshake successfully before reload swaps them into service.
+Extensions are JSON-RPC processes over bounded line-delimited frames. Discovery does not execute code. An extension must be enabled and its exact source must independently be trusted; a project configuration cannot grant trust to itself. Replacement processes must handshake successfully before reload swaps them into service. Python extensions can use the dependency-free [`ygg-extension-sdk`](sdk/python/README.md) instead of reimplementing the protocol loop.
 
 Start with [examples/README.md](examples/README.md), then read [docs/resources.md](docs/resources.md) and [docs/extensions.md](docs/extensions.md).
 
@@ -626,6 +626,7 @@ crates/ygg-ai/            provider-independent inference and protocols
 crates/ygg-agent/         agent runtime, tools, sessions, and extensions
 crates/ygg-coding-agent/  CLI, provider discovery, resources, and TUI
 crates/sexy-tui-rs/       vendored terminal rendering library
+sdk/python/              dependency-free Python extension SDK
 docs/                     public product and architecture contracts
 examples/                 prompts, skills, themes, and extensions
 fuzz/                     session-record fuzz target
@@ -643,6 +644,7 @@ third_party/              upstream license texts
 | [Release notes](docs/releases/v0.3.1-alpha.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
+| [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |
 | [Themes](docs/themes.md) | Theme schema, roles, glyphs, responsive layout, and fallback behavior. |
 | [Sessions](docs/sessions.md) | Commands, JSONL schema, branching, export, redaction, and repair. |
 | [AI architecture](docs/design/ygg-ai.md) | Canonical inference model, validation, transport, and streaming. |
