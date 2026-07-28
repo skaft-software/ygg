@@ -162,6 +162,9 @@ struct ToolPanel {
     cached_diff: RefCell<Option<Option<String>>>,
     /// Lazily cached metadata string for completed bash results.
     cached_metadata: RefCell<Option<Option<String>>>,
+    /// Whether Ctrl+O can change this finalized tool's physical rows. The
+    /// result is computed only after output becomes immutable.
+    cached_disclosure_sensitive: RefCell<Option<bool>>,
 }
 
 impl ToolPanel {
@@ -192,6 +195,7 @@ impl ToolPanel {
             model_lab,
             cached_diff: RefCell::new(None),
             cached_metadata: RefCell::new(None),
+            cached_disclosure_sensitive: RefCell::new(None),
         }
     }
 }

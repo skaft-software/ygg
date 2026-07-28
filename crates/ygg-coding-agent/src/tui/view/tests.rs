@@ -2666,6 +2666,138 @@ fn resize_while_overlayed_replays_owned_transcript_before_repainting_overlay() {
 }
 
 #[test]
+fn native_scrollback_keeps_finalized_tool_stable_while_streaming_scrolled_away() {
+    use ygg_agent::ToolOutput;
+
+    const WIDTH: u16 = 72;
+    const HEIGHT: u16 = 12;
+
+    for synchronized_output in [false, true] {
+        let (mut shell, bytes) = emulated_shell_with_sync(
+            crate::tui::theme::test_theme(),
+            WIDTH,
+            HEIGHT,
+            synchronized_output,
+        );
+        let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+            std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+        };
+        let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+        terminal.process(&drain(&bytes));
+
+        for index in 0..18 {
+            shell.notice(format!("TOOL-SCROLLBACK-HISTORY-{index:02}"));
+        }
+        let run_id = shell.begin_run("openai");
+        let tool_id = ToolCallId("tool-scrollback-regression".into());
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolStarted {
+                id: tool_id.clone(),
+                name: "bash".into(),
+                args: serde_json::json!({"command": "TOOL-CARD-SENTINEL"}),
+            },
+        );
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolFinished {
+                id: tool_id,
+                result: Ok(ToolOutput::new("tool completed")),
+            },
+        );
+        shell.render();
+        terminal.process(&drain(&bytes));
+
+        for index in 0..6 {
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::OutputDelta {
+                    channel: OutputChannel::Text,
+                    text: format!(
+                        "STREAM-BEFORE-{index:02} has enough words to occupy a physical row.\n\n"
+                    ),
+                },
+            );
+            shell.render();
+            terminal.process(&drain(&bytes));
+        }
+
+        let offset = (1..=usize::from(HEIGHT))
+            .find(|offset| {
+                terminal.set_scrollback(*offset);
+                terminal
+                    .screen()
+                    .contents()
+                    .lines()
+                    .take(terminal.screen().scrollback())
+                    .any(|line| line.contains("TOOL-CARD-SENTINEL"))
+            })
+            .expect("finalized tool should be retained in native scrollback");
+        terminal.set_scrollback(offset);
+        let historical_row_count = terminal.screen().scrollback();
+        let historical_view = terminal
+            .screen()
+            .contents()
+            .lines()
+            .take(historical_row_count)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        for index in 0..12 {
+            if index == 2 {
+                // vt100 0.15 cannot materialize a viewport whose preserved
+                // scrollback offset exceeds the screen height. Two streamed
+                // frames are enough to exercise read-while-streaming; process
+                // the remaining chronology from the live tail.
+                terminal.set_scrollback(0);
+            }
+            shell.on_run_event(
+                run_id,
+                &AgentEvent::OutputDelta {
+                    channel: OutputChannel::Text,
+                    text: format!(
+                        "STREAM-AFTER-{index:02} has enough words to occupy a physical row.\n\n"
+                    ),
+                },
+            );
+            shell.render();
+            terminal.process(&drain(&bytes));
+            if index < 2 {
+                let viewed_history = terminal
+                    .screen()
+                    .contents()
+                    .lines()
+                    .take(historical_row_count)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    viewed_history,
+                    historical_view,
+                    "historical tool surface changed during token {index} with synchronized_output={synchronized_output}"
+                );
+            }
+        }
+
+        terminal.set_size(256, WIDTH);
+        terminal.set_scrollback(usize::MAX);
+        let physical = terminal.screen().contents();
+        assert_eq!(
+            physical.matches("TOOL-CARD-SENTINEL").count(),
+            1,
+            "finalized tool was lost or duplicated:\n{physical}"
+        );
+        for index in 0..12 {
+            let sentinel = format!("STREAM-AFTER-{index:02}");
+            assert_eq!(
+                physical.matches(&sentinel).count(),
+                1,
+                "{sentinel} was lost or duplicated:\n{physical}"
+            );
+        }
+    }
+}
+
+#[test]
 fn streamed_table_and_wrapped_lists_survive_shrink_scroll_and_resize() {
     const WIDTH: u16 = 96;
     const HEIGHT: u16 = 22;

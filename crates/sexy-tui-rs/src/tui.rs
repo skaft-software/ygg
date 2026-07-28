@@ -50,8 +50,13 @@ pub struct PinnedFrame {
     /// Current-layout position of the cursor supplied to
     /// [`Component::render_update_with_cursor`].
     pub acknowledged: Option<CommitPosition>,
-    /// Furthest finalized boundary that may enter scrollback this frame.
+    /// Furthest finalized semantic boundary that may enter scrollback this
+    /// frame.
     pub target: Option<CommitPosition>,
+    /// Exclusive current-layout row boundary proven immutable. Physical rows
+    /// may enter terminal history up to this seam before a coarser semantic
+    /// `target` can be acknowledged.
+    pub stable_rows: usize,
 }
 
 /// A lazy replacement for the mutable tail of a retained frame. Lines before
@@ -463,9 +468,10 @@ pub struct TUI<'a> {
     /// addressing from this anchor rather than assuming a bottom-aligned tail.
     inline_bottom_row: usize,
     /// Current-layout prefix already represented in terminal-owned history.
-    /// Normally this equals the semantic commit row. A destructive replay can
-    /// also place provisional rows there, so it is tracked independently to
-    /// prevent a later semantic acknowledgement from appending them twice.
+    /// Immutable physical rows can advance beyond the coarser semantic commit
+    /// cursor. A destructive replay can also place provisional rows here, so
+    /// the seam is tracked independently to prevent later acknowledgement from
+    /// appending them twice.
     inline_history_rows: usize,
     /// Current-layout row corresponding to `inline_commit_cursor`. This is
     /// remapped from semantic identity on every update and is never reused
@@ -1261,7 +1267,8 @@ impl<'a> TUI<'a> {
     /// Append-only native-scrollback renderer for a frame with semantic commit
     /// points. The acknowledged cursor is remapped into the current width, so
     /// no physical row coordinate survives terminal reflow. The mutable grid
-    /// always starts at or after the committed seam.
+    /// always starts at or after the independently tracked physical-history
+    /// seam.
     fn write_inline_pinned(
         &mut self,
         new_lines: &[String],
@@ -1281,6 +1288,7 @@ impl<'a> TUI<'a> {
             // cursor, but the old history itself remains untouched.
             self.inline_commit_cursor = None;
             self.inline_history_rows = 0;
+            self.inline_committed_rows = 0;
             reanchor = true;
         }
 
@@ -1295,46 +1303,57 @@ impl<'a> TUI<'a> {
             "component did not map the retained semantic commit cursor"
         );
 
-        // Missing acknowledgement is an invalid component response. Freeze the
-        // tape and keep a usable visible tail rather than replaying any prefix.
+        // The semantic cursor can lag a large finalized block while immutable
+        // physical rows from that block move into history one at a time.
+        let prior_history_rows = self
+            .inline_history_rows
+            .max(acknowledged.map_or(0, |position| position.row.min(new_lines.len())));
+
         let mut commit_row = acknowledged
             .map(|position| position.row.min(new_lines.len()))
             .unwrap_or_else(|| {
-                if self.inline_commit_cursor.is_some() {
+                if cursor_unmapped {
                     reanchor = true;
-                    desired_window_top
+                    self.inline_committed_rows.min(new_lines.len())
                 } else {
                     0
                 }
             });
         let mut commit_cursor = self.inline_commit_cursor;
-        let mut commit_advanced = false;
-        if acknowledged.is_some() || commit_cursor.is_none() {
-            if let Some(target) = pinned.target.filter(|target| {
-                target.cursor.generation == pinned.generation
-                    && target.row >= commit_row
-                    && target.row <= desired_window_top
-                    && commit_cursor.is_none_or(|cursor| target.cursor > cursor)
-            }) {
-                commit_row = target.row;
-                commit_cursor = Some(target.cursor);
-                // A destructive replay can already have placed this boundary
-                // in terminal history. Advance semantic identity without
-                // repainting the unchanged live window in that case.
-                commit_advanced = target.row > self.inline_history_rows;
-            }
+        let target = if cursor_unmapped { None } else { pinned.target }.filter(|target| {
+            target.cursor.generation == pinned.generation
+                && target.row >= commit_row
+                && target.row <= desired_window_top
+                && commit_cursor.is_none_or(|cursor| target.cursor > cursor)
+        });
+
+        // Stable rows may cross the seam incrementally. A semantic target is
+        // also safe to stage once its complete boundary is above the live
+        // viewport, even when rows inside that block are disclosure-sensitive.
+        let append_limit = target.map_or(pinned.stable_rows, |target| {
+            pinned.stable_rows.max(target.row)
+        });
+        let stable_rows = if cursor_unmapped {
+            prior_history_rows
+        } else {
+            append_limit
+                .max(acknowledged.map_or(0, |position| position.row))
+                .min(desired_window_top)
+                .max(prior_history_rows)
+        };
+        let append_start = prior_history_rows.min(new_lines.len());
+        let append_end = stable_rows.min(new_lines.len());
+        let appended = &new_lines[append_start..append_end];
+        let history_rows = prior_history_rows.max(append_end);
+
+        // Advance semantic identity only after its complete boundary is known
+        // to be in physical history. A resize replay may already have put that
+        // boundary there without an append in this frame.
+        if let Some(target) = target.filter(|target| target.row <= history_rows) {
+            commit_row = target.row;
+            commit_cursor = Some(target.cursor);
         }
 
-        let commit_start = acknowledged
-            .map_or_else(
-                || if cursor_unmapped { commit_row } else { 0 },
-                |position| position.row,
-            )
-            .max(self.inline_history_rows)
-            .min(commit_row);
-        let committed =
-            &new_lines[commit_start.min(new_lines.len())..commit_row.min(new_lines.len())];
-        let history_rows = self.inline_history_rows.max(commit_row);
         // A shrinking frame can move its bottom-aligned viewport above the
         // immutable seam. Keep that physical alignment, but represent rows
         // before the seam as empty cells instead of repainting terminal-owned
@@ -1349,6 +1368,17 @@ impl<'a> TUI<'a> {
                 .unwrap_or("")
         };
 
+        // When the old grid begins exactly at the physical history seam, its
+        // stable top rows can enter scrollback with bottom-row newlines. This
+        // is the terminal's native append operation: it preserves a reader's
+        // scrollback anchor and avoids repainting the whole live grid.
+        let can_scroll_naturally = !appended.is_empty()
+            && !self.first_render
+            && !reanchor
+            && self.inline_window_top == prior_history_rows
+            && appended.len() <= rows
+            && previous_window.get(..appended.len()) == Some(appended);
+
         self.begin_synchronized_output();
         if self.first_render {
             // Preserve whatever preceded the application, then establish a
@@ -1356,22 +1386,22 @@ impl<'a> TUI<'a> {
             self.terminal.write(&"\n".repeat(rows));
         }
 
-        if self.first_render || reanchor || commit_advanced {
+        if self.first_render || reanchor || (!appended.is_empty() && !can_scroll_naturally) {
             self.terminal.write("\x1b[H");
             if self.first_render {
                 self.terminal.clear_screen();
                 self.terminal.write("\x1b[H");
             }
 
-            // Paint the new semantic chunk followed by exactly one complete
-            // grid. The trailing live window and blank padding push every new
-            // committed row into history while no mutable row is appended.
-            let paint_len = committed.len().saturating_add(rows);
+            // A reanchor or a previously compressed mutable window may not
+            // contain the rows now becoming stable. Stage that semantic chunk
+            // above one complete grid so only the staged rows scroll out.
+            let paint_len = appended.len().saturating_add(rows);
             for index in 0..paint_len {
-                let line = if index < committed.len() {
-                    committed[index].as_str()
+                let line = if index < appended.len() {
+                    appended[index].as_str()
                 } else {
-                    window_line(index - committed.len())
+                    window_line(index - appended.len())
                 };
                 self.terminal.clear_line();
                 self.terminal.write(line);
@@ -1380,12 +1410,23 @@ impl<'a> TUI<'a> {
                 }
             }
         } else {
-            // Ordinary token ticks never scroll. Compare the old and new
-            // logical rows occupying each physical screen row. The caller
-            // snapshots this small old window before lazy frame reuse.
+            let shifted_rows = if can_scroll_naturally {
+                // Address the live grid's bottom row before emitting newlines;
+                // cursor placement from the prior differential frame is not a
+                // reliable scroll origin.
+                self.terminal
+                    .write(&format!("\x1b[{rows};1H{}", "\r\n".repeat(appended.len())));
+                appended.len()
+            } else {
+                0
+            };
+
+            // Compare against the grid after any natural scroll. Pure appends
+            // now repaint only newly exposed bottom rows instead of replaying
+            // every physical row at a shifted logical index.
             for screen_row in 0..rows {
                 let previous = previous_window
-                    .get(screen_row)
+                    .get(screen_row.saturating_add(shifted_rows))
                     .map(String::as_str)
                     .unwrap_or("");
                 let next = window_line(screen_row);
@@ -1895,7 +1936,11 @@ mod tests {
         }
     }
 
-    fn test_pinned_frame(acknowledged: Option<CommitCursor>, target: Option<usize>) -> PinnedFrame {
+    fn test_pinned_frame_with_stable(
+        acknowledged: Option<CommitCursor>,
+        target: Option<usize>,
+        stable_rows: usize,
+    ) -> PinnedFrame {
         PinnedFrame {
             generation: 0,
             acknowledged: acknowledged.map(|cursor| CommitPosition {
@@ -1903,7 +1948,12 @@ mod tests {
                 cursor,
             }),
             target: target.map(test_commit_position),
+            stable_rows,
         }
+    }
+
+    fn test_pinned_frame(acknowledged: Option<CommitCursor>, target: Option<usize>) -> PinnedFrame {
+        test_pinned_frame_with_stable(acknowledged, target, target.unwrap_or(0))
     }
 
     struct OneLine;
@@ -2107,6 +2157,171 @@ mod tests {
     }
 
     #[test]
+    fn pinned_stable_rows_scroll_naturally_in_one_multi_row_append() {
+        let size = Rc::new(Cell::new((40, 4)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            false,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.first_render = false;
+        tui.previous_frame = [
+            "history 0",
+            "history 1",
+            "stable 2",
+            "stable 3",
+            "tail 4",
+            "tail 5",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        tui.inline_history_rows = 2;
+        tui.inline_window_top = 2;
+        tui.inline_bottom_row = 3;
+
+        let grown = tui
+            .previous_frame
+            .iter()
+            .cloned()
+            .chain(["tail 6".to_owned(), "tail 7".to_owned()])
+            .collect::<Vec<_>>();
+        let previous_window = tui.previous_frame[2..].to_vec();
+        tui.write_inline_pinned(
+            &grown,
+            4,
+            test_pinned_frame_with_stable(None, None, 4),
+            false,
+            &previous_window,
+        );
+
+        let output = writes.borrow().join("");
+        assert!(output.contains("\x1b[4;1H\r\n\r\n"), "{output:?}");
+        assert!(!output.contains("\x1b[H"), "{output:?}");
+        assert!(!output.contains("stable 2"), "{output:?}");
+        assert!(!output.contains("stable 3"), "{output:?}");
+        assert_eq!(output.matches("tail 6").count(), 1, "{output:?}");
+        assert_eq!(output.matches("tail 7").count(), 1, "{output:?}");
+        assert_eq!(tui.inline_history_rows, 4);
+        assert_eq!(tui.inline_window_top, 4);
+    }
+
+    #[test]
+    fn pinned_physical_stability_can_run_ahead_of_semantic_acknowledgement() {
+        let size = Rc::new(Cell::new((40, 4)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            false,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.first_render = false;
+        tui.previous_frame = ["row 0", "row 1", "row 2", "row 3"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        tui.inline_window_top = 0;
+        tui.inline_bottom_row = 3;
+
+        let grown = tui
+            .previous_frame
+            .iter()
+            .cloned()
+            .chain(
+                ["tail 4", "tail 5", "tail 6"]
+                    .into_iter()
+                    .map(str::to_owned),
+            )
+            .collect::<Vec<_>>();
+        let previous_window = tui.previous_frame.clone();
+        tui.write_inline_pinned(
+            &grown,
+            4,
+            test_pinned_frame_with_stable(None, Some(2), 3),
+            false,
+            &previous_window,
+        );
+
+        let cursor = test_commit_position(2).cursor;
+        assert_eq!(tui.inline_history_rows, 3);
+        assert_eq!(tui.inline_committed_rows, 2);
+        assert_eq!(tui.inline_commit_cursor, Some(cursor));
+
+        // The next acknowledgement maps only row two. The separately retained
+        // physical seam must prevent row two from being appended a second time.
+        writes.borrow_mut().clear();
+        tui.previous_frame = grown.clone();
+        let previous_window = grown[3..].to_vec();
+        let mut next = grown;
+        next.push("tail 7".to_owned());
+        tui.write_inline_pinned(
+            &next,
+            4,
+            test_pinned_frame_with_stable(Some(cursor), None, 4),
+            false,
+            &previous_window,
+        );
+
+        let output = writes.borrow().join("");
+        assert!(output.contains("\x1b[4;1H\r\n"), "{output:?}");
+        assert!(!output.contains("row 2"), "{output:?}");
+        assert!(!output.contains("row 3"), "{output:?}");
+        assert_eq!(tui.inline_history_rows, 4);
+        assert_eq!(tui.inline_committed_rows, 2);
+        assert_eq!(tui.inline_commit_cursor, Some(cursor));
+    }
+
+    #[test]
+    fn pinned_reanchor_stages_an_atomic_target_and_one_complete_grid() {
+        let size = Rc::new(Cell::new((40, 3)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            false,
+        );
+        let (terminal, clears, _, _, _, writes) = recording_terminal(size, capabilities);
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.first_render = false;
+        tui.inline_history_rows = 1;
+        tui.inline_committed_rows = 1;
+        tui.inline_commit_cursor = Some(test_commit_position(1).cursor);
+        tui.inline_generation = Some(0);
+        tui.inline_window_top = 4;
+        tui.inline_bottom_row = 2;
+
+        let replacement = (0..8).map(|row| format!("row {row}")).collect::<Vec<_>>();
+        tui.write_inline_pinned(
+            &replacement,
+            3,
+            test_pinned_frame_with_stable(tui.inline_commit_cursor, Some(3), 1),
+            true,
+            &[],
+        );
+
+        let output = writes.borrow().join("");
+        assert_eq!(clears.get(), 0, "reanchor must preserve saved lines");
+        assert!(output.starts_with("\x1b[H"), "{output:?}");
+        for row in [1, 2, 5, 6, 7] {
+            assert_eq!(
+                output.matches(&format!("row {row}")).count(),
+                1,
+                "row {row} was not staged exactly once: {output:?}"
+            );
+        }
+        for row in [0, 3, 4] {
+            assert!(!output.contains(&format!("row {row}")), "{output:?}");
+        }
+        assert_eq!(output.matches("\r\n").count(), 4, "{output:?}");
+        assert_eq!(tui.inline_history_rows, 3);
+        assert_eq!(tui.inline_committed_rows, 3);
+        assert_eq!(
+            tui.inline_commit_cursor,
+            Some(test_commit_position(3).cursor)
+        );
+        assert_eq!(tui.inline_window_top, 5);
+    }
+
+    #[test]
     fn pinned_window_shrink_never_repaints_before_committed_seam() {
         let size = Rc::new(Cell::new((40, 4)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
@@ -2202,6 +2417,7 @@ mod tests {
                 generation: 8,
                 acknowledged: None,
                 target: None,
+                stable_rows: 0,
             },
             false,
             &previous_window,

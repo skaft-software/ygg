@@ -172,6 +172,10 @@ fn compact_bash_output(panel: &ToolPanel, expanded: bool) -> CompactBashOutput {
     }
 }
 
+pub(super) fn bash_output_changes_when_expanded(panel: &ToolPanel) -> bool {
+    compact_bash_output(panel, false) != compact_bash_output(panel, true)
+}
+
 fn compute_tool_metadata(panel: &ToolPanel) -> Option<String> {
     if !matches!(panel.name.as_str(), "bash" | "exec") {
         return None;
