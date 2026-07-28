@@ -77,12 +77,14 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let _host_lock = ServeHostLock::acquire(&config)?;
     let host = Arc::new(YggHost::new(config)?);
+    let goal_store_root = host.serve_state_dir.join("goals");
     let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
     let server = LoopbackServer::start(
         supervisor,
         LoopbackConfig {
             port,
             web_root: web_root.clone(),
+            goal_store_root,
         },
     )
     .await?;
