@@ -3,11 +3,8 @@ import { extname, join, relative } from "node:path";
 
 const root = new URL("../src/", import.meta.url);
 const expectedTokens = new Map([
-  ["--font-body", "13px"],
+  ["--font-body", "14px"],
   ["--font-meta", "12px"],
-  ["--font-chat", "14px"],
-  ["--font-prompt", "16px"],
-  ["--font-display", "16px"],
 ]);
 const allowedUses = new Set(
   [...expectedTokens.keys()].map((token) => `var(${token})`),
@@ -103,11 +100,11 @@ for (const [name, expected] of expectedTokens) {
 
 if (failures.length) {
   console.error(
-    "Typography policy failed: only the measured Cowork typography tokens are allowed.",
+    "Typography policy failed: only the workbench interface and metadata size tokens are allowed.",
   );
   console.error(failures.join("\n"));
   process.exit(1);
 }
 console.log(
-  "Typography policy passed: measured Cowork UI, metadata, chat, prompt, and title tokens.",
+  "Typography policy passed: interface and metadata sizes only.",
 );

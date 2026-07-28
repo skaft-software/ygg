@@ -6,8 +6,8 @@ graphical `ygg serve` effort.
 ## Bottom line
 
 `ygg serve` is a substantial, testable experimental vertical slice backed by
-real Ygg sessions. It is not yet a finished Claude/ChatGPT-parity product, and
-the LAN/native-client layer is still specification-only.
+real Ygg sessions. It is not yet a finished coding workbench, and the
+LAN/native-client layer is still specification-only.
 
 The immediate release blockers are:
 
@@ -16,7 +16,7 @@ The immediate release blockers are:
 - some acceptance documentation is ahead of the real adapter producers;
 - the current production host has not completed final acceptance against a
   user's actual configured model provider; and
-- several Cowork-level product surfaces remain deliberately out of scope or
+- several workbench-level product surfaces remain deliberately out of scope or
   incomplete.
 
 ## Current status at a glance
@@ -35,7 +35,7 @@ The immediate release blockers are:
 | Child-agent visualization | Not implemented; the runtime does not expose it |
 | LAN-connected devices | Designed, not implemented |
 | macOS, iOS, and Android applications | Designed; no app projects or signed builds |
-| ChatGPT/Claude visual parity | Improved substantially; still visibly short of parity |
+| Clean-room coding-workbench layout | Implemented across desktop, tablet, and phone |
 | Ready to merge | No |
 | Ready for experimental user testing | Yes |
 
@@ -45,8 +45,8 @@ The settled product is not "Ygg Workbench" as a separate mode. It is simply
 graphical `ygg`:
 
 - `ygg serve` runs Ygg headlessly.
-- There is one normal interaction mode, broadly equivalent to a cowork/work
-  interface.
+- There is one normal interaction mode: a repository-oriented coding
+  workbench.
 - Opening the root creates a fresh provisional session.
 - An explicit session route restores an existing session.
 - Previous, pinned, and running sessions appear in the sidebar.
@@ -80,66 +80,73 @@ That exploration is preserved at:
 Useful server and protocol ideas survived, but the frontend layout, user flow,
 and visual language were restarted.
 
-The replacement direction used the installed ChatGPT and Claude desktop
-applications as behavioral and visual references:
+The replacement initially borrowed generic chat-product composition from
+ChatGPT and Claude. That direction was useful for interaction behavior, but its
+centered narrow composer, model-colored chrome, animated splash, soft cards,
+and mixed visual skins did not read as a coding workbench.
 
-- ChatGPT was inspected as an Electron application containing its `app.asar`,
-  the `codex` CLI, and `codex-code-mode-host`.
-- Claude was inspected as an Electron application containing its `app.asar`
-  and bundled frontend resources.
-
-No proprietary vendor bundle or asset was copied into Ygg. The implementation
-is clean-room React and Rust code. The intent is nevertheless deliberately
-familiar: ChatGPT/Claude composition, proportions, pacing, and interaction
-grammar, subtly restyled as `ygg`.
+The current direction is a clean-room coding workbench using familiar native
+macOS and editor conventions: project and session hierarchy at left, a broad
+transcript in the center, evidence at right, and an integrated pane-width
+composer. No proprietary vendor code, bundle, or asset was copied into Ygg; the
+interface remains original React and CSS built on Ygg's existing protocol and
+renderers.
 
 ## Settled visual and interaction language
 
 The UI iterations converged on these rules:
 
-- Always spell the product `ygg`.
-- Do not box the logo or put a tiny logo inside another rounded square.
-- Do not place the logo next to `ygg` in the sidebar header.
-- The model-colored braille tree belongs in the fresh-session splash only.
-- The splash derives from the TUI animation, is taller and less compressed,
-  and respects reduced-motion settings.
-- Do not display fake account, machine, or "connected" footers.
-- Connected Devices appears only when the host advertises that capability.
-- Use ChatGPT/Claude sidebar pacing: compact rows, quiet headings, small status
-  indicators, and restrained selection surfaces.
-- Working sessions use a small model-colored loader.
-- Attention or unread state uses a small blue dot.
-- Avoid count badges and decorative status pills.
-- Use shaded surfaces and spacing instead of thin divider outlines.
-- Keep shadows restrained and native-feeling.
-- Follow the operating system's light or dark appearance.
-- Use Geist Sans and Geist Mono by default. IBM Plex, JetBrains Nerd, Iosevka,
-  Fira Code, and native system choices remain locally selectable.
-- Keep prose in sans-serif. Use monospace only for code, paths, diffs,
-  commands, and technical metadata.
-- The default-theme composer has no permanent white outline. It is a rounded,
-  shaded surface.
-- During a run, a model-colored highlight travels continuously around the
-  composer's rounded perimeter.
-- Stop replaces Send with one pure-white circle containing one dark square.
-- The default model picker presents a simple model and effort abstraction.
-- Advanced exposes precise model and effort controls.
-- There is no speed control.
-- The top effort is Max, not Ultra.
-- Max uses a slowly moving full-spectrum rainbow, sparse pure-white particles,
-  a pure-white thumb, no rainbow thumb ring, and no excessive glow.
-- Slider dragging uses local state so an older host value cannot pull the
-  control backward.
-- Changing the model must not change the application color scheme.
-- Do not duplicate Working or Activity indicators.
-- The optional right rail is limited to Progress, Artifacts, and Context.
-- A dominant inspector opens source, output, image, and diff content.
-- Mobile displays one primary surface at a time.
+- Always spell the product `ygg`; keep the wordmark unboxed and unaccompanied
+  by a decorative logo in the sidebar header.
+- Use one opaque, neutral-dark workbench appearance. Do not use glass,
+  translucency, or model-driven application colors. Rainbow color is reserved
+  for the reasoning-effort control.
+- The desktop shell is a real three-pane workbench: a 296px project/session
+  sidebar, a broad center pane, and an optional 400px evidence pane. Distinct
+  shaded surfaces separate panes without one-pixel divider lines.
+- Label navigation as Sessions, retain project grouping, and keep each active
+  session row to its title plus an optional PR mark. The PR mark appears only
+  for structured `in_progress`, `ready`, or `merged` evidence; repository state,
+  model metadata, and generic run status are not synthesized into the row.
+- Status color is semantic: green means working or successful, amber means
+  attention, and red means failure. Provider and model colors do not determine
+  shell state.
+- Keep the fresh session quiet: “New workspace task,” “What should we work on?”,
+  and a short instruction replace the animated TUI/model splash.
+- Compose the transcript like an engineering record, not a chat product. User
+  turns and expanded tool calls use restrained tonal surfaces without thin card
+  outlines; assistant prose and grouped tool evidence remain primary. Prior
+  actions collapse into one concise activity summary while the latest streaming
+  item stays visible on its own line. Reasoning, commands, metadata, output, and
+  completion evidence remain available through disclosures.
+- The composer spans the usable center pane, has restrained geometry, and stays
+  visually attached to the work surface. It has no border, shimmer, perimeter
+  chase, glass, or model-colored chrome, while focus remains visibly ringed.
+- Use native system UI and system monospace by default. The visible type scale
+  has two sizes: 14px interface text and 12px metadata. Monospace remains
+  limited to code, paths, diffs, commands, and technical metadata. Local font
+  and size preferences remain available.
+- The model picker keeps the simple model/effort abstraction, with precise
+  controls under Advanced. Ordinary effort fills the track in blue through and
+  slightly behind the white thumb without a rounded-cap gap. Exact `xhigh` adds
+  varied white particles that float locally within the blue fill. Exact `max`
+  combines those particles with the animated rainbow and is the only rainbow
+  state. Reduced motion freezes that rainbow and removes all particles. Changing
+  models never changes the shell appearance.
+- Do not duplicate Working or Activity indicators. The optional right pane is
+  limited to review, command history, progress, artifacts, and context backed
+  by structured events.
+- A dominant inspector opens source, output, image, and diff content without
+  changing transport or transcript behavior.
+- Mobile displays one primary surface at a time. Navigation, Activity, and the
+  inspector become full-height overlays while the composer keeps all controls
+  keyboard accessible.
+- Connected Devices appears only when the host advertises that capability; do
+  not invent account, machine, connection, or evidence state.
 
-[Web acceptance](web-acceptance.md) still contains an earlier "exactly two
-font-size tokens" requirement. Later design feedback intentionally moved the
-interface toward a measured ChatGPT/Claude hierarchy. That acceptance item
-needs reconciliation.
+The typography policy and browser baselines enforce this workbench contract,
+including full-shell desktop, performance transcript, mobile completion review,
+and mobile inspector states.
 
 ## Architecture
 
@@ -272,21 +279,26 @@ comprehensively.
 
 ### Frontend
 
-- Sidebar with pinned and recent sessions and client-side title/preview search.
-- Transcript with Markdown and GitHub-Flavored Markdown.
-- User and assistant messages with grouped activity.
-- Source, diff, and output openers.
-- Image preview.
+- Project-grouped Sessions sidebar with title-only rows and evidence-gated PR
+  marks, plus client-side title/preview search.
+- One opaque neutral workbench visual system with semantic status colors and
+  borderless tonal pane separation.
+- Transcript with Markdown, GitHub-Flavored Markdown, concise collapsed work
+  summaries, a separate live item, and expandable typed detail.
+- Source, diff, output, and image openers.
 - Approval and input interactions.
-- Compact run outcome and elapsed-time presentation.
-- Composer with attachments, model, effort, authority, follow-up/steer, and
-  send/stop.
-- Ten projected Ygg themes.
-- Operating-system appearance support.
-- Device-local font and size preferences.
-- Settings, inspector, progress, artifacts, and context.
+- Compact run outcome, changed-file, and elapsed-time presentation.
+- Pane-width composer with attachments, context, model, effort, authority,
+  follow-up/steer, and send/stop.
+- Resizable desktop Activity and Inspector panes with full-surface mobile
+  overlays.
+- Native system typography by default with a two-size interface/metadata scale
+  and device-local font and size preferences.
+- A blue reasoning slider for ordinary effort, locally floating varied white
+  particles for exact `xhigh` and `max`, an animated rainbow reserved for exact
+  `max`, and static, particle-free reduced motion.
+- Settings, review, command history, progress, artifacts, and context.
 - Responsive desktop, tablet, and phone layouts.
-- TUI-derived animated braille splash.
 
 The earlier fixture response:
 
@@ -324,6 +336,8 @@ transport from becoming reachable as production behavior.
 - Live `SteeringDelivered`, `CompactionStarted`, and `CompactionFinished`
   events are currently ignored, although durable compaction records can appear
   after hydration.
+- Structured PR state is optional in `SessionSummary` and covered by fixtures,
+  but production has no PR evidence producer yet and therefore omits it.
 - Structured plans exist in DTOs and fixtures, but the real adapter does not
   produce them.
 
@@ -393,7 +407,9 @@ There are currently:
 
 ## Validation evidence
 
-The checkpoint was validated with the following results:
+The web and focused `ygg-serve` rows below were rerun after the workbench
+visual pass. Production-host and broader coding-agent rows retain the earlier
+integration-checkpoint evidence.
 
 | Gate | Result |
 | --- | --- |
@@ -404,18 +420,26 @@ The checkpoint was validated with the following results:
 | External request and CSP policy | Pass |
 | Font policy | Pass |
 | Embedded bundle synchronization and integrity | Pass |
-| Web unit tests | 89/89 pass on the final run |
-| Fixture Playwright matrix | 68 pass, 42 intentional skips |
-| Production-host Playwright | 1/1 pass |
-| `ygg-serve` Rust unit tests | 58 pass |
-| Golden protocol tests | 6 pass |
-| Coding-agent tests with `serve` | 624 unit and 9 SIGTERM pass |
-| Strict Clippy | Pass |
-| Rust formatting | Pass |
+| Web unit tests | 151/151 pass |
+| Fixture Playwright matrix | 74 pass, 70 intentional skips, 1 system-Chrome timing failure |
+| Production-host Playwright | 1/1 pass at the integration checkpoint |
+| `ygg-serve` Rust tests | 69 library tests and associated suites pass |
+| Golden protocol tests | 9/9 pass |
+| Coding-agent tests with `serve` | 624 unit and 9 SIGTERM pass at the integration checkpoint |
+| Strict Clippy | Pass at the integration checkpoint |
+| Rust formatting | Repository-wide check still encounters pre-existing formatting differences outside this change |
 | `git diff --check` | Pass |
-| Exact-feature binary build | Pass |
-| Installed-binary embedded-web smoke | Pass |
+| Exact-feature binary build | Pass at the integration checkpoint |
+| Installed-binary embedded-web smoke | Pass at the integration checkpoint |
 | Package-boundary gate | **Fail** |
+
+The installed system Chrome was used because Playwright's configured Chromium
+binary is not present locally. Its only full-project failure was the existing
+60-delta performance probe: scroll-retention, stream-time, and frame-rate
+assertions passed, but Chrome reported one 110ms long task. The unmodified Git
+`HEAD` reproduces one or two long tasks under the same browser, so this is not a
+regression from the workbench styling. It still needs confirmation with the
+locked Playwright Chromium before the matrix can be called fully green.
 
 Earlier web-unit runs exposed a focus assertion that executed before the
 composer menu's scheduled animation-frame focus restoration. The checkpoint
@@ -428,10 +452,11 @@ OpenAI-compatible provider. It proves the integration without requiring an
 external model. Final acceptance against a user's actual configured provider
 remains outstanding.
 
-The embedded bundle at this checkpoint has SHA-256:
+The synchronized embedded bundle after the compact-activity and slider pass has
+SHA-256:
 
 ```text
-6150a6359334797750e45c958715e29025368cb513aa89e7e1d05d7e1f1ad753
+6339e9e630069c1adb9f3bd1a430956fe6269a122320bbd54e406d15d0aa9f45
 ```
 
 ## Repository checkpoint
@@ -490,23 +515,33 @@ attribution bug.
 
 ## Visual truth
 
-The current UI is much closer than the rejected dashboard, but recent
-side-by-side inspection still shows clear differences from ChatGPT:
+The frontend now presents one coherent coding-workbench composition rather than
+another chat-product skin:
 
-- Ygg is sparser vertically and leaves more dead space.
-- The light theme is warmer and more beige than OpenAI's neutral white.
-- Transcript composition is less dense and editorial.
-- The sidebar has fewer navigation anchors and less mature pacing.
-- The advanced model and effort popover still feels detached and somewhat
-  oversized.
-- The composer is less integrated into the conversation's visual rhythm.
-- The right rail often disappears because production lacks real preview and
-  plan producers.
-- Fixtures do not naturally display the richness of a long real agent session.
-- Small control weights, icon sizing, bubbles, and alignment remain a polish
-  pass short of a native application.
+- A 296px project/session sidebar, broad transcript, and optional 400px evidence
+  pane establish the desktop hierarchy.
+- Headers, user turns, action groups, composer, Activity, and Inspector use
+  neutral opaque shades instead of warm tint or structural divider lines.
+- Model color does not drive navigation state or composer chrome. Session rows
+  contain only their title and an evidence-gated gray, green, or purple PR mark.
+- Completed work reduces to a concise action-and-duration summary, prior live
+  work stays collapsed, and the current live item remains visible. Commands,
+  reasoning, metadata, output, and completion review are disclosed on demand.
+- The reasoning control is the deliberate color exception only at exact `max`.
+  Other effort levels fill blue slightly behind the thumb; exact `xhigh` and
+  exact `max` add varied white particles that float locally. Exact `max` alone
+  adds the rainbow. Reduced motion freezes that rainbow and removes particles.
+- Interface typography resolves to 14px UI and 12px metadata tokens.
+- Fresh, populated, Activity, Inspector, performance, tablet, 390px phone, and
+  360px phone states have been inspected in a real browser.
+- Checked-in baselines now cover the full desktop shell as well as focused
+  performance, completion-review, and mobile-inspector states.
 
-That is iteration debt, not a reason to delay experimental testing.
+The remaining visual truth is product-data debt rather than another styling
+pass: production Activity can be sparse because plans and previews have limited
+real producers, the repository model is still synthetic, and fixture sessions
+cannot represent every long-running real-agent shape. The Activity pane remains
+user-controlled rather than appearing without structured evidence.
 
 ## Recommended next sequence
 

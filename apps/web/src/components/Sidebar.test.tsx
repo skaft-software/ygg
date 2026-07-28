@@ -62,7 +62,7 @@ function sidebarProps(
     open: true,
     blocked: false,
     sessions: [activeSession(), archivedSession(), trashedSession()],
-    models: fixtureBootstrap.models,
+    projects: fixtureBootstrap.projects,
     selectedSessionId: "session-active",
     surface: "session",
     devicesAvailable: false,
@@ -93,6 +93,42 @@ describe("sidebar session lifecycle", () => {
     });
   });
   afterEach(cleanup);
+
+  it("shows title-only rows and gates pull-request marks on structured evidence", () => {
+    const sessions = [
+      activeSession({ id: "session-none", title: "No PR evidence" }),
+      activeSession({
+        id: "session-progress",
+        title: "Draft review",
+        pullRequest: { state: "in_progress" },
+      }),
+      activeSession({
+        id: "session-ready",
+        title: "Ready review",
+        pullRequest: { state: "ready" },
+      }),
+      activeSession({
+        id: "session-merged",
+        title: "Merged review",
+        pullRequest: { state: "merged" },
+      }),
+    ];
+
+    const { container } = render(
+      <Sidebar {...sidebarProps({ sessions, selectedSessionId: "session-none" })} />,
+    );
+
+    const noEvidence = screen.getByRole("button", {
+      name: "Open session No PR evidence, Ready",
+    });
+    expect(noEvidence).toHaveTextContent("No PR evidence");
+    expect(noEvidence.querySelector("svg")).toBeNull();
+    expect(screen.getByTitle("Pull request in progress")).toBeVisible();
+    expect(screen.getByTitle("Pull request ready for review")).toBeVisible();
+    expect(screen.getByTitle("Pull request merged")).toBeVisible();
+    expect(container.querySelectorAll(".session-pull-request")).toHaveLength(3);
+    expect(screen.queryByText(/GPT|Claude|Qwen/)).toBeNull();
+  });
 
   it("browses active and archived sessions and restores through lifecycle active", () => {
     const setLifecycle = vi.fn();

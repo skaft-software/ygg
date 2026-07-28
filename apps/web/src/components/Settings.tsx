@@ -1,23 +1,14 @@
 import {
   Bell,
   BellOff,
-  Check,
-  ChevronRight,
   FolderClock,
-  Palette,
   ShieldCheck,
   SlidersHorizontal,
   Type,
 } from "lucide-react";
-import { type CSSProperties, useEffect, useState } from "react";
-import type { ThemeOption } from "../protocol";
-import { themeRoleColorToCss } from "../theme";
+import { useEffect, useState } from "react";
 
 interface SettingsViewProps {
-  themes: ThemeOption[];
-  selectedThemeId: string;
-  selectionAvailable: boolean;
-  onThemeChange: (themeId: string) => void;
   notificationsSupported: boolean;
   notificationsEnabled: boolean;
   notificationPermission: NotificationPermission | "unsupported";
@@ -65,15 +56,7 @@ const fontStacks = [
 
 const uiSizes = [12, 13, 14, 15] as const;
 
-function themeDescription(option: ThemeOption): string {
-  return `Follows system appearance · ${option.theme.source}`;
-}
-
 export function SettingsView({
-  themes,
-  selectedThemeId,
-  selectionAvailable,
-  onThemeChange,
   notificationsSupported,
   notificationsEnabled,
   notificationPermission,
@@ -81,10 +64,11 @@ export function SettingsView({
 }: SettingsViewProps) {
   const [fontStackId, setFontStackId] = useState(() => {
     const stored = localStorage.getItem("ygg.ui.font");
-    return !stored || stored === "ibm-plex-mono" ? "geist" : stored;
+    if (!stored) return "system-mono";
+    return stored === "ibm-plex-mono" ? "geist" : stored;
   });
   const [uiSize, setUiSize] = useState(
-    () => Number(localStorage.getItem("ygg.ui.size") ?? "13"),
+    () => Number(localStorage.getItem("ygg.ui.size") ?? "14"),
   );
   const [notificationPending, setNotificationPending] = useState(false);
   const [notificationMessage, setNotificationMessage] = useState<string | null>(
@@ -103,13 +87,10 @@ export function SettingsView({
   useEffect(() => {
     const normalized = uiSizes.includes(uiSize as (typeof uiSizes)[number])
       ? uiSize
-      : 13;
+      : 14;
     const root = document.documentElement;
     root.style.setProperty("--font-body", `${normalized}px`);
-    root.style.setProperty("--font-meta", `${Math.max(11, normalized - 1)}px`);
-    root.style.setProperty("--font-chat", `${normalized + 1}px`);
-    root.style.setProperty("--font-prompt", `${normalized + 3}px`);
-    root.style.setProperty("--font-display", `${normalized + 3}px`);
+    root.style.setProperty("--font-meta", `${Math.max(11, normalized - 2)}px`);
     localStorage.setItem("ygg.ui.size", String(normalized));
   }, [uiSize]);
 
@@ -122,64 +103,6 @@ export function SettingsView({
           Preferences live on this device and never require a ygg account.
         </p>
       </header>
-
-      <section className="settings-section" aria-labelledby="appearance-title">
-        <div className="settings-section-heading">
-          <Palette aria-hidden="true" />
-          <div>
-            <h2 id="appearance-title">Appearance</h2>
-            <p>
-              {selectionAvailable
-                ? "The installed ygg catalog recolors the same stable interface."
-                : "This theme is selected by the connected ygg host."}
-            </p>
-          </div>
-        </div>
-        <div className="theme-options">
-          {themes
-            .filter(
-              (option) =>
-                selectionAvailable || selectedThemeId === option.id,
-            )
-            .map((option) => {
-            const selected = selectedThemeId === option.id;
-            const pigment = themeRoleColorToCss(
-              option.theme,
-              ["accent", "link"],
-              "#168f91",
-              "accent",
-            );
-            return (
-              <button
-                key={option.id}
-                className={selected ? "is-selected" : ""}
-                onClick={
-                  selectionAvailable
-                    ? () => onThemeChange(option.id)
-                    : undefined
-                }
-                disabled={!selectionAvailable}
-                aria-pressed={selected}
-              >
-                <span
-                  className="theme-swatch"
-                  style={{ "--swatch": pigment } as CSSProperties}
-                  aria-hidden="true"
-                />
-                <span>
-                  <strong>{option.theme.name}</strong>
-                  <small>{themeDescription(option)}</small>
-                </span>
-                {selected ? (
-                  <Check aria-hidden="true" />
-                ) : selectionAvailable ? (
-                  <ChevronRight aria-hidden="true" />
-                ) : null}
-              </button>
-            );
-          })}
-        </div>
-      </section>
 
       <section className="settings-section" aria-labelledby="type-title">
         <div className="settings-section-heading">

@@ -22,6 +22,9 @@ inspection evidence.
 - Rename, pin, archive, delete, and stop behave consistently across clients.
 - Streaming assistant, reasoning, tool, approval, input, compaction, source,
   output, diff/change, preview, and run-outcome items have typed renderers.
+- Prior work is collapsed into a concise semantic summary, the latest live item
+  remains visible, and detailed reasoning, commands, metadata, output, and
+  completion review remain reachable through disclosures.
 - Composer text, supported attachments, model, reasoning, authority, send,
   stop, steer, and queued follow-up use real controls.
 - Sources, outputs, and changed files come from deterministic evidence.
@@ -45,14 +48,25 @@ inspection evidence.
 
 - The interface is inspected at 1440×900, 1024×768, 768×1024, 390×844, and
   360×800.
-- The application uses exactly two semantic font-size tokens—body and
-  display—and a style check rejects arbitrary component sizes.
-- Hierarchy comes from tonal surfaces, spacing, weight, and shape rather than a
-  dashboard grid of outlined cards.
+- The application uses exactly two measured semantic size tokens: 14px
+  interface text and 12px metadata; a style check rejects arbitrary component
+  sizes.
+- Wide screens use a 296px project/session sidebar, broad center pane, and
+  optional 400px evidence pane separated by distinct shades rather than lines.
+- Sidebar rows show a session title only, plus a PR mark only when structured
+  `in_progress`, `ready`, or `merged` evidence exists.
+- The shell uses neutral opaque tonal surfaces and restrained geometry, not
+  glass, shimmer, model-colored chrome, thin outlined work surfaces, or a
+  dashboard grid of cards.
+- The reasoning slider fills blue through and slightly behind the white thumb
+  for ordinary effort, with no rounded-cap gap. Exact `xhigh` and exact `max`
+  add varied white particles with local floating motion; exact `max` alone adds
+  the animated rainbow.
 - Mobile displays one primary surface at a time.
 - Core flows work by keyboard and return focus correctly after overlays.
 - Focus is visible, contrast is safe, and state is not encoded by color alone.
-- Reduced motion removes nonessential movement.
+- Reduced motion freezes the max rainbow and removes all slider particles along
+  with other nonessential movement.
 - Two-hundred-percent zoom preserves session selection, transcript reading,
   composer, approval, and preview close.
 - Automated checks find no critical or serious accessibility issue on the

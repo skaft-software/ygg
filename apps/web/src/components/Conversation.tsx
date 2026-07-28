@@ -51,7 +51,6 @@ import { CommandRejectedError } from "../command-error";
 import { SessionDraftStore } from "../drafts";
 import type {
   ActionItem,
-  ActivityPhase,
   AttachmentRef,
   AuthorityProfile,
   DocumentReference,
@@ -73,7 +72,6 @@ import {
   type ConversationBranchAction,
 } from "./ConversationBranchDialog";
 import { PromptContextPicker } from "./PromptContextPicker";
-import { TuiSplashLogo } from "./TuiSplashLogo";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage"));
 
@@ -574,21 +572,40 @@ function formatDuration(durationMs: number): string {
   return `${minutes}m ${seconds % 60}s`;
 }
 
-const phaseLabels: Record<ActivityPhase, string> = {
-  investigated: "Investigated",
-  changed: "Changed",
-  verified: "Verified",
-  produced: "Produced",
-  other: "Other work",
-};
+function cleanReasoningText(value: string): string {
+  return value
+    .replace(/\*\*([^*]+)\*\*/g, "$1. ")
+    .replace(/__([^_]+)__/g, "$1. ")
+    .replace(/[`*_#>~]/g, "")
+    .replace(/([.!?])(?=[A-Z])/g, "$1 ")
+    .replace(/\s+/g, " ")
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .replace(/([.!?])(?:\s*[.!?])+/g, "$1")
+    .trim();
+}
 
-const livePhaseLabels: Record<ActivityPhase, string> = {
-  investigated: "Investigating",
-  changed: "Making changes",
-  verified: "Verifying",
-  produced: "Producing output",
-  other: "Executing",
-};
+function reasoningDisplayLabel(
+  item: Extract<TranscriptItem, { kind: "reasoning" }>,
+): string {
+  const summary = cleanReasoningText(item.summary);
+  if (
+    summary &&
+    !/^(?:thinking|reasoning|working|executing|analy[sz](?:e|ing)?|processing)[.!…]*$/i.test(
+      summary,
+    )
+  ) {
+    return summary;
+  }
+  const emphasized = Array.from(
+    item.content.matchAll(/\*\*([^*]+)\*\*/g),
+    (match) => cleanReasoningText(match[1] ?? ""),
+  ).filter(Boolean);
+  const fallback = emphasized.at(-1) ?? cleanReasoningText(item.content);
+  if (!fallback) return summary || "Working";
+  return fallback.length > 92
+    ? `${fallback.slice(0, 89).trimEnd()}…`
+    : fallback;
+}
 
 function LiveDots() {
   return (
@@ -655,7 +672,6 @@ function ActionCell({
     <details
       className={`action-cell ${animate ? "is-entering" : ""}`}
       data-status={item.status}
-      open={isStreaming}
     >
       <summary>
         <span className={`action-glyph ${isStreaming ? "is-live" : ""}`}>
@@ -1260,15 +1276,14 @@ const TranscriptItemView = memo(function TranscriptItemView({
       return (
         <details
           className={`reasoning-block ${item.state === "streaming" ? "is-live" : ""} ${animate ? "is-entering" : ""}`}
-          open={item.state === "streaming"}
         >
-          <summary>
+          <summary aria-live={item.state === "streaming" ? "polite" : undefined}>
             {item.state === "streaming" ? (
               <LiveDots />
             ) : (
               <BrainCircuit aria-hidden="true" />
             )}
-            <span>{item.summary}</span>
+            <span>{reasoningDisplayLabel(item)}</span>
             <ChevronDown aria-hidden="true" />
           </summary>
           <p>{item.content}</p>
@@ -1382,45 +1397,54 @@ type WorkItem = Extract<
   { kind: "action" | "reasoning" }
 >;
 
-interface PhaseWorkGroup {
-  id: string;
-  phase: ActivityPhase;
-  items: WorkItem[];
-}
+const actionSummaryLabels: Record<
+  ActionItem["actionKind"],
+  (count: number) => string
+> = {
+  command: (count) => `Ran ${count === 1 ? "command" : "commands"}`,
+  file_read: () => "Read files",
+  file_search: () => "Searched files",
+  file_write: (count) => `Edited ${count === 1 ? "file" : "files"}`,
+  web_search: () => "Searched the web",
+  skill: (count) => `Used ${count === 1 ? "skill" : "skills"}`,
+  preview: (count) => `Viewed ${count === 1 ? "preview" : "previews"}`,
+  analysis: () => "Inspected results",
+};
 
-function phaseWorkGroups(items: readonly WorkItem[]): PhaseWorkGroup[] {
-  const groups: PhaseWorkGroup[] = [];
-  let currentPhase: ActivityPhase | undefined;
-  for (let index = 0; index < items.length; index += 1) {
-    const item = items[index]!;
-    const nextAction = items
-      .slice(index)
-      .find((candidate): candidate is ActionItem => candidate.kind === "action");
-    const phase =
-      item.kind === "action"
-        ? item.phase
-        : currentPhase ?? nextAction?.phase ?? "investigated";
-    const current = groups.at(-1);
-    if (!current || current.phase !== phase) {
-      groups.push({
-        id: `${phase}-${item.id}`,
-        phase,
-        items: [item],
-      });
-    } else {
-      current.items.push(item);
-    }
-    currentPhase = phase;
+function describeWork(items: readonly WorkItem[]): string {
+  const actionCounts = new Map<ActionItem["actionKind"], number>();
+  for (const item of items) {
+    if (item.kind !== "action") continue;
+    actionCounts.set(
+      item.actionKind,
+      (actionCounts.get(item.actionKind) ?? 0) + 1,
+    );
   }
-  return groups;
+  const labels = Array.from(actionCounts, ([kind, count]) =>
+    actionSummaryLabels[kind](count),
+  );
+  if (labels.length) {
+    return labels
+      .map((label, index) =>
+        index === 0 ? label : `${label[0]!.toLowerCase()}${label.slice(1)}`,
+      )
+      .join(", ");
+  }
+  const reasoning = [...items]
+    .reverse()
+    .find(
+      (item): item is Extract<WorkItem, { kind: "reasoning" }> =>
+        item.kind === "reasoning",
+    );
+  return reasoning ? reasoningDisplayLabel(reasoning) : "Work details";
 }
 
-type PhaseEntry =
+type WorkEntry =
   | { kind: "item"; item: WorkItem }
   | { kind: "command_batch"; id: string; items: ActionItem[] };
 
-function aggregatePhaseEntries(items: readonly WorkItem[]): PhaseEntry[] {
-  const entries: PhaseEntry[] = [];
+function aggregateWorkEntries(items: readonly WorkItem[]): WorkEntry[] {
+  const entries: WorkEntry[] = [];
   let index = 0;
   while (index < items.length) {
     const item = items[index]!;
@@ -1569,153 +1593,217 @@ const WorkGroup = memo(function WorkGroup({
   attachmentContentUrl,
   onPreviewAttachment,
 }: WorkGroupProps) {
-  const liveItem = row.items.find((item) => item.state === "streaming");
+  const liveItem = [...row.items]
+    .reverse()
+    .find((item) => item.state === "streaming");
   const live = Boolean(liveItem);
   const [userOpen, setUserOpen] = useState(false);
+  const historyItems = liveItem
+    ? row.items.filter((item) => item !== liveItem)
+    : row.items;
   const itemDuration = row.items.reduce(
     (total, item) =>
       total + (item.kind === "action" ? item.durationMs ?? 0 : 0),
     0,
   );
   const duration = row.outcome?.durationMs || itemDuration;
-  const currentPhase =
-    liveItem?.kind === "action"
-      ? liveItem.phase
-      : [...row.items]
-          .reverse()
-          .find((item): item is ActionItem => item.kind === "action")?.phase ??
-        "investigated";
-  const label = liveItem
-    ? `${livePhaseLabels[currentPhase]} · ${
-        liveItem.kind === "reasoning" ? liveItem.summary : liveItem.label
-      }`
-    : duration > 0
-      ? `Worked for ${formatDuration(duration)}`
-      : "Work details";
-  const open = live || userOpen;
-  const phases = phaseWorkGroups(row.items);
+  const failedActionCount = historyItems.filter(
+    (item) => item.kind === "action" && item.status === "failed",
+  ).length;
+  const historyLabel = [
+    describeWork(historyItems),
+    !live && duration > 0 ? formatDuration(duration) : null,
+    failedActionCount
+      ? `${failedActionCount} ${failedActionCount === 1 ? "failure" : "failures"}`
+      : null,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join(" · ");
+  const liveLabel = liveItem
+    ? liveItem.kind === "reasoning"
+      ? reasoningDisplayLabel(liveItem)
+      : liveItem.label
+    : null;
+  const label = liveLabel ?? historyLabel;
+  const open = historyItems.length > 0 && userOpen;
+  const historyAction = [...historyItems]
+    .reverse()
+    .find((item): item is ActionItem => item.kind === "action");
+  const changedActions = row.outcome
+    ? row.outcome.review.changedFileItemIds
+        .map((id) => reviewActions.find((action) => action.id === id))
+        .filter((action): action is ActionItem => Boolean(action))
+    : [];
+  const changedPaths = new Set(
+    changedActions.flatMap((action) =>
+      action.changedPaths.length
+        ? action.changedPaths
+        : action.target
+          ? [action.target]
+          : [],
+    ),
+  );
+  const changeAdditions = changedActions.reduce(
+    (total, action) => total + (action.additions ?? 0),
+    0,
+  );
+  const changeDeletions = changedActions.reduce(
+    (total, action) => total + (action.deletions ?? 0),
+    0,
+  );
 
   return (
     <section
-      className={`work-group ${live ? "is-live" : "is-complete"} ${open ? "is-open" : "is-collapsed"}`}
+      className={`work-group ${live ? "is-live" : "is-complete"} ${open ? "is-open" : "is-collapsed"} ${liveItem ? "has-live-item" : ""}`}
       aria-label={label}
     >
-      <button
-        type="button"
-        className="work-group-summary"
-        aria-expanded={open}
-        aria-disabled={live}
-        onClick={() => {
-          if (!live) setUserOpen((current) => !current);
-        }}
-      >
-        {!live ? (
-          <span className="work-group-glyph">
-            <span className="work-group-status is-finished">
-              {row.outcome?.outcome === "failed" ? (
+      {historyItems.length ? (
+        <>
+          <button
+            type="button"
+            className="work-group-summary"
+            aria-expanded={open}
+            onClick={() => setUserOpen((current) => !current)}
+          >
+            <span
+              className={`work-group-glyph ${live ? "is-history" : "is-finished"}`}
+            >
+              {live ? (
+                historyAction ? (
+                  actionIcons[historyAction.actionKind]
+                ) : (
+                  <BrainCircuit aria-hidden="true" />
+                )
+              ) : row.outcome?.outcome === "failed" ? (
                 <AlertTriangle aria-hidden="true" />
               ) : (
                 <Check aria-hidden="true" />
               )}
             </span>
-          </span>
-        ) : null}
-        <span>{label}</span>
-        <ChevronDown aria-hidden="true" />
-      </button>
-      <div className="work-group-content-clip" aria-hidden={!open}>
-        <div className="work-group-content">
-          {phases.map((phase) => (
-            <section
-              className={`activity-phase ${phase.items.some((item) => item.state === "streaming") ? "is-live" : ""}`}
-              key={phase.id}
-              aria-label={`${phaseLabels[phase.phase]} phase`}
-            >
-              <header>
-                <span>{phaseLabels[phase.phase]}</span>
-                <em>
-                  {
-                    phase.items.filter((item) => item.kind === "action")
-                      .length
-                  }
-                </em>
-              </header>
-              <div>
-                {aggregatePhaseEntries(phase.items).map((entry) =>
-                  entry.kind === "command_batch" ? (
-                    <details className="command-batch" key={entry.id}>
-                      <summary>
-                        <TerminalSquare aria-hidden="true" />
-                        <span>
-                          Ran {entry.items.length}{" "}
-                          {entry.items[0]!.rawToolName} commands
-                        </span>
+            <span>{historyLabel}</span>
+            <ChevronDown aria-hidden="true" />
+          </button>
+          <div
+            className="work-group-content-clip"
+            aria-hidden={!open}
+            inert={!open}
+          >
+            <div className="work-group-content">
+              {aggregateWorkEntries(historyItems).map((entry) =>
+                entry.kind === "command_batch" ? (
+                  <details className="command-batch" key={entry.id}>
+                    <summary>
+                      <TerminalSquare aria-hidden="true" />
+                      <span>Ran {entry.items.length} commands</span>
+                      {entry.items.some(
+                        (item) => item.status !== "succeeded",
+                      ) ? (
                         <em>
                           {
                             entry.items.filter(
-                              (item) => item.status === "succeeded",
+                              (item) => item.status !== "succeeded",
                             ).length
                           }{" "}
-                          succeeded
+                          incomplete
                         </em>
-                        <ChevronDown
-                          className="disclosure-chevron"
-                          aria-hidden="true"
+                      ) : null}
+                      <ChevronDown
+                        className="disclosure-chevron"
+                        aria-hidden="true"
+                      />
+                    </summary>
+                    <div>
+                      {entry.items.map((item) => (
+                        <AnchoredTranscriptItem
+                          key={item.id}
+                          item={item}
+                          animate={false}
+                          onResolveApproval={onResolveApproval}
+                          onResolveUserInput={onResolveUserInput}
+                          onOpenOutput={onOpenOutput}
+                          onOpenSource={onOpenSource}
+                          onOpenResource={onOpenResource}
+                          availableOutputs={availableOutputs}
+                          availableSources={availableSources}
+                          outputsByOrigin={outputsByOrigin}
+                          sourcesByOrigin={sourcesByOrigin}
+                          attachmentContentUrl={attachmentContentUrl}
+                          onPreviewAttachment={onPreviewAttachment}
                         />
-                      </summary>
-                      <div>
-                        {entry.items.map((item) => (
-                          <AnchoredTranscriptItem
-                            key={item.id}
-                            item={item}
-                            animate={false}
-                            onResolveApproval={onResolveApproval}
-                            onResolveUserInput={onResolveUserInput}
-                            onOpenOutput={onOpenOutput}
-                            onOpenSource={onOpenSource}
-                            onOpenResource={onOpenResource}
-                            availableOutputs={availableOutputs}
-                            availableSources={availableSources}
-                            outputsByOrigin={outputsByOrigin}
-                            sourcesByOrigin={sourcesByOrigin}
-                            attachmentContentUrl={attachmentContentUrl}
-                            onPreviewAttachment={onPreviewAttachment}
-                          />
-                        ))}
-                      </div>
-                    </details>
-                  ) : (
-                    <AnchoredTranscriptItem
-                      key={entry.item.id}
-                      item={entry.item}
-                      animate={!initialItemIds.has(entry.item.id)}
-                      onResolveApproval={onResolveApproval}
-                      onResolveUserInput={onResolveUserInput}
-                      onOpenOutput={onOpenOutput}
-                      onOpenSource={onOpenSource}
-                      onOpenResource={onOpenResource}
-                      availableOutputs={availableOutputs}
-                      availableSources={availableSources}
-                      outputsByOrigin={outputsByOrigin}
-                      sourcesByOrigin={sourcesByOrigin}
-                      attachmentContentUrl={attachmentContentUrl}
-                      onPreviewAttachment={onPreviewAttachment}
-                    />
-                  ),
-                )}
-              </div>
-            </section>
-          ))}
+                      ))}
+                    </div>
+                  </details>
+                ) : (
+                  <AnchoredTranscriptItem
+                    key={entry.item.id}
+                    item={entry.item}
+                    animate={!initialItemIds.has(entry.item.id)}
+                    onResolveApproval={onResolveApproval}
+                    onResolveUserInput={onResolveUserInput}
+                    onOpenOutput={onOpenOutput}
+                    onOpenSource={onOpenSource}
+                    onOpenResource={onOpenResource}
+                    availableOutputs={availableOutputs}
+                    availableSources={availableSources}
+                    outputsByOrigin={outputsByOrigin}
+                    sourcesByOrigin={sourcesByOrigin}
+                    attachmentContentUrl={attachmentContentUrl}
+                    onPreviewAttachment={onPreviewAttachment}
+                  />
+                ),
+              )}
+            </div>
+          </div>
+        </>
+      ) : null}
+      {liveItem ? (
+        <div className="work-group-live-item">
+          <AnchoredTranscriptItem
+            item={liveItem}
+            animate={!initialItemIds.has(liveItem.id)}
+            onResolveApproval={onResolveApproval}
+            onResolveUserInput={onResolveUserInput}
+            onOpenOutput={onOpenOutput}
+            onOpenSource={onOpenSource}
+            onOpenResource={onOpenResource}
+            availableOutputs={availableOutputs}
+            availableSources={availableSources}
+            outputsByOrigin={outputsByOrigin}
+            sourcesByOrigin={sourcesByOrigin}
+            attachmentContentUrl={attachmentContentUrl}
+            onPreviewAttachment={onPreviewAttachment}
+          />
         </div>
-      </div>
+      ) : null}
       {row.outcome ? (
-        <CompletionReview
-          outcome={row.outcome}
-          actions={reviewActions}
-          outputs={availableOutputs}
-          onOpenOutput={onOpenOutput}
-          onOpenResource={onOpenResource}
-        />
+        <details
+          className="completion-review-disclosure"
+          open={row.outcome.outcome === "failed"}
+        >
+          <summary>
+            <FileDiff aria-hidden="true" />
+            <span>
+              {changedPaths.size
+                ? `${changedPaths.size} ${changedPaths.size === 1 ? "file" : "files"} changed`
+                : "Review details"}
+            </span>
+            {changedActions.length ? (
+              <span className="diff-count" aria-label="Lines changed">
+                <em>+{changeAdditions}</em>
+                <b>−{changeDeletions}</b>
+              </span>
+            ) : null}
+            <ChevronDown className="disclosure-chevron" aria-hidden="true" />
+          </summary>
+          <CompletionReview
+            outcome={row.outcome}
+            actions={reviewActions}
+            outputs={availableOutputs}
+            onOpenOutput={onOpenOutput}
+            onOpenResource={onOpenResource}
+            compact
+          />
+        </details>
       ) : null}
     </section>
   );
@@ -1749,21 +1837,17 @@ const WorkGroup = memo(function WorkGroup({
 
 function EmptySession({
   attachments,
-  modelAccent,
 }: {
   attachments: boolean;
-  modelAccent: string;
 }) {
   return (
     <div className="empty-session">
-      <div className="empty-session-mark" aria-hidden="true">
-        <TuiSplashLogo modelAccent={modelAccent} />
-      </div>
-      <h1>What can I take off your plate?</h1>
+      <span className="empty-session-eyebrow">New workspace task</span>
+      <h1>What should we work on?</h1>
       <p>
         {attachments
-          ? "Describe a task, from a quick fix to a multi-step job. You can attach images."
-          : "Describe a task, from a quick fix to a multi-step job."}
+          ? "Describe the change you want to make. Add files or images when they help."
+          : "Describe the change you want to make in this workspace."}
       </p>
     </div>
   );
@@ -1794,11 +1878,11 @@ function ReasoningPowerSlider({
   const lastIndex = Math.max(0, options.length - 1);
   const position = lastIndex ? (selectedIndex / lastIndex) * 100 : 0;
   const wheelDeltaRef = useRef(0);
-  const isMax = selectedIndex === lastIndex && lastIndex > 0;
+  const selectedEffort = (options[selectedIndex] ?? "").toLowerCase();
+  const isMax = selectedEffort === "max";
+  const hasFloatingParticles = selectedEffort === "xhigh";
+  const thumbOffset = Number((14 - position * 0.28).toFixed(4));
   const visibleValue = formatValue?.(selectedValue) ?? selectedValue;
-  const isOverdrive =
-    /^(?:high|xhigh|max)$/i.test(options[selectedIndex] ?? "") &&
-    selectedIndex > 0;
 
   useEffect(() => {
     latestValueRef.current = value;
@@ -1857,21 +1941,24 @@ function ReasoningPowerSlider({
         <div
           className="power-slider-root"
           data-max={isMax}
-          data-overdrive={isOverdrive}
+          data-overdrive={hasFloatingParticles}
           data-dragging={dragging || undefined}
           data-disabled={disabled || undefined}
-          style={{ "--power-position": `${position}%` } as CSSProperties}
+          style={
+            {
+              "--power-position": `${position}%`,
+              "--power-thumb-position": `calc(${position}% + ${thumbOffset}px)`,
+            } as CSSProperties
+          }
         >
           <div className="power-slider-track" aria-hidden="true">
             <span className="power-slider-range" />
             <span className="power-slider-max-fill" />
-            {isOverdrive ? (
-              <span className="power-slider-fast-particles">
-                {Array.from({ length: 10 }, (_, index) => (
-                  <i key={index} />
-                ))}
-              </span>
-            ) : null}
+            <span className="power-slider-fast-particles">
+              {Array.from({ length: 12 }, (_, index) => (
+                <span key={index} />
+              ))}
+            </span>
           </div>
           <span className="power-slider-thumb-rail" aria-hidden="true">
             <span className="power-slider-thumb" />
@@ -3009,7 +3096,7 @@ function Composer({
                 : "Queue a follow-up…"
               : session.items.length
                 ? "Reply…"
-                : "Describe a task…"
+                : "Describe a change…"
           }
           rows={1}
           aria-label="Message ygg"
@@ -3360,12 +3447,6 @@ export function Conversation({
   const conversationBranching =
     bootstrap.capabilities.conversationBranching &&
     Boolean(onEditUserTurn && onRetryResponse && onForkConversation);
-  const selectedModelKey =
-    `${selectedModel?.provider ?? ""} ${selectedModel?.id ?? ""}`.toLowerCase();
-  const selectedModelAccent =
-    providerAccents.find(([provider]) =>
-      selectedModelKey.includes(provider),
-    )?.[1] ?? "#16876d";
 
   useEffect(() => {
     const element = scrollRef.current;
@@ -3500,7 +3581,6 @@ export function Conversation({
                   selectedModel?.inputModalities.includes("image"),
                 )
               }
-              modelAccent={selectedModelAccent}
             />
           ) : (
             rows.map((row) =>

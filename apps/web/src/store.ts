@@ -87,21 +87,6 @@ function writeSessionRoute(
   }
 }
 
-function themeStorageKey(hostId: string): string {
-  return `ygg:theme:${hostId}`;
-}
-
-function readLocalTheme(bootstrap: HostBootstrap): string | undefined {
-  try {
-    const stored = window.localStorage.getItem(themeStorageKey(bootstrap.host.id));
-    return bootstrap.themes.some((theme) => theme.id === stored)
-      ? stored ?? undefined
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function latestAssistant(snapshot: SessionSnapshot): string | undefined {
   return snapshot.items
     .filter((item) => item.kind === "assistant_message")
@@ -531,11 +516,7 @@ export class YggStore {
       const hostBootstrap = await this.transport.connect(
         routedProjectRunnable ? routedSessionId ?? undefined : undefined,
       );
-      const bootstrap: HostBootstrap = {
-        ...hostBootstrap,
-        selectedThemeId:
-          readLocalTheme(hostBootstrap) ?? hostBootstrap.selectedThemeId,
-      };
+      const bootstrap = hostBootstrap;
       const selected = await this.transport.getSession(
         bootstrap.selectedSessionId,
       );
@@ -1102,21 +1083,6 @@ export class YggStore {
       sessionId: session.sessionId,
       requestId,
       answer,
-    });
-  }
-
-  async selectTheme(themeId: string): Promise<void> {
-    const bootstrap = this.state.bootstrap;
-    if (!bootstrap || bootstrap.selectedThemeId === themeId) return;
-    if (!bootstrap.themes.some((theme) => theme.id === themeId)) return;
-    try {
-      window.localStorage.setItem(themeStorageKey(bootstrap.host.id), themeId);
-    } catch {
-      // Local presentation still changes for this page lifetime.
-    }
-    this.publish({
-      ...this.state,
-      bootstrap: { ...bootstrap, selectedThemeId: themeId },
     });
   }
 

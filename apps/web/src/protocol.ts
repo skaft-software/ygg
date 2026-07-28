@@ -176,6 +176,10 @@ export interface SessionSummary {
   unread: boolean;
   modelId: string;
   attentionCount: number;
+  /** Present only when the host has structured pull-request evidence. */
+  pullRequest?: {
+    state: "in_progress" | "ready" | "merged";
+  };
 }
 
 export interface HostBootstrap {

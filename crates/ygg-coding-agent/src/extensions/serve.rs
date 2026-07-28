@@ -6504,6 +6504,7 @@ fn seed_from_session(
         provisional: false,
         live_state: SessionLiveState::Idle,
         attention: AttentionState::None,
+        pull_request: None,
         owner: ActorOwnerState::Hosted,
         model: model.clone(),
     };
@@ -6553,6 +6554,7 @@ fn empty_seed(
             provisional: true,
             live_state: SessionLiveState::Idle,
             attention: AttentionState::None,
+            pull_request: None,
             owner: ActorOwnerState::Hosted,
             model: model.clone(),
         },
@@ -6993,6 +6995,7 @@ fn summary_from_meta(
         provisional: false,
         live_state: SessionLiveState::Idle,
         attention: AttentionState::None,
+        pull_request: None,
         owner: ActorOwnerState::Inactive,
         model,
     })

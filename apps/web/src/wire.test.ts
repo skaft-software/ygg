@@ -110,6 +110,7 @@ describe("authoritative Rust wire contract", () => {
       kind: "assistant_message",
       content: "Ready.",
     });
+    expect(bootstrap.sessions[0]?.pullRequest).toEqual({ state: "ready" });
     expect(bootstrap.capabilities.sessionBranches).toBe(true);
     expect(bootstrap.capabilities.sessionExport).toBe(true);
     expect(selectedSession.branches).toEqual({
@@ -1544,6 +1545,18 @@ describe("authoritative Rust wire contract", () => {
       "budget=8192",
     ]);
     expect(selectedSession.reasoning).toBe("budget=8192");
+  });
+
+  it("normalizes structured pull-request evidence and rejects unknown states", () => {
+    const inProgress = clone(hostBootstrapGolden);
+    inProgress.sessions[0]!.pullRequest.state = "inProgress";
+    expect(
+      projectHostBootstrap(inProgress).bootstrap.sessions[0]?.pullRequest,
+    ).toEqual({ state: "in_progress" });
+
+    const invalid = clone(hostBootstrapGolden);
+    invalid.sessions[0]!.pullRequest.state = "draft";
+    expect(() => projectHostBootstrap(invalid)).toThrow(WireContractError);
   });
 
   it("rejects unknown wire fields and catalog-invalid selections", () => {

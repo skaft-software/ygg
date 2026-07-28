@@ -270,6 +270,26 @@ pub enum AttentionState {
     Failure,
 }
 
+/// Structured pull-request state supplied by a host integration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PullRequestState {
+    /// Work is still in progress.
+    InProgress,
+    /// The pull request is ready for review.
+    Ready,
+    /// The pull request has been merged.
+    Merged,
+}
+
+/// Evidence-backed pull-request summary for a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PullRequestSummary {
+    /// Current pull-request state.
+    pub state: PullRequestState,
+}
+
 /// Session ownership truth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -408,6 +428,9 @@ pub struct SessionSummary {
     pub live_state: SessionLiveState,
     /// User-attention state.
     pub attention: AttentionState,
+    /// Structured pull-request evidence, when supplied by the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestSummary>,
     /// Mutable owner state.
     pub owner: ActorOwnerState,
     /// Model shown in compact metadata.
@@ -2309,6 +2332,7 @@ mod tests {
             provisional: false,
             live_state: SessionLiveState::Idle,
             attention: AttentionState::None,
+            pull_request: None,
             owner: ActorOwnerState::Inactive,
             model: ModelSelection {
                 provider: "provider".into(),

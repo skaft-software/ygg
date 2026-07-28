@@ -112,6 +112,9 @@
       "provisional": false,
       "liveState": "idle",
       "attention": "none",
+      "pullRequest": {
+        "state": "ready"
+      },
       "owner": "hosted",
       "model": {
         "provider": "openai",

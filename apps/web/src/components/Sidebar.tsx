@@ -2,6 +2,9 @@ import {
   Archive,
   ArchiveRestore,
   Folder,
+  GitMerge,
+  GitPullRequest,
+  GitPullRequestDraft,
   Laptop,
   Menu,
   MessageSquarePlus,
@@ -12,20 +15,19 @@ import {
   X,
 } from "lucide-react";
 import {
-  type CSSProperties,
   type ReactNode,
   memo,
   useEffect,
   useRef,
   useState,
 } from "react";
-import type { ModelSummary, SessionSummary } from "../protocol";
+import type { ProjectSummary, SessionSummary } from "../protocol";
 
 interface SidebarProps {
   open: boolean;
   blocked: boolean;
   sessions: SessionSummary[];
-  models: ModelSummary[];
+  projects?: ProjectSummary[];
   selectedSessionId: string | null;
   surface: "session" | "projects" | "settings" | "devices";
   devicesAvailable: boolean;
@@ -61,98 +63,88 @@ const sessionStatusLabel: Record<SessionSummary["status"], string> = {
   disconnected: "Reconnecting",
 };
 
-const modelAccents: Array<[string, string]> = [
-  ["openai", "#10a37f"],
-  ["anthropic", "#cc785c"],
-  ["google", "#34a853"],
-  ["xai", "#736cd3"],
-  ["meta", "#0089f4"],
-  ["mistral", "#fd6f00"],
-  ["deepseek", "#4263eb"],
-  ["alibaba", "#ff7018"],
-  ["minimax", "#eb3568"],
-  ["kimi", "#047afe"],
-  ["nvidia", "#86b737"],
-  ["cohere", "#d18ee2"],
-  ["amazon", "#ff9900"],
-  ["microsoft", "#0078d5"],
-];
+const pullRequestLabels: Record<
+  NonNullable<SessionSummary["pullRequest"]>["state"],
+  string
+> = {
+  in_progress: "Pull request in progress",
+  ready: "Pull request ready for review",
+  merged: "Pull request merged",
+};
 
-function modelAccent(model: ModelSummary | undefined): string {
-  const key = `${model?.provider ?? ""} ${model?.id ?? ""}`.toLowerCase();
+function PullRequestMark({
+  state,
+}: {
+  state: NonNullable<SessionSummary["pullRequest"]>["state"];
+}) {
+  const Icon =
+    state === "merged"
+      ? GitMerge
+      : state === "ready"
+        ? GitPullRequest
+        : GitPullRequestDraft;
   return (
-    modelAccents.find(([candidate]) => key.includes(candidate))?.[1] ??
-    "var(--theme-pigment)"
+    <span
+      className={`session-pull-request is-${state.replace("_", "-")}`}
+      title={pullRequestLabels[state]}
+      aria-hidden="true"
+    >
+      <Icon />
+    </span>
   );
 }
 
 function SessionRow({
   session,
-  model,
   selected,
   onSelect,
 }: {
   session: SessionSummary;
-  model: ModelSummary | undefined;
   selected: boolean;
   onSelect: () => void;
 }) {
+  const pullRequestLabel = session.pullRequest
+    ? `, ${pullRequestLabels[session.pullRequest.state]}`
+    : "";
   return (
     <button
       className={`session-row ${selected ? "is-selected" : ""}`}
       onClick={onSelect}
       aria-current={selected ? "page" : undefined}
-      aria-label={`Open session ${session.title}, ${sessionStatusLabel[session.status]}`}
+      aria-label={`Open session ${session.title}, ${sessionStatusLabel[session.status]}${pullRequestLabel}`}
       data-status={session.status}
-      style={
-        {
-          "--session-model-color": modelAccent(model),
-        } as CSSProperties
-      }
     >
-      <span className="session-row-copy">
-        <span className="session-row-title">{session.title}</span>
-      </span>
-      {session.status === "working" || session.status === "disconnected" ? (
-        <span
-          className="session-status-dot"
-          aria-label={sessionStatusLabel[session.status]}
-        />
-      ) : session.attentionCount > 0 || session.unread ? (
-        <span
-          className="session-unread"
-          aria-label={
-            session.attentionCount > 0
-              ? "Needs attention"
-              : "Unread activity"
-          }
-        />
+      <span className="session-row-title">{session.title}</span>
+      {session.pullRequest ? (
+        <PullRequestMark state={session.pullRequest.state} />
       ) : null}
     </button>
   );
 }
 
-function SessionSection({
-  title,
+function WorkspaceSection({
+  project,
   sessions,
-  models,
   selectedSessionId,
   onSelectSession,
   renderControls,
 }: {
-  title: string;
+  project?: ProjectSummary;
   sessions: SessionSummary[];
-  models: Map<string, ModelSummary>;
   selectedSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
   renderControls?: (session: SessionSummary) => ReactNode;
 }) {
   if (sessions.length === 0) return null;
+  const title = project?.name ?? "Unassigned project";
   return (
-    <section className="sidebar-section" aria-labelledby={`section-${title}`}>
-      <div className="sidebar-section-heading">
-        <h2 id={`section-${title}`}>{title}</h2>
-      </div>
+    <section className="workspace-section" aria-label={title}>
+      <header className="workspace-section-heading">
+        <span className="workspace-name">
+          <Folder aria-hidden="true" />
+          <strong>{title}</strong>
+        </span>
+      </header>
       <div className="session-list">
         {sessions.map((session) => {
           const controls = renderControls?.(session);
@@ -163,7 +155,6 @@ function SessionSection({
             >
               <SessionRow
                 session={session}
-                model={models.get(session.modelId)}
                 selected={session.id === selectedSessionId}
                 onSelect={() => onSelectSession(session.id)}
               />
@@ -193,7 +184,7 @@ function SidebarView({
   open,
   blocked,
   sessions,
-  models,
+  projects = [],
   selectedSessionId,
   surface,
   devicesAvailable,
@@ -297,13 +288,29 @@ function SidebarView({
         session.title.toLocaleLowerCase().includes(normalizedQuery) ||
         session.preview.toLocaleLowerCase().includes(normalizedQuery)),
   );
-  const pinned =
-    view === "active"
-      ? visibleSessions.filter((session) => session.pinned)
-      : [];
-  const pinnedIds = new Set(pinned.map((session) => session.id));
-  const recent = visibleSessions.filter((session) => !pinnedIds.has(session.id));
-  const modelsById = new Map(models.map((model) => [model.id, model]));
+  const projectsById = new Map(projects.map((project) => [project.id, project]));
+  const workspaceSessions = new Map<string, SessionSummary[]>();
+  for (const session of visibleSessions) {
+    const grouped = workspaceSessions.get(session.projectId);
+    if (grouped) grouped.push(session);
+    else workspaceSessions.set(session.projectId, [session]);
+  }
+  const workspaces = [
+    ...projects
+      .filter((project) => workspaceSessions.has(project.id))
+      .map((project) => ({
+        project,
+        sessions: workspaceSessions.get(project.id)!,
+      })),
+    ...Array.from(workspaceSessions.entries())
+      .filter(([projectId]) => !projectsById.has(projectId))
+      .map(([, workspace]) => ({ project: undefined, sessions: workspace })),
+  ];
+  for (const workspace of workspaces) {
+    workspace.sessions.sort(
+      (left, right) => Number(right.pinned) - Number(left.pinned),
+    );
+  }
   const archiveCount = sessions.filter(
     (session) => session.lifecycle === "archived",
   ).length;
@@ -627,29 +634,24 @@ function SidebarView({
             </div>
           ) : (
             <>
-              <SessionSection
-                title="Pinned"
-                sessions={pinned}
-                models={modelsById}
-                selectedSessionId={selectedSessionId}
-                onSelectSession={onSelectSession}
-              />
-              <SessionSection
-                title={
-                  view === "archived"
-                    ? "Archived"
-                    : view === "trash"
-                      ? "Trash"
-                      : "Recents"
-                }
-                sessions={recent}
-                models={modelsById}
-                selectedSessionId={selectedSessionId}
-                onSelectSession={onSelectSession}
-                renderControls={
-                  view === "active" ? undefined : renderSessionControls
-                }
-              />
+              <div className="workspace-list-heading">
+                <span>{view === "active" ? "Sessions" : "Session history"}</span>
+                <button type="button" onClick={onOpenProjects}>
+                  Manage
+                </button>
+              </div>
+              {workspaces.map((workspace) => (
+                <WorkspaceSection
+                  key={workspace.project?.id ?? workspace.sessions[0]!.projectId}
+                  project={workspace.project}
+                  sessions={workspace.sessions}
+                  selectedSessionId={selectedSessionId}
+                  onSelectSession={onSelectSession}
+                  renderControls={
+                    view === "active" ? undefined : renderSessionControls
+                  }
+                />
+              ))}
             </>
           )}
         </div>

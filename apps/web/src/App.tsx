@@ -54,7 +54,7 @@ import {
   YggStore,
   useYggStore,
 } from "./store";
-import { applyStoredTypePreferences, applyTheme } from "./theme";
+import { applyStoredTypePreferences } from "./theme";
 import {
   createTransport,
   type TransportConnectionState,
@@ -613,7 +613,7 @@ export default function App() {
   const [inspector, setInspector] = useState<InspectorSelection | null>(null);
   const [inspectorClosing, setInspectorClosing] = useState(false);
   const [activityPaneWidth, setActivityPaneWidth] = useState(() =>
-    storedPaneWidth(activityPaneStorageKey, 320),
+    storedPaneWidth(activityPaneStorageKey, 400),
   );
   const [inspectorPaneWidth, setInspectorPaneWidth] = useState(() =>
     storedPaneWidth(inspectorPaneStorageKey, 720),
@@ -760,9 +760,6 @@ export default function App() {
   const project = state.bootstrap?.projects.find(
     (candidate) => candidate.id === session?.projectId,
   );
-  const selectedTheme = state.bootstrap?.themes.find(
-    (option) => option.id === state.bootstrap?.selectedThemeId,
-  );
 
   const activityAvailable = Boolean(
     session &&
@@ -776,10 +773,6 @@ export default function App() {
     branchHistoryOpen ||
     transcriptSearchOpen ||
     (!wideLayout && (visibleActivityOpen || Boolean(inspector)));
-
-  useEffect(() => {
-    if (selectedTheme) applyTheme(selectedTheme.theme, selectedTheme.id);
-  }, [selectedTheme]);
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 760px)");
@@ -836,7 +829,7 @@ export default function App() {
 
   const paneBounds = useCallback(
     (kind: "activity" | "inspector") => {
-      const sidebarWidth = sidebarOpen ? 264 : 0;
+      const sidebarWidth = sidebarOpen ? 296 : 0;
       if (kind === "activity") {
         return {
           min: 280,
@@ -1225,7 +1218,7 @@ export default function App() {
         open={sidebarOpen}
         blocked={modalWorkspaceOpen}
         sessions={state.bootstrap.sessions}
-        models={state.bootstrap.models}
+        projects={state.bootstrap.projects}
         selectedSessionId={state.selectedSessionId}
         surface={surface}
         devicesAvailable={state.bootstrap.capabilities.connectedDevices}
@@ -1354,12 +1347,6 @@ export default function App() {
           <FixtureModeLabel />
           {surface === "settings" ? (
             <SettingsView
-              themes={state.bootstrap.themes}
-              selectedThemeId={state.bootstrap.selectedThemeId}
-              selectionAvailable={
-                state.bootstrap.capabilities.themeSelection
-              }
-              onThemeChange={(themeId) => void store.selectTheme(themeId)}
               notificationsSupported={notificationState.supported}
               notificationsEnabled={notificationState.enabled}
               notificationPermission={notificationState.permission}

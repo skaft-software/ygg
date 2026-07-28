@@ -1945,6 +1945,7 @@ mod tests {
                 provisional,
                 live_state: SessionLiveState::Idle,
                 attention: AttentionState::None,
+                pull_request: None,
                 owner: ActorOwnerState::Hosted,
                 model: model.clone(),
             },

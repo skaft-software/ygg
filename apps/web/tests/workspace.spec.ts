@@ -51,8 +51,8 @@ async function expectNoViewportOverflow(page: Page) {
         documentFits:
           document.documentElement.scrollWidth <= window.innerWidth + 1,
         shellFits:
-          document.querySelector(".app-shell")?.getBoundingClientRect().width ===
-          window.innerWidth,
+          document.querySelector(".app-shell")?.getBoundingClientRect()
+            .width === window.innerWidth,
       })),
     )
     .toEqual({ documentFits: true, shellFits: true });
@@ -61,7 +61,7 @@ async function expectNoViewportOverflow(page: Page) {
 test.beforeEach(async ({ page }) => {
   await page.goto("/?transport=fixture");
   await expect(
-    page.getByRole("heading", { name: "What can I take off your plate?" }),
+    page.getByRole("heading", { name: "What should we work on?" }),
   ).toBeVisible();
 });
 
@@ -95,43 +95,48 @@ test("opens in a fresh, quiet session with the standard composer", async ({
   await expect(page.locator(".brand-row .ygg-glyph")).toHaveCount(0);
   await expect(page.locator(".local-identity")).toHaveCount(0);
   await expect(page.getByText("Connected to local ygg")).toHaveCount(0);
-  await expect(page.getByText("Pinned", { exact: true })).toBeVisible();
-  await expect(page.getByText("Recents", { exact: true })).toBeVisible();
+  await expect(
+    page
+      .getByRole("tabpanel", { name: "Active sessions" })
+      .getByText("Sessions", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "ygg", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Research notes")).toBeVisible();
   await expect(page.getByLabel("Message ygg")).toBeVisible();
   await expect
     .poll(() =>
       page.evaluate(() => {
         const composer = document.querySelector(".composer")!;
         return {
-          theme: document.documentElement.dataset.theme,
-          border: getComputedStyle(composer).borderColor,
+          theme: document.documentElement.dataset.theme ?? null,
           shimmer: getComputedStyle(composer, "::before").animationName,
         };
       }),
     )
     .toEqual({
-      theme: "tidepool",
-      border: "rgba(0, 0, 0, 0)",
+      theme: null,
       shimmer: "none",
     });
-  await expect(page.getByRole("button", { name: /Model and effort/ })).toHaveAttribute(
-    "data-value",
-    "claude-sonnet-4-6",
-  );
   await expect(
-    page.locator(".activity-rail"),
-  ).toBeHidden();
+    page.getByRole("button", { name: /Model and effort/ }),
+  ).toHaveAttribute("data-value", "claude-sonnet-4-6");
+  await expect(page.locator(".activity-rail")).toBeHidden();
 });
 
 test("keeps composer controls keyboard focusable with a visible focus ring", async ({
   page,
 }) => {
   const attach = page.getByRole("button", { name: "Add files or photos" });
+  const context = page.getByRole("button", { name: "Context", exact: true });
   const model = page.getByRole("button", { name: /Model and effort/ });
   const authority = page.getByLabel("Authority");
 
   await attach.focus();
   await expect(attach).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(context).toBeFocused();
   await page.keyboard.press("Tab");
   await expect(model).toBeFocused();
   await expect
@@ -147,34 +152,48 @@ test("keeps composer controls keyboard focusable with a visible focus ring", asy
   await expect(authority).toBeFocused();
 });
 
-test("uses a static model-colored status and quiet blue activity dots", async ({
+test("shows pull-request marks only for structured PR evidence", async ({
   page,
 }) => {
-  const working = page.getByRole("button", {
-    name: /Refine onboarding preview, Working/,
-  });
-  const status = working.locator(".session-status-dot");
-  await expect(status).toBeVisible();
-  await expect(status).toHaveCSS("animation-name", "none");
-  await expect(working).toHaveCSS("--session-model-color", "#10a37f");
+  await ensureSidebar(page);
 
-  const attention = page.getByRole("button", {
-    name: /Prepare signed macOS build, Needs attention/,
+  const noEvidence = page.getByRole("button", {
+    name: "Open session New session, Ready",
   });
-  const attentionDot = attention.locator(".session-unread");
-  await expect(attentionDot).toBeVisible();
-  await expect(attentionDot).toHaveCSS("background-color", "rgb(110, 184, 255)");
+  await expect(noEvidence.locator(".session-pull-request")).toHaveCount(0);
+  await expect(noEvidence).toHaveText("New session");
 
-  const unread = page.getByRole("button", {
-    name: /Review release readiness, Done/,
+  const inProgress = page.getByRole("button", {
+    name: /Refine onboarding preview, Working, Pull request in progress/,
   });
-  await expect(unread.locator(".session-unread")).toBeVisible();
+  await expect(inProgress).toHaveText("Refine onboarding preview");
+  await expect(inProgress.locator(".session-pull-request")).toHaveCSS(
+    "color",
+    "rgb(139, 143, 152)",
+  );
+
+  const ready = page.getByRole("button", {
+    name: /Prepare signed macOS build, Needs attention, Pull request ready for review/,
+  });
+  await expect(ready).toHaveText("Prepare signed macOS build");
+  await expect(ready.locator(".session-pull-request")).toHaveCSS(
+    "color",
+    "rgb(82, 199, 123)",
+  );
+
+  const merged = page.getByRole("button", {
+    name: /Review release readiness, Done, Pull request merged/,
+  });
+  await expect(merged).toHaveText("Review release readiness");
+  await expect(merged.locator(".session-pull-request")).toHaveCSS(
+    "color",
+    "rgb(167, 139, 250)",
+  );
 });
 
-test("uploads an image, sends it without text, and restores thumbnail focus", async (
-  { page },
-  testInfo,
-) => {
+test("uploads an image, sends it without text, and restores thumbnail focus", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   const picker = page.locator('input[type="file"]');
   await expect(picker).toHaveAttribute("accept", /image\/\*/);
@@ -215,106 +234,290 @@ test("uploads an image, sends it without text, and restores thumbnail focus", as
   await expect(thumbnail).toBeVisible();
   await thumbnail.focus();
   await thumbnail.press("Enter");
-  await expect(page.getByRole("dialog", { name: "Preview tiny.png" })).toBeVisible();
+  await expect(
+    page.getByRole("dialog", { name: "Preview tiny.png" }),
+  ).toBeVisible();
   await page.keyboard.press("Escape");
-  await expect(page.getByRole("dialog", { name: "Preview tiny.png" })).toHaveCount(0);
+  await expect(
+    page.getByRole("dialog", { name: "Preview tiny.png" }),
+  ).toHaveCount(0);
   await expect(thumbnail).toBeFocused();
 });
 
-test("uses one keyboard-operable reasoning slider with static reduced motion", async (
-  { page },
-  testInfo,
-) => {
+test("uses blue effort fill, sparkling white dots, and a max-only rainbow", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   await page.getByRole("button", { name: /Model and effort/ }).click();
   const slider = page.getByRole("slider", { name: "Reasoning effort" });
-  await expect(slider).toHaveAttribute("aria-valuetext", "Max");
-  await expect(page.locator(".power-slider-root")).toHaveAttribute(
-    "data-overdrive",
-    "true",
-  );
-  await expect(page.locator(".power-slider-fast-particles i")).toHaveCount(10);
-  await expect
-    .poll(() =>
-      page.evaluate(() => ({
-        particle: getComputedStyle(
-          document.querySelector(".power-slider-fast-particles i")!,
-        ).backgroundColor,
-        thumb: getComputedStyle(
-          document.querySelector(".power-slider-thumb")!,
-        ).backgroundColor,
-      })),
-    )
-    .toEqual({
-      particle: "rgb(255, 255, 255)",
-      thumb: "rgb(255, 255, 255)",
-    });
-  await slider.press("ArrowLeft");
-  await expect(slider).toHaveAttribute("aria-valuetext", "Medium");
-  await expect(page.locator(".power-slider-root")).toHaveAttribute(
-    "data-overdrive",
-    "false",
-  );
-  await expect(page.locator(".power-slider-fast-particles i")).toHaveCount(0);
-  await slider.press("ArrowRight");
-  await expect(slider).toHaveAttribute("aria-valuetext", "Max");
-  await expect(page.locator(".power-slider-max-fill")).toBeVisible();
-  await expect(page.locator(".power-slider-burst")).toHaveCount(0);
-  await expect
-    .poll(() =>
-      page
-        .locator(".power-slider-max-fill")
-        .evaluate((element) => {
-          const style = getComputedStyle(element);
-          const flow = getComputedStyle(element, "::after");
-          return {
-            background: style.backgroundImage,
-            animation: flow.animationName,
-            duration: flow.animationDuration,
-          };
-        }),
-    )
-    .toEqual({
-      background: expect.stringContaining("rgb(66, 207, 155)"),
-      animation: "power-rainbow-flow",
-      duration: "9s",
+  const root = page.locator(".power-slider-root");
+  const track = page.locator(".power-slider-track");
+  const range = page.locator(".power-slider-range");
+  const fill = page.locator(".power-slider-max-fill");
+  const particles = page.locator(".power-slider-fast-particles");
+  const particle = particles.locator(":scope > span").first();
+  const compactEffort = page.locator(".model-picker-trigger-effort");
+  const ordinaryFillGeometry = () =>
+    page.evaluate(() => {
+      const track = document.querySelector<HTMLElement>(".power-slider-track")!;
+      const range = document.querySelector<HTMLElement>(".power-slider-range")!;
+      const thumb = document.querySelector<HTMLElement>(".power-slider-thumb")!;
+      const trackRect = track.getBoundingClientRect();
+      const rangeRect = range.getBoundingClientRect();
+      const thumbRect = thumb.getBoundingClientRect();
+      return {
+        fillRatio: rangeRect.width / trackRect.width,
+        thumbEndGap: trackRect.right - thumbRect.right,
+        thumbOverlap: rangeRect.right - (thumbRect.left + thumbRect.width / 2),
+      };
     });
 
+  await expect(compactEffort).toHaveCSS("background-image", "none");
+  await expect(slider).toHaveAttribute("aria-valuetext", "Max");
+  await expect(root).toHaveAttribute("data-max", "false");
+  await expect(root).toHaveAttribute("data-overdrive", "false");
+  await expect(range).toHaveCSS("background-color", "rgb(79, 141, 247)");
+  await expect(range).toHaveCSS("background-image", "none");
+  await expect(fill).toHaveCSS("animation-name", "none");
+  await expect(fill).toHaveCSS("opacity", "0");
+  await expect(particles).toHaveCSS("opacity", "0");
+  await expect(particles.locator(":scope > span")).toHaveCount(12);
+  const highGeometry = await ordinaryFillGeometry();
+  expect(highGeometry.fillRatio).toBeGreaterThan(0.9);
+  expect(highGeometry.fillRatio).toBeLessThan(1);
+  expect(highGeometry.thumbOverlap).toBeCloseTo(6, 0);
+  expect(highGeometry.thumbEndGap).toBeCloseTo(0, 0);
+
+  await root.evaluate((element) => {
+    element.dataset.overdrive = "true";
+  });
+  await expect(particles).toHaveCSS("opacity", "0.9");
+  await expect(particle).toHaveCSS(
+    "animation-name",
+    "reasoning-particle-float",
+  );
+  const floatingParticle = await particle.evaluate((element) => {
+    const style = getComputedStyle(element);
+    const animation = element.getAnimations()[0];
+    const keyframes =
+      animation?.effect instanceof KeyframeEffect
+        ? animation.effect.getKeyframes()
+        : [];
+    return {
+      background: style.backgroundColor,
+      width: style.width,
+      height: style.height,
+      radius: style.borderRadius,
+      changesTrackPosition: keyframes.some((frame) => "left" in frame),
+    };
+  });
+  expect(floatingParticle).toEqual({
+    background: "rgb(255, 255, 255)",
+    width: "2px",
+    height: "2px",
+    radius: "50%",
+    changesTrackPosition: false,
+  });
+
+  const particleSizes = await particles
+    .locator(":scope > span")
+    .evaluateAll((dots) =>
+      [...new Set(dots.map((dot) => getComputedStyle(dot).width))].sort(),
+    );
+  expect(particleSizes).toEqual(["1.5px", "2.5px", "2px", "3px"]);
+
+  await root.evaluate((element) => {
+    element.dataset.overdrive = "false";
+    element.dataset.max = "true";
+  });
+  await expect(particles).toHaveCSS("opacity", "0.9");
+  await expect(particle).toHaveCSS(
+    "animation-name",
+    "reasoning-particle-float",
+  );
+  await expect(range).toHaveCSS("opacity", "0");
+  await expect(fill).toHaveCSS("opacity", "1");
+  await expect(fill).toHaveCSS("animation-name", "reasoning-spectrum-shift");
+  await expect(fill).toHaveCSS("background-repeat", "no-repeat");
+  await expect(fill).toHaveCSS("background-size", "200% 100%");
+  const maxPresentation = await fill.evaluate((element) => {
+    const style = getComputedStyle(element);
+    const keyframes = element
+      .getAnimations()
+      .flatMap((animation) =>
+        animation.effect instanceof KeyframeEffect
+          ? animation.effect.getKeyframes()
+          : [],
+      )
+      .filter((frame) => frame.backgroundPositionX !== undefined);
+    return {
+      image: style.backgroundImage,
+      animationEnd: String(keyframes.at(-1)?.backgroundPositionX ?? ""),
+      fillRatio:
+        element.getBoundingClientRect().width /
+        document
+          .querySelector<HTMLElement>(".power-slider-track")!
+          .getBoundingClientRect().width,
+      thumb: getComputedStyle(
+        document.querySelector<HTMLElement>(".power-slider-thumb")!,
+      ).backgroundColor,
+    };
+  });
+  expect(maxPresentation.image).toContain("linear-gradient");
+  expect(maxPresentation.animationEnd).toContain("100%");
+  expect(maxPresentation.fillRatio).toBeCloseTo(1, 2);
+  expect(maxPresentation.thumb).toBe("rgb(236, 236, 239)");
+
+  await root.evaluate((element) => {
+    element.dataset.max = "false";
+  });
+  await slider.press("ArrowLeft");
+  await expect(slider).toHaveAttribute("aria-valuetext", "Medium");
+  await expect(root).toHaveAttribute("data-max", "false");
+  await expect(root).toHaveAttribute("data-overdrive", "false");
+  await expect
+    .poll(async () => {
+      const rangeRect = await range.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        return { right: rect.right, width: rect.width };
+      });
+      const thumbCenter = await page
+        .locator(".power-slider-thumb")
+        .evaluate((element) => {
+          const rect = element.getBoundingClientRect();
+          return rect.left + rect.width / 2;
+        });
+      const trackWidth = await track.evaluate(
+        (element) => element.getBoundingClientRect().width,
+      );
+      const fillRatio = rangeRect.width / trackWidth;
+      return (
+        fillRatio > 0.5 && fillRatio < 0.6 && rangeRect.right - thumbCenter >= 5
+      );
+    })
+    .toBe(true);
+  const mediumGeometry = await page.evaluate(() => {
+    const track = document.querySelector<HTMLElement>(".power-slider-track")!;
+    const range = document.querySelector<HTMLElement>(".power-slider-range")!;
+    const thumb = document.querySelector<HTMLElement>(".power-slider-thumb")!;
+    const trackRect = track.getBoundingClientRect();
+    const rangeRect = range.getBoundingClientRect();
+    const thumbRect = thumb.getBoundingClientRect();
+    return {
+      fillRatio: rangeRect.width / trackRect.width,
+      thumbOverlap: rangeRect.right - (thumbRect.left + thumbRect.width / 2),
+      rightRadius: getComputedStyle(range).borderTopRightRadius,
+    };
+  });
+  expect(mediumGeometry.fillRatio).toBeGreaterThan(0.5);
+  expect(mediumGeometry.fillRatio).toBeLessThan(0.6);
+  expect(mediumGeometry.thumbOverlap).toBeGreaterThanOrEqual(5);
+  expect(mediumGeometry.rightRadius).toBe("0px");
+
+  await slider.press("ArrowRight");
+  await expect(slider).toHaveAttribute("aria-valuetext", "Max");
+  await expect
+    .poll(async () => {
+      const geometry = await ordinaryFillGeometry();
+      return (
+        geometry.fillRatio > 0.9 &&
+        geometry.fillRatio < 1 &&
+        geometry.thumbOverlap >= 5 &&
+        Math.abs(geometry.thumbEndGap) < 0.5
+      );
+    })
+    .toBe(true);
+
+  await root.evaluate((element) => {
+    element.dataset.max = "true";
+    element.dataset.overdrive = "true";
+  });
   await page.evaluate(() => {
     document.documentElement.dataset.motion = "none";
   });
+  await expect(particles).toHaveCSS("display", "none");
   await expect
     .poll(() =>
-      page
-        .locator(".power-slider-fast-particles i")
-        .first()
-        .evaluate((element) => getComputedStyle(element).animationDuration),
+      fill.evaluate((element) => {
+        const style = getComputedStyle(element);
+        return {
+          animation: style.animationName,
+          image: style.backgroundImage,
+          transition: style.transitionDuration,
+        };
+      }),
     )
-    .toBe("1e-06s");
+    .toEqual({
+      animation: "none",
+      image: expect.stringContaining("linear-gradient"),
+      transition: "0s",
+    });
 });
 
 test("shows typed work and a conditional activity rail", async ({ page }) => {
   await selectSession(page, "Refine onboarding preview");
   const conversation = page.getByRole("region", { name: "Conversation" });
-  await expect(
-    conversation.getByText("Read onboarding flow"),
-  ).toBeVisible();
-  await expect(
-    conversation.getByRole("button", {
-      name: "Checking the narrow layout",
+  const historySummary = conversation.getByRole("button", {
+    name: "Read files, edited file, viewed preview",
+  });
+  await expect(historySummary).toBeVisible();
+  await expect(historySummary).toHaveAttribute("aria-expanded", "false");
+  const historyContent = conversation.locator(".work-group-content-clip");
+  await expect(historyContent).toHaveAttribute("inert", "");
+  const liveReasoning = conversation.locator(
+    ".work-group-live-item .reasoning-block",
+  );
+  await expect(liveReasoning).toContainText("Checking the narrow layout");
+  await expect(liveReasoning).not.toHaveAttribute("open", "");
+  await historySummary.click();
+  await expect(historySummary).toHaveAttribute("aria-expanded", "true");
+  await expect(historyContent).not.toHaveAttribute("inert");
+  await expect(conversation.getByText("Read onboarding flow")).toBeVisible();
+  const expandedAction = conversation
+    .locator(".action-cell")
+    .filter({ hasText: "Read onboarding flow" });
+  await expandedAction.locator(":scope > summary").click();
+  await expect(expandedAction).toHaveAttribute("open", "");
+  expect(
+    await expandedAction.evaluate((action) => {
+      const detail = action.querySelector<HTMLElement>(".action-detail")!;
+      const surfaces = [action, action.querySelector("summary")!, detail];
+      return {
+        borderless: surfaces.every((surface) => {
+          const style = getComputedStyle(surface);
+          return [
+            style.borderTopWidth,
+            style.borderRightWidth,
+            style.borderBottomWidth,
+            style.borderLeftWidth,
+          ].every((width) => width === "0px");
+        }),
+        transparentRow:
+          getComputedStyle(action).backgroundColor === "rgba(0, 0, 0, 0)",
+        tonalDetail:
+          getComputedStyle(detail).backgroundColor !== "rgba(0, 0, 0, 0)",
+      };
     }),
-  ).toBeVisible();
+  ).toEqual({ borderless: true, tonalDetail: true, transparentRow: true });
   await expect
     .poll(() =>
-      page.locator(".composer").evaluate((composer) => ({
-        border: getComputedStyle(composer).borderColor,
-        shimmer: getComputedStyle(composer, "::before").animationName,
-        perimeter:
-          composer.querySelector(".composer-running-edge-chase") !== null,
-      })),
+      page.locator(".composer").evaluate((composer) => {
+        const style = getComputedStyle(composer);
+        const wrap = composer.closest<HTMLElement>(".composer-wrap");
+        return {
+          borderWidth: style.borderWidth,
+          shadedSurface:
+            style.backgroundColor !== "rgba(0, 0, 0, 0)" &&
+            style.backgroundColor !== getComputedStyle(wrap!).backgroundColor,
+          shimmer: getComputedStyle(composer, "::before").animationName,
+          perimeter:
+            composer.querySelector(".composer-running-edge-chase") !== null,
+        };
+      }),
     )
     .toEqual({
-      border: "rgba(0, 0, 0, 0)",
+      borderWidth: "0px",
+      shadedSurface: true,
       shimmer: "none",
       perimeter: false,
     });
@@ -323,14 +526,48 @@ test("shows typed work and a conditional activity rail", async ({ page }) => {
     page.getByRole("button", { name: "Queue follow-up" }),
   ).toHaveCount(0);
   await ensureActivityOpen(page);
-  await expect(page.getByText("Verifying keyboard and touch behavior")).toBeVisible();
-  await expect(page.getByRole("button", { name: /Onboarding preview/ })).toBeVisible();
+  await expect(
+    page.getByText("Verifying keyboard and touch behavior"),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: /Onboarding preview/ }),
+  ).toBeVisible();
 });
 
-test("keeps the 1,000-item performance fixture bounded and quiet", async (
-  { page },
-  testInfo,
-) => {
+test("matches the settled desktop workbench shell", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop");
+  test.skip(
+    process.platform !== "darwin",
+    "The checked-in visual baseline targets the macOS desktop host.",
+  );
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await selectSession(page, "Review release readiness");
+  await ensureActivityOpen(page);
+  await expect(
+    page.locator(".activity-rail").getByText("release-pulse.html", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(page.getByLabel("Message ygg")).toHaveAttribute(
+    "placeholder",
+    "Reply…",
+  );
+  await page.evaluate(() => document.fonts.ready);
+
+  await expect(page.locator(".app-shell")).toHaveScreenshot(
+    "workbench-shell-settled.png",
+    {
+      animations: "disabled",
+      caret: "hide",
+    },
+  );
+});
+
+test("keeps the 1,000-item performance fixture bounded and quiet", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   await page.goto("/?transport=fixture&fixture=performance");
 
@@ -338,12 +575,12 @@ test("keeps the 1,000-item performance fixture bounded and quiet", async (
   const transcript = conversation.locator(".transcript");
   await expect(transcript).toHaveAttribute("data-item-count", "1000");
   await expect(conversation.locator(".command-batch")).toHaveCount(1);
+  await expect(conversation.locator(".command-batch > summary")).toHaveText(
+    "Ran 100 commands",
+  );
   await expect(
     conversation.locator(".command-batch > summary"),
-  ).toContainText("Ran 100 bash commands");
-  await expect(
-    conversation.locator(".command-batch > summary"),
-  ).toContainText("100 succeeded");
+  ).not.toContainText(/bash|succeeded/i);
   await expect
     .poll(() =>
       conversation
@@ -353,22 +590,22 @@ test("keeps the 1,000-item performance fixture bounded and quiet", async (
     )
     .toBe("auto");
   expect(
-    await conversation.evaluate((element) =>
-      element
-        .getAnimations({ subtree: true })
-        .filter(
-          (animation) =>
-            animation.effect instanceof KeyframeEffect &&
-            animation.effect.getTiming().iterations === Infinity,
-        ).length,
+    await conversation.evaluate(
+      (element) =>
+        element
+          .getAnimations({ subtree: true })
+          .filter(
+            (animation) =>
+              animation.effect instanceof KeyframeEffect &&
+              animation.effect.getTiming().iterations === Infinity,
+          ).length,
     ),
   ).toBeLessThanOrEqual(1);
 });
 
-test("rehydrates a replayed background run while concurrent sessions remain live", async (
-  { page },
-  testInfo,
-) => {
+test("rehydrates a replayed background run while concurrent sessions remain live", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   await page.goto("/?transport=fixture&fixture=performance");
   await ensureSidebar(page);
@@ -391,9 +628,7 @@ test("rehydrates a replayed background run while concurrent sessions remain live
 
   await page.reload();
   await expect(transcript).toHaveAttribute("data-session-sequence", "3407");
-  await expect(
-    page.getByText("Replayed durable session events"),
-  ).toBeVisible();
+  await expect(page.getByText("Replayed durable session events")).toBeVisible();
   await ensureSidebar(page);
   await expect(page.locator(".session-row[data-status='working']")).toHaveCount(
     3,
@@ -404,10 +639,9 @@ test("rehydrates a replayed background run while concurrent sessions remain live
   await expect(transcript).toHaveAttribute("data-session-sequence", "1001");
 });
 
-test("does not pull a scrolled-away performance transcript to the latest item", async (
-  { page },
-  testInfo,
-) => {
+test("does not pull a scrolled-away performance transcript to the latest item", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   await page.goto("/?transport=fixture&fixture=performance");
 
@@ -420,7 +654,9 @@ test("does not pull a scrolled-away performance transcript to the latest item", 
   });
   await scroll.focus();
   await page.keyboard.press("Home");
-  await expect(page.getByRole("button", { name: "Jump to latest" })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Jump to latest" }),
+  ).toBeVisible();
   const manualScrollPosition = await scroll.evaluate((element) => ({
     top: element.scrollTop,
     maximum: element.scrollHeight - element.clientHeight,
@@ -493,7 +729,8 @@ test("does not pull a scrolled-away performance transcript to the latest item", 
     const submit = document.querySelector<HTMLButtonElement>(
       'button[aria-label="Queue follow-up"]',
     );
-    if (!submit) throw new Error("Performance fixture submit button is missing.");
+    if (!submit)
+      throw new Error("Performance fixture submit button is missing.");
     submit.click();
   });
   await expect(transcript).toHaveAttribute("data-item-count", "1000");
@@ -575,9 +812,9 @@ test("does not pull a scrolled-away performance transcript to the latest item", 
     contentType: "application/json",
   });
 
-  expect(manualScrollPosition.maximum - manualScrollPosition.top).toBeGreaterThan(
-    1_000,
-  );
+  expect(
+    manualScrollPosition.maximum - manualScrollPosition.top,
+  ).toBeGreaterThan(1_000);
   expect(position.maximum - position.top).toBeGreaterThan(1_000);
   expect(position.top).toBeLessThan(position.maximum / 4);
   expect(performanceProbe?.frameCount).toBeGreaterThanOrEqual(80);
@@ -586,13 +823,14 @@ test("does not pull a scrolled-away performance transcript to the latest item", 
   expect(performanceProbe?.longTaskObservationSupported).toBe(true);
   expect(performanceProbe?.longTaskCount).toBe(0);
   expect(performanceProbe?.maximumLongTaskMs).toBeLessThanOrEqual(50);
-  await expect(page.getByRole("button", { name: "Jump to latest" })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Jump to latest" }),
+  ).toBeVisible();
 });
 
-test("matches the settled 1,000-item performance viewport", async (
-  { page },
-  testInfo,
-) => {
+test("matches the settled 1,000-item performance viewport", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   test.skip(
     process.platform !== "darwin",
@@ -616,10 +854,9 @@ test("matches the settled 1,000-item performance viewport", async (
   });
 });
 
-test("resizes the desktop activity pane and remembers its width", async (
-  { page },
-  testInfo,
-) => {
+test("resizes the desktop activity pane and remembers its width", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   await selectSession(page, "Refine onboarding preview");
   await ensureActivityOpen(page);
@@ -627,16 +864,16 @@ test("resizes the desktop activity pane and remembers its width", async (
   const separator = page.getByRole("separator", {
     name: "Resize session activity",
   });
-  await expect(separator).toHaveAttribute("aria-valuenow", "320");
+  await expect(separator).toHaveAttribute("aria-valuenow", "400");
   await separator.press("ArrowLeft");
-  await expect(separator).toHaveAttribute("aria-valuenow", "336");
+  await expect(separator).toHaveAttribute("aria-valuenow", "416");
 
   await page.reload();
   await selectSession(page, "Refine onboarding preview");
   await ensureActivityOpen(page);
   await expect(
     page.getByRole("separator", { name: "Resize session activity" }),
-  ).toHaveAttribute("aria-valuenow", "336");
+  ).toHaveAttribute("aria-valuenow", "416");
 });
 
 test("keeps the model picker inside the phone viewport", async ({
@@ -677,10 +914,9 @@ test("keeps the model picker inside the phone viewport", async ({
   await expect(trigger).toBeFocused();
 });
 
-test("closes the session actions menu with Escape and restores its trigger", async (
-  { page },
-  testInfo,
-) => {
+test("closes the session actions menu with Escape and restores its trigger", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   const trigger = page.getByRole("button", { name: "Session actions" });
   await trigger.focus();
@@ -691,10 +927,9 @@ test("closes the session actions menu with Escape and restores its trigger", asy
   await expect(trigger).toBeFocused();
 });
 
-test("treats the narrow activity rail as a dismissible keyboard overlay", async (
-  { page },
-  testInfo,
-) => {
+test("treats the narrow activity rail as a dismissible keyboard overlay", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "mobile");
   await selectSession(page, "Refine onboarding preview");
   const trigger = page.getByRole("button", { name: "Open activity" });
@@ -710,10 +945,9 @@ test("treats the narrow activity rail as a dismissible keyboard overlay", async 
   await expect(trigger).toBeFocused();
 });
 
-test("opens an output into the dominant preview inspector", async (
-  { page },
-  testInfo,
-) => {
+test("opens an output into the dominant preview inspector", async ({
+  page,
+}, testInfo) => {
   await selectSession(page, "Review release readiness");
   await ensureActivityOpen(page);
   await releasePulseArtifact(page).click();
@@ -721,12 +955,10 @@ test("opens an output into the dominant preview inspector", async (
   if (testInfo.project.name !== "desktop") {
     await expect
       .poll(() =>
-        page
-          .getByLabel("Release pulse inspector")
-          .evaluate((element) => ({
-            opacity: getComputedStyle(element).opacity,
-            animation: getComputedStyle(element).animationName,
-          })),
+        page.getByLabel("Release pulse inspector").evaluate((element) => ({
+          opacity: getComputedStyle(element).opacity,
+          animation: getComputedStyle(element).animationName,
+        })),
       )
       .toEqual({ opacity: "1", animation: "none" });
   }
@@ -799,7 +1031,12 @@ test("matches the settled mobile completion review", async ({
   );
   await page.emulateMedia({ reducedMotion: "reduce" });
   await selectSession(page, "Review release readiness");
-  const review = page.locator(".completion-review:visible").first();
+  const disclosure = page
+    .locator(".completion-review-disclosure:visible")
+    .first();
+  await expect(disclosure).toBeVisible();
+  await disclosure.locator("summary").click();
+  const review = disclosure.locator(".completion-review");
   await expect(review).toBeVisible();
   await review.scrollIntoViewIfNeeded();
   await page.evaluate(() => document.fonts.ready);
@@ -809,10 +1046,9 @@ test("matches the settled mobile completion review", async ({
   });
 });
 
-test("keeps the activity rail and dominant viewer usable at 1024px", async (
-  { page },
-  testInfo,
-) => {
+test("keeps the activity rail and dominant viewer usable at 1024px", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "tablet-landscape");
   await selectSession(page, "Review release readiness");
   const rail = await ensureActivityOpen(page);
@@ -844,10 +1080,9 @@ test("keeps the activity rail and dominant viewer usable at 1024px", async (
     .toBeGreaterThanOrEqual(689);
 });
 
-test("returns focus to a visible activity trigger after closing an inspector", async (
-  { page },
-  testInfo,
-) => {
+test("returns focus to a visible activity trigger after closing an inspector", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   await selectSession(page, "Review release readiness");
   await ensureActivityOpen(page);
@@ -859,9 +1094,7 @@ test("returns focus to a visible activity trigger after closing an inspector", a
   const inspector = page.getByLabel("Release pulse inspector");
   await expect
     .poll(() =>
-      inspector.evaluate((element) =>
-        element.contains(document.activeElement),
-      ),
+      inspector.evaluate((element) => element.contains(document.activeElement)),
     )
     .toBe(true);
   await page.keyboard.press("Escape");
@@ -876,53 +1109,17 @@ test("renders an explicit approval decision", async ({ page }) => {
   await expect(page.getByText("Allowed once")).toBeVisible();
 });
 
-test("uses the projected ten-theme catalog and changes pigment", async (
-  { page },
-  testInfo,
-) => {
+test("uses one fixed workbench appearance", async ({ page }) => {
   await ensureSidebar(page);
   await page.getByRole("button", { name: /Settings/ }).click();
-  await expect(page.getByRole("heading", { name: "Appearance" })).toBeVisible();
-  await expect(page.locator(".theme-options button")).toHaveCount(10);
-
-  await page.getByRole("button", { name: /Field Notes/ }).click();
-  await expect
-    .poll(() =>
-      page.evaluate(() =>
-        getComputedStyle(document.documentElement)
-          .getPropertyValue("--theme-pigment")
-          .trim(),
-      ),
-    )
-    .toBe("rgb(110 126 53)");
-  if (testInfo.project.name === "desktop") {
-    await page.screenshot({
-      path: testInfo.outputPath("theme-field-notes.png"),
-      fullPage: true,
-    });
-  }
-
-  await page.getByRole("button", { name: /Signal Noir/ }).click();
-  await expect
-    .poll(() =>
-      page.evaluate(() =>
-        getComputedStyle(document.documentElement)
-          .getPropertyValue("--theme-pigment")
-          .trim(),
-      ),
-    )
-    .toBe("rgb(181 44 58)");
-  if (testInfo.project.name === "desktop") {
-    await page.screenshot({
-      path: testInfo.outputPath("theme-signal-noir.png"),
-      fullPage: true,
-    });
-    await page.getByRole("button", { name: /Circuit Garden/ }).click();
-    await page.screenshot({
-      path: testInfo.outputPath("theme-circuit-garden.png"),
-      fullPage: true,
-    });
-  }
+  await expect(
+    page.getByRole("heading", { name: "Interface type" }),
+  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Appearance" })).toHaveCount(
+    0,
+  );
+  await expect(page.locator(".theme-options")).toHaveCount(0);
+  await expect(page.locator("html")).not.toHaveAttribute("data-theme");
 });
 
 test("opens connected devices only when the host advertises them", async ({
@@ -936,10 +1133,9 @@ test("opens connected devices only when the host advertises them", async ({
   await expect(page.getByText("Secure local network")).toBeVisible();
 });
 
-test("honors reduced motion for live status animation", async (
-  { page },
-  testInfo,
-) => {
+test("honors reduced motion for live status animation", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   await page.emulateMedia({ reducedMotion: "reduce" });
   await selectSession(page, "Refine onboarding preview");
@@ -962,10 +1158,9 @@ test("honors reduced motion for live status animation", async (
     .toEqual({ durationIsReduced: true, iterations: "1" });
 });
 
-test("preserves core flows at a 200-percent equivalent reflow", async (
-  { page },
-  testInfo,
-) => {
+test("preserves core flows at a 200-percent equivalent reflow", async ({
+  page,
+}, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
   await page.setViewportSize({ width: 720, height: 450 });
 
@@ -985,10 +1180,9 @@ test("preserves core flows at a 200-percent equivalent reflow", async (
   await expectNoViewportOverflow(page);
 });
 
-test("opens and dismisses the mobile sidebar with Escape", async (
-  { page },
-  testInfo,
-) => {
+test("opens and dismisses the mobile sidebar with Escape", async ({
+  page,
+}, testInfo) => {
   test.skip(
     testInfo.project.name !== "mobile" &&
       testInfo.project.name !== "mobile-small",

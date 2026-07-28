@@ -13,11 +13,12 @@ use ygg_serve_backend::{
     HostBootstrap, HostCapabilities, HostCommand, HostCommandAck, HostCommandEnvelope,
     HostDescriptor, HostId, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
     ModelSelection, ModelSummary, ProjectCatalog, ProjectId, ProjectSummary, PromptInput,
-    ProtocolValidation, RunId, RunOutcome, SessionBranchEntry, SessionBranchEntryKind,
-    SessionBranchGraph, SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId,
-    SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity,
-    ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
-    ToolActivity, ToolActivityStatus, ToolKind, TurnId, UsageSnapshot, UserMessageDelivery,
+    ProtocolValidation, PullRequestState, PullRequestSummary, RunId, RunOutcome,
+    SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionCommand,
+    SessionCommandEnvelope, SessionCursor, SessionId, SessionItem, SessionLiveState,
+    SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion,
+    ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, ToolActivity,
+    ToolActivityStatus, ToolKind, TurnId, UsageSnapshot, UserMessageDelivery,
 };
 
 fn model_selection() -> ModelSelection {
@@ -214,6 +215,9 @@ fn bootstrap() -> HostBootstrap {
             provisional: false,
             live_state: SessionLiveState::Idle,
             attention: AttentionState::None,
+            pull_request: Some(PullRequestSummary {
+                state: PullRequestState::Ready,
+            }),
             owner: ActorOwnerState::Hosted,
             model: model_selection(),
         }],

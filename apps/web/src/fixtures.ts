@@ -185,6 +185,7 @@ export const fixtureBootstrap: HostBootstrap = {
       unread: false,
       modelId: "gpt-5.4",
       attentionCount: 0,
+      pullRequest: { state: "in_progress" },
     },
     {
       id: "session-attention",
@@ -199,6 +200,7 @@ export const fixtureBootstrap: HostBootstrap = {
       unread: true,
       modelId: "claude-sonnet-4-6",
       attentionCount: 1,
+      pullRequest: { state: "ready" },
     },
     {
       id: "session-done",
@@ -213,6 +215,7 @@ export const fixtureBootstrap: HostBootstrap = {
       unread: true,
       modelId: "qwen3.5-27b",
       attentionCount: 0,
+      pullRequest: { state: "merged" },
     },
     {
       id: "session-recent",

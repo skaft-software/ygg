@@ -60,6 +60,7 @@ export function PromptContextPicker({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const catalogRequestedRef = useRef(false);
   const searchSequenceRef = useRef(0);
+  const contextCount = documents.length + projectFiles.length;
   const selectedIds = new Set(projectFiles.map((file) => file.id));
   const files = searchResult
     ? searchResult.hits.map((hit) => hit.entry)
@@ -173,6 +174,7 @@ export function PromptContextPicker({
         type="button"
         aria-expanded={open}
         aria-haspopup="dialog"
+        aria-label={`Context${contextCount ? ` ${contextCount}` : ""}`}
         onClick={() =>
           setOpen((current) => {
             if (current) searchSequenceRef.current += 1;
@@ -183,9 +185,7 @@ export function PromptContextPicker({
       >
         <FileSearch aria-hidden="true" />
         <span>Context</span>
-        {documents.length + projectFiles.length > 0 ? (
-          <strong>{documents.length + projectFiles.length}</strong>
-        ) : null}
+        {contextCount > 0 ? <strong>{contextCount}</strong> : null}
       </button>
       {open ? (
         <div

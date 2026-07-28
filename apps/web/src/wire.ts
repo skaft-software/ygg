@@ -517,6 +517,19 @@ function projectConversationBranchProvenance(
   };
 }
 
+function projectPullRequest(
+  value: unknown,
+  path: string,
+): NonNullable<SessionSummary["pullRequest"]> {
+  const pullRequest = object(value, path, ["state"]);
+  const state = enumeration(pullRequest.state, `${path}.state`, [
+    "inProgress",
+    "ready",
+    "merged",
+  ] as const);
+  return { state: state === "inProgress" ? "in_progress" : state };
+}
+
 function projectSummary(
   value: unknown,
   path: string,
@@ -537,6 +550,7 @@ function projectSummary(
     "provisional",
     "liveState",
     "attention",
+    "pullRequest",
     "owner",
     "model",
   ]);
@@ -645,6 +659,10 @@ function projectSummary(
     lifecycle,
     retention,
     forkedFrom,
+    pullRequest:
+      summary.pullRequest === undefined
+        ? undefined
+        : projectPullRequest(summary.pullRequest, `${path}.pullRequest`),
     unread: attention === "unreadCompletion",
     modelId: model.model,
     attentionCount:

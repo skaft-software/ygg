@@ -145,9 +145,7 @@ describe("conversation composer", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "Edit this turn" }));
-    expect(
-      screen.getByText("External effects are preserved."),
-    ).toBeVisible();
+    expect(screen.getByText("External effects are preserved.")).toBeVisible();
     const replacement = screen.getByLabelText("Replacement message");
     await user.clear(replacement);
     await user.type(replacement, "Replacement request");
@@ -164,13 +162,8 @@ describe("conversation composer", () => {
         name: "Retry response with another model",
       }),
     );
-    await user.selectOptions(
-      screen.getByLabelText("Model"),
-      "gpt-5.4",
-    );
-    await user.click(
-      screen.getByRole("button", { name: "Retry with model" }),
-    );
+    await user.selectOptions(screen.getByLabelText("Model"), "gpt-5.4");
+    await user.click(screen.getByRole("button", { name: "Retry with model" }));
     expect(onRetryResponse).toHaveBeenCalledWith(
       "entry-assistant",
       expect.objectContaining({ id: "gpt-5.4" }),
@@ -181,9 +174,7 @@ describe("conversation composer", () => {
         name: "Fork conversation here",
       })[0]!,
     );
-    await user.click(
-      screen.getByRole("button", { name: "Fork conversation" }),
-    );
+    await user.click(screen.getByRole("button", { name: "Fork conversation" }));
     expect(onForkConversation).toHaveBeenCalledWith("entry-user");
   });
 
@@ -360,17 +351,13 @@ describe("conversation composer", () => {
     const authority = screen.getByRole("button", {
       name: "Authority: Full access",
     });
-    expect(
-      screen.queryByRole("combobox", { name: "Authority" }),
-    ).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "Authority" })).toBeNull();
     await user.click(authority);
     expect(screen.getByRole("menu", { name: "Authority" })).toBeVisible();
     await user.click(screen.getByLabelText("Message ygg"));
     expect(screen.queryByRole("menu", { name: "Authority" })).toBeNull();
     await user.click(authority);
-    await user.click(
-      screen.getByRole("menuitemradio", { name: /Workspace/ }),
-    );
+    await user.click(screen.getByRole("menuitemradio", { name: /Workspace/ }));
 
     expect(onConfigure).toHaveBeenCalledWith({ authority: "workspace" });
     await waitFor(() => expect(authority).toHaveFocus());
@@ -410,11 +397,14 @@ describe("conversation composer", () => {
     expect(screen.queryByText("Ultra", { exact: true })).toBeNull();
     await user.click(screen.getByRole("button", { name: /Advanced/ }));
     await user.click(
-      screen.getByRole("dialog", { name: "Model and effort" }).querySelector(
-        ".model-picker-setting-row",
-      )!,
+      screen
+        .getByRole("dialog", { name: "Model and effort" })
+        .querySelector(".model-picker-setting-row")!,
     );
-    await user.type(screen.getByRole("textbox", { name: "Search models" }), "gpt");
+    await user.type(
+      screen.getByRole("textbox", { name: "Search models" }),
+      "gpt",
+    );
     await user.click(screen.getByRole("option", { name: /GPT-5.4/ }));
 
     expect(onConfigure).toHaveBeenCalledWith({ modelId: "gpt-5.4" });
@@ -422,11 +412,80 @@ describe("conversation composer", () => {
       screen.getByRole("button", { name: /^Model Claude Sonnet 4\.6/ }),
     ).toBeVisible();
     expect(screen.queryByText("Speed", { exact: true })).toBeNull();
-    await user.click(
-      screen.getByRole("button", { name: /^Effort High/ }),
-    );
+    await user.click(screen.getByRole("button", { name: /^Effort High/ }));
     await user.click(screen.getByRole("option", { name: "Low" }));
     expect(onConfigure).toHaveBeenCalledWith({ reasoning: "low" });
+  });
+
+  it("maps exact xhigh and max effort to particles and max to rainbow", async () => {
+    const user = userEvent.setup();
+    const cases = [
+      {
+        effort: "high",
+        options: ["low", "medium", "high"],
+        max: "false",
+        overdrive: "false",
+        particles: false,
+      },
+      {
+        effort: "xhigh",
+        options: ["low", "medium", "high", "xhigh"],
+        max: "false",
+        overdrive: "true",
+        particles: true,
+      },
+      {
+        effort: "max",
+        options: ["low", "medium", "high", "xhigh", "max"],
+        max: "true",
+        overdrive: "false",
+        particles: true,
+      },
+    ];
+
+    for (const testCase of cases) {
+      const bootstrap = structuredClone(fixtureBootstrap);
+      const session = structuredClone(fixtureSessions["session-fresh"]!);
+      const model = bootstrap.models.find(
+        (candidate) => candidate.id === session.modelId,
+      )!;
+      model.reasoning = testCase.options;
+      model.defaultReasoning = testCase.effort;
+      session.reasoning = testCase.effort;
+
+      const { container, unmount } = render(
+        <Conversation
+          session={session}
+          bootstrap={bootstrap}
+          onSubmit={noOp}
+          onInterrupt={noOp}
+          onConfigure={noOp}
+          onResolveApproval={noOp}
+          onResolveUserInput={noOp}
+          onOpenOutput={() => {}}
+          onOpenSource={() => {}}
+        />,
+      );
+      await user.click(
+        screen.getByRole("button", { name: /Model and effort/ }),
+      );
+
+      const slider =
+        container.querySelector<HTMLElement>(".power-slider-root")!;
+      expect(slider).toHaveAttribute("data-max", testCase.max);
+      expect(slider).toHaveAttribute("data-overdrive", testCase.overdrive);
+      expect(slider.matches('[data-overdrive="true"], [data-max="true"]')).toBe(
+        testCase.particles,
+      );
+      expect(
+        slider.querySelectorAll(".power-slider-fast-particles > span"),
+      ).toHaveLength(12);
+      expect(slider.style.getPropertyValue("--power-position")).toBe("100%");
+      expect(slider.style.getPropertyValue("--power-thumb-position")).toBe(
+        "calc(100% + -14px)",
+      );
+      unmount();
+    }
   });
 
   it("omits unavailable run timing instead of claiming zero work", () => {
@@ -485,9 +544,7 @@ describe("conversation composer", () => {
       />,
     );
 
-    expect(
-      screen.getByRole("heading", { name: "Result" }),
-    ).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Result" })).toBeVisible();
     expect(screen.getByRole("list")).toHaveTextContent(/One\s+Two/);
     expect(screen.getByRole("button", { name: "Copy code" })).toBeVisible();
     expect(container.querySelector("script")).toBeNull();
@@ -567,7 +624,7 @@ describe("conversation composer", () => {
     ).toBeVisible();
   });
 
-  it("smoothly collapses completed work and lets the user reopen it", async () => {
+  it("keeps prior live work collapsed and lets the user reopen it", async () => {
     const user = userEvent.setup();
     const session = structuredClone(fixtureSessions["session-live"]!);
     const props = {
@@ -584,11 +641,23 @@ describe("conversation composer", () => {
       <Conversation session={session} {...props} />,
     );
 
-    const workingSummary = screen.getByRole("button", {
-      name: /Checking the narrow layout/,
+    const historySummary = screen.getByRole("button", {
+      name: "Read files, edited file, viewed preview",
     });
-    expect(workingSummary).toHaveAttribute("aria-expanded", "true");
-    expect(workingSummary.querySelector(".work-group-glyph")).toBeNull();
+    expect(historySummary).toHaveAttribute("aria-expanded", "false");
+    expect(historySummary.querySelector(".work-group-glyph")).toHaveClass(
+      "is-history",
+    );
+    const historyContent = container.querySelector(".work-group-content-clip");
+    expect(historyContent).toHaveAttribute("aria-hidden", "true");
+    expect(historyContent).toHaveAttribute("inert", "");
+    const liveReasoning = screen
+      .getByText("Checking the narrow layout")
+      .closest("details");
+    expect(liveReasoning).not.toHaveAttribute("open");
+    expect(liveReasoning).toBe(
+      container.querySelector(".work-group-live-item .reasoning-block"),
+    );
 
     const completed = structuredClone(session);
     completed.status = "done";
@@ -612,13 +681,22 @@ describe("conversation composer", () => {
     });
     rerender(<Conversation session={completed} {...props} />);
 
-    const summary = screen.getByRole("button", { name: /Worked for/ });
+    const summary = screen.getByRole("button", {
+      name: "Read files, edited file, viewed preview · 5s",
+    });
     expect(summary).toHaveAttribute("aria-expanded", "false");
+    const completedHistoryContent = container.querySelector(
+      ".work-group-content-clip",
+    );
+    expect(completedHistoryContent).toHaveAttribute("aria-hidden", "true");
+    expect(completedHistoryContent).toHaveAttribute("inert", "");
     expect(
-      container.querySelector(".work-group-content-clip"),
-    ).toHaveAttribute("aria-hidden", "true");
+      screen.getByText("Review details").closest("details"),
+    ).not.toHaveAttribute("open");
     await user.click(summary);
     expect(summary).toHaveAttribute("aria-expanded", "true");
+    expect(completedHistoryContent).toHaveAttribute("aria-hidden", "false");
+    expect(completedHistoryContent).not.toHaveAttribute("inert");
   });
 
   it("opens durable diffs, resulting files, and origin-linked evidence", async () => {
@@ -872,9 +950,8 @@ describe("conversation composer", () => {
       />,
     );
 
-    const picker = container.querySelector<HTMLInputElement>(
-      'input[type="file"]',
-    );
+    const picker =
+      container.querySelector<HTMLInputElement>('input[type="file"]');
     expect(picker).not.toBeNull();
     await user.upload(
       picker!,
@@ -887,9 +964,7 @@ describe("conversation composer", () => {
     expect(screen.getByText("Upload failed")).toBeVisible();
     await user.click(retry);
     expect(await screen.findByText("Ready")).toBeVisible();
-    await user.click(
-      screen.getByRole("button", { name: "Remove photo.png" }),
-    );
+    await user.click(screen.getByRole("button", { name: "Remove photo.png" }));
     expect(
       screen.queryByRole("button", { name: "Remove photo.png" }),
     ).toBeNull();
