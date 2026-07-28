@@ -1,39 +1,22 @@
 #!/usr/bin/env python3
 """Read-only Git helpers for Ygg's executable-extension protocol."""
 
-import json
 import os
 from pathlib import Path
 import subprocess
-import sys
+
+from ygg_extension import Extension, RpcError
 
 
-API_VERSION = "0.1"
 MAX_GIT_OUTPUT_BYTES = 256 * 1024
 DEFAULT_MAX_ENTRIES = 80
 MAX_ENTRIES = 200
 
 
-def send(message):
-    print(json.dumps(message, separators=(",", ":")), flush=True)
+ext = Extension()
 
 
-def result(request_id, value):
-    send({"jsonrpc": "2.0", "id": request_id, "result": value})
-
-
-def rpc_error(request_id, code, message):
-    send(
-        {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": code, "message": message},
-        }
-    )
-
-
-def execution_workspace(params):
-    context = params.get("context") or {}
+def execution_workspace(context):
     value = context.get("workspace") or os.environ.get("YGG_WORKSPACE")
     if not value:
         raise ValueError("Ygg did not provide an active workspace")
@@ -144,150 +127,87 @@ def compact_status(status):
     return "\n".join(lines)
 
 
-def initialize(request_id):
-    result(
-        request_id,
-        {
-            "api_version": API_VERSION,
-            "tools": [
-                {
-                    "name": "git_status",
-                    "description": "Inspect the workspace Git status without acquiring optional locks",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "include_ignored": {
-                                "type": "boolean",
-                                "description": "Include ignored paths in the bounded result",
-                                "default": False,
-                            },
-                            "max_entries": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": MAX_ENTRIES,
-                                "default": DEFAULT_MAX_ENTRIES,
-                            },
-                        },
-                        "additionalProperties": False,
-                    },
-                }
-            ],
-            "commands": [
-                {
-                    "name": "checkpoint",
-                    "description": "Preview a named, read-only workspace checkpoint",
-                    "usage": "/checkpoint [label]",
-                }
-            ],
+@ext.tool(
+    name="git_status",
+    description="Inspect the workspace Git status without acquiring optional locks",
+    parameters={
+        "type": "object",
+        "properties": {
+            "include_ignored": {
+                "type": "boolean",
+                "description": "Include ignored paths in the bounded result",
+                "default": False,
+            },
+            "max_entries": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_ENTRIES,
+                "default": DEFAULT_MAX_ENTRIES,
+            },
         },
+        "additionalProperties": False,
+    },
+)
+def git_status(arguments, context):
+    arguments = arguments or {}
+    max_entries = bounded_integer(
+        arguments.get("max_entries"), DEFAULT_MAX_ENTRIES, 1, MAX_ENTRIES
     )
-
-
-def call_tool(request_id, params):
-    if params.get("name") != "git_status":
-        rpc_error(request_id, -32601, "unknown tool")
-        return
-    arguments = params.get("arguments") or {}
+    include_ignored = arguments.get("include_ignored", False)
+    if not isinstance(include_ignored, bool):
+        raise ValueError("include_ignored must be a boolean")
     try:
-        max_entries = bounded_integer(
-            arguments.get("max_entries"), DEFAULT_MAX_ENTRIES, 1, MAX_ENTRIES
-        )
-        include_ignored = arguments.get("include_ignored", False)
-        if not isinstance(include_ignored, bool):
-            raise ValueError("include_ignored must be a boolean")
         status = run_git_status(
-            execution_workspace(params),
+            execution_workspace(context),
             include_ignored=include_ignored,
             max_entries=max_entries,
         )
-        result(
-            request_id,
-            {
-                "content": compact_status(status),
-                "is_error": False,
-                "metadata": status,
-            },
-        )
+        return {"content": compact_status(status), "metadata": status}
     except (RuntimeError, ValueError) as error:
-        result(
-            request_id,
-            {"content": f"git_status failed: {error}", "is_error": True, "metadata": {}},
-        )
+        return {"content": f"git_status failed: {error}", "is_error": True}
 
 
-def execute_checkpoint(request_id, params):
-    if params.get("name") != "checkpoint":
-        rpc_error(request_id, -32601, "unknown command")
-        return
-    arguments = params.get("arguments") or []
+@ext.command(
+    name="checkpoint",
+    description="Preview a named, read-only workspace checkpoint",
+    usage="/checkpoint [label]",
+)
+def checkpoint(arguments, context):
     label = " ".join(arguments).strip() or "working tree"
     try:
-        status = run_git_status(execution_workspace(params))
+        status = run_git_status(execution_workspace(context))
         state = "clean" if status["clean"] else f"{status['total_entries']} changed paths"
-        result(
-            request_id,
-            {
-                "text": f"Checkpoint preview · {label}\n{status['branch']} · {state}\n\n{compact_status(status)}",
-                "notifications": [
-                    {
-                        "level": "info",
-                        "title": "Read-only checkpoint",
-                        "message": "No commit or filesystem mutation was performed.",
-                    }
-                ],
-                "context": [],
-            },
-        )
+        return {
+            "text": f"Checkpoint preview · {label}\n{status['branch']} · {state}\n\n{compact_status(status)}",
+            "notifications": [
+                {
+                    "level": "info",
+                    "title": "Read-only checkpoint",
+                    "message": "No commit or filesystem mutation was performed.",
+                }
+            ],
+            "context": [],
+        }
     except (RuntimeError, ValueError) as error:
-        rpc_error(request_id, -32001, f"checkpoint preview failed: {error}")
+        raise RpcError(-32001, f"checkpoint preview failed: {error}") from error
 
 
-def render_tool(request_id, params):
-    if params.get("name") != "git_status":
-        rpc_error(request_id, -32601, "unknown tool renderer")
-        return
+@ext.renderer("git_status")
+def render_tool(params):
     output = params.get("output") or "git status pending"
     dirty = "state=dirty" in output or params.get("is_error", False)
     state_role = "extension.git_tools.error" if params.get("is_error", False) else (
         "extension.git_tools.dirty" if dirty else "extension.git_tools.clean"
     )
     headline = "git · attention" if dirty else "git · clean"
-    result(
-        request_id,
-        {
-            "segments": [
-                {"text": headline, "style_role": state_role},
-                {"text": "\n", "style_role": None},
-                {"text": output, "style_role": "extension.git_tools.detail"},
-            ]
-        },
-    )
+    return {
+        "segments": [
+            {"text": headline, "style_role": state_role},
+            {"text": "\n", "style_role": None},
+            {"text": output, "style_role": "extension.git_tools.detail"},
+        ]
+    }
 
 
-def handle(request):
-    request_id = request.get("id")
-    method = request.get("method")
-    params = request.get("params") or {}
-    if method == "initialize":
-        initialize(request_id)
-    elif method == "tool/call":
-        call_tool(request_id, params)
-    elif method == "command/execute":
-        execute_checkpoint(request_id, params)
-    elif method == "tool/render":
-        render_tool(request_id, params)
-    elif method == "shutdown":
-        result(request_id, {})
-        return False
-    else:
-        rpc_error(request_id, -32601, f"unknown method: {method}")
-    return True
-
-
-for line in sys.stdin:
-    try:
-        request = json.loads(line)
-        if not handle(request):
-            break
-    except Exception as error:  # Protocol diagnostics must never use stdout.
-        print(f"git-tools extension error: {error}", file=sys.stderr, flush=True)
+if __name__ == "__main__":
+    ext.run()

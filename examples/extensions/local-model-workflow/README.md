@@ -1,7 +1,8 @@
 # local-model-workflow executable extension
 
-This dependency-free example shows how a local-model workflow can remain
-explicit and inspectable instead of silently rewriting prompts. It contributes:
+This Python example uses the dependency-free `ygg-extension-sdk` package to
+show how a local-model workflow can remain explicit and inspectable instead of
+silently rewriting prompts. It contributes:
 
 - a `before_prompt` hook that returns compact, labeled system-suffix context;
 - the same deterministic text through `context/collect` for normal prompt
@@ -9,6 +10,12 @@ explicit and inspectable instead of silently rewriting prompts. It contributes:
 - a semantic status item derived from current model and active-skill metadata;
   and
 - one process-originated notification when prompt shaping first becomes active.
+
+Install the SDK before copying the directory:
+
+```console
+python3 -m pip install ./sdk/python
+```
 
 Copy the directory to `.ygg/extensions/local-model-workflow/`, explicitly
 enable and trust it, then restart Ygg or use `/extensions reload`. The existing

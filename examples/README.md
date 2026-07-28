@@ -4,6 +4,10 @@ These examples are small, copyable starting points for a local Ygg setup. They
 use the same filesystem discovery and typed contribution boundaries as normal
 user resources.
 
+The Python extension examples use the dependency-free `ygg-extension-sdk`.
+Install it with `python3 -m pip install ./sdk/python` before copying an
+extension into a project.
+
 - [`prompts/`](prompts/) — Pi-compatible Markdown prompts and Ygg's compact
   TOML form.
 - [`skills/`](skills/) — explicit, inspectable skills with bounded text

@@ -197,6 +197,40 @@ Use `/extensions reload` to replace each running process after a successful
 handshake. The general `/reload` command re-runs resource discovery and rebuilds
 the product boundary.
 
+## Python SDK
+
+Ygg ships a dependency-free Python package for extensions that use the stdio
+protocol. Install it from a checkout before copying an example or building an
+extension:
+
+```console
+python3 -m pip install ./sdk/python
+```
+
+The package is named `ygg-extension-sdk` and exposes `ygg_extension.Extension`.
+Decorate tools and commands with their manifest metadata, then call
+`Extension.run()`; the SDK owns JSON-RPC 2.0 JSON-lines framing, flushes every
+reply, validates the initialize negotiation, dispatches all typed host methods,
+keeps structured logs on stderr, and exits on shutdown or stdin close.
+
+```python
+from ygg_extension import Extension
+
+ext = Extension()
+
+@ext.tool(name="hello_world", description="Greet someone")
+def hello(args):
+    return {"content": "Hello!"}
+
+ext.run()
+```
+
+Tool and command names must exactly match the manifest. The SDK also provides
+decorators for hooks, prompt context, status surfaces, and tool renderers, plus
+`notify()` and correlated `confirm()` helpers for process-to-host messages.
+See [`sdk/python/README.md`](../sdk/python/README.md) for the complete API and
+the three runnable examples below.
+
 ## Lifecycle and reload
 
 `ExtensionProcess` implements the existing native `Extension` trait, so its
@@ -216,8 +250,7 @@ Shutdown is requested gracefully and bounded by a short timeout. A process
 that does not exit is killed, and dropping the last runtime handle also uses
 kill-on-drop cleanup.
 
-Copyable examples are deliberately more important than a large SDK at this
-stage:
+The SDK-backed examples remain small and copyable:
 
 - [`hello-world`](../examples/extensions/hello-world) demonstrates the minimum
   process and protocol handshake.

@@ -1,38 +1,18 @@
 #!/usr/bin/env python3
 """Inspectable local-model workflow contributions for Ygg."""
 
-import json
 from pathlib import Path
-import sys
+
+from ygg_extension import Extension
 
 
-API_VERSION = "0.1"
+ext = Extension()
 notification_sent = False
 
 
-def send(message):
-    print(json.dumps(message, separators=(",", ":")), flush=True)
-
-
-def result(request_id, value):
-    send({"jsonrpc": "2.0", "id": request_id, "result": value})
-
-
-def rpc_error(request_id, code, message):
-    send(
-        {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": code, "message": message},
-        }
-    )
-
-
-def host_state(params):
-    context = params.get("context") or {}
-    host = context.get("host") or {}
-    workspace = context.get("workspace")
-    return host, workspace
+def host_state(context):
+    context = context or {}
+    return context.get("host") or {}, context.get("workspace")
 
 
 def model_label(host):
@@ -61,109 +41,56 @@ def workflow_context(host, workspace):
     )
 
 
-def initialize(request_id):
-    result(
-        request_id,
-        {"api_version": API_VERSION, "tools": [], "commands": []},
-    )
-
-
-def before_prompt(request_id, params):
+@ext.hook("before_prompt")
+def before_prompt(payload, context):
     global notification_sent
-    if params.get("hook") != "before_prompt":
-        rpc_error(request_id, -32602, "this extension only implements before_prompt")
-        return
-    host, workspace = host_state(params)
     if not notification_sent:
-        send(
-            {
-                "jsonrpc": "2.0",
-                "method": "notification",
-                "params": {
-                    "level": "info",
-                    "title": "Local workflow active",
-                    "message": f"Prompt shaping is enabled for {model_label(host)}.",
-                },
-            }
+        host, _ = host_state(context)
+        ext.notify(
+            f"Prompt shaping is enabled for {model_label(host)}.",
+            level="info",
+            title="Local workflow active",
         )
         notification_sent = True
-    result(
-        request_id,
-        {
-            "disposition": {"action": "continue"},
-            "context": [
-                {
-                    "label": "local-model-workflow",
-                    "content": workflow_context(host, workspace),
-                    "placement": "system_suffix",
-                }
-            ],
-            "notifications": [],
-        },
-    )
-
-
-def collect_context(request_id, params):
-    host, workspace = host_state(params)
-    result(
-        request_id,
-        [
+    host, workspace = host_state(context)
+    return {
+        "disposition": {"action": "continue"},
+        "context": [
             {
                 "label": "local-model-workflow",
                 "content": workflow_context(host, workspace),
                 "placement": "system_suffix",
             }
         ],
-    )
+        "notifications": [],
+    }
 
 
-def collect_status(request_id, params):
-    if params.get("surface") != "status":
-        rpc_error(request_id, -32602, "only the status surface is declared")
-        return
-    host, _ = host_state(params)
+@ext.context
+def collect_context(params):
+    host, workspace = host_state(params.get("context"))
+    return [
+        {
+            "label": "local-model-workflow",
+            "content": workflow_context(host, workspace),
+            "placement": "system_suffix",
+        }
+    ]
+
+
+@ext.status("status")
+def collect_status(params):
+    host, _ = host_state(params.get("context"))
     model = model_label(host)
     skill_count = len(active_skill_names(host))
     suffix = "skill" if skill_count == 1 else "skills"
-    result(
-        request_id,
-        {
-            "surface": "status",
-            "text": f"local · {model} · {skill_count} {suffix}",
-            "style_role": "extension.local_model_workflow.status",
-            "priority": 20,
-        },
-    )
+    return {
+        "surface": params.get("surface", "status"),
+        "text": f"local · {model} · {skill_count} {suffix}",
+        "style_role": "extension.local_model_workflow.status",
+        "priority": 20,
+    }
 
 
-def handle(request):
-    request_id = request.get("id")
-    method = request.get("method")
-    params = request.get("params") or {}
-    if method == "initialize":
-        initialize(request_id)
-    elif method == "hook/run":
-        before_prompt(request_id, params)
-    elif method == "context/collect":
-        collect_context(request_id, params)
-    elif method == "status/collect":
-        collect_status(request_id, params)
-    elif method == "shutdown":
-        result(request_id, {})
-        return False
-    else:
-        rpc_error(request_id, -32601, f"unknown method: {method}")
-    return True
-
-
-for line in sys.stdin:
-    try:
-        request = json.loads(line)
-        if not handle(request):
-            break
-    except Exception as error:  # Protocol diagnostics must never use stdout.
-        print(
-            f"local-model-workflow extension error: {error}",
-            file=sys.stderr,
-            flush=True,
-        )
+if __name__ == "__main__":
+    ext.run()
