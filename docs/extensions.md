@@ -1,5 +1,9 @@
 # Executable extensions
 
+> **Protocol reference:** [`docs/extensions/PROTOCOL-REFERENCE.md`](extensions/PROTOCOL-REFERENCE.md)
+> contains the complete specification of every JSON-RPC method, request/response
+> shape, type reference, and lifecycle timing.
+
 Ygg supports trusted local extension processes alongside native Rust
 `Extension` implementations. Process extensions use JSON-RPC 2.0 messages,
 one compact JSON object per line, over stdin/stdout. They may be written in any
