@@ -3746,6 +3746,22 @@ kbd {
   gap: 5px;
 }
 
+.composer-context-cost {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 4px;
+  color: var(--text-soft);
+  font-size: var(--font-meta);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.composer-context-cost strong {
+  color: var(--text);
+  font-weight: 560;
+}
+
 .composer-icon-button {
   width: 32px;
   height: 32px;

@@ -75,14 +75,15 @@ pub use model::{
     AttachmentPolicy, AttentionState, AuthorityProfile, CatalogCursor, CompletionReview,
     ContextUsage, ConversationBranchOperation, ConversationBranchProvenance, EvidenceCoverage,
     FileChange, HostBootstrap, HostCapabilities, HostDescriptor, InputModality, ItemLifecycle,
-    ItemPayload, ModelSelection, ModelSummary, PendingRequest,
+    ItemPayload, ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary,
+    PendingRequest,
     PlanStep, PlanStepState, PreviewRef, ProjectCatalog, ProjectSummary, PullRequestState,
     PullRequestSummary, RequestKind, RequestState, RunOutcome, SessionBranchEntry,
     SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState, SessionCursor, SessionItem,
     SessionLiveState, SessionRetention,
     SessionSnapshot, SessionSummary, SourceKind, SourceRef,
     ToolActivity, ToolActivityStatus, ToolKind, ToolResultSummary, UsageSnapshot,
-    UserMessageDelivery,
+    UserMessageDelivery, MAX_MODEL_INPUT_PRICING_TIERS,
 };
 pub use prompt_context::{
     compose_prompt_text, ComposedPromptText, PromptContextError,

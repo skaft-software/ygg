@@ -101,6 +101,33 @@ describe("conversation composer", () => {
     await waitFor(() => expect(onListProjectFiles).toHaveBeenCalledOnce());
   });
 
+  it("shows the context percentage and tier-aware input cost estimate", () => {
+    const session = structuredClone(fixtureSessions["session-live"]!);
+    session.modelId = "claude-sonnet-4-6";
+    session.contextTokens = 240_000;
+    session.contextPercent = 60;
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("~$1.44")).toBeVisible();
+    expect(
+      screen.getByLabelText(
+        "60% of context used; estimated next-turn input cost ~$1.44",
+      ),
+    ).toBeVisible();
+  });
+
   it("edits, retries with a model, and forks only from durable checkpoints", async () => {
     const user = userEvent.setup();
     const session = structuredClone(fixtureSessions["session-fresh"]!);

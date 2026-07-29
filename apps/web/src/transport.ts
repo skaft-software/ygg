@@ -659,6 +659,7 @@ export class FixtureTransport implements YggTransport {
         modelId: command.modelId,
         reasoning: command.reasoning,
         authority: command.authority,
+        contextTokens: 0,
         contextPercent: 0,
         startedAt: now,
         branches: { entries: [], truncated: false },
@@ -943,7 +944,7 @@ export class FixtureTransport implements YggTransport {
           type: "session.updated",
           sessionId: command.sessionId,
           sequence: sequence++,
-          patch: { status: "done", contextPercent: 4 },
+          patch: { status: "done", contextTokens: 8_000, contextPercent: 4 },
         });
         this.emit({
           type: "item.started",

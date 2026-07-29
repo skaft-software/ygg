@@ -146,6 +146,16 @@ export interface RepositoryContextSnapshot {
   };
 }
 
+export interface ModelInputPricingTier {
+  minInputTokens: number;
+  microdollarsPerMillionTokens: number;
+}
+
+export interface ModelInputPricing {
+  baseMicrodollarsPerMillionTokens: number;
+  tiers: ModelInputPricingTier[];
+}
+
 export interface ModelSummary {
   id: string;
   name: string;
@@ -154,6 +164,7 @@ export interface ModelSummary {
   available: boolean;
   reasoning: ReasoningEffort[];
   defaultReasoning?: ReasoningEffort;
+  inputPricing?: ModelInputPricing;
   inputModalities: Array<"text" | "image" | "audio" | "document">;
 }
 
@@ -662,6 +673,7 @@ export interface SessionSnapshot {
   modelId: string;
   reasoning: ReasoningEffort;
   authority: AuthorityProfile;
+  contextTokens: number;
   contextPercent: number;
   startedAt: string;
   branches: SessionBranchGraph;
@@ -694,6 +706,7 @@ export type SessionEvent =
           | "modelId"
           | "reasoning"
           | "authority"
+          | "contextTokens"
           | "contextPercent"
         >
       >;

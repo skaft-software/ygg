@@ -12,8 +12,9 @@ use ygg_serve_backend::{
     DeviceId, DurableEntryId, EventEnvelope, EventPayload, EvidenceCoverage, HostAckDisposition,
     HostBootstrap, HostCapabilities, HostCommand, HostCommandAck, HostCommandEnvelope,
     HostDescriptor, HostId, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
-    ModelSelection, ModelSummary, ProjectCatalog, ProjectId, ProjectSummary, PromptInput,
-    ProtocolValidation, PullRequestState, PullRequestSummary, RunId, RunOutcome,
+    ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary, ProjectCatalog,
+    ProjectId, ProjectSummary, PromptInput, ProtocolValidation, PullRequestState,
+    PullRequestSummary, RunId, RunOutcome,
     SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionCommand,
     SessionCommandEnvelope, SessionCursor, SessionId, SessionItem, SessionLiveState,
     SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion,
@@ -180,6 +181,13 @@ fn bootstrap() -> HostBootstrap {
             available: true,
             reasoning: vec!["low".into(), "medium".into(), "high".into()],
             default_reasoning: Some("high".into()),
+            input_pricing: Some(ModelInputPricing {
+                base_microdollars_per_million_tokens: 2_500_000,
+                tiers: vec![ModelInputPricingTier {
+                    min_input_tokens: 200_000,
+                    microdollars_per_million_tokens: 5_000_000,
+                }],
+            }),
             input_modalities: vec![InputModality::Text, InputModality::Image],
         }],
         authority_profiles: vec![
