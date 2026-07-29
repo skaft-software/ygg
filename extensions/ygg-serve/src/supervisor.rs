@@ -646,6 +646,24 @@ impl<H: HostService> SessionSupervisor<H> {
         self.host.session_export(session_id).await
     }
 
+    /// Returns current daily or trailing-seven-day inference usage totals.
+    pub async fn usage_stats(
+        &self,
+        period: crate::UsagePeriod,
+    ) -> Result<crate::UsageStats, crate::ServiceError> {
+        self.host.usage_stats(period).await
+    }
+
+    /// Returns all retained inference usage totals.
+    pub async fn usage_lifetime(&self) -> Result<crate::LifetimeUsage, crate::ServiceError> {
+        self.host.usage_lifetime().await
+    }
+
+    /// Returns recent daily inference activity and lifetime streaks.
+    pub async fn usage_activity(&self) -> Result<crate::UsageActivity, crate::ServiceError> {
+        self.host.usage_activity().await
+    }
+
     /// Subscribes to the ordered live stream across all hosted sessions.
     ///
     /// A lagged subscriber must recover each affected session through replay

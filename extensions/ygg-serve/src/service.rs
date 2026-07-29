@@ -13,7 +13,7 @@ use crate::{
     SessionCommand, SessionId, SessionSnapshot, SessionSummary,
     RepositoryContextSnapshot, StoredAttachment, ThemeId, ThemeOption, TimestampedEvent, TrustedFileEntry,
     TranscriptSearchRequest, TranscriptSearchResult, TrustedFileIndexSummary, TrustedFileRead,
-    TrustedFileSearchResult,
+    TrustedFileSearchResult, LifetimeUsage, UsageActivity, UsagePeriod, UsageStats,
 };
 
 /// Immutable, path-free content behind one host-minted opaque resource handle.
@@ -479,6 +479,21 @@ pub trait HostService: Send + Sync + 'static {
     ///
     /// Adapters must not accept client-selected paths or raw-secret options.
     async fn session_export(&self, _session_id: &crate::SessionId) -> Result<Bytes, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Returns current daily or trailing-seven-day inference usage totals.
+    async fn usage_stats(&self, _period: UsagePeriod) -> Result<UsageStats, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Returns all retained inference usage totals.
+    async fn usage_lifetime(&self) -> Result<LifetimeUsage, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
+
+    /// Returns recent daily inference activity and lifetime streaks.
+    async fn usage_activity(&self) -> Result<UsageActivity, ServiceError> {
         Err(ServiceError::Unavailable)
     }
 
