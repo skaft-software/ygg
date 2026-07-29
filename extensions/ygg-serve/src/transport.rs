@@ -29,9 +29,9 @@ use tokio::task::JoinHandle;
 
 use crate::embedded_web::WebBundle;
 use crate::{
-    AttachmentError, FileEntryId, HostCommandEnvelope, HostService, ProjectId,
-    ProtocolValidation, SanitizedError, ServiceError, SessionCommandEnvelope, SessionCursor,
-    SessionId, SessionSupervisor, SupervisorError, MAX_ATTACHMENT_FILE_BYTES, MAX_COMMAND_BYTES,
+    AttachmentError, FileEntryId, HostCommandEnvelope, HostService, ProjectId, ProtocolValidation,
+    SanitizedError, ServiceError, SessionCommandEnvelope, SessionCursor, SessionId,
+    SessionSupervisor, SupervisorError, MAX_ATTACHMENT_FILE_BYTES, MAX_COMMAND_BYTES,
     MAX_DOCUMENT_FILE_BYTES, PROTOCOL_VERSION,
 };
 

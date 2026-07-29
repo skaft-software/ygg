@@ -372,16 +372,15 @@ impl SessionActorCore {
                 | SessionCommand::EditUserTurn { .. }
                 | SessionCommand::RetryResponse { .. }
                 | SessionCommand::ForkConversation { .. }
-        )
-            && (self.view.snapshot.active_run_id.is_some()
-                || !self.view.snapshot.pending_requests.is_empty()
-                || !matches!(
-                    self.view.snapshot.live_state,
-                    SessionLiveState::Idle
-                        | SessionLiveState::Done
-                        | SessionLiveState::Failed
-                        | SessionLiveState::Stopped
-                ))
+        ) && (self.view.snapshot.active_run_id.is_some()
+            || !self.view.snapshot.pending_requests.is_empty()
+            || !matches!(
+                self.view.snapshot.live_state,
+                SessionLiveState::Idle
+                    | SessionLiveState::Done
+                    | SessionLiveState::Failed
+                    | SessionLiveState::Stopped
+            ))
         {
             return Err(SanitizedError::public(
                 ErrorCode::InvalidBoundary,
@@ -407,7 +406,10 @@ impl SessionActorCore {
             SessionCommand::EditUserTurn {
                 source_user_entry_id,
                 ..
-            } => Some((source_user_entry_id, crate::SessionBranchEntryKind::UserMessage)),
+            } => Some((
+                source_user_entry_id,
+                crate::SessionBranchEntryKind::UserMessage,
+            )),
             SessionCommand::RetryResponse {
                 source_assistant_entry_id,
                 ..
@@ -1117,9 +1119,9 @@ impl From<ActorError> for SanitizedError {
 mod tests {
     use crate::{
         AckDisposition, ActivityPhase, ContextUsage, DurableEntryId, ItemId, ModelSelection,
-        PendingRequest, PromptInput, RequestId, RequestKind, RequestState, RunId, SessionBranchEntry,
-        SessionBranchEntryKind, SessionBranchGraph, SessionId, SessionItem, SessionLiveState,
-        ToolActivity, ToolActivityStatus, ToolKind, TurnId,
+        PendingRequest, PromptInput, RequestId, RequestKind, RequestState, RunId,
+        SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionId, SessionItem,
+        SessionLiveState, ToolActivity, ToolActivityStatus, ToolKind, TurnId,
     };
 
     use super::*;

@@ -1839,12 +1839,7 @@ impl ProtocolValidation for ItemPayload {
                         512,
                         false,
                     )?;
-                    validate_public_text(
-                        "item.user.document.sha256",
-                        &document.sha256,
-                        64,
-                        false,
-                    )?;
+                    validate_public_text("item.user.document.sha256", &document.sha256, 64, false)?;
                 }
                 if project_files.len() > crate::MAX_TRUSTED_FILES_PER_CONTEXT {
                     return Err(ValidationError::new(
@@ -2390,9 +2385,7 @@ mod tests {
         assert!(complete.validate().is_err());
     }
 
-    fn branch_provenance(
-        operation: ConversationBranchOperation,
-    ) -> ConversationBranchProvenance {
+    fn branch_provenance(operation: ConversationBranchOperation) -> ConversationBranchProvenance {
         ConversationBranchProvenance {
             operation,
             source_session_id: SessionId::new("source-session").unwrap(),
@@ -2486,8 +2479,7 @@ mod tests {
         item.validate().unwrap();
 
         let mut retry = branch_provenance(ConversationBranchOperation::RetryResponse);
-        retry.originating_user_entry_id =
-            Some(DurableEntryId::new("originating-user").unwrap());
+        retry.originating_user_entry_id = Some(DurableEntryId::new("originating-user").unwrap());
         retry.model_override = Some(ModelSelection {
             provider: "alternate-provider".into(),
             model: "alternate-model".into(),
@@ -2496,9 +2488,7 @@ mod tests {
         retry.validate().unwrap();
 
         let mut fork = session_summary(SessionCatalogState::Active);
-        fork.forked_from = Some(branch_provenance(
-            ConversationBranchOperation::ForkSession,
-        ));
+        fork.forked_from = Some(branch_provenance(ConversationBranchOperation::ForkSession));
         fork.validate().unwrap();
 
         let mut misleading = branch_provenance(ConversationBranchOperation::EditUserTurn);

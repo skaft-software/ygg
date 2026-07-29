@@ -9,8 +9,8 @@ use crate::bounds::{
     MAX_COMMAND_BYTES, MAX_PROMPT_BYTES,
 };
 use crate::{
-    AuthorityProfile, CatalogCursor, CommandId, DeviceId, DurableEntryId, ErrorCode, HostId,
-    DocumentId, FileEntryId, ModelSelection, ProjectId, RequestId, RunId, SanitizedError,
+    AuthorityProfile, CatalogCursor, CommandId, DeviceId, DocumentId, DurableEntryId, ErrorCode,
+    FileEntryId, HostId, ModelSelection, ProjectId, RequestId, RunId, SanitizedError,
     SessionCatalogState, SessionCursor, SessionId, PROTOCOL_VERSION,
 };
 
@@ -1114,10 +1114,7 @@ mod tests {
         );
         ack.validate().unwrap();
         let value = serde_json::to_value(&ack).unwrap();
-        assert_eq!(
-            value["disposition"]["createdSessionId"],
-            "created-session"
-        );
+        assert_eq!(value["disposition"]["createdSessionId"], "created-session");
         assert!(value["disposition"].get("runId").is_none());
     }
 

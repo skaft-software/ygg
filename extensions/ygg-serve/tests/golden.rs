@@ -14,12 +14,11 @@ use ygg_serve_backend::{
     HostDescriptor, HostId, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
     ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary, ProjectCatalog,
     ProjectId, ProjectSummary, PromptInput, ProtocolValidation, PullRequestState,
-    PullRequestSummary, RunId, RunOutcome,
-    SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionCommand,
-    SessionCommandEnvelope, SessionCursor, SessionId, SessionItem, SessionLiveState,
-    SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion,
-    ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, ToolActivity,
-    ToolActivityStatus, ToolKind, TurnId, UsageSnapshot, UserMessageDelivery,
+    PullRequestSummary, RunId, RunOutcome, SessionBranchEntry, SessionBranchEntryKind,
+    SessionBranchGraph, SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId,
+    SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity,
+    ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
+    ToolActivity, ToolActivityStatus, ToolKind, TurnId, UsageSnapshot, UserMessageDelivery,
 };
 
 fn model_selection() -> ModelSelection {

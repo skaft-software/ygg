@@ -7,13 +7,13 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::{
-    AttachmentError, AttachmentPolicy, AttachmentRef, AuthorityProfile, HostCapabilities,
-    DocumentReference, FileEntryId, HostDescriptor, ModelSelection, ModelSummary, ProjectId,
-    PermanentDeleteConfirmation, ProjectSummary, RunId, SanitizedError, SessionCatalogState,
-    SessionCommand, SessionId, SessionSnapshot, SessionSummary,
-    RepositoryContextSnapshot, StoredAttachment, ThemeId, ThemeOption, TimestampedEvent, TrustedFileEntry,
-    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileIndexSummary, TrustedFileRead,
-    TrustedFileSearchResult, LifetimeUsage, UsageActivity, UsagePeriod, UsageStats,
+    AttachmentError, AttachmentPolicy, AttachmentRef, AuthorityProfile, DocumentReference,
+    FileEntryId, HostCapabilities, HostDescriptor, LifetimeUsage, ModelSelection, ModelSummary,
+    PermanentDeleteConfirmation, ProjectId, ProjectSummary, RepositoryContextSnapshot, RunId,
+    SanitizedError, SessionCatalogState, SessionCommand, SessionId, SessionSnapshot,
+    SessionSummary, StoredAttachment, ThemeId, ThemeOption, TimestampedEvent,
+    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileIndexSummary,
+    TrustedFileRead, TrustedFileSearchResult, UsageActivity, UsagePeriod, UsageStats,
 };
 
 /// Immutable, path-free content behind one host-minted opaque resource handle.
