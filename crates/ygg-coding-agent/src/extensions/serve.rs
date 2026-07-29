@@ -7363,7 +7363,7 @@ mod tests {
         config.invocation_cwd = config.workspace.clone();
         let sessions = SessionStore::new(&config.session_dir, &config.workspace);
         std::fs::create_dir_all(sessions.dir()).unwrap();
-        let mut session = Session::create(&sessions.dir().join("usage-backfill.jsonl")).unwrap();
+        let mut session = Session::create(sessions.dir().join("usage-backfill.jsonl")).unwrap();
         session
             .append(EntryValue::Message(Message::User(UserMessage {
                 content: vec![UserPart::Text("measure usage".into())],
