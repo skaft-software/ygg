@@ -30,6 +30,7 @@ mod theme;
 mod transcript_search;
 mod transport;
 mod trusted_files;
+mod usage;
 
 pub use actor::{
     ActorConfig, ActorError, ActorView, CommandAdmission, SessionActor, SessionActorCore,
@@ -137,6 +138,10 @@ pub use trusted_files::{
     TrustedFileKind, TrustedFileRead, TrustedFileSearchHit, TrustedFileSearchResult,
     TrustedProjectFiles, MAX_TRUSTED_FILE_BYTES, MAX_TRUSTED_FILE_CONTEXT_BYTES,
     MAX_TRUSTED_FILES_PER_CONTEXT,
+};
+pub use usage::{
+    InferenceRequest, InferenceRequestStore, LifetimeMetricsStore, LifetimeUsage, UsageActivity,
+    UsageActivityDay, UsagePeriod, UsageStats, UsageStoreError, USAGE_ACTIVITY_WEEKS,
 };
 
 /// Current experimental wire-protocol major.
