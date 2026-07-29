@@ -30,7 +30,8 @@ use ygg_serve_backend::{
     DocumentReference, DocumentStore, DocumentStoreError,
     DriverCommandOutcome, DurableEntryId, EventPayload, EvidenceCoverage, FileChange, FileEntryId,
     FinalizeCompletion, FinalizeDecision, HostCapabilities, HostDescriptor, HostId, HostService,
-    InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload, LoopbackConfig, LoopbackServer,
+    InferenceRequest, InferenceRequestStore, InputModality, ItemDelta, ItemId, ItemLifecycle,
+    ItemPayload, LifetimeUsage, LoopbackConfig, LoopbackServer,
     ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProjectId,
     ProjectRegistry,
     ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation, RegistryProjectId,
@@ -46,7 +47,8 @@ use ygg_serve_backend::{
     ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
     TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
     TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
-    UsageSnapshot, UserMessageDelivery, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
+    UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
+    MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
     MAX_TEST_OUTPUT_BYTES, StructuredTestResults, TestCommandOutcome, TestCommandStatus,
     TestFramework, TestOutputInput, parse_test_output, refresh_repository_context,
 };
@@ -188,6 +190,7 @@ struct YggHost {
     trusted_files: Arc<Mutex<HashMap<String, TrustedProjectFiles>>>,
     search_index: Arc<Mutex<TranscriptSearchIndex>>,
     resources: Option<ygg_serve_backend::ResourceStore>,
+    usage: Arc<Mutex<InferenceRequestStore>>,
     serve_state_dir: PathBuf,
     #[cfg(test)]
     checkout_hooks: Arc<Mutex<VecDeque<CheckoutTestHooks>>>,
@@ -284,6 +287,8 @@ impl YggHost {
                 None
             }
         };
+        let mut usage = InferenceRequestStore::open(&state_dir)?;
+        backfill_usage_store(&config, &projects, &mut usage)?;
         Ok(Self {
             config,
             catalog: boot.catalog,
@@ -298,6 +303,7 @@ impl YggHost {
             trusted_files: Arc::new(Mutex::new(HashMap::new())),
             search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources,
+            usage: Arc::new(Mutex::new(usage)),
             serve_state_dir: state_dir,
             #[cfg(test)]
             checkout_hooks: Arc::new(Mutex::new(VecDeque::new())),
@@ -466,6 +472,7 @@ impl YggHost {
             trusted_files: Arc::clone(&self.trusted_files),
             search_index: Arc::clone(&self.search_index),
             resources: self.resources.clone(),
+            usage: Arc::clone(&self.usage),
             #[cfg(test)]
             checkout_hooks: CheckoutTestHooks::default(),
         };
@@ -528,6 +535,7 @@ impl YggHost {
             trusted_files: Arc::clone(&self.trusted_files),
             search_index: Arc::clone(&self.search_index),
             resources: self.resources.clone(),
+            usage: Arc::clone(&self.usage),
             #[cfg(test)]
             checkout_hooks: self
                 .checkout_hooks
@@ -538,6 +546,95 @@ impl YggHost {
         };
         let known_entries = session.entries().len();
         Ok(YggSessionDriver::spawn(seed, plan, known_entries))
+    }
+}
+
+fn backfill_usage_store(
+    config: &Config,
+    projects: &ProjectRegistry,
+    usage: &mut InferenceRequestStore,
+) -> anyhow::Result<()> {
+    for project in projects.list() {
+        let Ok(root) = projects.resolve_root(&project.id) else {
+            continue;
+        };
+        let sessions = SessionStore::new(&config.session_dir, root.as_path());
+        let bound = projects
+            .sessions_for_project(&project.id)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for meta in sessions.list() {
+            if !bound.contains(&meta.id) {
+                continue;
+            }
+            let Ok(session) = Session::open_read_only(&meta.path) else {
+                continue;
+            };
+            usage.record_all(project_session_usage(&meta.id, &session)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn project_session_usage(
+    session_id: &str,
+    session: &Session,
+) -> Result<Vec<InferenceRequest>, UsageStoreError> {
+    session
+        .usage_records()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, record)| {
+            let request_ordinal =
+                u64::try_from(ordinal).map_err(|_| UsageStoreError::InvalidRecord)?;
+            Ok(InferenceRequest {
+                session_id: session_id.to_owned(),
+                request_ordinal,
+                provider: record
+                    .endpoint
+                    .as_ref()
+                    .map_or("unknown", |endpoint| endpoint.0.as_str())
+                    .to_owned(),
+                model: record
+                    .model
+                    .as_ref()
+                    .map_or("unknown", |model| model.0.as_str())
+                    .to_owned(),
+                timestamp_ms: record.completed_at_unix_ms.unwrap_or_default(),
+                prompt_tokens: record.usage.input_tokens,
+                completion_tokens: record.usage.output_tokens,
+                cache_read_tokens: record.usage.cache_read_tokens,
+                cache_write_tokens: record.usage.cache_write_tokens,
+                cache_write_1h_tokens: record.usage.cache_write_1h_tokens,
+                reasoning_tokens: record.usage.reasoning_tokens,
+                total_tokens: record.usage.total_tokens,
+            })
+        })
+        .collect()
+}
+
+fn sync_session_usage(
+    usage: &Arc<Mutex<InferenceRequestStore>>,
+    session_id: &SessionId,
+    session: &Session,
+) -> Result<(), ServiceError> {
+    let requests =
+        project_session_usage(session_id.as_str(), session).map_err(usage_store_service_error)?;
+    usage
+        .lock()
+        .map_err(|_| ServiceError::Internal)?
+        .record_all(requests)
+        .map_err(usage_store_service_error)?;
+    Ok(())
+}
+
+fn usage_store_service_error(error: UsageStoreError) -> ServiceError {
+    match error {
+        UsageStoreError::QuotaExceeded => ServiceError::Unavailable,
+        UsageStoreError::InvalidRecord
+        | UsageStoreError::Conflict
+        | UsageStoreError::Corrupt
+        | UsageStoreError::Storage => ServiceError::Internal,
     }
 }
 
@@ -1133,6 +1230,30 @@ impl HostService for YggHost {
         .map_err(|_| ServiceError::Internal)?
     }
 
+    async fn usage_stats(&self, period: UsagePeriod) -> Result<UsageStats, ServiceError> {
+        Ok(self
+            .usage
+            .lock()
+            .map_err(|_| ServiceError::Internal)?
+            .stats(period))
+    }
+
+    async fn usage_lifetime(&self) -> Result<LifetimeUsage, ServiceError> {
+        Ok(self
+            .usage
+            .lock()
+            .map_err(|_| ServiceError::Internal)?
+            .lifetime())
+    }
+
+    async fn usage_activity(&self) -> Result<UsageActivity, ServiceError> {
+        Ok(self
+            .usage
+            .lock()
+            .map_err(|_| ServiceError::Internal)?
+            .activity())
+    }
+
     fn authority_ceiling(&self) -> AuthorityProfile {
         AuthorityProfile::FullAccess
     }
@@ -1485,6 +1606,7 @@ struct WorkerPlan {
     trusted_files: Arc<Mutex<HashMap<String, TrustedProjectFiles>>>,
     search_index: Arc<Mutex<TranscriptSearchIndex>>,
     resources: Option<ygg_serve_backend::ResourceStore>,
+    usage: Arc<Mutex<InferenceRequestStore>>,
     #[cfg(test)]
     checkout_hooks: CheckoutTestHooks,
 }
@@ -3145,6 +3267,7 @@ async fn start_and_drive_run(
         }
     }
     drop(run);
+    sync_session_usage(&plan.usage, &plan.session_id, app.agent.session())?;
     let settled_at_ms = now_ms();
     let unfinished = projection
         .tool_calls
@@ -7251,6 +7374,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_backfills_durable_provider_usage_once_across_restarts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        config.workspace = config.workspace.canonicalize().unwrap();
+        config.invocation_cwd = config.workspace.clone();
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let mut session = Session::create(&sessions.dir().join("usage-backfill.jsonl")).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("measure usage".into())],
+            })))
+            .unwrap();
+        let assistant = session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("done".into())],
+                model: ModelId("gpt-4o-mini".into()),
+                protocol: Protocol::OpenAiChat,
+            })))
+            .unwrap();
+        session
+            .record_assistant_usage(
+                assistant,
+                ygg_ai::EndpointId("openai".into()),
+                ModelId("gpt-4o-mini".into()),
+                ygg_ai::Usage {
+                    input_tokens: 80,
+                    cache_read_tokens: 10,
+                    cache_write_tokens: 5,
+                    cache_write_1h_tokens: 0,
+                    output_tokens: 20,
+                    reasoning_tokens: 4,
+                    total_tokens: 115,
+                },
+                None,
+            )
+            .unwrap();
+        drop(session);
+
+        let host = YggHost::new(config.clone()).unwrap();
+        let lifetime = host.usage_lifetime().await.unwrap();
+        assert_eq!(lifetime.prompt_tokens, 80);
+        assert_eq!(lifetime.completion_tokens, 20);
+        assert_eq!(lifetime.cache_read_tokens, 10);
+        assert_eq!(lifetime.cache_write_tokens, 5);
+        assert_eq!(lifetime.cache_write_1h_tokens, 0);
+        assert_eq!(lifetime.reasoning_tokens, 4);
+        assert_eq!(lifetime.total_tokens, 115);
+        assert_eq!(lifetime.request_count, 1);
+        assert_eq!(
+            host.usage_stats(UsagePeriod::Daily)
+                .await
+                .unwrap()
+                .request_count,
+            1
+        );
+        drop(host);
+
+        let reopened = YggHost::new(config).unwrap();
+        assert_eq!(reopened.usage_lifetime().await.unwrap().request_count, 1);
+        assert_eq!(reopened.usage_lifetime().await.unwrap().total_tokens, 115);
+    }
+
+    #[tokio::test]
     async fn real_project_trust_is_required_and_session_binding_survives_restart() {
         let fixture = tempfile::tempdir().unwrap();
         let config = project_test_config(fixture.path(), false);
@@ -8028,6 +8215,9 @@ mod tests {
             trusted_files: Arc::new(Mutex::new(HashMap::new())),
             search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources: None,
+            usage: Arc::new(Mutex::new(
+                InferenceRequestStore::open(directory.path()).unwrap(),
+            )),
             checkout_hooks: CheckoutTestHooks::default(),
         };
         let mut projection = ProjectionState::new(0);
@@ -8523,6 +8713,9 @@ mod tests {
             trusted_files: Arc::new(Mutex::new(HashMap::new())),
             search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources: None,
+            usage: Arc::new(Mutex::new(
+                InferenceRequestStore::open(directory.path()).unwrap(),
+            )),
             checkout_hooks: CheckoutTestHooks::default(),
         };
 

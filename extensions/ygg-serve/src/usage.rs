@@ -97,8 +97,12 @@ pub struct UsageStats {
     pub prompt_tokens: u64,
     /// Generated output tokens.
     pub completion_tokens: u64,
-    /// Cache reads plus cache writes (one-hour writes are not double-counted).
-    pub cache_tokens: u64,
+    /// Prompt tokens read from a provider cache.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to a provider cache.
+    pub cache_write_tokens: u64,
+    /// One-hour cache writes, a subset of `cache_write_tokens`.
+    pub cache_write_1h_tokens: u64,
     /// Reasoning subset of generated output.
     pub reasoning_tokens: u64,
     /// Provider-reported total tokens.
@@ -121,8 +125,12 @@ pub struct LifetimeUsage {
     pub prompt_tokens: u64,
     /// Generated output tokens.
     pub completion_tokens: u64,
-    /// Cache reads plus cache writes (one-hour writes are not double-counted).
-    pub cache_tokens: u64,
+    /// Prompt tokens read from a provider cache.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to a provider cache.
+    pub cache_write_tokens: u64,
+    /// One-hour cache writes, a subset of `cache_write_tokens`.
+    pub cache_write_1h_tokens: u64,
     /// Reasoning subset of generated output.
     pub reasoning_tokens: u64,
     /// Provider-reported total tokens.
@@ -190,7 +198,9 @@ struct StoredRequest {
 struct Aggregate {
     prompt_tokens: u64,
     completion_tokens: u64,
-    cache_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    cache_write_1h_tokens: u64,
     reasoning_tokens: u64,
     total_tokens: u64,
     request_count: u64,
@@ -202,10 +212,15 @@ impl Aggregate {
         self.completion_tokens = self
             .completion_tokens
             .saturating_add(request.completion_tokens);
-        self.cache_tokens = self
-            .cache_tokens
-            .saturating_add(request.cache_read_tokens)
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(request.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
             .saturating_add(request.cache_write_tokens);
+        self.cache_write_1h_tokens = self
+            .cache_write_1h_tokens
+            .saturating_add(request.cache_write_1h_tokens);
         self.reasoning_tokens = self
             .reasoning_tokens
             .saturating_add(request.reasoning_tokens);
@@ -218,7 +233,15 @@ impl Aggregate {
         self.completion_tokens = self
             .completion_tokens
             .saturating_add(other.completion_tokens);
-        self.cache_tokens = self.cache_tokens.saturating_add(other.cache_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+        self.cache_write_1h_tokens = self
+            .cache_write_1h_tokens
+            .saturating_add(other.cache_write_1h_tokens);
         self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         self.request_count = self.request_count.saturating_add(other.request_count);
@@ -260,7 +283,9 @@ impl LifetimeMetricsStore {
         LifetimeUsage {
             prompt_tokens: self.lifetime.prompt_tokens,
             completion_tokens: self.lifetime.completion_tokens,
-            cache_tokens: self.lifetime.cache_tokens,
+            cache_read_tokens: self.lifetime.cache_read_tokens,
+            cache_write_tokens: self.lifetime.cache_write_tokens,
+            cache_write_1h_tokens: self.lifetime.cache_write_1h_tokens,
             reasoning_tokens: self.lifetime.reasoning_tokens,
             total_tokens: self.lifetime.total_tokens,
             request_count: self.lifetime.request_count,
@@ -284,7 +309,9 @@ impl LifetimeMetricsStore {
             period,
             prompt_tokens: total.prompt_tokens,
             completion_tokens: total.completion_tokens,
-            cache_tokens: total.cache_tokens,
+            cache_read_tokens: total.cache_read_tokens,
+            cache_write_tokens: total.cache_write_tokens,
+            cache_write_1h_tokens: total.cache_write_1h_tokens,
             reasoning_tokens: total.reasoning_tokens,
             total_tokens: total.total_tokens,
             request_count: total.request_count,
@@ -705,12 +732,16 @@ mod tests {
         let daily = metrics.stats_at(UsagePeriod::Daily, 3 * DAY_MILLISECONDS);
         assert_eq!(daily.total_tokens, 160);
         assert_eq!(daily.request_count, 1);
-        assert_eq!(daily.cache_tokens, 5);
+        assert_eq!(daily.cache_read_tokens, 3);
+        assert_eq!(daily.cache_write_tokens, 2);
+        assert_eq!(daily.cache_write_1h_tokens, 1);
 
         let weekly = metrics.stats_at(UsagePeriod::Weekly, 3 * DAY_MILLISECONDS);
         assert_eq!(weekly.total_tokens, 360);
         assert_eq!(weekly.request_count, 3);
-        assert_eq!(weekly.cache_tokens, 15);
+        assert_eq!(weekly.cache_read_tokens, 9);
+        assert_eq!(weekly.cache_write_tokens, 6);
+        assert_eq!(weekly.cache_write_1h_tokens, 3);
 
         let activity = metrics.activity_at(3 * DAY_MILLISECONDS);
         assert_eq!(activity.current_streak, 1);

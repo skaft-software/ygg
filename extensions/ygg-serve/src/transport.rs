@@ -325,6 +325,12 @@ struct TrustedFileSearchQuery {
     limit: usize,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UsageStatsQuery {
+    period: crate::UsagePeriod,
+}
+
 fn default_file_list_limit() -> usize {
     200
 }
@@ -339,6 +345,9 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
         .route("/__ygg/launch/{token}", get(exchange_launch_token::<H>))
         .route("/api/v1/bootstrap", get(bootstrap::<H>))
         .route("/api/v1/projects", get(project_catalog::<H>))
+        .route("/api/v1/usage/stats", get(usage_stats::<H>))
+        .route("/api/v1/usage/lifetime", get(usage_lifetime::<H>))
+        .route("/api/v1/usage/activity", get(usage_activity::<H>))
         .route(
             "/api/v1/projects/{project_id}/context",
             get(repository_context::<H>),
@@ -1051,6 +1060,43 @@ async fn project_catalog<H: HostService>(State(state): State<Arc<TransportState<
     match state.supervisor.project_catalog().await {
         Ok(catalog) => Json(catalog).into_response(),
         Err(error) => supervisor_error_response(error),
+    }
+}
+
+async fn usage_stats<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    query: Result<Query<UsageStatsQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_request(),
+    };
+    match state.supervisor.usage_stats(query.period).await {
+        Ok(stats) => Json(stats).into_response(),
+        Err(error) => service_error_response(error),
+    }
+}
+
+async fn usage_lifetime<H: HostService>(State(state): State<Arc<TransportState<H>>>) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    match state.supervisor.usage_lifetime().await {
+        Ok(lifetime) => Json(lifetime).into_response(),
+        Err(error) => service_error_response(error),
+    }
+}
+
+async fn usage_activity<H: HostService>(State(state): State<Arc<TransportState<H>>>) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    match state.supervisor.usage_activity().await {
+        Ok(activity) => Json(activity).into_response(),
+        Err(error) => service_error_response(error),
     }
 }
 
@@ -1838,6 +1884,50 @@ mod tests {
             }
         }
 
+        async fn usage_stats(
+            &self,
+            period: crate::UsagePeriod,
+        ) -> Result<crate::UsageStats, ServiceError> {
+            Ok(crate::UsageStats {
+                period,
+                prompt_tokens: 11,
+                completion_tokens: 7,
+                cache_read_tokens: 3,
+                cache_write_tokens: 2,
+                cache_write_1h_tokens: 1,
+                reasoning_tokens: 2,
+                total_tokens: 21,
+                request_count: 2,
+            })
+        }
+
+        async fn usage_lifetime(&self) -> Result<crate::LifetimeUsage, ServiceError> {
+            Ok(crate::LifetimeUsage {
+                prompt_tokens: 110,
+                completion_tokens: 70,
+                cache_read_tokens: 30,
+                cache_write_tokens: 20,
+                cache_write_1h_tokens: 10,
+                reasoning_tokens: 20,
+                total_tokens: 210,
+                request_count: 20,
+                first_request_at_ms: Some(1_700_000_000_000),
+                last_request_at_ms: Some(1_700_086_400_000),
+            })
+        }
+
+        async fn usage_activity(&self) -> Result<crate::UsageActivity, ServiceError> {
+            Ok(crate::UsageActivity {
+                days: vec![crate::UsageActivityDay {
+                    date: "2025-01-02".into(),
+                    tokens: 21,
+                    request_count: 2,
+                }],
+                current_streak: 2,
+                longest_streak: 5,
+            })
+        }
+
         fn authority_profiles(&self) -> Vec<AuthorityProfile> {
             vec![AuthorityProfile::FullAccess]
         }
@@ -2222,6 +2312,86 @@ mod tests {
         );
         assert_eq!(host.creates.load(Ordering::Relaxed), 2);
         assert_eq!(host.opens.load(Ordering::Relaxed), 1);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_transport_is_authenticated_and_validates_periods() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let server = LoopbackServer::start(
+            supervisor,
+            LoopbackConfig {
+                port: 0,
+                web_root: None,
+            },
+        )
+        .await
+        .unwrap();
+        let address = server.address();
+
+        let unauthenticated = request(
+            address,
+            get_request(address, "/api/v1/usage/stats?period=daily"),
+        )
+        .await;
+        assert!(unauthenticated.starts_with("HTTP/1.1 401"));
+
+        let exchanged = request(address, exchange_request(address, &server.launch_token)).await;
+        let cookie = response_header(&exchanged, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let invalid = request(
+            address,
+            authenticated_get_request(address, "/api/v1/usage/stats?period=monthly", cookie),
+        )
+        .await;
+        assert!(invalid.starts_with("HTTP/1.1 400"));
+
+        let daily = request(
+            address,
+            authenticated_get_request(address, "/api/v1/usage/stats?period=daily", cookie),
+        )
+        .await;
+        assert!(daily.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&daily)["period"], "daily");
+        assert_eq!(response_json(&daily)["prompt_tokens"], 11);
+        assert_eq!(response_json(&daily)["completion_tokens"], 7);
+        assert_eq!(response_json(&daily)["cache_read_tokens"], 3);
+        assert_eq!(response_json(&daily)["cache_write_tokens"], 2);
+        assert_eq!(response_json(&daily)["cache_write_1h_tokens"], 1);
+        assert_eq!(response_json(&daily)["reasoning_tokens"], 2);
+        assert_eq!(response_json(&daily)["total_tokens"], 21);
+        assert_eq!(response_json(&daily)["request_count"], 2);
+
+        let weekly = request(
+            address,
+            authenticated_get_request(address, "/api/v1/usage/stats?period=weekly", cookie),
+        )
+        .await;
+        assert_eq!(response_json(&weekly)["period"], "weekly");
+
+        let lifetime = request(
+            address,
+            authenticated_get_request(address, "/api/v1/usage/lifetime", cookie),
+        )
+        .await;
+        assert_eq!(response_json(&lifetime)["total_tokens"], 210);
+        assert_eq!(response_json(&lifetime)["request_count"], 20);
+        assert_eq!(response_json(&lifetime)["cache_read_tokens"], 30);
+        assert_eq!(response_json(&lifetime)["cache_write_tokens"], 20);
+        assert_eq!(response_json(&lifetime)["cache_write_1h_tokens"], 10);
+
+        let activity = request(
+            address,
+            authenticated_get_request(address, "/api/v1/usage/activity", cookie),
+        )
+        .await;
+        assert_eq!(response_json(&activity)["current_streak"], 2);
+        assert_eq!(response_json(&activity)["longest_streak"], 5);
+        assert_eq!(response_json(&activity)["days"][0]["date"], "2025-01-02");
         server.shutdown().await.unwrap();
     }
 
