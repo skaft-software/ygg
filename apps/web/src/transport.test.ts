@@ -764,6 +764,66 @@ describe("HTTP Ygg transport", () => {
     transport.close();
   });
 
+  it("loads authenticated usage routes through strict projections", async () => {
+    const totals = {
+      prompt_tokens: 120,
+      completion_tokens: 80,
+      cache_read_tokens: 40,
+      cache_write_tokens: 20,
+      cache_write_1h_tokens: 5,
+      reasoning_tokens: 16,
+      total_tokens: 260,
+      request_count: 3,
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ period: "weekly", ...totals }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          ...totals,
+          first_request_at_ms: 1_721_000_000_000,
+          last_request_at_ms: 1_721_000_100_000,
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          days: [
+            { date: "2025-01-02", tokens: 260, request_count: 3 },
+          ],
+          current_streak: 1,
+          longest_streak: 4,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+
+    await expect(transport.getUsageStats("weekly")).resolves.toMatchObject({
+      period: "weekly",
+      totalTokens: 260,
+      cacheWriteOneHourTokens: 5,
+    });
+    await expect(transport.getUsageLifetime()).resolves.toMatchObject({
+      requestCount: 3,
+      firstRequestAtMs: 1_721_000_000_000,
+    });
+    await expect(transport.getUsageActivity()).resolves.toEqual({
+      days: [{ date: "2025-01-02", tokens: 260, requestCount: 3 }],
+      currentStreak: 1,
+      longestStreak: 4,
+    });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/v1/usage/stats?period=weekly",
+      "/api/v1/usage/lifetime",
+      "/api/v1/usage/activity",
+    ]);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init).toEqual(
+        expect.objectContaining({ credentials: "same-origin" }),
+      );
+    }
+  });
+
   it("uses relative HTTP routes and derives WebSocket origin from the page", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()

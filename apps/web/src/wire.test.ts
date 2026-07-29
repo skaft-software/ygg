@@ -14,9 +14,12 @@ import {
   projectEventEnvelope,
   projectHostBootstrap,
   projectHostStreamEvent,
+  projectLifetimeUsage,
   projectProjectCatalog,
   projectRepositoryContext,
   projectSessionSnapshot,
+  projectUsageActivity,
+  projectUsageStats,
   WireContractError,
 } from "./wire";
 
@@ -1597,5 +1600,88 @@ describe("authoritative Rust wire contract", () => {
         context,
       ),
     ).toThrow(/one-shot approval only/);
+  });
+});
+
+describe("usage wire projections", () => {
+  const totals = {
+    prompt_tokens: 120,
+    completion_tokens: 80,
+    cache_read_tokens: 40,
+    cache_write_tokens: 20,
+    cache_write_1h_tokens: 5,
+    reasoning_tokens: 16,
+    total_tokens: 260,
+    request_count: 3,
+  };
+
+  it("projects exact token buckets and nullable lifetime timestamps", () => {
+    expect(projectUsageStats({ period: "weekly", ...totals })).toEqual({
+      period: "weekly",
+      promptTokens: 120,
+      completionTokens: 80,
+      cacheReadTokens: 40,
+      cacheWriteTokens: 20,
+      cacheWriteOneHourTokens: 5,
+      reasoningTokens: 16,
+      totalTokens: 260,
+      requestCount: 3,
+    });
+    expect(
+      projectLifetimeUsage({
+        ...totals,
+        first_request_at_ms: null,
+        last_request_at_ms: null,
+      }),
+    ).toMatchObject({
+      firstRequestAtMs: undefined,
+      lastRequestAtMs: undefined,
+    });
+  });
+
+  it("projects ordered daily activity and rejects malformed contracts", () => {
+    expect(
+      projectUsageActivity({
+        days: [
+          { date: "2025-01-01", tokens: 100, request_count: 1 },
+          { date: "2025-01-03", tokens: 300, request_count: 2 },
+        ],
+        current_streak: 1,
+        longest_streak: 4,
+      }),
+    ).toEqual({
+      days: [
+        { date: "2025-01-01", tokens: 100, requestCount: 1 },
+        { date: "2025-01-03", tokens: 300, requestCount: 2 },
+      ],
+      currentStreak: 1,
+      longestStreak: 4,
+    });
+
+    expect(() =>
+      projectUsageStats({ period: "monthly", ...totals }),
+    ).toThrow(WireContractError);
+    expect(() =>
+      projectUsageStats({ period: "daily", ...totals, injected: true }),
+    ).toThrow(WireContractError);
+    expect(() =>
+      projectUsageActivity({
+        days: [
+          { date: "2025-02-30", tokens: 1, request_count: 1 },
+        ],
+        current_streak: 1,
+        longest_streak: 1,
+      }),
+    ).toThrow(WireContractError);
+    expect(() =>
+      projectUsageActivity({
+        days: [
+          { date: "2025-01-03", tokens: 1, request_count: 1 },
+          { date: "2025-01-02", tokens: 1, request_count: 1 },
+        ],
+        current_streak: 1,
+        longest_streak: 1,
+      }),
+    ).toThrow(/ordered oldest first/);
   });
 });

@@ -1,6 +1,7 @@
 import {
   Archive,
   ArchiveRestore,
+  BarChart3,
   Folder,
   GitMerge,
   GitPullRequest,
@@ -29,7 +30,7 @@ interface SidebarProps {
   sessions: SessionSummary[];
   projects?: ProjectSummary[];
   selectedSessionId: string | null;
-  surface: "session" | "projects" | "settings" | "devices";
+  surface: "session" | "projects" | "usage" | "settings" | "devices";
   devicesAvailable: boolean;
   onRestoreFocus: () => void;
   onClose: () => void;
@@ -48,6 +49,7 @@ interface SidebarProps {
   ) => void | Promise<void>;
   onOpenDevices: () => void;
   onOpenProjects: () => void;
+  onOpenUsage: () => void;
   onOpenSettings: () => void;
   transcriptSearchAvailable?: boolean;
   onOpenTranscriptSearch?: () => void;
@@ -198,6 +200,7 @@ function SidebarView({
   onDeleteSessionPermanently,
   onOpenDevices,
   onOpenProjects,
+  onOpenUsage,
   onOpenSettings,
   transcriptSearchAvailable = false,
   onOpenTranscriptSearch,
@@ -663,6 +666,14 @@ function SidebarView({
           >
             <Folder aria-hidden="true" />
             <strong>Projects</strong>
+          </button>
+          <button
+            className={`sidebar-destination ${surface === "usage" ? "is-selected" : ""}`}
+            aria-current={surface === "usage" ? "page" : undefined}
+            onClick={onOpenUsage}
+          >
+            <BarChart3 aria-hidden="true" />
+            <strong>Usage</strong>
           </button>
           {devicesAvailable ? (
             <button

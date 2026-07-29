@@ -11,6 +11,7 @@ import type {
   DocumentReference,
   HostBootstrap,
   HostEvent,
+  LifetimeUsage,
   ModelSummary,
   OutputRef,
   PreviewRef,
@@ -35,6 +36,9 @@ import type {
   TrustedFileEntry,
   TrustedFileRead,
   TrustedFileSearchResult,
+  UsageActivity,
+  UsageStats,
+  UsageTotals,
 } from "./protocol";
 import {
   deriveSessionTitle,
@@ -2297,6 +2301,136 @@ export function projectProjectCatalog(value: unknown): ProjectCatalog {
           project,
           `projectCatalog.projects[${index}]`,
         ),
+    ),
+  };
+}
+
+function projectUsageTotals(value: JsonObject, path: string): UsageTotals {
+  return {
+    promptTokens: number(value.prompt_tokens, `${path}.prompt_tokens`),
+    completionTokens: number(
+      value.completion_tokens,
+      `${path}.completion_tokens`,
+    ),
+    cacheReadTokens: number(
+      value.cache_read_tokens,
+      `${path}.cache_read_tokens`,
+    ),
+    cacheWriteTokens: number(
+      value.cache_write_tokens,
+      `${path}.cache_write_tokens`,
+    ),
+    cacheWriteOneHourTokens: number(
+      value.cache_write_1h_tokens,
+      `${path}.cache_write_1h_tokens`,
+    ),
+    reasoningTokens: number(
+      value.reasoning_tokens,
+      `${path}.reasoning_tokens`,
+    ),
+    totalTokens: number(value.total_tokens, `${path}.total_tokens`),
+    requestCount: number(value.request_count, `${path}.request_count`),
+  };
+}
+
+const usageTotalKeys = [
+  "prompt_tokens",
+  "completion_tokens",
+  "cache_read_tokens",
+  "cache_write_tokens",
+  "cache_write_1h_tokens",
+  "reasoning_tokens",
+  "total_tokens",
+  "request_count",
+] as const;
+
+export function projectUsageStats(value: unknown): UsageStats {
+  const path = "usageStats";
+  const stats = object(value, path, ["period", ...usageTotalKeys]);
+  return {
+    period: enumeration(stats.period, `${path}.period`, [
+      "daily",
+      "weekly",
+    ] as const),
+    ...projectUsageTotals(stats, path),
+  };
+}
+
+export function projectLifetimeUsage(value: unknown): LifetimeUsage {
+  const path = "lifetimeUsage";
+  const lifetime = object(value, path, [
+    ...usageTotalKeys,
+    "first_request_at_ms",
+    "last_request_at_ms",
+  ]);
+  return {
+    ...projectUsageTotals(lifetime, path),
+    firstRequestAtMs:
+      lifetime.first_request_at_ms === null
+        ? undefined
+        : number(
+            lifetime.first_request_at_ms,
+            `${path}.first_request_at_ms`,
+          ),
+    lastRequestAtMs:
+      lifetime.last_request_at_ms === null
+        ? undefined
+        : number(
+            lifetime.last_request_at_ms,
+            `${path}.last_request_at_ms`,
+          ),
+  };
+}
+
+export function projectUsageActivity(value: unknown): UsageActivity {
+  const path = "usageActivity";
+  const activity = object(value, path, [
+    "days",
+    "current_streak",
+    "longest_streak",
+  ]);
+  const rawDays = array(activity.days, `${path}.days`);
+  if (rawDays.length > 53 * 7) {
+    throw new WireContractError(`${path}.days`, "must contain at most 53 weeks");
+  }
+  let previousDate = "";
+  const days = rawDays.map((value, index) => {
+    const dayPath = `${path}.days[${index}]`;
+    const day = object(value, dayPath, ["date", "tokens", "request_count"]);
+    const date = string(day.date, `${dayPath}.date`);
+    const timestamp = Date.parse(`${date}T00:00:00.000Z`);
+    if (
+      !/^\d{4}-\d{2}-\d{2}$/u.test(date) ||
+      !Number.isFinite(timestamp) ||
+      new Date(timestamp).toISOString().slice(0, 10) !== date
+    ) {
+      throw new WireContractError(`${dayPath}.date`, "must be a UTC date");
+    }
+    if (date <= previousDate) {
+      throw new WireContractError(
+        `${dayPath}.date`,
+        "must be unique and ordered oldest first",
+      );
+    }
+    previousDate = date;
+    return {
+      date,
+      tokens: number(day.tokens, `${dayPath}.tokens`),
+      requestCount: number(
+        day.request_count,
+        `${dayPath}.request_count`,
+      ),
+    };
+  });
+  return {
+    days,
+    currentStreak: number(
+      activity.current_streak,
+      `${path}.current_streak`,
+    ),
+    longestStreak: number(
+      activity.longest_streak,
+      `${path}.longest_streak`,
     ),
   };
 }
