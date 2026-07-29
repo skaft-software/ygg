@@ -70,6 +70,7 @@ pub mod context;
 pub mod events;
 pub mod extension;
 pub mod extension_process;
+pub mod goal_driver;
 pub mod input;
 pub mod sandbox;
 pub mod secure_fs;
@@ -96,6 +97,11 @@ pub use compaction::{
 pub use context::{
     ActiveContextCompaction, ContextBreakdown, ContextSnapshot, FinishedContextCompaction,
     RunPhase, RunTerminalState,
+};
+pub use goal_driver::{
+    continuation_prompt, detect_goal_marker, GoalContinuation, GoalDecision, GoalDriver,
+    GoalDriverError, GoalMarker, GoalState, GoalStatus, GoalStore, GoalTurnSource,
+    DEFAULT_GOAL_GRACE_PERIOD, GOAL_CONTINUATION_PROMPT_TEMPLATE,
 };
 pub use events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
