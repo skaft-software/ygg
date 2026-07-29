@@ -9,6 +9,7 @@ import type {
   DocumentReference,
   HostBootstrap,
   HostEvent,
+  LifetimeUsage,
   ModelSummary,
   ProjectCatalog,
   RepositoryContextSnapshot,
@@ -20,6 +21,9 @@ import type {
   TrustedFileCatalog,
   TrustedFileRead,
   TrustedFileSearchResult,
+  UsageActivity,
+  UsagePeriod,
+  UsageStats,
 } from "./protocol";
 import {
   primeSessionItemIndex,
@@ -31,6 +35,9 @@ import {
   projectHostBootstrap,
   projectProjectCatalog,
   projectRepositoryContext,
+  projectLifetimeUsage,
+  projectUsageActivity,
+  projectUsageStats,
   projectHostStreamEvent,
   projectDocumentReference,
   projectReplayResponse,
@@ -51,6 +58,9 @@ type ConnectionListener = (state: TransportConnectionState) => void;
 export interface YggTransport {
   getProjectCatalog(): Promise<ProjectCatalog>;
   getRepositoryContext(projectId: string): Promise<RepositoryContextSnapshot>;
+  getUsageStats(period: UsagePeriod): Promise<UsageStats>;
+  getUsageLifetime(): Promise<LifetimeUsage>;
+  getUsageActivity(): Promise<UsageActivity>;
   connect(selectedSessionId?: string): Promise<HostBootstrap>;
   getSession(sessionId: string, signal?: AbortSignal): Promise<SessionSnapshot>;
   send(command: ClientCommand): Promise<CommandAck>;
@@ -145,6 +155,62 @@ export class FixtureTransport implements YggTransport {
         omittedErrors: 0,
         loadedBytes: 0,
       },
+    };
+  }
+
+  async getUsageStats(period: UsagePeriod): Promise<UsageStats> {
+    const multiplier = period === "daily" ? 1 : 5;
+    return {
+      period,
+      promptTokens: 82_000 * multiplier,
+      completionTokens: 38_000 * multiplier,
+      cacheReadTokens: 54_000 * multiplier,
+      cacheWriteTokens: 12_000 * multiplier,
+      cacheWriteOneHourTokens: 2_000 * multiplier,
+      reasoningTokens: 9_000 * multiplier,
+      totalTokens: 186_000 * multiplier,
+      requestCount: 7 * multiplier,
+    };
+  }
+
+  async getUsageLifetime(): Promise<LifetimeUsage> {
+    const now = Date.now();
+    return {
+      promptTokens: 8_200_000,
+      completionTokens: 3_800_000,
+      cacheReadTokens: 5_400_000,
+      cacheWriteTokens: 1_200_000,
+      cacheWriteOneHourTokens: 200_000,
+      reasoningTokens: 900_000,
+      totalTokens: 18_600_000,
+      requestCount: 700,
+      firstRequestAtMs: now - 120 * 86_400_000,
+      lastRequestAtMs: now,
+    };
+  }
+
+  async getUsageActivity(): Promise<UsageActivity> {
+    const today = new Date();
+    const todayUtc = Date.UTC(
+      today.getUTCFullYear(),
+      today.getUTCMonth(),
+      today.getUTCDate(),
+    );
+    const days = Array.from({ length: 120 }, (_, index) => {
+      const offset = 119 - index;
+      if ((offset * 11) % 17 > 11 && offset > 2) return null;
+      return {
+        date: new Date(todayUtc - offset * 86_400_000)
+          .toISOString()
+          .slice(0, 10),
+        tokens: 18_000 + ((offset * 37_913) % 240_000),
+        requestCount: 1 + ((offset * 7) % 12),
+      };
+    }).filter((day): day is UsageActivity["days"][number] => day !== null);
+    return {
+      days,
+      currentStreak: 3,
+      longestStreak: 12,
     };
   }
 
@@ -1292,6 +1358,42 @@ export class HttpTransport implements YggTransport {
       throw new Error(`Project context failed with ${response.status}`);
     }
     return projectRepositoryContext(await response.json());
+  }
+
+  async getUsageStats(period: UsagePeriod): Promise<UsageStats> {
+    const response = await fetch(
+      `/api/v1/usage/stats?period=${encodeURIComponent(period)}`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Usage stats failed with ${response.status}`);
+    }
+    return projectUsageStats(await response.json());
+  }
+
+  async getUsageLifetime(): Promise<LifetimeUsage> {
+    const response = await fetch("/api/v1/usage/lifetime", {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    });
+    if (!response.ok) {
+      throw new Error(`Lifetime usage failed with ${response.status}`);
+    }
+    return projectLifetimeUsage(await response.json());
+  }
+
+  async getUsageActivity(): Promise<UsageActivity> {
+    const response = await fetch("/api/v1/usage/activity", {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    });
+    if (!response.ok) {
+      throw new Error(`Usage activity failed with ${response.status}`);
+    }
+    return projectUsageActivity(await response.json());
   }
 
   async connect(selectedSessionId?: string): Promise<HostBootstrap> {

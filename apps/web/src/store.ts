@@ -7,6 +7,7 @@ import type {
   DocumentReference,
   HostEvent,
   HostBootstrap,
+  LifetimeUsage,
   ProjectCatalog,
   RepositoryContextSnapshot,
   ReasoningEffort,
@@ -19,6 +20,9 @@ import type {
   TrustedFileEntry,
   TrustedFileRead,
   TrustedFileSearchResult,
+  UsageActivity,
+  UsagePeriod,
+  UsageStats,
 } from "./protocol";
 import {
   primeSessionItemIndex,
@@ -569,6 +573,18 @@ export class YggStore {
 
   getRepositoryContext(projectId: string): Promise<RepositoryContextSnapshot> {
     return this.transport.getRepositoryContext(projectId);
+  }
+
+  getUsageStats(period: UsagePeriod): Promise<UsageStats> {
+    return this.transport.getUsageStats(period);
+  }
+
+  getUsageLifetime(): Promise<LifetimeUsage> {
+    return this.transport.getUsageLifetime();
+  }
+
+  getUsageActivity(): Promise<UsageActivity> {
+    return this.transport.getUsageActivity();
   }
 
   searchTrustedFiles(

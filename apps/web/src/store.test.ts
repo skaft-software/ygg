@@ -8,6 +8,7 @@ import type {
   DocumentReference,
   HostEvent,
   HostBootstrap,
+  LifetimeUsage,
   ProjectCatalog,
   RepositoryContextSnapshot,
   SessionSnapshot,
@@ -15,6 +16,9 @@ import type {
   TrustedFileCatalog,
   TrustedFileRead,
   TrustedFileSearchResult,
+  UsageActivity,
+  UsagePeriod,
+  UsageStats,
 } from "./protocol";
 import { sessionIdFromPathname, YggStore } from "./store";
 import type { YggTransport } from "./transport";
@@ -84,6 +88,37 @@ class TestTransport implements YggTransport {
         loadedBytes: 0,
       },
     };
+  }
+
+  async getUsageStats(period: UsagePeriod): Promise<UsageStats> {
+    return {
+      period,
+      promptTokens: 0,
+      completionTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      cacheWriteOneHourTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 0,
+      requestCount: 0,
+    };
+  }
+
+  async getUsageLifetime(): Promise<LifetimeUsage> {
+    return {
+      promptTokens: 0,
+      completionTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      cacheWriteOneHourTokens: 0,
+      reasoningTokens: 0,
+      totalTokens: 0,
+      requestCount: 0,
+    };
+  }
+
+  async getUsageActivity(): Promise<UsageActivity> {
+    return { days: [], currentStreak: 0, longestStreak: 0 };
   }
 
   async connect(): Promise<HostBootstrap> {

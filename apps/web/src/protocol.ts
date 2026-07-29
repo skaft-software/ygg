@@ -157,6 +157,40 @@ export interface ModelSummary {
   inputModalities: Array<"text" | "image" | "audio" | "document">;
 }
 
+export type UsagePeriod = "daily" | "weekly";
+
+export interface UsageTotals {
+  promptTokens: number;
+  completionTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  cacheWriteOneHourTokens: number;
+  reasoningTokens: number;
+  totalTokens: number;
+  requestCount: number;
+}
+
+export interface UsageStats extends UsageTotals {
+  period: UsagePeriod;
+}
+
+export interface LifetimeUsage extends UsageTotals {
+  firstRequestAtMs?: number;
+  lastRequestAtMs?: number;
+}
+
+export interface UsageActivityDay {
+  date: string;
+  tokens: number;
+  requestCount: number;
+}
+
+export interface UsageActivity {
+  days: UsageActivityDay[];
+  currentStreak: number;
+  longestStreak: number;
+}
+
 export interface SessionSummary {
   id: string;
   projectId: string;

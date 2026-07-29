@@ -35,6 +35,7 @@ import { SettingsView } from "./components/Settings";
 import { Sidebar } from "./components/Sidebar";
 import { TranscriptSearch } from "./components/TranscriptSearch";
 import { ProjectsView } from "./components/Projects";
+import { UsagePage } from "./pages/UsagePage";
 import { YggGlyph } from "./components/YggGlyph";
 import type {
   AttachmentRef,
@@ -44,6 +45,7 @@ import type {
   SessionSnapshot,
   SessionStatus,
   TrustedFileEntry,
+  UsagePeriod,
 } from "./protocol";
 import {
   AttentionNotificationManager,
@@ -61,7 +63,7 @@ import {
   transportModeFromSearch,
 } from "./transport";
 
-type Surface = "session" | "projects" | "settings" | "devices";
+type Surface = "session" | "projects" | "usage" | "settings" | "devices";
 
 const statusLabel: Record<SessionStatus, string> = {
   idle: "Ready",
@@ -1056,6 +1058,13 @@ export default function App() {
       setSidebarOpen(false);
     }
   }, []);
+  const openUsage = useCallback(() => {
+    setSurface("usage");
+    setInspector(null);
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      setSidebarOpen(false);
+    }
+  }, []);
   const openDevices = useCallback(() => {
     setSurface("devices");
     setInspector(null);
@@ -1185,6 +1194,12 @@ export default function App() {
     (projectId: string) => store.getRepositoryContext(projectId),
     [],
   );
+  const loadUsageStats = useCallback(
+    (period: UsagePeriod) => store.getUsageStats(period),
+    [],
+  );
+  const loadUsageLifetime = useCallback(() => store.getUsageLifetime(), []);
+  const loadUsageActivity = useCallback(() => store.getUsageActivity(), []);
 
   if (state.connecting) return <LoadingState />;
   if (state.error) {
@@ -1230,6 +1245,7 @@ export default function App() {
           void restoreSession(sessionId);
         }}
         onOpenProjects={openProjects}
+        onOpenUsage={openUsage}
         onOpenSettings={openSettings}
         onOpenDevices={openDevices}
         transcriptSearchAvailable={
@@ -1337,7 +1353,9 @@ export default function App() {
                 ? "Settings"
                 : surface === "projects"
                   ? "Projects"
-                  : "Connected devices"
+                  : surface === "usage"
+                    ? "Usage"
+                    : "Connected devices"
             }
             sidebarOpen={sidebarOpen}
             onOpenSidebar={() => setSidebarOpen(true)}
@@ -1351,6 +1369,12 @@ export default function App() {
               notificationsEnabled={notificationState.enabled}
               notificationPermission={notificationState.permission}
               onNotificationsChange={changeNotifications}
+            />
+          ) : surface === "usage" ? (
+            <UsagePage
+              loadStats={loadUsageStats}
+              loadLifetime={loadUsageLifetime}
+              loadActivity={loadUsageActivity}
             />
           ) : surface === "projects" && state.projectCatalog ? (
             <ProjectsView

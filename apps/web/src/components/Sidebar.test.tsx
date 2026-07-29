@@ -75,6 +75,7 @@ function sidebarProps(
     onSetSessionLifecycle: vi.fn(),
     onDeleteSessionPermanently: vi.fn(),
     onOpenProjects: vi.fn(),
+    onOpenUsage: vi.fn(),
     onOpenDevices: vi.fn(),
     onOpenSettings: vi.fn(),
     ...overrides,
@@ -128,6 +129,25 @@ describe("sidebar session lifecycle", () => {
     expect(screen.getByTitle("Pull request merged")).toBeVisible();
     expect(container.querySelectorAll(".session-pull-request")).toHaveLength(3);
     expect(screen.queryByText(/GPT|Claude|Qwen/)).toBeNull();
+  });
+
+  it("opens usage from the persistent destination", () => {
+    const openUsage = vi.fn();
+    const { rerender } = render(
+      <Sidebar {...sidebarProps({ onOpenUsage: openUsage })} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
+    expect(openUsage).toHaveBeenCalledOnce();
+
+    rerender(
+      <Sidebar
+        {...sidebarProps({ surface: "usage", onOpenUsage: openUsage })}
+      />,
+    );
+    const usageDestination = screen.getByRole("button", { name: "Usage" });
+    expect(usageDestination).toHaveClass("is-selected");
+    expect(usageDestination).toHaveAttribute("aria-current", "page");
   });
 
   it("browses active and archived sessions and restores through lifecycle active", () => {
