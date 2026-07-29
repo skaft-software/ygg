@@ -1592,6 +1592,7 @@ mod tests {
                 available: true,
                 reasoning: vec!["off".into(), "high".into()],
                 default_reasoning: Some("off".into()),
+                input_pricing: None,
                 input_modalities: vec![InputModality::Text],
             }]
         }

@@ -31,9 +31,9 @@ use ygg_serve_backend::{
     DriverCommandOutcome, DurableEntryId, EventPayload, EvidenceCoverage, FileChange, FileEntryId,
     FinalizeCompletion, FinalizeDecision, HostCapabilities, HostDescriptor, HostId, HostService,
     InferenceRequest, InferenceRequestStore, InputModality, ItemDelta, ItemId, ItemLifecycle,
-    ItemPayload, LifetimeUsage, LoopbackConfig, LoopbackServer,
-    ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProjectId,
-    ProjectRegistry,
+    ItemPayload, LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing,
+    ModelInputPricingTier, ModelSelection, ModelSummary, PendingRequest,
+    PermanentDeleteConfirmation, ProjectId, ProjectRegistry,
     ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation, RegistryProjectId,
     RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer,
     RequestId, RequestKind, RequestState, RunId, SemanticRole,
@@ -48,7 +48,7 @@ use ygg_serve_backend::{
     TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
     TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
     UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
-    MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES,
+    MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES,
     MAX_TEST_OUTPUT_BYTES, StructuredTestResults, TestCommandOutcome, TestCommandStatus,
     TestFramework, TestOutputInput, parse_test_output, refresh_repository_context,
 };
@@ -6700,6 +6700,23 @@ fn empty_seed(
     }
 }
 
+fn graphical_input_pricing(pricing: Option<&ygg_ai::Pricing>) -> Option<ModelInputPricing> {
+    pricing.map(|pricing| ModelInputPricing {
+        base_microdollars_per_million_tokens: pricing.input.0,
+        tiers: pricing
+            .tiers
+            .iter()
+            .filter_map(|tier| {
+                tier.input.map(|rate| ModelInputPricingTier {
+                    min_input_tokens: tier.min_input_tokens,
+                    microdollars_per_million_tokens: rate.0,
+                })
+            })
+            .take(MAX_MODEL_INPUT_PRICING_TIERS)
+            .collect(),
+    })
+}
+
 fn graphical_model_catalog(catalog: &ModelCatalog, config: &Config) -> Vec<ModelSummary> {
     let models = catalog
         .models()
@@ -6749,6 +6766,7 @@ fn graphical_model_catalog(catalog: &ModelCatalog, config: &Config) -> Vec<Model
                 available: true,
                 reasoning,
                 default_reasoning,
+                input_pricing: graphical_input_pricing(model.spec.pricing.as_ref()),
                 input_modalities,
             }
         })
@@ -9623,6 +9641,50 @@ mod tests {
         assert_eq!(outcome.evidence_coverage, EvidenceCoverage::Partial);
     }
 
+    #[test]
+    fn graphical_pricing_projects_tiered_input_rates() {
+        let pricing = ygg_ai::Pricing {
+            input: ygg_ai::TokenRate(3_000_000),
+            output: ygg_ai::TokenRate(15_000_000),
+            cache_read: ygg_ai::TokenRate(300_000),
+            cache_write_5m: ygg_ai::TokenRate(3_750_000),
+            cache_write_1h: None,
+            reasoning: None,
+            tiers: vec![
+                ygg_ai::PricingTier {
+                    min_input_tokens: 100_000,
+                    input: None,
+                    output: Some(ygg_ai::TokenRate(20_000_000)),
+                    cache_read: None,
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: None,
+                },
+                ygg_ai::PricingTier {
+                    min_input_tokens: 200_000,
+                    input: Some(ygg_ai::TokenRate(6_000_000)),
+                    output: None,
+                    cache_read: None,
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            graphical_input_pricing(Some(&pricing)),
+            Some(ModelInputPricing {
+                base_microdollars_per_million_tokens: 3_000_000,
+                tiers: vec![ModelInputPricingTier {
+                    min_input_tokens: 200_000,
+                    microdollars_per_million_tokens: 6_000_000,
+                }],
+            })
+        );
+        assert_eq!(graphical_input_pricing(None), None);
+    }
+
     fn catalog_model(index: usize) -> ModelSummary {
         ModelSummary {
             id: format!("model-{index:03}"),
@@ -9632,6 +9694,7 @@ mod tests {
             available: true,
             reasoning: vec!["off".into()],
             default_reasoning: Some("off".into()),
+            input_pricing: None,
             input_modalities: vec![InputModality::Text],
         }
     }

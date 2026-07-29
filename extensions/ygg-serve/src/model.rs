@@ -23,6 +23,9 @@ const MAX_PLAN_STEPS: usize = 256;
 const MAX_CHOICES: usize = 32;
 const MAX_MODELS: usize = 256;
 const MAX_REASONING_OPTIONS: usize = 32;
+/// Maximum long-context input pricing tiers advertised for one model.
+pub const MAX_MODEL_INPUT_PRICING_TIERS: usize = 32;
+const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_THEMES: usize = 64;
 const MAX_AUTHORITY_PROFILES: usize = 8;
 
@@ -328,6 +331,26 @@ pub enum InputModality {
     Document,
 }
 
+/// Input pricing tier advertised to graphical clients.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelInputPricingTier {
+    /// Minimum context tokens required to use this rate.
+    pub min_input_tokens: u64,
+    /// Input rate in microdollars per one million tokens.
+    pub microdollars_per_million_tokens: u64,
+}
+
+/// Bounded input pricing needed for a current-context cost estimate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelInputPricing {
+    /// Base input rate in microdollars per one million tokens.
+    pub base_microdollars_per_million_tokens: u64,
+    /// Ascending long-context input-rate overrides.
+    pub tiers: Vec<ModelInputPricingTier>,
+}
+
 /// Bounded model-picker catalog entry.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -347,6 +370,9 @@ pub struct ModelSummary {
     /// Host-selected default reasoning choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_reasoning: Option<String>,
+    /// Input pricing used to estimate the cost of the current context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_pricing: Option<ModelInputPricing>,
     /// Supported model inputs.
     pub input_modalities: Vec<InputModality>,
 }
@@ -1287,6 +1313,42 @@ impl ProtocolValidation for ModelSelection {
     }
 }
 
+impl ProtocolValidation for ModelInputPricing {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.base_microdollars_per_million_tokens > MAX_JSON_SAFE_INTEGER {
+            return Err(ValidationError::new(
+                "model_summary.input_pricing.base_microdollars_per_million_tokens",
+                "must fit in a JSON safe integer",
+            ));
+        }
+        if self.tiers.len() > MAX_MODEL_INPUT_PRICING_TIERS {
+            return Err(ValidationError::new(
+                "model_summary.input_pricing.tiers",
+                format!("exceeds the {MAX_MODEL_INPUT_PRICING_TIERS}-tier limit"),
+            ));
+        }
+        let mut previous_threshold = None;
+        for tier in &self.tiers {
+            if tier.min_input_tokens > MAX_JSON_SAFE_INTEGER
+                || tier.microdollars_per_million_tokens > MAX_JSON_SAFE_INTEGER
+            {
+                return Err(ValidationError::new(
+                    "model_summary.input_pricing.tiers",
+                    "values must fit in JSON safe integers",
+                ));
+            }
+            if previous_threshold.is_some_and(|previous| previous >= tier.min_input_tokens) {
+                return Err(ValidationError::new(
+                    "model_summary.input_pricing.tiers",
+                    "must have strictly ascending input thresholds",
+                ));
+            }
+            previous_threshold = Some(tier.min_input_tokens);
+        }
+        Ok(())
+    }
+}
+
 impl ProtocolValidation for ModelSummary {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_public_text("model_summary.id", &self.id, 256, false)?;
@@ -1324,6 +1386,9 @@ impl ProtocolValidation for ModelSummary {
                     "must be one of the advertised reasoning options",
                 ));
             }
+        }
+        if let Some(pricing) = &self.input_pricing {
+            pricing.validate()?;
         }
         let modalities = self
             .input_modalities
@@ -2232,6 +2297,43 @@ fn authority_rank(authority: AuthorityProfile) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_input_pricing_requires_bounded_safe_ascending_tiers() {
+        let pricing = ModelInputPricing {
+            base_microdollars_per_million_tokens: 3_000_000,
+            tiers: vec![
+                ModelInputPricingTier {
+                    min_input_tokens: 100_000,
+                    microdollars_per_million_tokens: 6_000_000,
+                },
+                ModelInputPricingTier {
+                    min_input_tokens: 200_000,
+                    microdollars_per_million_tokens: 9_000_000,
+                },
+            ],
+        };
+        pricing.validate().unwrap();
+
+        let mut unordered = pricing.clone();
+        unordered.tiers.reverse();
+        assert!(unordered.validate().is_err());
+
+        let mut unsafe_rate = pricing;
+        unsafe_rate.base_microdollars_per_million_tokens = MAX_JSON_SAFE_INTEGER + 1;
+        assert!(unsafe_rate.validate().is_err());
+
+        let too_many = ModelInputPricing {
+            base_microdollars_per_million_tokens: 1,
+            tiers: (0..=MAX_MODEL_INPUT_PRICING_TIERS)
+                .map(|index| ModelInputPricingTier {
+                    min_input_tokens: index as u64,
+                    microdollars_per_million_tokens: 1,
+                })
+                .collect(),
+        };
+        assert!(too_many.validate().is_err());
+    }
 
     #[test]
     fn user_message_delivery_is_additive_and_legacy_safe() {

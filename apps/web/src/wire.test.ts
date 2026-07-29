@@ -87,6 +87,15 @@ describe("authoritative Rust wire contract", () => {
       available: true,
       reasoning: ["low", "medium", "high"],
       defaultReasoning: "high",
+      inputPricing: {
+        baseMicrodollarsPerMillionTokens: 2_500_000,
+        tiers: [
+          {
+            minInputTokens: 200_000,
+            microdollarsPerMillionTokens: 5_000_000,
+          },
+        ],
+      },
       inputModalities: ["text", "image"],
     });
     expect(bootstrap.authorityProfiles).toEqual([
@@ -140,6 +149,7 @@ describe("authoritative Rust wire contract", () => {
     });
 
     expect(snapshot.sequence).toBe(42);
+    expect(snapshot.contextTokens).toBe(165);
     expect(snapshot.contextPercent).toBe(0);
     expect(snapshot.title).toBe("New session");
     expect(snapshot.items).toHaveLength(1);

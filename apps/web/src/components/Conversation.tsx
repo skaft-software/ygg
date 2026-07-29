@@ -2542,6 +2542,28 @@ function ComposerMenu<T extends string>({
   );
 }
 
+function estimatedContextInputCost(
+  contextTokens: number,
+  model: ModelSummary | undefined,
+): string | undefined {
+  const pricing = model?.inputPricing;
+  if (!pricing) return undefined;
+
+  let rate = pricing.baseMicrodollarsPerMillionTokens;
+  for (const tier of pricing.tiers) {
+    if (contextTokens < tier.minInputTokens) break;
+    rate = tier.microdollarsPerMillionTokens;
+  }
+  const dollars =
+    (contextTokens / 1_000_000) * (rate / 1_000_000);
+  return dollars.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: dollars < 1 ? 4 : 2,
+  });
+}
+
 function Composer({
   session,
   bootstrap,
@@ -2626,6 +2648,13 @@ function Composer({
   const activeModel = bootstrap.models.find(
     (model) => model.id === session.modelId,
   );
+  const contextCost = estimatedContextInputCost(
+    session.contextTokens,
+    activeModel,
+  );
+  const contextDescription = `${session.contextPercent}% of context used${
+    contextCost ? `; estimated next-turn input cost ~${contextCost}` : ""
+  }`;
   const providerKey =
     `${activeModel?.provider ?? ""} ${activeModel?.id ?? ""}`.toLowerCase();
   const modelAccent =
@@ -3222,6 +3251,19 @@ function Composer({
             ) : null}
           </div>
           <div className="composer-actions">
+            <span
+              className="composer-context-cost"
+              aria-label={contextDescription}
+              title={contextDescription}
+            >
+              <span>{session.contextPercent}%</span>
+              {contextCost ? (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <strong>~{contextCost}</strong>
+                </>
+              ) : null}
+            </span>
             {isWorking ? (
               <button
                 className="submit-button stop-button"
@@ -3304,6 +3346,8 @@ const MemoizedComposer = memo(Composer, (previous, next) => {
     previousSession.modelId === nextSession.modelId &&
     previousSession.reasoning === nextSession.reasoning &&
     previousSession.authority === nextSession.authority &&
+    previousSession.contextTokens === nextSession.contextTokens &&
+    previousSession.contextPercent === nextSession.contextPercent &&
     previousSession.items.length === nextSession.items.length &&
     previous.bootstrap === next.bootstrap &&
     previous.onSubmit === next.onSubmit &&

@@ -21,6 +21,7 @@ const base: SessionSnapshot = {
   modelId: "model-1",
   reasoning: "medium",
   authority: "readOnly",
+  contextTokens: 24_000,
   contextPercent: 12,
   startedAt: "2026-07-26T12:00:00.000Z",
   branches: { entries: [], truncated: false },

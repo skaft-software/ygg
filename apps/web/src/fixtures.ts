@@ -241,6 +241,15 @@ export const fixtureBootstrap: HostBootstrap = {
       available: true,
       reasoning: ["low", "medium", "high"],
       defaultReasoning: "high",
+      inputPricing: {
+        baseMicrodollarsPerMillionTokens: 3_000_000,
+        tiers: [
+          {
+            minInputTokens: 200_000,
+            microdollarsPerMillionTokens: 6_000_000,
+          },
+        ],
+      },
       inputModalities: ["text", "image", "document"],
     },
     {
@@ -251,6 +260,10 @@ export const fixtureBootstrap: HostBootstrap = {
       available: true,
       reasoning: ["low", "medium", "high"],
       defaultReasoning: "high",
+      inputPricing: {
+        baseMicrodollarsPerMillionTokens: 2_500_000,
+        tiers: [],
+      },
       inputModalities: ["text", "image", "audio", "document"],
     },
     {
@@ -307,6 +320,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     modelId: "claude-sonnet-4-6",
     reasoning: "high",
     authority: "fullAccess",
+    contextTokens: 0,
     contextPercent: 0,
     startedAt: at(58),
     branches: { entries: [], truncated: false },
@@ -326,6 +340,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     modelId: "gpt-5.4",
     reasoning: "high",
     authority: "workspace",
+    contextTokens: 72_000,
     contextPercent: 36,
     startedAt: at(42),
     branches: { entries: [], truncated: false },
@@ -497,6 +512,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     modelId: "claude-sonnet-4-6",
     reasoning: "medium",
     authority: "readOnly",
+    contextTokens: 42_000,
     contextPercent: 21,
     startedAt: at(35),
     branches: { entries: [], truncated: false },
@@ -597,6 +613,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     modelId: "qwen3.5-27b",
     reasoning: "high",
     authority: "workspace",
+    contextTokens: 96_000,
     contextPercent: 48,
     startedAt: at(8),
     branches: {
@@ -833,6 +850,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     modelId: "qwen3.5-27b",
     reasoning: "medium",
     authority: "readOnly",
+    contextTokens: 36_000,
     contextPercent: 18,
     startedAt: at(2),
     branches: { entries: [], truncated: false },
@@ -1005,6 +1023,7 @@ function createPerformanceSession(): SessionSnapshot {
     modelId: "gpt-5.4",
     reasoning: "high",
     authority: "workspace",
+    contextTokens: 164_000,
     contextPercent: 82,
     startedAt: new Date(Date.UTC(2026, 6, 26, 12, 0, 0)).toISOString(),
     branches: { entries: [], truncated: false },
@@ -1038,6 +1057,7 @@ function createPerformanceReplaySession(): SessionSnapshot {
     modelId: "claude-sonnet-4-6",
     reasoning: "high",
     authority: "workspace",
+    contextTokens: 94_000,
     contextPercent: 47,
     startedAt,
     branches: { entries: [], truncated: false },

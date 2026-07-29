@@ -355,6 +355,52 @@ function projectThemeOption(value: unknown, path: string): ThemeOption {
   };
 }
 
+function projectInputPricing(
+  value: unknown,
+  path: string,
+): NonNullable<ModelSummary["inputPricing"]> {
+  const pricing = object(value, path, [
+    "baseMicrodollarsPerMillionTokens",
+    "tiers",
+  ]);
+  const rawTiers = array(pricing.tiers, `${path}.tiers`);
+  if (rawTiers.length > 32) {
+    throw new WireContractError(`${path}.tiers`, "has more than 32 tiers");
+  }
+  const tiers = rawTiers.map((value, index) => {
+    const tierPath = `${path}.tiers[${index}]`;
+    const tier = object(value, tierPath, [
+      "minInputTokens",
+      "microdollarsPerMillionTokens",
+    ]);
+    return {
+      minInputTokens: number(tier.minInputTokens, `${tierPath}.minInputTokens`),
+      microdollarsPerMillionTokens: number(
+        tier.microdollarsPerMillionTokens,
+        `${tierPath}.microdollarsPerMillionTokens`,
+      ),
+    };
+  });
+  if (
+    tiers.some(
+      (tier, index) =>
+        index > 0 && tier.minInputTokens <= tiers[index - 1]!.minInputTokens,
+    )
+  ) {
+    throw new WireContractError(
+      `${path}.tiers`,
+      "must have strictly ascending input thresholds",
+    );
+  }
+  return {
+    baseMicrodollarsPerMillionTokens: number(
+      pricing.baseMicrodollarsPerMillionTokens,
+      `${path}.baseMicrodollarsPerMillionTokens`,
+    ),
+    tiers,
+  };
+}
+
 function projectModel(value: unknown, path: string): ModelSummary {
   const model = object(value, path, [
     "id",
@@ -364,6 +410,7 @@ function projectModel(value: unknown, path: string): ModelSummary {
     "available",
     "reasoning",
     "defaultReasoning",
+    "inputPricing",
     "inputModalities",
   ]);
   const rawEfforts = array(model.reasoning, `${path}.reasoning`);
@@ -406,6 +453,10 @@ function projectModel(value: unknown, path: string): ModelSummary {
       "must be advertised by the model",
     );
   }
+  const inputPricing =
+    model.inputPricing === undefined
+      ? undefined
+      : projectInputPricing(model.inputPricing, `${path}.inputPricing`);
   return {
     id: boundedString(model.id, `${path}.id`, 256),
     name: boundedString(model.name, `${path}.name`, 256),
@@ -414,6 +465,7 @@ function projectModel(value: unknown, path: string): ModelSummary {
     available: boolean(model.available, `${path}.available`),
     reasoning: efforts,
     defaultReasoning,
+    inputPricing,
     inputModalities,
   };
 }
@@ -2222,6 +2274,7 @@ export function projectSessionSnapshot(
       snapshot.authority,
       "sessionSnapshot.authority",
     ),
+    contextTokens,
     contextPercent:
       contextLimit && contextLimit > 0
         ? Math.min(100, Math.round((contextTokens / contextLimit) * 100))
@@ -3330,6 +3383,7 @@ export function projectEventEnvelope(
         actorGeneration,
         sequence,
         patch: {
+          contextTokens: tokens,
           contextPercent:
             limit && limit > 0
               ? Math.min(100, Math.round((tokens / limit) * 100))

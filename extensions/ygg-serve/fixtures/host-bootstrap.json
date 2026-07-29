@@ -40,6 +40,15 @@
       "available": true,
       "reasoning": ["low", "medium", "high"],
       "defaultReasoning": "high",
+      "inputPricing": {
+        "baseMicrodollarsPerMillionTokens": 2500000,
+        "tiers": [
+          {
+            "minInputTokens": 200000,
+            "microdollarsPerMillionTokens": 5000000
+          }
+        ]
+      },
       "inputModalities": ["text", "image"]
     }
   ],
