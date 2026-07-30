@@ -22,6 +22,13 @@ export default defineConfig({
       output: {
         entryFileNames: "assets/app.js",
         chunkFileNames: "assets/chunk-[name].js",
+        manualChunks(id) {
+          const normalized = id.replaceAll("\\", "/");
+          return normalized.includes("/node_modules/@codemirror/") ||
+            normalized.includes("/node_modules/@lezer/")
+            ? "file-languages"
+            : undefined;
+        },
         assetFileNames: ({ names }) =>
           names.some((name) => name.endsWith(".css"))
             ? "assets/app.css"

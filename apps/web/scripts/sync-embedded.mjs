@@ -35,6 +35,10 @@ const assets = [
     mediaType: "text/javascript; charset=utf-8",
   },
   {
+    path: "assets/chunk-file-languages.js",
+    mediaType: "text/javascript; charset=utf-8",
+  },
+  {
     path: "assets/chunk-jsx-runtime.js",
     mediaType: "text/javascript; charset=utf-8",
   },

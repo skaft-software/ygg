@@ -27,6 +27,8 @@ import type {
   ProjectSummary,
 } from "../protocol";
 import { ProjectFileConflictError } from "../transport";
+import { FileCodeEditor } from "./FileCodeEditor";
+import { languageNameForPath } from "./fileLanguage";
 
 interface DirectoryState {
   tree?: ProjectFileTree;
@@ -589,7 +591,8 @@ function ProjectFilesWorkspace({
                 <div>
                   <strong>{selectedFile.path}</strong>
                   <span>
-                    {selectedFile.lineCount} {selectedFile.lineCount === 1 ? "line" : "lines"}
+                    {languageNameForPath(selectedFile.path)} · {selectedFile.lineCount}{" "}
+                    {selectedFile.lineCount === 1 ? "line" : "lines"}
                     {selectedFile.truncated ? " · partial view" : ""}
                   </span>
                 </div>
@@ -651,19 +654,15 @@ function ProjectFilesWorkspace({
                   </button>
                 </div>
               ) : null}
-              <textarea
-                className="files-editor-text"
-                aria-label={`Contents of ${selectedFile.path}`}
+              <FileCodeEditor
+                path={selectedFile.path}
                 value={draft}
-                readOnly={
-                  !writeAvailable || selectedFile.truncated || !selectedFile.sha256
-                }
-                onChange={(event) => {
-                  setDraft(event.target.value);
+                readOnly={!writeAvailable || selectedFile.truncated || !selectedFile.sha256}
+                onChange={(value) => {
+                  setDraft(value);
                   setSaveError(false);
                   setConflict(false);
                 }}
-                spellCheck={false}
               />
             </>
           )}

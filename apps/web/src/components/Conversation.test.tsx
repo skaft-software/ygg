@@ -889,7 +889,7 @@ describe("conversation composer", () => {
       />,
     );
 
-    expect(screen.getByText("Run completed")).toBeVisible();
+    expect(screen.queryByText("Run completed")).toBeNull();
     expect(screen.queryByText(/Worked for/)).toBeNull();
   });
 
@@ -1339,14 +1339,8 @@ describe("conversation composer", () => {
     );
     expect(container.querySelector(".work-group.is-direct")).not.toBeNull();
     expect(container.querySelector(".work-group-summary")).toBeNull();
-    const reviewDisclosure = container.querySelector(
-      ".completion-review-disclosure",
-    );
-    expect(reviewDisclosure).not.toBeNull();
-    expect(reviewDisclosure).not.toHaveAttribute("open");
-    expect(reviewDisclosure!.querySelector(":scope > summary")).toHaveTextContent(
-      "Open questions",
-    );
+    expect(container.querySelector(".completion-review-disclosure")).toBeNull();
+    expect(screen.queryByText("Open questions")).toBeNull();
   });
 
   it("loads inline diffs and line-numbered reads when a work group opens", async () => {

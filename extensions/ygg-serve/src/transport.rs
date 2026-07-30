@@ -3046,6 +3046,9 @@ mod tests {
             "assets/chunk-FilesPanel.js"
         )));
         assert!(safe_relative_path(FilePath::new(
+            "assets/chunk-file-languages.js"
+        )));
+        assert!(safe_relative_path(FilePath::new(
             "assets/chunk-jsx-runtime.js"
         )));
         assert!(safe_relative_path(FilePath::new(
@@ -3059,6 +3062,13 @@ mod tests {
         assert_eq!(
             bundle
                 .asset("assets/chunk-FilesPanel.js")
+                .unwrap()
+                .media_type,
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            bundle
+                .asset("assets/chunk-file-languages.js")
                 .unwrap()
                 .media_type,
             "text/javascript; charset=utf-8"
