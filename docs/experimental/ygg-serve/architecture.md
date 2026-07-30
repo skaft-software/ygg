@@ -97,6 +97,16 @@ validation, request/frame limits, security headers, and sanitized errors. It
 must not gain LAN access by binding the same unauthenticated server to
 `0.0.0.0`.
 
+## Local terminal
+
+When sandbox policy permits process execution, `ygg-serve` owns a bounded
+in-process PTY manager and exposes it only through the authenticated,
+same-origin loopback WebSocket. A browser owner key reattaches to a retained
+shell after disconnect, while the manager limits retained sessions to four and
+bounds input, replay, and dimensions. A terminal is rooted at the configured
+workspace; it is not a general path or remote-shell API. Server shutdown stops
+all retained shells.
+
 ## Preview isolation
 
 Generated HTML and live previews use a separate, capability-limited surface.

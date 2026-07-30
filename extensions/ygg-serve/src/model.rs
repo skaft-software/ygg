@@ -132,7 +132,7 @@ pub struct HostCapabilities {
     pub session_export: bool,
     /// LAN connected clients are supported.
     pub lan_clients: bool,
-    /// Interactive PTY support; false for the first web release.
+    /// Interactive PTY support through the authenticated loopback transport.
     pub terminal: bool,
     /// Nested child agents; false until Ygg implements them.
     pub child_agents: bool,

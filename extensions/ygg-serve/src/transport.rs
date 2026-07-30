@@ -30,14 +30,18 @@ use tokio::task::JoinHandle;
 use crate::embedded_web::WebBundle;
 use crate::{
     AttachmentError, FileEntryId, HostCommandEnvelope, HostService, ProjectFileSystemError,
-    ProjectId, ProtocolValidation, SanitizedError, ServiceError, SessionCommandEnvelope,
-    SessionCursor, SessionId, SessionSupervisor, SupervisorError, MAX_ATTACHMENT_FILE_BYTES,
+    ProjectId, ProtocolValidation, PtyAttachment, PtyError, PtyEvent, PtyExit, PtyManager,
+    PtyOpenRequest, SanitizedError, ServiceError, SessionCommandEnvelope, SessionCursor, SessionId,
+    SessionSupervisor, SupervisorError, TerminalConfig, MAX_ATTACHMENT_FILE_BYTES,
     MAX_COMMAND_BYTES, MAX_DOCUMENT_FILE_BYTES, MAX_PROJECT_FILE_PATH_BYTES,
-    MAX_PROJECT_FILE_WRITE_BYTES, PROTOCOL_VERSION,
+    MAX_PROJECT_FILE_WRITE_BYTES, MAX_PTY_INPUT_BYTES, PROTOCOL_VERSION,
 };
 
 const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 8 * 1024;
+// JSON may escape every input byte, while the decoded PTY input remains
+// bounded by `MAX_PTY_INPUT_BYTES` in the manager.
+const MAX_TERMINAL_WEBSOCKET_MESSAGE_BYTES: usize = MAX_PTY_INPUT_BYTES * 8;
 const RATE_LIMIT_REQUESTS: usize = 240;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_ATTACHMENT_UPLOADS: usize = 4;
@@ -54,6 +58,9 @@ pub struct LoopbackConfig {
     pub port: u16,
     /// Optional built graphical-shell directory.
     pub web_root: Option<PathBuf>,
+    /// Optional local terminal configuration. Omit it when process execution
+    /// is disabled by the host's sandbox policy.
+    pub terminal: Option<TerminalConfig>,
 }
 
 /// Transport startup or task failure.
@@ -62,6 +69,9 @@ pub enum TransportError {
     /// Initial host bootstrap failed.
     #[error("host startup failed")]
     Host(#[from] SupervisorError),
+    /// Terminal setup failed.
+    #[error("terminal setup failed")]
+    Terminal(#[from] PtyError),
     /// The loopback listener could not be created.
     #[error("loopback listener failed")]
     Io(#[from] std::io::Error),
@@ -74,6 +84,7 @@ pub enum TransportError {
 pub struct LoopbackServer {
     address: SocketAddr,
     launch_token: String,
+    terminal: Option<PtyManager>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
 }
@@ -92,6 +103,7 @@ impl LoopbackServer {
             Some(root) => WebBundle::from_root(root)?,
             None => WebBundle::embedded()?,
         };
+        let terminal = config.terminal.map(PtyManager::new).transpose()?;
         let listener = TcpListener::bind(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             config.port,
@@ -113,6 +125,7 @@ impl LoopbackServer {
             rate_limiter: RateLimiter::default(),
             attachment_uploads: Arc::new(Semaphore::new(MAX_CONCURRENT_ATTACHMENT_UPLOADS)),
             session_exports: Arc::new(Semaphore::new(MAX_CONCURRENT_SESSION_EXPORTS)),
+            terminal: terminal.clone(),
             web_bundle,
         });
         let router = build_router(state);
@@ -127,6 +140,7 @@ impl LoopbackServer {
         Ok(Self {
             address,
             launch_token,
+            terminal,
             shutdown: Some(shutdown),
             task: Some(task),
         })
@@ -150,27 +164,42 @@ impl LoopbackServer {
 
     /// Waits until the listener exits.
     pub async fn wait(mut self) -> Result<(), TransportError> {
-        if let Some(task) = self.task.take() {
-            task.await??;
-        }
+        let result = self.await_task().await;
         self.shutdown.take();
-        Ok(())
+        self.stop_terminal();
+        result
     }
 
     /// Requests graceful shutdown and waits for completion.
     pub async fn shutdown(mut self) -> Result<(), TransportError> {
+        self.stop_terminal();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        if let Some(task) = self.task.take() {
-            task.await??;
+        self.await_task().await
+    }
+
+    async fn await_task(&mut self) -> Result<(), TransportError> {
+        match self.task.take() {
+            Some(task) => match task.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(TransportError::Io(error)),
+                Err(error) => Err(TransportError::Task(error)),
+            },
+            None => Ok(()),
         }
-        Ok(())
+    }
+
+    fn stop_terminal(&mut self) {
+        if let Some(terminal) = self.terminal.take() {
+            terminal.shutdown();
+        }
     }
 }
 
 impl Drop for LoopbackServer {
     fn drop(&mut self) {
+        self.stop_terminal();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -184,6 +213,7 @@ struct TransportState<H: HostService> {
     rate_limiter: RateLimiter,
     attachment_uploads: Arc<Semaphore>,
     session_exports: Arc<Semaphore>,
+    terminal: Option<PtyManager>,
     web_bundle: WebBundle,
 }
 
@@ -368,6 +398,64 @@ struct UsageStatsQuery {
     period: crate::UsagePeriod,
 }
 
+#[derive(Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+enum TerminalClientMessage {
+    Open {
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        owner_key: Option<String>,
+        cols: u16,
+        rows: u16,
+    },
+    Resize {
+        id: String,
+        cols: u16,
+        rows: u16,
+    },
+    Input {
+        id: String,
+        data: String,
+    },
+    Detach {
+        id: String,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum TerminalServerMessage {
+    Opened {
+        id: String,
+        owner_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replay: Option<String>,
+    },
+    Output {
+        id: String,
+        data: String,
+    },
+    Exit {
+        id: String,
+        exit_code: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signal: Option<String>,
+    },
+    Error {
+        message: &'static str,
+    },
+}
+
 fn default_file_list_limit() -> usize {
     200
 }
@@ -450,6 +538,7 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
             get(resource_content::<H>),
         )
         .route("/api/v1/events", any(events_socket::<H>))
+        .route("/api/v1/terminal", any(terminal_socket::<H>))
         .route("/{*asset}", get(static_asset::<H>))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
@@ -1440,6 +1529,272 @@ async fn stream_events(
     }
 }
 
+async fn terminal_socket<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    let upgrade = match upgrade {
+        Ok(upgrade) => upgrade,
+        Err(_) => return invalid_request(),
+    };
+    let Some(terminal) = state.terminal.clone() else {
+        return not_found().await;
+    };
+    upgrade
+        .max_message_size(MAX_TERMINAL_WEBSOCKET_MESSAGE_BYTES)
+        .max_frame_size(MAX_TERMINAL_WEBSOCKET_MESSAGE_BYTES)
+        .on_upgrade(move |socket| stream_terminal(socket, terminal))
+}
+
+async fn stream_terminal(socket: WebSocket, terminal: PtyManager) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut attachment: Option<PtyAttachment> = None;
+    loop {
+        tokio::select! {
+            event = async {
+                if let Some(attachment) = attachment.as_mut() {
+                    attachment.events.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                let Some(id) = attachment.as_ref().map(|attachment| attachment.id.clone()) else {
+                    continue;
+                };
+                match event {
+                    Ok(PtyEvent::Output(data)) => {
+                        if !send_terminal_message(
+                            &mut sender,
+                            TerminalServerMessage::Output { id, data },
+                        ).await {
+                            break;
+                        }
+                    }
+                    Ok(PtyEvent::Exit(exit)) => {
+                        let _ = send_terminal_message(
+                            &mut sender,
+                            terminal_exit_message(id, exit),
+                        ).await;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = sender.send(Message::Close(Some(CloseFrame {
+                            code: 1013,
+                            reason: "terminal output replay required".into(),
+                        }))).await;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            incoming = receiver.next() => {
+                let message = match incoming {
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str(text.as_str()) {
+                        Ok(message) => message,
+                        Err(_) => {
+                            if !send_terminal_message(
+                                &mut sender,
+                                TerminalServerMessage::Error {
+                                    message: "The terminal message is invalid.",
+                                },
+                            ).await {
+                                break;
+                            }
+                            continue;
+                        }
+                    },
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(Message::Ping(bytes))) => {
+                        if sender.send(Message::Pong(bytes)).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Some(Ok(Message::Pong(_))) => continue,
+                    Some(Ok(Message::Binary(_))) => {
+                        let _ = sender.send(Message::Close(Some(CloseFrame {
+                            code: 1003,
+                            reason: "terminal messages must be text".into(),
+                        }))).await;
+                        break;
+                    }
+                };
+
+                match message {
+                    TerminalClientMessage::Open {
+                        cwd,
+                        owner_key,
+                        cols,
+                        rows,
+                    } => match terminal.open(PtyOpenRequest {
+                        cols,
+                        rows,
+                        owner_key,
+                        cwd,
+                    }) {
+                        Ok(next) => {
+                            let opened = TerminalServerMessage::Opened {
+                                id: next.id.clone(),
+                                owner_key: next.owner_key.clone(),
+                                replay: (!next.replay.is_empty()).then_some(next.replay.clone()),
+                            };
+                            let exit = next.exit.clone();
+                            if !send_terminal_message(&mut sender, opened).await {
+                                break;
+                            }
+                            if let Some(previous) = attachment.replace(next) {
+                                let _ = terminal.detach(&previous.id);
+                            }
+                            if let Some(exit) = exit {
+                                let Some(id) = attachment
+                                    .as_ref()
+                                    .map(|attachment| attachment.id.clone())
+                                else {
+                                    break;
+                                };
+                                let _ = send_terminal_message(
+                                    &mut sender,
+                                    terminal_exit_message(id, exit),
+                                ).await;
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            if !send_terminal_message(
+                                &mut sender,
+                                TerminalServerMessage::Error {
+                                    message: terminal_error_message(&error),
+                                },
+                            ).await {
+                                break;
+                            }
+                        }
+                    },
+                    TerminalClientMessage::Resize { id, cols, rows } => {
+                        if !terminal_attachment_matches(&attachment, &id) {
+                            if !send_terminal_message(
+                                &mut sender,
+                                TerminalServerMessage::Error {
+                                    message: "The terminal request is invalid.",
+                                },
+                            ).await {
+                                break;
+                            }
+                            continue;
+                        }
+                        if let Err(error) = terminal.resize(&id, cols, rows) {
+                            if !send_terminal_message(
+                                &mut sender,
+                                TerminalServerMessage::Error {
+                                    message: terminal_error_message(&error),
+                                },
+                            ).await {
+                                break;
+                            }
+                        }
+                    }
+                    TerminalClientMessage::Input { id, data } => {
+                        if !terminal_attachment_matches(&attachment, &id) {
+                            if !send_terminal_message(
+                                &mut sender,
+                                TerminalServerMessage::Error {
+                                    message: "The terminal request is invalid.",
+                                },
+                            ).await {
+                                break;
+                            }
+                            continue;
+                        }
+                        if let Err(error) = terminal.input(&id, &data) {
+                            if !send_terminal_message(
+                                &mut sender,
+                                TerminalServerMessage::Error {
+                                    message: terminal_error_message(&error),
+                                },
+                            ).await {
+                                break;
+                            }
+                        }
+                    }
+                    TerminalClientMessage::Detach { id } => {
+                        if !terminal_attachment_matches(&attachment, &id) {
+                            if !send_terminal_message(
+                                &mut sender,
+                                TerminalServerMessage::Error {
+                                    message: "The terminal request is invalid.",
+                                },
+                            ).await {
+                                break;
+                            }
+                            continue;
+                        }
+                        match terminal.detach(&id) {
+                            Ok(()) => {
+                                attachment.take();
+                            }
+                            Err(error) => {
+                                if !send_terminal_message(
+                                    &mut sender,
+                                    TerminalServerMessage::Error {
+                                        message: terminal_error_message(&error),
+                                    },
+                                ).await {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(attachment) = attachment {
+        let _ = terminal.detach(&attachment.id);
+    }
+}
+
+fn terminal_attachment_matches(attachment: &Option<PtyAttachment>, id: &str) -> bool {
+    attachment
+        .as_ref()
+        .is_some_and(|attachment| attachment.id == id)
+}
+
+async fn send_terminal_message(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: TerminalServerMessage,
+) -> bool {
+    let Ok(encoded) = serde_json::to_string(&message) else {
+        return false;
+    };
+    sender.send(Message::Text(encoded.into())).await.is_ok()
+}
+
+fn terminal_exit_message(id: String, exit: PtyExit) -> TerminalServerMessage {
+    TerminalServerMessage::Exit {
+        id,
+        exit_code: exit.exit_code,
+        signal: exit.signal,
+    }
+}
+
+fn terminal_error_message(error: &PtyError) -> &'static str {
+    match error {
+        PtyError::InvalidDimensions
+        | PtyError::InvalidOwnerKey
+        | PtyError::InvalidSessionId
+        | PtyError::InvalidWorkingDirectory => "The terminal request is invalid.",
+        PtyError::InputTooLarge => "The terminal input exceeds the size limit.",
+        PtyError::NotFound => "The terminal session is no longer available.",
+        PtyError::Exited => "The terminal session has exited.",
+        PtyError::WorkingDirectoryUnavailable | PtyError::Start | PtyError::Io(_) => {
+            "The terminal could not be started or reached."
+        }
+    }
+}
+
 async fn secure_request<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
     request: Request,
@@ -1460,6 +1815,7 @@ async fn secure_request<H: HostService>(
     let resource_request = matches!(request.method(), &Method::GET | &Method::HEAD)
         && request.uri().path().starts_with("/api/v1/sessions/")
         && request.uri().path().contains("/resources/");
+    let terminal_socket = request.uri().path() == "/api/v1/terminal";
     let host_allowed = headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
@@ -1471,6 +1827,11 @@ async fn secure_request<H: HostService>(
             .ok()
             .is_some_and(|value| state.allowed_authorities.allows_origin(value)),
     };
+    let terminal_origin_allowed = !terminal_socket
+        || headers
+            .get(ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| state.allowed_authorities.allows_origin(value));
     let fetch_site_allowed = match headers.get("sec-fetch-site") {
         None => true,
         Some(value) => value
@@ -1553,37 +1914,38 @@ async fn secure_request<H: HostService>(
     let api_authenticated =
         !request.uri().path().starts_with("/api/v1/") || state.auth.allows_cookie(headers);
 
-    let mut response = if !host_allowed || !origin_allowed || !fetch_site_allowed {
-        error_response(
-            StatusCode::FORBIDDEN,
-            SanitizedError::public(
-                crate::ErrorCode::Unauthorized,
-                "This request is not allowed by the loopback host.",
-            ),
-        )
-    } else if !api_authenticated {
-        authentication_required()
-    } else if export_has_query || export_has_body || resource_has_forbidden_shape {
-        invalid_request()
-    } else if !query_allowed || !content_length_allowed {
-        error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            SanitizedError::public(
-                crate::ErrorCode::InvalidCommand,
-                "The request exceeds a transport limit.",
-            ),
-        )
-    } else if !mutation_has_json {
-        error_response(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            SanitizedError::public(
-                crate::ErrorCode::InvalidCommand,
-                "This endpoint requires JSON.",
-            ),
-        )
-    } else {
-        next.run(request).await
-    };
+    let mut response =
+        if !host_allowed || !origin_allowed || !terminal_origin_allowed || !fetch_site_allowed {
+            error_response(
+                StatusCode::FORBIDDEN,
+                SanitizedError::public(
+                    crate::ErrorCode::Unauthorized,
+                    "This request is not allowed by the loopback host.",
+                ),
+            )
+        } else if !api_authenticated {
+            authentication_required()
+        } else if export_has_query || export_has_body || resource_has_forbidden_shape {
+            invalid_request()
+        } else if !query_allowed || !content_length_allowed {
+            error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                SanitizedError::public(
+                    crate::ErrorCode::InvalidCommand,
+                    "The request exceeds a transport limit.",
+                ),
+            )
+        } else if !mutation_has_json {
+            error_response(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                SanitizedError::public(
+                    crate::ErrorCode::InvalidCommand,
+                    "This endpoint requires JSON.",
+                ),
+            )
+        } else {
+            next.run(request).await
+        };
     apply_security_headers(response.headers_mut());
     response
 }
@@ -1964,7 +2326,14 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    #[cfg(unix)]
+    use futures_util::{SinkExt as _, StreamExt as _};
     use tokio::sync::Notify;
+    #[cfg(unix)]
+    use tokio_tungstenite::tungstenite::{
+        client::IntoClientRequest, http::HeaderValue as TungsteniteHeaderValue,
+        Message as TungsteniteMessage,
+    };
 
     use crate::{
         ActorOwnerState, AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState,
@@ -2495,6 +2864,47 @@ mod tests {
         String::from_utf8(request_bytes(address, request.into_bytes()).await).unwrap()
     }
 
+    #[cfg(unix)]
+    type TerminalSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    #[cfg(unix)]
+    async fn terminal_socket(address: SocketAddr, cookie: &str) -> TerminalSocket {
+        let mut request = format!("ws://{address}/api/v1/terminal")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "origin",
+            format!("http://{address}")
+                .parse::<TungsteniteHeaderValue>()
+                .unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse::<TungsteniteHeaderValue>().unwrap());
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
+    #[cfg(unix)]
+    async fn next_terminal_message(socket: &mut TerminalSocket) -> serde_json::Value {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
+                .await
+                .expect("terminal message timed out")
+                .expect("terminal websocket closed unexpectedly")
+                .expect("terminal websocket message failed");
+            match frame {
+                TungsteniteMessage::Text(text) => return serde_json::from_str(&text).unwrap(),
+                TungsteniteMessage::Ping(_) | TungsteniteMessage::Pong(_) => {}
+                TungsteniteMessage::Close(frame) => {
+                    panic!("terminal websocket closed unexpectedly: {frame:?}")
+                }
+                frame => panic!("unexpected terminal websocket frame: {frame:?}"),
+            }
+        }
+    }
+
     fn get_request(address: SocketAddr, path: &str) -> String {
         format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
     }
@@ -2519,6 +2929,24 @@ mod tests {
 
     fn exchange_request(address: SocketAddr, token: &str) -> String {
         get_request(address, &format!("/__ygg/launch/{token}"))
+    }
+
+    fn terminal_upgrade_request(
+        address: SocketAddr,
+        cookie: Option<&str>,
+        origin: Option<&str>,
+    ) -> String {
+        let mut request = format!(
+            "GET /api/v1/terminal HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        );
+        if let Some(cookie) = cookie {
+            request.push_str(&format!("Cookie: {cookie}\r\n"));
+        }
+        if let Some(origin) = origin {
+            request.push_str(&format!("Origin: {origin}\r\n"));
+        }
+        request.push_str("\r\n");
+        request
     }
 
     fn response_header<'a>(response: &'a str, name: &str) -> Option<&'a str> {
@@ -2634,6 +3062,171 @@ mod tests {
         assert!(bundle.asset("private.txt").is_none());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_socket_authenticates_replays_and_stops_with_the_server() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let workspace = tempfile::tempdir().unwrap();
+        let server = LoopbackServer::start(
+            supervisor,
+            LoopbackConfig {
+                port: 0,
+                web_root: None,
+                terminal: Some(TerminalConfig {
+                    cwd: workspace.path().to_path_buf(),
+                    shell: Some(PathBuf::from("/bin/sh")),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let address = server.address();
+        let origin = format!("http://{address}");
+
+        let unauthenticated = request(
+            address,
+            terminal_upgrade_request(address, None, Some(&origin)),
+        )
+        .await;
+        assert!(unauthenticated.starts_with("HTTP/1.1 401"));
+
+        let exchanged = request(address, exchange_request(address, &server.launch_token)).await;
+        let cookie = response_header(&exchanged, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let missing_origin = request(
+            address,
+            terminal_upgrade_request(address, Some(cookie), None),
+        )
+        .await;
+        assert!(missing_origin.starts_with("HTTP/1.1 403"));
+
+        let mut first = terminal_socket(address, cookie).await;
+        first
+            .send(TungsteniteMessage::Text("{not-json".into()))
+            .await
+            .unwrap();
+        let malformed = next_terminal_message(&mut first).await;
+        assert_eq!(malformed["type"], "error");
+
+        first
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "type": "input",
+                    "id": "f".repeat(32),
+                    "data": "echo rejected\\n",
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let unattached = next_terminal_message(&mut first).await;
+        assert_eq!(unattached["type"], "error");
+
+        first
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "type": "open",
+                    "cols": 80,
+                    "rows": 24,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let opened = next_terminal_message(&mut first).await;
+        assert_eq!(opened["type"], "opened");
+        let id = opened["id"].as_str().unwrap().to_owned();
+        let owner_key = opened["ownerKey"].as_str().unwrap().to_owned();
+
+        first
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "type": "resize",
+                    "id": id.clone(),
+                    "cols": 100,
+                    "rows": 30,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        first
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "type": "input",
+                    "id": id.clone(),
+                    "data": "printf 'terminal websocket works\\n'\\n",
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let output = next_terminal_message(&mut first).await;
+            if output["type"] == "output"
+                && output["data"]
+                    .as_str()
+                    .is_some_and(|data| data.contains("terminal websocket works"))
+            {
+                break;
+            }
+        }
+
+        first
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({ "type": "detach", "id": id.clone() })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        drop(first);
+
+        let mut second = terminal_socket(address, cookie).await;
+        second
+            .send(TungsteniteMessage::Text(
+                serde_json::json!({
+                    "type": "open",
+                    "ownerKey": owner_key,
+                    "cols": 100,
+                    "rows": 30,
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let reopened = next_terminal_message(&mut second).await;
+        assert_eq!(reopened["type"], "opened");
+        assert_eq!(reopened["id"], id);
+        assert!(reopened["replay"]
+            .as_str()
+            .is_some_and(|replay| replay.contains("terminal websocket works")));
+
+        let shutdown = tokio::spawn(async move { server.shutdown().await });
+        loop {
+            let message = next_terminal_message(&mut second).await;
+            if message["type"] == "exit" {
+                assert_eq!(message["id"], id);
+                break;
+            }
+        }
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("server shutdown timed out")
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn bootstrap_is_fresh_per_root_client_and_explicit_restore_does_not_create() {
         let host = Arc::new(MockHost::new());
@@ -2647,6 +3240,7 @@ mod tests {
             LoopbackConfig {
                 port: 0,
                 web_root: None,
+                terminal: None,
             },
         )
         .await
@@ -2740,6 +3334,7 @@ mod tests {
             LoopbackConfig {
                 port: 0,
                 web_root: None,
+                terminal: None,
             },
         )
         .await
@@ -2998,6 +3593,7 @@ mod tests {
             LoopbackConfig {
                 port: 0,
                 web_root: None,
+                terminal: None,
             },
         )
         .await
@@ -3132,6 +3728,7 @@ mod tests {
             LoopbackConfig {
                 port: 0,
                 web_root: None,
+                terminal: None,
             },
         )
         .await
@@ -3288,6 +3885,7 @@ mod tests {
             LoopbackConfig {
                 port: 0,
                 web_root: None,
+                terminal: None,
             },
         )
         .await
@@ -3405,6 +4003,7 @@ mod tests {
             LoopbackConfig {
                 port: 0,
                 web_root: None,
+                terminal: None,
             },
         )
         .await

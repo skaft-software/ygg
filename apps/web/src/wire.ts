@@ -2970,7 +2970,10 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
     capabilities.opaqueResources,
     "hostBootstrap.capabilities.opaqueResources",
   );
-  boolean(capabilities.terminal, "hostBootstrap.capabilities.terminal");
+  const terminal = boolean(
+    capabilities.terminal,
+    "hostBootstrap.capabilities.terminal",
+  );
   boolean(capabilities.childAgents, "hostBootstrap.capabilities.childAgents");
   const sessionMetadata = boolean(
     capabilities.sessionMetadata,
@@ -3186,6 +3189,7 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
         capabilities.lanClients,
         "hostBootstrap.capabilities.lanClients",
       ),
+      terminal,
       // These describe UI paths that require more than a host capability bit.
       // Keep pairing disabled until an authenticated pairing lifecycle exists.
       attachmentIngest: attachments && attachmentPolicy !== undefined,

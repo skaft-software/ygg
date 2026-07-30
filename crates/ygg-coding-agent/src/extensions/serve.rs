@@ -77,6 +77,14 @@ pub async fn run(
     web_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let _host_lock = ServeHostLock::acquire(&config)?;
+    let terminal =
+        config
+            .sandbox
+            .process_execution_allowed()
+            .then(|| ygg_serve_backend::TerminalConfig {
+                cwd: config.workspace.clone(),
+                shell: config.sandbox.shell_path.clone(),
+            });
     let host = Arc::new(YggHost::new(config)?);
     let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
     let server = LoopbackServer::start(
@@ -84,6 +92,7 @@ pub async fn run(
         LoopbackConfig {
             port,
             web_root: web_root.clone(),
+            terminal,
         },
     )
     .await?;
@@ -968,7 +977,7 @@ impl HostService for YggHost {
             session_trash: true,
             session_export: true,
             lan_clients: false,
-            terminal: false,
+            terminal: self.config.sandbox.process_execution_allowed(),
             child_agents: false,
         }
     }
@@ -7543,6 +7552,20 @@ mod tests {
         config.session_dir = directory.join("sessions");
         config.workspace_trusted = trusted;
         config
+    }
+
+    #[test]
+    fn terminal_capability_tracks_process_execution_permission() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = project_test_config(directory.path(), true);
+        let enabled = YggHost::new(config.clone()).unwrap();
+        assert!(enabled.capabilities().terminal);
+        drop(enabled);
+
+        let mut restricted = config;
+        restricted.sandbox.allow_process = false;
+        let disabled = YggHost::new(restricted).unwrap();
+        assert!(!disabled.capabilities().terminal);
     }
 
     #[test]
