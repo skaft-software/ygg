@@ -7,8 +7,8 @@ import unittest
 
 from evaluation.harbor.command import (
     FailureKind,
-    build_ygg_command,
     build_ygg_argv,
+    build_ygg_command,
     classify_failure,
     parse_ygg_version,
 )
