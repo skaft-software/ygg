@@ -4,6 +4,7 @@ import type {
   AttachmentRef,
   AuthorityProfile,
   ClientCommand,
+  CommandDiscovery,
   DocumentReference,
   HostEvent,
   HostBootstrap,
@@ -620,6 +621,32 @@ export class YggStore {
 
   getTrustedFiles(projectId: string): Promise<TrustedFileCatalog> {
     return this.transport.getTrustedFiles(projectId);
+  }
+
+  getCommandDiscovery(): Promise<CommandDiscovery> {
+    const session = this.selectedSession;
+    if (!session) return Promise.reject(new Error("No session is selected."));
+    return this.transport.getCommandDiscovery(session.sessionId);
+  }
+
+  async invokeSlashCommand(
+    invocation: string,
+    idempotencyKey: string = commandId(),
+  ): Promise<void> {
+    const session = this.selectedSession;
+    if (!session) throw new Error("No session is selected.");
+    const ack = await this.sendCommand({
+      id: idempotencyKey,
+      type: "session.invokeSlashCommand",
+      sessionId: session.sessionId,
+      invocation,
+    });
+    if (!ack.accepted) {
+      throw rejectedCommandError(
+        ack,
+        "The ygg host rejected this slash command.",
+      );
+    }
   }
 
   getRepositoryContext(projectId: string): Promise<RepositoryContextSnapshot> {

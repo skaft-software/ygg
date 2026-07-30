@@ -4,6 +4,7 @@ import { fixtureBootstrap, fixtureSessions } from "./fixtures";
 import type {
   ClientCommand,
   CommandAck,
+  CommandDiscovery,
   AttachmentRef,
   DocumentReference,
   HostEvent,
@@ -48,6 +49,8 @@ class TestTransport implements YggTransport {
     importSupported: false,
     projects: clone(fixtureBootstrap.projects),
   };
+  commandDiscovery: CommandDiscovery = { commands: [], skills: [] };
+  readonly commandDiscoverySessionIds: string[] = [];
   sessionLoader: SessionLoader = async (sessionId) => {
     const snapshot = fixtureSessions[sessionId];
     if (!snapshot) throw new Error(`Unknown session ${sessionId}`);
@@ -139,6 +142,11 @@ class TestTransport implements YggTransport {
     signal?: AbortSignal,
   ): Promise<SessionSnapshot> {
     return this.sessionLoader(sessionId, signal);
+  }
+
+  async getCommandDiscovery(sessionId: string): Promise<CommandDiscovery> {
+    this.commandDiscoverySessionIds.push(sessionId);
+    return clone(this.commandDiscovery);
   }
 
   async send(command: ClientCommand): Promise<CommandAck> {
@@ -658,6 +666,38 @@ describe("YggStore", () => {
       currentGeneration: 9,
     });
     expect(transport.commands.at(-1)?.id).toBe("command-stale");
+    store.dispose();
+  });
+
+  it("loads session-scoped slash discovery and sends typed invocation commands", async () => {
+    const transport = new TestTransport();
+    transport.commandDiscovery = {
+      commands: [
+        {
+          name: "compact",
+          usage: "/compact",
+          description: "Compact context.",
+          acceptsArgument: false,
+          kind: "builtIn",
+        },
+      ],
+      skills: [],
+    };
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    await expect(store.getCommandDiscovery()).resolves.toEqual(
+      transport.commandDiscovery,
+    );
+    expect(transport.commandDiscoverySessionIds).toEqual(["session-fresh"]);
+
+    await store.invokeSlashCommand("/compact", "command-slash");
+    expect(transport.commands.at(-1)).toMatchObject({
+      id: "command-slash",
+      type: "session.invokeSlashCommand",
+      sessionId: "session-fresh",
+      invocation: "/compact",
+    });
     store.dispose();
   });
 

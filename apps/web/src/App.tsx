@@ -1310,6 +1310,7 @@ export default function App() {
     },
     [selectedProjectId],
   );
+
   const getProjectFileTree = useCallback(
     (projectId: string, path?: string) => store.getProjectFileTree(projectId, path),
     [],
@@ -1328,6 +1329,39 @@ export default function App() {
       store.writeProjectFile(projectId, request),
     [],
   );
+const getCommandDiscovery = useCallback(
+    () => store.getCommandDiscovery(),
+    [],
+  );
+  const invokeSlashCommand = useCallback(
+    (invocation: string, idempotencyKey: string) =>
+      store.invokeSlashCommand(invocation, idempotencyKey),
+    [],
+  );
+  const exportSession = useCallback(() => {
+    if (!session) throw new Error("No session is selected.");
+    const link = document.createElement("a");
+    link.href = `/api/v1/sessions/${encodeURIComponent(session.sessionId)}/export`;
+    link.download = "";
+    link.hidden = true;
+    document.body.append(link);
+    link.click();
+    link.remove();
+  }, [session]);
+  const forkCurrentSession = useCallback(() => {
+    const entryId = session?.branches.head;
+    if (!entryId) {
+      return Promise.reject(
+        new Error("This conversation does not have a checkpoint to fork."),
+      );
+    }
+    return store.forkConversation(entryId);
+  }, [session?.branches.head]);
+  const openRuntimeStatus = useCallback(() => {
+    setInspector(null);
+    setActivityOpen(true);
+  }, []);
+
   const editUserTurn = useCallback(
     (entryId: string, text: string) =>
       store.editUserTurn(entryId, text),
@@ -1519,6 +1553,11 @@ export default function App() {
             onListProjectFiles={listProjectFiles}
             onSearchProjectFiles={searchProjectFiles}
             onReadProjectFile={readProjectFile}
+            onGetCommandDiscovery={getCommandDiscovery}
+            onInvokeSlashCommand={invokeSlashCommand}
+            onExportSession={exportSession}
+            onForkSession={forkCurrentSession}
+            onOpenRuntimeStatus={openRuntimeStatus}
             onEditUserTurn={editUserTurn}
             onRetryResponse={retryResponse}
             onForkConversation={forkConversation}

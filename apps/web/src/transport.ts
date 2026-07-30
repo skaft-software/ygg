@@ -6,6 +6,7 @@ import type {
   AttachmentRef,
   ClientCommand,
   CommandAck,
+  CommandDiscovery,
   DocumentReference,
   HostBootstrap,
   HostEvent,
@@ -49,6 +50,7 @@ import {
   projectUsageStats,
   projectHostStreamEvent,
   projectDocumentReference,
+  projectCommandDiscovery,
   projectReplayResponse,
   projectSessionSnapshot,
   projectTranscriptSearchResult,
@@ -72,6 +74,7 @@ export interface YggTransport {
   getUsageActivity(): Promise<UsageActivity>;
   connect(selectedSessionId?: string): Promise<HostBootstrap>;
   getSession(sessionId: string, signal?: AbortSignal): Promise<SessionSnapshot>;
+  getCommandDiscovery(sessionId: string): Promise<CommandDiscovery>;
   send(command: ClientCommand): Promise<CommandAck>;
   ingestAttachment(file: File): Promise<AttachmentRef>;
   ingestDocument(sessionId: string, file: File): Promise<DocumentReference>;
@@ -587,6 +590,53 @@ export class FixtureTransport implements YggTransport {
       throw new Error(`Unknown fixture session ${sessionId}`);
     }
     return clone(snapshot);
+  }
+
+  async getCommandDiscovery(sessionId: string): Promise<CommandDiscovery> {
+    if (!this.sessions[sessionId]) {
+      throw new Error(`Unknown fixture session ${sessionId}`);
+    }
+    return {
+      commands: [
+        {
+          name: "compact",
+          usage: "/compact",
+          description: "compress conversation context",
+          acceptsArgument: false,
+          kind: "builtIn",
+        },
+        {
+          name: "status",
+          usage: "/status",
+          description: "show session status",
+          acceptsArgument: false,
+          kind: "builtIn",
+        },
+        {
+          name: "skills",
+          usage: "/skills [subcommand]",
+          description: "manage and view agent skills",
+          acceptsArgument: true,
+          kind: "builtIn",
+        },
+        {
+          name: "review",
+          usage: "/review [focus]",
+          description: "prompt · review the current implementation",
+          argumentHint: "[focus]",
+          acceptsArgument: true,
+          kind: "prompt",
+        },
+      ],
+      skills: [
+        {
+          id: "testing",
+          name: "Testing",
+          description: "Run focused tests and interpret failures.",
+          active: false,
+        },
+      ],
+    };
   }
 
   subscribe(listener: EventListener): () => void {
@@ -1287,6 +1337,18 @@ export class FixtureTransport implements YggTransport {
       };
     }
 
+    if (command.type === "session.invokeSlashCommand") {
+      if (snapshot.status === "working" || snapshot.status === "needs_attention") {
+        return {
+          commandId: command.id,
+          accepted: false,
+          error: "Slash commands are available after current work finishes.",
+          errorCode: "invalidBoundary",
+        };
+      }
+      return { commandId: command.id, accepted: true };
+    }
+
     if (
       command.type === "session.submit" ||
       command.type === "session.steer" ||
@@ -1984,6 +2046,20 @@ export class HttpTransport implements YggTransport {
     this.assertSnapshotPastReplacementBarrier(snapshot);
     this.rememberSnapshot(snapshot);
     return snapshot;
+  }
+
+  async getCommandDiscovery(sessionId: string): Promise<CommandDiscovery> {
+    const response = await fetch(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/commands`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Command discovery failed with ${response.status}`);
+    }
+    return projectCommandDiscovery(await response.json());
   }
 
   async send(command: ClientCommand): Promise<CommandAck> {

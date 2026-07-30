@@ -54,6 +54,8 @@ import type {
   AttachmentRef,
   AuthorityProfile,
   DocumentReference,
+  CommandDiscovery,
+  CommandSuggestion,
   HostBootstrap,
   ModelSummary,
   OutputRef,
@@ -72,6 +74,10 @@ import {
   type ConversationBranchAction,
 } from "./ConversationBranchDialog";
 import { PromptContextPicker } from "./PromptContextPicker";
+import {
+  ComposerCompletion,
+  type ComposerCompletionOption,
+} from "./ComposerCompletion";
 import {
   BashLogo,
   InlineDiffPreview,
@@ -124,6 +130,14 @@ interface ConversationProps {
     query: string,
   ) => Promise<TrustedFileSearchResult>;
   onReadProjectFile?: (entryId: string) => Promise<TrustedFileRead>;
+  onGetCommandDiscovery?: () => Promise<CommandDiscovery>;
+  onInvokeSlashCommand?: (
+    invocation: string,
+    idempotencyKey: string,
+  ) => Promise<void>;
+  onExportSession?: () => Promise<void> | void;
+  onForkSession?: () => Promise<void>;
+  onOpenRuntimeStatus?: () => void;
   onEditUserTurn?: (entryId: string, text: string) => Promise<void>;
   onRetryResponse?: (
     entryId: string,
@@ -2651,6 +2665,214 @@ function ComposerMenu<T extends string>({
   );
 }
 
+type ComposerCompletionTrigger =
+  | {
+      kind: "files";
+      key: string;
+      query: string;
+      start: number;
+      end: number;
+    }
+  | {
+      kind: "commands" | "skillSubcommands" | "skills";
+      key: string;
+      query: string;
+      start: number;
+      end: number;
+    };
+
+type ComposerCompletionAction =
+  | { type: "file"; file: TrustedFileEntry; start: number; end: number }
+  | { type: "command"; command: CommandSuggestion }
+  | { type: "skillSubcommand"; name: string; acceptsArgument: boolean }
+  | { type: "skill"; name: string; start: number; end: number }
+  | { type: "direct"; name: "export" | "fork" | "status" };
+
+type ComposerOption = ComposerCompletionOption & {
+  action: ComposerCompletionAction;
+};
+
+const skillSubcommands = [
+  {
+    name: "list",
+    description: "list discovered skills",
+    acceptsArgument: false,
+  },
+  {
+    name: "active",
+    description: "list active skills",
+    acceptsArgument: false,
+  },
+  {
+    name: "show",
+    description: "show a skill's details",
+    acceptsArgument: true,
+  },
+  {
+    name: "search",
+    description: "search discovered skills",
+    acceptsArgument: true,
+  },
+  {
+    name: "load",
+    description: "activate a skill",
+    acceptsArgument: true,
+  },
+  {
+    name: "reload",
+    description: "rescan configured skill roots",
+    acceptsArgument: false,
+  },
+  {
+    name: "off",
+    description: "deactivate a skill",
+    acceptsArgument: true,
+  },
+] as const;
+
+function tokenTail(value: string, caret: number, pattern = "[^\\s]"): string {
+  return value.slice(caret).match(new RegExp(`^${pattern}*`, "u"))?.[0] ?? "";
+}
+
+function looksLikeAbsolutePath(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("/") || trimmed.includes("\n")) return false;
+  const firstToken = trimmed.match(/^(?:\\\s|[^\s])+/u)?.[0] ?? "";
+  return firstToken.slice(1).replaceAll("\\ ", " ").includes("/");
+}
+
+function isSlashCommandInput(value: string): boolean {
+  return value.startsWith("/") && !looksLikeAbsolutePath(value);
+}
+
+function slashCommandName(value: string): string {
+  return value.slice(1).trimStart().split(/\s/u, 1)[0] ?? "";
+}
+
+function completionTrigger(
+  value: string,
+  requestedCaret: number,
+): ComposerCompletionTrigger | null {
+  const caret = Math.max(0, Math.min(requestedCaret, value.length));
+  const before = value.slice(0, caret);
+  const fileMatch = !isSlashCommandInput(value)
+    ? /(^|\s)@([^\s@]*)$/u.exec(before)
+    : null;
+  if (fileMatch) {
+    const start = before.length - fileMatch[0].length + fileMatch[1].length;
+    const tail = tokenTail(value, caret, "[^\\s@]");
+    const query = `${fileMatch[2]}${tail}`;
+    const end = caret + tail.length;
+    return {
+      kind: "files",
+      key: `files:${start}:${end}:${query}`,
+      query,
+      start,
+      end,
+    };
+  }
+
+  const skillNameMatch = /^\/skills\s+(load|off|show)\s+([^\s]*)$/u.exec(
+    before,
+  );
+  if (skillNameMatch) {
+    const start = before.length - skillNameMatch[2].length;
+    const tail = tokenTail(value, caret);
+    const query = `${skillNameMatch[2]}${tail}`;
+    const end = caret + tail.length;
+    return {
+      kind: "skills",
+      key: `skills:${start}:${end}:${query}`,
+      query,
+      start,
+      end,
+    };
+  }
+
+  const skillSubcommandMatch = /^\/skills\s+([^\s]*)$/u.exec(before);
+  if (skillSubcommandMatch) {
+    const start = before.length - skillSubcommandMatch[1].length;
+    const tail = tokenTail(value, caret);
+    const query = `${skillSubcommandMatch[1]}${tail}`;
+    const end = caret + tail.length;
+    return {
+      kind: "skillSubcommands",
+      key: `skillSubcommands:${start}:${end}:${query}`,
+      query,
+      start,
+      end,
+    };
+  }
+
+  const commandMatch = /^\/([^\s]*)$/u.exec(before);
+  if (!commandMatch || /\s/u.test(value) || looksLikeAbsolutePath(value)) {
+    return null;
+  }
+  const tail = tokenTail(value, caret);
+  const query = `${commandMatch[1]}${tail}`;
+  const end = caret + tail.length;
+  return {
+    kind: "commands",
+    key: `commands:0:${end}:${query}`,
+    query,
+    start: 0,
+    end,
+  };
+}
+
+function fuzzyScore(value: string, query: string): number | null {
+  const needle = query.toLocaleLowerCase();
+  if (!needle) return 0;
+  const haystack = value.toLocaleLowerCase();
+  let cursor = 0;
+  let previous = -1;
+  let score = 0;
+  for (const character of needle) {
+    const index = haystack.indexOf(character, cursor);
+    if (index < 0) return null;
+    score += index - previous - 1;
+    previous = index;
+    cursor = index + 1;
+  }
+  return score + (haystack.startsWith(needle) ? -100 : 0);
+}
+
+function fuzzyTrustedFiles(
+  files: TrustedFileEntry[],
+  query: string,
+): TrustedFileEntry[] {
+  return files
+    .map((file, index) => {
+      const displayScore = fuzzyScore(file.displayName, query);
+      const pathScore = fuzzyScore(file.relativePath, query);
+      const score =
+        displayScore === null
+          ? pathScore
+          : pathScore === null
+            ? displayScore
+            : Math.min(displayScore, pathScore);
+      return { file, index, score };
+    })
+    .filter(
+      (candidate): candidate is { file: TrustedFileEntry; index: number; score: number } =>
+        candidate.score !== null,
+    )
+    .sort((left, right) => left.score - right.score || left.index - right.index)
+    .map((candidate) => candidate.file);
+}
+
+function trustedFileIcon(kind: TrustedFileEntry["kind"]): ReactNode {
+  if (kind === "source") return <FileDiff />;
+  if (kind === "configuration") return <File />;
+  return <FileText />;
+}
+
+function byteLabel(bytes: number): string {
+  if (bytes < 1024) return `${bytes.toLocaleString()} bytes`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function estimatedContextInputCost(
   contextTokens: number,
   model: ModelSummary | undefined,
@@ -2684,6 +2906,11 @@ function Composer({
   onListProjectFiles,
   onSearchProjectFiles,
   onReadProjectFile,
+  onGetCommandDiscovery,
+  onInvokeSlashCommand,
+  onExportSession,
+  onForkSession,
+  onOpenRuntimeStatus,
   onPreviewAttachment,
   attachmentContentUrl,
 }: Pick<
@@ -2698,6 +2925,11 @@ function Composer({
   | "onListProjectFiles"
   | "onSearchProjectFiles"
   | "onReadProjectFile"
+  | "onGetCommandDiscovery"
+  | "onInvokeSlashCommand"
+  | "onExportSession"
+  | "onForkSession"
+  | "onOpenRuntimeStatus"
   | "attachmentContentUrl"
 > & {
   onPreviewAttachment: (
@@ -2720,6 +2952,22 @@ function Composer({
   );
   const [documents, setDocuments] = useState<DocumentReference[]>([]);
   const [projectFiles, setProjectFiles] = useState<TrustedFileEntry[]>([]);
+  const [composerCaret, setComposerCaret] = useState(prompt.length);
+  const [fileCatalog, setFileCatalog] = useState<TrustedFileCatalog | null>(
+    null,
+  );
+  const [fileCatalogLoading, setFileCatalogLoading] = useState(false);
+  const [fileCatalogError, setFileCatalogError] = useState<string | null>(null);
+  const [commandDiscovery, setCommandDiscovery] =
+    useState<CommandDiscovery | null>(null);
+  const [commandDiscoveryLoading, setCommandDiscoveryLoading] = useState(false);
+  const [commandDiscoveryError, setCommandDiscoveryError] = useState<
+    string | null
+  >(null);
+  const [dismissedCompletionKey, setDismissedCompletionKey] = useState<
+    string | null
+  >(null);
+  const [activeCompletionIndex, setActiveCompletionIndex] = useState(0);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [draggingFiles, setDraggingFiles] = useState(false);
   const [activeDelivery, setActiveDelivery] = useState<
@@ -2741,14 +2989,21 @@ function Composer({
     null,
   );
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const pendingComposerCaretRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragDepthRef = useRef(0);
   const attachmentsRef = useRef<DraftAttachment[]>([]);
   const promptRef = useRef(prompt);
+  const fileCatalogRequestRef = useRef(0);
+  const commandDiscoveryRequestRef = useRef(0);
   const mountedRef = useRef(true);
   const pendingCommandRef = useRef<{
     id: string;
     signature: string;
+  } | null>(null);
+  const pendingSlashCommandRef = useRef<{
+    id: string;
+    invocation: string;
   } | null>(null);
   const isWorking =
     Boolean(session.activeRunId) ||
@@ -2798,6 +3053,289 @@ function Composer({
       onSearchProjectFiles &&
       onReadProjectFile,
   );
+  const triggeredCompletion = useMemo(
+    () => completionTrigger(prompt, composerCaret),
+    [composerCaret, prompt],
+  );
+  const activeCompletion =
+    triggeredCompletion &&
+    triggeredCompletion.key !== dismissedCompletionKey &&
+    (triggeredCompletion.kind !== "files" || projectFilesAvailable)
+      ? triggeredCompletion
+      : null;
+
+  useEffect(() => {
+    if (
+      activeCompletion?.kind !== "files" ||
+      !onListProjectFiles ||
+      fileCatalog ||
+      fileCatalogLoading ||
+      fileCatalogError
+    ) {
+      return;
+    }
+    const request = ++fileCatalogRequestRef.current;
+    setFileCatalogLoading(true);
+    void onListProjectFiles()
+      .then((catalog) => {
+        if (request === fileCatalogRequestRef.current) setFileCatalog(catalog);
+      })
+      .catch((error: unknown) => {
+        if (request === fileCatalogRequestRef.current) {
+          setFileCatalogError(
+            error instanceof Error
+              ? error.message
+              : "Trusted project files could not be loaded.",
+          );
+        }
+      })
+      .finally(() => {
+        if (request === fileCatalogRequestRef.current) {
+          setFileCatalogLoading(false);
+        }
+      });
+  }, [
+    activeCompletion?.kind,
+    fileCatalog,
+    fileCatalogError,
+    fileCatalogLoading,
+    onListProjectFiles,
+  ]);
+
+  useEffect(() => {
+    if (
+      (activeCompletion?.kind !== "commands" &&
+        activeCompletion?.kind !== "skills") ||
+      !onGetCommandDiscovery ||
+      commandDiscovery ||
+      commandDiscoveryLoading ||
+      commandDiscoveryError
+    ) {
+      return;
+    }
+    const request = ++commandDiscoveryRequestRef.current;
+    setCommandDiscoveryLoading(true);
+    void onGetCommandDiscovery()
+      .then((discovery) => {
+        if (request === commandDiscoveryRequestRef.current) {
+          setCommandDiscovery(discovery);
+        }
+      })
+      .catch((error: unknown) => {
+        if (request === commandDiscoveryRequestRef.current) {
+          setCommandDiscoveryError(
+            error instanceof Error
+              ? error.message
+              : "Slash commands could not be loaded.",
+          );
+        }
+      })
+      .finally(() => {
+        if (request === commandDiscoveryRequestRef.current) {
+          setCommandDiscoveryLoading(false);
+        }
+      });
+  }, [
+    activeCompletion?.kind,
+    commandDiscovery,
+    commandDiscoveryError,
+    commandDiscoveryLoading,
+    onGetCommandDiscovery,
+  ]);
+
+  const completionOptions = useMemo<ComposerOption[]>(() => {
+    if (!activeCompletion) return [];
+    if (activeCompletion.kind === "files") {
+      const selected = new Set(projectFiles.map((file) => file.id));
+      return fuzzyTrustedFiles(fileCatalog?.files ?? [], activeCompletion.query)
+        .filter((file) => !selected.has(file.id))
+        .slice(0, 100)
+        .map((file) => ({
+          id: `file-${file.id}`,
+          title: file.displayName,
+          description: file.relativePath,
+          meta: byteLabel(file.byteLen),
+          icon: trustedFileIcon(file.kind),
+          disabled: projectFiles.length >= 20,
+          action: {
+            type: "file",
+            file,
+            start: activeCompletion.start,
+            end: activeCompletion.end,
+          },
+        }));
+    }
+
+    if (activeCompletion.kind === "skillSubcommands") {
+      const query = activeCompletion.query.toLocaleLowerCase();
+      return skillSubcommands
+        .filter((subcommand) => subcommand.name.startsWith(query))
+        .map((subcommand) => ({
+          id: `skill-subcommand-${subcommand.name}`,
+          title: `/skills ${subcommand.name}`,
+          description: subcommand.description,
+          disabled: isWorking || !onInvokeSlashCommand,
+          action: {
+            type: "skillSubcommand",
+            name: subcommand.name,
+            acceptsArgument: subcommand.acceptsArgument,
+          },
+        }));
+    }
+
+    if (activeCompletion.kind === "skills") {
+      return (commandDiscovery?.skills ?? [])
+        .filter((skill) =>
+          fuzzyScore(
+            `${skill.id} ${skill.name} ${skill.description}`,
+            activeCompletion.query,
+          ) !== null,
+        )
+        .map((skill) => ({
+          id: `skill-${skill.id}`,
+          title: skill.name,
+          description: skill.description,
+          meta: skill.active ? "Active" : undefined,
+          icon: <BrainCircuit />,
+          disabled: isWorking || !onInvokeSlashCommand,
+          action: {
+            type: "skill",
+            name: skill.id,
+            start: activeCompletion.start,
+            end: activeCompletion.end,
+          },
+        }));
+    }
+
+    const direct = new Map<
+      string,
+      Omit<ComposerOption, "id"> & {
+        action: Extract<ComposerCompletionAction, { type: "direct" }>;
+      }
+    >();
+    if (onExportSession && bootstrap.capabilities.sessionExport) {
+      direct.set("export", {
+        title: "/export",
+        description: "download this session with secret redaction",
+        icon: <Download />,
+        disabled: isWorking,
+        action: { type: "direct", name: "export" },
+      });
+    }
+    if (onOpenRuntimeStatus) {
+      direct.set("status", {
+        title: "/status",
+        description: "open runtime status",
+        icon: <ScanSearch />,
+        disabled: false,
+        action: { type: "direct", name: "status" },
+      });
+    }
+    if (onForkSession && bootstrap.capabilities.conversationBranching) {
+      direct.set("fork", {
+        title: "/fork",
+        description: "fork this conversation at its current checkpoint",
+        icon: <GitFork />,
+        disabled: isWorking || !session.branches.head,
+        action: { type: "direct", name: "fork" },
+      });
+    }
+
+    const ordered = [...(commandDiscovery?.commands ?? [])].filter(
+      (command) =>
+        !["export", "fork", "status"].includes(command.name) ||
+        direct.has(command.name),
+    );
+    const insertDirect = (
+      name: "export" | "fork" | "status",
+      after?: string,
+    ) => {
+      if (!direct.has(name) || ordered.some((command) => command.name === name)) {
+        return;
+      }
+      const index = after
+        ? ordered.findIndex((command) => command.name === after)
+        : -1;
+      ordered.splice(index < 0 ? ordered.length : index + 1, 0, {
+        name,
+        usage: `/${name}`,
+        description: direct.get(name)!.description ?? "",
+        acceptsArgument: false,
+        kind: "builtIn",
+      });
+    };
+    insertDirect("status", "logout");
+    insertDirect("export", "sessions");
+    insertDirect("fork", "export");
+    const query = activeCompletion.query.toLocaleLowerCase();
+    return ordered
+      .filter((command) => command.name.toLocaleLowerCase().startsWith(query))
+      .map((command) => {
+        const replacement = direct.get(command.name);
+        if (replacement) return { ...replacement, id: `command-${command.name}` };
+        return {
+          id: `command-${command.name}`,
+          title: `/${command.name}`,
+          description: command.description,
+          meta: command.argumentHint ?? command.usage,
+          icon:
+            command.kind === "prompt" ? (
+              <FileText />
+            ) : command.kind === "extension" ? (
+              <TerminalSquare />
+            ) : (
+              <Zap />
+            ),
+          disabled: isWorking || !onInvokeSlashCommand,
+          action: { type: "command", command },
+        };
+      });
+  }, [
+    activeCompletion,
+    bootstrap.capabilities.conversationBranching,
+    bootstrap.capabilities.sessionExport,
+    commandDiscovery?.commands,
+    commandDiscovery?.skills,
+    fileCatalog?.files,
+    isWorking,
+    onExportSession,
+    onForkSession,
+    onInvokeSlashCommand,
+    onOpenRuntimeStatus,
+    projectFiles,
+    session.branches.head,
+  ]);
+  const completionLoading =
+    activeCompletion?.kind === "files"
+      ? fileCatalogLoading
+      : activeCompletion?.kind === "commands" || activeCompletion?.kind === "skills"
+        ? commandDiscoveryLoading
+        : false;
+  const completionError =
+    activeCompletion?.kind === "files"
+      ? fileCatalogError
+      : activeCompletion?.kind === "commands" || activeCompletion?.kind === "skills"
+        ? commandDiscoveryError
+        : null;
+  const completionLabel =
+    activeCompletion?.kind === "files"
+      ? "Trusted project files"
+      : activeCompletion?.kind === "skills"
+        ? "Available skills"
+        : activeCompletion?.kind === "skillSubcommands"
+          ? "Skill commands"
+          : "Slash commands";
+
+  useEffect(() => {
+    setActiveCompletionIndex(0);
+  }, [activeCompletion?.key]);
+
+  useEffect(() => {
+    setActiveCompletionIndex((index) =>
+      Math.max(0, Math.min(index, completionOptions.length - 1)),
+    );
+  }, [completionOptions.length]);
+
   const hasStagedImages = attachments.some((attachment) =>
     draftAttachmentMediaType(attachment).startsWith("image/"),
   );
@@ -2893,6 +3431,12 @@ function Composer({
     if (!textarea) return;
     textarea.style.height = "0";
     textarea.style.height = `${Math.min(textarea.scrollHeight, 180)}px`;
+    const caret = pendingComposerCaretRef.current;
+    if (caret !== null) {
+      pendingComposerCaretRef.current = null;
+      textarea.focus();
+      textarea.setSelectionRange(caret, caret);
+    }
   }, [prompt]);
 
   const submit = async () => {
@@ -2905,6 +3449,118 @@ function Composer({
       return;
     }
     const value = prompt;
+    const invocation = value.trim();
+    const isSlashCommand = isSlashCommandInput(value);
+    if (isSlashCommand) {
+      const commandName = slashCommandName(value);
+      const hasPromptContext =
+        uploadedAttachments.length > 0 ||
+        documents.length > 0 ||
+        projectFiles.length > 0;
+      if (hasPromptContext) {
+        setSubmitError({
+          kind: "rejected",
+          title: "Slash commands cannot include prompt context",
+          message:
+            "Remove attachments, documents, and referenced files before running a slash command.",
+          retryable: false,
+        });
+        return;
+      }
+      const exactLocalInvocation = invocation === `/${commandName}`;
+      const handlesStatus =
+        exactLocalInvocation && commandName === "status" && onOpenRuntimeStatus;
+      const handlesExport =
+        exactLocalInvocation &&
+        commandName === "export" &&
+        onExportSession &&
+        bootstrap.capabilities.sessionExport;
+      const handlesFork =
+        exactLocalInvocation &&
+        commandName === "fork" &&
+        onForkSession &&
+        bootstrap.capabilities.conversationBranching &&
+        Boolean(session.branches.head);
+      const localCommand = ["export", "fork", "status"].includes(commandName);
+      if (
+        localCommand &&
+        exactLocalInvocation &&
+        !handlesStatus &&
+        !handlesExport &&
+        !handlesFork
+      ) {
+        setSubmitError({
+          kind: "rejected",
+          title: "Slash command unavailable",
+          message: "This slash command is not available from the connected host.",
+          retryable: false,
+        });
+        return;
+      }
+      if (isWorking && !handlesStatus) {
+        setSubmitError({
+          kind: "session",
+          title: "Session is still working",
+          message: "Slash commands are available after current work finishes.",
+          retryable: true,
+        });
+        return;
+      }
+      if (
+        !handlesStatus &&
+        !handlesExport &&
+        !handlesFork &&
+        !onInvokeSlashCommand
+      ) {
+        setSubmitError({
+          kind: "rejected",
+          title: "Slash command unavailable",
+          message: "This slash command is not available from the connected host.",
+          retryable: false,
+        });
+        return;
+      }
+      setSubmitting(true);
+      setSubmitError(null);
+      try {
+        if (handlesExport) {
+          await onExportSession();
+        } else if (handlesFork) {
+          await onForkSession();
+        } else if (handlesStatus) {
+          onOpenRuntimeStatus();
+        } else if (onInvokeSlashCommand) {
+          let pendingSlashCommand = pendingSlashCommandRef.current;
+          if (pendingSlashCommand?.invocation !== invocation) {
+            pendingSlashCommand = {
+              id: crypto.randomUUID(),
+              invocation,
+            };
+            pendingSlashCommandRef.current = pendingSlashCommand;
+          }
+          await onInvokeSlashCommand(invocation, pendingSlashCommand.id);
+          pendingSlashCommandRef.current = null;
+        } else {
+          throw new Error("This slash command is not available.");
+        }
+        commandDiscoveryRequestRef.current += 1;
+        setCommandDiscovery(null);
+        setCommandDiscoveryError(null);
+        setCommandDiscoveryLoading(false);
+        setPrompt((current) => (current === value ? "" : current));
+        setComposerCaret(0);
+        setDismissedCompletionKey(null);
+        if (promptRef.current === value) {
+          draftStore.clear(bootstrap.host.id, session.sessionId);
+        }
+      } catch (error) {
+        setSubmitError(classifySubmissionFailure(error));
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
     const submittedAttachments = attachments;
     const submittedReferences = uploadedAttachments;
     const commandSignature = JSON.stringify({
@@ -2960,7 +3616,121 @@ function Composer({
     }
   };
 
+  const replaceComposerText = (value: string, caret: number) => {
+    pendingComposerCaretRef.current = caret;
+    setPrompt(value);
+    setComposerCaret(caret);
+    setDismissedCompletionKey(completionTrigger(value, caret)?.key ?? null);
+  };
+
+  const selectCompletion = (option: ComposerOption) => {
+    if (option.disabled) return;
+    const { action } = option;
+    if (action.type === "file") {
+      setProjectFiles((current) =>
+        current.some((file) => file.id === action.file.id) || current.length >= 20
+          ? current
+          : [...current, action.file],
+      );
+      const value = `${prompt.slice(0, action.start)}${prompt.slice(action.end)}`;
+      replaceComposerText(value, action.start);
+      return;
+    }
+    if (action.type === "command") {
+      const value = `/${action.command.name}${
+        action.command.acceptsArgument ? " " : ""
+      }`;
+      replaceComposerText(value, value.length);
+      return;
+    }
+    if (action.type === "skillSubcommand") {
+      const value = `/skills ${action.name}${action.acceptsArgument ? " " : ""}`;
+      replaceComposerText(value, value.length);
+      return;
+    }
+    if (action.type === "skill") {
+      const value = `${prompt.slice(0, action.start)}${action.name}${prompt.slice(
+        action.end,
+      )}`;
+      replaceComposerText(value, action.start + action.name.length);
+      return;
+    }
+    const value = `/${action.name}`;
+    replaceComposerText(value, value.length);
+  };
+
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.nativeEvent.isComposing) return;
+    if (activeCompletion) {
+      const enabledIndexes = completionOptions.flatMap((option, index) =>
+        option.disabled ? [] : [index],
+      );
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setDismissedCompletionKey(activeCompletion.key);
+        return;
+      }
+      if (event.key === "Tab" && activeCompletion.kind === "commands") {
+        if (enabledIndexes.length === 1) {
+          event.preventDefault();
+          selectCompletion(completionOptions[enabledIndexes[0]!]!);
+        }
+        return;
+      }
+      if (
+        ["ArrowDown", "ArrowUp", "Home", "End", "PageDown", "PageUp"].includes(
+          event.key,
+        ) &&
+        enabledIndexes.length
+      ) {
+        event.preventDefault();
+        const selected = enabledIndexes.indexOf(activeCompletionIndex);
+        const current =
+          selected >= 0
+            ? selected
+            : ["ArrowUp", "PageUp", "End"].includes(event.key)
+              ? enabledIndexes.length
+              : -1;
+        const next =
+          event.key === "ArrowDown"
+            ? Math.min(enabledIndexes.length - 1, current + 1)
+            : event.key === "ArrowUp"
+              ? Math.max(0, current - 1)
+              : event.key === "Home"
+                ? 0
+                : event.key === "End"
+                  ? enabledIndexes.length - 1
+                  : event.key === "PageDown"
+                    ? Math.min(enabledIndexes.length - 1, current + 5)
+                    : Math.max(0, current - 5);
+        setActiveCompletionIndex(enabledIndexes[next]!);
+        return;
+      }
+      if (event.key === "Enter" && !event.shiftKey) {
+        if (completionLoading) {
+          event.preventDefault();
+          return;
+        }
+        const option = completionOptions[activeCompletionIndex];
+        if (option && !option.disabled) {
+          const invokeExactCommand =
+            activeCompletion.kind === "commands" &&
+            ((option.action.type === "command" &&
+              option.action.command.name === activeCompletion.query &&
+              !option.action.command.acceptsArgument) ||
+              (option.action.type === "direct" &&
+                option.action.name === activeCompletion.query));
+          event.preventDefault();
+          if (invokeExactCommand) {
+            setDismissedCompletionKey(activeCompletion.key);
+            void submit();
+          } else {
+            selectCompletion(option);
+          }
+          return;
+        }
+      }
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void submit();
@@ -3242,10 +4012,41 @@ function Composer({
             })}
           </div>
         ) : null}
+        {projectFiles.length ? (
+          <div
+            className="composer-project-files"
+            aria-label="Referenced trusted project files"
+          >
+            {projectFiles.map((file) => (
+              <span key={file.id}>
+                {trustedFileIcon(file.kind)}
+                <strong>{file.relativePath}</strong>
+                <button
+                  type="button"
+                  aria-label={`Remove referenced ${file.relativePath}`}
+                  onClick={() =>
+                    setProjectFiles((current) =>
+                      current.filter((candidate) => candidate.id !== file.id),
+                    )
+                  }
+                >
+                  <X aria-hidden="true" />
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : null}
         <textarea
           ref={textareaRef}
           value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
+          onChange={(event) => {
+            setPrompt(event.target.value);
+            setComposerCaret(event.target.selectionStart);
+            setDismissedCompletionKey(null);
+          }}
+          onSelect={(event) =>
+            setComposerCaret(event.currentTarget.selectionStart)
+          }
           onKeyDown={onKeyDown}
           onPaste={(event) => {
             if (!attachmentsAvailable) return;
@@ -3266,7 +4067,35 @@ function Composer({
           rows={1}
           aria-label="Message ygg"
           aria-describedby={submitError ? "composer-send-error" : undefined}
+          aria-expanded={Boolean(activeCompletion)}
+          aria-haspopup={activeCompletion ? "listbox" : undefined}
+          aria-controls={
+            activeCompletion ? "composer-completion-list" : undefined
+          }
+          aria-activedescendant={
+            activeCompletion && completionOptions[activeCompletionIndex]
+              ? `composer-completion-${completionOptions[activeCompletionIndex]!.id}`
+              : undefined
+          }
         />
+        {activeCompletion ? (
+          <ComposerCompletion
+            label={completionLabel}
+            heading={completionLabel}
+            options={completionOptions}
+            activeIndex={activeCompletionIndex}
+            loading={completionLoading}
+            error={completionError}
+            emptyLabel={
+              activeCompletion.kind === "files"
+                ? "No trusted files match this reference."
+                : activeCompletion.kind === "skills"
+                  ? "No skills match this name."
+                  : "No matching commands."
+            }
+            onSelect={(option) => selectCompletion(option as ComposerOption)}
+          />
+        ) : null}
         <div className="composer-toolbar">
           <div className="composer-leading">
             {attachmentsAvailable ? (
@@ -3454,6 +4283,7 @@ function Composer({
                 disabled={submitting}
                 onClick={() => {
                   pendingCommandRef.current = null;
+                  pendingSlashCommandRef.current = null;
                   setSubmitError(null);
                 }}
               >
@@ -3484,6 +4314,7 @@ const MemoizedComposer = memo(Composer, (previous, next) => {
     previousSession.authority === nextSession.authority &&
     previousSession.contextTokens === nextSession.contextTokens &&
     previousSession.contextPercent === nextSession.contextPercent &&
+    previousSession.branches.head === nextSession.branches.head &&
     previousSession.items.length === nextSession.items.length &&
     previous.bootstrap === next.bootstrap &&
     previous.onSubmit === next.onSubmit &&
@@ -3494,6 +4325,11 @@ const MemoizedComposer = memo(Composer, (previous, next) => {
     previous.onListProjectFiles === next.onListProjectFiles &&
     previous.onSearchProjectFiles === next.onSearchProjectFiles &&
     previous.onReadProjectFile === next.onReadProjectFile &&
+    previous.onGetCommandDiscovery === next.onGetCommandDiscovery &&
+    previous.onInvokeSlashCommand === next.onInvokeSlashCommand &&
+    previous.onExportSession === next.onExportSession &&
+    previous.onForkSession === next.onForkSession &&
+    previous.onOpenRuntimeStatus === next.onOpenRuntimeStatus &&
     previous.onPreviewAttachment === next.onPreviewAttachment
   );
 });
@@ -3515,6 +4351,11 @@ export function Conversation({
   onListProjectFiles,
   onSearchProjectFiles,
   onReadProjectFile,
+  onGetCommandDiscovery,
+  onInvokeSlashCommand,
+  onExportSession,
+  onForkSession,
+  onOpenRuntimeStatus,
   onEditUserTurn,
   onRetryResponse,
   onForkConversation,
@@ -3841,6 +4682,11 @@ export function Conversation({
         onListProjectFiles={onListProjectFiles}
         onSearchProjectFiles={onSearchProjectFiles}
         onReadProjectFile={onReadProjectFile}
+        onGetCommandDiscovery={onGetCommandDiscovery}
+        onInvokeSlashCommand={onInvokeSlashCommand}
+        onExportSession={onExportSession}
+        onForkSession={onForkSession}
+        onOpenRuntimeStatus={onOpenRuntimeStatus}
         attachmentContentUrl={attachmentContentUrl}
         onPreviewAttachment={previewAttachment}
       />

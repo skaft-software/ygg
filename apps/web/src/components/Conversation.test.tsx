@@ -5,10 +5,64 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionDraftStore } from "../drafts";
 import { fixtureBootstrap, fixtureSessions } from "../fixtures";
-import type { CompletionReview } from "../protocol";
+import type {
+  CommandDiscovery,
+  CompletionReview,
+  TrustedFileEntry,
+} from "../protocol";
 import { Conversation } from "./Conversation";
 
 const noOp = async () => {};
+const mentionFiles: TrustedFileEntry[] = [
+  {
+    id: "file-readme",
+    relativePath: "docs/README.md",
+    displayName: "README.md",
+    kind: "documentation",
+    byteLen: 1_536,
+  },
+  {
+    id: "file-config",
+    relativePath: "config/application.toml",
+    displayName: "application.toml",
+    kind: "configuration",
+    byteLen: 768,
+  },
+];
+const slashDiscovery: CommandDiscovery = {
+  commands: [
+    {
+      name: "compact",
+      usage: "/compact",
+      description: "compact conversation context",
+      acceptsArgument: false,
+      kind: "builtIn",
+    },
+    {
+      name: "review",
+      usage: "/review [focus]",
+      description: "prompt · review the implementation",
+      argumentHint: "[focus]",
+      acceptsArgument: true,
+      kind: "prompt",
+    },
+    {
+      name: "skills",
+      usage: "/skills [subcommand]",
+      description: "manage and view agent skills",
+      acceptsArgument: true,
+      kind: "builtIn",
+    },
+  ],
+  skills: [
+    {
+      id: "testing",
+      name: "Testing",
+      description: "Run focused tests and interpret failures.",
+      active: false,
+    },
+  ],
+};
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
 
@@ -100,6 +154,264 @@ describe("conversation composer", () => {
       screen.getByRole("dialog", { name: "Add prompt context" }),
     ).toBeVisible();
     await waitFor(() => expect(onListProjectFiles).toHaveBeenCalledOnce());
+  });
+
+  it("adds fuzzy @ references as trusted project-file context without editing prompt text", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const onListProjectFiles = vi.fn().mockResolvedValue({
+      summary: { indexedFiles: mentionFiles.length, ignoredEntries: 0, truncated: false },
+      files: mentionFiles,
+    });
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={onSubmit}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+        onListProjectFiles={onListProjectFiles}
+        onSearchProjectFiles={vi.fn()}
+        onReadProjectFile={vi.fn()}
+      />,
+    );
+
+    const composer = screen.getByLabelText("Message ygg");
+    await user.type(composer, "Please inspect @RDM");
+    expect(
+      await screen.findByRole("option", { name: /README\.md.*docs\/README\.md/i }),
+    ).toBeVisible();
+    await user.keyboard("{Enter}");
+
+    expect(composer).toHaveValue("Please inspect ");
+    expect(screen.getByLabelText("Referenced trusted project files")).toHaveTextContent(
+      "docs/README.md",
+    );
+    await user.type(composer, "next");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(onSubmit).toHaveBeenCalledWith(
+      "Please inspect next",
+      [],
+      undefined,
+      expect.any(String),
+      [],
+      [mentionFiles[0]],
+    );
+  });
+
+  it("keeps @ completion available in absolute-path prompts", async () => {
+    const user = userEvent.setup();
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+        onListProjectFiles={vi.fn().mockResolvedValue({
+          summary: { indexedFiles: mentionFiles.length, ignoredEntries: 0, truncated: false },
+          files: mentionFiles,
+        })}
+        onSearchProjectFiles={vi.fn()}
+        onReadProjectFile={vi.fn()}
+      />,
+    );
+
+    await user.type(screen.getByLabelText("Message ygg"), "/workspace/src @RDM");
+
+    expect(
+      await screen.findByRole("option", { name: /README\.md.*docs\/README\.md/i }),
+    ).toBeVisible();
+  });
+
+  it("dismisses @ completion without submitting the draft", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={onSubmit}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+        onListProjectFiles={vi.fn().mockResolvedValue({
+          summary: { indexedFiles: mentionFiles.length, ignoredEntries: 0, truncated: false },
+          files: mentionFiles,
+        })}
+        onSearchProjectFiles={vi.fn()}
+        onReadProjectFile={vi.fn()}
+      />,
+    );
+
+    const composer = screen.getByLabelText("Message ygg");
+    await user.type(composer, "@");
+    expect(
+      await screen.findByRole("listbox", { name: "Trusted project files" }),
+    ).toBeVisible();
+    await user.keyboard("{Escape}");
+
+    expect(
+      screen.queryByRole("listbox", { name: "Trusted project files" }),
+    ).toBeNull();
+    expect(composer).toHaveValue("@");
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("discovers slash commands, keeps web-local commands available, and invokes skills through the host", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const onInvokeSlashCommand = vi.fn().mockResolvedValue(undefined);
+    const onOpenRuntimeStatus = vi.fn();
+    const bootstrap = structuredClone(fixtureBootstrap);
+    bootstrap.capabilities.sessionExport = true;
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    session.branches = {
+      head: "entry-forkable",
+      entries: [
+        {
+          entryId: "entry-forkable",
+          kind: "assistantMessage",
+          checkoutable: true,
+          label: "Ready",
+        },
+      ],
+      truncated: false,
+    };
+    render(
+      <Conversation
+        session={session}
+        bootstrap={bootstrap}
+        onSubmit={onSubmit}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+        onGetCommandDiscovery={vi.fn().mockResolvedValue(slashDiscovery)}
+        onInvokeSlashCommand={onInvokeSlashCommand}
+        onExportSession={vi.fn()}
+        onForkSession={vi.fn().mockResolvedValue(undefined)}
+        onOpenRuntimeStatus={onOpenRuntimeStatus}
+      />,
+    );
+
+    const composer = screen.getByLabelText("Message ygg");
+    await user.type(composer, "/");
+    expect(
+      await screen.findByRole("option", { name: /\/compact/ }),
+    ).toBeVisible();
+    expect(screen.getByRole("option", { name: /\/export/ })).toBeVisible();
+    expect(screen.getByRole("option", { name: /\/fork/ })).toBeVisible();
+    expect(screen.getByRole("option", { name: /\/status/ })).toBeVisible();
+
+    await user.clear(composer);
+    await user.type(composer, "/status");
+    await user.keyboard("{Enter}");
+    expect(onOpenRuntimeStatus).toHaveBeenCalledOnce();
+    expect(onInvokeSlashCommand).not.toHaveBeenCalled();
+
+    await user.type(composer, "/com");
+    expect(
+      await screen.findByRole("option", { name: /\/compact/ }),
+    ).toBeVisible();
+    await user.keyboard("{Tab}");
+    expect(composer).toHaveValue("/compact");
+    await user.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(onInvokeSlashCommand).toHaveBeenCalledWith(
+        "/compact",
+        expect.any(String),
+      ),
+    );
+
+    await user.type(composer, "/skills load ");
+    expect(
+      await screen.findByRole("option", { name: /Testing.*focused tests/i }),
+    ).toBeVisible();
+    await user.keyboard("{Enter}");
+    expect(composer).toHaveValue("/skills load testing");
+    await user.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(onInvokeSlashCommand).toHaveBeenLastCalledWith(
+        "/skills load testing",
+        expect.any(String),
+      ),
+    );
+
+    await user.type(composer, "/export archive");
+    await user.keyboard("{Enter}");
+    await waitFor(() =>
+      expect(onInvokeSlashCommand).toHaveBeenLastCalledWith(
+        "/export archive",
+        expect.any(String),
+      ),
+    );
+
+    await user.type(composer, "Explain /compact");
+    expect(screen.queryByRole("listbox", { name: "Slash commands" })).toBeNull();
+    await user.keyboard("{Enter}");
+    expect(onSubmit).toHaveBeenCalledWith(
+      "Explain /compact",
+      [],
+      undefined,
+      expect.any(String),
+      [],
+      [],
+    );
+  });
+
+  it("keeps slash commands out of active steer and follow-up prompts", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const onInvokeSlashCommand = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-live"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={onSubmit}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+        onInvokeSlashCommand={onInvokeSlashCommand}
+      />,
+    );
+
+    const composer = screen.getByLabelText("Message ygg");
+    await user.type(composer, "/compact ");
+    expect(screen.queryByRole("listbox", { name: "Slash commands" })).toBeNull();
+    await user.keyboard("{Enter}");
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onInvokeSlashCommand).not.toHaveBeenCalled();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Slash commands are available after current work finishes.",
+    );
+
+    await user.clear(composer);
+    await user.type(composer, "/skills ");
+    const listSkills = await screen.findByRole("option", {
+      name: /\/skills list/i,
+    });
+    expect(listSkills).toBeDisabled();
+    await user.click(listSkills);
+    expect(composer).toHaveValue("/skills ");
   });
 
   it("shows the context percentage and tier-aware input cost estimate", () => {
@@ -307,6 +619,40 @@ describe("conversation composer", () => {
     await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
     expect(onSubmit.mock.calls[1]?.[3]).toBe(firstKey);
     expect(screen.getByLabelText("Message ygg")).toHaveValue("");
+  });
+
+  it("starts a fresh slash invocation after cancelling a failed retry", async () => {
+    const user = userEvent.setup();
+    const onInvokeSlashCommand = vi
+      .fn()
+      .mockRejectedValue(new TypeError("Network unavailable"));
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+        onInvokeSlashCommand={onInvokeSlashCommand}
+      />,
+    );
+
+    const composer = screen.getByLabelText("Message ygg");
+    await user.type(composer, "/compact ");
+    await user.keyboard("{Enter}");
+    expect(await screen.findByText("Connection interrupted")).toBeVisible();
+    const firstKey = onInvokeSlashCommand.mock.calls[0]?.[1];
+    expect(firstKey).toEqual(expect.any(String));
+
+    await user.click(screen.getByRole("button", { name: "Cancel retry" }));
+    await user.click(composer);
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(onInvokeSlashCommand).toHaveBeenCalledTimes(2));
+    expect(onInvokeSlashCommand.mock.calls[1]?.[1]).not.toBe(firstKey);
   });
 
   it("queues by default and keeps Steer in a themed secondary menu", async () => {
