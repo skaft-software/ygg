@@ -1631,6 +1631,88 @@ describe("conversation composer", () => {
     await waitFor(() => expect(thumbnail).toHaveFocus());
   });
 
+  it("renders transcript file metadata for common file types", () => {
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    session.items.push({
+      id: "file-message",
+      turnId: "file-turn",
+      kind: "user_message",
+      content: "Review these files.",
+      attachments: [
+        {
+          id: "pdf-ref",
+          handle: "pdf-handle",
+          name: "architecture.pdf",
+          mediaType: "application/pdf",
+          size: 1_572_864,
+        },
+        {
+          id: "archive-ref",
+          handle: "archive-handle",
+          name: "sources.zip",
+          mediaType: "application/zip",
+          size: 2_048,
+        },
+        {
+          id: "code-ref",
+          name: "src/main.rs",
+          mediaType: "text/rust",
+          size: 512,
+        },
+      ],
+      state: "committed",
+      createdAt: new Date().toISOString(),
+    });
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    const pdf = screen
+      .getByText("architecture.pdf")
+      .closest(".message-file-attachment");
+    if (!pdf) throw new Error("PDF attachment was not rendered");
+    expect(pdf).toHaveAttribute(
+      "title",
+      "Media type: application/pdf\nSource: uploaded attachment",
+    );
+    expect(pdf).toHaveTextContent("1.5 MB");
+    expect(
+      pdf.querySelector(".message-file-attachment-icon.is-pdf"),
+    ).toBeInTheDocument();
+
+    const archive = screen
+      .getByText("sources.zip")
+      .closest(".message-file-attachment");
+    if (!archive) throw new Error("archive attachment was not rendered");
+    expect(archive).toHaveTextContent("2 KB");
+    expect(
+      archive.querySelector(".message-file-attachment-icon.is-archive"),
+    ).toBeInTheDocument();
+
+    const code = screen
+      .getByText("src/main.rs")
+      .closest(".message-file-attachment");
+    if (!code) throw new Error("code attachment was not rendered");
+    expect(code).toHaveAttribute(
+      "title",
+      "Media type: text/rust\nSource: transcript record",
+    );
+    expect(code).toHaveTextContent("512 B");
+    expect(
+      code.querySelector(".message-file-attachment-icon.is-code"),
+    ).toBeInTheDocument();
+  });
+
   it("answers a private tool-input request without adding it to prose", async () => {
     const user = userEvent.setup();
     const onResolveUserInput = vi.fn().mockResolvedValue(undefined);

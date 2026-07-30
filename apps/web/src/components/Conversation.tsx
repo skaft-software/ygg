@@ -12,6 +12,8 @@ import {
   Download,
   ExternalLink,
   File,
+  FileArchive,
+  FileCode2,
   FileDiff,
   FileText,
   GitFork,
@@ -284,6 +286,123 @@ function extensionLabel(name: string): string {
   return extension && extension !== name
     ? extension.slice(0, 4).toUpperCase()
     : "FILE";
+}
+
+const ARCHIVE_FILE_EXTENSIONS = new Set([
+  "7z",
+  "bz2",
+  "gz",
+  "rar",
+  "tar",
+  "tgz",
+  "xz",
+  "zip",
+]);
+const CODE_FILE_EXTENSIONS = new Set([
+  "c",
+  "cc",
+  "cpp",
+  "cs",
+  "css",
+  "go",
+  "h",
+  "html",
+  "java",
+  "js",
+  "json",
+  "jsx",
+  "kt",
+  "kts",
+  "php",
+  "py",
+  "rb",
+  "rs",
+  "scss",
+  "sh",
+  "sql",
+  "swift",
+  "toml",
+  "ts",
+  "tsx",
+  "xml",
+  "yaml",
+  "yml",
+  "zsh",
+]);
+const CODE_MEDIA_TYPES = new Set([
+  "application/javascript",
+  "application/json",
+  "application/sql",
+  "application/typescript",
+  "application/xml",
+  "application/x-sh",
+  "text/css",
+  "text/html",
+  "text/javascript",
+  "text/typescript",
+]);
+
+type AttachmentFileKind = "archive" | "code" | "pdf" | "generic";
+
+function attachmentExtension(name: string): string {
+  const extension = name.split(".").at(-1);
+  return extension && extension !== name ? extension.toLowerCase() : "";
+}
+
+function attachmentFileKind(attachment: AttachmentRef): AttachmentFileKind {
+  const mediaType = attachment.mediaType
+    .split(";", 1)[0]
+    ?.trim()
+    .toLowerCase();
+  const extension = attachmentExtension(attachment.name);
+  if (mediaType === "application/pdf" || extension === "pdf") return "pdf";
+  if (
+    ARCHIVE_FILE_EXTENSIONS.has(extension) ||
+    mediaType?.includes("zip") ||
+    mediaType === "application/gzip" ||
+    mediaType === "application/x-tar"
+  ) {
+    return "archive";
+  }
+  if (
+    CODE_FILE_EXTENSIONS.has(extension) ||
+    CODE_MEDIA_TYPES.has(mediaType ?? "")
+  ) {
+    return "code";
+  }
+  return "generic";
+}
+
+function TranscriptFileIcon({ attachment }: { attachment: AttachmentRef }) {
+  const kind = attachmentFileKind(attachment);
+  const className = `message-file-attachment-icon is-${kind}`;
+  switch (kind) {
+    case "pdf":
+      return <FileText aria-hidden="true" className={className} />;
+    case "archive":
+      return <FileArchive aria-hidden="true" className={className} />;
+    case "code":
+      return <FileCode2 aria-hidden="true" className={className} />;
+    case "generic":
+      return <File aria-hidden="true" className={className} />;
+  }
+}
+
+function attachmentSizeLabel(size: number): string {
+  if (size < 1024) return `${size} B`;
+  const units = ["B", "KB", "MB", "GB"];
+  const unit = Math.min(
+    Math.floor(Math.log(size) / Math.log(1024)),
+    units.length - 1,
+  );
+  const value = Math.round((size / 1024 ** unit) * 10) / 10;
+  return `${value} ${units[unit]}`;
+}
+
+function attachmentMetadataLabel(attachment: AttachmentRef): string {
+  return `Media type: ${attachment.mediaType}\nSource: ${
+    attachment.handle ? "uploaded attachment" : "transcript record"
+  }`;
 }
 
 function AttachmentPreviewDialog({
@@ -1232,38 +1351,49 @@ const TranscriptItemView = memo(function TranscriptItemView({
               }
             >
               {item.attachments.map((attachment, attachmentIndex) => {
-                const numberedImage = attachment.mediaType.startsWith("image/")
+                const isImage = attachment.mediaType.startsWith("image/");
+                const numberedImage = isImage
                   ? item.attachments!
                       .slice(0, attachmentIndex + 1)
                       .filter((candidate) =>
                         candidate.mediaType.startsWith("image/"),
                       ).length
                   : 0;
+                const imageUrl =
+                  isImage && attachment.handle
+                    ? attachmentContentUrl?.(attachment.handle)
+                    : undefined;
+                const fileAttachment = (
+                  <>
+                    <TranscriptFileIcon attachment={attachment} />
+                    <span className="message-file-attachment-copy">
+                      <em>{attachment.name}</em>
+                      <small>{attachmentSizeLabel(attachment.size)}</small>
+                    </span>
+                  </>
+                );
                 return (
                   <span role="listitem" key={attachment.id}>
-                    {attachment.mediaType.startsWith("image/") &&
-                    attachment.handle &&
-                    attachmentContentUrl?.(attachment.handle) ? (
+                    {imageUrl ? (
                       <button
                         className="message-image-attachment"
                         onClick={(event) =>
                           onPreviewAttachment(
-                            attachmentContentUrl(attachment.handle!),
+                            imageUrl,
                             attachment.name,
                             event.currentTarget,
                           )
                         }
                         aria-label={`View attached image ${numberedImage}`}
                       >
-                        <img
-                          src={attachmentContentUrl(attachment.handle)}
-                          alt={attachment.name}
-                        />
+                        <img src={imageUrl} alt={attachment.name} />
                       </button>
                     ) : (
-                      <span className="message-file-attachment">
-                        <b>{extensionLabel(attachment.name)}</b>
-                        <em>{attachment.name}</em>
+                      <span
+                        className="message-file-attachment"
+                        title={attachmentMetadataLabel(attachment)}
+                      >
+                        {fileAttachment}
                       </span>
                     )}
                   </span>
