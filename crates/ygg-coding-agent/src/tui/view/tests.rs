@@ -1642,14 +1642,17 @@ fn deferred_history_keeps_local_outcome_before_a_later_persisted_prompt() {
     shell
         .state
         .borrow_mut()
-        .push_block(TranscriptBlock::Outcome(RunOutcome::Completed {
-            elapsed: Duration::from_secs(1),
-            summary: crate::presentation::RunSummary {
-                files_changed: 0,
-                tool_calls: 0,
-                warnings: 0,
+        .push_block(TranscriptBlock::Outcome(OutcomeBlock::new(
+            RunOutcome::Completed {
+                elapsed: Duration::from_secs(1),
+                summary: crate::presentation::RunSummary {
+                    files_changed: 0,
+                    tool_calls: 0,
+                    warnings: 0,
+                },
             },
-        }));
+            None,
+        )));
     session
         .append(EntryValue::Message(Message::User(UserMessage {
             content: vec![UserPart::Text("persisted after local outcome".into())],
@@ -3993,14 +3996,17 @@ fn ascii_plain_and_unicode_no_colour_keep_the_same_structure() {
             None,
             None,
         ))));
-        state.push_block(TranscriptBlock::Outcome(RunOutcome::Completed {
-            elapsed: Duration::from_secs(1),
-            summary: crate::presentation::RunSummary {
-                files_changed: 1,
-                tool_calls: 1,
-                warnings: 0,
+        state.push_block(TranscriptBlock::Outcome(OutcomeBlock::new(
+            RunOutcome::Completed {
+                elapsed: Duration::from_secs(1),
+                summary: crate::presentation::RunSummary {
+                    files_changed: 1,
+                    tool_calls: 1,
+                    warnings: 0,
+                },
             },
-        }));
+            None,
+        )));
     }
     ascii.set_size(40, 20);
     let ascii = render_shell(&ascii.state.borrow(), 40)
@@ -5163,15 +5169,18 @@ fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
         event_margin_marker(&reasoning, &theme, false, true),
         Some(" ".into())
     );
-    let outcome = TranscriptBlock::Outcome(RunOutcome::CompletedWithWarnings {
-        elapsed: Duration::from_secs(1),
-        warnings: 1,
-        summary: crate::presentation::RunSummary {
-            files_changed: 0,
-            tool_calls: 1,
+    let outcome = TranscriptBlock::Outcome(OutcomeBlock::new(
+        RunOutcome::CompletedWithWarnings {
+            elapsed: Duration::from_secs(1),
             warnings: 1,
+            summary: crate::presentation::RunSummary {
+                files_changed: 0,
+                tool_calls: 1,
+                warnings: 1,
+            },
         },
-    });
+        None,
+    ));
     assert_eq!(event_margin_marker(&outcome, &theme, true, false), None);
 }
 
@@ -7263,14 +7272,17 @@ fn populate_theme_fixture(shell: &mut InteractiveShell) {
     state.push_block(TranscriptBlock::Notice(
         "Extension reloaded with one status contribution.".into(),
     ));
-    state.push_block(TranscriptBlock::Outcome(RunOutcome::Completed {
-        elapsed: Duration::from_millis(13700),
-        summary: crate::presentation::RunSummary {
-            files_changed: 1,
-            tool_calls: 2,
-            warnings: 0,
+    state.push_block(TranscriptBlock::Outcome(OutcomeBlock::new(
+        RunOutcome::Completed {
+            elapsed: Duration::from_millis(13700),
+            summary: crate::presentation::RunSummary {
+                files_changed: 1,
+                tool_calls: 2,
+                warnings: 0,
+            },
         },
-    }));
+        None,
+    )));
     state.extension_header = Some(("workspace · main".into(), None));
     state.extension_status = Some(("git clean".into(), None));
     state.editor = "draft a local patch".into();

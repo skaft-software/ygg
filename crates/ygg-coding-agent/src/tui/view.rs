@@ -117,6 +117,22 @@ struct CompactionBlock {
     expanded: bool,
 }
 
+#[derive(Clone, Debug)]
+struct OutcomeBlock {
+    outcome: RunOutcome,
+    /// Final provider-reported output rate captured when the run settles.
+    tokens_per_second: Option<f64>,
+}
+
+impl OutcomeBlock {
+    fn new(outcome: RunOutcome, tokens_per_second: Option<f64>) -> Self {
+        Self {
+            outcome,
+            tokens_per_second,
+        }
+    }
+}
+
 enum TranscriptBlock {
     User {
         text: String,
@@ -133,7 +149,7 @@ enum TranscriptBlock {
     Reasoning(Box<AssistantBlock>),
     Tool(Box<ToolPanel>),
     Shell(Box<ShellOutput>),
-    Outcome(RunOutcome),
+    Outcome(OutcomeBlock),
     Notice(String),
     Compaction(Box<CompactionBlock>),
 }
@@ -1271,7 +1287,13 @@ impl InteractiveShell {
         // after completion made the idle footer behave like a wall clock.
         state.shimmer_started_at = None;
         state.close_streaming_blocks();
-        state.push_block(TranscriptBlock::Outcome(outcome));
+        let tokens_per_second = state
+            .last_turn_tokens_per_second
+            .filter(|rate| rate.is_finite() && *rate > 0.0);
+        state.push_block(TranscriptBlock::Outcome(OutcomeBlock::new(
+            outcome,
+            tokens_per_second,
+        )));
         if !state.selected_model_owns_telemetry() {
             state.clear_turn_telemetry();
         }
@@ -3059,7 +3081,7 @@ impl InteractiveShell {
                 }
                 TranscriptBlock::Outcome(outcome) => {
                     result.push('\n');
-                    result.push_str(&format!("{outcome:?}"));
+                    result.push_str(&format!("{:?}", outcome.outcome));
                 }
                 TranscriptBlock::Shell(shell) => {
                     result.push('\n');

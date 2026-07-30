@@ -3,7 +3,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::presentation::{format_duration, RunOutcome};
 
-use super::outcome_render::bounded_outcome_detail;
+use super::outcome_render::{bounded_outcome_detail, completion_text};
 use super::terminal_text::sanitize_for_terminal;
 use super::tool_render::looks_like_diff;
 use super::{ShellState, TranscriptBlock};
@@ -71,19 +71,15 @@ pub(super) fn block_copy_text(block: &TranscriptBlock) -> String {
             };
             sanitize_for_terminal(&format!("$ {} [{status}]", shell.command))
         }
-        TranscriptBlock::Outcome(outcome) => match outcome {
-            RunOutcome::Completed { elapsed, summary } => format!(
-                "completed · {} · {} actions",
-                format_duration(*elapsed),
-                summary.tool_calls
-            ),
-            RunOutcome::CompletedWithWarnings { elapsed, .. } => {
-                format!("completed with notes · {}", format_duration(*elapsed))
+        TranscriptBlock::Outcome(outcome) => match &outcome.outcome {
+            RunOutcome::Completed { elapsed, .. }
+            | RunOutcome::CompletedWithWarnings { elapsed, .. } => {
+                completion_text(*elapsed, " · ", outcome.tokens_per_second)
             }
             RunOutcome::Failed { elapsed, reason } => format!(
                 "failed · {}\n{}",
                 format_duration(*elapsed),
-                bounded_outcome_detail(reason)
+                bounded_outcome_detail(reason.as_str())
             ),
             RunOutcome::Interrupted { elapsed } => {
                 format!("interrupted · {}", format_duration(*elapsed))
