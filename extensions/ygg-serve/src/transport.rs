@@ -3443,6 +3443,7 @@ mod tests {
             LoopbackConfig {
                 port: 0,
                 web_root: None,
+                terminal: None,
             },
         )
         .await
@@ -3583,6 +3584,7 @@ mod tests {
             LoopbackConfig {
                 port: 0,
                 web_root: None,
+                terminal: None,
             },
         )
         .await
