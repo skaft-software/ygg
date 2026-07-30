@@ -126,6 +126,12 @@ function ActivityRailView({
     (item): item is ActionItem =>
       item.kind === "action" && item.actionKind === "command",
   );
+  const hasActivity = Boolean(
+    latestOutcome ||
+      commands.length ||
+      session.progress.length ||
+      (resourcesAvailable && (session.outputs.length || session.sources.length)),
+  );
 
   return (
     <aside
@@ -143,6 +149,12 @@ function ActivityRailView({
       </button>
 
       <div className="rail-scroll">
+        {!hasActivity ? (
+          <div className="activity-empty" role="status">
+            <TerminalSquare aria-hidden="true" />
+            <p>No activity yet. The agent&apos;s work will appear here.</p>
+          </div>
+        ) : null}
         {latestOutcome ? (
           <section className="rail-section" aria-labelledby="review-heading">
             <details

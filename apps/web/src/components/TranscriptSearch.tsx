@@ -139,7 +139,6 @@ export function TranscriptSearch({
   const [selectedKinds, setSelectedKinds] = useState<
     ReadonlySet<TranscriptSearchKind>
   >(() => new Set());
-  const [submittedQuery, setSubmittedQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<TranscriptSearchResult | null>(null);
@@ -230,7 +229,6 @@ export function TranscriptSearch({
       limit: resultLimit,
     };
     const sequence = ++requestSequenceRef.current;
-    setSubmittedQuery(normalizedQuery);
     setLoading(true);
     setError(null);
     setResult(null);
@@ -361,7 +359,10 @@ export function TranscriptSearch({
         </div>
 
         {loading ? (
-          <div className="branch-history-empty transcript-search-state" role="status">
+          <div
+            className="branch-history-empty transcript-search-state is-loading"
+            role="status"
+          >
             <LoaderCircle className="spin" aria-hidden="true" />
             <span>Searching conversations…</span>
           </div>
@@ -442,13 +443,23 @@ export function TranscriptSearch({
               </div>
             </>
           ) : (
-            <div className="branch-history-empty transcript-search-state">
-              No conversations matched “{submittedQuery}”.
+            <div
+              className="branch-history-empty transcript-search-state is-empty"
+              role="status"
+            >
+              <Search aria-hidden="true" />
+              <strong>No matches found</strong>
+              <span>Try a different word or phrase.</span>
             </div>
           )
         ) : (
-          <div className="branch-history-empty transcript-search-state">
-            Enter a word or phrase to search visible conversation history.
+          <div
+            className="branch-history-empty transcript-search-state is-empty"
+            role="status"
+          >
+            <Search aria-hidden="true" />
+            <strong>Search across your conversation history</strong>
+            <span>Find visible messages, tool activity, and attachments.</span>
           </div>
         )}
       </section>

@@ -77,6 +77,30 @@ function repositoryContext(branch: string): RepositoryContextSnapshot {
 describe("projects", () => {
   afterEach(cleanup);
 
+  it("guides an empty project catalog without requesting a host path", () => {
+    render(
+      <ProjectsView
+        catalog={{ ...catalog, projects: [] }}
+        onboarding
+        onRename={vi.fn()}
+        onSetDefault={vi.fn()}
+        onSetTrust={vi.fn()}
+        onArchive={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", {
+        name: "No projects found. Open a folder to get started.",
+      }),
+    ).toBeVisible();
+    expect(
+      screen.getByText("ygg --workspace /path/to/project serve"),
+    ).toBeVisible();
+    expect(screen.queryByText("No trusted project is available")).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
+  });
+
   it("requires explicit trust without exposing or accepting a host path", async () => {
     const user = userEvent.setup();
     const setTrust = vi.fn().mockResolvedValue(undefined);

@@ -57,6 +57,10 @@ describe("TranscriptSearch", () => {
       />,
     );
 
+    expect(
+      screen.getByText("Search across your conversation history"),
+    ).toBeVisible();
+
     await user.type(
       screen.getByRole("searchbox", {
         name: "Search conversation transcripts",
@@ -118,9 +122,7 @@ describe("TranscriptSearch", () => {
     });
     await user.type(input, "missing");
     await user.click(screen.getByRole("button", { name: "Search" }));
-    expect(
-      await screen.findByText(/No conversations matched/),
-    ).toHaveTextContent("missing");
+    expect(await screen.findByText("No matches found")).toBeVisible();
 
     await user.clear(input);
     await user.type(input, "failure");
