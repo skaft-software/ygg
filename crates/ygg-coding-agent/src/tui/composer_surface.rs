@@ -569,7 +569,6 @@ enum FooterKind {
     Extension,
     ExtensionStatus,
     Tokens,
-    Throughput,
     CacheHit,
     Context,
     Cost,
@@ -817,33 +816,9 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
         segments.push(FooterSegment::new(FooterKind::Tokens, variants));
     }
 
-    let live_rate = show_turn_telemetry.then_some(()).and_then(|()| {
-        state.turn_generation_started_at.and_then(|started| {
-            let elapsed = now.saturating_duration_since(started);
-            let tokens = state.live_generated_tokens()?;
-            (elapsed >= Duration::from_millis(250) && tokens >= 2)
-                .then(|| tokens as f64 / elapsed.as_secs_f64())
-                .filter(|rate| rate.is_finite() && *rate > 0.0)
-        })
-    });
-    if let Some((rate, estimated)) = live_rate.map(|rate| (rate, true)).or_else(|| {
-        show_turn_telemetry
-            .then(|| {
-                state
-                    .last_turn_tokens_per_second
-                    .filter(|rate| rate.is_finite() && *rate > 0.0)
-                    .map(|rate| (rate, false))
-            })
-            .flatten()
-    }) {
-        segments.push(FooterSegment::new(
-            FooterKind::Throughput,
-            vec![format!(
-                "{}{rate:.1} tok/s",
-                if estimated { "~" } else { "" }
-            )],
-        ));
-    }
+    // Keep throughput in `/status`, where its completed-turn provenance is
+    // explicit. A live wall-clock average becomes misleading whenever output
+    // pauses and adds constantly changing noise to this pinned summary.
 
     let price_display = if active {
         state.run_price_display.unwrap_or(state.price_display)
@@ -892,7 +867,6 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
     if !layout.show_status_line {
         for kind in [
             FooterKind::Tokens,
-            FooterKind::Throughput,
             FooterKind::CacheHit,
             FooterKind::Context,
             FooterKind::Cost,
@@ -935,10 +909,8 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
             break;
         }
     }
-    for kind in [FooterKind::Cost, FooterKind::Throughput] {
-        if footer_width(&segments, gap) > available {
-            hide_footer_kind(&mut segments, kind);
-        }
+    if footer_width(&segments, gap) > available {
+        hide_footer_kind(&mut segments, FooterKind::Cost);
     }
     if footer_width(&segments, gap) > available {
         // An active state always remains observable. At extremely narrow

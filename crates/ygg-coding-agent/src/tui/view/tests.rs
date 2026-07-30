@@ -5727,17 +5727,17 @@ fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
     let now = Instant::now();
     assert_eq!(
         plain_footer(&shell, 100, now),
-        "  Qwen3.6 35B A3B · high   5.6k/246k   ↑26.8k ↓422   41.9 tok/s   $0"
+        "  Qwen3.6 35B A3B · high   5.6k/246k   ↑26.8k ↓422   $0"
     );
     assert_eq!(
         plain_footer(&shell, 68, now),
-        "  Qwen3.6 35B A3B   5.6k/246k   ↑26.8k ↓422   41.9 tok/s   $0"
+        "  Qwen3.6 35B A3B · high   5.6k/246k   ↑26.8k ↓422   $0"
     );
     assert_eq!(
         plain_footer(&shell, 44, now),
-        "  Qwen3.6 35B A3B   41.9 tok/s   $0"
+        "  Qwen3.6 35B A3B   5.6k/246k   $0"
     );
-    assert_eq!(plain_footer(&shell, 30, now), "  Qwen3.6  41.9 tok/s  $0");
+    assert_eq!(plain_footer(&shell, 30, now), "  Qwen3.6 35B A3B  $0");
 
     let surface = plain_composer_surface(&shell, 100, now);
     assert_eq!(surface.len(), 4, "one editor row, two borders, one footer");
@@ -5747,7 +5747,7 @@ fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
 }
 
 #[test]
-fn footer_omits_unknown_cost_and_shows_live_throughput_with_active_status() {
+fn footer_omits_noisy_throughput_but_keeps_final_rate_in_status() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("openai", "gpt-5.6", "high");
     let started = Instant::now();
@@ -5780,8 +5780,8 @@ fn footer_omits_unknown_cost_and_shows_live_throughput_with_active_status() {
     assert!(!live.contains("Working"), "{live:?}");
     assert!(!live.contains("waiting for API"), "{live:?}");
     assert!(
-        live.contains("~72.4 tok/s"),
-        "live estimate missing: {live:?}"
+        !live.contains("tok/s"),
+        "noisy live throughput leaked into footer: {live:?}"
     );
     assert!(
         live.contains("~↓630"),
@@ -5845,8 +5845,8 @@ fn footer_omits_unknown_cost_and_shows_live_throughput_with_active_status() {
     }
     let active_sample = plain_footer(&shell, 100, now);
     assert!(
-        active_sample.contains("72.4 tok/s"),
-        "provider-final throughput should remain visible while tools run: {active_sample:?}"
+        !active_sample.contains("tok/s"),
+        "final throughput leaked into footer while tools run: {active_sample:?}"
     );
     assert!(
         !active_sample.contains("8.7s"),
@@ -5863,8 +5863,8 @@ fn footer_omits_unknown_cost_and_shows_live_throughput_with_active_status() {
     }
     let completed_sample = plain_footer(&shell, 100, now);
     assert!(
-        completed_sample.contains("72.4 tok/s"),
-        "final metrics should appear after the whole run settles: {completed_sample:?}"
+        !completed_sample.contains("tok/s"),
+        "final throughput leaked into settled footer: {completed_sample:?}"
     );
     assert!(!completed_sample.contains('~'), "{completed_sample:?}");
 }
