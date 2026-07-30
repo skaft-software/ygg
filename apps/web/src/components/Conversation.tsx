@@ -405,6 +405,17 @@ function attachmentMetadataLabel(attachment: AttachmentRef): string {
   }`;
 }
 
+function documentTypeLabel(document: DocumentReference): string {
+  if (document.mediaType === "application/pdf") {
+    if (document.pageCount === undefined) return "PDF";
+    return `PDF · ${document.pageCount} ${
+      document.pageCount === 1 ? "page" : "pages"
+    }`;
+  }
+  if (document.mediaType === "text/markdown") return "Markdown";
+  return "Text";
+}
+
 function AttachmentPreviewDialog({
   source,
   name,
@@ -1408,12 +1419,13 @@ const TranscriptItemView = memo(function TranscriptItemView({
                   <FileText aria-hidden="true" />
                   <span>
                     <strong>{document.displayName}</strong>
-                    <small>
-                      {document.mediaType === "application/pdf"
-                        ? "Uploaded PDF"
-                        : document.mediaType === "text/markdown"
-                          ? "Uploaded Markdown"
-                          : "Uploaded text"}
+                    <small className="document-reference-badges">
+                      <span className="document-reference-badge">
+                        {documentTypeLabel(document)}
+                      </span>
+                      <span className="document-reference-badge is-fidelity">
+                        {document.fidelity}
+                      </span>
                     </small>
                   </span>
                 </span>
