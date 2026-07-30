@@ -285,7 +285,6 @@ function createCachedTerminal(ownerKey: string): CachedTerminal {
     cursorBlink: true,
     cursorStyle: "bar",
     fontFamily: cssColor("--mono-family", "ui-monospace, monospace"),
-    fontSize: terminalFontSize(),
     lineHeight: 1.2,
     macOptionIsMeta: true,
     rightClickSelectsWord: true,
@@ -293,6 +292,7 @@ function createCachedTerminal(ownerKey: string): CachedTerminal {
     screenReaderMode: true,
     theme: terminalTheme(),
   });
+  terminal.options.fontSize = terminalFontSize();
   const fit = new FitAddon();
   terminal.loadAddon(fit);
   terminal.loadAddon(new WebLinksAddon(openTerminalLink));
@@ -356,8 +356,8 @@ function connectionLabel(view: TerminalViewState): string {
   }
 }
 
-function setCachedTerminalFontSize(entry: CachedTerminal, fontSize: number): void {
-  entry.terminal.options.fontSize = fontSize;
+function setCachedTerminalFontSize(entry: CachedTerminal, size: number): void {
+  entry.terminal.options.fontSize = size;
 }
 
 function restartCachedTerminal(entry: CachedTerminal): void {

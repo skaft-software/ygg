@@ -1170,8 +1170,7 @@ impl SessionStore {
                 metadata.pinned = false;
                 if metadata.trashed_at_ms.is_none() {
                     metadata.trashed_at_ms = Some(changed_at_ms);
-                    metadata.purge_after_ms =
-                        changed_at_ms.checked_add(SESSION_TRASH_RETENTION_MS);
+                    metadata.purge_after_ms = changed_at_ms.checked_add(SESSION_TRASH_RETENTION_MS);
                 }
                 if metadata.purge_after_ms.is_none() {
                     anyhow::bail!("session trash retention timestamp overflow");
@@ -1204,11 +1203,7 @@ impl SessionStore {
     }
 
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
-    pub fn delete_permanently(
-        &self,
-        id: &str,
-        expected_trashed_at_ms: u64,
-    ) -> anyhow::Result<()> {
+    pub fn delete_permanently(&self, id: &str, expected_trashed_at_ms: u64) -> anyhow::Result<()> {
         let metadata = self.load_metadata(id)?;
         if metadata.trashed_at_ms != Some(expected_trashed_at_ms) {
             anyhow::bail!("session trash confirmation is stale");
@@ -1379,11 +1374,7 @@ mod tests {
         assert_eq!(restored.purge_after_ms, None);
 
         let archived = store
-            .set_lifecycle(
-                "lifecycle",
-                SessionStorageLifecycle::Archived,
-                11_000,
-            )
+            .set_lifecycle("lifecycle", SessionStorageLifecycle::Archived, 11_000)
             .unwrap();
         assert!(archived.archived);
         assert_eq!(archived.trashed_at_ms, None);
