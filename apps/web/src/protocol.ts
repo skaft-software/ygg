@@ -269,6 +269,8 @@ export interface HostBootstrap {
     sessionExport: boolean;
     documents: boolean;
     trustedProjectFiles: boolean;
+    projectFileBrowser: boolean;
+    projectFileWrite: boolean;
     transcriptSearch: boolean;
     themeSelection: boolean;
     steer: boolean;
@@ -336,6 +338,58 @@ export interface TrustedFileRead {
   entry: TrustedFileEntry;
   text: string;
   sha256: string;
+}
+
+export type ProjectFileEntryKind = "directory" | "file";
+
+/** A direct child of a trusted project directory. Paths are always project-relative. */
+export interface ProjectFileEntry {
+  name: string;
+  kind: ProjectFileEntryKind;
+  size: number;
+  modifiedAtMs?: number;
+}
+
+export interface ProjectFileTree {
+  path: string;
+  entries: ProjectFileEntry[];
+  truncated: boolean;
+}
+
+export interface ProjectFileRead {
+  path: string;
+  content: string;
+  startLine: number;
+  endLine: number;
+  lineCount: number;
+  truncated: boolean;
+  /** Present only for a complete read and required for optimistic writes. */
+  sha256?: string;
+}
+
+export interface ProjectFileSearchHit {
+  path: string;
+  line?: number;
+  snippet: string;
+}
+
+export interface ProjectFileSearchResult {
+  hits: ProjectFileSearchHit[];
+  truncated: boolean;
+  scannedBytes: number;
+}
+
+export interface ProjectFileWriteRequest {
+  path: string;
+  content: string;
+  expectedSha256: string;
+  force?: boolean;
+}
+
+export interface ProjectFileWrite {
+  path: string;
+  sha256: string;
+  modifiedAtMs?: number;
 }
 
 export type TranscriptSearchKind =

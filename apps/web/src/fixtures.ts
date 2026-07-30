@@ -285,6 +285,8 @@ export const fixtureBootstrap: HostBootstrap = {
     attachments: true,
     documents: true,
     trustedProjectFiles: true,
+    projectFileBrowser: true,
+    projectFileWrite: true,
     transcriptSearch: true,
     attachmentPolicy: {
       acceptedMediaTypes: ["image/*", "text/*", "application/pdf"],

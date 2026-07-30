@@ -3,6 +3,7 @@ import {
   ArchiveRestore,
   BarChart3,
   Folder,
+  Files,
   GitMerge,
   GitPullRequest,
   GitPullRequestDraft,
@@ -38,8 +39,9 @@ interface SidebarProps {
   sessions: SessionSummary[];
   projects?: ProjectSummary[];
   selectedSessionId: string | null;
-  surface: "session" | "projects" | "usage" | "settings" | "devices";
+  surface: "session" | "projects" | "files" | "usage" | "settings" | "devices";
   devicesAvailable: boolean;
+  filesAvailable?: boolean;
   onRestoreFocus: () => void;
   onClose: () => void;
   onNewSession: () => void;
@@ -57,6 +59,7 @@ interface SidebarProps {
   ) => void | Promise<void>;
   onOpenDevices: () => void;
   onOpenProjects: () => void;
+  onOpenFiles?: () => void;
   onOpenUsage: () => void;
   onOpenSettings: () => void;
   transcriptSearchAvailable?: boolean;
@@ -327,6 +330,7 @@ function SidebarView({
   selectedSessionId,
   surface,
   devicesAvailable,
+  filesAvailable = false,
   onRestoreFocus,
   onClose,
   onNewSession,
@@ -337,6 +341,7 @@ function SidebarView({
   onDeleteSessionPermanently,
   onOpenDevices,
   onOpenProjects,
+  onOpenFiles,
   onOpenUsage,
   onOpenSettings,
   transcriptSearchAvailable,
@@ -883,6 +888,16 @@ function SidebarView({
         </div>
 
         <footer className="sidebar-footer">
+          {filesAvailable && onOpenFiles ? (
+            <button
+              className={`sidebar-destination ${surface === "files" ? "is-selected" : ""}`}
+              aria-current={surface === "files" ? "page" : undefined}
+              onClick={onOpenFiles}
+            >
+              <Files aria-hidden="true" />
+              <strong>Files</strong>
+            </button>
+          ) : null}
           <button
             className={`sidebar-destination ${surface === "projects" ? "is-selected" : ""}`}
             onClick={onOpenProjects}

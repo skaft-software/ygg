@@ -10,6 +10,10 @@ import type {
   HostBootstrap,
   LifetimeUsage,
   ProjectCatalog,
+  ProjectFileRead,
+  ProjectFileSearchResult,
+  ProjectFileTree,
+  ProjectFileWrite,
   RepositoryContextSnapshot,
   SessionSnapshot,
   TranscriptSearchResult,
@@ -189,6 +193,22 @@ class TestTransport implements YggTransport {
 
   async readTrustedFile(): Promise<TrustedFileRead> {
     throw new Error("No trusted file fixture.");
+  }
+
+  async getProjectFileTree(): Promise<ProjectFileTree> {
+    return { path: "", entries: [], truncated: false };
+  }
+
+  async readProjectFile(): Promise<ProjectFileRead> {
+    throw new Error("No project file fixture.");
+  }
+
+  async searchProjectFiles(): Promise<ProjectFileSearchResult> {
+    return { hits: [], truncated: false, scannedBytes: 0 };
+  }
+
+  async writeProjectFile(): Promise<ProjectFileWrite> {
+    throw new Error("No project file fixture.");
   }
 
   async searchTranscripts(): Promise<TranscriptSearchResult> {

@@ -27,6 +27,7 @@ import {
 import { ActivityRail } from "./components/ActivityRail";
 import { Conversation } from "./components/Conversation";
 import { DevicesView } from "./components/Devices";
+import { FilesPanel } from "./components/FilesPanel";
 import {
   Inspector,
   type InspectorSelection,
@@ -64,7 +65,13 @@ import {
   transportModeFromSearch,
 } from "./transport";
 
-type Surface = "session" | "projects" | "usage" | "settings" | "devices";
+type Surface =
+  | "session"
+  | "projects"
+  | "files"
+  | "usage"
+  | "settings"
+  | "devices";
 
 const statusLabel: Record<SessionStatus, string> = {
   idle: "Ready",
@@ -1080,6 +1087,14 @@ export default function App() {
       setSidebarOpen(false);
     }
   }, []);
+  const openFiles = useCallback(() => {
+    setSurface("files");
+    setInspector(null);
+    setActivityOpen(false);
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      setSidebarOpen(false);
+    }
+  }, []);
   const openUsage = useCallback(() => {
     setSurface("usage");
     setInspector(null);
@@ -1168,6 +1183,24 @@ export default function App() {
       return store.readTrustedFile(selectedProjectId, entryId);
     },
     [selectedProjectId],
+  );
+  const getProjectFileTree = useCallback(
+    (projectId: string, path?: string) => store.getProjectFileTree(projectId, path),
+    [],
+  );
+  const readProjectFileContent = useCallback(
+    (projectId: string, path: string, startLine?: number, endLine?: number) =>
+      store.readProjectFile(projectId, path, startLine, endLine),
+    [],
+  );
+  const searchProjectFilesystem = useCallback(
+    (projectId: string, query: string) => store.searchProjectFiles(projectId, query),
+    [],
+  );
+  const writeProjectFile = useCallback(
+    (projectId: string, request: Parameters<YggStore["writeProjectFile"]>[1]) =>
+      store.writeProjectFile(projectId, request),
+    [],
   );
   const editUserTurn = useCallback(
     (entryId: string, text: string) =>
@@ -1259,6 +1292,7 @@ export default function App() {
         selectedSessionId={state.selectedSessionId}
         surface={surface}
         devicesAvailable={state.bootstrap.capabilities.connectedDevices}
+        filesAvailable={state.bootstrap.capabilities.projectFileBrowser}
         onRestoreFocus={restoreSidebarFocus}
         onClose={closeSidebar}
         onNewSession={startNewSession}
@@ -1268,6 +1302,7 @@ export default function App() {
         }}
         onSetSessionLifecycle={setSessionLifecycle}
         onOpenProjects={openProjects}
+        onOpenFiles={openFiles}
         onOpenUsage={openUsage}
         onOpenSettings={openSettings}
         onOpenDevices={openDevices}
@@ -1373,9 +1408,11 @@ export default function App() {
                 ? "Settings"
                 : surface === "projects"
                   ? "Projects"
-                  : surface === "usage"
-                    ? "Usage"
-                    : "Connected devices"
+                  : surface === "files"
+                    ? "Files"
+                    : surface === "usage"
+                      ? "Usage"
+                      : "Connected devices"
             }
             sidebarOpen={sidebarOpen}
             onOpenSidebar={() => setSidebarOpen(true)}
@@ -1383,7 +1420,17 @@ export default function App() {
           />
           <ConnectionBanner connection={state.connection} />
           <FixtureModeLabel />
-          {surface === "settings" ? (
+          {surface === "files" ? (
+            <FilesPanel
+              projects={state.bootstrap.projects}
+              preferredProjectId={session.projectId}
+              writeAvailable={state.bootstrap.capabilities.projectFileWrite}
+              getTree={getProjectFileTree}
+              readFile={readProjectFileContent}
+              searchFiles={searchProjectFilesystem}
+              writeFile={writeProjectFile}
+            />
+          ) : surface === "settings" ? (
             <SettingsView
               notificationsSupported={notificationState.supported}
               notificationsEnabled={notificationState.enabled}

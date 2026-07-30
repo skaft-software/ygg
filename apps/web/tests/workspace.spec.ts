@@ -86,6 +86,20 @@ test("labels simulated fixture mode", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("browses and saves a trusted project file", async ({ page }) => {
+  await ensureSidebar(page);
+  await page.getByRole("button", { name: "Files", exact: true }).click();
+
+  await expect(page.getByRole("heading", { name: "Files", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /README\.md/ }).click();
+  const editor = page.getByRole("textbox", { name: "Contents of README.md" });
+  await expect(editor).toBeVisible();
+  await editor.fill("# Updated fixture project\n");
+  await expect(page.getByText("Unsaved", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByText("Unsaved", { exact: true })).toHaveCount(0);
+});
+
 test("opens in a fresh, quiet session with the standard composer", async ({
   page,
 }) => {

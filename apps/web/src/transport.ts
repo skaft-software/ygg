@@ -12,6 +12,11 @@ import type {
   LifetimeUsage,
   ModelSummary,
   ProjectCatalog,
+  ProjectFileRead,
+  ProjectFileSearchResult,
+  ProjectFileTree,
+  ProjectFileWrite,
+  ProjectFileWriteRequest,
   RepositoryContextSnapshot,
   SessionEvent,
   SessionSnapshot,
@@ -36,6 +41,10 @@ import {
   projectProjectCatalog,
   projectRepositoryContext,
   projectLifetimeUsage,
+  projectProjectFileRead,
+  projectProjectFileSearchResult,
+  projectProjectFileTree,
+  projectProjectFileWrite,
   projectUsageActivity,
   projectUsageStats,
   projectHostStreamEvent,
@@ -76,6 +85,21 @@ export interface YggTransport {
     projectId: string,
     entryId: string,
   ): Promise<TrustedFileRead>;
+  getProjectFileTree(projectId: string, path?: string): Promise<ProjectFileTree>;
+  readProjectFile(
+    projectId: string,
+    path: string,
+    startLine?: number,
+    endLine?: number,
+  ): Promise<ProjectFileRead>;
+  searchProjectFiles(
+    projectId: string,
+    query: string,
+  ): Promise<ProjectFileSearchResult>;
+  writeProjectFile(
+    projectId: string,
+    request: ProjectFileWriteRequest,
+  ): Promise<ProjectFileWrite>;
   searchTranscripts(
     request: TranscriptSearchRequest,
   ): Promise<TranscriptSearchResult>;
@@ -88,6 +112,51 @@ export interface YggTransport {
 
 const clone = <T,>(value: T): T => structuredClone(value);
 
+/** Raised only when a write's optimistic SHA-256 version is stale. */
+export class ProjectFileConflictError extends Error {
+  constructor() {
+    super("The project file changed before the save completed.");
+    this.name = "ProjectFileConflictError";
+  }
+}
+
+interface FixtureProjectFile {
+  content: string;
+  modifiedAtMs: number;
+}
+
+function fixtureProjectFileHash(content: string): string {
+  let hash = 2_166_136_261;
+  for (const codeUnit of content) {
+    hash ^= codeUnit.codePointAt(0) ?? 0;
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0).toString(16).padStart(64, "0");
+}
+
+function fixtureProjectFileByteLength(content: string): number {
+  return new TextEncoder().encode(content).byteLength;
+}
+
+async function projectFileWriteError(response: Response): Promise<Error> {
+  try {
+    const value: unknown = await response.clone().json();
+    if (
+      response.status === 409 &&
+      typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      typeof (value as { error?: unknown }).error === "object" &&
+      (value as { error: { code?: unknown } }).error?.code === "locked"
+    ) {
+      return new ProjectFileConflictError();
+    }
+  } catch {
+    // The response status remains sufficient for a safe generic error.
+  }
+  return new Error(`Project-file write failed with ${response.status}`);
+}
+
 export class FixtureTransport implements YggTransport {
   private bootstrap = clone(fixtureBootstrap);
   private sessions = clone(fixtureSessions);
@@ -97,6 +166,7 @@ export class FixtureTransport implements YggTransport {
   private attachmentFiles = new Map<string, File>();
   private attachmentUrls = new Map<string, string>();
   private documents = new Map<string, DocumentReference[]>();
+  private projectFiles = new Map<string, Map<string, FixtureProjectFile>>();
 
   async getProjectCatalog(): Promise<ProjectCatalog> {
     return {
@@ -435,6 +505,129 @@ export class FixtureTransport implements YggTransport {
     };
   }
 
+  async getProjectFileTree(
+    projectId: string,
+    path = "",
+  ): Promise<ProjectFileTree> {
+    const files = this.fixtureProjectFiles(projectId);
+    const prefix = path ? `${path}/` : "";
+    const entries = new Map<
+      string,
+      { kind: "directory" | "file"; size: number; modifiedAtMs?: number }
+    >();
+    for (const [filePath, file] of files) {
+      if (!filePath.startsWith(prefix)) continue;
+      const remainder = filePath.slice(prefix.length);
+      const separator = remainder.indexOf("/");
+      if (separator >= 0) {
+        const name = remainder.slice(0, separator);
+        if (!entries.has(name)) {
+          entries.set(name, { kind: "directory", size: 0 });
+        }
+      } else {
+        entries.set(remainder, {
+          kind: "file",
+          size: fixtureProjectFileByteLength(file.content),
+          modifiedAtMs: file.modifiedAtMs,
+        });
+      }
+    }
+    return {
+      path,
+      entries: [...entries.entries()]
+        .map(([name, entry]) => ({ name, ...entry }))
+        .sort(
+          (left, right) =>
+            Number(right.kind === "file") - Number(left.kind === "file") ||
+            left.name.localeCompare(right.name),
+        ),
+      truncated: false,
+    };
+  }
+
+  async readProjectFile(
+    projectId: string,
+    path: string,
+    startLine?: number,
+    endLine?: number,
+  ): Promise<ProjectFileRead> {
+    const file = this.fixtureProjectFiles(projectId).get(path);
+    if (!file) throw new Error("Project file is not available.");
+    const lines = file.content ? file.content.match(/[^\n]*\n|[^\n]+$/gu) ?? [] : [];
+    const lineCount = lines.length;
+    const first = startLine ?? 1;
+    const last = endLine ?? lineCount;
+    const ranged = startLine !== undefined || endLine !== undefined;
+    const content =
+      first > lineCount || lineCount === 0
+        ? ""
+        : lines.slice(first - 1, Math.min(last, lineCount)).join("");
+    return {
+      path,
+      content,
+      startLine: content ? first : 0,
+      endLine: content ? Math.min(last, lineCount) : 0,
+      lineCount,
+      truncated: ranged,
+      sha256: ranged ? undefined : fixtureProjectFileHash(file.content),
+    };
+  }
+
+  async searchProjectFiles(
+    projectId: string,
+    query: string,
+  ): Promise<ProjectFileSearchResult> {
+    const needle = query.trim().toLocaleLowerCase();
+    if (!needle) throw new Error("A project-file search query is required.");
+    const files = this.fixtureProjectFiles(projectId);
+    const hits = [...files.entries()].flatMap(([path, file]) => {
+      const text = file.content;
+      const match = text.toLocaleLowerCase().indexOf(needle);
+      if (!path.toLocaleLowerCase().includes(needle) && match < 0) return [];
+      if (match < 0) return [{ path, snippet: "" }];
+      const line = text.slice(0, match).split("\n").length;
+      const lineStart = text.lastIndexOf("\n", match) + 1;
+      const lineEnd = text.indexOf("\n", match);
+      return [
+        {
+          path,
+          line,
+          snippet: text.slice(lineStart, lineEnd < 0 ? text.length : lineEnd).trim(),
+        },
+      ];
+    });
+    return {
+      hits,
+      truncated: false,
+      scannedBytes: [...files.values()].reduce(
+        (total, file) => total + fixtureProjectFileByteLength(file.content),
+        0,
+      ),
+    };
+  }
+
+  async writeProjectFile(
+    projectId: string,
+    request: ProjectFileWriteRequest,
+  ): Promise<ProjectFileWrite> {
+    const files = this.fixtureProjectFiles(projectId);
+    const current = files.get(request.path);
+    if (!current) throw new Error("Project file is not available.");
+    if (
+      !request.force &&
+      fixtureProjectFileHash(current.content) !== request.expectedSha256
+    ) {
+      throw new ProjectFileConflictError();
+    }
+    const modifiedAtMs = Date.now();
+    files.set(request.path, { content: request.content, modifiedAtMs });
+    return {
+      path: request.path,
+      sha256: fixtureProjectFileHash(request.content),
+      modifiedAtMs,
+    };
+  }
+
   async searchTranscripts(
     request: TranscriptSearchRequest,
   ): Promise<TranscriptSearchResult> {
@@ -520,6 +713,45 @@ export class FixtureTransport implements YggTransport {
 
   resourceContentUrl(sessionId: string, handle: string): string {
     return `/api/v1/sessions/${encodeURIComponent(sessionId)}/resources/${encodeURIComponent(handle)}`;
+  }
+
+  private fixtureProjectFiles(
+    projectId: string,
+  ): Map<string, FixtureProjectFile> {
+    if (!this.bootstrap.projects.some((project) => project.id === projectId)) {
+      throw new Error("A fixture project id is required.");
+    }
+    let files = this.projectFiles.get(projectId);
+    if (files) return files;
+    const initialModifiedAtMs = 1_753_626_615_000;
+    files = new Map([
+      [
+        "README.md",
+        {
+          content:
+            "# ygg fixture project\n\nThis browser edits only trusted project files.\n",
+          modifiedAtMs: initialModifiedAtMs,
+        },
+      ],
+      [
+        "docs/serve.md",
+        {
+          content:
+            "# Serve\n\nThe local web client connects through an authenticated loopback API.\n",
+          modifiedAtMs: initialModifiedAtMs,
+        },
+      ],
+      [
+        "src/main.ts",
+        {
+          content:
+            'export const greeting = "Hello from ygg";\n',
+          modifiedAtMs: initialModifiedAtMs,
+        },
+      ],
+    ]);
+    this.projectFiles.set(projectId, files);
+    return files;
   }
 
   private emit(event: SessionEvent): void {
@@ -1775,6 +2007,83 @@ export class HttpTransport implements YggTransport {
       throw new Error(`Project-file read failed with ${response.status}`);
     }
     return projectTrustedFileRead(await response.json());
+  }
+
+  async getProjectFileTree(
+    projectId: string,
+    path = "",
+  ): Promise<ProjectFileTree> {
+    const query = path ? `?path=${encodeURIComponent(path)}` : "";
+    const response = await fetch(
+      `/api/v1/fs/${encodeURIComponent(projectId)}/tree${query}`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Project-file tree failed with ${response.status}`);
+    }
+    return projectProjectFileTree(await response.json());
+  }
+
+  async readProjectFile(
+    projectId: string,
+    path: string,
+    startLine?: number,
+    endLine?: number,
+  ): Promise<ProjectFileRead> {
+    const query = new URLSearchParams({ path });
+    if (startLine !== undefined) query.set("startLine", String(startLine));
+    if (endLine !== undefined) query.set("endLine", String(endLine));
+    const response = await fetch(
+      `/api/v1/fs/${encodeURIComponent(projectId)}/read?${query.toString()}`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Project-file read failed with ${response.status}`);
+    }
+    return projectProjectFileRead(await response.json());
+  }
+
+  async searchProjectFiles(
+    projectId: string,
+    query: string,
+  ): Promise<ProjectFileSearchResult> {
+    const response = await fetch(
+      `/api/v1/fs/${encodeURIComponent(projectId)}/search?query=${encodeURIComponent(query)}`,
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`Project-file search failed with ${response.status}`);
+    }
+    return projectProjectFileSearchResult(await response.json());
+  }
+
+  async writeProjectFile(
+    projectId: string,
+    request: ProjectFileWriteRequest,
+  ): Promise<ProjectFileWrite> {
+    const response = await fetch(
+      `/api/v1/fs/${encodeURIComponent(projectId)}/write`,
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(request),
+      },
+    );
+    if (!response.ok) throw await projectFileWriteError(response);
+    return projectProjectFileWrite(await response.json());
   }
 
   async searchTranscripts(
