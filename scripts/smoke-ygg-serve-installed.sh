@@ -133,6 +133,24 @@ curl -fsS \
     --connect-timeout 2 \
     --max-time 10 \
     --cookie "$cookie_jar" \
+    --dump-header "$work_directory/files-panel-chunk.headers" \
+    --output "$work_directory/download/assets/chunk-FilesPanel.js" \
+    "$origin/assets/chunk-FilesPanel.js"
+curl -fsS \
+    --noproxy '*' \
+    --proto '=http' \
+    --connect-timeout 2 \
+    --max-time 10 \
+    --cookie "$cookie_jar" \
+    --dump-header "$work_directory/jsx-runtime-chunk.headers" \
+    --output "$work_directory/download/assets/chunk-jsx-runtime.js" \
+    "$origin/assets/chunk-jsx-runtime.js"
+curl -fsS \
+    --noproxy '*' \
+    --proto '=http' \
+    --connect-timeout 2 \
+    --max-time 10 \
+    --cookie "$cookie_jar" \
     --dump-header "$work_directory/markdown-chunk.headers" \
     --output "$work_directory/download/assets/chunk-MarkdownMessage.js" \
     "$origin/assets/chunk-MarkdownMessage.js"
@@ -140,6 +158,12 @@ curl -fsS \
 cmp "$work_directory/download/index.html" "$expected_directory/index.html"
 cmp "$work_directory/download/assets/app.js" "$expected_directory/assets/app.js"
 cmp "$work_directory/download/assets/app.css" "$expected_directory/assets/app.css"
+cmp \
+    "$work_directory/download/assets/chunk-FilesPanel.js" \
+    "$expected_directory/assets/chunk-FilesPanel.js"
+cmp \
+    "$work_directory/download/assets/chunk-jsx-runtime.js" \
+    "$expected_directory/assets/chunk-jsx-runtime.js"
 cmp \
     "$work_directory/download/assets/chunk-MarkdownMessage.js" \
     "$expected_directory/assets/chunk-MarkdownMessage.js"
@@ -157,6 +181,12 @@ tr -d '\r' <"$work_directory/index.headers" >"$work_directory/index.headers.clea
 tr -d '\r' <"$work_directory/app-js.headers" >"$work_directory/app-js.headers.clean"
 tr -d '\r' <"$work_directory/app-css.headers" >"$work_directory/app-css.headers.clean"
 tr -d '\r' \
+    <"$work_directory/files-panel-chunk.headers" \
+    >"$work_directory/files-panel-chunk.headers.clean"
+tr -d '\r' \
+    <"$work_directory/jsx-runtime-chunk.headers" \
+    >"$work_directory/jsx-runtime-chunk.headers.clean"
+tr -d '\r' \
     <"$work_directory/markdown-chunk.headers" \
     >"$work_directory/markdown-chunk.headers.clean"
 bundle_sha256=$(cat "$expected_directory/bundle.sha256")
@@ -165,11 +195,15 @@ expected_csp="content-security-policy: default-src 'self'; base-uri 'none'; conn
 grep -Fxi "content-type: text/html; charset=utf-8" "$work_directory/index.headers.clean" >/dev/null
 grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/app-js.headers.clean" >/dev/null
 grep -Fxi "content-type: text/css; charset=utf-8" "$work_directory/app-css.headers.clean" >/dev/null
+grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/files-panel-chunk.headers.clean" >/dev/null
+grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/jsx-runtime-chunk.headers.clean" >/dev/null
 grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/markdown-chunk.headers.clean" >/dev/null
 for headers in \
     "$work_directory/index.headers.clean" \
     "$work_directory/app-js.headers.clean" \
     "$work_directory/app-css.headers.clean" \
+    "$work_directory/files-panel-chunk.headers.clean" \
+    "$work_directory/jsx-runtime-chunk.headers.clean" \
     "$work_directory/markdown-chunk.headers.clean"
 do
     grep -Fxi "cache-control: no-store" "$headers" >/dev/null

@@ -16,7 +16,7 @@ export default defineConfig({
     cssCodeSplit: false,
     minify: "oxc",
     // Keep the compact Local variable pair inside app.css so the extension
-    // remains one deterministic three-file web bundle.
+    // remains a deterministic fixed-name web bundle.
     assetsInlineLimit: 64_000,
     rolldownOptions: {
       output: {
