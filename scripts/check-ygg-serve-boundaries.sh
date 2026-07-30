@@ -35,6 +35,7 @@ for changed_file in $changed_files; do
     crates/ygg-coding-agent/Cargo.toml \
       | crates/ygg-coding-agent/src/cli.rs \
       | crates/ygg-coding-agent/src/main.rs \
+      | crates/ygg-coding-agent/src/commands.rs \
       | crates/ygg-coding-agent/src/extensions.rs \
       | crates/ygg-coding-agent/src/extensions/serve.rs)
       ;;

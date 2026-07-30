@@ -8,13 +8,14 @@ use tokio::sync::oneshot;
 
 use crate::{
     AttachmentError, AttachmentPolicy, AttachmentRef, AuthorityProfile, DocumentReference,
-    FileEntryId, HostCapabilities, HostDescriptor, LifetimeUsage, ModelSelection, ModelSummary,
-    PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult, ProjectFileSystemError,
-    ProjectFileTree, ProjectFileWrite, ProjectId, ProjectSummary, RepositoryContextSnapshot, RunId,
-    SanitizedError, SessionCatalogState, SessionCommand, SessionId, SessionSnapshot,
-    SessionSummary, StoredAttachment, ThemeId, ThemeOption, TimestampedEvent,
-    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileIndexSummary,
+    FileEntryId, HostCapabilities, HostDescriptor, LifetimeUsage, ModelSelection,
+    ModelSummary, PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult, ProjectFileSystemError,
+    ProjectFileTree, ProjectFileWrite, ProjectId, ProjectSummary, RepositoryContextSnapshot,
+    RunId, SanitizedError, SessionCatalogState, SessionCommand, SessionId,
+    SessionSnapshot, SessionSummary, StoredAttachment, ThemeId, ThemeOption,
+    TimestampedEvent, TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileIndexSummary,
     TrustedFileRead, TrustedFileSearchResult, UsageActivity, UsagePeriod, UsageStats,
+    CommandDiscovery,
 };
 
 /// Immutable, path-free content behind one host-minted opaque resource handle.
@@ -316,6 +317,14 @@ impl ServiceError {
 pub trait SessionDriver: Send + 'static {
     /// Returns the authoritative initial projection.
     fn seed(&self) -> SessionSeed;
+
+    /// Returns host-admitted command and skill discovery for this session.
+    ///
+    /// The actor serializes this read with dispatch so dynamic extension and
+    /// skill state cannot race a command invocation.
+    async fn command_discovery(&mut self) -> Result<CommandDiscovery, ServiceError> {
+        Err(ServiceError::Unavailable)
+    }
 
     /// Routes a command to the owning App/Run boundary.
     async fn dispatch(

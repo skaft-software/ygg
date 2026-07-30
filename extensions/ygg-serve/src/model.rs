@@ -28,6 +28,9 @@ pub const MAX_MODEL_INPUT_PRICING_TIERS: usize = 32;
 const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_THEMES: usize = 64;
 const MAX_AUTHORITY_PROFILES: usize = 8;
+const MAX_COMMAND_SUGGESTIONS: usize = 512;
+const MAX_SKILL_SUGGESTIONS: usize = 512;
+const MAX_COMMAND_DISCOVERY_BYTES: usize = 256 * 1024;
 
 /// Monotonic host-catalog revision.
 #[derive(
@@ -136,6 +139,63 @@ pub struct HostCapabilities {
     pub terminal: bool,
     /// Nested child agents; false until Ygg implements them.
     pub child_agents: bool,
+}
+
+/// Source of one slash-command suggestion admitted by the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandSuggestionKind {
+    /// A built-in coding-agent slash command.
+    BuiltIn,
+    /// A prompt template admitted by the shared resource resolver.
+    Prompt,
+    /// An enabled executable-extension command.
+    Extension,
+}
+
+/// One bounded command shown by the graphical composer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandSuggestion {
+    /// Invocation name without its leading slash.
+    pub name: String,
+    /// Complete label/usage string, including the leading slash.
+    pub usage: String,
+    /// Short host-authored description.
+    pub description: String,
+    /// Optional argument placeholder supplied by a prompt template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+    /// Whether choosing the command should leave the composer ready for arguments.
+    pub accepts_argument: bool,
+    /// Trusted source that admitted this command.
+    pub kind: CommandSuggestionKind,
+}
+
+/// One trusted skill available to `/skills` operations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillSuggestion {
+    /// Stable skill identifier accepted by `/skills`.
+    pub id: String,
+    /// Human-readable skill name.
+    pub name: String,
+    /// Short host-authored description.
+    pub description: String,
+    /// Whether this skill is active for the selected session.
+    pub active: bool,
+}
+
+/// Read-only, bounded slash-command and skill discovery payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandDiscovery {
+    /// Protocol major.
+    pub protocol: u16,
+    /// TUI-ordered command/template/extension suggestions.
+    pub commands: Vec<CommandSuggestion>,
+    /// Trusted skills available to `/skills` operations.
+    pub skills: Vec<SkillSuggestion>,
 }
 
 /// Bounded host-ingest policy advertised to graphical clients.
@@ -1220,6 +1280,102 @@ fn validate_media_type(field: &'static str, value: &str) -> Result<(), Validatio
 impl ProtocolValidation for HostDescriptor {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_public_text("host.name", &self.name, 256, false)
+    }
+}
+
+fn validate_discovery_name(field: &'static str, value: &str) -> Result<(), ValidationError> {
+    validate_public_text(field, value, 128, false)?;
+    if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
+        return Err(ValidationError::new(
+            field,
+            "must be a non-blank, whitespace-free identifier",
+        ));
+    }
+    Ok(())
+}
+
+impl ProtocolValidation for CommandSuggestion {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_discovery_name("command_discovery.commands.name", &self.name)?;
+        validate_public_text("command_discovery.commands.usage", &self.usage, 512, false)?;
+        if !self.usage.starts_with('/') {
+            return Err(ValidationError::new(
+                "command_discovery.commands.usage",
+                "must begin with a slash",
+            ));
+        }
+        validate_public_text(
+            "command_discovery.commands.description",
+            &self.description,
+            2_048,
+            false,
+        )?;
+        if let Some(argument_hint) = &self.argument_hint {
+            validate_public_text(
+                "command_discovery.commands.argument_hint",
+                argument_hint,
+                512,
+                false,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolValidation for SkillSuggestion {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_discovery_name("command_discovery.skills.id", &self.id)?;
+        validate_public_text("command_discovery.skills.name", &self.name, 256, false)?;
+        validate_public_text(
+            "command_discovery.skills.description",
+            &self.description,
+            2_048,
+            false,
+        )
+    }
+}
+
+impl ProtocolValidation for CommandDiscovery {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.protocol != PROTOCOL_VERSION {
+            return Err(ValidationError::new(
+                "command_discovery.protocol",
+                format!("must equal protocol major {PROTOCOL_VERSION}"),
+            ));
+        }
+        if self.commands.len() > MAX_COMMAND_SUGGESTIONS {
+            return Err(ValidationError::new(
+                "command_discovery.commands",
+                format!("exceeds the {MAX_COMMAND_SUGGESTIONS}-command limit"),
+            ));
+        }
+        if self.skills.len() > MAX_SKILL_SUGGESTIONS {
+            return Err(ValidationError::new(
+                "command_discovery.skills",
+                format!("exceeds the {MAX_SKILL_SUGGESTIONS}-skill limit"),
+            ));
+        }
+        let mut command_names = BTreeSet::new();
+        for command in &self.commands {
+            command.validate()?;
+            if !command_names.insert(command.name.as_str()) {
+                return Err(ValidationError::new(
+                    "command_discovery.commands",
+                    "contains a duplicate command name",
+                ));
+            }
+        }
+        let mut skill_ids = BTreeSet::new();
+        for skill in &self.skills {
+            skill.validate()?;
+            if !skill_ids.insert(skill.id.as_str()) {
+                return Err(ValidationError::new(
+                    "command_discovery.skills",
+                    "contains a duplicate skill ID",
+                ));
+            }
+        }
+        validate_serialized_size("command_discovery", self, MAX_COMMAND_DISCOVERY_BYTES)
     }
 }
 

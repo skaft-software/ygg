@@ -479,6 +479,10 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
         )
         .route("/api/v1/sessions/{session_id}", get(session_snapshot::<H>))
         .route(
+            "/api/v1/sessions/{session_id}/commands",
+            get(command_discovery::<H>),
+        )
+        .route(
             "/api/v1/sessions/{session_id}/replay",
             get(session_replay::<H>),
         )
@@ -1369,6 +1373,23 @@ async fn session_snapshot<H: HostService>(
     };
     match state.supervisor.session_view(&session_id).await {
         Ok(view) => Json(view.snapshot).into_response(),
+        Err(error) => supervisor_error_response(error),
+    }
+}
+
+async fn command_discovery<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_session_id): Path<String>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    let session_id = match SessionId::new(raw_session_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    match state.supervisor.command_discovery(&session_id).await {
+        Ok(discovery) => Json(discovery).into_response(),
         Err(error) => supervisor_error_response(error),
     }
 }

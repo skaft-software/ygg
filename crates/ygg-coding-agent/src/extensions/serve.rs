@@ -23,43 +23,49 @@ use ygg_ai::{
     ReasoningConfig, ToolCallId, ToolResultPart, UserPart,
 };
 use ygg_serve_backend::{
-    parse_test_output, refresh_repository_context, ActivityPhase, ActivityPhaseSummary,
-    ActorOwnerState, ArtifactId, ArtifactKind, ArtifactRef, AttachmentError, AttachmentFingerprint,
+    parse_test_output, refresh_repository_context, ActivityPhase, ActivityPhaseSummary, ActorOwnerState,
+    ArtifactId, ArtifactKind, ArtifactRef, AttachmentError, AttachmentFingerprint,
     AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState, AuthorityProfile,
-    ColorScheme, CompletionReview, ContextUsage, ConversationBranchOperation,
-    ConversationBranchProvenance, CreateSessionRequest, DocumentReference, DocumentStore,
-    DocumentStoreError, DriverCommandOutcome, DurableEntryId, EventPayload, EvidenceCoverage,
-    FileChange, FileEntryId, FinalizeCompletion, FinalizeDecision, HostCapabilities,
-    HostDescriptor, HostId, HostService, InferenceRequest, InferenceRequestStore, InputModality,
-    ItemDelta, ItemId, ItemLifecycle, ItemPayload, LifetimeUsage, LoopbackConfig, LoopbackServer,
-    ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary, PendingRequest,
-    PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult, ProjectFileSystem,
+    ColorScheme, CompletionReview, ContextUsage, ConversationBranchOperation, ConversationBranchProvenance,
+    CreateSessionRequest, DocumentReference, DocumentStore, DocumentStoreError, DriverCommandOutcome,
+    DurableEntryId, EventPayload, EvidenceCoverage, FileChange, FileEntryId,
+    FinalizeCompletion, FinalizeDecision, HostCapabilities, HostDescriptor, HostId,
+    HostService, InferenceRequest, InferenceRequestStore, InputModality, ItemDelta,
+    ItemId, ItemLifecycle, ItemPayload, LifetimeUsage, LoopbackConfig,
+    LoopbackServer, ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary,
+    PendingRequest, PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult, ProjectFileSystem,
     ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ProjectId, ProjectRegistry,
     ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation, RegistryProjectId,
-    RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer,
-    RequestId, RequestKind, RequestState, RunId, SearchDocument, SearchDocumentKind, SearchError,
-    SemanticRole, ServiceError, SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph,
-    SessionCatalogState, SessionCommand, SessionCursor, SessionDriver, SessionId, SessionItem,
-    SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot, SessionSummary,
-    SessionSupervisor, SourceId, SourceKind, SourceRef, StoredAttachment, StoredResource,
-    StructuredTestResults, SupervisorConfig, TestCommandOutcome, TestCommandStatus, TestFramework,
-    TestOutputInput, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
+    RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer, RequestId,
+    RequestKind, RequestState, RunId, SearchDocument, SearchDocumentKind,
+    SearchError, SemanticRole, ServiceError, SessionBranchEntry, SessionBranchEntryKind,
+    SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor, SessionDriver,
+    SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed,
+    SessionSnapshot, SessionSummary, SessionSupervisor, SourceId, SourceKind,
+    SourceRef, StoredAttachment, StoredResource, StructuredTestResults, SupervisorConfig,
+    TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput, ThemeColor,
+    ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
     ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity,
-    ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
-    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
-    TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
-    UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
-    MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES,
+    ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest,
+    TranscriptSearchResult, TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary, TrustedFileRead,
+    TrustedFileSearchResult, TrustedProjectFiles, TurnId, UsageActivity, UsagePeriod,
+    UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery, MAX_ITEM_TEXT_BYTES,
+    MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES, CommandDiscovery, CommandSuggestion,
+    CommandSuggestionKind, SkillSuggestion, SlashCommandInvocation, PROTOCOL_VERSION,
 };
 
 use crate::app::bootstrap::{build_app, rebuild_app, LaunchSelection, SessionSelection};
 use crate::app::{reasoning_label, supported_levels, App, Reconfig};
+use crate::commands;
+use crate::compaction::attempt_compaction;
 use crate::config::{self, Config};
-use crate::resources::compose_instructions;
+use crate::resources::{compose_instructions, validate_skill_requirements};
 use crate::session_store::{SessionMeta, SessionStorageLifecycle, SessionStore};
 
 const DRIVER_MAILBOX_CAPACITY: usize = 64;
 const DRIVER_EVENT_CAPACITY: usize = 512;
+const MAX_BUFFERED_DISCOVERY_EVENTS: usize = 64;
+const DISCOVERY_BACKPRESSURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const MAX_GRAPHICAL_MODELS: usize = 256;
 const MAX_PROJECTED_SESSION_ITEMS: usize = 9_000;
 const MAX_PROJECTED_BRANCH_ENTRIES: usize = 2_048;
@@ -1654,8 +1660,9 @@ impl HostService for YggHost {
 
 struct YggSessionDriver {
     seed: SessionSeed,
-    commands: Option<mpsc::Sender<WorkerCommand>>,
+    commands: Option<mpsc::Sender<WorkerMessage>>,
     events: mpsc::Receiver<TimestampedEvent>,
+    buffered_events: VecDeque<TimestampedEvent>,
     worker: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -1673,6 +1680,7 @@ impl YggSessionDriver {
             seed,
             commands: Some(commands),
             events,
+            buffered_events: VecDeque::new(),
             worker: Some(worker),
         }
     }
@@ -1692,14 +1700,51 @@ impl SessionDriver for YggSessionDriver {
         self.commands
             .as_ref()
             .ok_or(ServiceError::OwnerLost)?
-            .send(WorkerCommand { command, response })
+            .send(WorkerMessage::Command(WorkerCommand { command, response }))
             .await
             .map_err(|_| ServiceError::Unavailable)?;
         receiver.await.map_err(|_| ServiceError::Unavailable)?
     }
 
+    async fn command_discovery(&mut self) -> Result<CommandDiscovery, ServiceError> {
+        let (response, mut receiver) = oneshot::channel();
+        self.commands
+            .as_ref()
+            .ok_or(ServiceError::OwnerLost)?
+            .send(WorkerMessage::CommandDiscovery { response })
+            .await
+            .map_err(|_| ServiceError::Unavailable)?;
+
+        // The actor serializes this call with `next_event`. Keep receiving into
+        // a private FIFO while the worker processes discovery so a busy stream
+        // cannot fill the worker's event channel and block its command select.
+        // If the FIFO reaches its bound, stop draining briefly so the worker can
+        // answer; otherwise fail the discovery request and let the actor resume
+        // normal event reduction without dropping stream events.
+        let mut events_open = true;
+        loop {
+            if events_open && self.buffered_events.len() >= MAX_BUFFERED_DISCOVERY_EVENTS {
+                let result = tokio::time::timeout(DISCOVERY_BACKPRESSURE_TIMEOUT, &mut receiver)
+                    .await
+                    .map_err(|_| ServiceError::Unavailable)?
+                    .map_err(|_| ServiceError::Unavailable)?;
+                return result;
+            }
+            tokio::select! {
+                result = &mut receiver => return result.map_err(|_| ServiceError::Unavailable)?,
+                event = self.events.recv(), if events_open => match event {
+                    Some(event) => self.buffered_events.push_back(event),
+                    None => events_open = false,
+                },
+            }
+        }
+    }
+
     async fn next_event(&mut self) -> Option<TimestampedEvent> {
-        self.events.recv().await
+        match self.buffered_events.pop_front() {
+            Some(event) => Some(event),
+            None => self.events.recv().await,
+        }
     }
 
     async fn shutdown(&mut self) {
@@ -1714,6 +1759,13 @@ impl SessionDriver for YggSessionDriver {
 struct WorkerCommand {
     command: SessionCommand,
     response: oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>,
+}
+
+enum WorkerMessage {
+    Command(WorkerCommand),
+    CommandDiscovery {
+        response: oneshot::Sender<Result<CommandDiscovery, ServiceError>>,
+    },
 }
 
 struct WorkerPlan {
@@ -1937,13 +1989,31 @@ impl ProjectionState {
 
 async fn run_worker(
     mut plan: WorkerPlan,
-    mut commands: mpsc::Receiver<WorkerCommand>,
+    mut commands: mpsc::Receiver<WorkerMessage>,
     events: mpsc::Sender<TimestampedEvent>,
     known_entries: usize,
 ) {
     let mut app: Option<App> = None;
     let mut projection = ProjectionState::new(known_entries);
     while let Some(message) = commands.recv().await {
+        let message = match message {
+            WorkerMessage::Command(message) => message,
+            WorkerMessage::CommandDiscovery { response } => {
+                let result = match app.as_ref() {
+                    Some(app) => build_command_discovery(app),
+                    None => match build_worker_app(&plan) {
+                        Ok(owned_app) => {
+                            let discovery = build_command_discovery(&owned_app);
+                            app = Some(owned_app);
+                            discovery
+                        }
+                        Err(_) => Err(ServiceError::Internal),
+                    },
+                };
+                let _ = response.send(result);
+                continue;
+            }
+        };
         match message.command {
             SessionCommand::SubmitPrompt { input } => {
                 let mut owned_app = match app.take() {
@@ -2319,6 +2389,65 @@ async fn run_worker(
                     }
                 }
             }
+            SessionCommand::InvokeSlashCommand { invocation } => {
+                let owned_app = match app.take() {
+                    Some(app) => app,
+                    None => match build_worker_app(&plan) {
+                        Ok(app) => app,
+                        Err(_) => {
+                            let _ = message.response.send(Err(ServiceError::Internal));
+                            continue;
+                        }
+                    },
+                };
+                let (next_app, result) =
+                    invoke_idle_slash_command(owned_app, invocation, &mut plan, &mut projection)
+                        .await;
+                match (next_app, result) {
+                    (Some(mut owned_app), Ok(SlashInvocationOutcome::Start(input))) => {
+                        let session_path = owned_app.agent.session().path().to_owned();
+                        plan.launch.session = SessionSelection::OpenExisting(session_path);
+                        match start_and_drive_run(
+                            &mut owned_app,
+                            input,
+                            None,
+                            &plan,
+                            &mut projection,
+                            &mut commands,
+                            &events,
+                            message.response,
+                        )
+                        .await
+                        {
+                            Ok(RunDriveOutcome::Admitted) => app = Some(owned_app),
+                            Ok(RunDriveOutcome::Rejected { admission, error }) => {
+                                let _ = admission.send(Err(error));
+                                app = Some(owned_app);
+                            }
+                            Err(_) => {
+                                let _ = events
+                                    .send(event(EventPayload::SessionStateChanged {
+                                        state: SessionLiveState::Failed,
+                                        active_run_id: None,
+                                    }))
+                                    .await;
+                                app = Some(owned_app);
+                            }
+                        }
+                    }
+                    (Some(owned_app), Ok(SlashInvocationOutcome::Immediate(outcome))) => {
+                        app = Some(owned_app);
+                        let _ = message.response.send(Ok(outcome));
+                    }
+                    (Some(owned_app), Err(error)) => {
+                        app = Some(owned_app);
+                        let _ = message.response.send(Err(error));
+                    }
+                    (None, _) => {
+                        let _ = message.response.send(Err(ServiceError::OwnerLost));
+                    }
+                }
+            }
             SessionCommand::ChangeModel { provider, model } => {
                 let Some(summary) = plan
                     .available_models
@@ -2487,6 +2616,313 @@ async fn run_worker(
         }
     }
     shutdown_worker_app(&mut app).await;
+}
+
+enum SlashInvocationOutcome {
+    Start(RunPromptInput),
+    Immediate(DriverCommandOutcome),
+}
+
+/// Executes one slash invocation at an idle worker boundary. The command is
+/// parsed from the same grammar as the TUI, but only durable/session-safe
+/// outcomes cross the graphical protocol boundary.
+async fn invoke_idle_slash_command(
+    app: App,
+    invocation: SlashCommandInvocation,
+    plan: &mut WorkerPlan,
+    projection: &mut ProjectionState,
+) -> (Option<App>, Result<SlashInvocationOutcome, ServiceError>) {
+    let parsed = commands::parse(&invocation.invocation);
+    match parsed {
+        commands::Command::Compact => {
+            let mut app = app;
+            let original_keep_recent_turns = app.config.compaction.keep_recent_turns;
+            app.config.compaction.keep_recent_turns = 1;
+            let result = attempt_compaction(&mut app).await;
+            app.config.compaction.keep_recent_turns = original_keep_recent_turns;
+            let outcome = match result {
+                Ok(_) => {
+                    let _ = sync_session_usage(&plan.usage, &plan.session_id, app.agent.session());
+                    idle_mutation_outcome(&app, plan, projection)
+                        .map(SlashInvocationOutcome::Immediate)
+                }
+                Err(_) => Err(ServiceError::Internal),
+            };
+            (Some(app), outcome)
+        }
+        commands::Command::Model(Some(model)) => {
+            let supported = plan
+                .available_models
+                .iter()
+                .any(|summary| summary.id == model && summary.available);
+            if !supported {
+                return (Some(app), Err(ServiceError::InvalidBoundary));
+            }
+            apply_slash_reconfiguration(app, Reconfig::Model(ModelId(model)), plan, projection)
+        }
+        commands::Command::CycleModel => {
+            let models = plan
+                .available_models
+                .iter()
+                .filter(|summary| summary.available)
+                .collect::<Vec<_>>();
+            let Some(current) = models
+                .iter()
+                .position(|summary| summary.id == plan.launch.model.0)
+            else {
+                return (Some(app), Err(ServiceError::InvalidBoundary));
+            };
+            let Some(next) = models.get((current + 1) % models.len()) else {
+                return (Some(app), Err(ServiceError::InvalidBoundary));
+            };
+            apply_slash_reconfiguration(
+                app,
+                Reconfig::Model(ModelId(next.id.clone())),
+                plan,
+                projection,
+            )
+        }
+        commands::Command::Thinking(Some(reasoning)) => {
+            let level = match config::ThinkingLevel::parse(&reasoning) {
+                Ok(level) => level,
+                Err(_) => return (Some(app), Err(ServiceError::InvalidBoundary)),
+            };
+            let reasoning = match crate::app::thinking_to_reasoning(level, &app.model) {
+                Ok(reasoning) => reasoning,
+                Err(_) => return (Some(app), Err(ServiceError::InvalidBoundary)),
+            };
+            apply_slash_reconfiguration(app, Reconfig::Thinking(reasoning), plan, projection)
+        }
+        commands::Command::Reload
+        | commands::Command::Extensions(commands::ExtensionsSubcommand::Reload)
+        | commands::Command::Skills(commands::SkillsSubcommand::Reload) => {
+            reload_slash_resources(app, plan, projection)
+        }
+        commands::Command::Skills(subcommand) => {
+            let mut app = app;
+            let outcome = execute_slash_skills_command(&mut app, subcommand, plan, projection)
+                .map(SlashInvocationOutcome::Immediate);
+            (Some(app), outcome)
+        }
+        commands::Command::Prompt(Some(invocation)) => {
+            let mut app = app;
+            let outcome = match slash_name_and_arguments(&invocation) {
+                Some((name, arguments)) => start_prompt_template(&mut app, name, arguments)
+                    .map(SlashInvocationOutcome::Start),
+                None => Err(ServiceError::InvalidBoundary),
+            };
+            (Some(app), outcome)
+        }
+        commands::Command::Unknown(invocation) => {
+            let mut app = app;
+            let outcome = invoke_dynamic_slash_command(&mut app, &invocation).await;
+            (Some(app), outcome)
+        }
+        commands::Command::Name(Some(title)) => (
+            Some(app),
+            rename_session_outcome(plan, &title).map(SlashInvocationOutcome::Immediate),
+        ),
+        commands::Command::Name(None)
+        | commands::Command::Prompt(None)
+        | commands::Command::Extensions(commands::ExtensionsSubcommand::List) => (
+            Some(app),
+            Ok(SlashInvocationOutcome::Immediate(
+                DriverCommandOutcome::default(),
+            )),
+        ),
+        _ => (Some(app), Err(ServiceError::InvalidBoundary)),
+    }
+}
+
+fn apply_slash_reconfiguration(
+    app: App,
+    reconfig: Reconfig,
+    plan: &mut WorkerPlan,
+    projection: &mut ProjectionState,
+) -> (Option<App>, Result<SlashInvocationOutcome, ServiceError>) {
+    match crate::app::apply_reconfig(app, reconfig) {
+        Ok(rebuilt) => {
+            plan.launch.model = rebuilt.model.spec.id.clone();
+            plan.launch.reasoning = rebuilt.reasoning.clone();
+            plan.launch.session =
+                SessionSelection::OpenExisting(rebuilt.agent.session().path().to_owned());
+            let selection = selection_for_model(&rebuilt.model, &rebuilt.reasoning, &plan.config);
+            let outcome =
+                reconfiguration_outcome(&rebuilt, plan, projection, selection, plan.authority)
+                    .map(SlashInvocationOutcome::Immediate);
+            (Some(rebuilt), outcome)
+        }
+        Err(_) => (build_worker_app(plan).ok(), Err(ServiceError::Internal)),
+    }
+}
+
+fn reload_slash_resources(
+    app: App,
+    plan: &mut WorkerPlan,
+    projection: &mut ProjectionState,
+) -> (Option<App>, Result<SlashInvocationOutcome, ServiceError>) {
+    let mut app = app;
+    let system = match compose_instructions(&app.config) {
+        Ok(system) => system,
+        Err(_) => return (Some(app), Err(ServiceError::Internal)),
+    };
+    app.system_tokens = crate::compaction::estimate_text_tokens(&system);
+    app.system = system;
+    match rebuild_app(app, None, None, None, None) {
+        Ok(rebuilt) => {
+            plan.launch.model = rebuilt.model.spec.id.clone();
+            plan.launch.reasoning = rebuilt.reasoning.clone();
+            plan.launch.session =
+                SessionSelection::OpenExisting(rebuilt.agent.session().path().to_owned());
+            let outcome = idle_mutation_outcome(&rebuilt, plan, projection)
+                .map(SlashInvocationOutcome::Immediate);
+            (Some(rebuilt), outcome)
+        }
+        Err(_) => (build_worker_app(plan).ok(), Err(ServiceError::Internal)),
+    }
+}
+
+fn execute_slash_skills_command(
+    app: &mut App,
+    subcommand: commands::SkillsSubcommand,
+    plan: &WorkerPlan,
+    projection: &mut ProjectionState,
+) -> Result<DriverCommandOutcome, ServiceError> {
+    match subcommand {
+        commands::SkillsSubcommand::Load(id) => {
+            let loaded = app
+                .skills
+                .load(&id)
+                .map_err(|_| ServiceError::InvalidBoundary)?;
+            validate_skill_requirements(&loaded.descriptor, &app.agent.registered_tool_names())
+                .map_err(|_| ServiceError::InvalidBoundary)?;
+            app.agent
+                .session_mut()
+                .append(EntryValue::SkillActivated {
+                    descriptor: loaded.descriptor,
+                    instructions_hash: loaded.content_hash,
+                    instructions: loaded.instructions,
+                })
+                .map_err(|_| ServiceError::Internal)?;
+            idle_mutation_outcome(app, plan, projection)
+        }
+        commands::SkillsSubcommand::Off(id) => {
+            let activation_id = app
+                .agent
+                .session()
+                .head_ref()
+                .and_then(|head| app.agent.session().resolve_active_skills(head).ok())
+                .and_then(|state| {
+                    state
+                        .active_skills
+                        .into_iter()
+                        .find(|skill| skill.descriptor.id == id)
+                        .map(|skill| skill.activation_id)
+                })
+                .ok_or(ServiceError::InvalidBoundary)?;
+            app.agent
+                .session_mut()
+                .append(EntryValue::SkillDeactivated {
+                    activation_id,
+                    skill_id: id,
+                })
+                .map_err(|_| ServiceError::Internal)?;
+            idle_mutation_outcome(app, plan, projection)
+        }
+        commands::SkillsSubcommand::List
+        | commands::SkillsSubcommand::Show(_)
+        | commands::SkillsSubcommand::Active
+        | commands::SkillsSubcommand::Search(_) => Ok(DriverCommandOutcome::default()),
+        commands::SkillsSubcommand::Reload => Err(ServiceError::InvalidBoundary),
+    }
+}
+
+fn idle_mutation_outcome(
+    app: &App,
+    plan: &WorkerPlan,
+    projection: &mut ProjectionState,
+) -> Result<DriverCommandOutcome, ServiceError> {
+    let branch_start = projection.known_entries;
+    let items = project_new_entries(
+        app.agent.session(),
+        &plan.config.workspace,
+        projection,
+        None,
+        None,
+        plan.attachments.as_ref(),
+        &plan.session_id,
+    )?;
+    if projection.known_entries == branch_start {
+        return Ok(DriverCommandOutcome::default());
+    }
+    let mut events = items
+        .into_iter()
+        .map(|item| event(EventPayload::ItemCommitted { item }))
+        .collect::<Vec<_>>();
+    events.extend(branch_delta_events(app.agent.session(), branch_start)?);
+    Ok(DriverCommandOutcome::with_events(events))
+}
+
+fn slash_name_and_arguments(invocation: &str) -> Option<(&str, &str)> {
+    let invocation = invocation.trim().trim_start_matches('/');
+    let end = invocation
+        .find(char::is_whitespace)
+        .unwrap_or(invocation.len());
+    let name = &invocation[..end];
+    (!name.is_empty()).then(|| (name, invocation[end..].trim_start()))
+}
+
+fn start_prompt_template(
+    app: &mut App,
+    name: &str,
+    arguments: &str,
+) -> Result<RunPromptInput, ServiceError> {
+    if !app.prompts.contains(name) {
+        return Err(ServiceError::InvalidBoundary);
+    }
+    let prompts = app.prompts.clone();
+    let workspace = app.config.workspace.clone();
+    let rendered = crate::prompts::render_and_record(
+        &prompts,
+        app.agent.session_mut(),
+        &workspace,
+        name,
+        arguments,
+        None,
+    )
+    .map_err(|_| ServiceError::InvalidBoundary)?;
+    if rendered.text.len() > MAX_PROMPT_BYTES {
+        return Err(ServiceError::InvalidBoundary);
+    }
+    Ok(RunPromptInput::New(PromptInput {
+        text: rendered.text,
+        attachments: Vec::new(),
+        document_ids: Vec::new(),
+        project_file_ids: Vec::new(),
+    }))
+}
+
+async fn invoke_dynamic_slash_command(
+    app: &mut App,
+    invocation: &str,
+) -> Result<SlashInvocationOutcome, ServiceError> {
+    let (name, arguments) =
+        slash_name_and_arguments(invocation).ok_or(ServiceError::InvalidBoundary)?;
+    let extension_arguments = arguments
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    match app
+        .executable_extensions
+        .execute_command_without_confirmation(name, extension_arguments)
+        .await
+    {
+        Ok(Some(_)) => Ok(SlashInvocationOutcome::Immediate(
+            DriverCommandOutcome::default(),
+        )),
+        Ok(None) => start_prompt_template(app, name, arguments).map(SlashInvocationOutcome::Start),
+        Err(_) => Err(ServiceError::InvalidBoundary),
+    }
 }
 
 fn reconfiguration_outcome(
@@ -2769,7 +3205,7 @@ async fn drive_sibling_conversation_branch(
     model_override: Option<ModelSelection>,
     plan: &mut WorkerPlan,
     projection: &mut ProjectionState,
-    commands: &mut mpsc::Receiver<WorkerCommand>,
+    commands: &mut mpsc::Receiver<WorkerMessage>,
     events: &mpsc::Sender<TimestampedEvent>,
     admission: oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>,
 ) -> Result<(App, bool), ServiceError> {
@@ -3028,6 +3464,152 @@ fn build_worker_app(plan: &WorkerPlan) -> anyhow::Result<App> {
     build_app(boot, plan.launch.clone(), system)
 }
 
+fn command_name_is_claimed_by_builtin(name: &str) -> bool {
+    !matches!(commands::parse(&format!("/{name}")), commands::Command::Unknown(_))
+}
+
+fn extension_command_presentation(
+    name: &str,
+    declared_usage: Option<String>,
+) -> (String, Option<String>) {
+    let default_usage = format!("/{name}");
+    let Some(declared_usage) = declared_usage else {
+        return (default_usage, None);
+    };
+    let usage = ygg_serve_backend::sanitize_public_text(declared_usage.trim(), 512, false);
+    let Some(suffix) = usage.strip_prefix(&default_usage) else {
+        return (default_usage, None);
+    };
+    if !suffix.is_empty()
+        && !matches!(suffix.chars().next(), Some(character) if character.is_whitespace())
+    {
+        return (default_usage, None);
+    }
+    let argument_hint = suffix.trim();
+    let argument_hint = (!argument_hint.is_empty()).then(|| argument_hint.to_owned());
+    (usage, argument_hint)
+}
+
+fn build_command_discovery(app: &App) -> Result<CommandDiscovery, ServiceError> {
+    const MAX_SUGGESTIONS: usize = 512;
+
+    let mut commands = Vec::new();
+    let mut command_names = BTreeSet::new();
+    let mut push_command = |suggestion: CommandSuggestion| {
+        if commands.len() >= MAX_SUGGESTIONS || !command_names.insert(suggestion.name.clone()) {
+            return;
+        }
+        if suggestion.validate().is_ok() {
+            commands.push(suggestion);
+        } else {
+            command_names.remove(&suggestion.name);
+        }
+    };
+
+    for command in commands::slash_commands() {
+        push_command(CommandSuggestion {
+            name: command.name.to_owned(),
+            usage: command.usage.to_owned(),
+            description: command.description.to_owned(),
+            argument_hint: None,
+            accepts_argument: command.accepts_argument,
+            kind: CommandSuggestionKind::BuiltIn,
+        });
+    }
+    let extension_commands = app
+        .executable_extensions
+        .command_suggestions_with_usage();
+    let extension_command_names = extension_commands
+        .iter()
+        .map(|(name, _, _)| name.as_str())
+        .collect::<BTreeSet<_>>();
+    for template in app.prompts.descriptors().iter() {
+        // `commands::parse` accepts unambiguous built-in prefixes. A dynamic
+        // name claimed that way would execute the built-in instead.
+        if command_name_is_claimed_by_builtin(&template.name) {
+            continue;
+        }
+        // Dynamic dispatch gives executable extensions precedence over prompt
+        // templates. Do not advertise a colliding template that would invoke
+        // an extension instead.
+        if extension_command_names.contains(template.name.as_str()) {
+            continue;
+        }
+        push_command(CommandSuggestion {
+            name: template.name.clone(),
+            usage: format!("/{}", template.name),
+            description: format!("prompt · {}", template.description),
+            argument_hint: template.argument_hint.clone(),
+            accepts_argument: true,
+            kind: CommandSuggestionKind::Prompt,
+        });
+    }
+    for (name, description, declared_usage) in extension_commands {
+        if command_name_is_claimed_by_builtin(&name) {
+            continue;
+        }
+        let (usage, argument_hint) = extension_command_presentation(&name, declared_usage);
+        push_command(CommandSuggestion {
+            usage,
+            name,
+            description: format!("extension · {description}"),
+            argument_hint,
+            accepts_argument: true,
+            kind: CommandSuggestionKind::Extension,
+        });
+    }
+
+    let active_skill_ids = app
+        .agent
+        .session()
+        .head_ref()
+        .and_then(|head| app.agent.session().resolve_active_skills(head).ok())
+        .map(|state| {
+            state
+                .active_skills
+                .into_iter()
+                .map(|skill| skill.descriptor.id)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut skill_ids = BTreeSet::new();
+    let mut skills = Vec::new();
+    for descriptor in app.skills.descriptors().iter() {
+        if skills.len() >= MAX_SUGGESTIONS || !skill_ids.insert(descriptor.id.clone()) {
+            continue;
+        }
+        let suggestion = SkillSuggestion {
+            id: descriptor.id.clone(),
+            name: descriptor.name.clone(),
+            description: descriptor.description.clone(),
+            active: active_skill_ids.contains(&descriptor.id),
+        };
+        if suggestion.validate().is_ok() {
+            skills.push(suggestion);
+        } else {
+            skill_ids.remove(&descriptor.id);
+        }
+    }
+
+    let mut discovery = CommandDiscovery {
+        protocol: PROTOCOL_VERSION,
+        commands,
+        skills,
+    };
+    trim_command_discovery_to_transport_bounds(&mut discovery);
+    discovery.validate().map_err(|_| ServiceError::Internal)?;
+    Ok(discovery)
+}
+
+fn trim_command_discovery_to_transport_bounds(discovery: &mut CommandDiscovery) {
+    while discovery.validate().is_err() {
+        if discovery.skills.pop().is_some() || discovery.commands.pop().is_some() {
+            continue;
+        }
+        break;
+    }
+}
+
 fn resolve_attachment_media(
     app: &App,
     plan: &WorkerPlan,
@@ -3199,7 +3781,7 @@ async fn start_and_drive_run(
     branch_provenance: Option<ConversationBranchProvenance>,
     plan: &WorkerPlan,
     projection: &mut ProjectionState,
-    commands: &mut mpsc::Receiver<WorkerCommand>,
+    commands: &mut mpsc::Receiver<WorkerMessage>,
     events: &mpsc::Sender<TimestampedEvent>,
     admission: oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>,
 ) -> Result<RunDriveOutcome, ServiceError> {
@@ -3253,6 +3835,10 @@ async fn start_and_drive_run(
         &app.reasoning,
         &app.sessions,
     );
+    let command_discovery = match build_command_discovery(app) {
+        Ok(discovery) => discovery,
+        Err(error) => return Ok(RunDriveOutcome::Rejected { admission, error }),
+    };
     let (pending_context_count, model_prompt) = if replay_exact {
         app.agent.set_system_prompt(app.system.clone());
         (0, prompt)
@@ -3401,7 +3987,14 @@ async fn start_and_drive_run(
                     terminal = TerminalProjection::stopped();
                     break;
                 };
+                match command {
+                    WorkerMessage::Command(command) => {
                 handle_active_command(command, &run_id, &control, plan, projection, events).await;
+            }
+                    WorkerMessage::CommandDiscovery { response } => {
+                        let _ = response.send(Ok(command_discovery.clone()));
+                    }
+                }
             }
         }
     }
@@ -7569,6 +8162,54 @@ mod tests {
     }
 
     #[test]
+    fn command_discovery_hides_dynamic_names_claimed_by_builtin_prefixes() {
+        assert!(command_name_is_claimed_by_builtin("compact"));
+        assert!(command_name_is_claimed_by_builtin("comp"));
+        assert!(command_name_is_claimed_by_builtin("status"));
+        assert!(command_name_is_claimed_by_builtin("stat"));
+        assert!(!command_name_is_claimed_by_builtin("review-worktree"));
+    }
+
+    #[test]
+    fn command_discovery_keeps_extension_usage_and_argument_hint() {
+        assert_eq!(
+            extension_command_presentation(
+                "review-worktree",
+                Some("/review-worktree [focus]".into()),
+            ),
+            (
+                "/review-worktree [focus]".into(),
+                Some("[focus]".into()),
+            )
+        );
+        assert_eq!(
+            extension_command_presentation("review-worktree", Some("/review-worktrees".into())),
+            ("/review-worktree".into(), None),
+        );
+    }
+
+    #[test]
+    fn command_discovery_trims_oversized_resource_metadata() {
+        let mut discovery = CommandDiscovery {
+            protocol: PROTOCOL_VERSION,
+            commands: Vec::new(),
+            skills: (0..512)
+                .map(|index| SkillSuggestion {
+                    id: format!("skill-{index}"),
+                    name: format!("Skill {index}"),
+                    description: "x".repeat(2_048),
+                    active: false,
+                })
+                .collect(),
+        };
+
+        assert!(discovery.validate().is_err());
+        trim_command_discovery_to_transport_bounds(&mut discovery);
+        assert!(discovery.validate().is_ok());
+        assert!(discovery.skills.len() < 512);
+    }
+
+    #[test]
     fn durable_prompt_title_changes_are_published_once() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().join("workspace");
@@ -7919,6 +8560,282 @@ mod tests {
             DurableEntryId::new(target.0).unwrap(),
             path,
         )
+    }
+
+    #[tokio::test]
+    async fn graphical_command_discovery_buffers_stream_events_until_the_actor_resumes() {
+        let (commands, mut worker_commands) = mpsc::channel(1);
+        let (event_sender, events) = mpsc::channel(1);
+        let mut driver = YggSessionDriver {
+            seed: empty_seed(
+                SessionId::new("buffered-discovery").unwrap(),
+                None,
+                ModelSelection {
+                    provider: "test".into(),
+                    model: "test".into(),
+                    reasoning: "off".into(),
+                },
+                AuthorityProfile::FullAccess,
+                1,
+            ),
+            commands: Some(commands),
+            events,
+            buffered_events: VecDeque::new(),
+            worker: None,
+        };
+        let first = TimestampedEvent::new(
+            1,
+            EventPayload::SessionStateChanged {
+                state: SessionLiveState::Working,
+                active_run_id: None,
+            },
+        );
+        let second = TimestampedEvent::new(
+            2,
+            EventPayload::SessionStateChanged {
+                state: SessionLiveState::Idle,
+                active_run_id: None,
+            },
+        );
+        tokio::spawn(async move {
+            let WorkerMessage::CommandDiscovery { response } = worker_commands.recv().await.unwrap() else {
+                panic!("expected command discovery request");
+            };
+            event_sender.send(first).await.unwrap();
+            // This send only completes when command_discovery keeps draining the
+            // bounded event stream while it awaits the worker response.
+            event_sender.send(second).await.unwrap();
+            response
+                .send(Ok(CommandDiscovery {
+                    protocol: PROTOCOL_VERSION,
+                    commands: Vec::new(),
+                    skills: Vec::new(),
+                }))
+                .unwrap();
+        });
+
+        let discovery = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            driver.command_discovery(),
+        )
+        .await
+        .expect("command discovery should not be blocked by stream events")
+        .unwrap();
+        assert_eq!(discovery.protocol, PROTOCOL_VERSION);
+        assert!(matches!(
+            driver.next_event().await,
+            Some(TimestampedEvent {
+                payload: EventPayload::SessionStateChanged {
+                    state: SessionLiveState::Working,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            driver.next_event().await,
+            Some(TimestampedEvent {
+                payload: EventPayload::SessionStateChanged {
+                    state: SessionLiveState::Idle,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn graphical_command_discovery_keeps_its_event_fifo_bounded() {
+        let (commands, mut worker_commands) = mpsc::channel(1);
+        let (event_sender, events) = mpsc::channel(1);
+        let mut driver = YggSessionDriver {
+            seed: empty_seed(
+                SessionId::new("bounded-discovery").unwrap(),
+                None,
+                ModelSelection {
+                    provider: "test".into(),
+                    model: "test".into(),
+                    reasoning: "off".into(),
+                },
+                AuthorityProfile::FullAccess,
+                1,
+            ),
+            commands: Some(commands),
+            events,
+            buffered_events: VecDeque::new(),
+            worker: None,
+        };
+        tokio::spawn(async move {
+            let WorkerMessage::CommandDiscovery { response } =
+                worker_commands.recv().await.unwrap()
+            else {
+                panic!("expected command discovery request");
+            };
+            for timestamp_ms in 1..=(MAX_BUFFERED_DISCOVERY_EVENTS as u64 + 1) {
+                event_sender
+                    .send(TimestampedEvent::new(
+                        timestamp_ms,
+                        EventPayload::SessionStateChanged {
+                            state: SessionLiveState::Idle,
+                            active_run_id: None,
+                        },
+                    ))
+                    .await
+                    .unwrap();
+            }
+            response
+                .send(Ok(CommandDiscovery {
+                    protocol: PROTOCOL_VERSION,
+                    commands: Vec::new(),
+                    skills: Vec::new(),
+                }))
+                .unwrap();
+        });
+
+        driver.command_discovery().await.unwrap();
+        assert_eq!(driver.buffered_events.len(), MAX_BUFFERED_DISCOVERY_EVENTS);
+        for timestamp_ms in 1..=(MAX_BUFFERED_DISCOVERY_EVENTS as u64 + 1) {
+            assert_eq!(
+                driver.next_event().await.unwrap().timestamp_ms,
+                timestamp_ms
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn graphical_command_discovery_uses_tui_order_and_invokes_idle_commands_off_prompt_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let skill_dir = workspace.join(".ygg/skills/composer-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: Composer Skill\ndescription: Exercise web skill discovery.\n---\n# Composer Skill\n",
+        )
+        .unwrap();
+        let prompt_dir = workspace.join(".ygg/prompts");
+        std::fs::create_dir_all(&prompt_dir).unwrap();
+        std::fs::write(
+            prompt_dir.join("composer-prompt.md"),
+            "---\ndescription: Exercise web prompt discovery.\nargument-hint: '[focus]'\n---\nReview ${@}.\n",
+        )
+        .unwrap();
+        let (host, session_id, _, _, _) =
+            worker_checkout_fixture(directory.path(), "slash-discovery");
+        let mut driver = host.open_session(&session_id).await.unwrap();
+
+        let discovery = driver.command_discovery().await.unwrap();
+        assert_eq!(discovery.protocol, PROTOCOL_VERSION);
+        let built_ins = commands::slash_commands()
+            .iter()
+            .map(|command| (command.name, command.usage, command.description))
+            .collect::<Vec<_>>();
+        let discovered_built_ins = discovery
+            .commands
+            .iter()
+            .take(built_ins.len())
+            .map(|command| {
+                (
+                    command.name.as_str(),
+                    command.usage.as_str(),
+                    command.description.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(discovered_built_ins, built_ins);
+        assert!(discovery.commands.iter().any(|command| {
+            command.name == "composer-prompt"
+                && command.argument_hint.as_deref() == Some("[focus]")
+                && command.kind == CommandSuggestionKind::Prompt
+        }));
+        assert!(discovery.skills.iter().any(|skill| {
+            skill.id == "composer-skill"
+                && skill.name == "Composer Skill"
+                && !skill.active
+        }));
+        discovery.validate().unwrap();
+
+        let renamed = driver
+            .dispatch(SessionCommand::InvokeSlashCommand {
+                invocation: SlashCommandInvocation {
+                    invocation: "/name Composer discovery".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            renamed.events.as_slice(),
+            [TimestampedEvent {
+                payload: EventPayload::SessionMetadataChanged {
+                    title: Some(title),
+                    pinned: None,
+                    archived: None,
+                },
+                ..
+            }] if title == "Composer discovery"
+        ));
+
+        let skills = driver
+            .dispatch(SessionCommand::InvokeSlashCommand {
+                invocation: SlashCommandInvocation {
+                    invocation: "/skills active".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(skills.events.is_empty());
+        assert!(skills.run_id.is_none());
+
+        let loaded = driver
+            .dispatch(SessionCommand::InvokeSlashCommand {
+                invocation: SlashCommandInvocation {
+                    invocation: "/skills load composer-skill".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(!loaded.events.is_empty());
+        assert!(
+            driver
+                .command_discovery()
+                .await
+                .unwrap()
+                .skills
+                .iter()
+                .any(|skill| skill.id == "composer-skill" && skill.active)
+        );
+
+        let unloaded = driver
+            .dispatch(SessionCommand::InvokeSlashCommand {
+                invocation: SlashCommandInvocation {
+                    invocation: "/skills off composer-skill".into(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(!unloaded.events.is_empty());
+        assert!(
+            driver
+                .command_discovery()
+                .await
+                .unwrap()
+                .skills
+                .iter()
+                .any(|skill| skill.id == "composer-skill" && !skill.active)
+        );
+
+        assert_eq!(
+            driver
+                .dispatch(SessionCommand::InvokeSlashCommand {
+                    invocation: SlashCommandInvocation {
+                        invocation: "/not-a-command".into(),
+                    },
+                })
+                .await
+                .unwrap_err(),
+            ServiceError::InvalidBoundary
+        );
+        driver.shutdown().await;
     }
 
     fn checkout_envelope(

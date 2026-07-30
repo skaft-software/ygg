@@ -50,7 +50,7 @@ pub use bounds::{
 pub use command::{
     AckDisposition, AttachmentRef, CommandAck, HostAckDisposition, HostCommand, HostCommandAck,
     HostCommandEnvelope, PermanentDeleteConfirmation, PromptInput, RequestAnswer, SessionCommand,
-    SessionCommandEnvelope,
+    SessionCommandEnvelope, SlashCommandInvocation,
 };
 pub use document_ingest::{
     ingest_document, DocumentIngestError, DocumentMediaType, DocumentProvenance,
@@ -82,7 +82,8 @@ pub use ids::{
 pub use journal::{EventJournal, JournalConfig, JournalError};
 pub use model::{
     ActivityPhase, ActivityPhaseSummary, ActorOwnerState, ArtifactKind, ArtifactRef,
-    AttachmentPolicy, AttentionState, AuthorityProfile, CatalogCursor, CompletionReview,
+    AttachmentPolicy, AttentionState, AuthorityProfile, CatalogCursor, CommandDiscovery,
+    CommandSuggestion, CommandSuggestionKind, CompletionReview,
     ContextUsage, ConversationBranchOperation, ConversationBranchProvenance, EvidenceCoverage,
     FileChange, HostBootstrap, HostCapabilities, HostDescriptor, InputModality, ItemLifecycle,
     ItemPayload, ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary,
@@ -91,7 +92,7 @@ pub use model::{
     PullRequestSummary, RequestKind, RequestState, RunOutcome, SessionBranchEntry,
     SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState, SessionCursor, SessionItem,
     SessionLiveState, SessionRetention,
-    SessionSnapshot, SessionSummary, SourceKind, SourceRef,
+    SessionSnapshot, SessionSummary, SkillSuggestion, SourceKind, SourceRef,
     ToolActivity, ToolActivityStatus, ToolKind, ToolResultSummary, UsageSnapshot,
     UserMessageDelivery, MAX_MODEL_INPUT_PRICING_TIERS,
 };

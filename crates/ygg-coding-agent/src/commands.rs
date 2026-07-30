@@ -207,6 +207,11 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
     slash!("quit", "/quit", "exit Ygg", false),
 ];
 
+/// Complete TUI-ordered built-in slash-command catalog.
+pub fn slash_commands() -> &'static [SlashCommandSuggestion] {
+    SLASH_COMMANDS
+}
+
 /// Suggestions for an editor value while its first token is a slash command.
 pub fn slash_suggestions(input: &str) -> Vec<&'static SlashCommandSuggestion> {
     let Some(query) = input.strip_prefix('/') else {
@@ -215,7 +220,7 @@ pub fn slash_suggestions(input: &str) -> Vec<&'static SlashCommandSuggestion> {
     if query.contains(char::is_whitespace) || query.contains('\n') {
         return Vec::new();
     }
-    SLASH_COMMANDS
+    slash_commands()
         .iter()
         .filter(|command| command.name.starts_with(query))
         .collect()
@@ -262,7 +267,7 @@ pub fn parse(input: &str) -> Command {
     if full_name == "skills" {
         let args: Vec<&str> = parts.collect();
         let sub = match args.as_slice() {
-            [] => SkillsSubcommand::List,
+            [] | ["list"] => SkillsSubcommand::List,
             ["active"] => SkillsSubcommand::Active,
             ["show", id] => SkillsSubcommand::Show(id.to_string()),
             ["search", query @ ..] if !query.is_empty() => {
@@ -866,6 +871,10 @@ mod tests {
         assert_eq!(parse("/help"), Command::Unknown("/help".into()));
         assert_eq!(parse("/quit"), Command::Quit);
         assert_eq!(parse("/skills"), Command::Skills(SkillsSubcommand::List));
+        assert_eq!(
+            parse("/skills list"),
+            Command::Skills(SkillsSubcommand::List)
+        );
         assert_eq!(
             parse("/sk active"),
             Command::Skills(SkillsSubcommand::Active)

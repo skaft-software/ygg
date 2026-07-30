@@ -446,6 +446,15 @@ impl<H: HostService> SessionSupervisor<H> {
         Ok(handle.command(envelope, acknowledged_at_ms).await?)
     }
 
+    /// Returns slash-command and skill discovery for one exclusive session owner.
+    pub async fn command_discovery(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<crate::CommandDiscovery, SupervisorError> {
+        let handle = self.open_session(session_id).await?;
+        Ok(handle.command_discovery().await?)
+    }
+
     /// Replays one session after a cursor.
     pub async fn replay_after(
         &self,

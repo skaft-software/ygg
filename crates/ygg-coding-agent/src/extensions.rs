@@ -621,14 +621,24 @@ impl ExecutableExtensions {
     }
 
     pub fn command_suggestions(&self) -> Vec<(String, String)> {
+        self.command_suggestions_with_usage()
+            .into_iter()
+            .map(|(name, description, _)| (name, description))
+            .collect()
+    }
+
+    /// Returns the executable command metadata needed by non-TUI discovery surfaces.
+    pub fn command_suggestions_with_usage(&self) -> Vec<(String, String, Option<String>)> {
         self.processes
             .iter()
             .flat_map(|process| {
-                process
-                    .contributions()
-                    .commands
-                    .iter()
-                    .map(|command| (command.name.clone(), command.description.clone()))
+                process.contributions().commands.iter().map(|command| {
+                    (
+                        command.name.clone(),
+                        command.description.clone(),
+                        command.usage.clone(),
+                    )
+                })
             })
             .collect()
     }
@@ -1038,7 +1048,98 @@ impl ExecutableExtensions {
         Ok(Some(blocks.join("\n")))
     }
 
-    /// Start a fresh semantic UI refresh without awaiting extension RPC on the
+    /// Executes an extension command at a non-interactive boundary.
+    ///
+    /// Extension confirmation requests are explicitly denied and reported as a
+    /// failed invocation because no trusted confirmation surface is available to
+    /// the caller. Commands that do not request confirmation retain ordinary
+    /// output and queued-context handling.
+    pub async fn execute_command_without_confirmation(
+        &mut self,
+        name: &str,
+        arguments: Vec<String>,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(process) = self
+            .processes
+            .iter()
+            .find(|process| {
+                process
+                    .contributions()
+                    .commands
+                    .iter()
+                    .any(|command| command.name == name)
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let extension_name = process.descriptor().manifest.name.clone();
+        let mut events = process.subscribe();
+        let (output, confirmation_denied) = {
+            let mut confirmation_denied = false;
+            let output = {
+                let mut execution = Box::pin(process.execute_command(
+                    name.to_owned(),
+                    arguments,
+                    process.current_context(),
+                ));
+                let mut events_open = true;
+                loop {
+                    tokio::select! {
+                        result = &mut execution => break result?,
+                        event = events.recv(), if events_open => match event {
+                            Ok(ExtensionEvent::ConfirmationRequested {
+                                request_id,
+                                generation,
+                                ..
+                            }) => {
+                                if !process.confirmation_answered(&request_id, generation) {
+                                    confirmation_denied = true;
+                                    process
+                                        .respond_to_confirmation(
+                                            request_id,
+                                            generation,
+                                            ConfirmationResponse { confirmed: false },
+                                        )
+                                        .await?;
+                                }
+                            }
+                            Ok(_) => {
+                                // The persistent receiver owns ordinary notifications,
+                                // status, context, and diagnostics.
+                            }
+                            Err(broadcast::error::RecvError::Lagged(count)) => {
+                                self.diagnostics.push(format!(
+                                    "warning: {extension_name}: confirmation listener lagged by {count} events"
+                                ));
+                            }
+                            Err(broadcast::error::RecvError::Closed) => events_open = false,
+                        },
+                    }
+                }
+            };
+            (output, confirmation_denied)
+        };
+        if confirmation_denied {
+            anyhow::bail!(
+                "extension command {name:?} requires an interactive confirmation surface"
+            );
+        }
+        self.enqueue_contexts(&extension_name, output.context);
+        let mut blocks = Vec::new();
+        if !output.text.trim().is_empty() {
+            blocks.push(output.text);
+        }
+        blocks.extend(
+            output
+                .notifications
+                .iter()
+                .map(|notification| format_notification(name, notification)),
+        );
+        blocks.extend(self.drain_events());
+        Ok(Some(blocks.join("\n")))
+    }
+
     /// input/render path. A newer request cancels the older generation.
     pub fn request_status_refresh(&mut self) {
         if let Some(task) = self.status_task.take() {
@@ -1918,6 +2019,83 @@ confirmations = true
                 "Allow fixture command?".to_owned()
             )]
         );
+        assert!(process.shutdown().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn noninteractive_command_confirmation_is_denied() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("noninteractive-confirmation-fixture.sh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"api_version":"0.1","tools":[],"commands":[{"name":"guarded","description":"Wait for an explicit confirmation","usage":"/guarded"}]}}'
+IFS= read -r command
+printf '%s\n' '{"jsonrpc":"2.0","id":"fixture-confirmation","method":"confirmation/request","params":{"prompt":"Allow fixture command?","detail":"The fixture will not finish until Ygg answers.","destructive":false,"default":false}}'
+IFS= read -r confirmation
+case "$confirmation" in
+  *'"id":"fixture-confirmation"'*'"confirmed":false'*) ;;
+  *) exit 41 ;;
+esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"text":"fixture denied","notifications":[],"context":[]}}'
+IFS= read -r shutdown
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+
+        let manifest = ExtensionManifest::parse(
+            r#"
+name = "noninteractive-confirmation-fixture"
+version = "0.1.0"
+api_version = "0.1"
+
+[entrypoint]
+command = "noninteractive-confirmation-fixture.sh"
+
+[contributes]
+commands = ["guarded"]
+confirmations = true
+"#,
+        )
+        .unwrap();
+        let process = ExtensionProcess::start(
+            DiscoveredExtension {
+                manifest,
+                manifest_path: temp.path().join("extension.toml"),
+                source: ExtensionSource::Explicit,
+                activation: ygg_agent::extension_process::ExtensionActivation {
+                    enabled: true,
+                    trust: ExtensionTrust::Trusted,
+                },
+            },
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .unwrap();
+
+        let mut extensions = ExecutableExtensions::default();
+        extensions.receivers.push(process.subscribe());
+        extensions.processes.push(process.clone());
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            extensions.execute_command_without_confirmation("guarded", Vec::new()),
+        )
+        .await
+        .expect("command remained blocked waiting for confirmation")
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("requires an interactive confirmation surface"));
         assert!(process.shutdown().await);
     }
 
