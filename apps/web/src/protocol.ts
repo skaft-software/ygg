@@ -341,6 +341,7 @@ export interface TrustedFileRead {
   sha256: string;
 }
 
+
 export type ProjectFileEntryKind = "directory" | "file";
 
 /** A direct child of a trusted project directory. Paths are always project-relative. */
@@ -391,6 +392,30 @@ export interface ProjectFileWrite {
   path: string;
   sha256: string;
   modifiedAtMs?: number;
+}
+
+export type CommandSuggestionKind = "builtIn" | "prompt" | "extension";
+
+export interface CommandSuggestion {
+  name: string;
+  usage: string;
+  description: string;
+  argumentHint?: string;
+  acceptsArgument: boolean;
+  kind: CommandSuggestionKind;
+}
+
+export interface SkillSuggestion {
+  id: string;
+  name: string;
+  description: string;
+  active: boolean;
+}
+
+export interface CommandDiscovery {
+  commands: CommandSuggestion[];
+  skills: SkillSuggestion[];
+
 }
 
 export type TranscriptSearchKind =
@@ -926,6 +951,12 @@ export type ClientCommand =
       attachments: AttachmentRef[];
       documentIds?: string[];
       projectFileIds?: string[];
+    }
+  | {
+      id: string;
+      type: "session.invokeSlashCommand";
+      sessionId: string;
+      invocation: string;
     }
   | {
       id: string;

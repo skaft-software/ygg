@@ -11,6 +11,7 @@ import sessionSnapshotGolden from "../../../extensions/ygg-serve/fixtures/sessio
 import {
   decodeWireCommandAck,
   encodeClientCommand,
+  projectCommandDiscovery,
   projectEventEnvelope,
   projectHostBootstrap,
   projectProjectFileRead,
@@ -1604,6 +1605,95 @@ describe("authoritative Rust wire contract", () => {
       project: { ...project, trusted: true },
       catalogChanged: undefined,
     });
+  });
+
+  it("projects command discovery strictly and encodes typed slash invocation", () => {
+    const discovery = {
+      protocol: 1,
+      commands: [
+        {
+          name: "compact",
+          usage: "/compact",
+          description: "Compact the conversation context.",
+          acceptsArgument: false,
+          kind: "builtIn",
+        },
+        {
+          name: "review",
+          usage: "/review [focus]",
+          description: "Review the current implementation.",
+          argumentHint: "[focus]",
+          acceptsArgument: true,
+          kind: "prompt",
+        },
+      ],
+      skills: [
+        {
+          id: "testing",
+          name: "Testing",
+          description: "Run focused tests.",
+          active: true,
+        },
+      ],
+    };
+    expect(projectCommandDiscovery(discovery)).toEqual({
+      commands: discovery.commands,
+      skills: discovery.skills,
+    });
+    expect(() =>
+      projectCommandDiscovery({
+        ...discovery,
+        commands: [...discovery.commands, discovery.commands[0]],
+      }),
+    ).toThrow(new WireContractError("commandDiscovery.commands[2].name", "is duplicated"));
+    expect(() =>
+      projectCommandDiscovery({
+        ...discovery,
+        skills: [...discovery.skills, discovery.skills[0]],
+      }),
+    ).toThrow(new WireContractError("commandDiscovery.skills[1].id", "is duplicated"));
+
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-slash",
+          type: "session.invokeSlashCommand",
+          sessionId: "session-demo",
+          invocation: " /compact ",
+        },
+        {
+          hostId: "host-demo",
+          deviceId: "device-browser",
+          issuedAtMs: 1_721_000_000_062,
+          actorGenerationBySession: { "session-demo": 3 },
+          modelIdBySession: {},
+          models: [],
+        },
+      ),
+    ).toMatchObject({
+      command: {
+        type: "session.invokeSlashCommand",
+        data: { invocation: { invocation: "/compact" } },
+      },
+    });
+    expect(() =>
+      encodeClientCommand(
+        {
+          id: "command-empty-slash",
+          type: "session.invokeSlashCommand",
+          sessionId: "session-demo",
+          invocation: "/ ",
+        },
+        {
+          hostId: "host-demo",
+          deviceId: "device-browser",
+          issuedAtMs: 1_721_000_000_062,
+          actorGenerationBySession: { "session-demo": 3 },
+          modelIdBySession: {},
+          models: [],
+        },
+      ),
+    ).toThrow(/slash-prefixed invocation is required/);
   });
 
   it("accepts provider-defined bounded reasoning from the host catalog", () => {

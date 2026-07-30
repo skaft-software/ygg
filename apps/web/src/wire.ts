@@ -7,6 +7,8 @@ import type {
   AuthorityProfile,
   ClientCommand,
   CommandAck,
+  CommandDiscovery,
+  CommandSuggestion,
   CompletionReview,
   DocumentReference,
   HostBootstrap,
@@ -31,6 +33,7 @@ import type {
   SessionSnapshot,
   SessionStatus,
   SessionSummary,
+  SkillSuggestion,
   SourceRef,
   ThemeColor,
   ThemeDto,
@@ -959,6 +962,7 @@ export function projectTrustedFileRead(value: unknown): TrustedFileRead {
   };
 }
 
+
 export function projectProjectFileTree(value: unknown): ProjectFileTree {
   const tree = object(value, "projectFileTree", ["path", "entries", "truncated"]);
   const entries = array(tree.entries, "projectFileTree.entries");
@@ -1085,6 +1089,86 @@ export function projectProjectFileWrite(value: unknown): ProjectFileWrite {
         ? undefined
         : number(write.modifiedAtMs, "projectFileWrite.modifiedAtMs"),
   };
+}
+
+function commandDiscoveryIdentifier(
+  value: unknown,
+  path: string,
+  maxLength: number,
+): string {
+  const identifier = boundedString(value, path, maxLength);
+  if (/\s/.test(identifier)) {
+    throw new WireContractError(path, "must not contain whitespace");
+  }
+  return identifier;
+}
+
+export function projectCommandDiscovery(value: unknown): CommandDiscovery {
+  const discovery = object(value, "commandDiscovery", [
+    "protocol",
+    "commands",
+    "skills",
+  ]);
+  protocol(discovery.protocol, "commandDiscovery.protocol");
+  const commandValues = array(discovery.commands, "commandDiscovery.commands");
+  const skillValues = array(discovery.skills, "commandDiscovery.skills");
+  if (commandValues.length > 512 || skillValues.length > 512) {
+    throw new WireContractError("commandDiscovery", "exceeds the discovery limit");
+  }
+  const commandNames = new Set<string>();
+  const commands = commandValues.map((value, index): CommandSuggestion => {
+    const path = `commandDiscovery.commands[${index}]`;
+    const command = object(value, path, [
+      "name",
+      "usage",
+      "description",
+      "argumentHint",
+      "acceptsArgument",
+      "kind",
+    ]);
+    const name = commandDiscoveryIdentifier(command.name, `${path}.name`, 128);
+    if (commandNames.has(name)) {
+      throw new WireContractError(`${path}.name`, "is duplicated");
+    }
+    commandNames.add(name);
+    const usage = boundedString(command.usage, `${path}.usage`, 512);
+    if (!usage.startsWith("/")) {
+      throw new WireContractError(`${path}.usage`, "must begin with a slash");
+    }
+    return {
+      name,
+      usage,
+      description: boundedString(command.description, `${path}.description`, 2_048),
+      argumentHint:
+        command.argumentHint === undefined
+          ? undefined
+          : boundedString(command.argumentHint, `${path}.argumentHint`, 512),
+      acceptsArgument: boolean(command.acceptsArgument, `${path}.acceptsArgument`),
+      kind: enumeration(command.kind, `${path}.kind`, [
+        "builtIn",
+        "prompt",
+        "extension",
+      ] as const),
+    };
+  });
+  const skillIds = new Set<string>();
+  const skills = skillValues.map((value, index): SkillSuggestion => {
+    const path = `commandDiscovery.skills[${index}]`;
+    const skill = object(value, path, ["id", "name", "description", "active"]);
+    const id = commandDiscoveryIdentifier(skill.id, `${path}.id`, 128);
+    if (skillIds.has(id)) {
+      throw new WireContractError(`${path}.id`, "is duplicated");
+    }
+    skillIds.add(id);
+    return {
+      id,
+      name: boundedString(skill.name, `${path}.name`, 256),
+      description: boundedString(skill.description, `${path}.description`, 2_048),
+      active: boolean(skill.active, `${path}.active`),
+    };
+  });
+  return { commands, skills };
+
 }
 
 export function projectTranscriptSearchResult(
@@ -4139,6 +4223,26 @@ export function encodeClientCommand(
       issuedAtMs: context.issuedAtMs,
       command: wireCommand,
     };
+  }
+  if (command.type === "session.invokeSlashCommand") {
+    const invocation = command.invocation.trim();
+    if (
+      !invocation.startsWith("/") ||
+      invocation.slice(1).trim().length === 0
+    ) {
+      throw new UnsupportedWireCommandError(
+        command.type,
+        "a slash-prefixed invocation is required",
+      );
+    }
+    return sessionEnvelope(
+      command,
+      {
+        type: "session.invokeSlashCommand",
+        data: { invocation: { invocation } },
+      },
+      context,
+    );
   }
   if (
     command.type === "session.submit" ||

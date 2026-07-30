@@ -161,6 +161,19 @@ describe("HTTP Ygg transport", () => {
         loadedBytes: 0,
       },
     };
+    const commandDiscovery = {
+      protocol: 1,
+      commands: [
+        {
+          name: "compact",
+          usage: "/compact",
+          description: "Compact context.",
+          acceptsArgument: false,
+          kind: "builtIn",
+        },
+      ],
+      skills: [],
+    };
     const transcriptResult = {
       hits: [
         {
@@ -207,6 +220,7 @@ describe("HTTP Ygg transport", () => {
           sha256: "b".repeat(64),
         }),
       )
+      .mockResolvedValueOnce(jsonResponse(commandDiscovery))
       .mockResolvedValueOnce(jsonResponse(transcriptResult));
     vi.stubGlobal("fetch", fetchMock);
     const transport = new HttpTransport("device-browser");
@@ -243,6 +257,9 @@ describe("HTTP Ygg transport", () => {
       ),
     ).resolves.toMatchObject({ entry, text: "# Release plan\n" });
     await expect(
+      transport.getCommandDiscovery("session/one"),
+    ).resolves.toEqual({ commands: commandDiscovery.commands, skills: [] });
+    await expect(
       transport.searchTranscripts(searchRequest),
     ).resolves.toEqual(transcriptResult);
 
@@ -278,6 +295,13 @@ describe("HTTP Ygg transport", () => {
       "/api/v1/projects/project%2Fone/files/file%2F22222222222222222222222222222222",
     );
     expect(fetchMock.mock.calls[6]).toEqual([
+      "/api/v1/sessions/session%2Fone/commands",
+      {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+      },
+    ]);
+    expect(fetchMock.mock.calls[7]).toEqual([
       "/api/v1/search",
       {
         method: "POST",
