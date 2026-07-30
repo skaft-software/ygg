@@ -2594,11 +2594,31 @@ mod tests {
     fn static_asset_allowlist_excludes_dotfiles_and_source_maps() {
         assert!(safe_relative_path(FilePath::new("assets/app.js")));
         assert!(safe_relative_path(FilePath::new(
+            "assets/chunk-FilesPanel.js"
+        )));
+        assert!(safe_relative_path(FilePath::new(
+            "assets/chunk-jsx-runtime.js"
+        )));
+        assert!(safe_relative_path(FilePath::new(
             "assets/chunk-MarkdownMessage.js"
         )));
         let bundle = WebBundle::embedded().unwrap();
         assert_eq!(
             bundle.asset("assets/app.js").unwrap().media_type,
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            bundle
+                .asset("assets/chunk-FilesPanel.js")
+                .unwrap()
+                .media_type,
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            bundle
+                .asset("assets/chunk-jsx-runtime.js")
+                .unwrap()
+                .media_type,
             "text/javascript; charset=utf-8"
         );
         assert_eq!(
@@ -3058,6 +3078,31 @@ mod tests {
         assert_eq!(
             javascript.split_once("\r\n\r\n").unwrap().1.as_bytes(),
             include_bytes!("../web/assets/app.js")
+        );
+        let files_panel =
+            request(address, get_request(address, "/assets/chunk-FilesPanel.js")).await;
+        assert!(files_panel.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            response_header(&files_panel, "content-type"),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            files_panel.split_once("\r\n\r\n").unwrap().1.as_bytes(),
+            include_bytes!("../web/assets/chunk-FilesPanel.js")
+        );
+        let jsx_runtime = request(
+            address,
+            get_request(address, "/assets/chunk-jsx-runtime.js"),
+        )
+        .await;
+        assert!(jsx_runtime.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            response_header(&jsx_runtime, "content-type"),
+            Some("text/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            jsx_runtime.split_once("\r\n\r\n").unwrap().1.as_bytes(),
+            include_bytes!("../web/assets/chunk-jsx-runtime.js")
         );
         let markdown = request(
             address,

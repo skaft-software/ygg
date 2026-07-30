@@ -17,7 +17,9 @@ import {
 import {
   type CSSProperties,
   type RefObject,
+  lazy,
   memo,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -27,7 +29,6 @@ import {
 import { ActivityRail } from "./components/ActivityRail";
 import { Conversation } from "./components/Conversation";
 import { DevicesView } from "./components/Devices";
-import { FilesPanel } from "./components/FilesPanel";
 import {
   Inspector,
   type InspectorSelection,
@@ -64,6 +65,12 @@ import {
   type TransportConnectionState,
   transportModeFromSearch,
 } from "./transport";
+
+const FilesPanel = lazy(() =>
+  import("./components/FilesPanel").then((module) => ({
+    default: module.FilesPanel,
+  })),
+);
 
 type Surface =
   | "session"
@@ -1421,15 +1428,24 @@ export default function App() {
           <ConnectionBanner connection={state.connection} />
           <FixtureModeLabel />
           {surface === "files" ? (
-            <FilesPanel
-              projects={state.bootstrap.projects}
-              preferredProjectId={session.projectId}
-              writeAvailable={state.bootstrap.capabilities.projectFileWrite}
-              getTree={getProjectFileTree}
-              readFile={readProjectFileContent}
-              searchFiles={searchProjectFilesystem}
-              writeFile={writeProjectFile}
-            />
+            <Suspense
+              fallback={
+                <main className="files-panel files-empty" aria-busy="true">
+                  <Folder aria-hidden="true" />
+                  <p role="status">Loading project files…</p>
+                </main>
+              }
+            >
+              <FilesPanel
+                projects={state.bootstrap.projects}
+                preferredProjectId={session.projectId}
+                writeAvailable={state.bootstrap.capabilities.projectFileWrite}
+                getTree={getProjectFileTree}
+                readFile={readProjectFileContent}
+                searchFiles={searchProjectFilesystem}
+                writeFile={writeProjectFile}
+              />
+            </Suspense>
           ) : surface === "settings" ? (
             <SettingsView
               notificationsSupported={notificationState.supported}
