@@ -1,6 +1,12 @@
 /// <reference types="vite/client" />
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fixtureBootstrap } from "../fixtures";
@@ -94,6 +100,30 @@ describe("sidebar session lifecycle", () => {
     });
   });
   afterEach(cleanup);
+
+  it("guides empty and filtered session lists", () => {
+    const onNewSession = vi.fn();
+    render(
+      <Sidebar
+        {...sidebarProps({ sessions: [], onNewSession })}
+      />,
+    );
+
+    const emptyState = screen
+      .getByText("Start a conversation to see it here")
+      .parentElement;
+    expect(emptyState).not.toBeNull();
+    fireEvent.click(
+      within(emptyState!).getByRole("button", { name: "New session" }),
+    );
+    expect(onNewSession).toHaveBeenCalledOnce();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search sessions" }), {
+      target: { value: "missing" },
+    });
+    expect(screen.getByText("No sessions match your query")).toBeVisible();
+    expect(screen.queryByText("No matching sessions")).toBeNull();
+  });
 
   it("shows title-only rows and gates pull-request marks on structured evidence", () => {
     const sessions = [
