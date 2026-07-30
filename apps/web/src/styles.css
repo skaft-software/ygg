@@ -1609,7 +1609,7 @@ kbd {
 
 .message-file-attachment {
   width: min(260px, 100%);
-  height: 32px;
+  min-height: 32px;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1619,7 +1619,7 @@ kbd {
   background: var(--surface-raised);
 }
 
-.message-file-attachment b,
+.message-file-attachment-icon,
 .attachment-extension {
   width: 24px;
   height: 24px;
@@ -1634,12 +1634,36 @@ kbd {
   font-weight: 560;
 }
 
+.message-file-attachment-copy {
+  min-width: 0;
+  display: flex;
+  flex: 1 1 auto;
+  align-items: baseline;
+  gap: 4px;
+}
+
 .message-file-attachment em {
   min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
   color: var(--text);
+  font-style: normal;
+  line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.message-file-attachment small {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: var(--font-meta);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.message-file-attachment small::before {
+  margin-right: 4px;
+  content: "·";
 }
 
 .message-image-attachment {
