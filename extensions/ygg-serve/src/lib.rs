@@ -20,6 +20,7 @@ mod ids;
 mod journal;
 mod model;
 mod prompt_context;
+mod pty;
 mod project_registry;
 mod repository_context;
 mod resource;
@@ -98,6 +99,11 @@ pub use prompt_context::{
     compose_prompt_text, ComposedPromptText, PromptContextError,
     MAX_AUXILIARY_PROMPT_CONTEXT_BYTES, MAX_DOCUMENT_CONTEXT_BYTES,
     MAX_PROJECT_FILE_CONTEXT_BYTES,
+};
+pub use pty::{
+    PtyAttachment, PtyError, PtyEvent, PtyExit, PtyManager, PtyOpenRequest, TerminalConfig,
+    TerminalSession, MAX_PTY_COLUMNS, MAX_PTY_INPUT_BYTES, MAX_PTY_REPLAY_BYTES, MAX_PTY_ROWS,
+    MAX_PTY_SESSIONS,
 };
 pub use project_registry::{
     ProjectId as RegistryProjectId, ProjectRegistry, ProjectRegistryError, ProjectRoot,
