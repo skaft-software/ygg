@@ -5,6 +5,7 @@ import {
   createTransport,
   FixtureTransport,
   HttpTransport,
+  ProjectFileConflictError,
   resolveClientDeviceId,
   transportModeFromSearch,
 } from "./transport";
@@ -286,6 +287,105 @@ describe("HTTP Ygg transport", () => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify(searchRequest),
+      },
+    ]);
+  });
+
+  it("uses root-confined filesystem routes and exposes optimistic write conflicts", async () => {
+    const tree = {
+      path: "src",
+      entries: [
+        {
+          name: "lib.rs",
+          kind: "file",
+          size: 24,
+          modifiedAtMs: 1_753_626_615_000,
+        },
+      ],
+      truncated: false,
+    };
+    const read = {
+      path: "src/lib.rs",
+      content: "export const ready = true;\n",
+      startLine: 1,
+      endLine: 1,
+      lineCount: 1,
+      truncated: false,
+      sha256: "a".repeat(64),
+    };
+    const search = {
+      hits: [{ path: "src/lib.rs", line: 1, snippet: "ready = true" }],
+      truncated: false,
+      scannedBytes: 24,
+    };
+    const write = {
+      path: "src/lib.rs",
+      sha256: "b".repeat(64),
+      modifiedAtMs: 1_753_626_615_001,
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(tree))
+      .mockResolvedValueOnce(jsonResponse(read))
+      .mockResolvedValueOnce(jsonResponse(search))
+      .mockResolvedValueOnce(jsonResponse(write))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { code: "locked" } }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+
+    await expect(
+      transport.getProjectFileTree("project/one", "src"),
+    ).resolves.toEqual(tree);
+    await expect(
+      transport.readProjectFile("project/one", "src/lib.rs", 2, 4),
+    ).resolves.toEqual(read);
+    await expect(
+      transport.searchProjectFiles("project/one", "ready & set"),
+    ).resolves.toEqual(search);
+    await expect(
+      transport.writeProjectFile("project/one", {
+        path: "src/lib.rs",
+        content: "export const ready = false;\n",
+        expectedSha256: "a".repeat(64),
+      }),
+    ).resolves.toEqual(write);
+    await expect(
+      transport.writeProjectFile("project/one", {
+        path: "src/lib.rs",
+        content: "export const ready = false;\n",
+        expectedSha256: "a".repeat(64),
+        force: true,
+      }),
+    ).rejects.toBeInstanceOf(ProjectFileConflictError);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/fs/project%2Fone/tree?path=src",
+    );
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "/api/v1/fs/project%2Fone/read?path=src%2Flib.rs&startLine=2&endLine=4",
+    );
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
+      "/api/v1/fs/project%2Fone/search?query=ready%20%26%20set",
+    );
+    expect(fetchMock.mock.calls[3]).toEqual([
+      "/api/v1/fs/project%2Fone/write",
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          path: "src/lib.rs",
+          content: "export const ready = false;\n",
+          expectedSha256: "a".repeat(64),
+        }),
       },
     ]);
   });

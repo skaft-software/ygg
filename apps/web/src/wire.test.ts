@@ -13,6 +13,10 @@ import {
   encodeClientCommand,
   projectEventEnvelope,
   projectHostBootstrap,
+  projectProjectFileRead,
+  projectProjectFileSearchResult,
+  projectProjectFileTree,
+  projectProjectFileWrite,
   projectHostStreamEvent,
   projectLifetimeUsage,
   projectProjectCatalog,
@@ -137,6 +141,64 @@ describe("authoritative Rust wire contract", () => {
       ],
       truncated: false,
     });
+  });
+
+  it("projects root-confined project filesystem DTOs", () => {
+    const tree = {
+      path: "src",
+      entries: [
+        {
+          name: "lib.rs",
+          kind: "file",
+          size: 42,
+          modifiedAtMs: 1_753_626_615_000,
+        },
+        { name: "nested", kind: "directory", size: 0 },
+      ],
+      truncated: false,
+    };
+    const read = {
+      path: "src/lib.rs",
+      content: "export const ready = true;\n",
+      startLine: 1,
+      endLine: 1,
+      lineCount: 1,
+      truncated: false,
+      sha256: "a".repeat(64),
+    };
+    const search = {
+      hits: [{ path: "src/lib.rs", line: 1, snippet: "ready = true" }],
+      truncated: false,
+      scannedBytes: 42,
+    };
+    const write = {
+      path: "src/lib.rs",
+      sha256: "b".repeat(64),
+      modifiedAtMs: 1_753_626_615_001,
+    };
+
+    expect(projectProjectFileTree(tree)).toEqual(tree);
+    expect(projectProjectFileRead(read)).toEqual(read);
+    expect(projectProjectFileSearchResult(search)).toEqual(search);
+    expect(projectProjectFileWrite(write)).toEqual(write);
+    expect(() =>
+      projectProjectFileTree({ ...tree, path: "../outside" }),
+    ).toThrow(WireContractError);
+    expect(() =>
+      projectProjectFileRead({ ...read, sha256: "A".repeat(64) }),
+    ).toThrow(WireContractError);
+
+    const bootstrap = clone(hostBootstrapGolden) as {
+      capabilities: Record<string, unknown>;
+    };
+    bootstrap.capabilities.projectFileBrowser = true;
+    bootstrap.capabilities.projectFileWrite = true;
+    expect(projectHostBootstrap(bootstrap).bootstrap.capabilities).toMatchObject({
+      projectFileBrowser: true,
+      projectFileWrite: true,
+    });
+    bootstrap.capabilities.projectFileBrowser = false;
+    expect(() => projectHostBootstrap(bootstrap)).toThrow(WireContractError);
   });
 
   it("projects the standalone session snapshot against the model catalog", () => {

@@ -9,6 +9,11 @@ import type {
   HostBootstrap,
   LifetimeUsage,
   ProjectCatalog,
+  ProjectFileRead,
+  ProjectFileSearchResult,
+  ProjectFileTree,
+  ProjectFileWrite,
+  ProjectFileWriteRequest,
   RepositoryContextSnapshot,
   ReasoningEffort,
   SessionEvent,
@@ -645,6 +650,36 @@ export class YggStore {
     entryId: string,
   ): Promise<TrustedFileRead> {
     return this.transport.readTrustedFile(projectId, entryId);
+  }
+
+  getProjectFileTree(
+    projectId: string,
+    path?: string,
+  ): Promise<ProjectFileTree> {
+    return this.transport.getProjectFileTree(projectId, path);
+  }
+
+  readProjectFile(
+    projectId: string,
+    path: string,
+    startLine?: number,
+    endLine?: number,
+  ): Promise<ProjectFileRead> {
+    return this.transport.readProjectFile(projectId, path, startLine, endLine);
+  }
+
+  searchProjectFiles(
+    projectId: string,
+    query: string,
+  ): Promise<ProjectFileSearchResult> {
+    return this.transport.searchProjectFiles(projectId, query);
+  }
+
+  writeProjectFile(
+    projectId: string,
+    request: ProjectFileWriteRequest,
+  ): Promise<ProjectFileWrite> {
+    return this.transport.writeProjectFile(projectId, request);
   }
 
   searchTranscripts(

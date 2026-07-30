@@ -276,6 +276,20 @@ describe("sidebar session lifecycle", () => {
     expect(setLifecycle).toHaveBeenCalledWith("session-trashed", "active");
   });
 
+  it("only exposes Files when the host advertises project browsing", () => {
+    const onOpenFiles = vi.fn();
+    const { rerender } = render(<Sidebar {...sidebarProps({ onOpenFiles })} />);
+
+    expect(screen.queryByRole("button", { name: "Files" })).toBeNull();
+    rerender(
+      <Sidebar
+        {...sidebarProps({ filesAvailable: true, onOpenFiles })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+    expect(onOpenFiles).toHaveBeenCalledOnce();
+  });
+
   it("requires the exact retention-bound phrase before permanent deletion", () => {
     const deletePermanently = vi.fn();
     const session = trashedSession();

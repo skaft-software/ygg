@@ -18,6 +18,10 @@ import type {
   PreviewRef,
   ProgressStep,
   ProjectCatalog,
+  ProjectFileRead,
+  ProjectFileSearchResult,
+  ProjectFileTree,
+  ProjectFileWrite,
   ProjectSummary,
   RepositoryContextSnapshot,
   ReasoningEffort,
@@ -122,6 +126,49 @@ function array(value: unknown, path: string): unknown[] {
 
 function optionalString(value: unknown, path: string): string | undefined {
   return value === undefined ? undefined : string(value, path);
+}
+
+function projectPathSegment(value: string, path: string): string {
+  if (
+    !value ||
+    value === "." ||
+    value === ".." ||
+    [...value].some(
+      (character) =>
+        character <= "\u001f" ||
+        character === "\u007f" ||
+        character === "/" ||
+        character === "\\" ||
+        (character >= "\u200b" && character <= "\u200f") ||
+        (character >= "\u202a" && character <= "\u202e") ||
+        (character >= "\u2066" && character <= "\u2069") ||
+        character === "\ufeff",
+    )
+  ) {
+    throw new WireContractError(path, "must be a safe project-relative path");
+  }
+  return value;
+}
+
+function projectRelativePath(
+  value: unknown,
+  path: string,
+  allowRoot = false,
+): string {
+  const decoded = boundedString(value, path, 2_048, allowRoot);
+  if (!decoded && allowRoot) return decoded;
+  for (const segment of decoded.split("/")) {
+    projectPathSegment(segment, path);
+  }
+  return decoded;
+}
+
+function projectFileSha256(value: unknown, path: string): string {
+  const decoded = boundedString(value, path, 64);
+  if (!/^[a-f0-9]{64}$/u.test(decoded)) {
+    throw new WireContractError(path, "must be a lowercase SHA-256 digest");
+  }
+  return decoded;
 }
 
 function enumeration<const Values extends readonly string[]>(
@@ -909,6 +956,134 @@ export function projectTrustedFileRead(value: unknown): TrustedFileRead {
     entry: projectTrustedFileEntry(read.entry, "trustedFileRead.entry"),
     text: boundedString(read.text, "trustedFileRead.text", 1024 * 1024),
     sha256: boundedString(read.sha256, "trustedFileRead.sha256", 64),
+  };
+}
+
+export function projectProjectFileTree(value: unknown): ProjectFileTree {
+  const tree = object(value, "projectFileTree", ["path", "entries", "truncated"]);
+  const entries = array(tree.entries, "projectFileTree.entries");
+  if (entries.length > 1_000) {
+    throw new WireContractError(
+      "projectFileTree.entries",
+      "must contain at most 1000 entries",
+    );
+  }
+  return {
+    path: projectRelativePath(tree.path, "projectFileTree.path", true),
+    entries: entries.map((value, index) => {
+      const entryPath = `projectFileTree.entries[${index}]`;
+      const entry = object(value, entryPath, [
+        "name",
+        "kind",
+        "size",
+        "modifiedAtMs",
+      ]);
+      return {
+        name: projectPathSegment(
+          boundedString(entry.name, `${entryPath}.name`, 2_048),
+          `${entryPath}.name`,
+        ),
+        kind: enumeration(entry.kind, `${entryPath}.kind`, [
+          "directory",
+          "file",
+        ] as const),
+        size: number(entry.size, `${entryPath}.size`),
+        modifiedAtMs:
+          entry.modifiedAtMs === undefined
+            ? undefined
+            : number(entry.modifiedAtMs, `${entryPath}.modifiedAtMs`),
+      };
+    }),
+    truncated: boolean(tree.truncated, "projectFileTree.truncated"),
+  };
+}
+
+export function projectProjectFileRead(value: unknown): ProjectFileRead {
+  const read = object(value, "projectFileRead", [
+    "path",
+    "content",
+    "startLine",
+    "endLine",
+    "lineCount",
+    "truncated",
+    "sha256",
+  ]);
+  const startLine = number(read.startLine, "projectFileRead.startLine");
+  const endLine = number(read.endLine, "projectFileRead.endLine");
+  const lineCount = number(read.lineCount, "projectFileRead.lineCount");
+  if (startLine > endLine || endLine > lineCount) {
+    throw new WireContractError(
+      "projectFileRead",
+      "has an invalid line range",
+    );
+  }
+  return {
+    path: projectRelativePath(read.path, "projectFileRead.path"),
+    content: boundedString(
+      read.content,
+      "projectFileRead.content",
+      1024 * 1024,
+      true,
+    ),
+    startLine,
+    endLine,
+    lineCount,
+    truncated: boolean(read.truncated, "projectFileRead.truncated"),
+    sha256:
+      read.sha256 === undefined
+        ? undefined
+        : projectFileSha256(read.sha256, "projectFileRead.sha256"),
+  };
+}
+
+export function projectProjectFileSearchResult(
+  value: unknown,
+): ProjectFileSearchResult {
+  const result = object(value, "projectFileSearch", [
+    "hits",
+    "truncated",
+    "scannedBytes",
+  ]);
+  const hits = array(result.hits, "projectFileSearch.hits");
+  if (hits.length > 100) {
+    throw new WireContractError(
+      "projectFileSearch.hits",
+      "must contain at most 100 hits",
+    );
+  }
+  return {
+    hits: hits.map((value, index) => {
+      const hitPath = `projectFileSearch.hits[${index}]`;
+      const hit = object(value, hitPath, ["path", "line", "snippet"]);
+      const line =
+        hit.line === undefined ? undefined : number(hit.line, `${hitPath}.line`);
+      if (line === 0) {
+        throw new WireContractError(`${hitPath}.line`, "must be positive");
+      }
+      return {
+        path: projectRelativePath(hit.path, `${hitPath}.path`),
+        line,
+        snippet: boundedString(hit.snippet, `${hitPath}.snippet`, 480, true),
+      };
+    }),
+    truncated: boolean(result.truncated, "projectFileSearch.truncated"),
+    scannedBytes: number(result.scannedBytes, "projectFileSearch.scannedBytes"),
+  };
+}
+
+export function projectProjectFileWrite(value: unknown): ProjectFileWrite {
+  const write = object(value, "projectFileWrite", [
+    "path",
+    "sha256",
+    "modifiedAtMs",
+  ]);
+  return {
+    path: projectRelativePath(write.path, "projectFileWrite.path"),
+    sha256: projectFileSha256(write.sha256, "projectFileWrite.sha256"),
+    modifiedAtMs:
+      write.modifiedAtMs === undefined
+        ? undefined
+        : number(write.modifiedAtMs, "projectFileWrite.modifiedAtMs"),
   };
 }
 
@@ -2772,6 +2947,8 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
       "attachmentPolicy",
       "documents",
       "trustedProjectFiles",
+      "projectFileBrowser",
+      "projectFileWrite",
       "transcriptSearch",
       "previews",
       "connectedDevices",
@@ -2839,6 +3016,26 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
           capabilities.trustedProjectFiles,
           "hostBootstrap.capabilities.trustedProjectFiles",
         );
+  const projectFileBrowser =
+    capabilities.projectFileBrowser === undefined
+      ? false
+      : boolean(
+          capabilities.projectFileBrowser,
+          "hostBootstrap.capabilities.projectFileBrowser",
+        );
+  const projectFileWrite =
+    capabilities.projectFileWrite === undefined
+      ? false
+      : boolean(
+          capabilities.projectFileWrite,
+          "hostBootstrap.capabilities.projectFileWrite",
+        );
+  if (projectFileWrite && !projectFileBrowser) {
+    throw new WireContractError(
+      "hostBootstrap.capabilities.projectFileWrite",
+      "requires projectFileBrowser",
+    );
+  }
   const transcriptSearch =
     capabilities.transcriptSearch === undefined
       ? false
@@ -3000,6 +3197,8 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
       sessionExport,
       documents,
       trustedProjectFiles,
+      projectFileBrowser,
+      projectFileWrite,
       transcriptSearch,
       themeSelection: themes.length > 1,
       steer: true,
