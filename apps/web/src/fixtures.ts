@@ -298,6 +298,7 @@ export const fixtureBootstrap: HostBootstrap = {
     resources: true,
     connectedDevices: true,
     lanClients: true,
+    terminal: false,
     attachmentIngest: true,
     pairDevices: true,
     sessionMetadata: true,

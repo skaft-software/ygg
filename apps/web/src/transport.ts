@@ -110,6 +110,235 @@ export interface YggTransport {
   close(): void;
 }
 
+export type TerminalConnectionState =
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "detached"
+  | "exited";
+
+export interface TerminalOpenRequest {
+  cols: number;
+  rows: number;
+  ownerKey?: string;
+  cwd?: string;
+}
+
+export type TerminalEvent =
+  | { type: "state"; state: TerminalConnectionState }
+  | { type: "opened"; id: string; ownerKey: string; replay?: string }
+  | { type: "output"; id: string; data: string }
+  | { type: "exit"; id: string; exitCode: number; signal?: string }
+  | { type: "error"; message: string };
+
+type TerminalListener = (event: TerminalEvent) => void;
+
+type TerminalServerMessage = Exclude<TerminalEvent, { type: "state" }>;
+
+const terminalReconnectMaximumDelayMs = 8_000;
+
+function terminalWebSocketUrl(): string {
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${scheme}//${window.location.host}/api/v1/terminal`;
+}
+
+function terminalServerMessage(value: unknown): TerminalServerMessage | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const message = value as Record<string, unknown>;
+  if (message.type === "opened") {
+    if (typeof message.id !== "string" || typeof message.ownerKey !== "string") {
+      return null;
+    }
+    if (message.replay !== undefined && typeof message.replay !== "string") {
+      return null;
+    }
+    return {
+      type: "opened",
+      id: message.id,
+      ownerKey: message.ownerKey,
+      replay: message.replay as string | undefined,
+    };
+  }
+  if (message.type === "output") {
+    return typeof message.id === "string" && typeof message.data === "string"
+      ? { type: "output", id: message.id, data: message.data }
+      : null;
+  }
+  if (message.type === "exit") {
+    return typeof message.id === "string" &&
+      typeof message.exitCode === "number" &&
+      Number.isSafeInteger(message.exitCode) &&
+      message.exitCode >= 0 &&
+      (message.signal === undefined || typeof message.signal === "string")
+      ? {
+          type: "exit",
+          id: message.id,
+          exitCode: message.exitCode,
+          signal: message.signal as string | undefined,
+        }
+      : null;
+  }
+  return message.type === "error" && typeof message.message === "string"
+    ? { type: "error", message: message.message }
+    : null;
+}
+
+/**
+ * Owns one same-origin terminal WebSocket. The backend retains the PTY, so a
+ * reconnect always opens with the last owner key rather than creating a shell.
+ */
+export class TerminalWebSocket {
+  private listeners = new Set<TerminalListener>();
+  private socket: WebSocket | null = null;
+  private reconnectTimer: number | null = null;
+  private reconnectAttempt = 0;
+  private openRequest: TerminalOpenRequest | null = null;
+  private terminalId: string | null = null;
+  private closedByClient = false;
+  private exited = false;
+  private currentState: TerminalConnectionState = "detached";
+
+  constructor(private readonly url = terminalWebSocketUrl()) {}
+
+  subscribe(listener: TerminalListener): () => void {
+    this.listeners.add(listener);
+    listener({ type: "state", state: this.currentState });
+    return () => this.listeners.delete(listener);
+  }
+
+  open(request: TerminalOpenRequest): void {
+    this.openRequest = { ...request };
+    this.closedByClient = false;
+    this.exited = false;
+    this.clearReconnectTimer();
+    const previousSocket = this.socket;
+    this.socket = null;
+    previousSocket?.close();
+    this.connect();
+  }
+
+  resize(cols: number, rows: number): void {
+    if (this.openRequest) {
+      this.openRequest = { ...this.openRequest, cols, rows };
+    }
+    if (this.terminalId) {
+      this.send({ type: "resize", id: this.terminalId, cols, rows });
+    }
+  }
+
+  input(data: string): void {
+    if (this.terminalId && data) {
+      this.send({ type: "input", id: this.terminalId, data });
+    }
+  }
+
+  detach(): void {
+    const terminalId = this.terminalId;
+    this.closedByClient = true;
+    this.openRequest = null;
+    this.terminalId = null;
+    this.clearReconnectTimer();
+    if (this.socket && terminalId && this.socket.readyState === WebSocket.OPEN) {
+      this.send({ type: "detach", id: terminalId });
+    }
+    this.socket?.close();
+    this.socket = null;
+    this.setState("detached");
+  }
+
+  dispose(): void {
+    this.detach();
+    this.listeners.clear();
+  }
+
+  private connect(): void {
+    if (!this.openRequest || this.closedByClient || this.socket) return;
+    this.setState(this.reconnectAttempt === 0 ? "connecting" : "reconnecting");
+    const socket = new WebSocket(this.url);
+    this.socket = socket;
+    socket.onopen = () => {
+      if (this.socket !== socket || !this.openRequest) return;
+      this.send({ type: "open", ...this.openRequest });
+    };
+    socket.onmessage = (event) => this.receive(socket, event);
+    socket.onclose = () => this.closed(socket);
+    socket.onerror = () => {
+      // The close callback supplies the reconnect boundary. Browser error
+      // events intentionally contain no safe diagnostic details.
+    };
+  }
+
+  private receive(socket: WebSocket, event: MessageEvent): void {
+    if (this.socket !== socket || typeof event.data !== "string") return;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(event.data);
+    } catch {
+      this.emit({ type: "error", message: "The terminal sent an invalid response." });
+      return;
+    }
+    const message = terminalServerMessage(decoded);
+    if (!message) {
+      this.emit({ type: "error", message: "The terminal sent an invalid response." });
+      return;
+    }
+    if (message.type === "opened") {
+      this.terminalId = message.id;
+      if (this.openRequest) {
+        this.openRequest = { ...this.openRequest, ownerKey: message.ownerKey };
+      }
+      this.reconnectAttempt = 0;
+      this.setState("connected");
+    }
+    if (message.type === "exit") {
+      this.exited = true;
+      this.terminalId = null;
+      this.setState("exited");
+    }
+    this.emit(message);
+  }
+
+  private closed(socket: WebSocket): void {
+    if (this.socket !== socket) return;
+    this.socket = null;
+    this.terminalId = null;
+    if (this.closedByClient || !this.openRequest || this.exited) return;
+    this.reconnectAttempt += 1;
+    this.setState("reconnecting");
+    const delay = Math.min(
+      250 * 2 ** (this.reconnectAttempt - 1),
+      terminalReconnectMaximumDelayMs,
+    );
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  }
+
+  private send(message: Record<string, unknown>): void {
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    this.socket.send(JSON.stringify(message));
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer === null) return;
+    window.clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private setState(state: TerminalConnectionState): void {
+    if (this.currentState === state) return;
+    this.currentState = state;
+    this.emit({ type: "state", state });
+  }
+
+  private emit(event: TerminalEvent): void {
+    for (const listener of this.listeners) listener(event);
+  }
+}
+
 const clone = <T,>(value: T): T => structuredClone(value);
 
 /** Raised only when a write's optimistic SHA-256 version is stale. */

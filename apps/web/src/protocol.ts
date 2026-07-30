@@ -260,6 +260,7 @@ export interface HostBootstrap {
     resources: boolean;
     connectedDevices: boolean;
     lanClients: boolean;
+    terminal: boolean;
     attachmentIngest: boolean;
     pairDevices: boolean;
     sessionMetadata: boolean;

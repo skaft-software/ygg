@@ -12,6 +12,7 @@ import {
   Pin,
   PinOff,
   RefreshCw,
+  SquareTerminal,
   X,
 } from "lucide-react";
 import {
@@ -36,6 +37,10 @@ import {
 import { SettingsView } from "./components/Settings";
 import { Sidebar } from "./components/Sidebar";
 import { ProjectsView } from "./components/Projects";
+import {
+  disposeTerminalCache,
+  TerminalPanel,
+} from "./components/TerminalPanel";
 import { UsagePage } from "./pages/UsagePage";
 import { YggGlyph } from "./components/YggGlyph";
 import type {
@@ -94,6 +99,8 @@ const transportMode = transportModeFromSearch(window.location.search);
 const store = new YggStore(createTransport(transportMode));
 const activityPaneStorageKey = "ygg.ui.activity-width";
 const inspectorPaneStorageKey = "ygg.ui.inspector-width";
+const terminalPaneStorageKey = "ygg.ui.terminal-width";
+const terminalPaneOpenStorageKey = "ygg.ui.terminal.open";
 const notificationPreferenceKey = (hostId: string) =>
   `ygg.notifications.enabled.${encodeURIComponent(hostId)}`;
 const MemoizedInspector = memo(
@@ -126,6 +133,22 @@ function persistPaneWidth(key: string, value: number) {
     window.localStorage.setItem(key, String(Math.round(value)));
   } catch {
     // A hardened browser may disable storage; resizing still works in memory.
+  }
+}
+
+function storedBoolean(key: string): boolean {
+  try {
+    return window.localStorage.getItem(key) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function persistBoolean(key: string, value: boolean): void {
+  try {
+    window.localStorage.setItem(key, String(value));
+  } catch {
+    // A hardened browser may disable storage; the panel still works in memory.
   }
 }
 
@@ -230,6 +253,8 @@ interface HeaderProps {
   status: SessionStatus;
   activityAvailable: boolean;
   activityOpen: boolean;
+  terminalAvailable: boolean;
+  terminalOpen: boolean;
   pinned: boolean;
   archived: boolean;
   sessionActionsAvailable: boolean;
@@ -240,6 +265,7 @@ interface HeaderProps {
   sidebarButtonRef: RefObject<HTMLButtonElement | null>;
   onOpenSidebar: () => void;
   onToggleActivity: () => void;
+  onToggleTerminal: () => void;
   onRename: (title: string) => void;
   onPin: (pinned: boolean) => void;
   onArchive: (archived: boolean) => void;
@@ -254,6 +280,8 @@ export function SessionHeader({
   status,
   activityAvailable,
   activityOpen,
+  terminalAvailable,
+  terminalOpen,
   pinned,
   archived,
   sessionActionsAvailable,
@@ -264,6 +292,7 @@ export function SessionHeader({
   sidebarButtonRef,
   onOpenSidebar,
   onToggleActivity,
+  onToggleTerminal,
   onRename,
   onPin,
   onArchive,
@@ -348,6 +377,16 @@ export function SessionHeader({
           ) : null}
           {statusLabel[status]}
         </span>
+        {terminalAvailable ? (
+          <button
+            className={`icon-button ${terminalOpen ? "is-active" : ""}`}
+            onClick={onToggleTerminal}
+            aria-label={terminalOpen ? "Close terminal" : "Open terminal"}
+            aria-pressed={terminalOpen}
+          >
+            <SquareTerminal aria-hidden="true" />
+          </button>
+        ) : null}
         {activityAvailable ? (
           <button
             ref={activityButtonRef}
@@ -624,7 +663,13 @@ export default function App() {
   const [wideLayout, setWideLayout] = useState(
     () => window.matchMedia("(min-width: 1280px)").matches,
   );
+  const [terminalSplitLayout, setTerminalSplitLayout] = useState(
+    () => window.matchMedia("(min-width: 900px)").matches,
+  );
   const [activityOpen, setActivityOpen] = useState(false);
+  const [terminalOpen, setTerminalOpen] = useState(() =>
+    storedBoolean(terminalPaneOpenStorageKey),
+  );
   const [branchHistoryOpen, setBranchHistoryOpen] = useState(false);
   const [inspector, setInspector] = useState<InspectorSelection | null>(null);
   const [inspectorClosing, setInspectorClosing] = useState(false);
@@ -633,6 +678,9 @@ export default function App() {
   );
   const [inspectorPaneWidth, setInspectorPaneWidth] = useState(() =>
     storedPaneWidth(inspectorPaneStorageKey, 720),
+  );
+  const [terminalPaneWidth, setTerminalPaneWidth] = useState(() =>
+    storedPaneWidth(terminalPaneStorageKey, 460),
   );
   const [surface, setSurface] = useState<Surface>("session");
   const notificationManagerRef =
@@ -693,6 +741,7 @@ export default function App() {
         window.clearTimeout(inspectorCloseTimerRef.current);
       }
       paneResizeCleanupRef.current?.();
+      disposeTerminalCache();
       store.dispose();
     };
   }, []);
@@ -776,6 +825,14 @@ export default function App() {
   const project = state.bootstrap?.projects.find(
     (candidate) => candidate.id === session?.projectId,
   );
+  const terminalAvailable = Boolean(state.bootstrap?.capabilities.terminal);
+
+  const closeTerminal = useCallback(() => {
+    setTerminalOpen(false);
+    persistBoolean(terminalPaneOpenStorageKey, false);
+  }, []);
+
+  const visibleTerminalOpen = terminalAvailable && terminalOpen;
 
   const activityAvailable = Boolean(
     session &&
@@ -786,12 +843,23 @@ export default function App() {
   );
   const visibleActivityOpen = activityOpen && activityAvailable;
   const modalWorkspaceOpen =
-    branchHistoryOpen || (!wideLayout && (visibleActivityOpen || Boolean(inspector)));
+    branchHistoryOpen ||
+    (!wideLayout && (visibleActivityOpen || Boolean(inspector))) ||
+    (!terminalSplitLayout && visibleTerminalOpen);
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 760px)");
     const onChange = (event: MediaQueryListEvent) => {
       setMobileLayout(event.matches);
+    };
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 900px)");
+    const onChange = (event: MediaQueryListEvent) => {
+      setTerminalSplitLayout(event.matches);
     };
     media.addEventListener("change", onChange);
     return () => media.removeEventListener("change", onChange);
@@ -806,30 +874,39 @@ export default function App() {
     return () => media.removeEventListener("change", onChange);
   }, []);
 
-  const openOutput = useCallback((outputId: string) => {
-    if (inspectorCloseTimerRef.current !== null) {
-      window.clearTimeout(inspectorCloseTimerRef.current);
-      inspectorCloseTimerRef.current = null;
-    }
-    setInspectorClosing(false);
-    setActivityOpen(false);
-    setInspector({ type: "output", id: outputId });
-  }, []);
-  const openSource = useCallback((sourceId: string) => {
-    if (inspectorCloseTimerRef.current !== null) {
-      window.clearTimeout(inspectorCloseTimerRef.current);
-      inspectorCloseTimerRef.current = null;
-    }
-    setInspectorClosing(false);
-    setActivityOpen(false);
-    setInspector({ type: "source", id: sourceId });
-  }, []);
+  const openOutput = useCallback(
+    (outputId: string) => {
+      closeTerminal();
+      if (inspectorCloseTimerRef.current !== null) {
+        window.clearTimeout(inspectorCloseTimerRef.current);
+        inspectorCloseTimerRef.current = null;
+      }
+      setInspectorClosing(false);
+      setActivityOpen(false);
+      setInspector({ type: "output", id: outputId });
+    },
+    [closeTerminal],
+  );
+  const openSource = useCallback(
+    (sourceId: string) => {
+      closeTerminal();
+      if (inspectorCloseTimerRef.current !== null) {
+        window.clearTimeout(inspectorCloseTimerRef.current);
+        inspectorCloseTimerRef.current = null;
+      }
+      setInspectorClosing(false);
+      setActivityOpen(false);
+      setInspector({ type: "source", id: sourceId });
+    },
+    [closeTerminal],
+  );
   const openResource = useCallback(
     (
       handle: string,
       title: string,
       presentation: "text" | "diff" | "image",
     ) => {
+      closeTerminal();
       if (inspectorCloseTimerRef.current !== null) {
         window.clearTimeout(inspectorCloseTimerRef.current);
         inspectorCloseTimerRef.current = null;
@@ -838,11 +915,11 @@ export default function App() {
       setActivityOpen(false);
       setInspector({ type: "resource", handle, title, presentation });
     },
-    [],
+    [closeTerminal],
   );
 
   const paneBounds = useCallback(
-    (kind: "activity" | "inspector") => {
+    (kind: "activity" | "inspector" | "terminal") => {
       const sidebarWidth = sidebarOpen ? 296 : 0;
       if (kind === "activity") {
         return {
@@ -850,6 +927,15 @@ export default function App() {
           max: Math.max(
             280,
             Math.min(440, window.innerWidth - sidebarWidth - 520),
+          ),
+        };
+      }
+      if (kind === "terminal") {
+        return {
+          min: 300,
+          max: Math.max(
+            300,
+            Math.min(720, window.innerWidth - sidebarWidth - 360),
           ),
         };
       }
@@ -862,28 +948,39 @@ export default function App() {
   );
 
   const resizePaneBy = useCallback(
-    (kind: "activity" | "inspector", delta: number) => {
+    (kind: "activity" | "inspector" | "terminal", delta: number) => {
       const bounds = paneBounds(kind);
       const current =
-        kind === "activity" ? activityPaneWidth : inspectorPaneWidth;
+        kind === "activity"
+          ? activityPaneWidth
+          : kind === "inspector"
+            ? inspectorPaneWidth
+            : terminalPaneWidth;
       const next = Math.max(bounds.min, Math.min(bounds.max, current + delta));
       if (kind === "activity") {
         setActivityPaneWidth(next);
         persistPaneWidth(activityPaneStorageKey, next);
-      } else {
+      } else if (kind === "inspector") {
         setInspectorPaneWidth(next);
         persistPaneWidth(inspectorPaneStorageKey, next);
+      } else {
+        setTerminalPaneWidth(next);
+        persistPaneWidth(terminalPaneStorageKey, next);
       }
     },
-    [activityPaneWidth, inspectorPaneWidth, paneBounds],
+    [activityPaneWidth, inspectorPaneWidth, paneBounds, terminalPaneWidth],
   );
 
   const beginPaneResize = useCallback(
-    (kind: "activity" | "inspector", startX: number) => {
+    (kind: "activity" | "inspector" | "terminal", startX: number) => {
       paneResizeCleanupRef.current?.();
       const bounds = paneBounds(kind);
       const startWidth =
-        kind === "activity" ? activityPaneWidth : inspectorPaneWidth;
+        kind === "activity"
+          ? activityPaneWidth
+          : kind === "inspector"
+            ? inspectorPaneWidth
+            : terminalPaneWidth;
       let nextWidth = startWidth;
       const onMove = (event: PointerEvent) => {
         nextWidth = Math.max(
@@ -891,7 +988,8 @@ export default function App() {
           Math.min(bounds.max, startWidth + startX - event.clientX),
         );
         if (kind === "activity") setActivityPaneWidth(nextWidth);
-        else setInspectorPaneWidth(nextWidth);
+        else if (kind === "inspector") setInspectorPaneWidth(nextWidth);
+        else setTerminalPaneWidth(nextWidth);
       };
       const cleanup = () => {
         window.removeEventListener("pointermove", onMove);
@@ -906,7 +1004,9 @@ export default function App() {
         persistPaneWidth(
           kind === "activity"
             ? activityPaneStorageKey
-            : inspectorPaneStorageKey,
+            : kind === "inspector"
+              ? inspectorPaneStorageKey
+              : terminalPaneStorageKey,
           nextWidth,
         );
       };
@@ -917,7 +1017,7 @@ export default function App() {
       window.addEventListener("pointercancel", finish);
       window.addEventListener("blur", finish);
     },
-    [activityPaneWidth, inspectorPaneWidth, paneBounds],
+    [activityPaneWidth, inspectorPaneWidth, paneBounds, terminalPaneWidth],
   );
 
   const appClass = useMemo(
@@ -927,16 +1027,35 @@ export default function App() {
         sidebarOpen ? "has-sidebar" : "",
         visibleActivityOpen && !inspector ? "has-activity" : "",
         inspector ? "has-inspector" : "",
+        visibleTerminalOpen ? "has-terminal" : "",
         `surface-${surface}`,
       ]
         .filter(Boolean)
         .join(" "),
-    [inspector, sidebarOpen, surface, visibleActivityOpen],
+    [
+      inspector,
+      sidebarOpen,
+      surface,
+      visibleActivityOpen,
+      visibleTerminalOpen,
+    ],
   );
   const appStyle = {
     "--activity-width": `${activityPaneWidth}px`,
     "--inspector-width": `${inspectorPaneWidth}px`,
+    "--terminal-width": `${terminalPaneWidth}px`,
   } as CSSProperties;
+  const toggleTerminal = useCallback(() => {
+    if (!terminalAvailable) return;
+    if (terminalOpen) {
+      closeTerminal();
+      return;
+    }
+    setTerminalOpen(true);
+    persistBoolean(terminalPaneOpenStorageKey, true);
+    setActivityOpen(false);
+    setInspector(null);
+  }, [closeTerminal, terminalAvailable, terminalOpen]);
   const startNewSession = useCallback(() => {
     setSurface("session");
     setInspector(null);
@@ -1335,6 +1454,8 @@ export default function App() {
             status={session.status}
             activityAvailable={activityAvailable}
             activityOpen={visibleActivityOpen}
+            terminalAvailable={terminalAvailable}
+            terminalOpen={visibleTerminalOpen}
             pinned={selectedSummary?.pinned ?? false}
             archived={selectedSummary?.archived ?? false}
             sessionActionsAvailable={
@@ -1356,9 +1477,11 @@ export default function App() {
             sidebarButtonRef={sidebarButtonRef}
             onOpenSidebar={() => setSidebarOpen(true)}
             onToggleActivity={() => {
+              closeTerminal();
               setInspector(null);
               setActivityOpen((open) => !open);
             }}
+            onToggleTerminal={toggleTerminal}
             onRename={(title) => void store.rename(title)}
             onPin={(pinned) => {
               void store.pin(pinned);
@@ -1482,9 +1605,44 @@ export default function App() {
         </div>
       )}
 
+      {terminalSplitLayout && visibleTerminalOpen ? (
+        <div
+          className="pane-resize-handle terminal-pane-resize-handle"
+          role="separator"
+          aria-label="Resize terminal"
+          aria-orientation="vertical"
+          aria-valuemin={300}
+          aria-valuemax={paneBounds("terminal").max}
+          aria-valuenow={terminalPaneWidth}
+          tabIndex={0}
+          onPointerDown={(event) => {
+            event.preventDefault();
+            beginPaneResize("terminal", event.clientX);
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
+              return;
+            }
+            event.preventDefault();
+            resizePaneBy(
+              "terminal",
+              event.key === "ArrowLeft" ? 16 : -16,
+            );
+          }}
+        />
+      ) : null}
+      {visibleTerminalOpen ? (
+        <TerminalPanel
+          hostId={state.bootstrap.host.id}
+          onClose={closeTerminal}
+        />
+      ) : null}
+
       {surface === "session" && session ? (
         <>
-          {wideLayout && ((visibleActivityOpen && !inspector) || inspector) ? (
+          {wideLayout &&
+          !visibleTerminalOpen &&
+          ((visibleActivityOpen && !inspector) || inspector) ? (
             <div
               className="pane-resize-handle"
               role="separator"

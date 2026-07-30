@@ -16,7 +16,9 @@ The package contains:
 - a `SessionSupervisor` that prevents duplicate mutable owners without holding
   its actor-map lock across slow session factories; and
 - a loopback-only HTTP/WebSocket transport with one-use launch authentication,
-  strict same-origin checks, bounded requests, and safe static assets; and
+  strict same-origin checks, bounded requests, and safe static assets;
+- an optional bounded in-process PTY manager for authenticated local terminal
+  sessions; and
 - `HostService` / `SessionDriver` adapter traits for the real Ygg application.
 
 It does **not** contain a TUI, web layout, provider client, Agent, authenticated
@@ -29,6 +31,15 @@ append-only JSONL.
 Golden JSON contracts for the browser/native client boundary live in
 `fixtures/`. They use camel-case fields and explicit dotted command/event
 discriminators.
+
+## Local terminal
+
+When the host's process-execution sandbox permission is enabled, the loopback
+transport exposes an authenticated same-origin terminal WebSocket. It starts
+shells only in the configured workspace, retains at most four sessions, and
+uses an opaque owner key to reattach after a browser disconnect. Replay, input,
+and terminal dimensions are bounded. Browser detach retains a shell; loopback
+server shutdown stops every retained shell.
 
 ## Core adapter requirements
 
