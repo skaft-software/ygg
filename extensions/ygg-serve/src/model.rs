@@ -103,6 +103,12 @@ pub struct HostCapabilities {
     /// Root-confined trusted-project file browsing and context selection is available.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trusted_project_files: bool,
+    /// Root-confined trusted-project directory, search, and text-read routes are available.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub project_file_browser: bool,
+    /// Full-file replacement through the trusted-project browser is available.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub project_file_write: bool,
     /// Authenticated search over durable, already-redacted transcript projections is available.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub transcript_search: bool,
@@ -172,6 +178,8 @@ impl Default for HostCapabilities {
             attachment_policy: None,
             documents: false,
             trusted_project_files: false,
+            project_file_browser: false,
+            project_file_write: false,
             transcript_search: false,
             previews: false,
             connected_devices: false,
@@ -2138,6 +2146,12 @@ impl ProtocolValidation for HostBootstrap {
                     "requires the attachments capability",
                 ));
             }
+        }
+        if self.capabilities.project_file_write && !self.capabilities.project_file_browser {
+            return Err(ValidationError::new(
+                "bootstrap.capabilities.project_file_write",
+                "requires the project file browser capability",
+            ));
         }
         if self.models.is_empty() || self.models.len() > MAX_MODELS {
             return Err(ValidationError::new(

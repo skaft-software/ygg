@@ -23,34 +23,33 @@ use ygg_ai::{
     ReasoningConfig, ToolCallId, ToolResultPart, UserPart,
 };
 use ygg_serve_backend::{
-    ActivityPhase, ActivityPhaseSummary, ActorOwnerState, ArtifactId, ArtifactKind, ArtifactRef,
-    AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef, AttachmentStore,
-    AttentionState, AuthorityProfile, ColorScheme, CompletionReview, ContextUsage,
-    ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
-    DocumentReference, DocumentStore, DocumentStoreError,
-    DriverCommandOutcome, DurableEntryId, EventPayload, EvidenceCoverage, FileChange, FileEntryId,
-    FinalizeCompletion, FinalizeDecision, HostCapabilities, HostDescriptor, HostId, HostService,
-    InferenceRequest, InferenceRequestStore, InputModality, ItemDelta, ItemId, ItemLifecycle,
-    ItemPayload, LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing,
-    ModelInputPricingTier, ModelSelection, ModelSummary, PendingRequest,
-    PermanentDeleteConfirmation, ProjectId, ProjectRegistry,
+    parse_test_output, refresh_repository_context, ActivityPhase, ActivityPhaseSummary,
+    ActorOwnerState, ArtifactId, ArtifactKind, ArtifactRef, AttachmentError, AttachmentFingerprint,
+    AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState, AuthorityProfile,
+    ColorScheme, CompletionReview, ContextUsage, ConversationBranchOperation,
+    ConversationBranchProvenance, CreateSessionRequest, DocumentReference, DocumentStore,
+    DocumentStoreError, DriverCommandOutcome, DurableEntryId, EventPayload, EvidenceCoverage,
+    FileChange, FileEntryId, FinalizeCompletion, FinalizeDecision, HostCapabilities,
+    HostDescriptor, HostId, HostService, InferenceRequest, InferenceRequestStore, InputModality,
+    ItemDelta, ItemId, ItemLifecycle, ItemPayload, LifetimeUsage, LoopbackConfig, LoopbackServer,
+    ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary, PendingRequest,
+    PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult, ProjectFileSystem,
+    ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ProjectId, ProjectRegistry,
     ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation, RegistryProjectId,
     RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer,
-    RequestId, RequestKind, RequestState, RunId, SemanticRole,
-    SearchDocument, SearchDocumentKind, SearchError, ServiceError, SessionBranchEntry,
-    SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor,
-    SessionDriver, SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed,
-    SessionSnapshot, SessionSummary,
+    RequestId, RequestKind, RequestState, RunId, SearchDocument, SearchDocumentKind, SearchError,
+    SemanticRole, ServiceError, SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph,
+    SessionCatalogState, SessionCommand, SessionCursor, SessionDriver, SessionId, SessionItem,
+    SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot, SessionSummary,
     SessionSupervisor, SourceId, SourceKind, SourceRef, StoredAttachment, StoredResource,
-    SupervisorConfig, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
+    StructuredTestResults, SupervisorConfig, TestCommandOutcome, TestCommandStatus, TestFramework,
+    TestOutputInput, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
     ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity,
     ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
     TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
     TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
     UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
-    MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES,
-    MAX_TEST_OUTPUT_BYTES, StructuredTestResults, TestCommandOutcome, TestCommandStatus,
-    TestFramework, TestOutputInput, parse_test_output, refresh_repository_context,
+    MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES,
 };
 
 use crate::app::bootstrap::{build_app, rebuild_app, LaunchSelection, SessionSelection};
@@ -868,6 +867,19 @@ fn with_trusted_project_files<T>(
     operation(&service, &projects).map_err(trusted_file_service_error)
 }
 
+fn with_project_file_system<T>(
+    projects: &Arc<Mutex<ProjectRegistry>>,
+    project_id: &ProjectId,
+    operation: impl FnOnce(&ProjectRegistry, &RegistryProjectId) -> Result<T, ProjectFileSystemError>,
+) -> Result<T, ProjectFileSystemError> {
+    let registry_id = RegistryProjectId::parse(project_id.as_str())
+        .map_err(|_| ProjectFileSystemError::InvalidPath)?;
+    let projects = projects
+        .lock()
+        .map_err(|_| ProjectFileSystemError::Storage)?;
+    operation(&projects, &registry_id)
+}
+
 fn public_project_summary(
     registry: &ProjectRegistry,
     project: ygg_serve_backend::RegistryProjectSummary,
@@ -945,6 +957,8 @@ impl HostService for YggHost {
             attachment_policy,
             documents: self.documents.is_some(),
             trusted_project_files: cfg!(unix),
+            project_file_browser: cfg!(unix),
+            project_file_write: cfg!(unix) && self.config.tool_available("write"),
             transcript_search: true,
             previews: false,
             connected_devices: false,
@@ -1103,6 +1117,108 @@ impl HostService for YggHost {
         })
         .await
         .map_err(|_| ServiceError::Internal)?
+    }
+
+    fn project_file_browser_supported(&self) -> bool {
+        cfg!(unix)
+    }
+
+    fn project_file_write_supported(&self) -> bool {
+        cfg!(unix) && self.config.tool_available("write")
+    }
+
+    async fn project_file_tree(
+        &self,
+        project_id: &ProjectId,
+        path: &str,
+    ) -> Result<ProjectFileTree, ProjectFileSystemError> {
+        if !self.project_file_browser_supported() {
+            return Err(ProjectFileSystemError::Unavailable);
+        }
+        let projects = Arc::clone(&self.projects);
+        let project_id = project_id.clone();
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            with_project_file_system(&projects, &project_id, |registry, registry_id| {
+                ProjectFileSystem::tree(registry, registry_id, &path)
+            })
+        })
+        .await
+        .map_err(|_| ProjectFileSystemError::Storage)?
+    }
+
+    async fn read_project_file(
+        &self,
+        project_id: &ProjectId,
+        path: &str,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+    ) -> Result<ProjectFileRead, ProjectFileSystemError> {
+        if !self.project_file_browser_supported() {
+            return Err(ProjectFileSystemError::Unavailable);
+        }
+        let projects = Arc::clone(&self.projects);
+        let project_id = project_id.clone();
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            with_project_file_system(&projects, &project_id, |registry, registry_id| {
+                ProjectFileSystem::read(registry, registry_id, &path, start_line, end_line)
+            })
+        })
+        .await
+        .map_err(|_| ProjectFileSystemError::Storage)?
+    }
+
+    async fn search_project_files(
+        &self,
+        project_id: &ProjectId,
+        query: &str,
+    ) -> Result<ProjectFileSearchResult, ProjectFileSystemError> {
+        if !self.project_file_browser_supported() {
+            return Err(ProjectFileSystemError::Unavailable);
+        }
+        let projects = Arc::clone(&self.projects);
+        let project_id = project_id.clone();
+        let query = query.to_owned();
+        tokio::task::spawn_blocking(move || {
+            with_project_file_system(&projects, &project_id, |registry, registry_id| {
+                ProjectFileSystem::search(registry, registry_id, &query)
+            })
+        })
+        .await
+        .map_err(|_| ProjectFileSystemError::Storage)?
+    }
+
+    async fn write_project_file(
+        &self,
+        project_id: &ProjectId,
+        path: &str,
+        content: &str,
+        expected_sha256: &str,
+        force: bool,
+    ) -> Result<ProjectFileWrite, ProjectFileSystemError> {
+        if !self.project_file_write_supported() {
+            return Err(ProjectFileSystemError::WriteUnavailable);
+        }
+        let projects = Arc::clone(&self.projects);
+        let project_id = project_id.clone();
+        let path = path.to_owned();
+        let content = content.to_owned();
+        let expected_sha256 = expected_sha256.to_owned();
+        tokio::task::spawn_blocking(move || {
+            with_project_file_system(&projects, &project_id, |registry, registry_id| {
+                ProjectFileSystem::write(
+                    registry,
+                    registry_id,
+                    &path,
+                    &content,
+                    &expected_sha256,
+                    force,
+                )
+            })
+        })
+        .await
+        .map_err(|_| ProjectFileSystemError::Storage)?
     }
 
     fn transcript_search_supported(&self) -> bool {
@@ -7596,6 +7712,58 @@ mod tests {
         assert!(matches!(
             reopened.create_session(request).await,
             Err(ServiceError::Unauthorized)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_file_browser_is_trust_confined_and_honors_write_policy() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = project_test_config(fixture.path(), true);
+        std::fs::write(config.workspace.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let host = YggHost::new(config.clone()).unwrap();
+        let project_id = host.launch_project_id.clone();
+        assert!(host.capabilities().project_file_browser);
+        assert!(host.capabilities().project_file_write);
+
+        let tree = host.project_file_tree(&project_id, "").await.unwrap();
+        assert!(tree.entries.iter().any(|entry| entry.name == "main.rs"));
+        assert_eq!(tree.path, "");
+
+        let read = host
+            .read_project_file(&project_id, "main.rs", None, None)
+            .await
+            .unwrap();
+        assert_eq!(read.path, "main.rs");
+        let version = read.sha256.unwrap();
+        let write = host
+            .write_project_file(
+                &project_id,
+                "main.rs",
+                "fn main() { println!(\"updated\"); }\n",
+                &version,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.path, "main.rs");
+        assert_eq!(
+            std::fs::read_to_string(config.workspace.join("main.rs")).unwrap(),
+            "fn main() { println!(\"updated\"); }\n"
+        );
+        drop(host);
+
+        let mut read_only = config;
+        read_only.sandbox.allow_write = false;
+        let read_only_host = YggHost::new(read_only).unwrap();
+        assert!(read_only_host.capabilities().project_file_browser);
+        assert!(!read_only_host.capabilities().project_file_write);
+        assert!(matches!(
+            read_only_host
+                .write_project_file(&project_id, "main.rs", "updated", &write.sha256, false)
+                .await,
+            Err(ProjectFileSystemError::WriteUnavailable)
         ));
     }
 

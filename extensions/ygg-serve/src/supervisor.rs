@@ -603,6 +603,61 @@ impl<H: HostService> SessionSupervisor<H> {
         self.host.read_trusted_file(project_id, entry_id).await
     }
 
+    /// Whether root-confined project file-tree, text-read, and search routes are available.
+    pub fn project_file_browser_supported(&self) -> bool {
+        self.host.project_file_browser_supported()
+    }
+
+    /// Whether full-file replacement is available through the project file browser.
+    pub fn project_file_write_supported(&self) -> bool {
+        self.host.project_file_write_supported()
+    }
+
+    /// Lists one validated project-relative directory.
+    pub async fn project_file_tree(
+        &self,
+        project_id: &crate::ProjectId,
+        path: &str,
+    ) -> Result<crate::ProjectFileTree, crate::ProjectFileSystemError> {
+        self.host.project_file_tree(project_id, path).await
+    }
+
+    /// Reads bounded text from one validated project-relative file.
+    pub async fn read_project_file(
+        &self,
+        project_id: &crate::ProjectId,
+        path: &str,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+    ) -> Result<crate::ProjectFileRead, crate::ProjectFileSystemError> {
+        self.host
+            .read_project_file(project_id, path, start_line, end_line)
+            .await
+    }
+
+    /// Searches bounded project text and relative paths.
+    pub async fn search_project_files(
+        &self,
+        project_id: &crate::ProjectId,
+        query: &str,
+    ) -> Result<crate::ProjectFileSearchResult, crate::ProjectFileSystemError> {
+        self.host.search_project_files(project_id, query).await
+    }
+
+    /// Replaces a complete project file after an optimistic version check.
+    pub async fn write_project_file(
+        &self,
+        project_id: &crate::ProjectId,
+        path: &str,
+        content: &str,
+        expected_sha256: &str,
+        force: bool,
+    ) -> Result<crate::ProjectFileWrite, crate::ProjectFileSystemError> {
+        self.host
+            .write_project_file(project_id, path, content, expected_sha256, force)
+            .await
+    }
+
     /// Whether the host exposes authenticated durable transcript search.
     pub fn transcript_search_supported(&self) -> bool {
         self.host.transcript_search_supported()

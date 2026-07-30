@@ -29,10 +29,11 @@ use tokio::task::JoinHandle;
 
 use crate::embedded_web::WebBundle;
 use crate::{
-    AttachmentError, FileEntryId, HostCommandEnvelope, HostService, ProjectId,
-    ProtocolValidation, SanitizedError, ServiceError, SessionCommandEnvelope, SessionCursor,
-    SessionId, SessionSupervisor, SupervisorError, MAX_ATTACHMENT_FILE_BYTES, MAX_COMMAND_BYTES,
-    MAX_DOCUMENT_FILE_BYTES, PROTOCOL_VERSION,
+    AttachmentError, FileEntryId, HostCommandEnvelope, HostService, ProjectFileSystemError,
+    ProjectId, ProtocolValidation, SanitizedError, ServiceError, SessionCommandEnvelope,
+    SessionCursor, SessionId, SessionSupervisor, SupervisorError, MAX_ATTACHMENT_FILE_BYTES,
+    MAX_COMMAND_BYTES, MAX_DOCUMENT_FILE_BYTES, MAX_PROJECT_FILE_PATH_BYTES,
+    MAX_PROJECT_FILE_WRITE_BYTES, PROTOCOL_VERSION,
 };
 
 const MAX_QUERY_BYTES: usize = 4 * 1024;
@@ -41,6 +42,9 @@ const RATE_LIMIT_REQUESTS: usize = 240;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_ATTACHMENT_UPLOADS: usize = 4;
 const MAX_CONCURRENT_SESSION_EXPORTS: usize = 1;
+// JSON escapes can expand each accepted UTF-8 byte to six bytes.
+const MAX_PROJECT_FILE_WRITE_REQUEST_BYTES: usize =
+    MAX_PROJECT_FILE_WRITE_BYTES * 6 + MAX_PROJECT_FILE_PATH_BYTES * 6 + 1024;
 const X_YGG_WEB_BUNDLE: HeaderName = HeaderName::from_static("x-ygg-web-bundle");
 
 /// Loopback listener configuration.
@@ -326,6 +330,39 @@ struct TrustedFileSearchQuery {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectFileTreeQuery {
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectFileReadQuery {
+    path: String,
+    #[serde(default)]
+    start_line: Option<u32>,
+    #[serde(default)]
+    end_line: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectFileSearchQuery {
+    query: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectFileWriteRequest {
+    path: String,
+    content: String,
+    expected_sha256: String,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UsageStatsQuery {
     period: crate::UsagePeriod,
@@ -396,6 +433,17 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
         .route(
             "/api/v1/projects/{project_id}/files/{entry_id}",
             get(read_trusted_file::<H>),
+        )
+        .route("/api/v1/fs/{project_id}/tree", get(project_file_tree::<H>))
+        .route("/api/v1/fs/{project_id}/read", get(read_project_file::<H>))
+        .route(
+            "/api/v1/fs/{project_id}/search",
+            get(search_project_files::<H>),
+        )
+        .route(
+            "/api/v1/fs/{project_id}/write",
+            post(write_project_file::<H>)
+                .layer(DefaultBodyLimit::max(MAX_PROJECT_FILE_WRITE_REQUEST_BYTES)),
         )
         .route(
             "/api/v1/sessions/{session_id}/resources/{handle}",
@@ -622,6 +670,128 @@ async fn read_trusted_file<H: HostService>(
     {
         Ok(file) => Json(file).into_response(),
         Err(error) => service_error_response(error),
+    }
+}
+
+async fn project_file_tree<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_project_id): Path<String>,
+    query: Result<Query<ProjectFileTreeQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    if !state.supervisor.project_file_browser_supported() {
+        return project_file_system_error_response(ProjectFileSystemError::Unavailable);
+    }
+    let project_id = match ProjectId::new(raw_project_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_request(),
+    };
+    match state
+        .supervisor
+        .project_file_tree(&project_id, &query.path)
+        .await
+    {
+        Ok(tree) => Json(tree).into_response(),
+        Err(error) => project_file_system_error_response(error),
+    }
+}
+
+async fn read_project_file<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_project_id): Path<String>,
+    query: Result<Query<ProjectFileReadQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    if !state.supervisor.project_file_browser_supported() {
+        return project_file_system_error_response(ProjectFileSystemError::Unavailable);
+    }
+    let project_id = match ProjectId::new(raw_project_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_request(),
+    };
+    match state
+        .supervisor
+        .read_project_file(&project_id, &query.path, query.start_line, query.end_line)
+        .await
+    {
+        Ok(file) => Json(file).into_response(),
+        Err(error) => project_file_system_error_response(error),
+    }
+}
+
+async fn search_project_files<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_project_id): Path<String>,
+    query: Result<Query<ProjectFileSearchQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    if !state.supervisor.project_file_browser_supported() {
+        return project_file_system_error_response(ProjectFileSystemError::Unavailable);
+    }
+    let project_id = match ProjectId::new(raw_project_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_request(),
+    };
+    match state
+        .supervisor
+        .search_project_files(&project_id, &query.query)
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => project_file_system_error_response(error),
+    }
+}
+
+async fn write_project_file<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_project_id): Path<String>,
+    payload: Result<Json<ProjectFileWriteRequest>, JsonRejection>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    if !state.supervisor.project_file_write_supported() {
+        return project_file_system_error_response(ProjectFileSystemError::WriteUnavailable);
+    }
+    let project_id = match ProjectId::new(raw_project_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(_) => return invalid_request(),
+    };
+    match state
+        .supervisor
+        .write_project_file(
+            &project_id,
+            &request.path,
+            &request.content,
+            &request.expected_sha256,
+            request.force,
+        )
+        .await
+    {
+        Ok(file) => Json(file).into_response(),
+        Err(error) => project_file_system_error_response(error),
     }
 }
 
@@ -1281,6 +1451,9 @@ async fn secure_request<H: HostService>(
     let document_upload = request.method() == Method::POST
         && request.uri().path().starts_with("/api/v1/sessions/")
         && request.uri().path().ends_with("/documents");
+    let project_file_write = request.method() == Method::POST
+        && request.uri().path().starts_with("/api/v1/fs/")
+        && request.uri().path().ends_with("/write");
     let session_export = request.method() == Method::GET
         && request.uri().path().starts_with("/api/v1/sessions/")
         && request.uri().path().ends_with("/export");
@@ -1334,6 +1507,8 @@ async fn secure_request<H: HostService>(
             .unwrap_or(MAX_ATTACHMENT_FILE_BYTES)
     } else if document_upload {
         MAX_DOCUMENT_FILE_BYTES
+    } else if project_file_write {
+        MAX_PROJECT_FILE_WRITE_REQUEST_BYTES
     } else {
         MAX_COMMAND_BYTES
     };
@@ -1445,6 +1620,65 @@ fn supervisor_error_response(error: SupervisorError) -> Response {
             .with_retryable(true),
         ),
         _ => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SanitizedError::internal(),
+        ),
+    }
+}
+
+fn project_file_system_error_response(error: ProjectFileSystemError) -> Response {
+    match error {
+        ProjectFileSystemError::TrustRequired => error_response(
+            StatusCode::FORBIDDEN,
+            SanitizedError::public(
+                crate::ErrorCode::Unauthorized,
+                "Explicit project trust is required for this operation.",
+            ),
+        ),
+        ProjectFileSystemError::RootChanged => error_response(
+            StatusCode::CONFLICT,
+            SanitizedError::public(
+                crate::ErrorCode::Unavailable,
+                "The trusted project root changed before the operation completed.",
+            ),
+        ),
+        ProjectFileSystemError::InvalidPath
+        | ProjectFileSystemError::InvalidRange
+        | ProjectFileSystemError::InvalidSearch
+        | ProjectFileSystemError::NotDirectory
+        | ProjectFileSystemError::NotFile
+        | ProjectFileSystemError::NotText => invalid_request(),
+        ProjectFileSystemError::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            SanitizedError::public(
+                crate::ErrorCode::NotFound,
+                "The project file was not found.",
+            ),
+        ),
+        ProjectFileSystemError::ContentTooLarge => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            SanitizedError::public(
+                crate::ErrorCode::PayloadTooLarge,
+                "The project file exceeds the host limit.",
+            ),
+        ),
+        ProjectFileSystemError::Conflict => error_response(
+            StatusCode::CONFLICT,
+            SanitizedError::public(
+                crate::ErrorCode::Locked,
+                "The project file changed before the operation completed.",
+            ),
+        ),
+        ProjectFileSystemError::Unavailable | ProjectFileSystemError::WriteUnavailable => {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                SanitizedError::public(
+                    crate::ErrorCode::Unavailable,
+                    "Project file access is not available on this host.",
+                ),
+            )
+        }
+        ProjectFileSystemError::Storage => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             SanitizedError::internal(),
         ),
@@ -1736,13 +1970,16 @@ mod tests {
         ActorOwnerState, AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState,
         AuthorityProfile, ColorScheme, ContextUsage, CreateSessionRequest, DriverCommandOutcome,
         HostCapabilities, HostDescriptor, HostId, InputModality, ModelSelection, ModelSummary,
-        ServiceError, SessionCommand, SessionCursor, SessionDriver, SessionLiveState, SessionSeed,
-        SessionSnapshot, SessionSummary, StoredAttachment, StoredResource, SupervisorConfig,
-        ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeSourceClass,
-        ThemeTypography,
+        ProjectFileEntry, ProjectFileEntryKind, ProjectFileRead, ProjectFileSearchResult,
+        ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ServiceError, SessionCommand,
+        SessionCursor, SessionDriver, SessionLiveState, SessionSeed, SessionSnapshot,
+        SessionSummary, StoredAttachment, StoredResource, SupervisorConfig, ThemeDensity, ThemeDto,
+        ThemeId, ThemeMotion, ThemeOption, ThemeSourceClass, ThemeTypography,
     };
 
     use super::*;
+
+    type ProjectFileWriteRecord = (String, String, String, bool);
 
     #[derive(Clone)]
     struct MockHost {
@@ -1752,6 +1989,9 @@ mod tests {
         seeds: Arc<Mutex<BTreeMap<SessionId, SessionSeed>>>,
         attachments: AttachmentStore,
         _attachment_root: Arc<tempfile::TempDir>,
+        project_file_browser: bool,
+        project_file_write: bool,
+        project_file_writes: Arc<Mutex<Vec<ProjectFileWriteRecord>>>,
         export_started: Arc<Notify>,
         export_release: Arc<Notify>,
     }
@@ -1767,9 +2007,19 @@ mod tests {
                 seeds: Arc::new(Mutex::new(BTreeMap::new())),
                 attachments,
                 _attachment_root: attachment_root,
+                project_file_browser: false,
+                project_file_write: false,
+                project_file_writes: Arc::new(Mutex::new(Vec::new())),
                 export_started: Arc::new(Notify::new()),
                 export_release: Arc::new(Notify::new()),
             }
+        }
+
+        fn with_project_files() -> Self {
+            let mut host = Self::new();
+            host.project_file_browser = true;
+            host.project_file_write = true;
+            host
         }
 
         fn insert_existing(&self, id: &str) -> SessionId {
@@ -1811,6 +2061,8 @@ mod tests {
             HostCapabilities {
                 attachments: true,
                 attachment_policy: Some(AttachmentPolicy::image_defaults()),
+                project_file_browser: self.project_file_browser,
+                project_file_write: self.project_file_write,
                 session_export: true,
                 ..HostCapabilities::default()
             }
@@ -1834,6 +2086,111 @@ mod tests {
             handle: &str,
         ) -> Result<StoredAttachment, AttachmentError> {
             self.attachments.content(handle)
+        }
+
+        fn project_file_browser_supported(&self) -> bool {
+            self.project_file_browser
+        }
+
+        fn project_file_write_supported(&self) -> bool {
+            self.project_file_write
+        }
+
+        async fn project_file_tree(
+            &self,
+            _project_id: &ProjectId,
+            path: &str,
+        ) -> Result<ProjectFileTree, ProjectFileSystemError> {
+            if !self.project_file_browser {
+                return Err(ProjectFileSystemError::Unavailable);
+            }
+            if path == "conflict" {
+                return Err(ProjectFileSystemError::Conflict);
+            }
+            Ok(ProjectFileTree {
+                path: path.to_owned(),
+                entries: vec![ProjectFileEntry {
+                    name: "src".into(),
+                    kind: ProjectFileEntryKind::Directory,
+                    size: 0,
+                    modified_at_ms: None,
+                }],
+                truncated: false,
+            })
+        }
+
+        async fn read_project_file(
+            &self,
+            _project_id: &ProjectId,
+            path: &str,
+            start_line: Option<u32>,
+            end_line: Option<u32>,
+        ) -> Result<ProjectFileRead, ProjectFileSystemError> {
+            if !self.project_file_browser {
+                return Err(ProjectFileSystemError::Unavailable);
+            }
+            if path == "conflict" {
+                return Err(ProjectFileSystemError::Conflict);
+            }
+            if start_line == Some(0) || end_line == Some(0) {
+                return Err(ProjectFileSystemError::InvalidRange);
+            }
+            Ok(ProjectFileRead {
+                path: path.to_owned(),
+                content: "fn main() {}\n".into(),
+                start_line: start_line.unwrap_or(1),
+                end_line: end_line.unwrap_or(1),
+                line_count: 1,
+                truncated: false,
+                sha256: Some(
+                    "f1b0dcd7f39a36e5f99d602a87616e4e13f9d7dcf99096f1d7ec179c34d93d1e".into(),
+                ),
+            })
+        }
+
+        async fn search_project_files(
+            &self,
+            _project_id: &ProjectId,
+            query: &str,
+        ) -> Result<ProjectFileSearchResult, ProjectFileSystemError> {
+            if !self.project_file_browser {
+                return Err(ProjectFileSystemError::Unavailable);
+            }
+            if query == "invalid" {
+                return Err(ProjectFileSystemError::InvalidSearch);
+            }
+            Ok(ProjectFileSearchResult {
+                hits: Vec::new(),
+                truncated: false,
+                scanned_bytes: 0,
+            })
+        }
+
+        async fn write_project_file(
+            &self,
+            _project_id: &ProjectId,
+            path: &str,
+            content: &str,
+            expected_sha256: &str,
+            force: bool,
+        ) -> Result<ProjectFileWrite, ProjectFileSystemError> {
+            if !self.project_file_write {
+                return Err(ProjectFileSystemError::WriteUnavailable);
+            }
+            if path == "conflict" {
+                return Err(ProjectFileSystemError::Conflict);
+            }
+            self.project_file_writes.lock().unwrap().push((
+                path.to_owned(),
+                content.to_owned(),
+                expected_sha256.to_owned(),
+                force,
+            ));
+            Ok(ProjectFileWrite {
+                path: path.to_owned(),
+                sha256: "fb1b5b67516d1d8348a527480830b9717bc8c0f9f7f405d5e5196ae8e251066e".into(),
+                modified_at_ms: Some(1),
+            })
         }
 
         async fn resource_content(
@@ -2148,6 +2505,18 @@ mod tests {
         )
     }
 
+    fn authenticated_json_post_request(
+        address: SocketAddr,
+        path: &str,
+        cookie: &str,
+        body: &str,
+    ) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
     fn exchange_request(address: SocketAddr, token: &str) -> String {
         get_request(address, &format!("/__ygg/launch/{token}"))
     }
@@ -2423,6 +2792,180 @@ mod tests {
         assert_eq!(response_json(&activity)["current_streak"], 2);
         assert_eq!(response_json(&activity)["longest_streak"], 5);
         assert_eq!(response_json(&activity)["days"][0]["date"], "2025-01-02");
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_file_transport_is_authenticated_validated_and_conflict_aware() {
+        let host = Arc::new(MockHost::with_project_files());
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig::default(),
+        ));
+        let server = LoopbackServer::start(
+            supervisor,
+            LoopbackConfig {
+                port: 0,
+                web_root: None,
+            },
+        )
+        .await
+        .unwrap();
+        let address = server.address();
+
+        let unauthenticated = request(
+            address,
+            get_request(address, "/api/v1/fs/project-test/tree"),
+        )
+        .await;
+        assert!(unauthenticated.starts_with("HTTP/1.1 401"));
+
+        let exchanged = request(address, exchange_request(address, &server.launch_token)).await;
+        let cookie = response_header(&exchanged, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+
+        let invalid_project = request(
+            address,
+            authenticated_get_request(address, "/api/v1/fs/project%24/tree", cookie),
+        )
+        .await;
+        assert!(invalid_project.starts_with("HTTP/1.1 400"));
+
+        let tree = request(
+            address,
+            authenticated_get_request(address, "/api/v1/fs/project-test/tree", cookie),
+        )
+        .await;
+        assert!(tree.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&tree)["path"], "");
+        assert_eq!(response_json(&tree)["entries"][0]["name"], "src");
+
+        let invalid_range = request(
+            address,
+            authenticated_get_request(
+                address,
+                "/api/v1/fs/project-test/read?path=src%2Fmain.rs&startLine=0",
+                cookie,
+            ),
+        )
+        .await;
+        assert!(invalid_range.starts_with("HTTP/1.1 400"));
+
+        let file = request(
+            address,
+            authenticated_get_request(
+                address,
+                "/api/v1/fs/project-test/read?path=src%2Fmain.rs&startLine=1&endLine=1",
+                cookie,
+            ),
+        )
+        .await;
+        assert!(file.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&file)["path"], "src/main.rs");
+        assert!(response_json(&file)["sha256"].is_string());
+
+        let search = request(
+            address,
+            authenticated_get_request(address, "/api/v1/fs/project-test/search?query=main", cookie),
+        )
+        .await;
+        assert!(search.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&search)["hits"], serde_json::json!([]));
+
+        let expected_sha256 = "a".repeat(64);
+        let write_body = serde_json::json!({
+            "path": "src/main.rs",
+            "content": "updated",
+            "expectedSha256": expected_sha256,
+            "force": true,
+        })
+        .to_string();
+        let write = request(
+            address,
+            authenticated_json_post_request(
+                address,
+                "/api/v1/fs/project-test/write",
+                cookie,
+                &write_body,
+            ),
+        )
+        .await;
+        assert!(write.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&write)["path"], "src/main.rs");
+        assert_eq!(
+            host.project_file_writes.lock().unwrap().as_slice(),
+            [(
+                "src/main.rs".into(),
+                "updated".into(),
+                expected_sha256,
+                true
+            )]
+        );
+
+        let malformed_write = request(
+            address,
+            authenticated_json_post_request(
+                address,
+                "/api/v1/fs/project-test/write",
+                cookie,
+                r#"{"path":"src/main.rs","content":"updated"}"#,
+            ),
+        )
+        .await;
+        assert!(malformed_write.starts_with("HTTP/1.1 400"));
+
+        let conflict_body = serde_json::json!({
+            "path": "conflict",
+            "content": "updated",
+            "expectedSha256": "a".repeat(64),
+        })
+        .to_string();
+        let conflict = request(
+            address,
+            authenticated_json_post_request(
+                address,
+                "/api/v1/fs/project-test/write",
+                cookie,
+                &conflict_body,
+            ),
+        )
+        .await;
+        assert!(conflict.starts_with("HTTP/1.1 409"));
+        assert_eq!(response_json(&conflict)["error"]["code"], "locked");
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_file_transport_honors_host_capabilities() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let server = LoopbackServer::start(
+            supervisor,
+            LoopbackConfig {
+                port: 0,
+                web_root: None,
+            },
+        )
+        .await
+        .unwrap();
+        let address = server.address();
+        let exchanged = request(address, exchange_request(address, &server.launch_token)).await;
+        let cookie = response_header(&exchanged, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+
+        let unavailable = request(
+            address,
+            authenticated_get_request(address, "/api/v1/fs/project-test/tree", cookie),
+        )
+        .await;
+        assert!(unavailable.starts_with("HTTP/1.1 503"));
+        assert_eq!(response_json(&unavailable)["error"]["code"], "unavailable");
         server.shutdown().await.unwrap();
     }
 

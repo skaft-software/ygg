@@ -160,6 +160,8 @@ fn bootstrap() -> HostBootstrap {
             attachment_policy: Some(AttachmentPolicy::image_defaults()),
             documents: false,
             trusted_project_files: false,
+            project_file_browser: false,
+            project_file_write: false,
             transcript_search: false,
             previews: true,
             connected_devices: false,
