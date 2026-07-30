@@ -92,6 +92,8 @@ test("browses and saves a trusted project file", async ({ page }) => {
 
   await expect(page.getByRole("heading", { name: "Files", exact: true })).toBeVisible();
   await page.getByRole("button", { name: /README\.md/ }).click();
+  await expect(page.getByRole("heading", { name: "Fixture" })).toBeVisible();
+  await page.getByRole("button", { name: "Edit Markdown" }).click();
   const editor = page.getByRole("textbox", { name: "Contents of README.md" });
   await expect(editor).toBeVisible();
   await editor.fill("# Updated fixture project\n");

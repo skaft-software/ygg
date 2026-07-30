@@ -28,10 +28,24 @@ function renderFilesPanel(
   };
   const read: ProjectFileRead = {
     path: "README.md",
-    content: "# Fixture\n",
+    content: `# Fixture
+
+**Bold** and [a link](https://example.com).
+
+- one
+- two
+
+| Name | Value |
+| --- | --- |
+| Ygg | Serve |
+
+\`\`\`ts
+const answer = 42;
+\`\`\`
+`,
     startLine: 1,
-    endLine: 1,
-    lineCount: 1,
+    endLine: 14,
+    lineCount: 14,
     truncated: false,
     sha256: version,
   };
@@ -64,10 +78,22 @@ function renderFilesPanel(
 afterEach(cleanup);
 
 describe("FilesPanel", () => {
-  it("loads a trusted tree, tracks a dirty editor, and saves an optimistic write", async () => {
+  it("renders Markdown in a rich preview and preserves the editable save flow", async () => {
     const { getTree, readFile, writeFile } = renderFilesPanel();
 
     fireEvent.click(await screen.findByRole("button", { name: /README\.md/ }));
+    expect(await screen.findByRole("heading", { name: "Fixture" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "a link" })).toHaveAttribute(
+      "href",
+      "https://example.com",
+    );
+    expect(screen.getByRole("table")).toBeTruthy();
+    expect(screen.getByText("const answer = 42;")).toBeTruthy();
+    expect(
+      screen.queryByRole("textbox", { name: "Contents of README.md" }),
+    ).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit Markdown" }));
     const editor = await screen.findByRole("textbox", {
       name: "Contents of README.md",
     });
@@ -100,6 +126,8 @@ describe("FilesPanel", () => {
     renderFilesPanel({ writeFile });
 
     fireEvent.click(await screen.findByRole("button", { name: /README\.md/ }));
+    await screen.findByRole("heading", { name: "Fixture" });
+    fireEvent.click(screen.getByRole("button", { name: "Edit Markdown" }));
     const editor = await screen.findByRole("textbox", {
       name: "Contents of README.md",
     });

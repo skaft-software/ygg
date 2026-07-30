@@ -5,6 +5,15 @@ function basename(path: string): string {
   return path.slice(path.lastIndexOf("/") + 1);
 }
 
+export function isMarkdownPath(path: string): boolean {
+  const filename = basename(path).toLowerCase();
+  return (
+    filename === "readme" ||
+    filename.endsWith(".md") ||
+    filename.endsWith(".markdown")
+  );
+}
+
 export function languageForPath(path: string): LanguageDescription | null {
   const filename = basename(path);
   return (

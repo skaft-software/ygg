@@ -27,8 +27,9 @@ import type {
   ProjectSummary,
 } from "../protocol";
 import { ProjectFileConflictError } from "../transport";
+import MarkdownMessage from "./MarkdownMessage";
 import { FileCodeEditor } from "./FileCodeEditor";
-import { languageNameForPath } from "./fileLanguage";
+import { isMarkdownPath, languageNameForPath } from "./fileLanguage";
 
 interface DirectoryState {
   tree?: ProjectFileTree;
@@ -149,6 +150,9 @@ function ProjectFilesWorkspace({
   );
   const [selectedFile, setSelectedFile] = useState<ProjectFileRead | null>(null);
   const [draft, setDraft] = useState("");
+  const [markdownMode, setMarkdownMode] = useState<"preview" | "source">(
+    "source",
+  );
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -171,6 +175,7 @@ function ProjectFilesWorkspace({
   const selectedProject = availableProjects.find(
     (project) => project.id === projectId,
   );
+  const markdownFile = selectedFile !== null && isMarkdownPath(selectedFile.path);
 
   const loadDirectory = useCallback(
     async (path: string) => {
@@ -221,6 +226,7 @@ function ProjectFilesWorkspace({
         }
         setSelectedFile(file);
         setDraft(file.content);
+        setMarkdownMode(isMarkdownPath(file.path) ? "preview" : "source");
       } catch {
         if (fileRequestRef.current === request) {
           setFileError(true);
@@ -598,6 +604,24 @@ function ProjectFilesWorkspace({
                 </div>
                 <div className="files-editor-actions">
                   {dirty ? <span className="files-dirty">Unsaved</span> : null}
+                  {markdownFile ? (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      aria-label={
+                        markdownMode === "preview"
+                          ? "Edit Markdown"
+                          : "Preview Markdown"
+                      }
+                      onClick={() =>
+                        setMarkdownMode((mode) =>
+                          mode === "preview" ? "source" : "preview",
+                        )
+                      }
+                    >
+                      {markdownMode === "preview" ? "Edit Markdown" : "Preview Markdown"}
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="secondary-button"
@@ -654,16 +678,25 @@ function ProjectFilesWorkspace({
                   </button>
                 </div>
               ) : null}
-              <FileCodeEditor
-                path={selectedFile.path}
-                value={draft}
-                readOnly={!writeAvailable || selectedFile.truncated || !selectedFile.sha256}
-                onChange={(value) => {
-                  setDraft(value);
-                  setSaveError(false);
-                  setConflict(false);
-                }}
-              />
+              {markdownFile && markdownMode === "preview" ? (
+                <div
+                  className="files-markdown-viewer"
+                  aria-label="Rendered Markdown"
+                >
+                  <MarkdownMessage content={draft} />
+                </div>
+              ) : (
+                <FileCodeEditor
+                  path={selectedFile.path}
+                  value={draft}
+                  readOnly={!writeAvailable || selectedFile.truncated || !selectedFile.sha256}
+                  onChange={(value) => {
+                    setDraft(value);
+                    setSaveError(false);
+                    setConflict(false);
+                  }}
+                />
+              )}
             </>
           )}
         </section>
