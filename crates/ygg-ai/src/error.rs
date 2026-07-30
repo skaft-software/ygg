@@ -92,8 +92,11 @@ pub struct TransportError {
 /// Phases of request execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransportPhase {
-    /// Connection handshake or receiving headers.
-    ConnectOrHeaders,
+    /// DNS, TCP, or TLS connection establishment before a request is accepted.
+    Connect,
+    /// Sending the request or waiting for response headers. The provider may
+    /// already have accepted the request, so replay is not inherently safe.
+    ResponseHeaders,
     /// Streaming/reading the response body.
     Body,
 }
@@ -375,14 +378,14 @@ mod tests {
     #[test]
     fn test_transport_error_preserves_phase() {
         let err = AiError::Transport(TransportError {
-            phase: TransportPhase::ConnectOrHeaders,
+            phase: TransportPhase::ResponseHeaders,
             timeout: true,
             message: "Sanitized error message".to_string(),
         });
         let AiError::Transport(transport) = &err else {
             unreachable!()
         };
-        assert_eq!(transport.phase, TransportPhase::ConnectOrHeaders);
+        assert_eq!(transport.phase, TransportPhase::ResponseHeaders);
         assert!(transport.timeout);
         let display = err.to_string();
         assert_eq!(display.matches("Transport error").count(), 1, "{display}");

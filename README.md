@@ -589,7 +589,7 @@ ygg is intentionally honest about where its boundary ends.
 - **Bounded inputs:** provider streams, discovery payloads, configuration, credentials, context, sessions, tool arguments/results, and local reads have byte/count limits.
 - **Crash behavior:** complete records survive; a torn final append is narrowly repairable; unresolved mutation is reported as indeterminate and never replayed.
 - **Cancellation:** provider streams, retry waits, compaction, tools, and descendant process groups observe cancellation.
-- **Network recovery:** non-timeout transport loss retries up to five times with visible diagnostics; provisional TUI output is discarded before replacement. A full timeout is not multiplied automatically.
+- **Network recovery:** non-timeout connection-establishment failures and response-body disconnects retry up to five times with visible diagnostics; provisional TUI output is discarded before replacement. Full transport timeouts are terminal. Failures while sending a POST or awaiting response headers are also terminal because provider acceptance is ambiguous.
 - **Secret handling:** credential files are owner-private, sensitive headers are marked, redirects are disabled, provider diagnostics redact request credentials, debug formatting redacts secrets, and session export applies bounded deterministic redaction.
 - **Terminal safety:** untrusted terminal controls are neutralized; terminal capabilities degrade without changing semantic content.
 - **Dependency policy:** `cargo audit` and `cargo deny` cover advisories, licenses, bans, duplicate visibility, and source policy as release gates.

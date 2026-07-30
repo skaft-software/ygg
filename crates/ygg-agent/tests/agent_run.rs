@@ -343,6 +343,17 @@ impl Respond for RetryInitialOpen {
     }
 }
 
+struct DelayedHeaders {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Respond for DelayedHeaders {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ResponseTemplate::new(200).set_delay(Duration::from_millis(100))
+    }
+}
+
 struct FailThenSucceed {
     calls: AtomicUsize,
 }
@@ -421,10 +432,31 @@ async fn interrupted_body_server(partial: String, recovered: String) -> (String,
     (uri, calls)
 }
 
+/// Accept TLS connections and close each socket during the handshake, before
+/// any HTTP request can reach the server. This deterministically exercises a
+/// replay-safe connection-establishment failure.
+async fn failed_tls_connect_server(attempts: usize) -> (String, Arc<AtomicUsize>) {
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!("https://{}", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    tokio::spawn(async move {
+        for _ in 0..attempts {
+            let (socket, _) = listener.accept().await.unwrap();
+            server_calls.fetch_add(1, Ordering::SeqCst);
+            drop(socket);
+        }
+    });
+    (uri, calls)
+}
+
 /// Accept requests and close each socket before writing response headers. This
-/// deterministically exercises ConnectOrHeaders recovery without waiting on a
-/// real DNS route or provider timeout.
+/// deterministically exercises an ambiguous response-header failure after the
+/// provider may have accepted the POST.
 async fn dropped_header_server(attempts: usize) -> (String, Arc<AtomicUsize>) {
+    use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -433,7 +465,39 @@ async fn dropped_header_server(attempts: usize) -> (String, Arc<AtomicUsize>) {
     let server_calls = calls.clone();
     tokio::spawn(async move {
         for _ in 0..attempts {
-            let (socket, _) = listener.accept().await.unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let (body_start, content_length) = loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let body_start = header_end + 4;
+                let headers = String::from_utf8_lossy(&request[..body_start]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                break (body_start, content_length);
+            };
+            while request.len().saturating_sub(body_start) < content_length {
+                let read = socket.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
             server_calls.fetch_add(1, Ordering::SeqCst);
             drop(socket);
         }
@@ -593,6 +657,14 @@ fn scripted_responses_model(uri: &str) -> Model {
             transport: ygg_ai::EndpointTransport::Http,
             timeout: Duration::from_secs(10),
         }),
+    }
+}
+
+fn scripted_model_for_protocol(uri: &str, protocol: Protocol) -> Model {
+    match protocol {
+        Protocol::OpenAiResponses => scripted_responses_model(uri),
+        Protocol::OpenAiChat => openai_multimodal_model(uri),
+        Protocol::AnthropicMessages => scripted_model(uri),
     }
 }
 
@@ -922,6 +994,61 @@ async fn retryable_initial_stream_open_is_retried_by_the_agent() {
 }
 
 #[tokio::test]
+async fn response_header_timeout_is_terminal_without_replaying_post() {
+    for protocol in [
+        Protocol::OpenAiResponses,
+        Protocol::OpenAiChat,
+        Protocol::AnthropicMessages,
+    ] {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .respond_with(DelayedHeaders {
+                calls: calls.clone(),
+            })
+            .mount(&server)
+            .await;
+
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let session_dir = tempfile::tempdir().unwrap();
+        let workspace = workspace_dir.path().canonicalize().unwrap();
+        let session_path = session_dir.path().join("session.jsonl");
+        let mut model = scripted_model_for_protocol(&server.uri(), protocol);
+        Arc::make_mut(&mut model.endpoint).timeout = Duration::from_millis(10);
+        let mut agent = build_agent_with_reasoning(
+            model,
+            &session_path,
+            &workspace,
+            ReasoningConfig::Off,
+            Some(4),
+        );
+
+        let mut run = agent.prompt("do not replay a slow POST").await.unwrap();
+        let events = collect(&mut run).await;
+        assert!(
+            matches!(assert_single_run_finished(&events), FinishReason::Failed(_)),
+            "{protocol:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ProviderRetry { .. })),
+            "{protocol:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{protocol:?}");
+        let FinishReason::Failed(error) = assert_single_run_finished(&events) else {
+            unreachable!("failure was asserted above")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for response headers"),
+            "{protocol:?}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn incomplete_responses_output_survives_continuation_and_restart() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1161,8 +1288,55 @@ async fn responses_restart_compact_and_post_checkpoint_replay_stay_exact_end_to_
 }
 
 #[tokio::test]
-async fn repeated_header_transport_failure_is_visible_and_bounded() {
-    let (uri, calls) = dropped_header_server(MAX_CONNECT_ATTEMPTS_FOR_TEST).await;
+async fn accepted_post_dropped_before_headers_is_not_replayed() {
+    for protocol in [
+        Protocol::OpenAiResponses,
+        Protocol::OpenAiChat,
+        Protocol::AnthropicMessages,
+    ] {
+        let (uri, calls) = dropped_header_server(2).await;
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let session_dir = tempfile::tempdir().unwrap();
+        let workspace = workspace_dir.path().canonicalize().unwrap();
+        let session_path = session_dir.path().join("session.jsonl");
+        let model = scripted_model_for_protocol(&uri, protocol);
+        let mut agent = build_agent_with_reasoning(
+            model,
+            &session_path,
+            &workspace,
+            ReasoningConfig::Off,
+            Some(4),
+        );
+
+        let mut run = agent
+            .prompt("do not replay an accepted POST")
+            .await
+            .unwrap();
+        let events = collect(&mut run).await;
+        assert!(
+            matches!(assert_single_run_finished(&events), FinishReason::Failed(_)),
+            "{protocol:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ProviderRetry { .. })),
+            "{protocol:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{protocol:?}");
+        let FinishReason::Failed(error) = assert_single_run_finished(&events) else {
+            unreachable!("failure was asserted above")
+        };
+        assert!(
+            error.to_string().contains("ResponseHeaders"),
+            "{protocol:?}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn repeated_connect_failure_is_visible_and_bounded() {
+    let (uri, calls) = failed_tls_connect_server(MAX_CONNECT_ATTEMPTS_FOR_TEST).await;
     let workspace_dir = tempfile::tempdir().unwrap();
     let session_dir = tempfile::tempdir().unwrap();
     let workspace = workspace_dir.path().canonicalize().unwrap();
@@ -1194,7 +1368,7 @@ async fn repeated_header_transport_failure_is_visible_and_bounded() {
         .iter()
         .all(|(_, _, error)| error.contains("Are you connected to the internet?")));
     assert!(retries[0].2.contains("provider=test model=scripted"));
-    assert!(retries[0].2.contains("ConnectOrHeaders"));
+    assert!(retries[0].2.contains("Connect"));
     assert!(
         retries[0].2.contains("connection") || retries[0].2.contains("closed"),
         "the sanitized transport cause chain was lost: {}",
@@ -1217,7 +1391,7 @@ async fn repeated_header_transport_failure_is_visible_and_bounded() {
 
 #[tokio::test]
 async fn connect_retry_delay_is_cancellable() {
-    let (uri, calls) = dropped_header_server(1).await;
+    let (uri, calls) = failed_tls_connect_server(2).await;
     let workspace_dir = tempfile::tempdir().unwrap();
     let session_dir = tempfile::tempdir().unwrap();
     let workspace = workspace_dir.path().canonicalize().unwrap();
