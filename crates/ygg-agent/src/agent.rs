@@ -885,9 +885,7 @@ fn close_failed_turn(session: &mut Session, model: &Model) -> Result<(), AgentEr
 fn retryable_before_generation(error: &AiError) -> bool {
     match error {
         AiError::Http(error) => error.is_safe_to_retry(),
-        AiError::Transport(error) => {
-            !error.timeout && error.phase == ygg_ai::TransportPhase::ConnectOrHeaders
-        }
+        AiError::Transport(error) => error.phase == ygg_ai::TransportPhase::ConnectOrHeaders,
         _ => false,
     }
 }
@@ -993,10 +991,14 @@ fn retryable_stream_start(error: &AiError) -> bool {
 }
 
 fn provider_retry_limit(error: &AiError) -> usize {
-    if matches!(error, AiError::Transport(transport) if transport.timeout) {
-        // A timeout already consumed the configured wait budget. Repeating it
-        // automatically would turn one bounded deadline into prolonged UI
-        // silence; let the user explicitly retry instead.
+    if matches!(
+        error,
+        AiError::Transport(transport)
+            if transport.timeout && transport.phase == ygg_ai::TransportPhase::Body
+    ) {
+        // A body timeout already consumed the stream's idle or absolute
+        // deadline. Keep it terminal; response-header timeouts happen before
+        // generation is observed and use the bounded provider retry budget.
         0
     } else if is_transient_network_failure(error) {
         MAX_NETWORK_RETRIES
@@ -3902,13 +3904,14 @@ mod tests {
     }
 
     #[test]
-    fn response_header_timeout_is_not_automatically_retried() {
+    fn response_header_timeout_is_retried_before_generation() {
         let error = AiError::Transport(ygg_ai::TransportError {
             phase: ygg_ai::TransportPhase::ConnectOrHeaders,
             timeout: true,
             message: "response headers stalled".into(),
         });
-        assert_eq!(provider_retry_limit(&error), 0);
+        assert!(retryable_before_generation(&error));
+        assert_eq!(provider_retry_limit(&error), MAX_PROVIDER_RETRIES);
     }
 
     #[test]

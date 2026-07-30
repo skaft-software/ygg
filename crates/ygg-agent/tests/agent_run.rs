@@ -343,6 +343,23 @@ impl Respond for RetryInitialOpen {
     }
 }
 
+struct HeaderTimeoutThenSucceed {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Respond for HeaderTimeoutThenSucceed {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        let response = ResponseTemplate::new(200)
+            .set_body_string(text_turn("recovered after header timeout"))
+            .insert_header("content-type", "text/event-stream");
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            response.set_delay(Duration::from_millis(100))
+        } else {
+            response
+        }
+    }
+}
+
 struct FailThenSucceed {
     calls: AtomicUsize,
 }
@@ -918,6 +935,50 @@ async fn retryable_initial_stream_open_is_retried_by_the_agent() {
         .filter(|event| matches!(event, AgentEvent::ProviderRetry { .. }))
         .count();
     assert_eq!(retries, 1, "the retry must be visible while it happens");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn response_header_timeout_retries_the_turn_and_recovers() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(HeaderTimeoutThenSucceed {
+            calls: calls.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let session_path = session_dir.path().join("session.jsonl");
+    let mut model = scripted_model(&server.uri());
+    Arc::make_mut(&mut model.endpoint).timeout = Duration::from_millis(10);
+    let mut agent = build_agent_with_reasoning(
+        model,
+        &session_path,
+        &workspace,
+        ReasoningConfig::Off,
+        Some(4),
+    );
+
+    let mut run = agent.prompt("survive a slow response start").await.unwrap();
+    let events = collect(&mut run).await;
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ProviderRetry {
+            attempt: 1,
+            max_attempts: 3,
+            error,
+            ..
+        } if error.contains("timed out waiting for response headers")
+    )));
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
