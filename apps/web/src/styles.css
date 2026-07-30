@@ -753,8 +753,39 @@ kbd {
   flex-direction: column;
   align-items: center;
   gap: 10px;
-  padding: 44px 16px;
+  margin: 16px 8px;
+  padding: 32px 16px;
+  border-radius: 10px;
   color: var(--text-faint);
+  background: var(--surface);
+  text-align: center;
+}
+
+.sidebar-empty > svg {
+  width: 20px;
+  height: 20px;
+  color: var(--text-muted);
+}
+
+.sidebar-empty > strong {
+  max-width: 200px;
+  color: var(--text-soft);
+  font-size: var(--font-body);
+  font-weight: 550;
+  line-height: 1.4;
+}
+
+.sidebar-empty-action {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.sidebar-empty-action > svg {
+  width: 15px;
+  height: 15px;
 }
 
 .sidebar-footer {
@@ -7298,8 +7329,15 @@ kbd {
   gap: 12px;
   padding: 24px;
   color: var(--text-soft);
-  background: var(--bg);
   text-align: center;
+}
+
+.app-loading {
+  background: var(--bg);
+}
+
+.app-error {
+  background: color-mix(in srgb, var(--danger) 3%, var(--bg));
 }
 
 .app-loading .ygg-glyph {
@@ -7307,12 +7345,23 @@ kbd {
   height: 68px;
 }
 
+.app-loading > strong,
+.app-error > h1 {
+  color: var(--text);
+}
+
+.app-loading > p,
+.app-error > p {
+  max-width: 320px;
+  color: var(--text-muted);
+}
+
 .loading-pulse {
   width: 26px;
   height: 3px;
   overflow: hidden;
   border-radius: 99px;
-  background: var(--surface);
+  background: var(--accent);
 }
 
 .error-mark {

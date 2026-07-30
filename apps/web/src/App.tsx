@@ -211,10 +211,11 @@ function ConnectionBanner({
 
 function LoadingState() {
   return (
-    <div className="app-loading" aria-live="polite">
+    <div className="app-loading" role="status" aria-live="polite">
       <YggGlyph />
-      <span className="loading-pulse" />
-      <strong>Opening a new session</strong>
+      <span className="loading-pulse" aria-hidden="true" />
+      <strong>Connecting to ygg</strong>
+      <p>Preparing your workspace.</p>
     </div>
   );
 }

@@ -843,15 +843,25 @@ function SidebarView({
               ) : (
                 <Menu aria-hidden="true" />
               )}
-              <span>
+              <strong>
                 {normalizedQuery
-                  ? "No matching sessions"
+                  ? "No sessions match your query"
                   : view === "archived"
                     ? "Archive is empty"
                     : view === "trash"
                       ? "Trash is empty"
-                      : "No sessions yet"}
-              </span>
+                      : "Start a conversation to see it here"}
+              </strong>
+              {view === "active" && !normalizedQuery ? (
+                <button
+                  className="secondary-button sidebar-empty-action"
+                  type="button"
+                  onClick={onNewSession}
+                >
+                  <MessageSquarePlus aria-hidden="true" />
+                  New session
+                </button>
+              ) : null}
             </div>
           ) : (
             <>
