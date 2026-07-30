@@ -9146,7 +9146,7 @@ body {
 }
 
 .files-panel-header h1 {
-  font-size: 20px;
+  font-size: var(--font-body);
   line-height: 26px;
   font-weight: 620;
 }
@@ -9463,7 +9463,7 @@ body {
   color: var(--viewer-ink);
   background: transparent;
   font-family: var(--mono-family);
-  font-size: 13px;
+  font-size: var(--font-body);
   line-height: 1.62;
   tab-size: 2;
   white-space: pre;
@@ -9587,7 +9587,7 @@ body {
 
 .files-empty h1 {
   color: var(--text);
-  font-size: 20px;
+  font-size: var(--font-body);
 }
 
 .files-empty p {
@@ -9603,10 +9603,6 @@ body {
 
   .files-panel-header > div > span {
     display: none;
-  }
-
-  .files-panel-header h1 {
-    font-size: 18px;
   }
 
   .files-project-picker {
@@ -9638,7 +9634,7 @@ body {
 
   .files-editor-text {
     padding: 12px;
-    font-size: 12px;
+    font-size: var(--font-meta);
   }
 
   .files-conflict,
