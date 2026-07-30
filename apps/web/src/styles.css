@@ -9847,6 +9847,33 @@ body {
   font-weight: 600;
 }
 
+.files-markdown-viewer {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 24px clamp(16px, 4vw, 56px) 40px;
+  color: var(--viewer-ink);
+  background: var(--viewer-paper);
+}
+
+.files-markdown-viewer > .markdown-body {
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+.files-markdown-viewer .markdown-body h1 {
+  margin-top: 0;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.files-markdown-viewer .markdown-body h2,
+.files-markdown-viewer .markdown-body h3,
+.files-markdown-viewer .markdown-body h4 {
+  font-weight: 620;
+}
+
 .files-code-editor {
   position: relative;
   min-width: 0;
@@ -9881,6 +9908,19 @@ body {
   background: transparent;
   font-family: var(--mono-family);
   font-size: var(--font-body);
+}
+
+.files-code-editor.is-numbered .files-code-highlight .cm-gutters {
+  border-right: 1px solid var(--line);
+  color: var(--text-faint);
+  background: transparent;
+  font-family: var(--mono-family);
+}
+
+.files-code-editor.is-numbered .files-code-highlight .cm-gutterElement {
+  min-width: 36px;
+  padding: 0 8px 0 0;
+  text-align: right;
 }
 
 .files-code-highlight .cm-scroller {
@@ -9919,6 +9959,10 @@ body {
   text-shadow: none;
   white-space: pre;
   overflow-wrap: normal;
+}
+
+.files-code-editor.is-numbered .files-editor-input {
+  padding-left: 58px;
 }
 
 .files-editor-input::selection {
@@ -10085,10 +10129,18 @@ body {
     padding-inline: 10px;
   }
 
+  .files-markdown-viewer {
+    padding: 16px 12px 28px;
+  }
+
   .files-code-highlight .cm-content,
   .files-editor-input {
     padding: 12px;
     font-size: var(--font-meta);
+  }
+
+  .files-code-editor.is-numbered .files-editor-input {
+    padding-left: 52px;
   }
 
   .files-conflict,

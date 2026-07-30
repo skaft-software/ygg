@@ -89,6 +89,59 @@ describe("FilesPanel", () => {
     );
     expect(screen.getByRole("table")).toBeTruthy();
     expect(screen.getByText("const answer = 42;")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy file" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Download file" })).toBeTruthy();
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const originalClipboard = navigator.clipboard;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Copy file" }));
+      await waitFor(() => {
+        expect(writeText).toHaveBeenCalledWith(expect.stringContaining("# Fixture"));
+      });
+    } finally {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: originalClipboard,
+      });
+    }
+
+    const originalCreateObjectURL = URL.createObjectURL;
+    const originalRevokeObjectURL = URL.revokeObjectURL;
+    const createObjectURL = vi.fn(() => "blob:fixture");
+    const revokeObjectURL = vi.fn();
+    const anchorClick = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectURL,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectURL,
+    });
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Download file" }));
+      expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+      expect(anchorClick).toHaveBeenCalledOnce();
+      await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:fixture"));
+    } finally {
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        value: originalCreateObjectURL,
+      });
+      Object.defineProperty(URL, "revokeObjectURL", {
+        configurable: true,
+        value: originalRevokeObjectURL,
+      });
+      anchorClick.mockRestore();
+    }
+
     expect(
       screen.queryByRole("textbox", { name: "Contents of README.md" }),
     ).toBeNull();
@@ -97,6 +150,7 @@ describe("FilesPanel", () => {
     const editor = await screen.findByRole("textbox", {
       name: "Contents of README.md",
     });
+    expect(document.querySelector(".files-code-editor.is-numbered")).toBeTruthy();
     fireEvent.change(editor, { target: { value: "# Updated fixture\n" } });
 
     expect(screen.getByText("Unsaved")).toBeTruthy();
