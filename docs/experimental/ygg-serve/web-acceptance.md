@@ -31,6 +31,15 @@ inspection evidence.
   summary, and evidence-free outcomes do not add empty review disclosures.
 - Composer text, supported attachments, model, reasoning, authority, send,
   stop, steer, and queued follow-up use real controls.
+- Typing a trailing `@` token opens a keyboard-first trusted-file completion;
+  selection keeps the file ID as explicit prompt context and does not alter the
+  user-authored text.
+- Typing `/` as the first composer token opens TUI-ordered command discovery.
+  Built-ins, prompt templates, admitted skills, and enabled extension commands
+  retain host-provided labels and argument hints; typed slash invocation never
+  becomes an ordinary model prompt.
+- Completion supports arrows, Home/End, Page Up/Down, Enter, Escape, and unique
+  slash-prefix Tab completion while the textarea retains focus.
 - Sources, outputs, and changed files come from deterministic evidence.
 - Preview opens in a resizable split on wide screens and a full-screen surface
   on phones.

@@ -31,7 +31,7 @@ The immediate release blockers are:
 | Sources, diffs, and outputs | Real but limited to specific built-in tools |
 | Live generated-site previews | Fixture UI exists; production capability is off |
 | Projects and folder management | One synthetic launch workspace only |
-| Extension, skills, MCP, or LSP GUI | Not implemented |
+| Extension, skills, MCP, or LSP GUI | Composer discovery supports trusted skills, prompt templates, and enabled extension commands; no dedicated management GUI, MCP, or LSP |
 | Child-agent visualization | Not implemented; the runtime does not expose it |
 | LAN-connected devices | Designed, not implemented |
 | macOS, iOS, and Android applications | Designed; no app projects or signed builds |
@@ -235,6 +235,11 @@ experiment. `--port 0` may be added to request an ephemeral port.
 - Durable run outcomes.
 - Model catalog and model selection.
 - Reasoning-effort selection.
+- Composer `@` completion backed by trusted project-file IDs; selected files remain
+  explicit context instead of being silently injected into user text.
+- Session-scoped `/` discovery and typed idle-boundary invocation for built-in
+  commands, prompt templates, host-admitted skills, and enabled extension
+  commands.
 
 The actual production authority catalog currently exposes `FullAccess` only.
 Narrower authority values exist in the protocol and UI vocabulary but are not
@@ -357,12 +362,24 @@ transport from becoming reachable as production behavior.
 
 ### Extensions and agent ecosystem
 
-The first web release intentionally excludes:
+The web composer has limited, session-scoped parity with TUI resource discovery:
 
-- skills management;
+- it exposes only skills, prompt templates, and executable extension commands
+  already admitted by the host's existing trust policy;
+- `/skills` accepts the TUI list, show, active, search, load, reload, and off
+  workflow, with selectable skill names from the discovery payload;
+- `/reload`, `/skills reload`, and `/extensions reload` rebuild dynamic
+  instructions, prompts, skills, and enabled extensions at an idle boundary;
+  and
+- extension commands that need an interactive extension confirmation are denied,
+  because the web host does not yet expose a confirmation bridge or an extension
+  output panel.
+
+The first web release still excludes:
+
 - MCP management;
-- plugin or extension catalog and lifecycle;
-- extension diagnostics and reload;
+- a plugin or extension catalog and lifecycle UI;
+- extension diagnostics and a dedicated extension-output surface;
 - LSP;
 - scheduling;
 - interactive terminal;
