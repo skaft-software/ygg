@@ -10,13 +10,13 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 use crate::{
-    ActorOwnerState, AttentionState, AuthorityProfile, CommandAck, CommandDiscovery, CommandId, DeviceId,
-    DriverCommandOutcome, ErrorCode, EventEnvelope, EventJournal, EventPayload, FinalizeCompletion,
-    FinalizeDecision, HostId, ItemDelta, ItemLifecycle, ItemPayload, JournalConfig, JournalError,
-    ProtocolValidation, ReplayResponse, RequestAnswer, RequestState, SanitizedError, ServiceError,
-    SessionCommand, SessionCommandEnvelope, SessionCursor, SessionDriver, SessionLiveState,
-    SessionSeed, SessionSnapshot, SessionSummary, TimestampedEvent, ValidationError,
-    MAX_DRIVER_OUTCOME_EVENTS,
+    ActorOwnerState, AttentionState, AuthorityProfile, CommandAck, CommandDiscovery, CommandId,
+    DeviceId, DriverCommandOutcome, ErrorCode, EventEnvelope, EventJournal, EventPayload,
+    FinalizeCompletion, FinalizeDecision, HostId, ItemDelta, ItemLifecycle, ItemPayload,
+    JournalConfig, JournalError, ProtocolValidation, ReplayResponse, RequestAnswer, RequestState,
+    SanitizedError, ServiceError, SessionCommand, SessionCommandEnvelope, SessionCursor,
+    SessionDriver, SessionLiveState, SessionSeed, SessionSnapshot, SessionSummary,
+    TimestampedEvent, ValidationError, MAX_DRIVER_OUTCOME_EVENTS,
 };
 
 const MAX_COMMAND_CACHE_CAPACITY: usize = 65_536;
@@ -375,16 +375,15 @@ impl SessionActorCore {
                 | SessionCommand::EditUserTurn { .. }
                 | SessionCommand::RetryResponse { .. }
                 | SessionCommand::ForkConversation { .. }
-        )
-            && (self.view.snapshot.active_run_id.is_some()
-                || !self.view.snapshot.pending_requests.is_empty()
-                || !matches!(
-                    self.view.snapshot.live_state,
-                    SessionLiveState::Idle
-                        | SessionLiveState::Done
-                        | SessionLiveState::Failed
-                        | SessionLiveState::Stopped
-                ))
+        ) && (self.view.snapshot.active_run_id.is_some()
+            || !self.view.snapshot.pending_requests.is_empty()
+            || !matches!(
+                self.view.snapshot.live_state,
+                SessionLiveState::Idle
+                    | SessionLiveState::Done
+                    | SessionLiveState::Failed
+                    | SessionLiveState::Stopped
+            ))
         {
             return Err(SanitizedError::public(
                 ErrorCode::InvalidBoundary,
@@ -414,7 +413,10 @@ impl SessionActorCore {
             SessionCommand::EditUserTurn {
                 source_user_entry_id,
                 ..
-            } => Some((source_user_entry_id, crate::SessionBranchEntryKind::UserMessage)),
+            } => Some((
+                source_user_entry_id,
+                crate::SessionBranchEntryKind::UserMessage,
+            )),
             SessionCommand::RetryResponse {
                 source_assistant_entry_id,
                 ..
@@ -1144,9 +1146,10 @@ impl From<ActorError> for SanitizedError {
 mod tests {
     use crate::{
         AckDisposition, ActivityPhase, ContextUsage, DurableEntryId, ItemId, ModelSelection,
-        PendingRequest, PromptInput, RequestId, RequestKind, RequestState, RunId, SessionBranchEntry,
-        SessionBranchEntryKind, SessionBranchGraph, SessionId, SessionItem, SessionLiveState,
-        SlashCommandInvocation, ToolActivity, ToolActivityStatus, ToolKind, TurnId,
+        PendingRequest, PromptInput, RequestId, RequestKind, RequestState, RunId,
+        SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionId, SessionItem,
+        SessionLiveState, SlashCommandInvocation, ToolActivity, ToolActivityStatus, ToolKind,
+        TurnId,
     };
 
     use super::*;

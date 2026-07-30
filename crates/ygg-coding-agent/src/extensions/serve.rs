@@ -23,35 +23,35 @@ use ygg_ai::{
     ReasoningConfig, ToolCallId, ToolResultPart, UserPart,
 };
 use ygg_serve_backend::{
-    parse_test_output, refresh_repository_context, ActivityPhase, ActivityPhaseSummary, ActorOwnerState,
-    ArtifactId, ArtifactKind, ArtifactRef, AttachmentError, AttachmentFingerprint,
+    parse_test_output, refresh_repository_context, ActivityPhase, ActivityPhaseSummary,
+    ActorOwnerState, ArtifactId, ArtifactKind, ArtifactRef, AttachmentError, AttachmentFingerprint,
     AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState, AuthorityProfile,
-    ColorScheme, CompletionReview, ContextUsage, ConversationBranchOperation, ConversationBranchProvenance,
-    CreateSessionRequest, DocumentReference, DocumentStore, DocumentStoreError, DriverCommandOutcome,
-    DurableEntryId, EventPayload, EvidenceCoverage, FileChange, FileEntryId,
-    FinalizeCompletion, FinalizeDecision, HostCapabilities, HostDescriptor, HostId,
-    HostService, InferenceRequest, InferenceRequestStore, InputModality, ItemDelta,
-    ItemId, ItemLifecycle, ItemPayload, LifetimeUsage, LoopbackConfig,
+    ColorScheme, CommandDiscovery, CommandSuggestion, CommandSuggestionKind, CompletionReview,
+    ContextUsage, ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
+    DocumentReference, DocumentStore, DocumentStoreError, DriverCommandOutcome, DurableEntryId,
+    EventPayload, EvidenceCoverage, FileChange, FileEntryId, FinalizeCompletion, FinalizeDecision,
+    HostCapabilities, HostDescriptor, HostId, HostService, InferenceRequest, InferenceRequestStore,
+    InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload, LifetimeUsage, LoopbackConfig,
     LoopbackServer, ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary,
-    PendingRequest, PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult, ProjectFileSystem,
-    ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ProjectId, ProjectRegistry,
-    ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation, RegistryProjectId,
-    RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer, RequestId,
-    RequestKind, RequestState, RunId, SearchDocument, SearchDocumentKind,
+    PendingRequest, PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult,
+    ProjectFileSystem, ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ProjectId,
+    ProjectRegistry, ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation,
+    RegistryProjectId, RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot,
+    RequestAnswer, RequestId, RequestKind, RequestState, RunId, SearchDocument, SearchDocumentKind,
     SearchError, SemanticRole, ServiceError, SessionBranchEntry, SessionBranchEntryKind,
     SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor, SessionDriver,
-    SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed,
-    SessionSnapshot, SessionSummary, SessionSupervisor, SourceId, SourceKind,
-    SourceRef, StoredAttachment, StoredResource, StructuredTestResults, SupervisorConfig,
-    TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput, ThemeColor,
-    ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
-    ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity,
-    ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest,
-    TranscriptSearchResult, TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary, TrustedFileRead,
-    TrustedFileSearchResult, TrustedProjectFiles, TurnId, UsageActivity, UsagePeriod,
-    UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery, MAX_ITEM_TEXT_BYTES,
-    MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES, CommandDiscovery, CommandSuggestion,
-    CommandSuggestionKind, SkillSuggestion, SlashCommandInvocation, PROTOCOL_VERSION,
+    SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot,
+    SessionSummary, SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId,
+    SourceKind, SourceRef, StoredAttachment, StoredResource, StructuredTestResults,
+    SupervisorConfig, TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput,
+    ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle,
+    ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity, ToolActivityStatus,
+    ToolKind, ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest,
+    TranscriptSearchResult, TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary,
+    TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId, UsageActivity,
+    UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
+    MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES,
+    PROTOCOL_VERSION,
 };
 
 use crate::app::bootstrap::{build_app, rebuild_app, LaunchSelection, SessionSelection};
@@ -764,12 +764,12 @@ fn search_document_for_item(
                     .iter()
                     .map(|document| document.display_name.clone()),
             );
-            visible.extend(
-                project_files
-                    .iter()
-                    .map(|file| file.relative_path.clone()),
-            );
-            (SearchDocumentKind::User, visible.join("\n"), fallback_timestamp_ms)
+            visible.extend(project_files.iter().map(|file| file.relative_path.clone()));
+            (
+                SearchDocumentKind::User,
+                visible.join("\n"),
+                fallback_timestamp_ms,
+            )
         }
         ItemPayload::AssistantMessage { text } => (
             SearchDocumentKind::Assistant,
@@ -803,11 +803,14 @@ fn search_document_for_item(
             } else {
                 SearchDocumentKind::Tool
             },
-            [Some(result.summary.as_str()), result.output_summary.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join("\n"),
+            [
+                Some(result.summary.as_str()),
+                result.output_summary.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n"),
             result.completed_at_ms,
         ),
         ItemPayload::RunOutcome {
@@ -836,10 +839,7 @@ fn search_document_for_item(
         item_id: item.id.as_str().to_owned(),
         kind,
         session_title: bounded_text(session_title, 512),
-        text: bounded_text(
-            &text,
-            ygg_serve_backend::MAX_SEARCH_DOCUMENT_TEXT_BYTES,
-        ),
+        text: bounded_text(&text, ygg_serve_backend::MAX_SEARCH_DOCUMENT_TEXT_BYTES),
         timestamp_ms,
     })
 }
@@ -1297,10 +1297,7 @@ impl HostService for YggHost {
                         },
                     )?;
                     rebuilt
-                        .replace_session(
-                            session_id.as_str(),
-                            search_documents_for_seed(&seed),
-                        )
+                        .replace_session(session_id.as_str(), search_documents_for_seed(&seed))
                         .map_err(transcript_search_service_error)?;
                 }
             }
@@ -1549,8 +1546,8 @@ impl HostService for YggHost {
             .sessions
             .set_lifecycle(session_id.as_str(), storage_lifecycle, changed_at_ms)
             .map_err(|_| ServiceError::Internal)?;
-        let meta = session_meta_for_id(&context.sessions, session_id)
-            .ok_or(ServiceError::NotFound)?;
+        let meta =
+            session_meta_for_id(&context.sessions, session_id).ok_or(ServiceError::NotFound)?;
         let selection = Session::open_read_only(&meta.path)
             .ok()
             .and_then(|session| {
@@ -1566,8 +1563,7 @@ impl HostService for YggHost {
         confirmation: &PermanentDeleteConfirmation,
     ) -> Result<(), ServiceError> {
         if &confirmation.session_id != session_id
-            || confirmation.phrase
-                != format!("permanently delete {}", session_id.as_str())
+            || confirmation.phrase != format!("permanently delete {}", session_id.as_str())
         {
             return Err(ServiceError::InvalidBoundary);
         }
@@ -2070,8 +2066,7 @@ async fn run_worker(
                         }
                     },
                 };
-                let source_entry =
-                    EntryId(source_user_entry_id.as_str().to_owned());
+                let source_entry = EntryId(source_user_entry_id.as_str().to_owned());
                 if owned_app
                     .agent
                     .session()
@@ -2079,9 +2074,7 @@ async fn run_worker(
                     .is_none_or(|entry| !is_user_authored_entry(entry))
                 {
                     app = Some(owned_app);
-                    let _ = message
-                        .response
-                        .send(Err(ServiceError::InvalidBoundary));
+                    let _ = message.response.send(Err(ServiceError::InvalidBoundary));
                     continue;
                 }
                 let provenance = ConversationBranchProvenance {
@@ -2138,39 +2131,33 @@ async fn run_worker(
                         }
                     },
                 };
-                let assistant_entry =
-                    EntryId(source_assistant_entry_id.as_str().to_owned());
-                let source_user_entry = match retry_originating_user_entry(
-                    owned_app.agent.session(),
-                    &assistant_entry,
-                ) {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        app = Some(owned_app);
-                        let _ = message.response.send(Err(error));
-                        continue;
-                    }
-                };
-                let replay = match replay_prompt_input(
-                    owned_app.agent.session(),
-                    &source_user_entry,
-                    &plan,
-                ) {
-                    Ok(replay) => replay,
-                    Err(error) => {
-                        app = Some(owned_app);
-                        let _ = message.response.send(Err(error));
-                        continue;
-                    }
-                };
+                let assistant_entry = EntryId(source_assistant_entry_id.as_str().to_owned());
+                let source_user_entry =
+                    match retry_originating_user_entry(owned_app.agent.session(), &assistant_entry)
+                    {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            app = Some(owned_app);
+                            let _ = message.response.send(Err(error));
+                            continue;
+                        }
+                    };
+                let replay =
+                    match replay_prompt_input(owned_app.agent.session(), &source_user_entry, &plan)
+                    {
+                        Ok(replay) => replay,
+                        Err(error) => {
+                            app = Some(owned_app);
+                            let _ = message.response.send(Err(error));
+                            continue;
+                        }
+                    };
                 let originating_user_entry_id =
                     match DurableEntryId::new(source_user_entry.0.clone()) {
                         Ok(entry) => entry,
                         Err(_) => {
                             app = Some(owned_app);
-                            let _ = message
-                                .response
-                                .send(Err(ServiceError::InvalidBoundary));
+                            let _ = message.response.send(Err(ServiceError::InvalidBoundary));
                             continue;
                         }
                     };
@@ -2229,10 +2216,7 @@ async fn run_worker(
                     Ok(created_session_id) => {
                         let outcome = DriverCommandOutcome::fork(created_session_id.clone());
                         if message.response.send(Ok(outcome)).is_err() {
-                            let _ = rollback_conversation_fork(
-                                &plan,
-                                &created_session_id,
-                            );
+                            let _ = rollback_conversation_fork(&plan, &created_session_id);
                         }
                         app = Some(owned_app);
                     }
@@ -3090,10 +3074,7 @@ fn retry_originating_user_entry(
     let assistant = session
         .entry(source_assistant_entry_id)
         .ok_or(ServiceError::InvalidBoundary)?;
-    if !matches!(
-        &assistant.value,
-        EntryValue::Message(Message::Assistant(_))
-    ) {
+    if !matches!(&assistant.value, EntryValue::Message(Message::Assistant(_))) {
         return Err(ServiceError::InvalidBoundary);
     }
     let mut cursor = assistant.parent.as_ref();
@@ -3137,10 +3118,7 @@ fn replay_prompt_input(
         .iter()
         .any(|part| matches!(part, UserPart::Media(_)))
     {
-        let store = plan
-            .attachments
-            .as_ref()
-            .ok_or(ServiceError::Unavailable)?;
+        let store = plan.attachments.as_ref().ok_or(ServiceError::Unavailable)?;
         store
             .refs_for_entry(&plan.session_id, &entry.id.0)
             .map_err(attachment_service_error)?
@@ -3230,10 +3208,7 @@ async fn drive_sibling_conversation_branch(
                 let _ = admission.send(Err(ServiceError::InvalidBoundary));
                 return Ok((owned_app, false));
             }
-            let model = match owned_app
-                .catalog
-                .resolve(&ModelId(selection.model.clone()))
-            {
+            let model = match owned_app.catalog.resolve(&ModelId(selection.model.clone())) {
                 Ok(model) => model,
                 Err(_) => {
                     let _ = admission.send(Err(ServiceError::InvalidBoundary));
@@ -3465,7 +3440,10 @@ fn build_worker_app(plan: &WorkerPlan) -> anyhow::Result<App> {
 }
 
 fn command_name_is_claimed_by_builtin(name: &str) -> bool {
-    !matches!(commands::parse(&format!("/{name}")), commands::Command::Unknown(_))
+    !matches!(
+        commands::parse(&format!("/{name}")),
+        commands::Command::Unknown(_)
+    )
 }
 
 fn extension_command_presentation(
@@ -3516,9 +3494,7 @@ fn build_command_discovery(app: &App) -> Result<CommandDiscovery, ServiceError> 
             kind: CommandSuggestionKind::BuiltIn,
         });
     }
-    let extension_commands = app
-        .executable_extensions
-        .command_suggestions_with_usage();
+    let extension_commands = app.executable_extensions.command_suggestions_with_usage();
     let extension_command_names = extension_commands
         .iter()
         .map(|(name, _, _)| name.as_str())
@@ -3690,9 +3666,7 @@ async fn resolve_prompt_input(
                     &projects,
                     &trusted_files,
                     &project_id,
-                    |service, registry| {
-                        service.attach_as_context(registry, &project_file_ids)
-                    },
+                    |service, registry| service.attach_as_context(registry, &project_file_ids),
                 )
             })
             .await
@@ -3701,7 +3675,9 @@ async fn resolve_prompt_input(
     };
     let composed = ygg_serve_backend::compose_prompt_text(
         &text,
-        document_context.as_ref().map(|context| context.text.as_str()),
+        document_context
+            .as_ref()
+            .map(|context| context.text.as_str()),
         project_file_context
             .as_ref()
             .map(|context| context.text.as_str()),
@@ -4228,56 +4204,52 @@ async fn handle_active_command(
     events: &mpsc::Sender<TimestampedEvent>,
 ) {
     let outcome = match message.command {
-        SessionCommand::Steer { input } => {
-            match resolve_prompt_input(plan, input).await {
-                Ok(resolved) => match resolve_control_input(
-                    plan,
-                    resolved.model_text.clone(),
-                    &resolved.attachments,
-                ) {
-                    Ok(input) => match control.steer(input).await {
-                        Ok(()) => {
-                            publish_control_user_item(
-                                run_id,
-                                resolved,
-                                UserMessageDelivery::Steer,
-                                projection,
-                                events,
-                            )
-                            .await
-                        }
-                        Err(_) => Err(ServiceError::InvalidBoundary),
-                    },
-                    Err(error) => Err(error),
+        SessionCommand::Steer { input } => match resolve_prompt_input(plan, input).await {
+            Ok(resolved) => match resolve_control_input(
+                plan,
+                resolved.model_text.clone(),
+                &resolved.attachments,
+            ) {
+                Ok(input) => match control.steer(input).await {
+                    Ok(()) => {
+                        publish_control_user_item(
+                            run_id,
+                            resolved,
+                            UserMessageDelivery::Steer,
+                            projection,
+                            events,
+                        )
+                        .await
+                    }
+                    Err(_) => Err(ServiceError::InvalidBoundary),
                 },
                 Err(error) => Err(error),
-            }
-        }
-        SessionCommand::FollowUp { input } => {
-            match resolve_prompt_input(plan, input).await {
-                Ok(resolved) => match resolve_control_input(
-                    plan,
-                    resolved.model_text.clone(),
-                    &resolved.attachments,
-                ) {
-                    Ok(input) => match control.follow_up(input).await {
-                        Ok(()) => {
-                            publish_control_user_item(
-                                run_id,
-                                resolved,
-                                UserMessageDelivery::FollowUp,
-                                projection,
-                                events,
-                            )
-                            .await
-                        }
-                        Err(_) => Err(ServiceError::InvalidBoundary),
-                    },
-                    Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        },
+        SessionCommand::FollowUp { input } => match resolve_prompt_input(plan, input).await {
+            Ok(resolved) => match resolve_control_input(
+                plan,
+                resolved.model_text.clone(),
+                &resolved.attachments,
+            ) {
+                Ok(input) => match control.follow_up(input).await {
+                    Ok(()) => {
+                        publish_control_user_item(
+                            run_id,
+                            resolved,
+                            UserMessageDelivery::FollowUp,
+                            projection,
+                            events,
+                        )
+                        .await
+                    }
+                    Err(_) => Err(ServiceError::InvalidBoundary),
                 },
                 Err(error) => Err(error),
-            }
-        }
+            },
+            Err(error) => Err(error),
+        },
         SessionCommand::Rename { title } => rename_session_outcome(plan, &title),
         SessionCommand::SetPinned { pinned } => pin_session_outcome(plan, pinned),
         SessionCommand::SetArchived { archived } => archive_session_outcome(plan, archived),
@@ -4647,34 +4619,30 @@ fn command_activity_details(
     // Keep the complete command visible. The command is already bounded and
     // control-safe at the public boundary; only credential-like values are
     // collapsed so observability does not become an accidental secret leak.
-    let command_preview = if safe_public_query(workspace, raw_command).as_deref()
-        == Some("[redacted query]")
-    {
-        let context = raw_command
-            .split_ascii_whitespace()
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" ");
-        if context.is_empty() {
-            "[redacted command]".into()
+    let command_preview =
+        if safe_public_query(workspace, raw_command).as_deref() == Some("[redacted query]") {
+            let context = raw_command
+                .split_ascii_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if context.is_empty() {
+                "[redacted command]".into()
+            } else {
+                format!("{context} [redacted arguments]")
+            }
         } else {
-            format!("{context} [redacted arguments]")
-        }
-    } else {
-        raw_command.to_owned()
-    };
+            raw_command.to_owned()
+        };
 
     // Verification classification remains intentionally conservative and is
     // independent from command visibility. A compound or quoted shell command
     // is still shown in full, but is not promoted to a verified-test phase
     // unless its shape can be classified deterministically.
-    let normalized = crate::presentation::summarize_tool_with_workspace(
-        name,
-        arguments,
-        Some(workspace),
-    )
-    .shell_command
-    .unwrap_or_default();
+    let normalized =
+        crate::presentation::summarize_tool_with_workspace(name, arguments, Some(workspace))
+            .shell_command
+            .unwrap_or_default();
     let simple_command = !normalized.chars().any(|character| {
         matches!(
             character,
@@ -4987,8 +4955,7 @@ fn test_framework_hint(activity: &ToolActivity) -> Option<TestFramework> {
         .unwrap_or_default();
     match (program, words.get(1).copied(), words.get(2).copied()) {
         ("cargo", Some("test"), _) => Some(TestFramework::CargoLibtest),
-        ("pytest", _, _)
-        | ("python" | "python3", Some("-m"), Some("pytest" | "unittest")) => {
+        ("pytest", _, _) | ("python" | "python3", Some("-m"), Some("pytest" | "unittest")) => {
             Some(TestFramework::Pytest)
         }
         ("go", Some("test"), _) => Some(TestFramework::GoTest),
@@ -5169,9 +5136,7 @@ async fn project_agent_event(
                 tool.result = Some(semantic_result);
                 projection.tool_calls.insert(id.0.clone(), tool);
                 if let Ok(output) = result.as_ref() {
-                    if let Some(test_results) =
-                        project_test_results(&item_id, &activity, output)
-                    {
+                    if let Some(test_results) = project_test_results(&item_id, &activity, output) {
                         projection.test_results.push(test_results);
                     }
                 }
@@ -6176,8 +6141,7 @@ fn persist_run_projection(
             },
             branch_provenance: match &item.payload {
                 ItemPayload::UserMessage {
-                    branch_provenance,
-                    ..
+                    branch_provenance, ..
                 } => branch_provenance.clone(),
                 _ => None,
             },
@@ -7927,19 +7891,17 @@ fn session_catalog_metadata(
         meta.forked_from_entry_id.as_deref(),
     ) {
         (None, None) => None,
-        (Some(source_session_id), Some(source_entry_id)) => {
-            Some(ConversationBranchProvenance {
-                operation: ConversationBranchOperation::ForkSession,
-                source_session_id: SessionId::new(source_session_id.to_owned())
-                    .map_err(|_| ServiceError::InvalidSeed)?,
-                source_entry_id: DurableEntryId::new(source_entry_id.to_owned())
-                    .map_err(|_| ServiceError::InvalidSeed)?,
-                originating_user_entry_id: None,
-                model_override: None,
-                external_effects_preserved: true,
-                warning: EXTERNAL_EFFECTS_WARNING.to_owned(),
-            })
-        }
+        (Some(source_session_id), Some(source_entry_id)) => Some(ConversationBranchProvenance {
+            operation: ConversationBranchOperation::ForkSession,
+            source_session_id: SessionId::new(source_session_id.to_owned())
+                .map_err(|_| ServiceError::InvalidSeed)?,
+            source_entry_id: DurableEntryId::new(source_entry_id.to_owned())
+                .map_err(|_| ServiceError::InvalidSeed)?,
+            originating_user_entry_id: None,
+            model_override: None,
+            external_effects_preserved: true,
+            warning: EXTERNAL_EFFECTS_WARNING.to_owned(),
+        }),
         _ => return Err(ServiceError::InvalidSeed),
     };
     let _ = session_id;
@@ -8177,10 +8139,7 @@ mod tests {
                 "review-worktree",
                 Some("/review-worktree [focus]".into()),
             ),
-            (
-                "/review-worktree [focus]".into(),
-                Some("[focus]".into()),
-            )
+            ("/review-worktree [focus]".into(), Some("[focus]".into()),)
         );
         assert_eq!(
             extension_command_presentation("review-worktree", Some("/review-worktrees".into())),
@@ -8598,7 +8557,9 @@ mod tests {
             },
         );
         tokio::spawn(async move {
-            let WorkerMessage::CommandDiscovery { response } = worker_commands.recv().await.unwrap() else {
+            let WorkerMessage::CommandDiscovery { response } =
+                worker_commands.recv().await.unwrap()
+            else {
                 panic!("expected command discovery request");
             };
             event_sender.send(first).await.unwrap();
@@ -8703,7 +8664,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graphical_command_discovery_uses_tui_order_and_invokes_idle_commands_off_prompt_path() {
+    async fn graphical_command_discovery_uses_tui_order_and_invokes_idle_commands_off_prompt_path()
+    {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().join("workspace");
         let skill_dir = workspace.join(".ygg/skills/composer-skill");
@@ -8749,9 +8711,7 @@ mod tests {
                 && command.kind == CommandSuggestionKind::Prompt
         }));
         assert!(discovery.skills.iter().any(|skill| {
-            skill.id == "composer-skill"
-                && skill.name == "Composer Skill"
-                && !skill.active
+            skill.id == "composer-skill" && skill.name == "Composer Skill" && !skill.active
         }));
         discovery.validate().unwrap();
 
@@ -8795,15 +8755,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!loaded.events.is_empty());
-        assert!(
-            driver
-                .command_discovery()
-                .await
-                .unwrap()
-                .skills
-                .iter()
-                .any(|skill| skill.id == "composer-skill" && skill.active)
-        );
+        assert!(driver
+            .command_discovery()
+            .await
+            .unwrap()
+            .skills
+            .iter()
+            .any(|skill| skill.id == "composer-skill" && skill.active));
 
         let unloaded = driver
             .dispatch(SessionCommand::InvokeSlashCommand {
@@ -8814,15 +8772,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!unloaded.events.is_empty());
-        assert!(
-            driver
-                .command_discovery()
-                .await
-                .unwrap()
-                .skills
-                .iter()
-                .any(|skill| skill.id == "composer-skill" && !skill.active)
-        );
+        assert!(driver
+            .command_discovery()
+            .await
+            .unwrap()
+            .skills
+            .iter()
+            .any(|skill| skill.id == "composer-skill" && !skill.active));
 
         assert_eq!(
             driver
