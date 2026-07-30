@@ -122,7 +122,7 @@ export function ProjectsView({
         </div>
       </header>
 
-      {onboarding && runnable.length === 0 ? (
+      {onboarding && catalog.projects.length > 0 && runnable.length === 0 ? (
         <section className="project-onboarding-note">
           <ShieldAlert aria-hidden="true" />
           <div>
@@ -136,6 +136,18 @@ export function ProjectsView({
       ) : null}
 
       <section className="project-grid" aria-label="Registered projects">
+        {catalog.projects.length === 0 ? (
+          <div className="projects-empty">
+            <span className="projects-empty-icon" aria-hidden="true">
+              <Folder />
+            </span>
+            <div>
+              <h2>No projects found. Open a folder to get started.</h2>
+              <p>Start ygg from the folder you want to add:</p>
+              <code>ygg --workspace /path/to/project serve</code>
+            </div>
+          </div>
+        ) : null}
         {catalog.projects.map((project) => {
           const projectPending = pending?.endsWith(`:${project.id}`) ?? false;
           const canRun =
@@ -329,7 +341,7 @@ export function ProjectsView({
         })}
       </section>
 
-      {!catalog.importSupported ? (
+      {catalog.projects.length > 0 && !catalog.importSupported ? (
         <p className="project-import-note">
           Additional folders can be registered only by a host-native picker.
           This browser build never asks you to type or transmit an absolute

@@ -14,6 +14,31 @@ import { ActivityRail } from "./ActivityRail";
 describe("activity rail", () => {
   afterEach(cleanup);
 
+  it("explains when a session has no activity", () => {
+    const session = structuredClone(fixtureSessions["session-live"]!);
+    session.items = [];
+    session.progress = [];
+    session.outputs = [];
+    session.sources = [];
+
+    render(
+      <ActivityRail
+        session={session}
+        open
+        onClose={vi.fn()}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+        modal={false}
+        onRestoreFocus={vi.fn()}
+        resourcesAvailable
+      />,
+    );
+
+    expect(
+      screen.getByText("No activity yet. The agent's work will appear here."),
+    ).toBeVisible();
+  });
+
   it("keeps work detail in the transcript while exposing session resources", () => {
     render(
       <ActivityRail

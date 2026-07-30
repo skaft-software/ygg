@@ -1221,9 +1221,35 @@ kbd {
   overflow-wrap: anywhere;
 }
 
+.transcript-search-state.is-loading {
+  color: var(--text-soft);
+  background: var(--accent-wash);
+}
+
+.transcript-search-state.is-empty {
+  background: var(--surface);
+}
+
 .transcript-search-state.is-error {
   color: var(--danger);
   background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+}
+
+.transcript-search-state > svg {
+  width: 20px;
+  height: 20px;
+  color: var(--text-faint);
+}
+
+.transcript-search-state > strong {
+  color: var(--text-soft);
+  font-weight: 560;
+}
+
+.transcript-search-state > span {
+  max-width: 320px;
+  color: var(--text-muted);
+  text-align: center;
 }
 
 .transcript-search-state .spin {
@@ -5584,6 +5610,31 @@ kbd {
   scrollbar-gutter: stable;
 }
 
+.activity-empty {
+  flex: 1 1 auto;
+  min-height: 160px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 24px;
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: var(--surface);
+  text-align: center;
+}
+
+.activity-empty > svg {
+  width: 20px;
+  height: 20px;
+  color: var(--text-faint);
+}
+
+.activity-empty > p {
+  max-width: 220px;
+  line-height: 1.5;
+}
+
 .rail-section {
   flex: 0 0 auto;
   overflow: hidden;
@@ -6446,6 +6497,56 @@ kbd {
   display: grid;
   gap: 10px;
   margin-top: 24px;
+}
+
+.projects-empty {
+  min-height: 168px;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-content: center;
+  gap: 14px;
+  padding: 24px;
+  border-radius: 13px;
+  background: var(--surface);
+}
+
+.projects-empty-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  color: var(--text-muted);
+  background: var(--surface-raised);
+}
+
+.projects-empty-icon > svg {
+  width: 21px;
+  height: 21px;
+}
+
+.projects-empty h2 {
+  color: var(--text);
+  font-size: var(--font-body);
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.projects-empty p {
+  margin-top: 5px;
+  color: var(--text-soft);
+  line-height: 1.5;
+}
+
+.projects-empty code {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-raised);
+  font-size: var(--font-meta);
+  overflow-wrap: anywhere;
 }
 
 .project-card {
