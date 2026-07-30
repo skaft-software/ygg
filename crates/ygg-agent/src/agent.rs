@@ -885,13 +885,23 @@ fn close_failed_turn(session: &mut Session, model: &Model) -> Result<(), AgentEr
 fn retryable_before_generation(error: &AiError) -> bool {
     match error {
         AiError::Http(error) => error.is_safe_to_retry(),
-        AiError::Transport(error) => error.phase == ygg_ai::TransportPhase::ConnectOrHeaders,
+        AiError::Transport(error) => {
+            !error.timeout && error.phase == ygg_ai::TransportPhase::Connect
+        }
         _ => false,
     }
 }
 
-fn is_transient_network_failure(error: &AiError) -> bool {
-    matches!(error, AiError::Transport(transport) if !transport.timeout)
+fn is_replayable_network_failure(error: &AiError) -> bool {
+    matches!(
+        error,
+        AiError::Transport(transport)
+            if !transport.timeout
+                && matches!(
+                    transport.phase,
+                    ygg_ai::TransportPhase::Connect | ygg_ai::TransportPhase::Body
+                )
+    )
 }
 
 fn looks_like_context_error(error: &AiError) -> bool {
@@ -994,13 +1004,13 @@ fn provider_retry_limit(error: &AiError) -> usize {
     if matches!(
         error,
         AiError::Transport(transport)
-            if transport.timeout && transport.phase == ygg_ai::TransportPhase::Body
+            if transport.timeout || transport.phase == ygg_ai::TransportPhase::ResponseHeaders
     ) {
-        // A body timeout already consumed the stream's idle or absolute
-        // deadline. Keep it terminal; response-header timeouts happen before
-        // generation is observed and use the bounded provider retry budget.
+        // A timeout has already consumed its configured deadline. A request
+        // that failed while sending or awaiting headers may also have been
+        // accepted by the provider. Neither class is replayed automatically.
         0
-    } else if is_transient_network_failure(error) {
+    } else if is_replayable_network_failure(error) {
         MAX_NETWORK_RETRIES
     } else {
         MAX_PROVIDER_RETRIES
@@ -1024,7 +1034,7 @@ fn provider_retry_diagnostic(model: &Model, error: &AiError) -> String {
         "provider={} model={}: {error}",
         model.endpoint.id.0, model.spec.id.0
     );
-    if is_transient_network_failure(error) {
+    if is_replayable_network_failure(error) {
         format!("Network connection lost. Are you connected to the internet? {context}")
     } else {
         context
@@ -1032,7 +1042,7 @@ fn provider_retry_diagnostic(model: &Model, error: &AiError) -> String {
 }
 
 fn provider_failure(error: AiError, retries: usize) -> AgentError {
-    if is_transient_network_failure(&error) {
+    if is_replayable_network_failure(&error) {
         AgentError::NetworkUnavailable {
             retries,
             detail: error.to_string(),
@@ -3154,7 +3164,7 @@ impl Agent {
                                 }
                             }
                             while (!attempt_saw_generation
-                                || is_transient_network_failure(&error))
+                                || is_replayable_network_failure(&error))
                                 && stream_retries < provider_retry_limit(&error)
                                 && retryable_stream_start(&error)
                             {
@@ -3904,14 +3914,17 @@ mod tests {
     }
 
     #[test]
-    fn response_header_timeout_is_retried_before_generation() {
-        let error = AiError::Transport(ygg_ai::TransportError {
-            phase: ygg_ai::TransportPhase::ConnectOrHeaders,
-            timeout: true,
-            message: "response headers stalled".into(),
-        });
-        assert!(retryable_before_generation(&error));
-        assert_eq!(provider_retry_limit(&error), MAX_PROVIDER_RETRIES);
+    fn response_header_failures_are_not_automatically_replayed() {
+        for timeout in [false, true] {
+            let error = AiError::Transport(ygg_ai::TransportError {
+                phase: ygg_ai::TransportPhase::ResponseHeaders,
+                timeout,
+                message: "response headers unavailable".into(),
+            });
+            assert!(!retryable_before_generation(&error));
+            assert!(!retryable_stream_start(&error));
+            assert_eq!(provider_retry_limit(&error), 0);
+        }
     }
 
     #[test]
@@ -4012,16 +4025,29 @@ mod tests {
     #[test]
     fn non_timeout_network_failure_gets_five_retries_and_friendly_failure() {
         let error = AiError::Transport(ygg_ai::TransportError {
-            phase: ygg_ai::TransportPhase::ConnectOrHeaders,
+            phase: ygg_ai::TransportPhase::Connect,
             timeout: false,
             message: "connection refused".into(),
         });
         assert!(retryable_before_generation(&error));
+        assert!(retryable_stream_start(&error));
         assert_eq!(provider_retry_limit(&error), 5);
 
         let failure = provider_failure(error, 5).to_string();
         assert!(failure.contains("Are you connected to the internet?"));
         assert!(failure.contains("connection refused"));
+    }
+
+    #[test]
+    fn connect_timeout_is_not_automatically_retried() {
+        let error = AiError::Transport(ygg_ai::TransportError {
+            phase: ygg_ai::TransportPhase::Connect,
+            timeout: true,
+            message: "connection timed out".into(),
+        });
+        assert!(!retryable_before_generation(&error));
+        assert!(!retryable_stream_start(&error));
+        assert_eq!(provider_retry_limit(&error), 0);
     }
 
     #[test]

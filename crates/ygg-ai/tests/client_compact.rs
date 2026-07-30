@@ -305,6 +305,29 @@ async fn compact_rejects_oversized_chunked_body_while_streaming() {
 }
 
 #[tokio::test]
+async fn compact_response_header_timeout_is_classified_separately() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses/compact"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(100)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut model = model(&format!("{}/", server.uri()), Protocol::OpenAiResponses);
+    Arc::make_mut(&mut model.endpoint).timeout = Duration::from_millis(10);
+    let error = AiClient::new()
+        .compact_responses(&model, compact_request(ResponsesInput::default(), None))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AiError::Transport(ref transport)
+            if transport.phase == TransportPhase::ResponseHeaders && transport.timeout
+    ));
+}
+
+#[tokio::test]
 async fn compact_stalled_body_obeys_the_idle_timeout() {
     let error = AiClient::new()
         .with_stream_timeouts(Duration::from_millis(25), Duration::from_secs(2))

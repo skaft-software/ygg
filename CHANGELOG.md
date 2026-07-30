@@ -24,6 +24,10 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Sanitized user input before Markdown parsing so terminal protocols cannot
   expand differently from the semantic copy projection or destabilize prompt
   geometry.
+- Prevented OpenAI Responses, OpenAI Chat Completions, and Anthropic Messages
+  POSTs from being replayed after full transport timeouts or ambiguous failures
+  while sending the request or awaiting response headers; replay-safe connection
+  failures remain visible, cancellable, and bounded.
 
 ### Performance and reliability
 

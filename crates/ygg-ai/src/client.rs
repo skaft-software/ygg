@@ -200,6 +200,18 @@ fn reqwest_transport_error(
     })
 }
 
+fn request_open_transport_error(error: reqwest::Error, operation: &str) -> AiError {
+    let phase = if error.is_connect() {
+        TransportPhase::Connect
+    } else {
+        // Once connection establishment succeeded, request-send failures and
+        // response-header failures are ambiguous: the provider may have
+        // accepted the POST even though no response was observed locally.
+        TransportPhase::ResponseHeaders
+    };
+    reqwest_transport_error(error, phase, operation)
+}
+
 fn json_scalar_string(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(value) => Some(value.clone()),
@@ -466,19 +478,12 @@ impl AiClient {
             .await
             .map_err(|_| {
                 AiError::Transport(TransportError {
-                    phase: TransportPhase::ConnectOrHeaders,
+                    phase: TransportPhase::ResponseHeaders,
                     timeout: true,
                     message: "request timed out waiting for response headers".to_string(),
                 })
             })?
-            .map_err(|error| {
-                let phase = if error.is_connect() || error.is_request() {
-                    TransportPhase::ConnectOrHeaders
-                } else {
-                    TransportPhase::Body
-                };
-                reqwest_transport_error(error, phase, "request")
-            })
+            .map_err(|error| request_open_transport_error(error, "request"))
             .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?;
 
         // 4. Handle non-2xx HTTP errors
@@ -872,14 +877,12 @@ impl AiClient {
         .await
         .map_err(|_| {
             AiError::Transport(TransportError {
-                phase: TransportPhase::ConnectOrHeaders,
+                phase: TransportPhase::ResponseHeaders,
                 timeout: true,
                 message: "compact request timed out waiting for response headers".to_owned(),
             })
         })?
-        .map_err(|error| {
-            reqwest_transport_error(error, TransportPhase::ConnectOrHeaders, "compact request")
-        })
+        .map_err(|error| request_open_transport_error(error, "compact request"))
         .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?;
         let status = response.status();
         let request_id = response
@@ -1049,11 +1052,10 @@ mod tests {
             .send()
             .await
             .expect_err("the released listener must refuse the connection");
-        let AiError::Transport(error) =
-            reqwest_transport_error(error, TransportPhase::ConnectOrHeaders, "request")
-        else {
+        let AiError::Transport(error) = request_open_transport_error(error, "request") else {
             unreachable!()
         };
+        assert_eq!(error.phase, TransportPhase::Connect);
         assert!(error.message.starts_with("request connection failed:"));
         assert!(error.message.contains("refused") || error.message.contains("connect"));
         assert!(!error.message.contains(secret));
