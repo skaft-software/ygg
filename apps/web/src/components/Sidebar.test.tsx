@@ -5,6 +5,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import type { ComponentProps } from "react";
@@ -100,6 +101,179 @@ describe("sidebar session lifecycle", () => {
     });
   });
   afterEach(cleanup);
+
+  it("combines metadata matches with transcript search and restores the list when cleared", async () => {
+    const search = vi.fn().mockResolvedValue({ hits: [], truncated: false });
+    const sessions = [
+      activeSession({
+        id: "session-metadata",
+        title: "Deployment notes",
+        preview: "Migrate database safely",
+      }),
+      activeSession({
+        id: "session-other",
+        title: "Unrelated session",
+        preview: "Nothing here",
+      }),
+    ];
+    render(
+      <Sidebar
+        {...sidebarProps({
+          sessions,
+          selectedSessionId: "session-metadata",
+          transcriptSearchAvailable: true,
+          onSearchTranscripts: search,
+        })}
+      />,
+    );
+
+    const input = screen.getByRole("searchbox", { name: "Search sessions" });
+    fireEvent.change(input, { target: { value: "migrate" } });
+    await waitFor(() => {
+      expect(search).toHaveBeenCalledWith({
+        query: "migrate",
+        filter: {},
+        limit: 100,
+      });
+    });
+    expect(
+      screen.getByRole("button", {
+        name: "Open session Deployment notes, Ready",
+      }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", {
+        name: "Open session Unrelated session, Ready",
+      }),
+    ).toBeNull();
+
+    fireEvent.change(input, { target: { value: "missing" } });
+    await waitFor(() => {
+      expect(search).toHaveBeenLastCalledWith({
+        query: "missing",
+        filter: {},
+        limit: 100,
+      });
+    });
+    expect(screen.getByText("No sessions match your query")).toBeVisible();
+
+    fireEvent.change(input, { target: { value: "" } });
+    expect(
+      screen.getByRole("button", {
+        name: "Open session Deployment notes, Ready",
+      }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", {
+        name: "Open session Unrelated session, Ready",
+      }),
+    ).toBeVisible();
+  });
+
+  it("shows content hits and activates their transcript item", async () => {
+    const search = vi.fn().mockResolvedValue({
+      hits: [
+        {
+          sessionId: "session-content",
+          itemId: "item-content",
+          kind: "user",
+          sessionTitle: "Content session",
+          snippet: "Needle in the transcript",
+          matchRanges: [{ startChar: 0, endChar: 6 }],
+          titleMatchRanges: [],
+          timestampMs: 1,
+          score: 10,
+        },
+      ],
+      truncated: false,
+    });
+    const activate = vi.fn();
+    render(
+      <Sidebar
+        {...sidebarProps({
+          sessions: [
+            activeSession({
+              id: "session-content",
+              title: "Content session",
+              preview: "No metadata match",
+            }),
+          ],
+          transcriptSearchAvailable: true,
+          onSearchTranscripts: search,
+          onActivateSearchResult: activate,
+        })}
+      />,
+    );
+
+    fireEvent.change(
+      screen.getByRole("searchbox", { name: "Search sessions" }),
+      { target: { value: "needle" } },
+    );
+    const result = await screen.findByRole("button", {
+      name: "Open User message result from Content session",
+    });
+    fireEvent.click(result);
+    expect(activate).toHaveBeenCalledWith("session-content", "item-content");
+  });
+
+  it("does not surface results from a different lifecycle view", async () => {
+    const search = vi.fn().mockResolvedValue({
+      hits: [
+        {
+          sessionId: "session-archived",
+          itemId: "item-archived",
+          kind: "assistant",
+          sessionTitle: "Archived investigation",
+          snippet: "Archived needle",
+          matchRanges: [{ startChar: 9, endChar: 15 }],
+          titleMatchRanges: [],
+          timestampMs: 1,
+          score: 10,
+        },
+      ],
+      truncated: false,
+    });
+    render(
+      <Sidebar
+        {...sidebarProps({
+          sessions: [activeSession(), archivedSession()],
+          transcriptSearchAvailable: true,
+          onSearchTranscripts: search,
+        })}
+      />,
+    );
+
+    fireEvent.change(
+      screen.getByRole("searchbox", { name: "Search sessions" }),
+      { target: { value: "archived needle" } },
+    );
+    await waitFor(() => expect(search).toHaveBeenCalled());
+    expect(screen.getByText("No sessions match your query")).toBeVisible();
+  });
+
+  it("reports search failures instead of leaving the loading state", async () => {
+    const search = vi.fn().mockRejectedValue(new Error("offline"));
+    render(
+      <Sidebar
+        {...sidebarProps({
+          sessions: [activeSession()],
+          transcriptSearchAvailable: true,
+          onSearchTranscripts: search,
+        })}
+      />,
+    );
+
+    fireEvent.change(
+      screen.getByRole("searchbox", { name: "Search sessions" }),
+      { target: { value: "offline" } },
+    );
+    await waitFor(() => {
+      expect(
+        screen.getByText("Session search could not be completed. Try again."),
+      ).toBeVisible();
+    });
+    expect(screen.queryByText("Searching sessions…")).toBeNull();
+  });
 
   it("guides empty and filtered session lists", () => {
     const onNewSession = vi.fn();
