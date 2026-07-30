@@ -179,6 +179,9 @@ pub enum ProjectFileSystemError {
     /// The file changed since the caller read its current version.
     #[error("the project file changed before it could be saved")]
     Conflict,
+    /// The concrete host does not expose trusted-project filesystem operations.
+    #[error("project filesystem access is not available")]
+    Unavailable,
     /// A filesystem operation failed closed.
     #[error("trusted project file access is unavailable")]
     Storage,
@@ -247,7 +250,7 @@ impl ProjectFileSystem {
             }
             let kind = if metadata.file_type().is_dir() {
                 ProjectFileEntryKind::Directory
-            } else if metadata.file_type().is_file() {
+            } else if metadata.file_type().is_file() && hard_link_count(&metadata) <= 1 {
                 ProjectFileEntryKind::File
             } else {
                 continue;

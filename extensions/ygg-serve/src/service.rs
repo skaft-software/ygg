@@ -7,13 +7,14 @@ use bytes::Bytes;
 use tokio::sync::oneshot;
 
 use crate::{
-    AttachmentError, AttachmentPolicy, AttachmentRef, AuthorityProfile, HostCapabilities,
-    DocumentReference, FileEntryId, HostDescriptor, ModelSelection, ModelSummary, ProjectId,
-    PermanentDeleteConfirmation, ProjectSummary, RunId, SanitizedError, SessionCatalogState,
-    SessionCommand, SessionId, SessionSnapshot, SessionSummary,
-    RepositoryContextSnapshot, StoredAttachment, ThemeId, ThemeOption, TimestampedEvent, TrustedFileEntry,
-    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileIndexSummary, TrustedFileRead,
-    TrustedFileSearchResult, LifetimeUsage, UsageActivity, UsagePeriod, UsageStats,
+    AttachmentError, AttachmentPolicy, AttachmentRef, AuthorityProfile, DocumentReference,
+    FileEntryId, HostCapabilities, HostDescriptor, LifetimeUsage, ModelSelection, ModelSummary,
+    PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult, ProjectFileSystemError,
+    ProjectFileTree, ProjectFileWrite, ProjectId, ProjectSummary, RepositoryContextSnapshot, RunId,
+    SanitizedError, SessionCatalogState, SessionCommand, SessionId, SessionSnapshot,
+    SessionSummary, StoredAttachment, ThemeId, ThemeOption, TimestampedEvent,
+    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileIndexSummary,
+    TrustedFileRead, TrustedFileSearchResult, UsageActivity, UsagePeriod, UsageStats,
 };
 
 /// Immutable, path-free content behind one host-minted opaque resource handle.
@@ -434,6 +435,57 @@ pub trait HostService: Send + Sync + 'static {
         _entry_id: &FileEntryId,
     ) -> Result<TrustedFileRead, ServiceError> {
         Err(ServiceError::Unavailable)
+    }
+
+    /// Whether root-confined project file-tree, text-read, and search routes are available.
+    fn project_file_browser_supported(&self) -> bool {
+        false
+    }
+
+    /// Whether full-file replacement is available through the project file browser.
+    fn project_file_write_supported(&self) -> bool {
+        false
+    }
+
+    /// Lists one immediate project directory by validated project-relative path.
+    async fn project_file_tree(
+        &self,
+        _project_id: &ProjectId,
+        _path: &str,
+    ) -> Result<ProjectFileTree, ProjectFileSystemError> {
+        Err(ProjectFileSystemError::Unavailable)
+    }
+
+    /// Reads bounded text from one validated project-relative regular file.
+    async fn read_project_file(
+        &self,
+        _project_id: &ProjectId,
+        _path: &str,
+        _start_line: Option<u32>,
+        _end_line: Option<u32>,
+    ) -> Result<ProjectFileRead, ProjectFileSystemError> {
+        Err(ProjectFileSystemError::Unavailable)
+    }
+
+    /// Searches bounded project text and relative paths.
+    async fn search_project_files(
+        &self,
+        _project_id: &ProjectId,
+        _query: &str,
+    ) -> Result<ProjectFileSearchResult, ProjectFileSystemError> {
+        Err(ProjectFileSystemError::Unavailable)
+    }
+
+    /// Replaces a complete project file after an optimistic version check.
+    async fn write_project_file(
+        &self,
+        _project_id: &ProjectId,
+        _path: &str,
+        _content: &str,
+        _expected_sha256: &str,
+        _force: bool,
+    ) -> Result<ProjectFileWrite, ProjectFileSystemError> {
+        Err(ProjectFileSystemError::WriteUnavailable)
     }
 
     /// Whether authenticated search over durable public transcript projections is available.

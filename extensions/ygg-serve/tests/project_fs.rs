@@ -92,6 +92,7 @@ fn traversal_and_links_are_rejected_before_they_can_escape_the_root() {
             let outside = root.parent().unwrap().join("outside.txt");
             fs::write(&outside, "outside\n").unwrap();
             symlink(&outside, root.join("outside.txt")).unwrap();
+            fs::hard_link(&outside, root.join("linked-outside.txt")).unwrap();
         }
     });
 
@@ -124,6 +125,10 @@ fn traversal_and_links_are_rejected_before_they_can_escape_the_root() {
     {
         let tree = ProjectFileSystem::tree(&fixture.registry, &fixture.project_id, "").unwrap();
         assert!(tree.entries.iter().all(|entry| entry.name != "outside.txt"));
+        assert!(tree
+            .entries
+            .iter()
+            .all(|entry| entry.name != "linked-outside.txt"));
         assert_eq!(
             ProjectFileSystem::read(
                 &fixture.registry,
@@ -133,6 +138,16 @@ fn traversal_and_links_are_rejected_before_they_can_escape_the_root() {
                 None,
             ),
             Err(ProjectFileSystemError::InvalidPath)
+        );
+        assert_eq!(
+            ProjectFileSystem::read(
+                &fixture.registry,
+                &fixture.project_id,
+                "linked-outside.txt",
+                None,
+                None,
+            ),
+            Err(ProjectFileSystemError::NotFile)
         );
     }
 }
