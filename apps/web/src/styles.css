@@ -1559,6 +1559,29 @@ kbd {
   font-size: var(--font-meta);
 }
 
+.document-reference-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.document-reference-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--text-soft);
+  background: var(--surface);
+  font-family: var(--mono-family);
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.document-reference-badge.is-fidelity {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+}
+
 .transcript-item-anchor {
   position: relative;
   isolation: isolate;

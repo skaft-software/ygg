@@ -1713,6 +1713,69 @@ describe("conversation composer", () => {
     ).toBeInTheDocument();
   });
 
+  it("renders document type, page-count, and fidelity badges", () => {
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    session.items.push({
+      id: "document-message",
+      turnId: "document-turn",
+      kind: "user_message",
+      content: "Use these documents as context.",
+      documents: [
+        {
+          id: "document-pdf",
+          displayName: "architecture.pdf",
+          mediaType: "application/pdf",
+          sourceByteCount: 16_384,
+          extractedTextByteCount: 8_192,
+          sha256: "a".repeat(64),
+          fidelity: "pdfTextOnlyPartial",
+          pageCount: 7,
+          createdAtMs: 1,
+        },
+        {
+          id: "document-markdown",
+          displayName: "notes.md",
+          mediaType: "text/markdown",
+          sourceByteCount: 2_048,
+          extractedTextByteCount: 2_048,
+          sha256: "b".repeat(64),
+          fidelity: "exactUtf8",
+          createdAtMs: 1,
+        },
+      ],
+      state: "committed",
+      createdAt: new Date().toISOString(),
+    });
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    expect(screen.getByText("PDF · 7 pages")).toHaveClass(
+      "document-reference-badge",
+    );
+    expect(screen.getByText("pdfTextOnlyPartial")).toHaveClass(
+      "document-reference-badge",
+      "is-fidelity",
+    );
+    expect(screen.getByText("Markdown")).toHaveClass(
+      "document-reference-badge",
+    );
+    expect(screen.getByText("exactUtf8")).toHaveClass(
+      "document-reference-badge",
+      "is-fidelity",
+    );
+  });
+
   it("answers a private tool-input request without adding it to prose", async () => {
     const user = userEvent.setup();
     const onResolveUserInput = vi.fn().mockResolvedValue(undefined);
