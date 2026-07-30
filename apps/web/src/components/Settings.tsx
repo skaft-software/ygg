@@ -17,6 +17,12 @@ interface SettingsViewProps {
 
 const fontStacks = [
   {
+    id: "local",
+    label: "Local Grotesk + Mono (default)",
+    ui: '"Local Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif',
+    mono: '"Local Mono", "LocalMono Nerd Font Mono", "SFMono-Regular", "Cascadia Mono", Menlo, Consolas, ui-monospace, monospace',
+  },
+  {
     id: "geist",
     label: "Geist Sans + Geist Mono",
     ui: '"Geist", Inter, ui-sans-serif, system-ui, sans-serif',
@@ -64,8 +70,10 @@ export function SettingsView({
 }: SettingsViewProps) {
   const [fontStackId, setFontStackId] = useState(() => {
     const stored = localStorage.getItem("ygg.ui.font");
-    if (!stored) return "system-mono";
-    return stored === "ibm-plex-mono" ? "geist" : stored;
+    if (stored === "ibm-plex-mono") return "geist";
+    return stored !== null && fontStacks.some((stack) => stack.id === stored)
+      ? stored
+      : "local";
   });
   const [uiSize, setUiSize] = useState(
     () => Number(localStorage.getItem("ygg.ui.size") ?? "14"),
@@ -109,7 +117,10 @@ export function SettingsView({
           <Type aria-hidden="true" />
           <div>
             <h2 id="type-title">Interface type</h2>
-            <p>Pair readable conversation type with precise technical text.</p>
+            <p>
+              Local ships with ygg for legible, playful DIY work; alternatives
+              use fonts installed on this device.
+            </p>
           </div>
         </div>
         <div className="preference-fields">

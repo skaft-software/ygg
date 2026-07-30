@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -71,24 +71,25 @@ describe("App transcript search workflow", () => {
     vi.unstubAllGlobals();
   });
 
-  it("opens search, selects another session, and jumps to the matched item", async () => {
+  it("searches session contents, selects another session, and jumps to the matched item", async () => {
     const user = userEvent.setup();
     const { default: App } = await import("./App");
     render(<App />);
 
-    const openSearch = await screen.findByRole("button", {
-      name: "Search conversation contents",
-    });
-    await user.click(openSearch);
-    const query = screen.getByRole("searchbox", {
-      name: "Search conversation transcripts",
+    const query = await screen.findByRole("searchbox", {
+      name: "Search sessions",
     });
     await user.type(query, "release candidate");
-    await user.click(screen.getByRole("button", { name: "Search" }));
 
     const result = await screen.findByRole("button", {
       name: "Open User message result from Review release readiness",
     });
+    expect(
+      screen.queryByRole("button", { name: "Search conversation contents" }),
+    ).toBeNull();
+    expect(
+      within(result).getByText("release candidate", { selector: "strong" }),
+    ).toBeVisible();
     await user.click(result);
 
     expect(

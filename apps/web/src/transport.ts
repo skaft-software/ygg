@@ -170,6 +170,33 @@ export class FixtureTransport implements YggTransport {
       reasoningTokens: 9_000 * multiplier,
       totalTokens: 186_000 * multiplier,
       requestCount: 7 * multiplier,
+      models: [
+        {
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          promptTokens: 60_000 * multiplier,
+          completionTokens: 28_000 * multiplier,
+          cacheReadTokens: 40_000 * multiplier,
+          cacheWriteTokens: 9_000 * multiplier,
+          cacheWriteOneHourTokens: 1_500 * multiplier,
+          reasoningTokens: 7_000 * multiplier,
+          totalTokens: 137_000 * multiplier,
+          requestCount: 5 * multiplier,
+        },
+        {
+          provider: "openai",
+          model: "gpt-5.4",
+          promptTokens: 22_000 * multiplier,
+          completionTokens: 10_000 * multiplier,
+          cacheReadTokens: 14_000 * multiplier,
+          cacheWriteTokens: 3_000 * multiplier,
+          cacheWriteOneHourTokens: 500 * multiplier,
+          reasoningTokens: 2_000 * multiplier,
+          totalTokens: 49_000 * multiplier,
+          requestCount: 2 * multiplier,
+        },
+      ],
+      modelsTruncated: false,
     };
   }
 
@@ -184,6 +211,33 @@ export class FixtureTransport implements YggTransport {
       reasoningTokens: 900_000,
       totalTokens: 18_600_000,
       requestCount: 700,
+      models: [
+        {
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          promptTokens: 6_000_000,
+          completionTokens: 2_800_000,
+          cacheReadTokens: 4_000_000,
+          cacheWriteTokens: 900_000,
+          cacheWriteOneHourTokens: 150_000,
+          reasoningTokens: 700_000,
+          totalTokens: 13_700_000,
+          requestCount: 500,
+        },
+        {
+          provider: "openai",
+          model: "gpt-5.4",
+          promptTokens: 2_200_000,
+          completionTokens: 1_000_000,
+          cacheReadTokens: 1_400_000,
+          cacheWriteTokens: 300_000,
+          cacheWriteOneHourTokens: 50_000,
+          reasoningTokens: 200_000,
+          totalTokens: 4_900_000,
+          requestCount: 200,
+        },
+      ],
+      modelsTruncated: false,
       firstRequestAtMs: now - 120 * 86_400_000,
       lastRequestAtMs: now,
     };
@@ -385,6 +439,7 @@ export class FixtureTransport implements YggTransport {
     request: TranscriptSearchRequest,
   ): Promise<TranscriptSearchResult> {
     const query = request.query.trim().toLocaleLowerCase();
+    const queryLength = [...query].length;
     const hits = Object.values(this.sessions).flatMap((session) =>
       session.items.flatMap((item) => {
         const projected =
@@ -405,9 +460,17 @@ export class FixtureTransport implements YggTransport {
                 : item.kind === "run_outcome" && item.outcome === "failed"
                   ? { kind: "error" as const, text: item.summary }
                   : undefined;
+        const sessionTitle =
+          this.bootstrap.sessions.find(
+            (summary) => summary.id === session.sessionId,
+          )?.title ?? "Session";
+        const textStart = projected
+          ? projected.text.toLocaleLowerCase().indexOf(query)
+          : -1;
+        const titleStart = sessionTitle.toLocaleLowerCase().indexOf(query);
         if (
           !projected ||
-          !projected.text.toLocaleLowerCase().includes(query) ||
+          (textStart < 0 && titleStart < 0) ||
           (request.filter.sessionId &&
             request.filter.sessionId !== session.sessionId) ||
           (request.filter.kinds?.length &&
@@ -415,21 +478,24 @@ export class FixtureTransport implements YggTransport {
         ) {
           return [];
         }
-        const start = projected.text.toLocaleLowerCase().indexOf(query);
         return [
           {
             sessionId: session.sessionId,
             itemId: item.id,
             kind: projected.kind,
-            sessionTitle:
-              this.bootstrap.sessions.find(
-                (summary) => summary.id === session.sessionId,
-              )?.title ?? "Session",
+            sessionTitle,
             snippet: projected.text,
-            matchRanges: [
-              { startChar: start, endChar: start + [...query].length },
-            ],
-            titleMatchRanges: [],
+            matchRanges:
+              textStart >= 0
+                ? [{ startChar: textStart, endChar: textStart + queryLength }]
+                : [],
+            titleMatchRanges:
+              titleStart >= 0
+                ? [{
+                    startChar: titleStart,
+                    endChar: titleStart + queryLength,
+                  }]
+                : [],
             timestampMs: Date.parse(item.createdAt),
             score: 100,
           },

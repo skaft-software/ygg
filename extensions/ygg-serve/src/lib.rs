@@ -141,8 +141,9 @@ pub use trusted_files::{
     MAX_TRUSTED_FILES_PER_CONTEXT,
 };
 pub use usage::{
-    InferenceRequest, InferenceRequestStore, LifetimeMetricsStore, LifetimeUsage, UsageActivity,
-    UsageActivityDay, UsagePeriod, UsageStats, UsageStoreError, USAGE_ACTIVITY_WEEKS,
+    InferenceRequest, InferenceRequestStore, LifetimeMetricsStore, LifetimeUsage, ModelUsage,
+    UsageActivity, UsageActivityDay, UsagePeriod, UsageStats, UsageStoreError,
+    MAX_USAGE_MODEL_ROWS, USAGE_ACTIVITY_WEEKS,
 };
 
 /// Current experimental wire-protocol major.

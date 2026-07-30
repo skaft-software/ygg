@@ -18,13 +18,40 @@ function stats(period: UsagePeriod): UsageStats {
     reasoningTokens: 16 * multiplier,
     totalTokens: 260 * multiplier,
     requestCount: 3 * multiplier,
+    models: [
+      {
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        promptTokens: 90 * multiplier,
+        completionTokens: 60 * multiplier,
+        cacheReadTokens: 30 * multiplier,
+        cacheWriteTokens: 15 * multiplier,
+        cacheWriteOneHourTokens: 4 * multiplier,
+        reasoningTokens: 12 * multiplier,
+        totalTokens: 195 * multiplier,
+        requestCount: 2 * multiplier,
+      },
+      {
+        provider: "unknown",
+        model: "unknown",
+        promptTokens: 30 * multiplier,
+        completionTokens: 20 * multiplier,
+        cacheReadTokens: 10 * multiplier,
+        cacheWriteTokens: 5 * multiplier,
+        cacheWriteOneHourTokens: 1 * multiplier,
+        reasoningTokens: 4 * multiplier,
+        totalTokens: 65 * multiplier,
+        requestCount: 1 * multiplier,
+      },
+    ],
+    modelsTruncated: false,
   };
 }
 
 describe("usage page", () => {
   afterEach(cleanup);
 
-  it("renders lifetime activity and switches the token breakdown period", async () => {
+  it("shows compact totals, model usage, activity, and an all-time range", async () => {
     const user = userEvent.setup();
     const loadStats = vi.fn(async (period: UsagePeriod) => stats(period));
     const loadLifetime = vi.fn().mockResolvedValue({
@@ -49,35 +76,55 @@ describe("usage page", () => {
       />,
     );
 
-    expect(await screen.findByRole("heading", { name: "Today" })).toBeVisible();
-    const freshInput = screen.getByText("Fresh input").closest("article");
-    expect(freshInput).not.toBeNull();
-    expect(within(freshInput!).getByText("120")).toBeVisible();
-    expect(screen.getByLabelText("Usage streaks")).toHaveTextContent(
-      "2 current",
+    const today = await screen.findByRole("region", {
+      name: "Today usage summary",
+    });
+    expect(within(today).getByText("260")).toBeVisible();
+    expect(
+      within(today).getByText("Fresh input").closest("div"),
+    ).toHaveTextContent("120");
+    expect(screen.getByRole("button", { name: "Today" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
     );
+    const models = screen.getByRole("table", {
+      name: "Today usage by model",
+    });
+    expect(within(models).getByText("claude-sonnet-4-6")).toBeVisible();
+    expect(within(models).getByText("Unknown model")).toBeVisible();
+    expect(within(models).getByText("Unknown provider")).toBeVisible();
+    expect(within(models).getByText("75%")).toBeVisible();
     expect(
       screen.getByRole("grid", {
         name: "Daily token activity for the last 53 weeks",
       }),
     ).toBeVisible();
-    expect(screen.getByRole("heading", { name: "Lifetime" })).toBeVisible();
+    expect(screen.queryByLabelText("Usage streaks")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Lifetime" })).toBeNull();
     expect(loadLifetime).toHaveBeenCalledOnce();
     expect(loadActivity).toHaveBeenCalledOnce();
 
-    await user.click(screen.getByRole("button", { name: "Weekly" }));
+    await user.click(screen.getByRole("button", { name: "7 days" }));
 
     await waitFor(() => expect(loadStats).toHaveBeenLastCalledWith("weekly"));
+    const weekly = await screen.findByRole("region", {
+      name: "Last 7 days usage summary",
+    });
     expect(
-      await screen.findByRole("heading", { name: "Trailing seven days" }),
-    ).toBeVisible();
-    expect(screen.getByRole("button", { name: "Weekly" })).toHaveAttribute(
+      within(weekly).getByText("Fresh input").closest("div"),
+    ).toHaveTextContent("240");
+    expect(screen.getByRole("button", { name: "7 days" })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
-    expect(screen.getByText("Fresh input").closest("article")).toHaveTextContent(
-      "240",
-    );
+
+    await user.click(screen.getByRole("button", { name: "All time" }));
+
+    const allTime = await screen.findByRole("region", {
+      name: "All time usage summary",
+    });
+    expect(within(allTime).getByText("520")).toBeVisible();
+    expect(allTime).toHaveTextContent("Jan 1, 2025 – Jan 3, 2025");
     expect(loadStats.mock.calls.map(([period]) => period)).toEqual([
       "daily",
       "weekly",
@@ -112,7 +159,9 @@ describe("usage page", () => {
     );
     await user.click(screen.getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(loadStats).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText("Standard-rate prompt tokens")).toBeVisible();
+    expect(
+      await screen.findByRole("region", { name: "Today usage summary" }),
+    ).toHaveTextContent("Fresh input");
     expect(screen.queryByRole("alert")).toBeNull();
   });
 });

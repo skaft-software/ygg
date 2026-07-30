@@ -144,11 +144,14 @@ test("runs the authenticated production host lifecycle end to end", async ({
       });
       expect(reused.status()).toBe(401);
 
-      const bootstrapResponse = page.waitForResponse(
-        (response) =>
-          response.url() === `${origin}/api/v1/bootstrap` &&
-          response.request().method() === "GET",
-      );
+      const bootstrapResponse = page.waitForResponse((response) => {
+        const url = new URL(response.url());
+        return (
+          url.origin === origin &&
+          url.pathname === "/api/v1/bootstrap" &&
+          response.request().method() === "GET"
+        );
+      });
       const documentResponse = await page.goto(
         `${origin}/?transport=fixture`,
       );
@@ -193,11 +196,21 @@ test("runs the authenticated production host lifecycle end to end", async ({
       await sendPrompt(page, STREAM_PROMPT);
       const request = await host.provider.waitForPrompt(STREAM_PROMPT);
       expectDeterministicRequest(request);
+      await expect(
+        page.getByRole("button", {
+          name: `Open session ${STREAM_PROMPT}, Working`,
+        }),
+      ).toBeVisible();
       await expect(page.getByText(STREAM_PARTIAL, { exact: true })).toBeVisible();
       await expect(page.getByRole("button", { name: "Stop ygg" })).toBeVisible();
 
       host.provider.release(STREAM_PROMPT);
       await expectDone(page, STREAM_REPLY);
+      await expect(
+        page.getByRole("button", {
+          name: `Open session ${STREAM_PROMPT}, Done`,
+        }),
+      ).toBeVisible();
       const snapshot = await sessionSnapshot(page, origin, sessionId);
       expect(snapshot.liveState).toBe("done");
       expect(JSON.stringify(snapshot.items)).toContain(STREAM_REPLY);

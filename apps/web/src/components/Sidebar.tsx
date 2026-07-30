@@ -17,12 +17,20 @@ import {
 } from "lucide-react";
 import {
   type ReactNode,
+  Fragment,
   memo,
   useEffect,
   useRef,
   useState,
 } from "react";
-import type { ProjectSummary, SessionSummary } from "../protocol";
+import type {
+  ProjectSummary,
+  SearchMatchRange,
+  SessionSummary,
+  TranscriptSearchHit,
+  TranscriptSearchRequest,
+  TranscriptSearchResult,
+} from "../protocol";
 
 interface SidebarProps {
   open: boolean;
@@ -52,7 +60,10 @@ interface SidebarProps {
   onOpenUsage: () => void;
   onOpenSettings: () => void;
   transcriptSearchAvailable?: boolean;
-  onOpenTranscriptSearch?: () => void;
+  onSearchTranscripts?: (
+    request: TranscriptSearchRequest,
+  ) => Promise<TranscriptSearchResult>;
+  onActivateSearchResult?: (sessionId: string, itemId: string) => void;
 }
 
 const sessionStatusLabel: Record<SessionSummary["status"], string> = {
@@ -73,6 +84,102 @@ const pullRequestLabels: Record<
   ready: "Pull request ready for review",
   merged: "Pull request merged",
 };
+
+const searchKindLabels: Record<TranscriptSearchHit["kind"], string> = {
+  user: "User message",
+  assistant: "Assistant message",
+  tool: "Tool result",
+  error: "Error",
+  attachment: "Attachment",
+};
+
+function searchMatchRanges(
+  textLength: number,
+  ranges: readonly SearchMatchRange[],
+): Array<{ start: number; end: number }> {
+  return ranges
+    .filter(
+      (range) =>
+        Number.isFinite(range.startChar) && Number.isFinite(range.endChar),
+    )
+    .map((range) => ({
+      start: Math.max(0, Math.min(textLength, Math.trunc(range.startChar))),
+      end: Math.max(0, Math.min(textLength, Math.trunc(range.endChar))),
+    }))
+    .filter((range) => range.end > range.start)
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+    .reduce<Array<{ start: number; end: number }>>((merged, range) => {
+      const previous = merged.at(-1);
+      if (previous && range.start <= previous.end) {
+        previous.end = Math.max(previous.end, range.end);
+      } else {
+        merged.push({ ...range });
+      }
+      return merged;
+    }, []);
+}
+
+function BoldedSearchText({
+  text,
+  ranges,
+}: {
+  text: string;
+  ranges: readonly SearchMatchRange[];
+}) {
+  const characters = Array.from(text);
+  const highlights = searchMatchRanges(characters.length, ranges);
+  if (!highlights.length) return text;
+
+  const parts = [];
+  let cursor = 0;
+  for (const [index, range] of highlights.entries()) {
+    if (range.start > cursor) {
+      parts.push(
+        <Fragment key={`text-${cursor}-${range.start}`}>
+          {characters.slice(cursor, range.start).join("")}
+        </Fragment>,
+      );
+    }
+    parts.push(
+      <strong
+        className="sidebar-search-match"
+        key={`match-${range.start}-${range.end}-${index}`}
+      >
+        {characters.slice(range.start, range.end).join("")}
+      </strong>,
+    );
+    cursor = range.end;
+  }
+  if (cursor < characters.length) {
+    parts.push(
+      <Fragment key={`text-${cursor}-${characters.length}`}>
+        {characters.slice(cursor).join("")}
+      </Fragment>,
+    );
+  }
+  return <>{parts}</>;
+}
+
+function SessionSearchHit({
+  hit,
+  onActivate,
+}: {
+  hit: TranscriptSearchHit;
+  onActivate?: (sessionId: string, itemId: string) => void;
+}) {
+  return (
+    <button
+      className="session-search-hit"
+      type="button"
+      aria-label={`Open ${searchKindLabels[hit.kind]} result from ${hit.sessionTitle}`}
+      onClick={() => onActivate?.(hit.sessionId, hit.itemId)}
+    >
+      <span>
+        <BoldedSearchText text={hit.snippet} ranges={hit.matchRanges} />
+      </span>
+    </button>
+  );
+}
 
 function PullRequestMark({
   state,
@@ -100,10 +207,12 @@ function SessionRow({
   session,
   selected,
   onSelect,
+  titleContent,
 }: {
   session: SessionSummary;
   selected: boolean;
   onSelect: () => void;
+  titleContent?: ReactNode;
 }) {
   const pullRequestLabel = session.pullRequest
     ? `, ${pullRequestLabels[session.pullRequest.state]}`
@@ -116,7 +225,9 @@ function SessionRow({
       aria-label={`Open session ${session.title}, ${sessionStatusLabel[session.status]}${pullRequestLabel}`}
       data-status={session.status}
     >
-      <span className="session-row-title">{session.title}</span>
+      <span className="session-row-title">
+        {titleContent ?? session.title}
+      </span>
       {session.pullRequest ? (
         <PullRequestMark state={session.pullRequest.state} />
       ) : null}
@@ -130,12 +241,16 @@ function WorkspaceSection({
   selectedSessionId,
   onSelectSession,
   renderControls,
+  searchHitsBySession,
+  onActivateSearchResult,
 }: {
   project?: ProjectSummary;
   sessions: SessionSummary[];
   selectedSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
   renderControls?: (session: SessionSummary) => ReactNode;
+  searchHitsBySession?: ReadonlyMap<string, TranscriptSearchHit[]>;
+  onActivateSearchResult?: (sessionId: string, itemId: string) => void;
 }) {
   if (sessions.length === 0) return null;
   const title = project?.name ?? "Unassigned project";
@@ -150,6 +265,9 @@ function WorkspaceSection({
       <div className="session-list">
         {sessions.map((session) => {
           const controls = renderControls?.(session);
+          const searchHits = searchHitsBySession?.get(session.id);
+          const titleMatchRanges =
+            searchHits?.flatMap((hit) => hit.titleMatchRanges) ?? [];
           return (
             <div
               className={`session-row-shell ${controls ? "has-actions" : ""}`}
@@ -159,7 +277,26 @@ function WorkspaceSection({
                 session={session}
                 selected={session.id === selectedSessionId}
                 onSelect={() => onSelectSession(session.id)}
+                titleContent={
+                  searchHits ? (
+                    <BoldedSearchText
+                      text={session.title}
+                      ranges={titleMatchRanges}
+                    />
+                  ) : undefined
+                }
               />
+              {searchHits?.length ? (
+                <div className="session-search-hits">
+                  {searchHits.map((hit) => (
+                    <SessionSearchHit
+                      key={`${hit.sessionId}:${hit.itemId}`}
+                      hit={hit}
+                      onActivate={onActivateSearchResult}
+                    />
+                  ))}
+                </div>
+              ) : null}
               {controls}
             </div>
           );
@@ -202,8 +339,9 @@ function SidebarView({
   onOpenProjects,
   onOpenUsage,
   onOpenSettings,
-  transcriptSearchAvailable = false,
-  onOpenTranscriptSearch,
+  transcriptSearchAvailable,
+  onSearchTranscripts,
+  onActivateSearchResult,
 }: SidebarProps) {
   const sidebarRef = useRef<HTMLElement>(null);
   const onCloseRef = useRef(onClose);
@@ -279,11 +417,62 @@ function SidebarView({
     trashedAtMs: number;
   } | null>(null);
   const [deletePhrase, setDeletePhrase] = useState("");
+  const searchSequenceRef = useRef(0);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [searchResult, setSearchResult] =
+    useState<TranscriptSearchResult | null>(null);
   const view =
     selectedView === "trash" && !sessionTrashAvailable
       ? "active"
       : selectedView;
   const normalizedQuery = query.trim().toLocaleLowerCase();
+  const searchQuery = query.trim();
+  const contentSearchEnabled = Boolean(
+    onSearchTranscripts && transcriptSearchAvailable !== false,
+  );
+
+  useEffect(() => {
+    if (!contentSearchEnabled || !searchQuery || !onSearchTranscripts) {
+      searchSequenceRef.current += 1;
+      return;
+    }
+
+    const sequence = ++searchSequenceRef.current;
+    const timer = window.setTimeout(() => {
+      void onSearchTranscripts({
+        query: searchQuery,
+        filter: {},
+        limit: 100,
+      })
+        .then((result) => {
+          if (sequence !== searchSequenceRef.current) return;
+          setSearchResult(result);
+        })
+        .catch(() => {
+          if (sequence !== searchSequenceRef.current) return;
+          setSearchError("Session search could not be completed. Try again.");
+        })
+        .finally(() => {
+          if (sequence === searchSequenceRef.current) setSearchLoading(false);
+        });
+    }, 140);
+
+    return () => {
+      window.clearTimeout(timer);
+      if (sequence === searchSequenceRef.current) {
+        searchSequenceRef.current += 1;
+      }
+    };
+  }, [contentSearchEnabled, onSearchTranscripts, searchQuery]);
+
+  const updateSearchQuery = (nextQuery: string) => {
+    setQuery(nextQuery);
+    setSearchError(null);
+    setSearchResult(null);
+    setSearchLoading(contentSearchEnabled && Boolean(nextQuery.trim()));
+  };
+
   const visibleSessions = sessions.filter(
     (session) =>
       session.lifecycle === view &&
@@ -291,9 +480,21 @@ function SidebarView({
         session.title.toLocaleLowerCase().includes(normalizedQuery) ||
         session.preview.toLocaleLowerCase().includes(normalizedQuery)),
   );
+  const searchHitsBySession = new Map<string, TranscriptSearchHit[]>();
+  if (searchResult) {
+    for (const hit of searchResult.hits) {
+      const hits = searchHitsBySession.get(hit.sessionId);
+      if (hits) hits.push(hit);
+      else searchHitsBySession.set(hit.sessionId, [hit]);
+    }
+  }
+  const searchMode = contentSearchEnabled && Boolean(searchQuery);
+  const searchVisibleSessions = searchMode
+    ? sessions.filter((session) => searchHitsBySession.has(session.id))
+    : visibleSessions;
   const projectsById = new Map(projects.map((project) => [project.id, project]));
   const workspaceSessions = new Map<string, SessionSummary[]>();
-  for (const session of visibleSessions) {
+  for (const session of searchVisibleSessions) {
     const grouped = workspaceSessions.get(session.projectId);
     if (grouped) grouped.push(session);
     else workspaceSessions.set(session.projectId, [session]);
@@ -323,7 +524,7 @@ function SidebarView({
 
   const selectView = (nextView: SessionSummary["lifecycle"]) => {
     setSelectedView(nextView);
-    setQuery("");
+    updateSearchQuery("");
     setActionError(null);
     setDeleteTarget(null);
     setDeletePhrase("");
@@ -390,7 +591,7 @@ function SidebarView({
   };
 
   const renderSessionControls = (session: SessionSummary) => {
-    if (view === "active") return null;
+    if (view === "active" && !onSetSessionLifecycle) return null;
     const pending = pendingSessionId === session.id;
     const retention = session.retention;
     const expectedPhrase = `permanently delete ${session.id}`;
@@ -403,16 +604,29 @@ function SidebarView({
     return (
       <>
         <div className="session-row-actions">
-          <button
-            type="button"
-            className="session-row-restore"
-            onClick={() => void setLifecycle(session, "active")}
-            aria-label={`Restore session ${session.title}`}
-            title="Restore session"
-            disabled={pending}
-          >
-            <ArchiveRestore aria-hidden="true" />
-          </button>
+          {view === "active" ? (
+            <button
+              type="button"
+              className="session-row-archive"
+              onClick={() => void setLifecycle(session, "archived")}
+              aria-label={`Archive session ${session.title}`}
+              title="Archive session"
+              disabled={pending}
+            >
+              <Archive aria-hidden="true" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="session-row-restore"
+              onClick={() => void setLifecycle(session, "active")}
+              aria-label={`Restore session ${session.title}`}
+              title="Restore session"
+              disabled={pending}
+            >
+              <ArchiveRestore aria-hidden="true" />
+            </button>
+          )}
           {view === "archived" &&
           sessionTrashAvailable &&
           onSetSessionLifecycle ? (
@@ -547,7 +761,7 @@ function SidebarView({
             <input
               type="search"
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => updateSearchQuery(event.target.value)}
               placeholder={
                 view === "archived"
                   ? "Search archive"
@@ -557,16 +771,6 @@ function SidebarView({
               }
             />
           </label>
-          {transcriptSearchAvailable && onOpenTranscriptSearch ? (
-            <button
-              type="button"
-              className="sidebar-transcript-search"
-              onClick={onOpenTranscriptSearch}
-            >
-              <Search aria-hidden="true" />
-              <span>Search conversation contents</span>
-            </button>
-          ) : null}
           <div
             className="sidebar-lifecycle-tabs"
             role="tablist"
@@ -618,7 +822,16 @@ function SidebarView({
           role="tabpanel"
           aria-label={`${view === "archived" ? "Archive" : view === "trash" ? "Trash" : "Active"} sessions`}
         >
-          {visibleSessions.length === 0 ? (
+          {searchMode &&
+          (searchLoading || (!searchResult && !searchError)) ? (
+            <div className="sidebar-search-state" role="status">
+              Searching sessions…
+            </div>
+          ) : searchMode && searchError ? (
+            <div className="sidebar-search-state is-error" role="alert">
+              {searchError}
+            </div>
+          ) : searchVisibleSessions.length === 0 ? (
             <div className="sidebar-empty">
               {normalizedQuery ? (
                 <Search aria-hidden="true" />
@@ -638,7 +851,13 @@ function SidebarView({
           ) : (
             <>
               <div className="workspace-list-heading">
-                <span>{view === "active" ? "Sessions" : "Session history"}</span>
+                <span>
+                  {searchMode
+                    ? "Search results"
+                    : view === "active"
+                      ? "Sessions"
+                      : "Session history"}
+                </span>
                 <button type="button" onClick={onOpenProjects}>
                   Manage
                 </button>
@@ -650,8 +869,12 @@ function SidebarView({
                   sessions={workspace.sessions}
                   selectedSessionId={selectedSessionId}
                   onSelectSession={onSelectSession}
+                  searchHitsBySession={
+                    searchMode ? searchHitsBySession : undefined
+                  }
+                  onActivateSearchResult={onActivateSearchResult}
                   renderControls={
-                    view === "active" ? undefined : renderSessionControls
+                    !searchMode ? renderSessionControls : undefined
                   }
                 />
               ))}

@@ -774,6 +774,21 @@ describe("HTTP Ygg transport", () => {
       reasoning_tokens: 16,
       total_tokens: 260,
       request_count: 3,
+      models: [
+        {
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          prompt_tokens: 120,
+          completion_tokens: 80,
+          cache_read_tokens: 40,
+          cache_write_tokens: 20,
+          cache_write_1h_tokens: 5,
+          reasoning_tokens: 16,
+          total_tokens: 260,
+          request_count: 3,
+        },
+      ],
+      models_truncated: false,
     };
     const fetchMock = vi
       .fn<typeof fetch>()

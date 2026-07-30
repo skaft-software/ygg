@@ -33,10 +33,7 @@ import {
   SessionProjectionReplacementRequiredError,
   SessionSequenceGapError,
 } from "./reducer";
-import {
-  deriveSessionTitle,
-  isUntitledSession,
-} from "./session-title";
+import { isUntitledSession } from "./session-title";
 import type {
   TransportConnectionState,
   YggTransport,
@@ -97,6 +94,12 @@ function latestAssistant(snapshot: SessionSnapshot): string | undefined {
     .at(-1)?.content;
 }
 
+function stableSessionTitle(current: string, incoming: string): string {
+  return isUntitledSession(incoming) && !isUntitledSession(current)
+    ? current
+    : incoming;
+}
+
 function updateSummary(
   summary: SessionSummary,
   event: SessionEvent,
@@ -106,7 +109,7 @@ function updateSummary(
   if (event.type === "session.snapshot") {
     return {
       ...summary,
-      title: event.snapshot.title,
+      title: stableSessionTitle(summary.title, event.snapshot.title),
       status: event.snapshot.status,
       modelId: event.snapshot.modelId,
       preview: latestAssistant(event.snapshot) || summary.preview,
@@ -131,7 +134,10 @@ function updateSummary(
     const status = event.patch.status ?? summary.status;
     return {
       ...summary,
-      title: event.patch.title ?? summary.title,
+      title:
+        event.patch.title === undefined
+          ? summary.title
+          : stableSessionTitle(summary.title, event.patch.title),
       status,
       modelId: event.patch.modelId ?? summary.modelId,
       updatedAt: new Date().toISOString(),
@@ -160,14 +166,15 @@ function updateSummary(
     };
   }
   if (snapshot) {
+    const title = stableSessionTitle(summary.title, snapshot.title);
     if (
-      summary.title !== snapshot.title ||
+      summary.title !== title ||
       summary.status !== snapshot.status ||
       summary.modelId !== snapshot.modelId
     ) {
       return {
         ...summary,
-        title: snapshot.title,
+        title,
         status: snapshot.status,
         modelId: snapshot.modelId,
         updatedAt: new Date().toISOString(),
@@ -233,13 +240,28 @@ export class YggStore {
         ) {
           continue;
         }
-        const summary =
-          event.summary.id === next.selectedSessionId
-            ? { ...event.summary, unread: false }
-            : event.summary;
-        const exists = bootstrap.sessions.some(
-          (candidate) => candidate.id === summary.id,
+        const existingSummary = bootstrap.sessions.find(
+          (candidate) => candidate.id === event.summary.id,
         );
+        const currentSession = next.sessions[event.summary.id];
+        const priorTitle =
+          currentSession && !isUntitledSession(currentSession.title)
+            ? currentSession.title
+            : (existingSummary?.title ?? currentSession?.title);
+        const mergedSummary = {
+          ...event.summary,
+          title: priorTitle
+            ? stableSessionTitle(priorTitle, event.summary.title)
+            : event.summary.title,
+        };
+        const summary =
+          mergedSummary.id === next.selectedSessionId
+            ? { ...mergedSummary, unread: false }
+            : mergedSummary;
+        const exists = Boolean(existingSummary);
+        const sessionTitle = currentSession
+          ? stableSessionTitle(currentSession.title, summary.title)
+          : undefined;
         next = {
           ...next,
           bootstrap: {
@@ -251,6 +273,15 @@ export class YggStore {
                 )
               : [summary, ...bootstrap.sessions],
           },
+          sessions:
+            currentSession &&
+            sessionTitle !== undefined &&
+            sessionTitle !== currentSession.title
+              ? {
+                  ...next.sessions,
+                  [summary.id]: { ...currentSession, title: sessionTitle },
+                }
+              : next.sessions,
         };
         changed = true;
         continue;
@@ -324,19 +355,9 @@ export class YggStore {
           throw error;
         }
       }
-      if (
-        updated &&
-        isUntitledSession(updated.title) &&
-        (event.type === "item.started" || event.type === "item.committed") &&
-        event.item.kind === "user_message"
-      ) {
-        updated = {
-          ...updated,
-          title: deriveSessionTitle(
-            event.item.content,
-            event.item.attachments?.at(0)?.name,
-          ),
-        };
+      if (updated && current) {
+        const title = stableSessionTitle(current.title, updated.title);
+        if (title !== updated.title) updated = { ...updated, title };
       }
 
       const bootstrap = next.bootstrap;
@@ -416,15 +437,28 @@ export class YggStore {
             throw new Error("Session resync returned a stale projection.");
           }
           const bootstrap = this.state.bootstrap;
-          primeSessionItemIndex(snapshot);
+          const summary = bootstrap?.sessions.find(
+            (candidate) => candidate.id === sessionId,
+          );
+          const priorTitle =
+            current && !isUntitledSession(current.title)
+              ? current.title
+              : (summary?.title ?? current?.title);
+          const replacement = priorTitle
+            ? {
+                ...snapshot,
+                title: stableSessionTitle(priorTitle, snapshot.title),
+              }
+            : snapshot;
+          primeSessionItemIndex(replacement);
           const summaries = bootstrap?.sessions.map((summary) =>
             summary.id === sessionId
               ? {
                   ...summary,
-                  title: snapshot.title,
-                  status: snapshot.status,
-                  modelId: snapshot.modelId,
-                  preview: latestAssistant(snapshot) || summary.preview,
+                  title: stableSessionTitle(summary.title, replacement.title),
+                  status: replacement.status,
+                  modelId: replacement.modelId,
+                  preview: latestAssistant(replacement) || summary.preview,
                 }
               : summary,
           );
@@ -434,7 +468,7 @@ export class YggStore {
               bootstrap && summaries
                 ? { ...bootstrap, sessions: summaries }
                 : bootstrap,
-            sessions: { ...this.state.sessions, [sessionId]: snapshot },
+            sessions: { ...this.state.sessions, [sessionId]: replacement },
           });
           installed = true;
         } catch {
@@ -524,10 +558,22 @@ export class YggStore {
       const selected = await this.transport.getSession(
         bootstrap.selectedSessionId,
       );
-      primeSessionItemIndex(selected);
+      const selectedSummaryTitle = bootstrap.sessions
+        .find((summary) => summary.id === selected.sessionId)
+        ?.title;
+      const installedSelected = selectedSummaryTitle
+        ? {
+            ...selected,
+            title: stableSessionTitle(selectedSummaryTitle, selected.title),
+          }
+        : selected;
+      primeSessionItemIndex(installedSelected);
       const summaries = bootstrap.sessions.map((summary) =>
-        summary.id === selected.sessionId
-          ? { ...summary, title: selected.title }
+        summary.id === installedSelected.sessionId
+          ? {
+              ...summary,
+              title: stableSessionTitle(summary.title, installedSelected.title),
+            }
           : summary,
       );
       this.publish({
@@ -537,10 +583,10 @@ export class YggStore {
         error: null,
         bootstrap: { ...bootstrap, sessions: summaries },
         projectCatalog,
-        selectedSessionId: selected.sessionId,
-        sessions: { [selected.sessionId]: selected },
+        selectedSessionId: installedSelected.sessionId,
+        sessions: { [installedSelected.sessionId]: installedSelected },
       });
-      writeSessionRoute(selected.sessionId, "replace");
+      writeSessionRoute(installedSelected.sessionId, "replace");
     } catch (error) {
       this.publish({
         ...this.state,
@@ -635,7 +681,16 @@ export class YggStore {
       const snapshot =
         this.state.sessions[sessionId] ??
         (await this.transport.getSession(sessionId, controller.signal));
-      primeSessionItemIndex(snapshot);
+      const summaryTitle = this.state.bootstrap?.sessions.find(
+        (summary) => summary.id === sessionId,
+      )?.title;
+      const installedSnapshot = summaryTitle
+        ? {
+            ...snapshot,
+            title: stableSessionTitle(summaryTitle, snapshot.title),
+          }
+        : snapshot;
+      primeSessionItemIndex(installedSnapshot);
       if (generation !== this.selectionGeneration || controller.signal.aborted) {
         return;
       }
@@ -646,13 +701,23 @@ export class YggStore {
               ...this.state.bootstrap,
               sessions: this.state.bootstrap.sessions.map((summary) =>
                 summary.id === sessionId
-                  ? { ...summary, title: snapshot.title, unread: false }
+                  ? {
+                      ...summary,
+                      title: stableSessionTitle(
+                        summary.title,
+                        installedSnapshot.title,
+                      ),
+                      unread: false,
+                    }
                   : summary,
               ),
             }
           : this.state.bootstrap,
         selectedSessionId: sessionId,
-        sessions: { ...this.state.sessions, [sessionId]: snapshot },
+        sessions: {
+          ...this.state.sessions,
+          [sessionId]: installedSnapshot,
+        },
       });
       if (routeMode !== "none") writeSessionRoute(sessionId, routeMode);
       this.selectionAbort = null;

@@ -22,9 +22,13 @@ inspection evidence.
 - Rename, pin, archive, delete, and stop behave consistently across clients.
 - Streaming assistant, reasoning, tool, approval, input, compaction, source,
   output, diff/change, preview, and run-outcome items have typed renderers.
-- Prior work is collapsed into a concise semantic summary, the latest live item
-  remains visible, and detailed reasoning, commands, metadata, output, and
-  completion review remain reachable through disclosures.
+- Fenced unified diffs in committed assistant Markdown render with semantic
+  headers, change counts, old/new line gutters, and visible change markers.
+- Multi-item work stays behind a concise semantic disclosure while streaming and
+  after completion, so detailed reasoning, commands, metadata, output, and
+  completion review remain reachable without redundant rows. Completed
+  one-action runs use the action row directly rather than a nested generic
+  summary, and evidence-free outcomes do not add empty review disclosures.
 - Composer text, supported attachments, model, reasoning, authority, send,
   stop, steer, and queued follow-up use real controls.
 - Sources, outputs, and changed files come from deterministic evidence.
@@ -51,8 +55,13 @@ inspection evidence.
 - The application uses exactly two measured semantic size tokens: 14px
   interface text and 12px metadata; a style check rejects arbitrary component
   sizes.
+- Local Grotesk and Local Mono from Local Type System 0.53 are the self-hosted
+  default pairing, shipped as two compact variable WOFF2 files; alternatives
+  use only device-installed fonts and never trigger a remote font request.
 - Wide screens use a 296px project/session sidebar, broad center pane, and
   optional 400px evidence pane separated by distinct shades rather than lines.
+- The transcript and composer share a 740px reading measure; transcript rows use
+  a 16px cadence, and user messages hug their content up to 70% of that measure.
 - Sidebar rows show a session title only, plus a PR mark only when structured
   `in_progress`, `ready`, or `merged` evidence exists.
 - The shell uses neutral opaque tonal surfaces and restrained geometry, not

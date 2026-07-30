@@ -13,6 +13,7 @@ import type {
   HostEvent,
   LifetimeUsage,
   ModelSummary,
+  ModelUsage,
   OutputRef,
   PreviewRef,
   ProgressStep,
@@ -40,10 +41,6 @@ import type {
   UsageStats,
   UsageTotals,
 } from "./protocol";
-import {
-  deriveSessionTitle,
-  isUntitledSession,
-} from "./session-title";
 
 type JsonObject = Record<string, unknown>;
 
@@ -2170,18 +2167,7 @@ export function projectSessionSnapshot(
       ),
     )
     .filter((item): item is TranscriptItem => item !== null);
-  const summaryTitle = context.summary?.title ?? "Session";
-  const firstUserInput = items.find(
-    (item) => item.kind === "user_message",
-  );
-  const title =
-    isUntitledSession(summaryTitle) &&
-    firstUserInput?.kind === "user_message"
-      ? deriveSessionTitle(
-          firstUserInput.content,
-          firstUserInput.attachments?.at(0)?.name,
-        )
-      : summaryTitle;
+  const title = context.summary?.title ?? "Session";
 
   const itemSources = rawItems.flatMap((item, index) => {
     const wireItem = object(item, `sessionSnapshot.items[${index}]`);
@@ -2397,15 +2383,65 @@ const usageTotalKeys = [
   "request_count",
 ] as const;
 
+const MAX_USAGE_MODEL_ROWS = 256;
+
+function projectModelUsage(value: unknown, path: string): ModelUsage {
+  const model = object(value, path, ["provider", "model", ...usageTotalKeys]);
+  return {
+    provider: boundedString(model.provider, `${path}.provider`, 128),
+    model: boundedString(model.model, `${path}.model`, 256),
+    ...projectUsageTotals(model, path),
+  };
+}
+
+function projectModelBreakdown(
+  value: unknown,
+  path: string,
+): ModelUsage[] {
+  const rows = array(value, path);
+  if (rows.length > MAX_USAGE_MODEL_ROWS) {
+    throw new WireContractError(
+      path,
+      `must contain at most ${MAX_USAGE_MODEL_ROWS} models`,
+    );
+  }
+  const identities = new Set<string>();
+  let previousTotal = Number.POSITIVE_INFINITY;
+  return rows.map((value, index) => {
+    const rowPath = `${path}[${index}]`;
+    const row = projectModelUsage(value, rowPath);
+    const identity = `${row.provider}\0${row.model}`;
+    if (identities.has(identity)) {
+      throw new WireContractError(rowPath, "must identify a unique model");
+    }
+    if (row.totalTokens > previousTotal) {
+      throw new WireContractError(path, "must be ordered by total tokens");
+    }
+    identities.add(identity);
+    previousTotal = row.totalTokens;
+    return row;
+  });
+}
+
 export function projectUsageStats(value: unknown): UsageStats {
   const path = "usageStats";
-  const stats = object(value, path, ["period", ...usageTotalKeys]);
+  const stats = object(value, path, [
+    "period",
+    ...usageTotalKeys,
+    "models",
+    "models_truncated",
+  ]);
   return {
     period: enumeration(stats.period, `${path}.period`, [
       "daily",
       "weekly",
     ] as const),
     ...projectUsageTotals(stats, path),
+    models: projectModelBreakdown(stats.models, `${path}.models`),
+    modelsTruncated: boolean(
+      stats.models_truncated,
+      `${path}.models_truncated`,
+    ),
   };
 }
 
@@ -2413,11 +2449,18 @@ export function projectLifetimeUsage(value: unknown): LifetimeUsage {
   const path = "lifetimeUsage";
   const lifetime = object(value, path, [
     ...usageTotalKeys,
+    "models",
+    "models_truncated",
     "first_request_at_ms",
     "last_request_at_ms",
   ]);
   return {
     ...projectUsageTotals(lifetime, path),
+    models: projectModelBreakdown(lifetime.models, `${path}.models`),
+    modelsTruncated: boolean(
+      lifetime.models_truncated,
+      `${path}.models_truncated`,
+    ),
     firstRequestAtMs:
       lifetime.first_request_at_ms === null
         ? undefined

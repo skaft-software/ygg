@@ -1,4 +1,8 @@
 const storedFontStacks: Record<string, { ui: string; mono: string }> = {
+  local: {
+    ui: '"Local Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif',
+    mono: '"Local Mono", "LocalMono Nerd Font Mono", "SFMono-Regular", "Cascadia Mono", Menlo, Consolas, ui-monospace, monospace',
+  },
   geist: {
     ui: '"Geist", Inter, ui-sans-serif, system-ui, sans-serif',
     mono: '"Geist Mono", "SFMono-Regular", Menlo, Consolas, ui-monospace, monospace',
@@ -28,13 +32,13 @@ const storedFontStacks: Record<string, { ui: string; mono: string }> = {
 export function applyStoredTypePreferences(): void {
   const root = document.documentElement;
   const storedStackId = localStorage.getItem("ygg.ui.font");
+  const migratedStackId =
+    storedStackId === "ibm-plex-mono" ? "geist" : storedStackId;
   const stackId =
-    !storedStackId
-      ? "system-mono"
-      : storedStackId === "ibm-plex-mono"
-        ? "geist"
-        : storedStackId;
-  const stack = storedFontStacks[stackId] ?? storedFontStacks["system-mono"];
+    migratedStackId && Object.hasOwn(storedFontStacks, migratedStackId)
+      ? migratedStackId
+      : "local";
+  const stack = storedFontStacks[stackId];
   const sizeValue = Number(localStorage.getItem("ygg.ui.size") ?? "14");
   const size = [12, 13, 14, 15].includes(sizeValue) ? sizeValue : 14;
   root.style.setProperty("--ui-family", stack.ui);

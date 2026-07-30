@@ -22,7 +22,7 @@ async function ensureSidebar(page: Page) {
 
 async function selectSession(page: Page, title: string) {
   await ensureSidebar(page);
-  await page.getByRole("button", { name: new RegExp(title) }).click();
+  await page.locator("button.session-row").filter({ hasText: title }).click();
 }
 
 async function ensureActivityOpen(page: Page) {
@@ -112,12 +112,15 @@ test("opens in a fresh, quiet session with the standard composer", async ({
         return {
           theme: document.documentElement.dataset.theme ?? null,
           shimmer: getComputedStyle(composer, "::before").animationName,
+          perimeter:
+            composer.querySelector(".composer-running-edge-chase") !== null,
         };
       }),
     )
     .toEqual({
       theme: null,
       shimmer: "none",
+      perimeter: false,
     });
   await expect(
     page.getByRole("button", { name: /Model and effort/ }),
@@ -454,18 +457,83 @@ test("uses blue effort fill, sparkling white dots, and a max-only rainbow", asyn
     });
 });
 
+test("keeps the transcript on a compact conversational cadence", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop");
+  await selectSession(page, "Review release readiness");
+
+  const geometry = await page.evaluate(() => {
+    const transcript = document.querySelector<HTMLElement>(".transcript")!;
+    const userMessage = transcript.querySelector<HTMLElement>(".user-message")!;
+    const composer = document.querySelector<HTMLElement>(".composer")!;
+    const transcriptBounds = transcript.getBoundingClientRect();
+    const userBounds = userMessage.getBoundingClientRect();
+    const composerBounds = composer.getBoundingClientRect();
+    const transcriptStyle = getComputedStyle(transcript);
+    const contentLeft =
+      transcriptBounds.left + Number.parseFloat(transcriptStyle.paddingLeft);
+    const contentRight =
+      transcriptBounds.right - Number.parseFloat(transcriptStyle.paddingRight);
+
+    return {
+      contentWidth: contentRight - contentLeft,
+      gap: transcriptStyle.gap,
+      composerWidth: composerBounds.width,
+      composerAligned:
+        Math.abs(composerBounds.left - contentLeft) < 0.5 &&
+        Math.abs(composerBounds.right - contentRight) < 0.5,
+      userWidth: userBounds.width,
+      userRightAligned: Math.abs(userBounds.right - contentRight) < 0.5,
+      userPadding: getComputedStyle(userMessage).padding,
+    };
+  });
+
+  expect(geometry).toEqual({
+    contentWidth: 740,
+    gap: "16px",
+    composerWidth: 740,
+    composerAligned: true,
+    userWidth: 518,
+    userRightAligned: true,
+    userPadding: "8px 12px",
+  });
+
+  await selectSession(page, "Summarize provider notes");
+  const shortMessage = await page.evaluate(() => {
+    const transcript = document.querySelector<HTMLElement>(".transcript")!;
+    const message = transcript.querySelector<HTMLElement>(".user-message")!;
+    const transcriptBounds = transcript.getBoundingClientRect();
+    const messageBounds = message.getBoundingClientRect();
+    const transcriptStyle = getComputedStyle(transcript);
+    const contentRight =
+      transcriptBounds.right - Number.parseFloat(transcriptStyle.paddingRight);
+    return {
+      width: messageBounds.width,
+      rightAligned: Math.abs(messageBounds.right - contentRight) < 0.5,
+    };
+  });
+  expect(shortMessage.width).toBeLessThan(400);
+  expect(shortMessage.rightAligned).toBe(true);
+});
+
 test("shows typed work and a conditional activity rail", async ({ page }) => {
   await selectSession(page, "Refine onboarding preview");
   const conversation = page.getByRole("region", { name: "Conversation" });
   const historySummary = conversation.getByRole("button", {
-    name: "Read files, edited file, viewed preview",
+    name: "Working",
+    exact: true,
   });
   await expect(historySummary).toBeVisible();
   await expect(historySummary).toHaveAttribute("aria-expanded", "false");
+  await expect(historySummary.locator(".work-group-glyph")).toHaveClass(
+    /is-live/,
+  );
   const historyContent = conversation.locator(".work-group-content-clip");
   await expect(historyContent).toHaveAttribute("inert", "");
+  await expect(conversation.locator(".work-group-live-item")).toHaveCount(0);
   const liveReasoning = conversation.locator(
-    ".work-group-live-item .reasoning-block",
+    ".work-group-content .reasoning-block",
   );
   await expect(liveReasoning).toContainText("Checking the narrow layout");
   await expect(liveReasoning).not.toHaveAttribute("open", "");
@@ -519,8 +587,15 @@ test("shows typed work and a conditional activity rail", async ({ page }) => {
       borderWidth: "0px",
       shadedSurface: true,
       shimmer: "none",
-      perimeter: false,
+      perimeter: true,
     });
+  await expect
+    .poll(() =>
+      page
+        .locator(".composer-running-edge-chase")
+        .evaluate((edge) => getComputedStyle(edge).animationName),
+    )
+    .toBe("composer-ring-chase");
   await expect(page.getByRole("button", { name: "Stop ygg" })).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Queue follow-up" }),
@@ -574,13 +649,17 @@ test("keeps the 1,000-item performance fixture bounded and quiet", async ({
   const conversation = page.getByRole("region", { name: "Conversation" });
   const transcript = conversation.locator(".transcript");
   await expect(transcript).toHaveAttribute("data-item-count", "1000");
-  await expect(conversation.locator(".command-batch")).toHaveCount(1);
-  await expect(conversation.locator(".command-batch > summary")).toHaveText(
-    "Ran 100 commands",
+  const commandGroup = conversation.locator(
+    ".work-group:has(.command-batch)",
+  );
+  await expect(commandGroup).toHaveCount(1);
+  await expect(commandGroup.locator(".work-group-summary")).toContainText(
+    "Ran commands",
   );
   await expect(
-    conversation.locator(".command-batch > summary"),
+    commandGroup.locator(".work-group-summary"),
   ).not.toContainText(/bash|succeeded/i);
+  await expect(commandGroup.locator(".command-batch > summary")).toHaveCount(0);
   await expect
     .poll(() =>
       conversation
@@ -1105,6 +1184,7 @@ test("returns focus to a visible activity trigger after closing an inspector", a
 test("renders an explicit approval decision", async ({ page }) => {
   await selectSession(page, "Prepare signed macOS build");
   await expect(page.getByText("Your approval is needed")).toBeVisible();
+  await expect(page.locator(".composer-running-edge")).toHaveCount(0);
   await page.getByRole("button", { name: "Allow once" }).click();
   await expect(page.getByText("Allowed once")).toBeVisible();
 });
@@ -1140,7 +1220,13 @@ test("honors reduced motion for live status animation", async ({
   await page.emulateMedia({ reducedMotion: "reduce" });
   await selectSession(page, "Refine onboarding preview");
   const liveDot = page.locator(".live-dots i").first();
+  const runningEdge = page.locator(".composer-running-edge-chase");
   await expect(liveDot).toBeVisible();
+  await expect
+    .poll(() =>
+      runningEdge.evaluate((element) => getComputedStyle(element).animationName),
+    )
+    .toBe("none");
   await expect
     .poll(() =>
       liveDot.evaluate((element) => {

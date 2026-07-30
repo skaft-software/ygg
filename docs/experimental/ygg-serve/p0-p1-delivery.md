@@ -8,9 +8,12 @@ fixture-only behavior does not count.
 
 ## Constraints
 
-- Keep raw tool arguments, unredacted command output, secrets, and host paths
-  behind the coding-agent adapter. The public Serve protocol receives only
-  bounded, redacted presentation data and opaque resource handles.
+- Keep unredacted command output, secrets, and host paths behind the
+  coding-agent adapter. The public Serve protocol exposes every Bash command
+  as bounded, control-safe text, redacting only credential-like values, plus
+  opaque resource handles.
+- Keep non-command tool arguments, progress, and raw results behind the
+  coding-agent adapter.
 - Keep workspace trust, agent authority, and future device authentication as
   separate decisions.
 - Do not present conversation checkpoints as Git branches.
@@ -25,8 +28,10 @@ fixture-only behavior does not count.
 ### Semantic activity
 
 - [ ] Project every supported tool to a deterministic semantic kind, title,
-      target, safe command/cwd preview, state, exit information, and duration.
-- [ ] Remove raw tool arguments, progress, and results from the public protocol.
+      target, full bounded command/cwd preview, state, exit information, and
+      duration.
+- [ ] Keep raw non-command tool arguments, progress, and results out of the
+      public protocol.
 - [ ] Group work into deterministic investigate/change/verify/produce phases.
 - [ ] Aggregate repeated commands and expose compact summaries by default.
 - [ ] Link actions to sources, changed paths, diffs, outputs, approvals, and

@@ -181,11 +181,21 @@ export interface UsageTotals {
   requestCount: number;
 }
 
-export interface UsageStats extends UsageTotals {
+export interface ModelUsage extends UsageTotals {
+  provider: string;
+  model: string;
+}
+
+export interface UsageBreakdown extends UsageTotals {
+  models: ModelUsage[];
+  modelsTruncated: boolean;
+}
+
+export interface UsageStats extends UsageBreakdown {
   period: UsagePeriod;
 }
 
-export interface LifetimeUsage extends UsageTotals {
+export interface LifetimeUsage extends UsageBreakdown {
   firstRequestAtMs?: number;
   lastRequestAtMs?: number;
 }

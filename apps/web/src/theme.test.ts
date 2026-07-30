@@ -22,6 +22,15 @@ describe("stored type preferences", () => {
     vi.unstubAllGlobals();
   });
 
+  it("uses Local as the default interface and technical type pairing", () => {
+    applyStoredTypePreferences();
+
+    const style = document.documentElement.style;
+    expect(style.getPropertyValue("--ui-family")).toContain('"Local Grotesk"');
+    expect(style.getPropertyValue("--mono-family")).toContain('"Local Mono"');
+    expect(values.get("ygg.ui.font")).toBe("local");
+  });
+
   it("uses one interface size and one compact metadata size", () => {
     localStorage.setItem("ygg.ui.size", "13");
 

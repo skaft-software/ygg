@@ -3173,6 +3173,8 @@ async fn start_and_drive_run(
         input_parts.push(InputPart::Text(model_prompt));
     }
     input_parts.extend(media.into_iter().map(InputPart::Media));
+    let title_before_prompt =
+        session_meta_for_id(&plan.sessions, &plan.session_id).map(|metadata| metadata.title);
     let mut run = match app.agent.prompt(UserInput::from(input_parts)).await {
         Ok(run) => run,
         Err(_) => {
@@ -3199,7 +3201,19 @@ async fn start_and_drive_run(
         .commit_prompt_context(pending_context_count);
     let control = run.control();
     let context_limit = app.model.spec.limits.context_window;
-    let immediate = vec![
+    let mut immediate = Vec::with_capacity(3);
+    if let Some(title) = changed_session_title(
+        &plan.sessions,
+        &plan.session_id,
+        title_before_prompt.as_deref(),
+    ) {
+        immediate.push(event(EventPayload::SessionMetadataChanged {
+            title: Some(title),
+            pinned: None,
+            archived: None,
+        }));
+    }
+    immediate.extend([
         event(EventPayload::ItemStarted {
             item: SessionItem {
                 id: user_item_id.clone(),
@@ -3222,7 +3236,7 @@ async fn start_and_drive_run(
             state: SessionLiveState::Working,
             active_run_id: Some(run_id.clone()),
         }),
-    ];
+    ]);
     if admission
         .send(Ok(DriverCommandOutcome::run(run_id.clone(), immediate)))
         .is_err()
@@ -3896,7 +3910,7 @@ fn search_target(query: Option<String>, path: Option<String>) -> Option<String> 
     }
 }
 
-fn safe_command_shape(
+fn command_activity_details(
     name: &str,
     arguments: &serde_json::Value,
     workspace: &Path,
@@ -3904,23 +3918,51 @@ fn safe_command_shape(
     if !matches!(name, "bash" | "exec") {
         return (None, false);
     }
-    // Reuse the native presentation normalizer only as an internal first pass.
-    // None of its argument-derived strings cross the public boundary until the
-    // strict allowlist below has reduced the command to a known shape.
-    let normalized =
-        crate::presentation::summarize_tool_with_workspace(name, arguments, Some(workspace))
-            .shell_command
-            .unwrap_or_default();
-    if normalized.is_empty()
-        || normalized.chars().any(|character| {
-            matches!(
-                character,
-                '\n' | '\r' | ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\'' | '"'
-            )
-        })
-    {
+    let raw_command = arguments
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if raw_command.is_empty() {
         return (None, false);
     }
+
+    // Keep the complete command visible. The command is already bounded and
+    // control-safe at the public boundary; only credential-like values are
+    // collapsed so observability does not become an accidental secret leak.
+    let command_preview = if safe_public_query(workspace, raw_command).as_deref()
+        == Some("[redacted query]")
+    {
+        let context = raw_command
+            .split_ascii_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if context.is_empty() {
+            "[redacted command]".into()
+        } else {
+            format!("{context} [redacted arguments]")
+        }
+    } else {
+        raw_command.to_owned()
+    };
+
+    // Verification classification remains intentionally conservative and is
+    // independent from command visibility. A compound or quoted shell command
+    // is still shown in full, but is not promoted to a verified-test phase
+    // unless its shape can be classified deterministically.
+    let normalized = crate::presentation::summarize_tool_with_workspace(
+        name,
+        arguments,
+        Some(workspace),
+    )
+    .shell_command
+    .unwrap_or_default();
+    let simple_command = !normalized.chars().any(|character| {
+        matches!(
+            character,
+            '\n' | '\r' | ';' | '|' | '&' | '>' | '<' | '`' | '$' | '\'' | '"'
+        )
+    });
     let words = normalized.split_ascii_whitespace().collect::<Vec<_>>();
     let program = words
         .first()
@@ -3928,52 +3970,27 @@ fn safe_command_shape(
         .and_then(|word| word.to_str())
         .unwrap_or_default();
     let subcommand = words.get(1).copied().unwrap_or_default();
-    let shape = match (program, subcommand, words.get(2).copied()) {
-        ("cargo", command, _)
-            if matches!(
-                command,
-                "test" | "check" | "clippy" | "fmt" | "build" | "doc"
-            ) =>
-        {
-            Some(format!("cargo {command}"))
-        }
-        ("npm" | "pnpm" | "yarn" | "bun", "test" | "build" | "lint" | "check", _) => {
-            Some(format!("{program} {subcommand}"))
-        }
-        ("npm" | "pnpm" | "yarn" | "bun", "run", Some(command))
-            if matches!(command, "test" | "build" | "lint" | "check" | "typecheck") =>
-        {
-            Some(format!("{program} run {command}"))
-        }
-        ("pytest", _, _) => Some("pytest".into()),
-        ("python" | "python3", "-m", Some("pytest" | "unittest")) => {
-            Some(format!("{program} -m {}", words[2]))
-        }
-        ("go", "test" | "vet" | "build", _) => Some(format!("go {subcommand}")),
-        ("rustc", _, _) => Some("rustc".into()),
-        ("git", "status" | "diff" | "log" | "show", _) => Some(format!("git {subcommand}")),
-        _ => None,
-    };
-    let verification = matches!(
-        (program, subcommand, words.get(2).copied()),
-        (
-            "cargo",
-            "test" | "check" | "clippy" | "fmt" | "build" | "doc",
-            _
-        ) | (
-            "npm" | "pnpm" | "yarn" | "bun",
-            "test" | "build" | "lint" | "check",
-            _
-        ) | (
-            "npm" | "pnpm" | "yarn" | "bun",
-            "run",
-            Some("test" | "build" | "lint" | "check" | "typecheck")
-        ) | ("pytest", _, _)
-            | ("python" | "python3", "-m", Some("pytest" | "unittest"))
-            | ("go", "test" | "vet" | "build", _)
-            | ("rustc", _, _)
-    );
-    (shape.map(|shape| bounded_text(&shape, 1024)), verification)
+    let verification = simple_command
+        && matches!(
+            (program, subcommand, words.get(2).copied()),
+            (
+                "cargo",
+                "test" | "check" | "clippy" | "fmt" | "build" | "doc",
+                _
+            ) | (
+                "npm" | "pnpm" | "yarn" | "bun",
+                "test" | "build" | "lint" | "check",
+                _
+            ) | (
+                "npm" | "pnpm" | "yarn" | "bun",
+                "run",
+                Some("test" | "build" | "lint" | "check" | "typecheck")
+            ) | ("pytest", _, _)
+                | ("python" | "python3", "-m", Some("pytest" | "unittest"))
+                | ("go", "test" | "vet" | "build", _)
+                | ("rustc", _, _)
+        );
+    (Some(bounded_text(&command_preview, 1024)), verification)
 }
 
 fn semantic_tool_activity(
@@ -4002,7 +4019,7 @@ fn semantic_tool_activity(
         .get("cwd")
         .and_then(serde_json::Value::as_str)
         .and_then(|value| safe_workspace_path(workspace, value));
-    let (command_preview, verification) = safe_command_shape(name, arguments, workspace);
+    let (command_preview, verification) = command_activity_details(name, arguments, workspace);
     let remote_read = name == "read"
         && arguments
             .get("path")
@@ -4062,7 +4079,10 @@ fn semantic_tool_activity(
             },
             command_preview
                 .as_ref()
-                .map(|command| format!("Run {command}"))
+                .map(|command| {
+                    let single_line = command.replace(['\r', '\n', '\t'], " ");
+                    format!("Run {single_line}")
+                })
                 .unwrap_or_else(|| "Run command".into()),
             None,
         ),
@@ -4240,12 +4260,20 @@ fn complete_tool_activity(
 }
 
 fn test_framework_hint(activity: &ToolActivity) -> Option<TestFramework> {
-    match activity.command_preview.as_deref() {
-        Some("cargo test") => Some(TestFramework::CargoLibtest),
-        Some("pytest") | Some("python -m pytest") | Some("python3 -m pytest") => {
+    let command = activity.command_preview.as_deref()?;
+    let words = command.split_ascii_whitespace().collect::<Vec<_>>();
+    let program = words
+        .first()
+        .and_then(|word| Path::new(word).file_name())
+        .and_then(|word| word.to_str())
+        .unwrap_or_default();
+    match (program, words.get(1).copied(), words.get(2).copied()) {
+        ("cargo", Some("test"), _) => Some(TestFramework::CargoLibtest),
+        ("pytest", _, _)
+        | ("python" | "python3", Some("-m"), Some("pytest" | "unittest")) => {
             Some(TestFramework::Pytest)
         }
-        Some("go test") => Some(TestFramework::GoTest),
+        ("go", Some("test"), _) => Some(TestFramework::GoTest),
         // Package runners may dispatch either Vitest or Jest, so their
         // deterministic reporter markers select the parser.
         _ => None,
@@ -7113,6 +7141,16 @@ fn session_meta_for_id(store: &SessionStore, session_id: &SessionId) -> Option<S
         .find(|meta| meta.id == session_id.as_str())
 }
 
+fn changed_session_title(
+    store: &SessionStore,
+    session_id: &SessionId,
+    previous: Option<&str>,
+) -> Option<String> {
+    let title = session_meta_for_id(store, session_id)?.title;
+    (title != "(empty session)" && !title.trim().is_empty() && previous != Some(title.as_str()))
+        .then_some(title)
+}
+
 fn summary_from_meta(
     meta: &SessionMeta,
     project_id: Option<ProjectId>,
@@ -7389,6 +7427,37 @@ mod tests {
         config.session_dir = directory.join("sessions");
         config.workspace_trusted = trusted;
         config
+    }
+
+    #[test]
+    fn durable_prompt_title_changes_are_published_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let session_dir = directory.path().join("sessions");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let store = SessionStore::new(&session_dir, &workspace);
+        let session_id = SessionId::new("title-change").unwrap();
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let mut session = Session::create(store.dir().join("title-change.jsonl")).unwrap();
+
+        assert!(session_meta_for_id(&store, &session_id).is_none());
+        assert_eq!(changed_session_title(&store, &session_id, None), None);
+
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text(
+                    "  Keep   the new session title stable  ".into(),
+                )],
+            })))
+            .unwrap();
+
+        let changed = changed_session_title(&store, &session_id, None).unwrap();
+        assert_eq!(changed, "Keep the new session title stable");
+        assert_eq!(
+            changed_session_title(&store, &session_id, Some(&changed)),
+            None
+        );
     }
 
     #[tokio::test]
@@ -9121,7 +9190,10 @@ mod tests {
         let activity = semantic_tool_activity("bash", &arguments, workspace.path(), 10_000);
         assert_eq!(activity.kind, ToolKind::Command);
         assert_eq!(activity.phase, ActivityPhase::Verified);
-        assert_eq!(activity.command_preview.as_deref(), Some("cargo test"));
+        assert_eq!(
+            activity.command_preview.as_deref(),
+            Some("cargo test [redacted arguments]")
+        );
         assert_eq!(activity.cwd.as_deref(), Some("crates/ygg"));
 
         let raw = ToolOutput::new(format!("exit=7 duration=1.25s\nstderr:\n{output_canary}"));
@@ -9158,12 +9230,28 @@ mod tests {
     }
 
     #[test]
+    fn semantic_command_projection_keeps_full_arbitrary_command() {
+        let workspace = tempfile::tempdir().unwrap();
+        let command = "rg -n 'worker shutdown' crates/ygg-coding-agent/src && rustfmt --check crates/ygg-coding-agent/src/lib.rs";
+        let activity = semantic_tool_activity(
+            "bash",
+            &serde_json::json!({"command": command}),
+            workspace.path(),
+            10,
+        );
+
+        assert_eq!(activity.command_preview.as_deref(), Some(command));
+        assert_eq!(activity.title, format!("Run {command}"));
+        assert_eq!(activity.phase, ActivityPhase::Other);
+    }
+
+    #[test]
     fn verified_test_command_projects_only_parser_proven_counts() {
         let workspace = tempfile::tempdir().unwrap();
         let item_id = ItemId::new("item-test-command").unwrap();
         let activity = semantic_tool_activity(
             "bash",
-            &serde_json::json!({"command": "cargo test"}),
+            &serde_json::json!({"command": "cargo test --workspace"}),
             workspace.path(),
             10,
         );
@@ -9484,7 +9572,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(activity.status, ToolActivityStatus::Succeeded);
-        assert_eq!(activity.command_preview.as_deref(), Some("cargo test"));
+        assert_eq!(
+            activity.command_preview.as_deref(),
+            Some("cargo test [redacted arguments]")
+        );
         assert_eq!(activity.duration_ms, Some(50));
         let public = serde_json::to_string(&seed.snapshot).unwrap();
         for secret in [argument_canary, output_canary] {

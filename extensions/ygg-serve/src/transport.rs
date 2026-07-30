@@ -1898,6 +1898,19 @@ mod tests {
                 reasoning_tokens: 2,
                 total_tokens: 21,
                 request_count: 2,
+                models: vec![crate::ModelUsage {
+                    provider: "mock".into(),
+                    model: "mock-model".into(),
+                    prompt_tokens: 11,
+                    completion_tokens: 7,
+                    cache_read_tokens: 3,
+                    cache_write_tokens: 2,
+                    cache_write_1h_tokens: 1,
+                    reasoning_tokens: 2,
+                    total_tokens: 21,
+                    request_count: 2,
+                }],
+                models_truncated: false,
             })
         }
 
@@ -1911,6 +1924,19 @@ mod tests {
                 reasoning_tokens: 20,
                 total_tokens: 210,
                 request_count: 20,
+                models: vec![crate::ModelUsage {
+                    provider: "mock".into(),
+                    model: "mock-model".into(),
+                    prompt_tokens: 110,
+                    completion_tokens: 70,
+                    cache_read_tokens: 30,
+                    cache_write_tokens: 20,
+                    cache_write_1h_tokens: 10,
+                    reasoning_tokens: 20,
+                    total_tokens: 210,
+                    request_count: 20,
+                }],
+                models_truncated: false,
                 first_request_at_ms: Some(1_700_000_000_000),
                 last_request_at_ms: Some(1_700_086_400_000),
             })
@@ -2366,6 +2392,10 @@ mod tests {
         assert_eq!(response_json(&daily)["reasoning_tokens"], 2);
         assert_eq!(response_json(&daily)["total_tokens"], 21);
         assert_eq!(response_json(&daily)["request_count"], 2);
+        assert_eq!(response_json(&daily)["models"][0]["provider"], "mock");
+        assert_eq!(response_json(&daily)["models"][0]["model"], "mock-model");
+        assert_eq!(response_json(&daily)["models"][0]["total_tokens"], 21);
+        assert_eq!(response_json(&daily)["models_truncated"], false);
 
         let weekly = request(
             address,

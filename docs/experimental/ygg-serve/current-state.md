@@ -122,10 +122,15 @@ The UI iterations converged on these rules:
 - The composer spans the usable center pane, has restrained geometry, and stays
   visually attached to the work surface. It has no border, shimmer, perimeter
   chase, glass, or model-colored chrome, while focus remains visibly ringed.
-- Use native system UI and system monospace by default. The visible type scale
-  has two sizes: 14px interface text and 12px metadata. Monospace remains
-  limited to code, paths, diffs, commands, and technical metadata. Local font
-  and size preferences remain available.
+- Use Local Grotesk and Local Mono from bundled Local Type System 0.53 by
+  default. Their compact variable web fonts cover the full 400–700 interface
+  range without separate weight files. Open counters, differentiated ambiguity
+  forms, restrained lower-half gravity, and a shared authored construction
+  grammar balance legibility with a playful DIY character without making a
+  clinical accessibility claim. The visible type scale has two sizes: 14px
+  interface text and 12px metadata. Monospace remains limited to code, paths,
+  diffs, commands, and technical metadata. Popular device-installed font
+  pairings and size preferences remain available.
 - The model picker keeps the simple model/effort abstraction, with precise
   controls under Advanced. Ordinary effort fills the track in blue through and
   slightly behind the white thumb without a rounded-cap gap. Exact `xhigh` adds
@@ -292,8 +297,8 @@ comprehensively.
   follow-up/steer, and send/stop.
 - Resizable desktop Activity and Inspector panes with full-surface mobile
   overlays.
-- Native system typography by default with a two-size interface/metadata scale
-  and device-local font and size preferences.
+- Bundled Local Grotesk and Local Mono typography by default with a two-size
+  interface/metadata scale and popular device-local font and size alternatives.
 - A blue reasoning slider for ordinary effort, locally floating varied white
   particles for exact `xhigh` and `max`, an animated rainbow reserved for exact
   `max`, and static, particle-free reduced motion.

@@ -72,6 +72,13 @@ import {
   type ConversationBranchAction,
 } from "./ConversationBranchDialog";
 import { PromptContextPicker } from "./PromptContextPicker";
+import {
+  BashLogo,
+  InlineDiffPreview,
+  InlineFilePreview,
+  ShellCommand,
+  type ResourceContentUrl,
+} from "./ActivityPreview";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage"));
 
@@ -109,6 +116,7 @@ interface ConversationProps {
     title: string,
     presentation: "text" | "diff" | "image",
   ) => void;
+  resourceContentUrl?: ResourceContentUrl;
   onIngestAttachment?: (file: File) => Promise<AttachmentRef>;
   onIngestDocument?: (file: File) => Promise<DocumentReference>;
   onListProjectFiles?: () => Promise<TrustedFileCatalog>;
@@ -607,9 +615,9 @@ function reasoningDisplayLabel(
     : fallback;
 }
 
-function LiveDots() {
+function LiveDots({ animated = true }: { animated?: boolean }) {
   return (
-    <span className="live-dots" aria-hidden="true">
+    <span className={`live-dots ${animated ? "" : "is-static"}`} aria-hidden="true">
       <i />
     </span>
   );
@@ -632,9 +640,26 @@ function useExitPresence(open: boolean, durationMs = 170) {
   return { present: open || retain, closing: !open && retain };
 }
 
+function actionFileTitle(
+  item: ActionItem,
+  sources: readonly SourceRef[],
+): string {
+  if (item.actionKind === "file_read" && sources.length === 1) {
+    return sources[0]!.title;
+  }
+  if (item.actionKind === "file_write" && item.changedPaths.length === 1) {
+    return item.changedPaths[0]!;
+  }
+  return item.target ?? item.label;
+}
+
 function ActionCell({
   item,
   animate,
+  durationOverrideMs,
+  groupExpanded = false,
+  sessionId,
+  resourceContentUrl,
   onOpenOutput,
   onOpenSource,
   onOpenResource,
@@ -645,6 +670,10 @@ function ActionCell({
 }: {
   item: ActionItem;
   animate: boolean;
+  durationOverrideMs?: number;
+  groupExpanded?: boolean;
+  sessionId: string;
+  resourceContentUrl?: ResourceContentUrl;
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
   onOpenResource: ConversationProps["onOpenResource"];
@@ -654,6 +683,7 @@ function ActionCell({
   sourcesByOrigin: ReadonlyMap<string, readonly SourceRef[]>;
 }) {
   const isStreaming = item.state === "streaming";
+  const [expanded, setExpanded] = useState(false);
   const sourceIds = new Set([
     ...(item.sourceIds ?? []),
     ...(sourcesByOrigin.get(item.id) ?? []).map((source) => source.id),
@@ -668,170 +698,202 @@ function ActionCell({
   const outputs = Array.from(outputIds)
     .map((id) => availableOutputs.get(id))
     .filter((output): output is OutputRef => Boolean(output));
-  return (
-    <details
-      className={`action-cell ${animate ? "is-entering" : ""}`}
-      data-status={item.status}
-    >
-      <summary>
-        <span className={`action-glyph ${isStreaming ? "is-live" : ""}`}>
-          {isStreaming ? (
-            <LiveDots />
-          ) : (
-            actionIcons[item.actionKind]
-          )}
-        </span>
-        <span className="action-title">
-          <strong>{item.label}</strong>
-          {item.target ? <code>{item.target}</code> : null}
-        </span>
-        {typeof item.additions === "number" ? (
-          <span className="diff-count">
-            <em>+{item.additions}</em>
-            <b>−{item.deletions ?? 0}</b>
-          </span>
-        ) : null}
-        {item.durationMs ? (
-          <span className="action-duration">
-            {formatDuration(item.durationMs)}
-          </span>
-        ) : null}
-        {item.status === "failed" ? (
-          <AlertTriangle
-            className="action-status-icon"
-            aria-label="Action failed"
+  const durationMs = item.durationMs ?? durationOverrideMs;
+  const isCommand = item.actionKind === "command";
+  const fileTitle = actionFileTitle(item, sources);
+  const command = item.commandPreview ?? item.target ?? item.label;
+  const inlinePreview =
+    item.actionKind === "file_write" && item.diffHandle ? (
+      <InlineDiffPreview
+        title={fileTitle}
+        url={
+          groupExpanded || expanded
+            ? resourceContentUrl
+              ? resourceContentUrl(sessionId, item.diffHandle)
+              : undefined
+            : undefined
+        }
+        enabled={groupExpanded || expanded}
+        sessionId={sessionId}
+        handle={item.diffHandle}
+      />
+    ) : item.actionKind === "file_read" && sources.length ? (
+      <div className="activity-file-previews">
+        {sources.map((source) => (
+          <InlineFilePreview
+            key={source.id}
+            source={source}
+            url={
+              groupExpanded || expanded
+                ? resourceContentUrl && source.handle
+                  ? resourceContentUrl(sessionId, source.handle)
+                  : undefined
+                : undefined
+            }
+            enabled={groupExpanded || expanded}
+            sessionId={sessionId}
           />
-        ) : null}
-        <ChevronDown className="disclosure-chevron" aria-hidden="true" />
-      </summary>
-      <div className="action-detail">
-        {item.outputSummary ?? item.summary ?? item.detail ? (
-          <p>{item.outputSummary ?? item.summary ?? item.detail}</p>
-        ) : null}
-        {item.commandPreview ? (
-          <pre className="action-command">
-            <code>{item.commandPreview}</code>
-          </pre>
-        ) : null}
-        <dl className="action-metadata">
-          <div>
-            <dt>Status</dt>
-            <dd>{item.status}</dd>
-          </div>
-          {item.cwd ? (
-            <div>
-              <dt>Working directory</dt>
-              <dd>
-                <code>{item.cwd}</code>
-              </dd>
-            </div>
-          ) : null}
-          {typeof item.exitCode === "number" ? (
-            <div>
-              <dt>Exit</dt>
-              <dd>{item.exitCode}</dd>
-            </div>
-          ) : null}
-          {typeof item.signal === "number" ? (
-            <div>
-              <dt>Signal</dt>
-              <dd>{item.signal}</dd>
-            </div>
-          ) : null}
-          {item.observedOutputBytes > 0 ? (
-            <div>
-              <dt>Observed output</dt>
-              <dd>{item.observedOutputBytes.toLocaleString()} bytes</dd>
-            </div>
-          ) : null}
-          {item.droppedOutputBytes > 0 ? (
-            <div data-warning="true">
-              <dt>Truncated</dt>
-              <dd>{item.droppedOutputBytes.toLocaleString()} bytes omitted</dd>
-            </div>
-          ) : null}
-        </dl>
-        {item.outputHandle && onOpenResource ? (
-          <div className="action-links">
-            <button
-              onClick={() =>
-                onOpenResource(
-                  item.outputHandle!,
-                  `${item.label} output`,
-                  "text",
-                )
-              }
-              aria-label={`Open full output for ${item.label}`}
-            >
-              <TerminalSquare aria-hidden="true" />
-              Open full output
-            </button>
-          </div>
-        ) : null}
-        {(item.diffHandle || item.resultHandle) && onOpenResource ? (
-          <div className="action-links">
-            {item.diffHandle ? (
-              <button
-                onClick={() =>
-                  onOpenResource(
-                    item.diffHandle!,
-                    `${item.target ?? "File"} changes`,
-                    "diff",
-                  )
-                }
-                aria-label={`View changes to ${item.target ?? "file"}`}
-              >
-                <FileDiff aria-hidden="true" />
-                View diff
-              </button>
-            ) : null}
-            {item.resultHandle ? (
-              <button
-                onClick={() =>
-                  onOpenResource(
-                    item.resultHandle!,
-                    item.target ?? "Changed file",
-                    "text",
-                  )
-                }
-                aria-label={`View resulting ${item.target ?? "file"}`}
-              >
-                <FileText aria-hidden="true" />
-                View file
-              </button>
-            ) : null}
-          </div>
-        ) : null}
-        {sources?.length ? (
-          <div className="action-links">
-            {sources.map((source) => (
-              <button
-                key={source.id}
-                onClick={() => onOpenSource(source.id)}
-                aria-label={`Open source ${source.title}`}
-              >
-                <File aria-hidden="true" />
-                {source.title}
-              </button>
-            ))}
-          </div>
-        ) : null}
-        {outputs?.length ? (
-          <div className="action-links">
-            {outputs.map((output) => (
-              <button
-                key={output.id}
-                onClick={() => onOpenOutput(output.id)}
-                aria-label={`Open output ${output.title}`}
-              >
-                <ExternalLink aria-hidden="true" />
-                {output.title}
-              </button>
-            ))}
-          </div>
-        ) : null}
+        ))}
       </div>
-    </details>
+    ) : null;
+  const secondaryLabel =
+    !isCommand && fileTitle !== item.label ? item.label : undefined;
+
+  return (
+    <>
+      <details
+        className={`action-cell ${animate ? "is-entering" : ""}`}
+        data-status={item.status}
+        onToggle={(event) => setExpanded(event.currentTarget.open)}
+      >
+        <summary>
+          <span
+            className={`action-glyph ${isStreaming ? "is-live" : ""} ${isCommand ? "is-bash" : ""}`}
+          >
+            {isStreaming ? <LiveDots animated={false} /> : isCommand ? <BashLogo /> : actionIcons[item.actionKind]}
+          </span>
+          <span className={`action-title ${isCommand ? "is-command" : ""}`}>
+            {isCommand ? (
+              <ShellCommand command={command} />
+            ) : (
+              <>
+                <strong>{fileTitle}</strong>
+                {item.target && item.target !== fileTitle ? <code>{item.target}</code> : null}
+                {secondaryLabel ? <small>{secondaryLabel}</small> : null}
+              </>
+            )}
+          </span>
+          {typeof item.additions === "number" ? (
+            <span className="diff-count">
+              <em>+{item.additions}</em>
+              <b>−{item.deletions ?? 0}</b>
+            </span>
+          ) : null}
+          {durationMs ? <span className="action-duration">{formatDuration(durationMs)}</span> : null}
+          {item.status === "failed" ? (
+            <AlertTriangle className="action-status-icon" aria-label="Action failed" />
+          ) : null}
+          <ChevronDown className="disclosure-chevron" aria-hidden="true" />
+        </summary>
+        <div className="action-detail">
+          {item.outputSummary ?? item.summary ?? item.detail ? (
+            <p>{item.outputSummary ?? item.summary ?? item.detail}</p>
+          ) : null}
+          {item.commandPreview ? (
+            <pre className="action-command">
+              <ShellCommand command={item.commandPreview} />
+            </pre>
+          ) : null}
+          {!groupExpanded && expanded ? inlinePreview : null}
+          <dl className="action-metadata">
+            <div>
+              <dt>Status</dt>
+              <dd>{item.status}</dd>
+            </div>
+            {item.cwd ? (
+              <div>
+                <dt>Working directory</dt>
+                <dd>
+                  <code>{item.cwd}</code>
+                </dd>
+              </div>
+            ) : null}
+            {typeof item.exitCode === "number" ? (
+              <div>
+                <dt>Exit</dt>
+                <dd>{item.exitCode}</dd>
+              </div>
+            ) : null}
+            {typeof item.signal === "number" ? (
+              <div>
+                <dt>Signal</dt>
+                <dd>{item.signal}</dd>
+              </div>
+            ) : null}
+            {item.observedOutputBytes > 0 ? (
+              <div>
+                <dt>Observed output</dt>
+                <dd>{item.observedOutputBytes.toLocaleString()} bytes</dd>
+              </div>
+            ) : null}
+            {item.droppedOutputBytes > 0 ? (
+              <div data-warning="true">
+                <dt>Truncated</dt>
+                <dd>{item.droppedOutputBytes.toLocaleString()} bytes omitted</dd>
+              </div>
+            ) : null}
+          </dl>
+          {item.outputHandle && onOpenResource ? (
+            <div className="action-links">
+              <button
+                onClick={() =>
+                  onOpenResource(item.outputHandle!, `${item.label} output`, "text")
+                }
+                aria-label={`Open full output for ${item.label}`}
+              >
+                <TerminalSquare aria-hidden="true" />
+                Open full output
+              </button>
+            </div>
+          ) : null}
+          {(item.diffHandle || item.resultHandle) && onOpenResource ? (
+            <div className="action-links">
+              {item.diffHandle ? (
+                <button
+                  onClick={() =>
+                    onOpenResource(item.diffHandle!, `${fileTitle} changes`, "diff")
+                  }
+                  aria-label={`View changes to ${fileTitle}`}
+                >
+                  <FileDiff aria-hidden="true" />
+                  View full diff
+                </button>
+              ) : null}
+              {item.resultHandle ? (
+                <button
+                  onClick={() =>
+                    onOpenResource(item.resultHandle!, fileTitle, "text")
+                  }
+                  aria-label={`View resulting ${fileTitle}`}
+                >
+                  <FileText aria-hidden="true" />
+                  View file
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {sources.length ? (
+            <div className="action-links">
+              {sources.map((source) => (
+                <button
+                  key={source.id}
+                  onClick={() => onOpenSource(source.id)}
+                  aria-label={`Open source ${source.title}`}
+                >
+                  <File aria-hidden="true" />
+                  {source.title}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          {outputs.length ? (
+            <div className="action-links">
+              {outputs.map((output) => (
+                <button
+                  key={output.id}
+                  onClick={() => onOpenOutput(output.id)}
+                  aria-label={`Open output ${output.title}`}
+                >
+                  <ExternalLink aria-hidden="true" />
+                  {output.title}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </details>
+      {groupExpanded ? inlinePreview : null}
+    </>
   );
 }
 
@@ -1069,6 +1131,7 @@ function AssistantMessage({
 const TranscriptItemView = memo(function TranscriptItemView({
   item,
   animate,
+  actionDurationOverrideMs,
   onResolveApproval,
   onResolveUserInput,
   onOpenOutput,
@@ -1078,6 +1141,9 @@ const TranscriptItemView = memo(function TranscriptItemView({
   availableSources,
   outputsByOrigin,
   sourcesByOrigin,
+  sessionId = "",
+  resourceContentUrl,
+  groupExpanded = false,
   attachmentContentUrl,
   onPreviewAttachment,
   conversationBranching = false,
@@ -1088,6 +1154,7 @@ const TranscriptItemView = memo(function TranscriptItemView({
 }: {
   item: TranscriptItem;
   animate: boolean;
+  actionDurationOverrideMs?: number;
   onResolveApproval: ConversationProps["onResolveApproval"];
   onResolveUserInput: ConversationProps["onResolveUserInput"];
   onOpenOutput: (outputId: string) => void;
@@ -1097,6 +1164,9 @@ const TranscriptItemView = memo(function TranscriptItemView({
   availableSources: ReadonlyMap<string, SourceRef>;
   outputsByOrigin: ReadonlyMap<string, readonly OutputRef[]>;
   sourcesByOrigin: ReadonlyMap<string, readonly SourceRef[]>;
+  sessionId?: string;
+  resourceContentUrl?: ResourceContentUrl;
+  groupExpanded?: boolean;
   attachmentContentUrl?: (handle: string) => string;
   onPreviewAttachment: (
     source: string,
@@ -1279,7 +1349,7 @@ const TranscriptItemView = memo(function TranscriptItemView({
         >
           <summary aria-live={item.state === "streaming" ? "polite" : undefined}>
             {item.state === "streaming" ? (
-              <LiveDots />
+              <LiveDots animated={false} />
             ) : (
               <BrainCircuit aria-hidden="true" />
             )}
@@ -1295,6 +1365,10 @@ const TranscriptItemView = memo(function TranscriptItemView({
         <ActionCell
           item={item}
           animate={animate}
+          durationOverrideMs={actionDurationOverrideMs}
+          groupExpanded={groupExpanded}
+          sessionId={sessionId}
+          resourceContentUrl={resourceContentUrl}
           onOpenOutput={onOpenOutput}
           onOpenSource={onOpenSource}
           onOpenResource={onOpenResource}
@@ -1412,6 +1486,12 @@ const actionSummaryLabels: Record<
 };
 
 function describeWork(items: readonly WorkItem[]): string {
+  if (items.length === 1) {
+    const item = items[0]!;
+    return item.kind === "action"
+      ? item.label
+      : reasoningDisplayLabel(item);
+  }
   const actionCounts = new Map<ActionItem["actionKind"], number>();
   for (const item of items) {
     if (item.kind !== "action") continue;
@@ -1556,6 +1636,25 @@ function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
   return rows;
 }
 
+function hasReviewDetails(
+  outcome: Extract<TranscriptItem, { kind: "run_outcome" }> | undefined,
+): boolean {
+  if (!outcome) return false;
+  const { review } = outcome;
+  return (
+    outcome.outcome !== "done" ||
+    review.evidenceCoverage !== "none" ||
+    review.changedFileItemIds.length > 0 ||
+    review.verificationActionItemIds.length > 0 ||
+    review.failedActionItemIds.length > 0 ||
+    review.warningActionItemIds.length > 0 ||
+    review.sourceIds.length > 0 ||
+    review.outputIds.length > 0 ||
+    review.testResults.length > 0 ||
+    review.openQuestions.length > 0
+  );
+}
+
 interface WorkGroupProps {
   row: Extract<TranscriptRow, { kind: "work" }>;
   reviewActions: readonly ActionItem[];
@@ -1565,6 +1664,8 @@ interface WorkGroupProps {
   onOpenOutput: (outputId: string) => void;
   onOpenSource: (sourceId: string) => void;
   onOpenResource: ConversationProps["onOpenResource"];
+  sessionId: string;
+  resourceContentUrl?: ResourceContentUrl;
   availableOutputs: ReadonlyMap<string, OutputRef>;
   availableSources: ReadonlyMap<string, SourceRef>;
   outputsByOrigin: ReadonlyMap<string, readonly OutputRef[]>;
@@ -1586,6 +1687,8 @@ const WorkGroup = memo(function WorkGroup({
   onOpenOutput,
   onOpenSource,
   onOpenResource,
+  sessionId,
+  resourceContentUrl,
   availableOutputs,
   availableSources,
   outputsByOrigin,
@@ -1593,42 +1696,29 @@ const WorkGroup = memo(function WorkGroup({
   attachmentContentUrl,
   onPreviewAttachment,
 }: WorkGroupProps) {
-  const liveItem = [...row.items]
-    .reverse()
-    .find((item) => item.state === "streaming");
-  const live = Boolean(liveItem);
+  const live = row.items.some((item) => item.state === "streaming");
   const [userOpen, setUserOpen] = useState(false);
-  const historyItems = liveItem
-    ? row.items.filter((item) => item !== liveItem)
-    : row.items;
   const itemDuration = row.items.reduce(
     (total, item) =>
       total + (item.kind === "action" ? item.durationMs ?? 0 : 0),
     0,
   );
   const duration = row.outcome?.durationMs || itemDuration;
-  const failedActionCount = historyItems.filter(
+  const showReview = hasReviewDetails(row.outcome);
+  const failedActionCount = row.items.filter(
     (item) => item.kind === "action" && item.status === "failed",
   ).length;
   const historyLabel = [
-    describeWork(historyItems),
-    !live && duration > 0 ? formatDuration(duration) : null,
+    describeWork(row.items),
+    duration > 0 ? formatDuration(duration) : null,
     failedActionCount
       ? `${failedActionCount} ${failedActionCount === 1 ? "failure" : "failures"}`
       : null,
   ]
     .filter((part): part is string => Boolean(part))
     .join(" · ");
-  const liveLabel = liveItem
-    ? liveItem.kind === "reasoning"
-      ? reasoningDisplayLabel(liveItem)
-      : liveItem.label
-    : null;
-  const label = liveLabel ?? historyLabel;
-  const open = historyItems.length > 0 && userOpen;
-  const historyAction = [...historyItems]
-    .reverse()
-    .find((item): item is ActionItem => item.kind === "action");
+  const label = live ? "Working" : historyLabel;
+  const open = row.items.length > 0 && userOpen;
   const changedActions = row.outcome
     ? row.outcome.review.changedFileItemIds
         .map((id) => reviewActions.find((action) => action.id === id))
@@ -1651,13 +1741,93 @@ const WorkGroup = memo(function WorkGroup({
     (total, action) => total + (action.deletions ?? 0),
     0,
   );
+  const directAction =
+    !live && row.items.length === 1 && row.items[0]?.kind === "action"
+      ? row.items[0]
+      : undefined;
+  const reviewLabel = changedPaths.size
+    ? `${changedPaths.size} ${changedPaths.size === 1 ? "file" : "files"} changed`
+    : row.outcome?.outcome === "failed"
+      ? "Failure details"
+      : row.outcome?.outcome === "stopped"
+        ? "Stopped run details"
+        : row.outcome?.review.warningActionItemIds.length
+          ? "Warnings"
+          : row.outcome?.review.verificationActionItemIds.length ||
+              row.outcome?.review.testResults.length
+            ? "Verification details"
+            : row.outcome?.review.openQuestions.length
+              ? "Open questions"
+              : "Evidence details";
+  const reviewDisclosure =
+    row.outcome && showReview ? (
+      <details className="completion-review-disclosure">
+        <summary>
+          {changedPaths.size ? (
+            <FileDiff aria-hidden="true" />
+          ) : row.outcome.outcome === "failed" ||
+            row.outcome.review.warningActionItemIds.length ||
+            row.outcome.review.openQuestions.length ? (
+            <AlertTriangle aria-hidden="true" />
+          ) : (
+            <ShieldCheck aria-hidden="true" />
+          )}
+          <span>{reviewLabel}</span>
+          {changedActions.length ? (
+            <span className="diff-count" aria-label="Lines changed">
+              <em>+{changeAdditions}</em>
+              <b>−{changeDeletions}</b>
+            </span>
+          ) : null}
+          <ChevronDown className="disclosure-chevron" aria-hidden="true" />
+        </summary>
+        <CompletionReview
+          outcome={row.outcome}
+          actions={reviewActions}
+          outputs={availableOutputs}
+          onOpenOutput={onOpenOutput}
+          onOpenResource={onOpenResource}
+          compact
+        />
+      </details>
+    ) : null;
+
+  if (directAction) {
+    return (
+      <section
+        className="work-group is-complete is-direct"
+        aria-label={historyLabel}
+      >
+        <AnchoredTranscriptItem
+          item={directAction}
+          sessionId={sessionId}
+          resourceContentUrl={resourceContentUrl}
+          groupExpanded={false}
+          animate={!initialItemIds.has(directAction.id)}
+          actionDurationOverrideMs={duration}
+          onResolveApproval={onResolveApproval}
+          onResolveUserInput={onResolveUserInput}
+          onOpenOutput={onOpenOutput}
+          onOpenSource={onOpenSource}
+          onOpenResource={onOpenResource}
+          availableOutputs={availableOutputs}
+          availableSources={availableSources}
+          outputsByOrigin={outputsByOrigin}
+          sourcesByOrigin={sourcesByOrigin}
+          attachmentContentUrl={attachmentContentUrl}
+          onPreviewAttachment={onPreviewAttachment}
+        />
+        {reviewDisclosure}
+      </section>
+    );
+  }
 
   return (
     <section
-      className={`work-group ${live ? "is-live" : "is-complete"} ${open ? "is-open" : "is-collapsed"} ${liveItem ? "has-live-item" : ""}`}
+      className={`work-group ${live ? "is-live" : "is-complete"} ${open ? "is-open" : "is-collapsed"}`}
       aria-label={label}
     >
-      {historyItems.length ? (
+      {row.items.length ? (
         <>
           <button
             type="button"
@@ -1666,21 +1836,17 @@ const WorkGroup = memo(function WorkGroup({
             onClick={() => setUserOpen((current) => !current)}
           >
             <span
-              className={`work-group-glyph ${live ? "is-history" : "is-finished"}`}
+              className={`work-group-glyph ${live ? "is-live" : "is-finished"}`}
             >
               {live ? (
-                historyAction ? (
-                  actionIcons[historyAction.actionKind]
-                ) : (
-                  <BrainCircuit aria-hidden="true" />
-                )
+                <LiveDots />
               ) : row.outcome?.outcome === "failed" ? (
                 <AlertTriangle aria-hidden="true" />
               ) : (
                 <Check aria-hidden="true" />
               )}
             </span>
-            <span>{historyLabel}</span>
+            <span>{label}</span>
             <ChevronDown aria-hidden="true" />
           </button>
           <div
@@ -1689,54 +1855,43 @@ const WorkGroup = memo(function WorkGroup({
             inert={!open}
           >
             <div className="work-group-content">
-              {aggregateWorkEntries(historyItems).map((entry) =>
+              {aggregateWorkEntries(row.items).map((entry) =>
                 entry.kind === "command_batch" ? (
-                  <details className="command-batch" key={entry.id}>
-                    <summary>
-                      <TerminalSquare aria-hidden="true" />
-                      <span>Ran {entry.items.length} commands</span>
-                      {entry.items.some(
-                        (item) => item.status !== "succeeded",
-                      ) ? (
-                        <em>
-                          {
-                            entry.items.filter(
-                              (item) => item.status !== "succeeded",
-                            ).length
-                          }{" "}
-                          incomplete
-                        </em>
-                      ) : null}
-                      <ChevronDown
-                        className="disclosure-chevron"
-                        aria-hidden="true"
+                  <div
+                    className="command-batch"
+                    key={entry.id}
+                    role="group"
+                    aria-label="Bash commands"
+                  >
+                    {entry.items.map((item) => (
+                      <AnchoredTranscriptItem
+                        key={item.id}
+                        item={item}
+                        sessionId={sessionId}
+                        resourceContentUrl={resourceContentUrl}
+                        groupExpanded={open}
+                        animate={false}
+                        onResolveApproval={onResolveApproval}
+                        onResolveUserInput={onResolveUserInput}
+                        onOpenOutput={onOpenOutput}
+                        onOpenSource={onOpenSource}
+                        onOpenResource={onOpenResource}
+                        availableOutputs={availableOutputs}
+                        availableSources={availableSources}
+                        outputsByOrigin={outputsByOrigin}
+                        sourcesByOrigin={sourcesByOrigin}
+                        attachmentContentUrl={attachmentContentUrl}
+                        onPreviewAttachment={onPreviewAttachment}
                       />
-                    </summary>
-                    <div>
-                      {entry.items.map((item) => (
-                        <AnchoredTranscriptItem
-                          key={item.id}
-                          item={item}
-                          animate={false}
-                          onResolveApproval={onResolveApproval}
-                          onResolveUserInput={onResolveUserInput}
-                          onOpenOutput={onOpenOutput}
-                          onOpenSource={onOpenSource}
-                          onOpenResource={onOpenResource}
-                          availableOutputs={availableOutputs}
-                          availableSources={availableSources}
-                          outputsByOrigin={outputsByOrigin}
-                          sourcesByOrigin={sourcesByOrigin}
-                          attachmentContentUrl={attachmentContentUrl}
-                          onPreviewAttachment={onPreviewAttachment}
-                        />
-                      ))}
-                    </div>
-                  </details>
+                    ))}
+                  </div>
                 ) : (
                   <AnchoredTranscriptItem
                     key={entry.item.id}
                     item={entry.item}
+                    sessionId={sessionId}
+                    resourceContentUrl={resourceContentUrl}
+                    groupExpanded={open}
                     animate={!initialItemIds.has(entry.item.id)}
                     onResolveApproval={onResolveApproval}
                     onResolveUserInput={onResolveUserInput}
@@ -1756,55 +1911,7 @@ const WorkGroup = memo(function WorkGroup({
           </div>
         </>
       ) : null}
-      {liveItem ? (
-        <div className="work-group-live-item">
-          <AnchoredTranscriptItem
-            item={liveItem}
-            animate={!initialItemIds.has(liveItem.id)}
-            onResolveApproval={onResolveApproval}
-            onResolveUserInput={onResolveUserInput}
-            onOpenOutput={onOpenOutput}
-            onOpenSource={onOpenSource}
-            onOpenResource={onOpenResource}
-            availableOutputs={availableOutputs}
-            availableSources={availableSources}
-            outputsByOrigin={outputsByOrigin}
-            sourcesByOrigin={sourcesByOrigin}
-            attachmentContentUrl={attachmentContentUrl}
-            onPreviewAttachment={onPreviewAttachment}
-          />
-        </div>
-      ) : null}
-      {row.outcome ? (
-        <details
-          className="completion-review-disclosure"
-          open={row.outcome.outcome === "failed"}
-        >
-          <summary>
-            <FileDiff aria-hidden="true" />
-            <span>
-              {changedPaths.size
-                ? `${changedPaths.size} ${changedPaths.size === 1 ? "file" : "files"} changed`
-                : "Review details"}
-            </span>
-            {changedActions.length ? (
-              <span className="diff-count" aria-label="Lines changed">
-                <em>+{changeAdditions}</em>
-                <b>−{changeDeletions}</b>
-              </span>
-            ) : null}
-            <ChevronDown className="disclosure-chevron" aria-hidden="true" />
-          </summary>
-          <CompletionReview
-            outcome={row.outcome}
-            actions={reviewActions}
-            outputs={availableOutputs}
-            onOpenOutput={onOpenOutput}
-            onOpenResource={onOpenResource}
-            compact
-          />
-        </details>
-      ) : null}
+      {reviewDisclosure}
     </section>
   );
 }, (previous, next) => {
@@ -1826,6 +1933,8 @@ const WorkGroup = memo(function WorkGroup({
     previous.onOpenOutput === next.onOpenOutput &&
     previous.onOpenSource === next.onOpenSource &&
     previous.onOpenResource === next.onOpenResource &&
+    previous.sessionId === next.sessionId &&
+    previous.resourceContentUrl === next.resourceContentUrl &&
     previous.availableOutputs === next.availableOutputs &&
     previous.availableSources === next.availableSources &&
     previous.outputsByOrigin === next.outputsByOrigin &&
@@ -2645,6 +2754,9 @@ function Composer({
     Boolean(session.activeRunId) ||
     session.status === "working" ||
     session.status === "needs_attention";
+  // Approval/input pauses retain an active run but do not animate the model
+  // shimmer. The TUI only advances its perimeter while the model is running.
+  const isModelWorking = session.status === "working";
   const activeModel = bootstrap.models.find(
     (model) => model.id === session.modelId,
   );
@@ -2659,7 +2771,7 @@ function Composer({
     `${activeModel?.provider ?? ""} ${activeModel?.id ?? ""}`.toLowerCase();
   const modelAccent =
     providerAccents.find(([provider]) => providerKey.includes(provider))?.[1] ??
-    "var(--theme-pigment)";
+    "#16876d";
   const reasoningOptions =
     bootstrap.models.find((model) => model.id === session.modelId)?.reasoning ??
     [session.reasoning];
@@ -3021,6 +3133,30 @@ function Composer({
         className={`composer ${isWorking ? "is-working" : ""}`}
         style={composerStyle}
       >
+        {isModelWorking ? (
+          <span className="composer-running-edge" aria-hidden="true">
+            <svg preserveAspectRatio="none">
+              <rect
+                className="composer-running-edge-base"
+                x="1"
+                y="1"
+                width="calc(100% - 2px)"
+                height="calc(100% - 2px)"
+                rx="10"
+                pathLength="100"
+              />
+              <rect
+                className="composer-running-edge-chase"
+                x="1"
+                y="1"
+                width="calc(100% - 2px)"
+                height="calc(100% - 2px)"
+                rx="10"
+                pathLength="100"
+              />
+            </svg>
+          </span>
+        ) : null}
         {draggingFiles ? (
           <div className="attachment-drop-overlay" aria-hidden="true">
             <Paperclip />
@@ -3373,6 +3509,7 @@ export function Conversation({
   onOpenOutput,
   onOpenSource,
   onOpenResource,
+  resourceContentUrl,
   onIngestAttachment,
   onIngestDocument,
   onListProjectFiles,
@@ -3641,6 +3778,8 @@ export function Conversation({
                         )
                   }
                   initialItemIds={initialItemIds}
+                  sessionId={session.sessionId}
+                  resourceContentUrl={resourceContentUrl}
                   onResolveApproval={onResolveApproval}
                   onResolveUserInput={onResolveUserInput}
                   onOpenOutput={onOpenOutput}

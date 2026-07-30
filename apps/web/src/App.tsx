@@ -33,7 +33,6 @@ import {
 } from "./components/Inspector";
 import { SettingsView } from "./components/Settings";
 import { Sidebar } from "./components/Sidebar";
-import { TranscriptSearch } from "./components/TranscriptSearch";
 import { ProjectsView } from "./components/Projects";
 import { UsagePage } from "./pages/UsagePage";
 import { YggGlyph } from "./components/YggGlyph";
@@ -45,6 +44,8 @@ import type {
   SessionSnapshot,
   SessionStatus,
   TrustedFileEntry,
+  TranscriptSearchRequest,
+  TranscriptSearchResult,
   UsagePeriod,
 } from "./protocol";
 import {
@@ -611,7 +612,6 @@ export default function App() {
   );
   const [activityOpen, setActivityOpen] = useState(false);
   const [branchHistoryOpen, setBranchHistoryOpen] = useState(false);
-  const [transcriptSearchOpen, setTranscriptSearchOpen] = useState(false);
   const [inspector, setInspector] = useState<InspectorSelection | null>(null);
   const [inspectorClosing, setInspectorClosing] = useState(false);
   const [activityPaneWidth, setActivityPaneWidth] = useState(() =>
@@ -772,9 +772,7 @@ export default function App() {
   );
   const visibleActivityOpen = activityOpen && activityAvailable;
   const modalWorkspaceOpen =
-    branchHistoryOpen ||
-    transcriptSearchOpen ||
-    (!wideLayout && (visibleActivityOpen || Boolean(inspector)));
+    branchHistoryOpen || (!wideLayout && (visibleActivityOpen || Boolean(inspector)));
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 760px)");
@@ -945,12 +943,20 @@ export default function App() {
     },
     [state.selectedSessionId],
   );
+  const searchTranscripts = useCallback(
+    (request: TranscriptSearchRequest): Promise<TranscriptSearchResult> =>
+      store.searchTranscripts(request),
+    [],
+  );
   const activateSearchResult = useCallback(
     (sessionId: string, itemId: string) => {
       void (async () => {
         setSurface("session");
         setInspector(null);
         setActivityOpen(false);
+        if (window.matchMedia("(max-width: 760px)").matches) {
+          setSidebarOpen(false);
+        }
         await store.selectSession(sessionId);
         for (let attempt = 0; attempt < 12; attempt += 1) {
           await new Promise<void>((resolve) =>
@@ -990,6 +996,22 @@ export default function App() {
       setSidebarOpen(false);
     }
   }, []);
+  const setSessionLifecycle = useCallback(
+    async (
+      sessionId: string,
+      lifecycle: "active" | "archived" | "trash",
+    ): Promise<void> => {
+      if (lifecycle === "active") {
+        await restoreSession(sessionId);
+        return;
+      }
+      await store.setSessionLifecycle(sessionId, lifecycle);
+      if (lifecycle === "archived" && sessionId === state.selectedSessionId) {
+        await store.createSession();
+      }
+    },
+    [restoreSession, state.selectedSessionId],
+  );
   const changeNotifications = useCallback(
     async (enabled: boolean): Promise<boolean> => {
       const manager = notificationManagerRef.current;
@@ -1244,6 +1266,7 @@ export default function App() {
         onRestoreSession={(sessionId) => {
           void restoreSession(sessionId);
         }}
+        onSetSessionLifecycle={setSessionLifecycle}
         onOpenProjects={openProjects}
         onOpenUsage={openUsage}
         onOpenSettings={openSettings}
@@ -1251,12 +1274,8 @@ export default function App() {
         transcriptSearchAvailable={
           state.bootstrap.capabilities.transcriptSearch
         }
-        onOpenTranscriptSearch={() => {
-          setTranscriptSearchOpen(true);
-          if (window.matchMedia("(max-width: 760px)").matches) {
-            setSidebarOpen(false);
-          }
-        }}
+        onSearchTranscripts={searchTranscripts}
+        onActivateSearchResult={activateSearchResult}
       />
 
       {surface === "session" ? (
@@ -1329,6 +1348,7 @@ export default function App() {
                 ? openResource
                 : undefined
             }
+            resourceContentUrl={resourceContentUrl}
             onIngestAttachment={ingestAttachment}
             onIngestDocument={ingestDocument}
             onListProjectFiles={listProjectFiles}
@@ -1472,15 +1492,6 @@ export default function App() {
           onCheckout={(entryId) => store.checkoutBranch(entryId)}
         />
       ) : null}
-      <TranscriptSearch
-        open={
-          Boolean(state.bootstrap.capabilities.transcriptSearch) &&
-          transcriptSearchOpen
-        }
-        onClose={() => setTranscriptSearchOpen(false)}
-        onSearch={(request) => store.searchTranscripts(request)}
-        onActivate={activateSearchResult}
-      />
     </div>
   );
 }

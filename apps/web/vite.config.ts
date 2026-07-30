@@ -15,9 +15,9 @@ export default defineConfig({
     sourcemap: false,
     cssCodeSplit: false,
     minify: "oxc",
-    // Keep the self-hosted Geist pair inside app.css so the extension remains
-    // one deterministic three-file web bundle.
-    assetsInlineLimit: 160_000,
+    // Keep the compact Local variable pair inside app.css so the extension
+    // remains one deterministic three-file web bundle.
+    assetsInlineLimit: 64_000,
     rolldownOptions: {
       output: {
         entryFileNames: "assets/app.js",

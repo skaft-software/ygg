@@ -101,6 +101,8 @@ class TestTransport implements YggTransport {
       reasoningTokens: 0,
       totalTokens: 0,
       requestCount: 0,
+      models: [],
+      modelsTruncated: false,
     };
   }
 
@@ -114,6 +116,8 @@ class TestTransport implements YggTransport {
       reasoningTokens: 0,
       totalTokens: 0,
       requestCount: 0,
+      models: [],
+      modelsTruncated: false,
     };
   }
 
@@ -364,6 +368,61 @@ describe("YggStore", () => {
       title: "Batched title",
     });
     unsubscribe();
+    store.dispose();
+  });
+
+  it("does not regress a host-derived title to an untitled snapshot or catalog summary", async () => {
+    const transport = new TestTransport();
+    const title = "Keep the new-session title stable";
+    transport.commandHandler = async (command) => {
+      if (command.type === "session.submit") {
+        transport.emit({
+          type: "session.updated",
+          sessionId: command.sessionId,
+          sequence: 2,
+          patch: { title },
+        });
+      }
+      return { commandId: command.id, accepted: true };
+    };
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    await store.submit(title, []);
+    await nextFrame();
+    expect(store.selectedSession?.title).toBe(title);
+
+    transport.emit({
+      type: "session.snapshot",
+      sessionId: "session-fresh",
+      sequence: 3,
+      snapshot: {
+        ...clone(fixtureSessions["session-fresh"]),
+        sequence: 3,
+        title: "New session",
+      },
+    });
+    transport.emit({
+      type: "catalog.summary",
+      catalogRevision: fixtureBootstrap.catalogRevision + 1,
+      summary: {
+        ...clone(
+          fixtureBootstrap.sessions.find(
+            (summary) => summary.id === "session-fresh",
+          )!,
+        ),
+        title: "New session",
+      },
+    });
+    await nextFrame();
+
+    expect(store.selectedSession?.title).toBe(title);
+    expect(
+      store
+        .getSnapshot()
+        .bootstrap?.sessions.find((summary) => summary.id === "session-fresh")
+        ?.title,
+    ).toBe(title);
     store.dispose();
   });
 

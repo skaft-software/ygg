@@ -1623,6 +1623,21 @@ describe("usage wire projections", () => {
     reasoning_tokens: 16,
     total_tokens: 260,
     request_count: 3,
+    models: [
+      {
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        prompt_tokens: 120,
+        completion_tokens: 80,
+        cache_read_tokens: 40,
+        cache_write_tokens: 20,
+        cache_write_1h_tokens: 5,
+        reasoning_tokens: 16,
+        total_tokens: 260,
+        request_count: 3,
+      },
+    ],
+    models_truncated: false,
   };
 
   it("projects exact token buckets and nullable lifetime timestamps", () => {
@@ -1636,6 +1651,21 @@ describe("usage wire projections", () => {
       reasoningTokens: 16,
       totalTokens: 260,
       requestCount: 3,
+      models: [
+        {
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          promptTokens: 120,
+          completionTokens: 80,
+          cacheReadTokens: 40,
+          cacheWriteTokens: 20,
+          cacheWriteOneHourTokens: 5,
+          reasoningTokens: 16,
+          totalTokens: 260,
+          requestCount: 3,
+        },
+      ],
+      modelsTruncated: false,
     });
     expect(
       projectLifetimeUsage({
@@ -1647,6 +1677,38 @@ describe("usage wire projections", () => {
       firstRequestAtMs: undefined,
       lastRequestAtMs: undefined,
     });
+  });
+
+  it("requires bounded, unique, descending model breakdowns", () => {
+    const model = totals.models[0];
+    expect(() =>
+      projectUsageStats({
+        period: "daily",
+        ...totals,
+        models: [model, { ...model }],
+      }),
+    ).toThrow(/unique model/);
+    expect(() =>
+      projectUsageStats({
+        period: "daily",
+        ...totals,
+        models: [
+          { ...model, total_tokens: 1 },
+          { ...model, model: "claude-opus-4-6", total_tokens: 2 },
+        ],
+      }),
+    ).toThrow(/ordered by total tokens/);
+    expect(() =>
+      projectUsageStats({
+        period: "daily",
+        ...totals,
+        models: Array.from({ length: 257 }, (_, index) => ({
+          ...model,
+          model: `model-${index}`,
+          total_tokens: 257 - index,
+        })),
+      }),
+    ).toThrow(/at most 256 models/);
   });
 
   it("projects ordered daily activity and rejects malformed contracts", () => {

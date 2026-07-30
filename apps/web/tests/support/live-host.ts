@@ -464,6 +464,7 @@ export class LiveHostHarness {
       [
         "--workspace",
         this.workspaceDir,
+        "--workspace-trusted",
         "--session-dir",
         this.sessionDir,
         "--model",

@@ -65,6 +65,7 @@ describe("conversation composer", () => {
 
   afterEach(() => {
     cleanup();
+    vi.unstubAllGlobals();
     window.localStorage.clear();
   });
 
@@ -553,7 +554,7 @@ describe("conversation composer", () => {
       turnId: "turn-markdown",
       kind: "assistant_message",
       content:
-        "## Result\n\n- One\n- Two\n\n```ts\nconst answer = 42;\n```\n\n<script>alert('no')</script>",
+        "## Result\n\n- One\n- Two\n\n```ts\nconst answer = 42;\n```\n\n```diff\ndiff --git a/src/result.ts b/src/result.ts\n--- a/src/result.ts\n+++ b/src/result.ts\n@@ -1,2 +1,2 @@\n const stable = true;\n-const answer = 41;\n+const answer = 42;\n```\n\n<script>alert('no')</script>",
       state: "committed",
       createdAt: new Date().toISOString(),
     });
@@ -573,7 +574,28 @@ describe("conversation composer", () => {
 
     expect(screen.getByRole("heading", { name: "Result" })).toBeVisible();
     expect(screen.getByRole("list")).toHaveTextContent(/One\s+Two/);
-    expect(screen.getByRole("button", { name: "Copy code" })).toBeVisible();
+    expect(screen.getAllByRole("button", { name: "Copy code" })).toHaveLength(
+      2,
+    );
+    const diff = container.querySelector<HTMLElement>(
+      ".markdown-code-block.is-diff",
+    );
+    expect(diff).not.toBeNull();
+    expect(diff!.querySelector(".markdown-code-language")).toHaveTextContent(
+      "src/result.ts",
+    );
+    expect(diff!.querySelectorAll(".markdown-diff-line.is-addition")).toHaveLength(
+      1,
+    );
+    expect(diff!.querySelectorAll(".markdown-diff-line.is-deletion")).toHaveLength(
+      1,
+    );
+    expect(diff!.querySelectorAll(".markdown-diff-line.is-hunk")).toHaveLength(
+      1,
+    );
+    expect(diff!.querySelector(".markdown-diff-stats")).toHaveAccessibleName(
+      "1 added, 1 removed",
+    );
     expect(container.querySelector("script")).toBeNull();
     expect(screen.getByText("<script>alert('no')</script>")).toBeVisible();
   });
@@ -668,12 +690,20 @@ describe("conversation composer", () => {
       <Conversation session={session} {...props} />,
     );
 
-    const historySummary = screen.getByRole("button", {
-      name: "Read files, edited file, viewed preview",
-    });
+    expect(container.querySelector(".composer-running-edge-chase")).not.toBeNull();
+    expect(
+      container
+        .querySelector<HTMLElement>(".composer")
+        ?.style.getPropertyValue("--model-accent-dark"),
+    ).not.toBe("");
+
+    const historySummary = screen.getByRole("button", { name: "Working" });
     expect(historySummary).toHaveAttribute("aria-expanded", "false");
     expect(historySummary.querySelector(".work-group-glyph")).toHaveClass(
-      "is-history",
+      "is-live",
+    );
+    expect(historySummary.querySelector(".live-dots")).not.toHaveClass(
+      "is-static",
     );
     const historyContent = container.querySelector(".work-group-content-clip");
     expect(historyContent).toHaveAttribute("aria-hidden", "true");
@@ -683,8 +713,64 @@ describe("conversation composer", () => {
       .closest("details");
     expect(liveReasoning).not.toHaveAttribute("open");
     expect(liveReasoning).toBe(
-      container.querySelector(".work-group-live-item .reasoning-block"),
+      container.querySelector(".work-group-content .reasoning-block"),
     );
+    expect(liveReasoning?.querySelector(".live-dots")).toHaveClass(
+      "is-static",
+    );
+    expect(container.querySelector(".work-group-live-item")).toBeNull();
+
+    const streamingUpdate = structuredClone(session);
+    const reasoning = streamingUpdate.items.find(
+      (item) => item.kind === "reasoning",
+    );
+    if (reasoning?.kind === "reasoning") {
+      reasoning.summary = "Checking focus order and the final phone state";
+      reasoning.content += " The focus order is now stable.";
+    }
+    rerender(<Conversation session={streamingUpdate} {...props} />);
+
+    expect(screen.getByRole("button", { name: "Working" })).toBe(
+      historySummary,
+    );
+    expect(container.querySelector(".work-group-content-clip")).toBe(
+      historyContent,
+    );
+
+    const toolUpdate = structuredClone(streamingUpdate);
+    const completedReasoning = toolUpdate.items.find(
+      (item) => item.kind === "reasoning",
+    );
+    if (completedReasoning?.kind === "reasoning") {
+      completedReasoning.state = "committed";
+    }
+    toolUpdate.items.push({
+      id: "live-tool",
+      runId: "run-live",
+      turnId: "live-turn",
+      kind: "action",
+      actionKind: "file_search",
+      phase: "investigated",
+      status: "running",
+      rawToolName: "search",
+      label: "Searching focus styles",
+      observedOutputBytes: 0,
+      droppedOutputBytes: 0,
+      changedPaths: [],
+      sourceIds: [],
+      outputIds: [],
+      state: "streaming",
+      createdAt: new Date().toISOString(),
+    });
+    rerender(<Conversation session={toolUpdate} {...props} />);
+
+    expect(screen.getByRole("button", { name: "Working" })).toBe(
+      historySummary,
+    );
+    expect(container.querySelector(".work-group-content-clip")).toBe(
+      historyContent,
+    );
+    expect(screen.getByText("Searching focus styles")).toBeInTheDocument();
 
     const completed = structuredClone(session);
     completed.status = "done";
@@ -708,22 +794,339 @@ describe("conversation composer", () => {
     });
     rerender(<Conversation session={completed} {...props} />);
 
+    expect(container.querySelector(".composer-running-edge")).toBeNull();
     const summary = screen.getByRole("button", {
       name: "Read files, edited file, viewed preview · 5s",
     });
+    expect(summary).toBe(historySummary);
     expect(summary).toHaveAttribute("aria-expanded", "false");
     const completedHistoryContent = container.querySelector(
       ".work-group-content-clip",
     );
+    expect(completedHistoryContent).toBe(historyContent);
     expect(completedHistoryContent).toHaveAttribute("aria-hidden", "true");
     expect(completedHistoryContent).toHaveAttribute("inert", "");
-    expect(
-      screen.getByText("Review details").closest("details"),
-    ).not.toHaveAttribute("open");
+    expect(screen.queryByText("Review details")).toBeNull();
+    expect(container.querySelector(".completion-review-disclosure")).toBeNull();
     await user.click(summary);
     expect(summary).toHaveAttribute("aria-expanded", "true");
     expect(completedHistoryContent).toHaveAttribute("aria-hidden", "false");
     expect(completedHistoryContent).not.toHaveAttribute("inert");
+  });
+
+  it("groups completed Bash commands while keeping each command collapsed", async () => {
+    const user = userEvent.setup();
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    const timestamp = new Date().toISOString();
+    session.status = "done";
+    session.items = [
+      {
+        id: "bash-one",
+        runId: "bash-run",
+        turnId: "bash-turn",
+        kind: "action",
+        actionKind: "command",
+        phase: "investigated",
+        status: "succeeded",
+        rawToolName: "bash",
+        label: "Ran command",
+        commandPreview: "git status --short",
+        observedOutputBytes: 32,
+        droppedOutputBytes: 0,
+        changedPaths: [],
+        sourceIds: [],
+        outputIds: [],
+        state: "committed",
+        createdAt: timestamp,
+      },
+      {
+        id: "bash-two",
+        runId: "bash-run",
+        turnId: "bash-turn",
+        kind: "action",
+        actionKind: "command",
+        phase: "verified",
+        status: "succeeded",
+        rawToolName: "bash",
+        label: "Ran command",
+        commandPreview: "npm test -- --run src/components",
+        observedOutputBytes: 64,
+        droppedOutputBytes: 0,
+        changedPaths: [],
+        sourceIds: [],
+        outputIds: [],
+        state: "committed",
+        createdAt: timestamp,
+      },
+    ];
+
+    const { container } = render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    const groupSummary = screen.getByRole("button", {
+      name: "Ran commands",
+    });
+    expect(groupSummary).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelectorAll(".command-batch .action-cell")).toHaveLength(
+      2,
+    );
+    expect(container.querySelectorAll(".command-batch > summary")).toHaveLength(
+      0,
+    );
+    expect(container.querySelectorAll(".command-batch .action-cell[open]")).toHaveLength(
+      0,
+    );
+    expect(container.querySelectorAll(".bash-logo")).toHaveLength(2);
+
+    await user.click(groupSummary);
+    expect(groupSummary).toHaveAttribute("aria-expanded", "true");
+    const firstActionSummary = container.querySelector<HTMLElement>(
+      ".command-batch .action-cell > summary",
+    );
+    expect(firstActionSummary).not.toBeNull();
+    await user.click(firstActionSummary!);
+    expect(firstActionSummary!.parentElement).toHaveAttribute("open", "");
+  });
+
+  it("flattens evidence-free one-action runs into one useful row", () => {
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    const timestamp = new Date().toISOString();
+    const review = completionReview("Context compacted", 83_000);
+    review.actionCount = 1;
+    review.phases = [
+      {
+        phase: "other",
+        actionCount: 1,
+        succeededCount: 1,
+        failedCount: 0,
+        stoppedCount: 0,
+      },
+    ];
+    session.items = [
+      {
+        id: "compaction-action",
+        runId: "compaction-run",
+        turnId: "compaction-turn",
+        kind: "action",
+        actionKind: "analysis",
+        phase: "other",
+        status: "succeeded",
+        rawToolName: "compaction",
+        label: "Compacted session context",
+        detail: "The context window reached its safe compaction boundary.",
+        observedOutputBytes: 0,
+        droppedOutputBytes: 0,
+        changedPaths: [],
+        sourceIds: [],
+        outputIds: [],
+        state: "committed",
+        createdAt: timestamp,
+      },
+      {
+        id: "compaction-outcome",
+        runId: "compaction-run",
+        turnId: "compaction-turn",
+        kind: "run_outcome",
+        outcome: "done",
+        durationMs: 83_000,
+        summary: "Context compacted",
+        review,
+        state: "committed",
+        createdAt: timestamp,
+      },
+    ];
+    const { container, rerender } = render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    const action = screen.getByText("Compacted session context").closest(
+      "summary",
+    );
+    expect(action).toHaveTextContent("1m 23s");
+    expect(container.querySelector(".work-group.is-direct")).not.toBeNull();
+    expect(container.querySelector(".work-group-summary")).toBeNull();
+    expect(container.querySelector(".completion-review-disclosure")).toBeNull();
+    expect(screen.queryByText("Inspected results")).toBeNull();
+    expect(screen.queryByText("Review details")).toBeNull();
+
+    const reviewed = structuredClone(session);
+    const reviewedOutcome = reviewed.items.find(
+      (item) => item.kind === "run_outcome",
+    );
+    if (reviewedOutcome?.kind === "run_outcome") {
+      reviewedOutcome.review.evidenceCoverage = "partial";
+      reviewedOutcome.review.openQuestions = ["Confirm the next context budget"];
+    }
+    rerender(
+      <Conversation
+        session={reviewed}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+    expect(container.querySelector(".work-group.is-direct")).not.toBeNull();
+    expect(container.querySelector(".work-group-summary")).toBeNull();
+    const reviewDisclosure = container.querySelector(
+      ".completion-review-disclosure",
+    );
+    expect(reviewDisclosure).not.toBeNull();
+    expect(reviewDisclosure).not.toHaveAttribute("open");
+    expect(reviewDisclosure!.querySelector(":scope > summary")).toHaveTextContent(
+      "Open questions",
+    );
+  });
+
+  it("loads inline diffs and line-numbered reads when a work group opens", async () => {
+    const user = userEvent.setup();
+    const diff = [
+      "diff --git a/src/theme.ts b/src/theme.ts",
+      "--- a/src/theme.ts",
+      "+++ b/src/theme.ts",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    ].join("\n");
+    const sourceText = "const answer = 42;\nexport default answer;\n";
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
+      const body = String(input).endsWith("resource-diff") ? diff : sourceText;
+      return new Response(body, {
+        status: 200,
+        headers: {
+          "Content-Length": String(new TextEncoder().encode(body).byteLength),
+        },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const resourceContentUrl = vi.fn(
+      (sessionId: string, handle: string) =>
+        `/api/v1/sessions/${sessionId}/resources/${handle}`,
+    );
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    const timestamp = new Date().toISOString();
+    session.status = "done";
+    session.items = [
+      {
+        id: "read-theme",
+        runId: "preview-run",
+        turnId: "preview-turn",
+        kind: "action",
+        actionKind: "file_read",
+        phase: "investigated",
+        status: "succeeded",
+        rawToolName: "read",
+        label: "Read source",
+        target: "src/theme.ts",
+        observedOutputBytes: sourceText.length,
+        droppedOutputBytes: 0,
+        changedPaths: [],
+        sourceIds: ["source-theme"],
+        outputIds: [],
+        state: "committed",
+        createdAt: timestamp,
+      },
+      {
+        id: "write-theme",
+        runId: "preview-run",
+        turnId: "preview-turn",
+        kind: "action",
+        actionKind: "file_write",
+        phase: "changed",
+        status: "succeeded",
+        rawToolName: "apply_patch",
+        label: "Edited theme",
+        target: "src/theme.ts",
+        observedOutputBytes: 0,
+        droppedOutputBytes: 0,
+        changedPaths: ["src/theme.ts"],
+        sourceIds: [],
+        outputIds: [],
+        diffHandle: "resource-diff",
+        state: "committed",
+        createdAt: timestamp,
+      },
+    ];
+    session.sources = [
+      {
+        id: "source-theme",
+        handle: "resource-source",
+        kind: "file",
+        title: "theme.ts",
+        subtitle: "2 lines",
+        consultedAt: timestamp,
+        iconLabel: "SRC",
+      },
+    ];
+
+    const { container } = render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        resourceContentUrl={resourceContentUrl}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    const groupSummary = screen.getByRole("button", {
+      name: "Read files, edited file",
+    });
+    expect(groupSummary).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".activity-preview")).toBeNull();
+
+    await user.click(groupSummary);
+    expect(await screen.findByText("const answer = 42;")).toBeVisible();
+    expect(await screen.findByText("new")).toBeVisible();
+    expect(container.querySelectorAll(".activity-source-number").length).toBeGreaterThanOrEqual(2);
+    expect(container.querySelectorAll(".activity-diff-line.is-addition")).toHaveLength(1);
+    expect(container.querySelectorAll(".activity-diff-line.is-deletion")).toHaveLength(1);
+    expect(resourceContentUrl).toHaveBeenCalledWith(
+      "session-fresh",
+      "resource-source",
+    );
+    expect(resourceContentUrl).toHaveBeenCalledWith(
+      "session-fresh",
+      "resource-diff",
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/sessions/session-fresh/resources/resource-source",
+      expect.objectContaining({
+        credentials: "same-origin",
+        cache: "no-store",
+        redirect: "error",
+      }),
+    );
   });
 
   it("opens durable diffs, resulting files, and origin-linked evidence", async () => {
@@ -799,6 +1202,7 @@ describe("conversation composer", () => {
       />,
     );
 
+    await user.click(screen.getByRole("button", { name: "Working" }));
     await user.click(
       screen.getByRole("button", { name: "View changes to src/theme.ts" }),
     );
@@ -911,6 +1315,7 @@ describe("conversation composer", () => {
       />,
     );
 
+    expect(document.querySelector(".composer-running-edge")).toBeNull();
     const field = screen.getByLabelText("Private answer");
     expect(field).toHaveAttribute("type", "password");
     await user.type(field, "secret-value");

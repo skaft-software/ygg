@@ -131,6 +131,33 @@ describe("sidebar session lifecycle", () => {
     expect(screen.queryByText(/GPT|Claude|Qwen/)).toBeNull();
   });
 
+  it("offers archive and restore actions with distinct symbols", () => {
+    const setLifecycle = vi.fn();
+    const { container } = render(
+      <Sidebar
+        {...sidebarProps({
+          sessions: [activeSession(), archivedSession()],
+          onSetSessionLifecycle: setLifecycle,
+        })}
+      />,
+    );
+
+    const archive = screen.getByRole("button", {
+      name: "Archive session Active investigation",
+    });
+    expect(archive).toHaveClass("session-row-archive");
+    expect(archive.querySelector("svg")).not.toBeNull();
+    fireEvent.click(archive);
+    expect(setLifecycle).toHaveBeenCalledWith("session-active", "archived");
+
+    fireEvent.click(screen.getByRole("tab", { name: /Archive/ }));
+    const restore = screen.getByRole("button", {
+      name: "Restore session Archived investigation",
+    });
+    expect(restore).toHaveClass("session-row-restore");
+    expect(container.querySelector(".session-row-archive")).toBeNull();
+  });
+
   it("opens usage from the persistent destination", () => {
     const openUsage = vi.fn();
     const { rerender } = render(

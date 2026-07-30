@@ -819,7 +819,7 @@ pub struct ToolActivity {
     /// Validated workspace-relative command working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Safe preview for an allowlisted command shape.
+    /// Full bounded Bash command text; credential-like values may be redacted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_preview: Option<String>,
     /// Process exit code when deterministically parsed.
@@ -1548,7 +1548,7 @@ impl ProtocolValidation for ToolActivity {
             validate_public_text("item.tool.cwd", cwd, 1024, false)?;
         }
         if let Some(command) = &self.command_preview {
-            validate_public_text("item.tool.command_preview", command, 1024, false)?;
+            validate_public_text("item.tool.command_preview", command, 1024, true)?;
         }
         if let Some(summary) = &self.output_summary {
             validate_public_text("item.tool.output_summary", summary, 2 * 1024, true)?;

@@ -27,6 +27,8 @@ const DAY_MILLISECONDS: u64 = 86_400_000;
 const MAX_TIMESTAMP_MILLISECONDS: u64 = 253_402_300_799_999;
 /// Number of weeks returned for the activity heatmap.
 pub const USAGE_ACTIVITY_WEEKS: u64 = 53;
+/// Maximum number of model rows returned by one aggregate projection.
+pub const MAX_USAGE_MODEL_ROWS: usize = 256;
 
 /// Token usage reported for one completed provider operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +89,32 @@ pub enum UsagePeriod {
     Weekly,
 }
 
+/// Token and request totals attributed to one provider/model pair.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelUsage {
+    /// Endpoint/provider route used for these operations.
+    pub provider: String,
+    /// Canonical selected model used for these operations.
+    pub model: String,
+    /// Standard-rate prompt tokens.
+    pub prompt_tokens: u64,
+    /// Generated output tokens.
+    pub completion_tokens: u64,
+    /// Prompt tokens read from a provider cache.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to a provider cache.
+    pub cache_write_tokens: u64,
+    /// One-hour cache writes, a subset of `cache_write_tokens`.
+    pub cache_write_1h_tokens: u64,
+    /// Reasoning subset of generated output.
+    pub reasoning_tokens: u64,
+    /// Provider-reported total tokens.
+    pub total_tokens: u64,
+    /// Completed provider operations.
+    pub request_count: u64,
+}
+
 /// Flat token and request totals for a selected period.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,6 +137,10 @@ pub struct UsageStats {
     pub total_tokens: u64,
     /// Completed provider operations.
     pub request_count: u64,
+    /// Highest-usage provider/model pairs in this period.
+    pub models: Vec<ModelUsage>,
+    /// Whether additional lower-usage model rows were omitted.
+    pub models_truncated: bool,
 }
 
 impl Default for UsagePeriod {
@@ -137,6 +169,10 @@ pub struct LifetimeUsage {
     pub total_tokens: u64,
     /// Completed provider operations.
     pub request_count: u64,
+    /// Highest-usage provider/model pairs across retained activity.
+    pub models: Vec<ModelUsage>,
+    /// Whether additional lower-usage model rows were omitted.
+    pub models_truncated: bool,
     /// Earliest retained request timestamp.
     pub first_request_at_ms: Option<u64>,
     /// Latest retained request timestamp.
@@ -248,11 +284,67 @@ impl Aggregate {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct AggregateSet {
+    total: Aggregate,
+    models: BTreeMap<(String, String), Aggregate>,
+}
+
+impl AggregateSet {
+    fn add_request(&mut self, request: &InferenceRequest) {
+        self.total.add_request(request);
+        self.models
+            .entry((request.provider.clone(), request.model.clone()))
+            .or_default()
+            .add_request(request);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.total.merge(other.total);
+        for (identity, aggregate) in &other.models {
+            self.models
+                .entry(identity.clone())
+                .or_default()
+                .merge(*aggregate);
+        }
+    }
+
+    fn model_breakdown(&self) -> (Vec<ModelUsage>, bool) {
+        let mut models = self
+            .models
+            .iter()
+            .map(|((provider, model), aggregate)| ModelUsage {
+                provider: provider.clone(),
+                model: model.clone(),
+                prompt_tokens: aggregate.prompt_tokens,
+                completion_tokens: aggregate.completion_tokens,
+                cache_read_tokens: aggregate.cache_read_tokens,
+                cache_write_tokens: aggregate.cache_write_tokens,
+                cache_write_1h_tokens: aggregate.cache_write_1h_tokens,
+                reasoning_tokens: aggregate.reasoning_tokens,
+                total_tokens: aggregate.total_tokens,
+                request_count: aggregate.request_count,
+            })
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| {
+            right
+                .total_tokens
+                .cmp(&left.total_tokens)
+                .then_with(|| right.request_count.cmp(&left.request_count))
+                .then_with(|| left.provider.cmp(&right.provider))
+                .then_with(|| left.model.cmp(&right.model))
+        });
+        let truncated = models.len() > MAX_USAGE_MODEL_ROWS;
+        models.truncate(MAX_USAGE_MODEL_ROWS);
+        (models, truncated)
+    }
+}
+
 /// In-memory lifetime and daily metrics rebuilt from durable request records.
 #[derive(Clone, Debug, Default)]
 pub struct LifetimeMetricsStore {
-    lifetime: Aggregate,
-    daily: BTreeMap<u64, Aggregate>,
+    lifetime: AggregateSet,
+    daily: BTreeMap<u64, AggregateSet>,
     first_request_at_ms: Option<u64>,
     last_request_at_ms: Option<u64>,
 }
@@ -280,15 +372,19 @@ impl LifetimeMetricsStore {
 
     /// Returns all retained token and request totals.
     pub fn lifetime(&self) -> LifetimeUsage {
+        let total = self.lifetime.total;
+        let (models, models_truncated) = self.lifetime.model_breakdown();
         LifetimeUsage {
-            prompt_tokens: self.lifetime.prompt_tokens,
-            completion_tokens: self.lifetime.completion_tokens,
-            cache_read_tokens: self.lifetime.cache_read_tokens,
-            cache_write_tokens: self.lifetime.cache_write_tokens,
-            cache_write_1h_tokens: self.lifetime.cache_write_1h_tokens,
-            reasoning_tokens: self.lifetime.reasoning_tokens,
-            total_tokens: self.lifetime.total_tokens,
-            request_count: self.lifetime.request_count,
+            prompt_tokens: total.prompt_tokens,
+            completion_tokens: total.completion_tokens,
+            cache_read_tokens: total.cache_read_tokens,
+            cache_write_tokens: total.cache_write_tokens,
+            cache_write_1h_tokens: total.cache_write_1h_tokens,
+            reasoning_tokens: total.reasoning_tokens,
+            total_tokens: total.total_tokens,
+            request_count: total.request_count,
+            models,
+            models_truncated,
             first_request_at_ms: self.first_request_at_ms,
             last_request_at_ms: self.last_request_at_ms,
         }
@@ -301,10 +397,12 @@ impl LifetimeMetricsStore {
             UsagePeriod::Daily => today,
             UsagePeriod::Weekly => today.saturating_sub(6),
         };
-        let mut total = Aggregate::default();
+        let mut aggregate = AggregateSet::default();
         for (_, day) in self.daily.range(first_day..=today) {
-            total.merge(*day);
+            aggregate.merge(day);
         }
+        let total = aggregate.total;
+        let (models, models_truncated) = aggregate.model_breakdown();
         UsageStats {
             period,
             prompt_tokens: total.prompt_tokens,
@@ -315,6 +413,8 @@ impl LifetimeMetricsStore {
             reasoning_tokens: total.reasoning_tokens,
             total_tokens: total.total_tokens,
             request_count: total.request_count,
+            models,
+            models_truncated,
         }
     }
 
@@ -327,8 +427,8 @@ impl LifetimeMetricsStore {
             .range(first_day..=today)
             .map(|(day, aggregate)| UsageActivityDay {
                 date: format_utc_day(*day),
-                tokens: aggregate.total_tokens,
-                request_count: aggregate.request_count,
+                tokens: aggregate.total.total_tokens,
+                request_count: aggregate.total.request_count,
             })
             .collect();
         let active_days = self.daily.range(..=today).map(|(day, _)| *day);
@@ -754,5 +854,44 @@ mod tests {
             metrics.lifetime().last_request_at_ms,
             Some(3 * DAY_MILLISECONDS)
         );
+    }
+
+    #[test]
+    fn model_breakdowns_follow_the_selected_period_and_sort_by_tokens() {
+        let mut metrics = LifetimeMetricsStore::default();
+        let mut older = request(0, 0, 120);
+        older.model = "claude-small".into();
+        let mut current = request(3, 1, 240);
+        current.model = "claude-large".into();
+        metrics.record(&older);
+        metrics.record(&current);
+
+        let daily = metrics.stats_at(UsagePeriod::Daily, 3 * DAY_MILLISECONDS);
+        assert_eq!(daily.models.len(), 1);
+        assert_eq!(daily.models[0].model, "claude-large");
+        assert_eq!(daily.models[0].total_tokens, 240);
+        assert!(!daily.models_truncated);
+
+        let lifetime = metrics.lifetime();
+        assert_eq!(lifetime.models.len(), 2);
+        assert_eq!(lifetime.models[0].model, "claude-large");
+        assert_eq!(lifetime.models[1].model, "claude-small");
+        assert!(!lifetime.models_truncated);
+    }
+
+    #[test]
+    fn model_breakdowns_are_bounded() {
+        let mut metrics = LifetimeMetricsStore::default();
+        for index in 0..=MAX_USAGE_MODEL_ROWS {
+            let ordinal = u64::try_from(index).unwrap();
+            let mut usage = request(0, ordinal, ordinal + 1);
+            usage.model = format!("model-{index:03}");
+            metrics.record(&usage);
+        }
+
+        let lifetime = metrics.lifetime();
+        assert_eq!(lifetime.models.len(), MAX_USAGE_MODEL_ROWS);
+        assert!(lifetime.models_truncated);
+        assert_eq!(lifetime.models[0].model, "model-256");
     }
 }
