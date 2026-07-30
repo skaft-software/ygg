@@ -290,6 +290,14 @@ pub struct PromptInput {
     pub project_file_ids: Vec<FileEntryId>,
 }
 
+/// User-selected slash invocation routed through the session owner rather than the model prompt path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SlashCommandInvocation {
+    /// Exact slash-prefixed input typed in the composer.
+    pub invocation: String,
+}
+
 /// Typed answer to one opaque public request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -337,6 +345,12 @@ pub enum SessionCommand {
     FollowUp {
         /// User input.
         input: PromptInput,
+    },
+    /// Invoke a host-admitted slash command without turning it into a model prompt.
+    #[serde(rename = "session.invokeSlashCommand")]
+    InvokeSlashCommand {
+        /// Exact slash-prefixed invocation.
+        invocation: SlashCommandInvocation,
     },
     /// Stop the current run.
     #[serde(rename = "session.abort")]
@@ -707,6 +721,24 @@ impl ProtocolValidation for PromptInput {
     }
 }
 
+impl ProtocolValidation for SlashCommandInvocation {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_public_text(
+            "command.slash.invocation",
+            &self.invocation,
+            MAX_PROMPT_BYTES,
+            false,
+        )?;
+        if !self.invocation.starts_with('/') || self.invocation[1..].trim().is_empty() {
+            return Err(ValidationError::new(
+                "command.slash.invocation",
+                "must contain a slash-prefixed command name",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ProtocolValidation for SessionCommandEnvelope {
     fn validate(&self) -> Result<(), ValidationError> {
         if self.protocol != PROTOCOL_VERSION {
@@ -726,6 +758,7 @@ impl ProtocolValidation for SessionCommandEnvelope {
             | SessionCommand::Steer { input }
             | SessionCommand::FollowUp { input }
             | SessionCommand::EditUserTurn { input, .. } => input.validate()?,
+            SessionCommand::InvokeSlashCommand { invocation } => invocation.validate()?,
             SessionCommand::Abort { .. } => {}
             SessionCommand::AnswerRequest { answer, .. } => match answer {
                 RequestAnswer::Approval { .. } => {}

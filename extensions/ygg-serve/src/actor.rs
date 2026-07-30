@@ -10,7 +10,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 use crate::{
-    ActorOwnerState, AttentionState, AuthorityProfile, CommandAck, CommandId, DeviceId,
+    ActorOwnerState, AttentionState, AuthorityProfile, CommandAck, CommandDiscovery, CommandId, DeviceId,
     DriverCommandOutcome, ErrorCode, EventEnvelope, EventJournal, EventPayload, FinalizeCompletion,
     FinalizeDecision, HostId, ItemDelta, ItemLifecycle, ItemPayload, JournalConfig, JournalError,
     ProtocolValidation, ReplayResponse, RequestAnswer, RequestState, SanitizedError, ServiceError,
@@ -366,9 +366,12 @@ impl SessionActorCore {
                 ));
             }
         }
+        let slash_invocation =
+            matches!(&command.command, SessionCommand::InvokeSlashCommand { .. });
         if matches!(
             command.command,
-            SessionCommand::Checkout { .. }
+            SessionCommand::InvokeSlashCommand { .. }
+                | SessionCommand::Checkout { .. }
                 | SessionCommand::EditUserTurn { .. }
                 | SessionCommand::RetryResponse { .. }
                 | SessionCommand::ForkConversation { .. }
@@ -385,7 +388,11 @@ impl SessionActorCore {
         {
             return Err(SanitizedError::public(
                 ErrorCode::InvalidBoundary,
-                "A session branch can only be checked out after current work finishes.",
+                if slash_invocation {
+                    "A slash command can only run after current work finishes."
+                } else {
+                    "A session branch can only be checked out after current work finishes."
+                },
             ));
         }
         if let SessionCommand::Checkout { entry_id } = &command.command {
@@ -895,6 +902,9 @@ enum ActorMessage {
         after: SessionCursor,
         response: oneshot::Sender<ReplayResponse>,
     },
+    CommandDiscovery {
+        response: oneshot::Sender<Result<CommandDiscovery, ServiceError>>,
+    },
     Retire,
 }
 
@@ -983,6 +993,16 @@ impl SessionActorHandle {
         receiver.await.map_err(|_| ActorError::Closed)
     }
 
+    /// Returns the session owner's current command and skill discovery payload.
+    pub async fn command_discovery(&self) -> Result<CommandDiscovery, ServiceError> {
+        let (response, receiver) = oneshot::channel();
+        self.sender
+            .send(ActorMessage::CommandDiscovery { response })
+            .await
+            .map_err(|_| ServiceError::Unavailable)?;
+        receiver.await.map_err(|_| ServiceError::Unavailable)?
+    }
+
     /// Requests retained replay or a complete snapshot gap fallback.
     pub async fn replay_after(&self, after: SessionCursor) -> Result<ReplayResponse, ActorError> {
         let (response, receiver) = oneshot::channel();
@@ -1060,6 +1080,13 @@ impl SessionActor {
                     Input::Message(Some(ActorMessage::Replay { after, response })) => {
                         let _ = response.send(core.replay_after(after));
                     }
+                    Input::Message(Some(ActorMessage::CommandDiscovery { response })) => {
+                        let result = driver.command_discovery().await.and_then(|discovery| {
+                            discovery.validate().map_err(|_| ServiceError::Internal)?;
+                            Ok(discovery)
+                        });
+                        let _ = response.send(result);
+                    }
                     Input::Message(Some(ActorMessage::Retire)) => break,
                     Input::Message(None) => break,
                     Input::DriverEvent(Some(event)) => {
@@ -1119,7 +1146,7 @@ mod tests {
         AckDisposition, ActivityPhase, ContextUsage, DurableEntryId, ItemId, ModelSelection,
         PendingRequest, PromptInput, RequestId, RequestKind, RequestState, RunId, SessionBranchEntry,
         SessionBranchEntryKind, SessionBranchGraph, SessionId, SessionItem, SessionLiveState,
-        ToolActivity, ToolActivityStatus, ToolKind, TurnId,
+        SlashCommandInvocation, ToolActivity, ToolActivityStatus, ToolKind, TurnId,
     };
 
     use super::*;
@@ -1230,6 +1257,30 @@ mod tests {
         behavior: FinalizerBehavior,
     }
 
+    struct InvalidDiscoveryDriver(SessionSeed);
+
+    #[async_trait::async_trait]
+    impl SessionDriver for InvalidDiscoveryDriver {
+        fn seed(&self) -> SessionSeed {
+            self.0.clone()
+        }
+
+        async fn command_discovery(&mut self) -> Result<CommandDiscovery, ServiceError> {
+            Ok(CommandDiscovery {
+                protocol: 0,
+                commands: Vec::new(),
+                skills: Vec::new(),
+            })
+        }
+
+        async fn dispatch(
+            &mut self,
+            _command: SessionCommand,
+        ) -> Result<DriverCommandOutcome, ServiceError> {
+            Ok(DriverCommandOutcome::default())
+        }
+    }
+
     #[async_trait::async_trait]
     impl SessionDriver for FinalizingDriver {
         fn seed(&self) -> SessionSeed {
@@ -1306,6 +1357,23 @@ mod tests {
             Some(1),
             command,
         )
+    }
+
+    #[tokio::test]
+    async fn command_discovery_is_validated_before_it_leaves_the_actor() {
+        let handle = SessionActor::spawn(
+            HostId::new("host-test").unwrap(),
+            InvalidDiscoveryDriver(seed()),
+            ActorConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            handle.command_discovery().await,
+            Err(ServiceError::Internal)
+        );
+        handle.retire().await;
+        handle.quiesced().await;
     }
 
     #[test]
@@ -1681,6 +1749,44 @@ mod tests {
                 "{state:?} must reject branch checkout"
             );
         }
+    }
+
+    #[test]
+    fn slash_invocations_require_an_idle_session_boundary() {
+        let command = || {
+            SessionCommandEnvelope::new(
+                HostId::new("host-test").unwrap(),
+                DeviceId::new("device-test").unwrap(),
+                SessionId::new("session-actor").unwrap(),
+                CommandId::new("command-slash-working").unwrap(),
+                1,
+                Some(1),
+                SessionCommand::InvokeSlashCommand {
+                    invocation: SlashCommandInvocation {
+                        invocation: "/compact".into(),
+                    },
+                },
+            )
+        };
+        let mut core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            checkout_seed(),
+            ActorConfig::default(),
+        )
+        .unwrap();
+        core.view.summary.live_state = SessionLiveState::Working;
+        core.view.snapshot.live_state = SessionLiveState::Working;
+
+        let error = core.preflight_command(&command()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidBoundary);
+        assert_eq!(
+            error.message,
+            "A slash command can only run after current work finishes."
+        );
+
+        core.view.summary.live_state = SessionLiveState::Idle;
+        core.view.snapshot.live_state = SessionLiveState::Idle;
+        core.preflight_command(&command()).unwrap();
     }
 
     #[test]
