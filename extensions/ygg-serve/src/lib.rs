@@ -15,6 +15,7 @@ mod document_store;
 mod embedded_web;
 mod error;
 mod event;
+mod fs;
 mod ids;
 mod journal;
 mod model;
@@ -64,6 +65,14 @@ pub use error::{ErrorCode, SanitizedError};
 pub use event::{
     EventEnvelope, EventPayload, HostCatalogChange, HostStreamEvent, ItemDelta, ReplayGap,
     ReplayResponse, TimestampedEvent,
+};
+pub use fs::{
+    ProjectFileEntry, ProjectFileEntryKind, ProjectFileRead, ProjectFileSearchHit,
+    ProjectFileSearchResult, ProjectFileSystem, ProjectFileSystemError, ProjectFileTree,
+    ProjectFileWrite, MAX_PROJECT_FILE_PATH_BYTES, MAX_PROJECT_FILE_PATH_COMPONENTS,
+    MAX_PROJECT_FILE_READ_BYTES, MAX_PROJECT_FILE_SEARCH_BYTES, MAX_PROJECT_FILE_SEARCH_DEPTH,
+    MAX_PROJECT_FILE_SEARCH_FILES, MAX_PROJECT_FILE_SEARCH_QUERY_BYTES,
+    MAX_PROJECT_FILE_SEARCH_RESULTS, MAX_PROJECT_FILE_TREE_ENTRIES, MAX_PROJECT_FILE_WRITE_BYTES,
 };
 pub use ids::{
     ArtifactId, CommandId, DeviceId, DurableEntryId, HostId, ItemId, ProjectId, RequestId, RunId,
