@@ -1,16 +1,32 @@
 @font-face {
   font-family: "Local Grotesk";
-  src: url("./assets/fonts/LocalGrotesk-Variable.woff2") format("woff2");
+  src: url("./assets/fonts/LocalGrotesk-Regular.woff2") format("woff2");
   font-style: normal;
-  font-weight: 400 700;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Local Grotesk";
+  src: url("./assets/fonts/LocalGrotesk-Bold.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 700;
   font-display: swap;
 }
 
 @font-face {
   font-family: "Local Mono";
-  src: url("./assets/fonts/LocalMono-Variable.woff2") format("woff2");
+  src: url("./assets/fonts/LocalMono-Regular.woff2") format("woff2");
   font-style: normal;
-  font-weight: 400 700;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Local Mono";
+  src: url("./assets/fonts/LocalMono-Bold.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 700;
   font-display: swap;
 }
 
