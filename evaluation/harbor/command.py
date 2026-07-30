@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
 import re
 import shlex
-from typing import Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
+from enum import Enum
 
 
 class FailureKind(str, Enum):
@@ -92,6 +92,22 @@ def build_ygg_command(
             session_dir=session_dir,
             max_turns=max_turns,
             workspace_trusted=workspace_trusted,
+        )
+    )
+
+
+def wrap_with_timeout(command: YggCommand, timeout_sec: int) -> YggCommand:
+    """Run a command through coreutils timeout while retaining its output."""
+
+    if timeout_sec < 1:
+        raise ValueError("timeout_sec must be greater than zero")
+    return YggCommand(
+        (
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=5s",
+            f"{timeout_sec}s",
+            *command.argv,
         )
     )
 

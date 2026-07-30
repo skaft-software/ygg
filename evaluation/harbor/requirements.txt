@@ -1,0 +1,4 @@
+# Harbor is installed from the exact source revision used by this adapter.
+# Prefer a checkout plus Harbor's own uv.lock; this file is for a lightweight
+# virtual environment when a Harbor checkout is not convenient.
+harbor @ git+https://github.com/harbor-framework/harbor.git@e76f7e32f5644fb9f648cd23151aac5c67492ea0
