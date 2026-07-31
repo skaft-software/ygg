@@ -29,6 +29,7 @@ import {
 } from "react";
 import { ActivityRail } from "./components/ActivityRail";
 import { Conversation } from "./components/Conversation";
+import { GoalBadge } from "./components/GoalBadge";
 import { DevicesView } from "./components/Devices";
 import {
   Inspector,
@@ -47,6 +48,7 @@ import type {
   AttachmentRef,
   AuthorityProfile,
   DocumentReference,
+  GoalState,
   ReasoningEffort,
   SessionSnapshot,
   SessionStatus,
@@ -64,6 +66,11 @@ import {
   YggStore,
   useYggStore,
 } from "./store";
+import {
+  goalCommandHelp,
+  goalStatusMessage,
+  type GoalCommand,
+} from "./components/ComposerCommands/goal";
 import { applyStoredTypePreferences } from "./theme";
 import {
   createTransport,
@@ -252,6 +259,7 @@ interface HeaderProps {
   sessionTitle: string;
   projectName: string;
   status: SessionStatus;
+  goal?: GoalState | null;
   activityAvailable: boolean;
   activityOpen: boolean;
   terminalAvailable: boolean;
@@ -279,6 +287,7 @@ export function SessionHeader({
   sessionTitle,
   projectName,
   status,
+  goal = null,
   activityAvailable,
   activityOpen,
   terminalAvailable,
@@ -372,6 +381,10 @@ export function SessionHeader({
       </div>
 
       <div className="session-header-actions">
+        <GoalBadge
+          goal={goal}
+          working={status === "working" || status === "needs_attention"}
+        />
         <span className={`header-status is-${status}`}>
           {status === "working" ? (
             <span className="status-orbit" aria-hidden="true" />
@@ -1255,6 +1268,32 @@ export default function App() {
       ),
     [],
   );
+  const goalCommand = useCallback(
+    async (command: GoalCommand): Promise<string> => {
+      switch (command.type) {
+        case "help":
+          return goalCommandHelp;
+        case "status":
+          return goalStatusMessage(state.goal);
+        case "set": {
+          const goal = await store.setGoal(command.objective);
+          return `Goal set: ${goal?.objective ?? command.objective}`;
+        }
+        case "pause": {
+          const goal = await store.pauseGoal();
+          return goal ? `Goal paused: ${goal.objective}` : "Goal paused.";
+        }
+        case "resume": {
+          const goal = await store.resumeGoal();
+          return goal ? `Goal resumed: ${goal.objective}` : "Goal resumed.";
+        }
+        case "clear":
+          await store.clearGoal();
+          return "Goal cleared.";
+      }
+    },
+    [state.goal],
+  );
   const interruptSession = useCallback(() => store.interrupt(), []);
   const configureSession = useCallback(
     (patch: {
@@ -1487,6 +1526,7 @@ const getCommandDiscovery = useCallback(
             sessionTitle={session.title}
             projectName={project?.name ?? "Local project"}
             status={session.status}
+            goal={state.goal}
             activityAvailable={activityAvailable}
             activityOpen={visibleActivityOpen}
             terminalAvailable={terminalAvailable}
@@ -1536,6 +1576,8 @@ const getCommandDiscovery = useCallback(
             key={session.sessionId}
             session={session}
             bootstrap={state.bootstrap}
+            goal={state.goal}
+            onGoalCommand={goalCommand}
             onSubmit={submitSession}
             onInterrupt={interruptSession}
             onConfigure={configureSession}

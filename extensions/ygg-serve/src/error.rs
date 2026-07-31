@@ -15,6 +15,8 @@ pub enum ErrorCode {
     IncompatibleProtocol,
     /// Invalid command or DTO.
     InvalidCommand,
+    /// Goal objective, budget, or lifecycle transition is invalid.
+    InvalidGoal,
     /// Command ID was reused with different content.
     CommandIdConflict,
     /// Session ownership generation changed.

@@ -16,6 +16,7 @@ mod embedded_web;
 mod error;
 mod event;
 mod fs;
+mod goal;
 mod ids;
 mod journal;
 mod model;
@@ -63,6 +64,7 @@ pub use document_store::{
     StoredDocument, MAX_DOCUMENTS_PER_PROMPT, MAX_STORED_DOCUMENTS_PER_SESSION,
 };
 pub use error::{ErrorCode, SanitizedError};
+pub use goal::{GoalAction, GoalState, GoalStatus, GoalStore, GoalStoreError};
 pub use event::{
     EventEnvelope, EventPayload, HostCatalogChange, HostStreamEvent, ItemDelta, ReplayGap,
     ReplayResponse, TimestampedEvent,

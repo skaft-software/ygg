@@ -12,6 +12,32 @@ export type SessionStatus =
   | "stopped"
   | "disconnected";
 
+export type GoalStatus =
+  | "active"
+  | "paused"
+  | "complete"
+  | "blocked"
+  | "budget_limited";
+
+export type GoalAction = "pause" | "resume" | "clear";
+
+export interface GoalState {
+  objective: string;
+  status: GoalStatus;
+  turnBudget: number | null;
+  turnsUsed: number;
+  createdAt: string;
+}
+
+export type GoalMutation =
+  | {
+      objective: string;
+      turnBudget?: number | null;
+    }
+  | {
+      action: GoalAction;
+    };
+
 export type ItemState = "streaming" | "committed" | "failed" | "stopped";
 
 // Reasoning choices are provider-defined catalog values. Keep the UI model

@@ -936,6 +936,73 @@ kbd {
   display: none;
 }
 
+.goal-badge {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(30vw, 260px);
+  padding: 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--theme-pigment) 24%, transparent);
+  border-radius: 99px;
+  color: var(--text-soft);
+  background: color-mix(in srgb, var(--theme-pigment) 8%, var(--surface));
+  font-size: var(--font-meta);
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.goal-badge-indicator {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--theme-pigment);
+}
+
+.goal-badge-label,
+.goal-badge-budget {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.goal-badge-budget {
+  color: var(--text-faint);
+}
+
+.goal-badge.is-working .goal-badge-indicator {
+  animation: goal-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes goal-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+.goal-badge.is-paused {
+  border-color: color-mix(in srgb, var(--text-muted) 30%, transparent);
+}
+
+.goal-badge.is-paused .goal-badge-indicator {
+  background: var(--text-muted);
+}
+
+.goal-badge.is-complete .goal-badge-indicator {
+  background: var(--success);
+}
+
+.goal-badge.is-blocked .goal-badge-indicator,
+.goal-badge.is-budget_limited .goal-badge-indicator {
+  background: var(--warning);
+}
+
 .menu-anchor {
   position: relative;
 }
@@ -4412,6 +4479,40 @@ kbd {
   font-size: var(--font-meta);
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.composer-goal-status {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px 6px;
+  color: var(--text-faint);
+  font-size: var(--font-meta);
+}
+
+.composer-goal-status > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-goal-status .goal-badge {
+  flex: 0 0 auto;
+  max-width: none;
+  padding-block: 3px;
+}
+
+.composer-goal-status .goal-badge-budget {
+  display: none;
+}
+
+.composer-command-feedback {
+  margin: 8px 4px 2px;
+  color: var(--text-muted);
+  font-size: var(--font-meta);
+  line-height: 1.4;
 }
 
 .composer-toolbar,

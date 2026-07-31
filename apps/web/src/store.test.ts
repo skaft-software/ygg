@@ -7,6 +7,8 @@ import type {
   CommandDiscovery,
   AttachmentRef,
   DocumentReference,
+  GoalMutation,
+  GoalState,
   HostEvent,
   HostBootstrap,
   LifetimeUsage,
@@ -59,6 +61,7 @@ class TestTransport implements YggTransport {
   commandHandler: (command: ClientCommand) => Promise<CommandAck> = async (
     command,
   ) => ({ commandId: command.id, accepted: true });
+  readonly goals = new Map<string, GoalState>();
 
   async getProjectCatalog(): Promise<ProjectCatalog> {
     return clone(this.projectCatalog);
@@ -147,6 +150,40 @@ class TestTransport implements YggTransport {
   async getCommandDiscovery(sessionId: string): Promise<CommandDiscovery> {
     this.commandDiscoverySessionIds.push(sessionId);
     return clone(this.commandDiscovery);
+  }
+
+  async getGoal(sessionId: string): Promise<GoalState | null> {
+    return clone(this.goals.get(sessionId) ?? null);
+  }
+
+  async updateGoal(
+    sessionId: string,
+    mutation: GoalMutation,
+  ): Promise<GoalState | null> {
+    if ("objective" in mutation) {
+      const now = new Date().toISOString();
+      const goal: GoalState = {
+        objective: mutation.objective,
+        status: "active",
+        turnBudget: mutation.turnBudget ?? null,
+        turnsUsed: 0,
+        createdAt: now,
+      };
+      this.goals.set(sessionId, goal);
+      return clone(goal);
+    }
+    if (mutation.action === "clear") {
+      this.goals.delete(sessionId);
+      return null;
+    }
+    const goal = this.goals.get(sessionId);
+    if (!goal) throw new Error("No goal is configured for this session.");
+    const next: GoalState = {
+      ...goal,
+      status: mutation.action === "pause" ? "paused" : "active",
+    };
+    this.goals.set(sessionId, next);
+    return clone(next);
   }
 
   async send(command: ClientCommand): Promise<CommandAck> {
@@ -320,6 +357,32 @@ describe("YggStore", () => {
       type: "project.setTrust",
       trusted: true,
     });
+    store.dispose();
+  });
+
+  it("loads and persists the selected session goal through lifecycle commands", async () => {
+    const transport = new TestTransport();
+    transport.goals.set("session-fresh", {
+      objective: "ship the release",
+      status: "active",
+      turnBudget: 3,
+      turnsUsed: 1,
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    const store = new YggStore(transport);
+
+    await store.initialize();
+    expect(store.getSnapshot().goal).toMatchObject({
+      objective: "ship the release",
+      status: "active",
+    });
+
+    await store.pauseGoal();
+    expect(store.getSnapshot().goal?.status).toBe("paused");
+    await store.resumeGoal();
+    expect(store.getSnapshot().goal?.status).toBe("active");
+    await store.clearGoal();
+    expect(store.getSnapshot().goal).toBeNull();
     store.dispose();
   });
 

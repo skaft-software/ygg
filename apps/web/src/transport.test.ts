@@ -91,6 +91,37 @@ describe("HTTP Ygg transport", () => {
     expect(transportModeFromSearch("?transport=fixture-preview")).toBe("live");
   });
 
+  it("supports persistent goal reads and lifecycle mutations", async () => {
+    const goal = {
+      objective: "ship the release",
+      status: "active",
+      turnBudget: 4,
+      turnsUsed: 1,
+      createdAt: "2026-01-01T00:00:00Z",
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(goal))
+      .mockResolvedValueOnce(jsonResponse({ ...goal, status: "paused" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+
+    await expect(transport.getGoal("session/one")).resolves.toEqual(goal);
+    await expect(
+      transport.updateGoal("session/one", { action: "pause" }),
+    ).resolves.toMatchObject({ status: "paused" });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/sessions/session%2Fone/goal",
+    );
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({
+      method: "POST",
+      credentials: "same-origin",
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+      action: "pause",
+    });
+  });
+
   it("scopes opaque resource URLs to the owning session", () => {
     expect(
       new FixtureTransport().resourceContentUrl(

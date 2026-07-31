@@ -92,6 +92,7 @@ pub async fn run(
                 shell: config.sandbox.shell_path.clone(),
             });
     let host = Arc::new(YggHost::new(config)?);
+    let goal_store_root = host.serve_state_dir.join("goals");
     let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
     let server = LoopbackServer::start(
         supervisor,
@@ -99,6 +100,7 @@ pub async fn run(
             port,
             web_root: web_root.clone(),
             terminal,
+            goal_store_root,
         },
     )
     .await?;

@@ -6,6 +6,8 @@ import type {
   ClientCommand,
   CommandDiscovery,
   DocumentReference,
+  GoalState,
+  GoalMutation,
   HostEvent,
   HostBootstrap,
   LifetimeUsage,
@@ -53,6 +55,7 @@ export interface YggState {
   bootstrap: HostBootstrap | null;
   projectCatalog: ProjectCatalog | null;
   selectedSessionId: string | null;
+  goal: GoalState | null;
   sessions: Record<string, SessionSnapshot>;
 }
 
@@ -64,6 +67,7 @@ const initialState: YggState = {
   bootstrap: null,
   projectCatalog: null,
   selectedSessionId: null,
+  goal: null,
   sessions: {},
 };
 
@@ -537,6 +541,7 @@ export class YggStore {
           bootstrap: null,
           projectCatalog,
           selectedSessionId: null,
+          goal: null,
           sessions: {},
         });
         return;
@@ -561,9 +566,10 @@ export class YggStore {
         routedProjectRunnable ? routedSessionId ?? undefined : undefined,
       );
       const bootstrap = hostBootstrap;
-      const selected = await this.transport.getSession(
-        bootstrap.selectedSessionId,
-      );
+      const [selected, goal] = await Promise.all([
+        this.transport.getSession(bootstrap.selectedSessionId),
+        this.transport.getGoal(bootstrap.selectedSessionId),
+      ]);
       const selectedSummaryTitle = bootstrap.sessions
         .find((summary) => summary.id === selected.sessionId)
         ?.title;
@@ -574,6 +580,7 @@ export class YggStore {
           }
         : selected;
       primeSessionItemIndex(installedSelected);
+
       const summaries = bootstrap.sessions.map((summary) =>
         summary.id === installedSelected.sessionId
           ? {
@@ -590,6 +597,7 @@ export class YggStore {
         bootstrap: { ...bootstrap, sessions: summaries },
         projectCatalog,
         selectedSessionId: installedSelected.sessionId,
+        goal,
         sessions: { [installedSelected.sessionId]: installedSelected },
       });
       writeSessionRoute(installedSelected.sessionId, "replace");
@@ -672,6 +680,36 @@ export class YggStore {
     return this.transport.searchTrustedFiles(projectId, query);
   }
 
+  private async applyGoalMutation(
+    mutation: GoalMutation,
+  ): Promise<GoalState | null> {
+    const session = this.selectedSession;
+    if (!session) throw new Error("No session is selected.");
+    const goal = await this.transport.updateGoal(session.sessionId, mutation);
+    if (this.state.selectedSessionId === session.sessionId) {
+      this.publish({ ...this.state, goal });
+    }
+    return goal;
+  }
+
+  setGoal(objective: string): Promise<GoalState | null> {
+    const value = objective.trim();
+    if (!value) return Promise.reject(new Error("A goal objective is required."));
+    return this.applyGoalMutation({ objective: value });
+  }
+
+  pauseGoal(): Promise<GoalState | null> {
+    return this.applyGoalMutation({ action: "pause" });
+  }
+
+  resumeGoal(): Promise<GoalState | null> {
+    return this.applyGoalMutation({ action: "resume" });
+  }
+
+  clearGoal(): Promise<GoalState | null> {
+    return this.applyGoalMutation({ action: "clear" });
+  }
+
   readTrustedFile(
     projectId: string,
     entryId: string,
@@ -740,9 +778,11 @@ export class YggStore {
     this.selectionAbort = controller;
 
     try {
-      const snapshot =
+      const [snapshot, goal] = await Promise.all([
         this.state.sessions[sessionId] ??
-        (await this.transport.getSession(sessionId, controller.signal));
+          this.transport.getSession(sessionId, controller.signal),
+        this.transport.getGoal(sessionId, controller.signal),
+      ]);
       const summaryTitle = this.state.bootstrap?.sessions.find(
         (summary) => summary.id === sessionId,
       )?.title;
@@ -776,6 +816,7 @@ export class YggStore {
             }
           : this.state.bootstrap,
         selectedSessionId: sessionId,
+        goal,
         sessions: {
           ...this.state.sessions,
           [sessionId]: installedSnapshot,
@@ -822,7 +863,10 @@ export class YggStore {
     sessionId: string,
     bootstrap: HostBootstrap,
   ): Promise<void> {
-    const snapshot = await this.transport.getSession(sessionId);
+    const [snapshot, goal] = await Promise.all([
+      this.transport.getSession(sessionId),
+      this.transport.getGoal(sessionId),
+    ]);
     const summary: SessionSummary = {
       id: snapshot.sessionId,
       projectId: snapshot.projectId,
@@ -851,6 +895,7 @@ export class YggStore {
         ],
       },
       selectedSessionId: snapshot.sessionId,
+      goal,
       sessions: { ...this.state.sessions, [snapshot.sessionId]: snapshot },
     });
     writeSessionRoute(snapshot.sessionId, "push");
@@ -1326,6 +1371,10 @@ export class YggStore {
   get selectedSession(): SessionSnapshot | null {
     const id = this.state.selectedSessionId;
     return id ? (this.state.sessions[id] ?? null) : null;
+  }
+
+  get selectedGoal(): GoalState | null {
+    return this.state.goal;
   }
 
   dispose(): void {

@@ -59,6 +59,7 @@ import type {
   CommandDiscovery,
   CommandSuggestion,
   HostBootstrap,
+  GoalState,
   ModelSummary,
   OutputRef,
   ReasoningEffort,
@@ -70,6 +71,7 @@ import type {
   TrustedFileRead,
   TrustedFileSearchResult,
 } from "../protocol";
+import { GoalBadge } from "./GoalBadge";
 import {
   ConversationBranchDialog,
   type ConversationBranchAction,
@@ -86,12 +88,18 @@ import {
   ShellCommand,
   type ResourceContentUrl,
 } from "./ActivityPreview";
+import {
+  parseGoalCommand,
+  type GoalCommand,
+} from "./ComposerCommands/goal";
 
 const MarkdownMessage = lazy(() => import("./MarkdownMessage"));
 
 interface ConversationProps {
   session: SessionSnapshot;
   bootstrap: HostBootstrap;
+  goal?: GoalState | null;
+  onGoalCommand?: (command: GoalCommand) => Promise<string>;
   onSubmit: (
     prompt: string,
     attachments: AttachmentRef[],
@@ -2961,6 +2969,8 @@ function estimatedContextInputCost(
 function Composer({
   session,
   bootstrap,
+  goal = null,
+  onGoalCommand,
   onSubmit,
   onInterrupt,
   onConfigure,
@@ -2980,6 +2990,8 @@ function Composer({
   ConversationProps,
   | "session"
   | "bootstrap"
+  | "goal"
+  | "onGoalCommand"
   | "onSubmit"
   | "onInterrupt"
   | "onConfigure"
@@ -3051,6 +3063,7 @@ function Composer({
   const [submitError, setSubmitError] = useState<SubmissionFailure | null>(
     null,
   );
+  const [commandFeedback, setCommandFeedback] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const pendingComposerCaretRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -3504,17 +3517,19 @@ function Composer({
 
   const submit = async () => {
     if (!canSubmit || submitting) return;
+    const value = prompt;
+    const goalCommand = parseGoalCommand(value);
     if (
+      !goalCommand &&
       isWorking &&
       ((activeDelivery === "steer" && !bootstrap.capabilities.steer) ||
         (activeDelivery === "followUp" && !bootstrap.capabilities.followUp))
     ) {
       return;
     }
-    const value = prompt;
     const invocation = value.trim();
     const isSlashCommand = isSlashCommandInput(value);
-    if (isSlashCommand) {
+    if (isSlashCommand && !goalCommand) {
       const commandName = slashCommandName(value);
       const hasPromptContext =
         uploadedAttachments.length > 0 ||
@@ -3626,6 +3641,45 @@ function Composer({
 
     const submittedAttachments = attachments;
     const submittedReferences = uploadedAttachments;
+    if (goalCommand) {
+      if (
+        submittedReferences.length > 0 ||
+        documents.length > 0 ||
+        projectFiles.length > 0
+      ) {
+        setSubmitError({
+          kind: "rejected",
+          title: "Goal command cannot include context",
+          message: "Remove attachments and selected context before using /goal.",
+          retryable: false,
+        });
+        return;
+      }
+      if (!onGoalCommand) {
+        setSubmitError({
+          kind: "rejected",
+          title: "Goal commands are unavailable",
+          message: "This session does not support the /goal extension.",
+          retryable: false,
+        });
+        return;
+      }
+      setSubmitting(true);
+      setSubmitError(null);
+      setCommandFeedback(null);
+      try {
+        const feedback = await onGoalCommand(goalCommand);
+        setPrompt((current) => (current === value ? "" : current));
+        pendingCommandRef.current = null;
+        draftStore.clear(bootstrap.host.id, session.sessionId);
+        setCommandFeedback(feedback);
+      } catch (error) {
+        setSubmitError(classifySubmissionFailure(error));
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
     const commandSignature = JSON.stringify({
       text: value,
       delivery: isWorking ? activeDelivery : "submit",
@@ -3642,6 +3696,7 @@ function Composer({
     const idempotencyKey = pendingCommandRef.current.id;
     setSubmitting(true);
     setSubmitError(null);
+    setCommandFeedback(null);
     try {
       await onSubmit(
         value,
@@ -3996,6 +4051,12 @@ function Composer({
             <strong>Drop files to attach</strong>
           </div>
         ) : null}
+        {goal ? (
+          <div className="composer-goal-status">
+            <GoalBadge goal={goal} working={isWorking} compact />
+            <span>{goal.objective}</span>
+          </div>
+        ) : null}
         {attachments.length ? (
           <div className="composer-attachments" aria-label="Attached files">
             {attachments.map((attachment) => {
@@ -4320,6 +4381,11 @@ function Composer({
             ) : null}
           </div>
         </div>
+        {commandFeedback ? (
+          <p className="composer-command-feedback" role="status">
+            {commandFeedback}
+          </p>
+        ) : null}
         {submitError ? (
           <div
             id="composer-send-error"
@@ -4379,8 +4445,10 @@ const MemoizedComposer = memo(Composer, (previous, next) => {
     previousSession.contextPercent === nextSession.contextPercent &&
     previousSession.branches.head === nextSession.branches.head &&
     previousSession.items.length === nextSession.items.length &&
+    previous.goal === next.goal &&
     previous.bootstrap === next.bootstrap &&
     previous.onSubmit === next.onSubmit &&
+    previous.onGoalCommand === next.onGoalCommand &&
     previous.onInterrupt === next.onInterrupt &&
     previous.onConfigure === next.onConfigure &&
     previous.onIngestAttachment === next.onIngestAttachment &&
@@ -4400,6 +4468,8 @@ const MemoizedComposer = memo(Composer, (previous, next) => {
 export function Conversation({
   session,
   bootstrap,
+  goal,
+  onGoalCommand,
   onSubmit,
   onInterrupt,
   onConfigure,
@@ -4723,6 +4793,8 @@ export function Conversation({
         key={session.sessionId}
         session={session}
         bootstrap={bootstrap}
+        goal={goal}
+        onGoalCommand={onGoalCommand}
         onSubmit={onSubmit}
         onInterrupt={onInterrupt}
         onConfigure={onConfigure}

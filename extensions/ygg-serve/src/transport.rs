@@ -29,12 +29,13 @@ use tokio::task::JoinHandle;
 
 use crate::embedded_web::WebBundle;
 use crate::{
-    AttachmentError, FileEntryId, HostCommandEnvelope, HostService, ProjectFileSystemError,
-    ProjectId, ProtocolValidation, PtyAttachment, PtyError, PtyEvent, PtyExit, PtyManager,
-    PtyOpenRequest, SanitizedError, ServiceError, SessionCommandEnvelope, SessionCursor, SessionId,
-    SessionSupervisor, SupervisorError, TerminalConfig, MAX_ATTACHMENT_FILE_BYTES,
-    MAX_COMMAND_BYTES, MAX_DOCUMENT_FILE_BYTES, MAX_PROJECT_FILE_PATH_BYTES,
-    MAX_PROJECT_FILE_WRITE_BYTES, MAX_PTY_INPUT_BYTES, PROTOCOL_VERSION,
+    AttachmentError, FileEntryId, GoalAction, GoalStore, GoalStoreError, HostCommandEnvelope,
+    HostService, ProjectFileSystemError, ProjectId, ProtocolValidation, PtyAttachment, PtyError,
+    PtyEvent, PtyExit, PtyManager, PtyOpenRequest, SanitizedError, ServiceError,
+    SessionCommandEnvelope, SessionCursor, SessionId, SessionSupervisor, SupervisorError,
+    TerminalConfig, MAX_ATTACHMENT_FILE_BYTES, MAX_COMMAND_BYTES, MAX_DOCUMENT_FILE_BYTES,
+    MAX_PROJECT_FILE_PATH_BYTES, MAX_PROJECT_FILE_WRITE_BYTES, MAX_PTY_INPUT_BYTES,
+    PROTOCOL_VERSION,
 };
 
 const MAX_QUERY_BYTES: usize = 4 * 1024;
@@ -61,6 +62,8 @@ pub struct LoopbackConfig {
     /// Optional local terminal configuration. Omit it when process execution
     /// is disabled by the host's sandbox policy.
     pub terminal: Option<TerminalConfig>,
+    /// Private root directory for persistent per-session goals.
+    pub goal_store_root: PathBuf,
 }
 
 /// Transport startup or task failure.
@@ -75,7 +78,10 @@ pub enum TransportError {
     /// The loopback listener could not be created.
     #[error("loopback listener failed")]
     Io(#[from] std::io::Error),
-    /// The server task ended unexpectedly.
+    /// Goal storage could not be initialized.
+    #[error("goal storage startup failed")]
+    Goal(#[from] GoalStoreError),
+    /// The loopback server task ended unexpectedly.
     #[error("loopback server task failed")]
     Task(#[from] tokio::task::JoinError),
 }
@@ -104,6 +110,7 @@ impl LoopbackServer {
             None => WebBundle::embedded()?,
         };
         let terminal = config.terminal.map(PtyManager::new).transpose()?;
+        let goal_store = GoalStore::open(&config.goal_store_root)?;
         let listener = TcpListener::bind(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             config.port,
@@ -126,6 +133,7 @@ impl LoopbackServer {
             attachment_uploads: Arc::new(Semaphore::new(MAX_CONCURRENT_ATTACHMENT_UPLOADS)),
             session_exports: Arc::new(Semaphore::new(MAX_CONCURRENT_SESSION_EXPORTS)),
             terminal: terminal.clone(),
+            goal_store,
             web_bundle,
         });
         let router = build_router(state);
@@ -214,6 +222,7 @@ struct TransportState<H: HostService> {
     attachment_uploads: Arc<Semaphore>,
     session_exports: Arc<Semaphore>,
     terminal: Option<PtyManager>,
+    goal_store: GoalStore,
     web_bundle: WebBundle,
 }
 
@@ -456,6 +465,17 @@ enum TerminalServerMessage {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GoalRequest {
+    #[serde(default)]
+    objective: Option<String>,
+    #[serde(default)]
+    turn_budget: Option<u32>,
+    #[serde(default)]
+    action: Option<GoalAction>,
+}
+
 fn default_file_list_limit() -> usize {
     200
 }
@@ -481,6 +501,12 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
         .route(
             "/api/v1/sessions/{session_id}/commands",
             get(command_discovery::<H>),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/goal",
+            get(session_goal::<H>)
+                .post(update_goal::<H>)
+                .layer(DefaultBodyLimit::max(MAX_COMMAND_BYTES)),
         )
         .route(
             "/api/v1/sessions/{session_id}/replay",
@@ -1394,6 +1420,61 @@ async fn command_discovery<H: HostService>(
     }
 }
 
+async fn session_goal<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_session_id): Path<String>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    let session_id = match SessionId::new(raw_session_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    if let Err(error) = state.supervisor.session_view(&session_id).await {
+        return supervisor_error_response(error);
+    }
+    match state.goal_store.get(&session_id) {
+        Ok(goal) => Json(goal).into_response(),
+        Err(error) => goal_error_response(error),
+    }
+}
+
+async fn update_goal<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    Path(raw_session_id): Path<String>,
+    payload: Result<Json<GoalRequest>, JsonRejection>,
+) -> Response {
+    if !state.rate_limiter.admit() {
+        return rate_limited();
+    }
+    let session_id = match SessionId::new(raw_session_id) {
+        Ok(id) => id,
+        Err(_) => return invalid_request(),
+    };
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(_) => return invalid_request(),
+    };
+    if let Err(error) = state.supervisor.session_view(&session_id).await {
+        return supervisor_error_response(error);
+    }
+    let result = match (request.objective, request.action) {
+        (Some(objective), None) => state
+            .goal_store
+            .set(&session_id, &objective, request.turn_budget)
+            .map(Some),
+        (None, Some(action)) if request.turn_budget.is_none() => {
+            state.goal_store.apply(&session_id, action)
+        }
+        _ => return invalid_request(),
+    };
+    match result {
+        Ok(goal) => Json(goal).into_response(),
+        Err(error) => goal_error_response(error),
+    }
+}
+
 async fn session_replay<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
     Path(raw_session_id): Path<String>,
@@ -2068,6 +2149,45 @@ fn project_file_system_error_response(error: ProjectFileSystemError) -> Response
     }
 }
 
+fn goal_error_response(error: GoalStoreError) -> Response {
+    match error {
+        GoalStoreError::InvalidObjective => error_response(
+            StatusCode::BAD_REQUEST,
+            SanitizedError::public(
+                crate::ErrorCode::InvalidGoal,
+                "The goal objective is invalid.",
+            ),
+        ),
+        GoalStoreError::InvalidTurnBudget => error_response(
+            StatusCode::BAD_REQUEST,
+            SanitizedError::public(
+                crate::ErrorCode::InvalidGoal,
+                "The goal turn budget is invalid.",
+            ),
+        ),
+        GoalStoreError::InvalidTransition => error_response(
+            StatusCode::BAD_REQUEST,
+            SanitizedError::public(
+                crate::ErrorCode::InvalidGoal,
+                "The goal cannot be changed from its current status.",
+            ),
+        ),
+        GoalStoreError::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            SanitizedError::public(
+                crate::ErrorCode::NotFound,
+                "The requested goal was not be found.",
+            ),
+        ),
+        GoalStoreError::CorruptState
+        | GoalStoreError::UnsafePath
+        | GoalStoreError::Storage(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SanitizedError::internal(),
+        ),
+    }
+}
+
 fn service_error_response(error: ServiceError) -> Response {
     match error {
         ServiceError::NotFound => error_response(
@@ -2382,6 +2502,7 @@ mod tests {
         project_file_browser: bool,
         project_file_write: bool,
         project_file_writes: Arc<Mutex<Vec<ProjectFileWriteRecord>>>,
+        _goal_root: Arc<tempfile::TempDir>,
         export_started: Arc<Notify>,
         export_release: Arc<Notify>,
     }
@@ -2390,6 +2511,7 @@ mod tests {
         fn new() -> Self {
             let attachment_root = Arc::new(tempfile::tempdir().unwrap());
             let attachments = AttachmentStore::open(attachment_root.path()).unwrap();
+            let goal_root = Arc::new(tempfile::tempdir().unwrap());
             Self {
                 creates: Arc::new(AtomicUsize::new(0)),
                 opens: Arc::new(AtomicUsize::new(0)),
@@ -2400,6 +2522,7 @@ mod tests {
                 project_file_browser: false,
                 project_file_write: false,
                 project_file_writes: Arc::new(Mutex::new(Vec::new())),
+                _goal_root: goal_root,
                 export_started: Arc::new(Notify::new()),
                 export_release: Arc::new(Notify::new()),
             }
@@ -3097,7 +3220,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_socket_authenticates_replays_and_stops_with_the_server() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
         let workspace = tempfile::tempdir().unwrap();
         let server = LoopbackServer::start(
             supervisor,
@@ -3108,6 +3231,7 @@ mod tests {
                     cwd: workspace.path().to_path_buf(),
                     shell: Some(PathBuf::from("/bin/sh")),
                 }),
+                goal_store_root: host._goal_root.path().join("goals"),
             },
         )
         .await
@@ -3272,6 +3396,7 @@ mod tests {
                 port: 0,
                 web_root: None,
                 terminal: None,
+                goal_store_root: host._goal_root.path().join("goals"),
             },
         )
         .await
@@ -3359,13 +3484,14 @@ mod tests {
     #[tokio::test]
     async fn usage_transport_is_authenticated_and_validates_periods() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
         let server = LoopbackServer::start(
             supervisor,
             LoopbackConfig {
                 port: 0,
                 web_root: None,
                 terminal: None,
+                goal_store_root: host._goal_root.path().join("goals"),
             },
         )
         .await
@@ -3454,6 +3580,7 @@ mod tests {
                 port: 0,
                 web_root: None,
                 terminal: None,
+                goal_store_root: host._goal_root.path().join("goals"),
             },
         )
         .await
@@ -3588,13 +3715,14 @@ mod tests {
     #[tokio::test]
     async fn project_file_transport_honors_host_capabilities() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
         let server = LoopbackServer::start(
             supervisor,
             LoopbackConfig {
                 port: 0,
                 web_root: None,
                 terminal: None,
+                goal_store_root: host._goal_root.path().join("goals"),
             },
         )
         .await
@@ -3618,15 +3746,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loopback_transport_rejects_cross_origin_and_oversized_requests() {
+    async fn goal_transport_supports_lifecycle_and_restart_persistence() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let session_id = host.insert_existing("goal-transport-session");
+        let goal_store_root = host._goal_root.path().join("goals");
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig::default(),
+        ));
+        let server = LoopbackServer::start(
+            Arc::clone(&supervisor),
+            LoopbackConfig {
+                port: 0,
+                web_root: None,
+                terminal: None,
+                goal_store_root: goal_store_root.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let address = server.address();
+        let exchanged = request(address, exchange_request(address, &server.launch_token)).await;
+        let cookie = response_header(&exchanged, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let path = format!("/api/v1/sessions/{}/goal", session_id.as_str());
+        let created = request(
+            address,
+            authenticated_json_post_request(
+                address,
+                &path,
+                &cookie,
+                r#"{"objective":"Ship the README","turnBudget":10}"#,
+            ),
+        )
+        .await;
+        assert!(created.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&created)["objective"], "Ship the README");
+        assert_eq!(response_json(&created)["status"], "active");
+        assert_eq!(response_json(&created)["turnBudget"], 10);
+        server.shutdown().await.unwrap();
+
         let server = LoopbackServer::start(
             supervisor,
             LoopbackConfig {
                 port: 0,
                 web_root: None,
                 terminal: None,
+                goal_store_root,
+            },
+        )
+        .await
+        .unwrap();
+        let address = server.address();
+        let exchanged = request(address, exchange_request(address, &server.launch_token)).await;
+        let cookie = response_header(&exchanged, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let restored = request(
+            address,
+            authenticated_get_request(address, &path, cookie),
+        )
+        .await;
+        assert!(restored.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&restored)["objective"], "Ship the README");
+
+        let paused = request(
+            address,
+            authenticated_json_post_request(address, &path, cookie, r#"{"action":"pause"}"#),
+        )
+        .await;
+        assert!(paused.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&paused)["status"], "paused");
+        let resumed = request(
+            address,
+            authenticated_json_post_request(address, &path, cookie, r#"{"action":"resume"}"#),
+        )
+        .await;
+        assert!(resumed.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&resumed)["status"], "active");
+        let cleared = request(
+            address,
+            authenticated_json_post_request(address, &path, cookie, r#"{"action":"clear"}"#),
+        )
+        .await;
+        assert!(cleared.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&cleared), serde_json::Value::Null);
+        let after_clear = request(
+            address,
+            authenticated_get_request(address, &path, cookie),
+        )
+        .await;
+        assert!(after_clear.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_json(&after_clear), serde_json::Value::Null);
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_transport_rejects_cross_origin_and_oversized_requests() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
+        let server = LoopbackServer::start(
+            supervisor,
+            LoopbackConfig {
+                port: 0,
+                web_root: None,
+                terminal: None,
+                goal_store_root: host._goal_root.path().join("goals"),
             },
         )
         .await
@@ -3755,13 +3986,14 @@ mod tests {
     #[tokio::test]
     async fn attachment_transport_is_authenticated_bounded_and_path_free() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
         let server = LoopbackServer::start(
             supervisor,
             LoopbackConfig {
                 port: 0,
                 web_root: None,
                 terminal: None,
+                goal_store_root: host._goal_root.path().join("goals"),
             },
         )
         .await
@@ -3919,6 +4151,7 @@ mod tests {
                 port: 0,
                 web_root: None,
                 terminal: None,
+                goal_store_root: host._goal_root.path().join("goals"),
             },
         )
         .await
@@ -4030,13 +4263,14 @@ mod tests {
     #[tokio::test]
     async fn opaque_resource_transport_requires_auth_and_never_interprets_handles() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
         let server = LoopbackServer::start(
             supervisor,
             LoopbackConfig {
                 port: 0,
                 web_root: None,
                 terminal: None,
+                goal_store_root: host._goal_root.path().join("goals"),
             },
         )
         .await
