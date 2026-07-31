@@ -28,10 +28,24 @@ function renderFilesPanel(
   };
   const read: ProjectFileRead = {
     path: "README.md",
-    content: "# Fixture\n",
+    content: `# Fixture
+
+**Bold** and [a link](https://example.com).
+
+- one
+- two
+
+| Name | Value |
+| --- | --- |
+| Ygg | Serve |
+
+\`\`\`ts
+const answer = 42;
+\`\`\`
+`,
     startLine: 1,
-    endLine: 1,
-    lineCount: 1,
+    endLine: 14,
+    lineCount: 14,
     truncated: false,
     sha256: version,
   };
@@ -64,13 +78,79 @@ function renderFilesPanel(
 afterEach(cleanup);
 
 describe("FilesPanel", () => {
-  it("loads a trusted tree, tracks a dirty editor, and saves an optimistic write", async () => {
+  it("renders Markdown in a rich preview and preserves the editable save flow", async () => {
     const { getTree, readFile, writeFile } = renderFilesPanel();
 
     fireEvent.click(await screen.findByRole("button", { name: /README\.md/ }));
+    expect(await screen.findByRole("heading", { name: "Fixture" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "a link" })).toHaveAttribute(
+      "href",
+      "https://example.com",
+    );
+    expect(screen.getByRole("table")).toBeTruthy();
+    expect(screen.getByText("const answer = 42;")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy file" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Download file" })).toBeTruthy();
+
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const originalClipboard = navigator.clipboard;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Copy file" }));
+      await waitFor(() => {
+        expect(writeText).toHaveBeenCalledWith(expect.stringContaining("# Fixture"));
+      });
+    } finally {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: originalClipboard,
+      });
+    }
+
+    const originalCreateObjectURL = URL.createObjectURL;
+    const originalRevokeObjectURL = URL.revokeObjectURL;
+    const createObjectURL = vi.fn(() => "blob:fixture");
+    const revokeObjectURL = vi.fn();
+    const anchorClick = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+    Object.defineProperty(URL, "createObjectURL", {
+      configurable: true,
+      value: createObjectURL,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      configurable: true,
+      value: revokeObjectURL,
+    });
+    try {
+      fireEvent.click(screen.getByRole("button", { name: "Download file" }));
+      expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+      expect(anchorClick).toHaveBeenCalledOnce();
+      await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:fixture"));
+    } finally {
+      Object.defineProperty(URL, "createObjectURL", {
+        configurable: true,
+        value: originalCreateObjectURL,
+      });
+      Object.defineProperty(URL, "revokeObjectURL", {
+        configurable: true,
+        value: originalRevokeObjectURL,
+      });
+      anchorClick.mockRestore();
+    }
+
+    expect(
+      screen.queryByRole("textbox", { name: "Contents of README.md" }),
+    ).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit Markdown" }));
     const editor = await screen.findByRole("textbox", {
       name: "Contents of README.md",
     });
+    expect(document.querySelector(".files-code-editor.is-numbered")).toBeTruthy();
     fireEvent.change(editor, { target: { value: "# Updated fixture\n" } });
 
     expect(screen.getByText("Unsaved")).toBeTruthy();
@@ -100,6 +180,8 @@ describe("FilesPanel", () => {
     renderFilesPanel({ writeFile });
 
     fireEvent.click(await screen.findByRole("button", { name: /README\.md/ }));
+    await screen.findByRole("heading", { name: "Fixture" });
+    fireEvent.click(screen.getByRole("button", { name: "Edit Markdown" }));
     const editor = await screen.findByRole("textbox", {
       name: "Contents of README.md",
     });

@@ -16,7 +16,6 @@ import type {
   SessionSnapshot,
   SourceRef,
 } from "../protocol";
-import { CompletionReview } from "./CompletionReview";
 
 interface ActivityRailProps {
   session: SessionSnapshot;
@@ -64,7 +63,6 @@ function ActivityRailView({
 }: ActivityRailProps) {
   const railRef = useRef<HTMLElement>(null);
   const [openSections, setOpenSections] = useState({
-    review: true,
     commands: false,
     progress: true,
     artifacts: true,
@@ -112,23 +110,12 @@ function ActivityRailView({
   const completeCount = session.progress.filter(
     (step) => step.status === "completed",
   ).length;
-  const latestOutcome = [...session.items]
-    .reverse()
-    .find((item) => item.kind === "run_outcome");
-  const actions = session.items.filter((item): item is ActionItem => {
-    if (item.kind !== "action" || !latestOutcome) return false;
-    return latestOutcome.runId
-      ? item.runId === latestOutcome.runId
-      : !item.runId && item.turnId === latestOutcome.turnId;
-  });
-  const outputs = new Map(session.outputs.map((output) => [output.id, output]));
   const commands = session.items.filter(
     (item): item is ActionItem =>
       item.kind === "action" && item.actionKind === "command",
   );
   const hasActivity = Boolean(
-    latestOutcome ||
-      commands.length ||
+    commands.length ||
       session.progress.length ||
       (resourcesAvailable && (session.outputs.length || session.sources.length)),
   );
@@ -154,34 +141,6 @@ function ActivityRailView({
             <TerminalSquare aria-hidden="true" />
             <p>No activity yet. The agent&apos;s work will appear here.</p>
           </div>
-        ) : null}
-        {latestOutcome ? (
-          <section className="rail-section" aria-labelledby="review-heading">
-            <details
-              open={openSections.review}
-              onToggle={(event) => {
-                const open = event.currentTarget.open;
-                setOpenSections((current) => ({
-                  ...current,
-                  review: open,
-                }));
-              }}
-            >
-              <summary>
-                <span id="review-heading">Review</span>
-                <em>{latestOutcome.review.evidenceCoverage}</em>
-                <ChevronDown aria-hidden="true" />
-              </summary>
-              <CompletionReview
-                outcome={latestOutcome}
-                actions={actions}
-                outputs={outputs}
-                onOpenOutput={onOpenOutput}
-                onOpenResource={onOpenResource}
-                compact
-              />
-            </details>
-          </section>
         ) : null}
 
         {commands.length ? (

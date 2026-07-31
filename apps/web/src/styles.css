@@ -1,16 +1,32 @@
 @font-face {
   font-family: "Local Grotesk";
-  src: url("./assets/fonts/LocalGrotesk-Variable.woff2") format("woff2");
+  src: url("./assets/fonts/LocalGrotesk-Regular.woff2") format("woff2");
   font-style: normal;
-  font-weight: 400 700;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Local Grotesk";
+  src: url("./assets/fonts/LocalGrotesk-Bold.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 700;
   font-display: swap;
 }
 
 @font-face {
   font-family: "Local Mono";
-  src: url("./assets/fonts/LocalMono-Variable.woff2") format("woff2");
+  src: url("./assets/fonts/LocalMono-Regular.woff2") format("woff2");
   font-style: normal;
-  font-weight: 400 700;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Local Mono";
+  src: url("./assets/fonts/LocalMono-Bold.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 700;
   font-display: swap;
 }
 
@@ -9831,29 +9847,130 @@ body {
   font-weight: 600;
 }
 
-.files-editor-text {
-  width: 100%;
+.files-markdown-viewer {
   min-width: 0;
   min-height: 0;
   flex: 1;
+  overflow: auto;
+  padding: 24px clamp(16px, 4vw, 56px) 40px;
+  color: var(--viewer-ink);
+  background: var(--viewer-paper);
+}
+
+.files-markdown-viewer > .markdown-body {
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+.files-markdown-viewer .markdown-body h1 {
+  margin-top: 0;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.files-markdown-viewer .markdown-body h2,
+.files-markdown-viewer .markdown-body h3,
+.files-markdown-viewer .markdown-body h4 {
+  font-weight: 620;
+}
+
+.files-code-editor {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--viewer-ink);
+  background: transparent;
+  --files-syntax-comment: #9da8b5;
+  --files-syntax-keyword: #f29e74;
+  --files-syntax-type: #76c7c0;
+  --files-syntax-function: #a8c7fa;
+  --files-syntax-variable: #d6dee8;
+  --files-syntax-string: #a8d279;
+  --files-syntax-number: #d6a6e8;
+  --files-syntax-operator: #aab4c0;
+  --files-syntax-punctuation: #aab4c0;
+  --files-syntax-meta: #c6a0f6;
+  --files-syntax-invalid: #ff7078;
+}
+
+.files-code-highlight {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.files-code-highlight .cm-editor {
+  height: 100%;
+  color: inherit;
+  background: transparent;
+  font-family: var(--mono-family);
+  font-size: var(--font-body);
+}
+
+.files-code-editor.is-numbered .files-code-highlight .cm-gutters {
+  border-right: 1px solid var(--line);
+  color: var(--text-faint);
+  background: transparent;
+  font-family: var(--mono-family);
+}
+
+.files-code-editor.is-numbered .files-code-highlight .cm-gutterElement {
+  min-width: 36px;
+  padding: 0 8px 0 0;
+  text-align: right;
+}
+
+.files-code-highlight .cm-scroller {
+  overflow: hidden;
+  font-family: inherit;
+  line-height: 1.62;
+}
+
+.files-code-highlight .cm-content {
+  min-height: 100%;
+  padding: 16px 18px 32px;
+  tab-size: 2;
+}
+
+.files-code-highlight .cm-line {
+  padding: 0;
+}
+
+.files-editor-input {
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   resize: none;
   padding: 16px 18px 32px;
   border: 0;
   outline: 0;
-  color: var(--viewer-ink);
+  color: transparent;
   background: transparent;
+  caret-color: var(--focus);
   font-family: var(--mono-family);
   font-size: var(--font-body);
   line-height: 1.62;
   tab-size: 2;
+  text-shadow: none;
   white-space: pre;
+  overflow-wrap: normal;
 }
 
-.files-editor-text:read-only {
-  color: color-mix(in srgb, var(--viewer-ink) 82%, var(--text-faint));
+.files-code-editor.is-numbered .files-editor-input {
+  padding-left: 58px;
 }
 
-.files-editor-text:focus-visible {
+.files-editor-input::selection {
+  color: transparent;
+  background: color-mix(in srgb, var(--focus) 30%, transparent);
+}
+
+.files-editor-input:focus-visible {
   outline: inset 2px solid color-mix(in srgb, var(--focus) 62%, transparent);
   outline-offset: -2px;
 }
@@ -10012,9 +10129,18 @@ body {
     padding-inline: 10px;
   }
 
-  .files-editor-text {
+  .files-markdown-viewer {
+    padding: 16px 12px 28px;
+  }
+
+  .files-code-highlight .cm-content,
+  .files-editor-input {
     padding: 12px;
     font-size: var(--font-meta);
+  }
+
+  .files-code-editor.is-numbered .files-editor-input {
+    padding-left: 52px;
   }
 
   .files-conflict,

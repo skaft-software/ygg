@@ -1,6 +1,10 @@
 import {
+  Check,
   ChevronDown,
   ChevronRight,
+  Copy,
+  Download,
+  Eye,
   FileCode2,
   Folder,
   FolderOpen,
@@ -27,6 +31,9 @@ import type {
   ProjectSummary,
 } from "../protocol";
 import { ProjectFileConflictError } from "../transport";
+import MarkdownMessage from "./MarkdownMessage";
+import { FileCodeEditor } from "./FileCodeEditor";
+import { isMarkdownPath, languageNameForPath } from "./fileLanguage";
 
 interface DirectoryState {
   tree?: ProjectFileTree;
@@ -67,6 +74,46 @@ function fileSize(size: number): string {
   if (size < 1_024) return `${size} B`;
   if (size < 1_024 * 1_024) return `${Math.ceil(size / 1_024)} KB`;
   return `${(size / (1_024 * 1_024)).toFixed(1)} MB`;
+}
+
+async function copyText(text: string): Promise<void> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch {
+    // Fall through to the legacy selection-based copy path.
+  }
+
+  const input = document.createElement("textarea");
+  input.value = text;
+  input.setAttribute("readonly", "true");
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.appendChild(input);
+  input.select();
+  let copied: boolean;
+  try {
+    copied =
+      typeof document.execCommand === "function" && document.execCommand("copy");
+  } finally {
+    input.remove();
+  }
+  if (!copied) throw new Error("clipboard unavailable");
+}
+
+function downloadText(path: string, content: string): void {
+  const url = URL.createObjectURL(
+    new Blob([content], { type: "text/plain;charset=utf-8" }),
+  );
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = path.slice(path.lastIndexOf("/") + 1) || "file.txt";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function selectableProjects(projects: ProjectSummary[]): ProjectSummary[] {
@@ -147,6 +194,12 @@ function ProjectFilesWorkspace({
   );
   const [selectedFile, setSelectedFile] = useState<ProjectFileRead | null>(null);
   const [draft, setDraft] = useState("");
+  const [markdownMode, setMarkdownMode] = useState<"preview" | "source">(
+    "source",
+  );
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "error">(
+    "idle",
+  );
   const [fileLoading, setFileLoading] = useState(false);
   const [fileError, setFileError] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -169,6 +222,21 @@ function ProjectFilesWorkspace({
   const selectedProject = availableProjects.find(
     (project) => project.id === projectId,
   );
+  const markdownFile = selectedFile !== null && isMarkdownPath(selectedFile.path);
+
+  const copyFile = useCallback(async () => {
+    try {
+      await copyText(draft);
+      setCopyState("copied");
+      window.setTimeout(() => setCopyState("idle"), 1_500);
+    } catch {
+      setCopyState("error");
+    }
+  }, [draft]);
+
+  const downloadFile = useCallback(() => {
+    if (selectedPath) downloadText(selectedPath, draft);
+  }, [draft, selectedPath]);
 
   const loadDirectory = useCallback(
     async (path: string) => {
@@ -219,6 +287,8 @@ function ProjectFilesWorkspace({
         }
         setSelectedFile(file);
         setDraft(file.content);
+        setCopyState("idle");
+        setMarkdownMode(isMarkdownPath(file.path) ? "preview" : "source");
       } catch {
         if (fileRequestRef.current === request) {
           setFileError(true);
@@ -589,12 +659,63 @@ function ProjectFilesWorkspace({
                 <div>
                   <strong>{selectedFile.path}</strong>
                   <span>
-                    {selectedFile.lineCount} {selectedFile.lineCount === 1 ? "line" : "lines"}
+                    {languageNameForPath(selectedFile.path)} · {selectedFile.lineCount}{" "}
+                    {selectedFile.lineCount === 1 ? "line" : "lines"}
                     {selectedFile.truncated ? " · partial view" : ""}
                   </span>
                 </div>
                 <div className="files-editor-actions">
                   {dirty ? <span className="files-dirty">Unsaved</span> : null}
+                  {markdownFile ? (
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      aria-label={
+                        markdownMode === "preview"
+                          ? "Edit Markdown"
+                          : "Preview Markdown"
+                      }
+                      onClick={() =>
+                        setMarkdownMode((mode) =>
+                          mode === "preview" ? "source" : "preview",
+                        )
+                      }
+                    >
+                      {markdownMode === "preview" ? (
+                        <FileCode2 aria-hidden="true" />
+                      ) : (
+                        <Eye aria-hidden="true" />
+                      )}
+                      {markdownMode === "preview" ? "Edit Markdown" : "Preview Markdown"}
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    aria-label="Copy file"
+                    title={copyState === "error" ? "Copy failed" : "Copy file"}
+                    onClick={() => void copyFile()}
+                  >
+                    {copyState === "copied" ? (
+                      <Check aria-hidden="true" />
+                    ) : (
+                      <Copy aria-hidden="true" />
+                    )}
+                    {copyState === "copied"
+                      ? "Copied"
+                      : copyState === "error"
+                        ? "Copy failed"
+                        : "Copy"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    aria-label="Download file"
+                    onClick={downloadFile}
+                  >
+                    <Download aria-hidden="true" />
+                    Download
+                  </button>
                   <button
                     type="button"
                     className="secondary-button"
@@ -651,20 +772,27 @@ function ProjectFilesWorkspace({
                   </button>
                 </div>
               ) : null}
-              <textarea
-                className="files-editor-text"
-                aria-label={`Contents of ${selectedFile.path}`}
-                value={draft}
-                readOnly={
-                  !writeAvailable || selectedFile.truncated || !selectedFile.sha256
-                }
-                onChange={(event) => {
-                  setDraft(event.target.value);
-                  setSaveError(false);
-                  setConflict(false);
-                }}
-                spellCheck={false}
-              />
+              {markdownFile && markdownMode === "preview" ? (
+                <div
+                  className="files-markdown-viewer"
+                  aria-label="Rendered Markdown"
+                >
+                  <MarkdownMessage content={draft} />
+                </div>
+              ) : (
+                <FileCodeEditor
+                  path={selectedFile.path}
+                  value={draft}
+                  readOnly={!writeAvailable || selectedFile.truncated || !selectedFile.sha256}
+                  showLineNumbers={markdownFile}
+                  onChange={(value) => {
+                    setDraft(value);
+                    setCopyState("idle");
+                    setSaveError(false);
+                    setConflict(false);
+                  }}
+                />
+              )}
             </>
           )}
         </section>

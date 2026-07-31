@@ -70,7 +70,6 @@ import type {
   TrustedFileRead,
   TrustedFileSearchResult,
 } from "../protocol";
-import { CompletionReview } from "./CompletionReview";
 import {
   ConversationBranchDialog,
   type ConversationBranchAction,
@@ -1595,15 +1594,8 @@ const TranscriptItemView = memo(function TranscriptItemView({
       );
 
     case "run_outcome":
-      return (
-        <CompletionReview
-          outcome={item}
-          actions={[]}
-          outputs={availableOutputs}
-          onOpenOutput={onOpenOutput}
-          onOpenResource={onOpenResource}
-        />
-      );
+      return null;
+
   }
 });
 
@@ -1792,28 +1784,8 @@ function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
   return rows;
 }
 
-function hasReviewDetails(
-  outcome: Extract<TranscriptItem, { kind: "run_outcome" }> | undefined,
-): boolean {
-  if (!outcome) return false;
-  const { review } = outcome;
-  return (
-    outcome.outcome !== "done" ||
-    review.evidenceCoverage !== "none" ||
-    review.changedFileItemIds.length > 0 ||
-    review.verificationActionItemIds.length > 0 ||
-    review.failedActionItemIds.length > 0 ||
-    review.warningActionItemIds.length > 0 ||
-    review.sourceIds.length > 0 ||
-    review.outputIds.length > 0 ||
-    review.testResults.length > 0 ||
-    review.openQuestions.length > 0
-  );
-}
-
 interface WorkGroupProps {
   row: Extract<TranscriptRow, { kind: "work" }>;
-  reviewActions: readonly ActionItem[];
   initialItemIds: ReadonlySet<string>;
   onResolveApproval: ConversationProps["onResolveApproval"];
   onResolveUserInput: ConversationProps["onResolveUserInput"];
@@ -1836,7 +1808,6 @@ interface WorkGroupProps {
 
 const WorkGroup = memo(function WorkGroup({
   row,
-  reviewActions,
   initialItemIds,
   onResolveApproval,
   onResolveUserInput,
@@ -1860,7 +1831,6 @@ const WorkGroup = memo(function WorkGroup({
     0,
   );
   const duration = row.outcome?.durationMs || itemDuration;
-  const showReview = hasReviewDetails(row.outcome);
   const failedActionCount = row.items.filter(
     (item) => item.kind === "action" && item.status === "failed",
   ).length;
@@ -1875,78 +1845,10 @@ const WorkGroup = memo(function WorkGroup({
     .join(" · ");
   const label = live ? "Working" : historyLabel;
   const open = row.items.length > 0 && userOpen;
-  const changedActions = row.outcome
-    ? row.outcome.review.changedFileItemIds
-        .map((id) => reviewActions.find((action) => action.id === id))
-        .filter((action): action is ActionItem => Boolean(action))
-    : [];
-  const changedPaths = new Set(
-    changedActions.flatMap((action) =>
-      action.changedPaths.length
-        ? action.changedPaths
-        : action.target
-          ? [action.target]
-          : [],
-    ),
-  );
-  const changeAdditions = changedActions.reduce(
-    (total, action) => total + (action.additions ?? 0),
-    0,
-  );
-  const changeDeletions = changedActions.reduce(
-    (total, action) => total + (action.deletions ?? 0),
-    0,
-  );
   const directAction =
     !live && row.items.length === 1 && row.items[0]?.kind === "action"
       ? row.items[0]
       : undefined;
-  const reviewLabel = changedPaths.size
-    ? `${changedPaths.size} ${changedPaths.size === 1 ? "file" : "files"} changed`
-    : row.outcome?.outcome === "failed"
-      ? "Failure details"
-      : row.outcome?.outcome === "stopped"
-        ? "Stopped run details"
-        : row.outcome?.review.warningActionItemIds.length
-          ? "Warnings"
-          : row.outcome?.review.verificationActionItemIds.length ||
-              row.outcome?.review.testResults.length
-            ? "Verification details"
-            : row.outcome?.review.openQuestions.length
-              ? "Open questions"
-              : "Evidence details";
-  const reviewDisclosure =
-    row.outcome && showReview ? (
-      <details className="completion-review-disclosure">
-        <summary>
-          {changedPaths.size ? (
-            <FileDiff aria-hidden="true" />
-          ) : row.outcome.outcome === "failed" ||
-            row.outcome.review.warningActionItemIds.length ||
-            row.outcome.review.openQuestions.length ? (
-            <AlertTriangle aria-hidden="true" />
-          ) : (
-            <ShieldCheck aria-hidden="true" />
-          )}
-          <span>{reviewLabel}</span>
-          {changedActions.length ? (
-            <span className="diff-count" aria-label="Lines changed">
-              <em>+{changeAdditions}</em>
-              <b>−{changeDeletions}</b>
-            </span>
-          ) : null}
-          <ChevronDown className="disclosure-chevron" aria-hidden="true" />
-        </summary>
-        <CompletionReview
-          outcome={row.outcome}
-          actions={reviewActions}
-          outputs={availableOutputs}
-          onOpenOutput={onOpenOutput}
-          onOpenResource={onOpenResource}
-          compact
-        />
-      </details>
-    ) : null;
 
   if (directAction) {
     return (
@@ -1973,7 +1875,6 @@ const WorkGroup = memo(function WorkGroup({
           attachmentContentUrl={attachmentContentUrl}
           onPreviewAttachment={onPreviewAttachment}
         />
-        {reviewDisclosure}
       </section>
     );
   }
@@ -2067,14 +1968,12 @@ const WorkGroup = memo(function WorkGroup({
           </div>
         </>
       ) : null}
-      {reviewDisclosure}
     </section>
   );
 }, (previous, next) => {
   if (
     previous.row.id !== next.row.id ||
     previous.row.outcome !== next.row.outcome ||
-    previous.reviewActions !== next.reviewActions ||
     previous.row.items.length !== next.row.items.length
   ) {
     return false;
@@ -4559,17 +4458,6 @@ export function Conversation({
     return byOrigin;
   }, [availableSources]);
   const rows = useMemo(() => transcriptRows(session.items), [session.items]);
-  const actionsByRun = useMemo(() => {
-    const byRun = new Map<string, ActionItem[]>();
-    for (const item of session.items) {
-      if (item.kind !== "action") continue;
-      const identity = workIdentity(item);
-      const current = byRun.get(identity) ?? [];
-      current.push(item);
-      byRun.set(identity, current);
-    }
-    return byRun;
-  }, [session.items]);
   const previewAttachment = useCallback(
     (source: string, name: string, trigger: HTMLElement) => {
       setAttachmentPreview({ source, name, trigger });
@@ -4752,14 +4640,6 @@ export function Conversation({
                 <WorkGroup
                   key={row.id}
                   row={row}
-                  reviewActions={
-                    row.outcome
-                      ? (actionsByRun.get(workIdentity(row.outcome)) ?? [])
-                      : row.items.filter(
-                          (item): item is ActionItem =>
-                            item.kind === "action",
-                        )
-                  }
                   initialItemIds={initialItemIds}
                   sessionId={session.sessionId}
                   resourceContentUrl={resourceContentUrl}
