@@ -110,6 +110,33 @@ pub enum GitWorktreeState {
     Unknown,
 }
 
+/// Safe classification for one changed path in a Git worktree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitFileStatusKind {
+    /// A tracked file changed in the index or worktree.
+    Modified,
+    /// A new path was added to the index.
+    Added,
+    /// A tracked path was removed from the worktree or index.
+    Deleted,
+    /// A path was renamed or copied to its current location.
+    Renamed,
+    /// A path is not tracked by Git.
+    Untracked,
+}
+
+/// Safe metadata for one changed Git path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitFileStatus {
+    /// Coarse status used by the project-file tree.
+    pub kind: GitFileStatusKind,
+    /// Previous project-relative path for a rename, when Git reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+}
+
 /// Safe branch classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -447,25 +474,28 @@ fn refresh_git(root: &Path, timeout: Duration) -> GitRepositoryContext {
         ),
         GitRunResult::Finished(output) => {
             match parse_git_status(&output.stdout, output.truncated) {
-                Some(parsed) => GitRepositoryContext {
-                    source: RepositoryStateSource::GitStatusPorcelainV2,
-                    refresh: refresh_status(
-                        started,
-                        if output.truncated {
-                            ContextRefreshState::Partial
-                        } else {
-                            ContextRefreshState::Current
-                        },
-                        output.truncated,
-                    ),
-                    worktree: GitWorktreeState::Present,
-                    head: parsed.head,
-                    branch_state: parsed.branch_state,
-                    branch: parsed.branch,
-                    dirty: Some(parsed.dirty),
-                    ahead: parsed.ahead,
-                    behind: parsed.behind,
-                },
+                Some(parsed) => {
+                    let partial = output.truncated || parsed.file_statuses_truncated;
+                    GitRepositoryContext {
+                        source: RepositoryStateSource::GitStatusPorcelainV2,
+                        refresh: refresh_status(
+                            started,
+                            if partial {
+                                ContextRefreshState::Partial
+                            } else {
+                                ContextRefreshState::Current
+                            },
+                            partial,
+                        ),
+                        worktree: GitWorktreeState::Present,
+                        head: parsed.head,
+                        branch_state: parsed.branch_state,
+                        branch: parsed.branch,
+                        dirty: Some(parsed.dirty),
+                        ahead: parsed.ahead,
+                        behind: parsed.behind,
+                    }
+                }
                 None => unavailable_git(
                     started,
                     ContextRefreshState::Unavailable,
@@ -474,6 +504,83 @@ fn refresh_git(root: &Path, timeout: Duration) -> GitRepositoryContext {
             }
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GitFileStatusSnapshot {
+    pub(crate) entries: Vec<GitFileStatusEntry>,
+    pub(crate) truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GitFileStatusEntry {
+    pub(crate) path: String,
+    pub(crate) status: GitFileStatus,
+}
+
+/// Refreshes bounded per-path Git status for the exact trusted project root.
+///
+/// A failed or non-applicable Git check is represented by an empty snapshot so
+/// file browsing remains available without crossing the trusted root boundary.
+pub(crate) fn refresh_git_file_status(root: &Path, timeout: Duration) -> GitFileStatusSnapshot {
+    let mut snapshot = GitFileStatusSnapshot::default();
+    let metadata = match root.join(".git").symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return snapshot,
+    };
+    if metadata.file_type().is_symlink()
+        || (!metadata.file_type().is_dir() && !metadata.file_type().is_file())
+    {
+        return snapshot;
+    }
+    let top_level = run_git(
+        root,
+        &["-c", "core.fsmonitor=false", "rev-parse", "--show-toplevel"],
+        timeout,
+        MAX_GIT_ROOT_BYTES,
+    );
+    let GitRunResult::Finished(top_level) = top_level else {
+        return snapshot;
+    };
+    if !top_level.status.success()
+        || top_level.truncated
+        || !top_level_matches(root, &top_level.stdout)
+    {
+        return snapshot;
+    }
+    let status = run_git(
+        root,
+        &[
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "submodule.recurse=false",
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+            "--renames",
+        ],
+        timeout,
+        MAX_GIT_STATUS_BYTES,
+    );
+    let GitRunResult::Finished(output) = status else {
+        return snapshot;
+    };
+    if !output.status.success() {
+        return snapshot;
+    }
+    let Some(parsed) = parse_git_status(&output.stdout, output.truncated) else {
+        snapshot.truncated = true;
+        return snapshot;
+    };
+    snapshot.entries = parsed.file_statuses;
+    snapshot.truncated = output.truncated || parsed.file_statuses_truncated;
+    snapshot
 }
 
 fn unavailable_git(
@@ -502,6 +609,8 @@ struct ParsedGitStatus {
     dirty: bool,
     ahead: Option<u32>,
     behind: Option<u32>,
+    file_statuses: Vec<GitFileStatusEntry>,
+    file_statuses_truncated: bool,
 }
 
 fn parse_git_status(bytes: &[u8], truncated: bool) -> Option<ParsedGitStatus> {
@@ -513,11 +622,13 @@ fn parse_git_status(bytes: &[u8], truncated: bool) -> Option<ParsedGitStatus> {
     let mut dirty = truncated;
     let mut ahead = None;
     let mut behind = None;
-
-    for record in bytes
+    let mut file_statuses = Vec::new();
+    let mut file_statuses_truncated = truncated;
+    let mut records = bytes
         .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-    {
+        .filter(|record| !record.is_empty());
+
+    while let Some(record) = records.next() {
         if let Some(value) = record.strip_prefix(b"# branch.oid ") {
             oid_seen = true;
             if value != b"(initial)" {
@@ -553,6 +664,11 @@ fn parse_git_status(bytes: &[u8], truncated: bool) -> Option<ParsedGitStatus> {
             || record.starts_with(b"? ")
         {
             dirty = true;
+            let old_path = record.starts_with(b"2 ").then(|| records.next()).flatten();
+            match parse_git_file_status(record, old_path) {
+                Some(status) => file_statuses.push(status),
+                None => file_statuses_truncated = true,
+            }
         }
     }
     if !oid_seen || !branch_seen {
@@ -568,7 +684,106 @@ fn parse_git_status(bytes: &[u8], truncated: bool) -> Option<ParsedGitStatus> {
         dirty,
         ahead,
         behind,
+        file_statuses,
+        file_statuses_truncated,
     })
+}
+
+fn parse_git_file_status(record: &[u8], old_path: Option<&[u8]>) -> Option<GitFileStatusEntry> {
+    if record.starts_with(b"? ") {
+        return Some(GitFileStatusEntry {
+            path: git_relative_path(&record[2..])?,
+            status: GitFileStatus {
+                kind: GitFileStatusKind::Untracked,
+                old_path: None,
+            },
+        });
+    }
+
+    let (kind, xy) = status_record_kind_and_xy(record)?;
+    let (path_field, old_path) = if kind == b'2' {
+        (
+            status_field(record, 9)?,
+            Some(git_relative_path(old_path?)?),
+        )
+    } else if kind == b'1' {
+        (status_field(record, 8)?, None)
+    } else if kind == b'u' {
+        (status_field(record, 10)?, None)
+    } else {
+        return None;
+    };
+    let path = git_relative_path(path_field)?;
+    let status_kind = classify_git_file_status(xy[0], xy[1], kind == b'2');
+    Some(GitFileStatusEntry {
+        path,
+        status: GitFileStatus {
+            kind: status_kind,
+            old_path,
+        },
+    })
+}
+
+fn status_record_kind_and_xy(record: &[u8]) -> Option<(u8, [u8; 2])> {
+    let mut fields = record.split(|byte| *byte == b' ');
+    let kind = *fields.next()?.first()?;
+    if !matches!(kind, b'1' | b'2' | b'u') {
+        return None;
+    }
+    let xy = fields.next()?;
+    Some((kind, [*xy.first()?, *xy.get(1)?]))
+}
+
+fn status_field(record: &[u8], field_index: usize) -> Option<&[u8]> {
+    record
+        .splitn(field_index.saturating_add(1), |byte| *byte == b' ')
+        .nth(field_index)
+}
+
+fn classify_git_file_status(index: u8, worktree: u8, renamed: bool) -> GitFileStatusKind {
+    if renamed || matches!(index, b'R' | b'C') || matches!(worktree, b'R' | b'C') {
+        GitFileStatusKind::Renamed
+    } else if index == b'D' || worktree == b'D' {
+        GitFileStatusKind::Deleted
+    } else if index == b'A' || worktree == b'A' {
+        GitFileStatusKind::Added
+    } else {
+        GitFileStatusKind::Modified
+    }
+}
+
+fn git_relative_path(value: &[u8]) -> Option<String> {
+    let value = std::str::from_utf8(value).ok()?;
+    let value = value.strip_suffix('/').unwrap_or(value);
+    if value.is_empty() || value.len() > MAX_PUBLIC_ORIGIN_BYTES {
+        return None;
+    }
+    let components = value.split('/');
+    let mut count = 0usize;
+    for component in components {
+        count = count.saturating_add(1);
+        if count > 64 || !safe_git_component(component) {
+            return None;
+        }
+    }
+    Some(value.to_owned())
+}
+
+fn safe_git_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{feff}'
+                )
+        })
 }
 
 fn valid_object_id(value: &str) -> bool {
@@ -1310,5 +1525,91 @@ fn refresh_status(
             .min(u64::MAX as u128) as u64,
         duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         truncated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_git_status, GitFileStatusKind};
+
+    fn status_output(records: &[&[u8]], truncated: bool) -> (Vec<super::GitFileStatusEntry>, bool) {
+        let mut bytes = Vec::new();
+        for record in records {
+            bytes.extend_from_slice(record);
+            bytes.push(0);
+        }
+        let parsed = parse_git_status(&bytes, truncated).unwrap();
+        (parsed.file_statuses, parsed.file_statuses_truncated)
+    }
+
+    #[test]
+    fn parses_porcelain_v2_file_kinds_and_rename_paths() {
+        let records = [
+            b"# branch.oid 1111111111111111111111111111111111111111".as_slice(),
+            b"# branch.head main".as_slice(),
+            b"# branch.ab +0 -0".as_slice(),
+            b"1 .M N... 100644 100644 100644 1111111111111111111111111111111111111111 1111111111111111111111111111111111111111 modified.txt".as_slice(),
+            b"1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 1111111111111111111111111111111111111111 added.txt".as_slice(),
+            b"1 .D N... 100644 000000 000000 1111111111111111111111111111111111111111 0000000000000000000000000000000000000000 deleted.txt".as_slice(),
+            b"2 R. N... 100644 100644 100644 1111111111111111111111111111111111111111 1111111111111111111111111111111111111111 R100 renamed.txt".as_slice(),
+            b"? untracked-dir/".as_slice(),
+        ];
+        let mut bytes = Vec::new();
+        for (index, record) in records.iter().enumerate() {
+            if index == 6 {
+                bytes.extend_from_slice(record);
+                bytes.push(0);
+                bytes.extend_from_slice(b"old-name.txt");
+            } else {
+                bytes.extend_from_slice(record);
+            }
+            bytes.push(0);
+        }
+        let parsed = parse_git_status(&bytes, false).unwrap();
+        assert!(!parsed.file_statuses_truncated);
+        assert_eq!(
+            parsed
+                .file_statuses
+                .iter()
+                .map(|entry| entry.status.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                GitFileStatusKind::Modified,
+                GitFileStatusKind::Added,
+                GitFileStatusKind::Deleted,
+                GitFileStatusKind::Renamed,
+                GitFileStatusKind::Untracked,
+            ]
+        );
+        assert_eq!(parsed.file_statuses[3].path, "renamed.txt");
+        assert_eq!(
+            parsed.file_statuses[3].status.old_path.as_deref(),
+            Some("old-name.txt")
+        );
+        assert_eq!(parsed.file_statuses[4].path, "untracked-dir");
+    }
+
+    #[test]
+    fn propagates_output_truncation_without_claiming_a_complete_status_set() {
+        let records = [
+            b"# branch.oid (initial)".as_slice(),
+            b"# branch.head main".as_slice(),
+            b"? first.txt".as_slice(),
+        ];
+        let (statuses, file_statuses_truncated) = status_output(&records, true);
+        assert_eq!(statuses.len(), 1);
+        assert!(file_statuses_truncated);
+    }
+
+    #[test]
+    fn malformed_file_status_is_omitted_and_marks_the_snapshot_partial() {
+        let records = [
+            b"# branch.oid (initial)".as_slice(),
+            b"# branch.head main".as_slice(),
+            b"1 .M".as_slice(),
+        ];
+        let (statuses, file_statuses_truncated) = status_output(&records, false);
+        assert!(statuses.is_empty());
+        assert!(file_statuses_truncated);
     }
 }

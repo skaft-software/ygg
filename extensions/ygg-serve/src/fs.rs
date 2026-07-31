@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -17,6 +18,10 @@ use thiserror::Error;
 
 use crate::project_registry::{
     ProjectId as RegistryProjectId, ProjectRegistry, ProjectRegistryError,
+};
+use crate::repository_context::{
+    refresh_git_file_status, GitFileStatus, GitFileStatusEntry, GitFileStatusKind,
+    GitFileStatusSnapshot, DEFAULT_GIT_TIMEOUT,
 };
 
 /// Maximum UTF-8 bytes accepted in a project-relative path.
@@ -69,6 +74,10 @@ pub struct ProjectFileEntry {
     /// Best-effort modification time in Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_at_ms: Option<u64>,
+    /// Git states affecting this entry. Directories contain the stable union
+    /// of descendant states so collapsed folders remain informative.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_status: Vec<GitFileStatus>,
 }
 
 /// One bounded immediate directory listing.
@@ -81,6 +90,8 @@ pub struct ProjectFileTree {
     pub entries: Vec<ProjectFileEntry>,
     /// Whether the directory contained more entries than the fixed response bound.
     pub truncated: bool,
+    /// Whether bounded Git output omitted status records.
+    pub git_status_truncated: bool,
 }
 
 /// Bounded text returned for a project file.
@@ -224,53 +235,79 @@ impl ProjectFileSystem {
     ) -> Result<ProjectFileTree, ProjectFileSystemError> {
         let relative = parse_relative_path(path, true)?;
         let root = trusted_root(registry, project_id)?;
-        let directory = resolve_directory(&root, &relative.path)?;
-        let entries = std::fs::read_dir(&directory).map_err(map_read_error)?;
+        let git_status = refresh_git_file_status(&root, DEFAULT_GIT_TIMEOUT);
+        let directory = match resolve_directory(&root, &relative.path) {
+            Ok(directory) => Some(directory),
+            Err(ProjectFileSystemError::NotFound)
+                if has_git_statuses_under(&git_status, &relative.display) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let mut public_entries = Vec::new();
+        let mut present_names = BTreeSet::new();
         let mut truncated = false;
         let mut scanned_entries = 0usize;
 
-        for entry in entries {
-            if scanned_entries >= MAX_PROJECT_FILE_TREE_SCANNED_ENTRIES {
-                truncated = true;
-                break;
-            }
-            scanned_entries = scanned_entries.saturating_add(1);
-            let entry = entry.map_err(|_| ProjectFileSystemError::Storage)?;
-            let name = match entry.file_name().into_string() {
-                Ok(name) if safe_path_component(&name) => name,
-                _ => continue,
-            };
-            let metadata = entry
-                .path()
-                .symlink_metadata()
-                .map_err(|_| ProjectFileSystemError::Storage)?;
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            let kind = if metadata.file_type().is_dir() {
-                ProjectFileEntryKind::Directory
-            } else if metadata.file_type().is_file() && hard_link_count(&metadata) <= 1 {
-                ProjectFileEntryKind::File
-            } else {
-                continue;
-            };
-            if public_entries.len() >= MAX_PROJECT_FILE_TREE_ENTRIES {
-                truncated = true;
-                continue;
-            }
-            public_entries.push(ProjectFileEntry {
-                name,
-                kind,
-                size: if matches!(kind, ProjectFileEntryKind::File) {
-                    metadata.len()
+        if let Some(directory) = directory {
+            let entries = std::fs::read_dir(&directory).map_err(map_read_error)?;
+            for entry in entries {
+                if scanned_entries >= MAX_PROJECT_FILE_TREE_SCANNED_ENTRIES {
+                    truncated = true;
+                    break;
+                }
+                scanned_entries = scanned_entries.saturating_add(1);
+                let entry = entry.map_err(|_| ProjectFileSystemError::Storage)?;
+                let name = match entry.file_name().into_string() {
+                    Ok(name) if safe_path_component(&name) => name,
+                    _ => continue,
+                };
+                present_names.insert(name.clone());
+                let metadata = entry
+                    .path()
+                    .symlink_metadata()
+                    .map_err(|_| ProjectFileSystemError::Storage)?;
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                let kind = if metadata.file_type().is_dir() {
+                    ProjectFileEntryKind::Directory
+                } else if metadata.file_type().is_file() && hard_link_count(&metadata) <= 1 {
+                    ProjectFileEntryKind::File
                 } else {
-                    0
-                },
-                modified_at_ms: modified_at_ms(&metadata),
-            });
+                    continue;
+                };
+                if public_entries.len() >= MAX_PROJECT_FILE_TREE_ENTRIES {
+                    truncated = true;
+                    continue;
+                }
+                let entry_path = join_project_path(&relative.display, &name);
+                public_entries.push(ProjectFileEntry {
+                    name,
+                    kind,
+                    size: if matches!(kind, ProjectFileEntryKind::File) {
+                        metadata.len()
+                    } else {
+                        0
+                    },
+                    modified_at_ms: modified_at_ms(&metadata),
+                    git_status: git_status_for_path(
+                        &git_status.entries,
+                        &entry_path,
+                        matches!(kind, ProjectFileEntryKind::Directory),
+                    ),
+                });
+            }
         }
 
+        append_virtual_git_entries(
+            &git_status,
+            &relative.display,
+            &present_names,
+            &mut public_entries,
+            &mut truncated,
+        );
         public_entries.sort_by(|left, right| {
             entry_kind_order(left.kind)
                 .cmp(&entry_kind_order(right.kind))
@@ -280,6 +317,7 @@ impl ProjectFileSystem {
             path: relative.display,
             entries: public_entries,
             truncated,
+            git_status_truncated: git_status.truncated,
         })
     }
 
@@ -508,6 +546,120 @@ impl ProjectFileSystem {
             sha256: sha256_hex(content.as_bytes()),
             modified_at_ms: modified_at_ms(&written),
         })
+    }
+}
+
+fn join_project_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn has_git_statuses_under(snapshot: &GitFileStatusSnapshot, path: &str) -> bool {
+    if path.is_empty() {
+        return !snapshot.entries.is_empty();
+    }
+    let prefix = format!("{path}/");
+    snapshot
+        .entries
+        .iter()
+        .any(|entry| entry.path.starts_with(&prefix))
+}
+
+fn git_status_for_path(
+    entries: &[GitFileStatusEntry],
+    path: &str,
+    directory: bool,
+) -> Vec<GitFileStatus> {
+    let prefix = format!("{path}/");
+    let mut statuses = BTreeMap::<GitFileStatusKind, Option<String>>::new();
+    for entry in entries {
+        let matches = if directory {
+            entry.path == path || entry.path.starts_with(&prefix)
+        } else {
+            entry.path == path
+        };
+        if !matches {
+            continue;
+        }
+        let old_path = (!directory && entry.path == path)
+            .then(|| entry.status.old_path.clone())
+            .flatten();
+        statuses
+            .entry(entry.status.kind)
+            .and_modify(|current| {
+                if current.is_none() {
+                    *current = old_path.clone();
+                }
+            })
+            .or_insert(old_path);
+    }
+    statuses
+        .into_iter()
+        .map(|(kind, old_path)| GitFileStatus { kind, old_path })
+        .collect()
+}
+
+fn append_virtual_git_entries(
+    snapshot: &GitFileStatusSnapshot,
+    path: &str,
+    present_names: &BTreeSet<String>,
+    entries: &mut Vec<ProjectFileEntry>,
+    truncated: &mut bool,
+) {
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}/")
+    };
+    let mut virtual_names = BTreeMap::<String, ProjectFileEntryKind>::new();
+    for status in &snapshot.entries {
+        let Some(remainder) = status.path.strip_prefix(&prefix) else {
+            continue;
+        };
+        if remainder.is_empty() {
+            continue;
+        }
+        let Some(name) = remainder.split('/').next() else {
+            continue;
+        };
+        if present_names.contains(name) {
+            continue;
+        }
+        let kind = if remainder.contains('/') {
+            ProjectFileEntryKind::Directory
+        } else {
+            ProjectFileEntryKind::File
+        };
+        virtual_names
+            .entry(name.to_owned())
+            .and_modify(|current| {
+                if kind == ProjectFileEntryKind::Directory {
+                    *current = kind;
+                }
+            })
+            .or_insert(kind);
+    }
+
+    for (name, kind) in virtual_names {
+        if entries.len() >= MAX_PROJECT_FILE_TREE_ENTRIES {
+            *truncated = true;
+            break;
+        }
+        let entry_path = join_project_path(path, &name);
+        entries.push(ProjectFileEntry {
+            name,
+            kind,
+            size: 0,
+            modified_at_ms: None,
+            git_status: git_status_for_path(
+                &snapshot.entries,
+                &entry_path,
+                matches!(kind, ProjectFileEntryKind::Directory),
+            ),
+        });
     }
 }
 

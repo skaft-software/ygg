@@ -344,18 +344,32 @@ export interface TrustedFileRead {
 
 export type ProjectFileEntryKind = "directory" | "file";
 
+export type ProjectFileGitStatusKind =
+  | "modified"
+  | "added"
+  | "deleted"
+  | "renamed"
+  | "untracked";
+
+export interface ProjectFileGitStatus {
+  kind: ProjectFileGitStatusKind;
+  oldPath?: string;
+}
+
 /** A direct child of a trusted project directory. Paths are always project-relative. */
 export interface ProjectFileEntry {
   name: string;
   kind: ProjectFileEntryKind;
   size: number;
   modifiedAtMs?: number;
+  gitStatus?: ProjectFileGitStatus[];
 }
 
 export interface ProjectFileTree {
   path: string;
   entries: ProjectFileEntry[];
   truncated: boolean;
+  gitStatusTruncated: boolean;
 }
 
 export interface ProjectFileRead {

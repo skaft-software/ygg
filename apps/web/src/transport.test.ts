@@ -327,6 +327,7 @@ describe("HTTP Ygg transport", () => {
         },
       ],
       truncated: false,
+      gitStatusTruncated: false,
     };
     const read = {
       path: "src/lib.rs",

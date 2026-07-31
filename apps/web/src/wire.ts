@@ -20,6 +20,7 @@ import type {
   PreviewRef,
   ProgressStep,
   ProjectCatalog,
+  ProjectFileGitStatus,
   ProjectFileRead,
   ProjectFileSearchResult,
   ProjectFileTree,
@@ -963,8 +964,34 @@ export function projectTrustedFileRead(value: unknown): TrustedFileRead {
 }
 
 
+function projectFileGitStatus(
+  value: unknown,
+  path: string,
+): ProjectFileGitStatus {
+  const status = object(value, path, ["kind", "oldPath"]);
+  const oldPath =
+    status.oldPath === undefined
+      ? undefined
+      : projectRelativePath(status.oldPath, `${path}.oldPath`);
+  return {
+    kind: enumeration(status.kind, `${path}.kind`, [
+      "modified",
+      "added",
+      "deleted",
+      "renamed",
+      "untracked",
+    ] as const),
+    oldPath,
+  };
+}
+
 export function projectProjectFileTree(value: unknown): ProjectFileTree {
-  const tree = object(value, "projectFileTree", ["path", "entries", "truncated"]);
+  const tree = object(value, "projectFileTree", [
+    "path",
+    "entries",
+    "truncated",
+    "gitStatusTruncated",
+  ]);
   const entries = array(tree.entries, "projectFileTree.entries");
   if (entries.length > 1_000) {
     throw new WireContractError(
@@ -981,8 +1008,25 @@ export function projectProjectFileTree(value: unknown): ProjectFileTree {
         "kind",
         "size",
         "modifiedAtMs",
+        "gitStatus",
       ]);
-      return {
+      const gitStatusValues =
+        entry.gitStatus === undefined
+          ? undefined
+          : array(entry.gitStatus, `${entryPath}.gitStatus`);
+      if (gitStatusValues && gitStatusValues.length > 5) {
+        throw new WireContractError(
+          `${entryPath}.gitStatus`,
+          "must contain at most 5 statuses",
+        );
+      }
+      const gitStatus = gitStatusValues?.map((status, statusIndex) =>
+        projectFileGitStatus(
+          status,
+          `${entryPath}.gitStatus[${statusIndex}]`,
+        ),
+      );
+      const parsedEntry = {
         name: projectPathSegment(
           boundedString(entry.name, `${entryPath}.name`, 2_048),
           `${entryPath}.name`,
@@ -997,8 +1041,15 @@ export function projectProjectFileTree(value: unknown): ProjectFileTree {
             ? undefined
             : number(entry.modifiedAtMs, `${entryPath}.modifiedAtMs`),
       };
+      return gitStatus === undefined
+        ? parsedEntry
+        : { ...parsedEntry, gitStatus };
     }),
     truncated: boolean(tree.truncated, "projectFileTree.truncated"),
+    gitStatusTruncated:
+      tree.gitStatusTruncated === undefined
+        ? false
+        : boolean(tree.gitStatusTruncated, "projectFileTree.gitStatusTruncated"),
   };
 }
 

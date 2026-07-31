@@ -204,7 +204,7 @@ class TestTransport implements YggTransport {
   }
 
   async getProjectFileTree(): Promise<ProjectFileTree> {
-    return { path: "", entries: [], truncated: false };
+    return { path: "", entries: [], truncated: false, gitStatusTruncated: false };
   }
 
   async readProjectFile(): Promise<ProjectFileRead> {

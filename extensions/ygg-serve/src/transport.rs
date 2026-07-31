@@ -2504,8 +2504,10 @@ mod tests {
                     kind: ProjectFileEntryKind::Directory,
                     size: 0,
                     modified_at_ms: None,
+                    git_status: Vec::new(),
                 }],
                 truncated: false,
+                git_status_truncated: false,
             })
         }
 

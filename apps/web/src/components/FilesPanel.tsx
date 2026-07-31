@@ -1,9 +1,14 @@
 import {
+  ArrowRightLeft,
+  CircleDashed,
+  CircleDot,
   ChevronDown,
   ChevronRight,
   FileCode2,
   Folder,
   FolderOpen,
+  Minus,
+  Plus,
   RefreshCw,
   Save,
   Search,
@@ -19,6 +24,8 @@ import {
   useState,
 } from "react";
 import type {
+  ProjectFileGitStatus,
+  ProjectFileGitStatusKind,
   ProjectFileRead,
   ProjectFileSearchResult,
   ProjectFileTree,
@@ -69,6 +76,66 @@ function fileSize(size: number): string {
   if (size < 1_024) return `${size} B`;
   if (size < 1_024 * 1_024) return `${Math.ceil(size / 1_024)} KB`;
   return `${(size / (1_024 * 1_024)).toFixed(1)} MB`;
+}
+
+function gitStatusLabel(status: ProjectFileGitStatus): string {
+  const label =
+    status.kind === "modified"
+      ? "Modified"
+      : status.kind === "added"
+        ? "Added"
+        : status.kind === "deleted"
+          ? "Deleted"
+          : status.kind === "renamed"
+            ? "Renamed"
+            : "Untracked";
+  return status.kind === "renamed" && status.oldPath
+    ? `${label} from ${status.oldPath}`
+    : label;
+}
+
+function gitStatusIcon(kind: ProjectFileGitStatusKind): ReactNode {
+  switch (kind) {
+    case "modified":
+      return <CircleDot aria-hidden="true" />;
+    case "added":
+      return <Plus aria-hidden="true" />;
+    case "deleted":
+      return <Minus aria-hidden="true" />;
+    case "renamed":
+      return <ArrowRightLeft aria-hidden="true" />;
+    case "untracked":
+      return <CircleDashed aria-hidden="true" />;
+  }
+}
+
+function GitStatusIndicators({
+  statuses,
+}: {
+  statuses?: ProjectFileGitStatus[];
+}) {
+  if (!statuses || statuses.length === 0) {
+    return <span className="files-tree-git-status" aria-hidden="true" />;
+  }
+  const labels = statuses.map(gitStatusLabel);
+  const description = `Git status: ${labels.join(", ")}`;
+  return (
+    <span
+      className="files-tree-git-status"
+      role="img"
+      aria-label={description}
+      title={description}
+    >
+      {statuses.map((status, index) => (
+        <span
+          className={`files-tree-git-status-icon is-${status.kind}`}
+          key={`${status.kind}-${index}`}
+        >
+          {gitStatusIcon(status.kind)}
+        </span>
+      ))}
+    </span>
+  );
 }
 
 function selectableProjects(projects: ProjectSummary[]): ProjectSummary[] {
@@ -204,6 +271,14 @@ function ProjectFilesWorkspace({
     },
     [getTree, projectId],
   );
+
+  const refreshDirectories = useCallback(() => {
+    const paths = Object.entries(directories)
+      .filter(([, directory]) => directory.tree)
+      .map(([path]) => path);
+    if (!paths.includes("")) paths.unshift("");
+    for (const path of paths) void loadDirectory(path);
+  }, [directories, loadDirectory]);
 
   const loadFile = useCallback(
     async (path: string) => {
@@ -371,6 +446,7 @@ function ProjectFilesWorkspace({
             : current,
         );
         setConflict(false);
+        refreshDirectories();
       } catch (error) {
         if (error instanceof ProjectFileConflictError) setConflict(true);
         else setSaveError(true);
@@ -378,7 +454,7 @@ function ProjectFilesWorkspace({
         setSaving(false);
       }
     },
-    [draft, projectId, saving, selectedFile, writeAvailable, writeFile],
+    [draft, projectId, refreshDirectories, saving, selectedFile, writeAvailable, writeFile],
   );
 
   useEffect(() => {
@@ -452,7 +528,8 @@ function ProjectFilesWorkspace({
                 ) : (
                   <FileCode2 aria-hidden="true" />
                 )}
-                <span>{entry.name}</span>
+                <span className="files-tree-name">{entry.name}</span>
+                <GitStatusIndicators statuses={entry.gitStatus} />
                 {!directoryEntry ? <small>{fileSize(entry.size)}</small> : null}
               </button>
               {directoryEntry && expanded ? renderDirectory(entryPath, depth + 1) : null}
@@ -462,6 +539,11 @@ function ProjectFilesWorkspace({
         {directory.tree.truncated ? (
           <p className="files-tree-status" role="status">
             This folder has more files than ygg can safely list.
+          </p>
+        ) : null}
+        {directory.tree.gitStatusTruncated ? (
+          <p className="files-tree-status" role="status">
+            Some Git status entries are omitted because the repository is large.
           </p>
         ) : null}
       </>
@@ -475,19 +557,30 @@ function ProjectFilesWorkspace({
           <span>Trusted project browser</span>
           <h1 id="files-title">Files</h1>
         </div>
-        <label className="files-project-picker">
-          <span className="sr-only">Project</span>
-          <select
-            value={projectId}
-            onChange={(event) => requestProject(event.target.value)}
+        <div className="files-panel-header-actions">
+          <button
+            type="button"
+            className="files-tree-refresh"
+            aria-label="Refresh file tree"
+            title="Refresh file tree"
+            onClick={refreshDirectories}
           >
-            {availableProjects.map((project) => (
-              <option key={project.id} value={project.id}>
-                {project.name}
-              </option>
-            ))}
-          </select>
-        </label>
+            <RefreshCw aria-hidden="true" />
+          </button>
+          <label className="files-project-picker">
+            <span className="sr-only">Project</span>
+            <select
+              value={projectId}
+              onChange={(event) => requestProject(event.target.value)}
+            >
+              {availableProjects.map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
       </header>
 
       {pendingNavigation ? (

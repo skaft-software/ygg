@@ -9,11 +9,17 @@ mod project_registry;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[allow(dead_code)]
+#[path = "../src/repository_context.rs"]
+mod repository_context;
 
 use project_fs::{
     ProjectFileEntryKind, ProjectFileSystem, ProjectFileSystemError, MAX_PROJECT_FILE_READ_BYTES,
 };
 use project_registry::{ProjectId, ProjectRegistry};
+use repository_context::GitFileStatusKind;
 
 struct Fixture {
     _temporary: tempfile::TempDir,
@@ -39,6 +45,131 @@ impl Fixture {
             project_id,
         }
     }
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn initialize_git(root: &Path) {
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "user.name", "Ygg Test"]);
+    git(root, &["config", "user.email", "ygg@example.invalid"]);
+}
+
+fn commit_all(root: &Path, message: &str) {
+    git(root, &["add", "."]);
+    git(root, &["commit", "-qm", message]);
+}
+
+fn status_kinds(entry: &project_fs::ProjectFileEntry) -> Vec<GitFileStatusKind> {
+    entry.git_status.iter().map(|status| status.kind).collect()
+}
+
+#[test]
+fn tree_exposes_file_statuses_folder_aggregates_and_deleted_paths() {
+    let fixture = Fixture::new(|root| {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("removed")).unwrap();
+        fs::write(root.join("modified.txt"), "base\n").unwrap();
+        fs::write(root.join("deleted.txt"), "base\n").unwrap();
+        fs::write(root.join("renamed-before.txt"), "base\n").unwrap();
+        fs::write(root.join("src/nested.txt"), "base\n").unwrap();
+        fs::write(root.join("removed/lost.txt"), "base\n").unwrap();
+    });
+    initialize_git(&fixture.root);
+    commit_all(&fixture.root, "base");
+    fs::write(fixture.root.join("modified.txt"), "changed\n").unwrap();
+    fs::write(fixture.root.join("untracked.txt"), "new\n").unwrap();
+    fs::create_dir_all(fixture.root.join("untracked-dir/nested")).unwrap();
+    fs::write(fixture.root.join("untracked-dir/nested/file.txt"), "new\n").unwrap();
+    fs::write(fixture.root.join("src/added.txt"), "new\n").unwrap();
+    fs::write(fixture.root.join("src/nested.txt"), "changed\n").unwrap();
+    fs::remove_file(fixture.root.join("deleted.txt")).unwrap();
+    fs::remove_dir_all(fixture.root.join("removed")).unwrap();
+    git(&fixture.root, &["add", "src/added.txt"]);
+    git(
+        &fixture.root,
+        &["mv", "renamed-before.txt", "renamed-after.txt"],
+    );
+
+    let tree = ProjectFileSystem::tree(&fixture.registry, &fixture.project_id, "").unwrap();
+    assert!(!tree.git_status_truncated);
+    let entry = |name: &str| {
+        tree.entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap()
+    };
+    assert_eq!(
+        status_kinds(entry("modified.txt")),
+        vec![GitFileStatusKind::Modified]
+    );
+    assert_eq!(
+        status_kinds(entry("deleted.txt")),
+        vec![GitFileStatusKind::Deleted]
+    );
+    assert_eq!(
+        status_kinds(entry("renamed-after.txt")),
+        vec![GitFileStatusKind::Renamed]
+    );
+    assert_eq!(
+        entry("renamed-after.txt").git_status[0].old_path.as_deref(),
+        Some("renamed-before.txt")
+    );
+    assert_eq!(
+        status_kinds(entry("untracked-dir")),
+        vec![GitFileStatusKind::Untracked]
+    );
+    let untracked =
+        ProjectFileSystem::tree(&fixture.registry, &fixture.project_id, "untracked-dir").unwrap();
+    assert_eq!(untracked.entries[0].name, "nested");
+    assert_eq!(
+        status_kinds(&untracked.entries[0]),
+        vec![GitFileStatusKind::Untracked]
+    );
+    let nested = ProjectFileSystem::tree(
+        &fixture.registry,
+        &fixture.project_id,
+        "untracked-dir/nested",
+    )
+    .unwrap();
+    assert_eq!(nested.entries[0].name, "file.txt");
+    assert_eq!(
+        status_kinds(&nested.entries[0]),
+        vec![GitFileStatusKind::Untracked]
+    );
+    assert_eq!(
+        status_kinds(entry("untracked.txt")),
+        vec![GitFileStatusKind::Untracked]
+    );
+    assert_eq!(
+        status_kinds(entry("src")),
+        vec![GitFileStatusKind::Modified, GitFileStatusKind::Added]
+    );
+    assert_eq!(
+        status_kinds(entry("removed")),
+        vec![GitFileStatusKind::Deleted]
+    );
+
+    let removed =
+        ProjectFileSystem::tree(&fixture.registry, &fixture.project_id, "removed").unwrap();
+    assert_eq!(removed.entries[0].name, "lost.txt");
+    assert_eq!(
+        status_kinds(&removed.entries[0]),
+        vec![GitFileStatusKind::Deleted]
+    );
 }
 
 #[test]
