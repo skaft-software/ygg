@@ -21,7 +21,7 @@ use crate::presentation::{
     format_duration, is_hidden_tool_detail, summarize_tool_with_workspace, tool_failure_reason,
     tool_result_is_failure, RunOutcome, RunPhase, RunTracker,
 };
-use crate::resources::compose_instructions;
+use crate::resources::{compose_instructions, expand_skill_command};
 use crate::tui::theme::YggTheme;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -187,7 +187,16 @@ async fn run_prompt(
         }
         None => prompt,
     };
-    write_prompt(output, theme, &prompt)?;
+    let display_prompt = prompt.clone();
+    let prompt = match expand_skill_command(app.skills.as_ref(), &prompt) {
+        Ok(Some(expanded)) => expanded,
+        Ok(None) => prompt,
+        Err(error) => {
+            eprintln!("warning: failed to expand /skill: command: {error}");
+            prompt
+        }
+    };
+    write_prompt(output, theme, &display_prompt)?;
     let run_id = tracker
         .begin(&app.model.endpoint.id.0)
         .expect("fresh tracker cannot have an active run");
@@ -238,7 +247,7 @@ async fn run_prompt(
         )?;
     }
     app.agent.set_system_prompt(composition.system);
-    app.agent.set_prompt_display_text(Some(prompt));
+    app.agent.set_prompt_display_text(Some(display_prompt));
     let mut run = match app.agent.prompt(composition.prompt).await {
         Ok(run) => run,
         Err(error) => {
@@ -459,7 +468,8 @@ async fn run_prompt(
                             }
                         }
                     }
-                    AgentEvent::SteeringDelivered { .. } => {}
+                    AgentEvent::SteeringDelivered { .. }
+                    | AgentEvent::FollowUpDelivered { .. } => {}
                     AgentEvent::RunFinished { reason, .. } => {
                         finished = Some(match reason {
                             ygg_agent::FinishReason::Completed => RunEnded::Completed,
@@ -655,6 +665,7 @@ mod tests {
                 model: ModelId("test-model".into()),
                 protocol: Protocol::OpenAiChat,
             },
+            stop_reason: ygg_ai::StopReason::EndTurn,
             turn_usage: Usage::default(),
             usage: Usage::default(),
             session_cost_microdollars: None,

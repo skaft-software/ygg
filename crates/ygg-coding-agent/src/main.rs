@@ -93,6 +93,7 @@ async fn run() -> anyhow::Result<()> {
         }
         config::Mode::Interactive => modes::plain::run_plain(boot, initial_prompt).await,
         config::Mode::Print { prompt } => modes::print::run_print(boot, prompt).await,
+        config::Mode::Rpc => modes::rpc::run_rpc(boot).await,
     };
     // Mode owners have now aborted active work and shut down their children.
     // Preserve the conventional signal status even when cleanup itself found

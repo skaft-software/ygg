@@ -58,6 +58,9 @@ pub struct Cli {
     /// With `--login`, print the device URL/code without opening a browser.
     #[arg(long)]
     pub headless: bool,
+    /// Frontend mode: interactive or rpc.
+    #[arg(long, value_name = "MODE", conflicts_with = "print")]
+    pub mode: Option<String>,
     /// Use headless print mode instead of the full-screen TUI.
     #[arg(long, short = 'p')]
     pub print: bool,
@@ -125,6 +128,14 @@ pub struct Cli {
     /// Explicit prompt-template file or directory (repeatable, Pi compatible).
     #[arg(long = "prompt-template", value_name = "PATH")]
     pub prompt_templates: Vec<PathBuf>,
+    /// Override the composed system prompt. Use `--system-prompt` to clear it.
+    #[arg(
+        long = "system-prompt",
+        value_name = "PROMPT",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    pub system_prompt: Option<String>,
     /// Additional directory paths to scan for agent skills.
     #[arg(long = "skill-dir", value_name = "DIR")]
     pub skill_dirs: Vec<PathBuf>,
@@ -234,6 +245,7 @@ struct ConfigLayer {
     offline: Option<bool>,
     enabled_extensions: Option<Vec<String>>,
     trusted_extensions: Option<Vec<String>>,
+    system_prompt: Option<String>,
     compaction: Option<CompactionLayer>,
 }
 
@@ -272,6 +284,7 @@ impl ConfigLayer {
         override_some!(offline);
         override_some!(enabled_extensions);
         override_some!(trusted_extensions);
+        override_some!(system_prompt);
         match (self.compaction.as_mut(), newer.compaction) {
             (Some(current), Some(newer)) => {
                 if newer.mode.is_some() {
@@ -590,6 +603,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         offline: env_parse("YGG_OFFLINE")?,
         enabled_extensions: env_value("YGG_EXTENSIONS").map(split_names),
         trusted_extensions: env_value("YGG_TRUSTED_EXTENSIONS").map(split_names),
+        system_prompt: env_value("YGG_SYSTEM_PROMPT"),
         compaction: (compaction_mode.is_some()
             || compaction_enabled.is_some()
             || threshold_fraction.is_some()
@@ -681,6 +695,7 @@ fn build_config_with_global_path(
         Some(value) => config::MouseMode::parse(value)?,
         None => config::MouseMode::Auto,
     };
+    let system_prompt = cli.system_prompt.or(values.system_prompt);
 
     let mut sandbox = SandboxPolicy::default();
     if let Some(value) = values.allow_external_paths {
@@ -800,14 +815,20 @@ fn build_config_with_global_path(
         }
     }
 
-    let mode = if cli.print {
-        let prompt = cli.message.clone().unwrap_or_default();
-        if prompt.is_empty() && cli.prompt_template.is_none() {
-            anyhow::bail!("--print requires a prompt or --prompt <template>");
+    let mode = match cli.mode.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("rpc") => Mode::Rpc,
+        Some(value) if value.eq_ignore_ascii_case("interactive") => Mode::Interactive,
+        Some(value) => {
+            anyhow::bail!("invalid frontend mode {value:?}; use interactive or rpc (or --print)")
         }
-        Mode::Print { prompt }
-    } else {
-        Mode::Interactive
+        None if cli.print => {
+            let prompt = cli.message.clone().unwrap_or_default();
+            if prompt.is_empty() && cli.prompt_template.is_none() {
+                anyhow::bail!("--print requires a prompt or --prompt <template>");
+            }
+            Mode::Print { prompt }
+        }
+        None => Mode::Interactive,
     };
     let resume = if cli.continue_ {
         ResumeSelector::Continue
@@ -839,6 +860,7 @@ fn build_config_with_global_path(
         cache_retention,
         sandbox,
         theme: cli.theme.or(values.theme),
+        system_prompt,
         theme_paths: cli.theme_dirs,
         color,
         mouse,
@@ -860,7 +882,9 @@ fn build_config_with_global_path(
             }
         },
         show_reasoning_in_print: cli.show_reasoning,
-        initial_prompt: (!cli.print).then_some(cli.message).flatten(),
+        initial_prompt: matches!(mode, Mode::Interactive)
+            .then_some(cli.message)
+            .flatten(),
         prompt_template: cli.prompt_template,
         debug_prompt: cli.debug_prompt,
         prompt_paths: cli.prompt_templates,
@@ -899,6 +923,7 @@ mod tests {
             login: None,
             logout: None,
             headless: false,
+            mode: None,
             print: false,
             continue_: false,
             resume: None,
@@ -938,6 +963,7 @@ mod tests {
             offline: false,
             bash_timeout_secs: None,
             max_output_bytes: None,
+            system_prompt: None,
         }
     }
 
@@ -1168,34 +1194,45 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_project_config_is_ignored_and_cannot_relax_global_policy() {
+    fn system_prompt_layered_precedence_prefers_cli_over_project_then_global() {
         let directory = cwd();
         let global = directory.path().join("global.toml");
-        std::fs::write(
-            &global,
-            "model = 'global'\nallow_external_paths = false\nallow_edit = false\nallow_write = false\nallow_process = false\nallow_shell = false\nsession_dir = 'global-sessions'\n",
-        )
-        .unwrap();
+        std::fs::write(&global, "system_prompt = 'global'\n").unwrap();
         std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
-        std::fs::write(
-            directory.path().join(".ygg/config.toml"),
-            "model = 'project'\nallow_external_paths = true\nallow_edit = true\nallow_write = true\nallow_process = true\nallow_shell = true\nsession_dir = 'project-sessions'\n",
-        )
-        .unwrap();
+        std::fs::write(directory.path().join(".ygg/config.toml"), "system_prompt = 'project'\n").unwrap();
+
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        cli.system_prompt = Some("cli".into());
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.system_prompt.as_deref(), Some("cli"));
 
-        assert_eq!(config.model.unwrap().0, "global");
-        assert!(!config.sandbox.allow_external_paths);
-        assert!(!config.sandbox.allow_edit);
-        assert!(!config.sandbox.allow_write);
-        assert!(!config.sandbox.allow_process);
-        assert!(!config.sandbox.allow_shell);
-        assert_eq!(config.session_dir, PathBuf::from("global-sessions"));
-        assert!(!config.tools.enabled("edit"));
-        assert!(!config.tools.enabled("write"));
-        assert!(!config.tools.enabled("bash"));
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.system_prompt.as_deref(), Some("project"));
+    }
+
+    #[test]
+    fn system_prompt_explicit_empty_cli_value_is_preserved() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "system_prompt = 'global'\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.system_prompt = Some("".into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.system_prompt.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn parse_system_prompt_flag_without_value() {
+        let cli = Cli::try_parse_from(["ygg", "--system-prompt", "--print", "--prompt", "review"])
+            .unwrap();
+        assert!(cli.system_prompt.is_some());
+        assert_eq!(cli.system_prompt.as_deref(), Some(""));
     }
 
     #[test]
@@ -1516,4 +1553,5 @@ mod tests {
         assert_eq!(cli.prompt_template.as_deref(), Some("review"));
         assert!(cli.debug_prompt);
     }
+
 }

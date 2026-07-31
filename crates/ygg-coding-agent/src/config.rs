@@ -64,6 +64,7 @@ impl MouseMode {
 pub enum Mode {
     Interactive,
     Print { prompt: String },
+    Rpc,
 }
 
 /// Session selected at startup.
@@ -398,6 +399,10 @@ pub struct Config {
     pub cache_retention: CacheRetention,
     pub sandbox: SandboxPolicy,
     pub theme: Option<String>,
+    /// Explicit system prompt override. `None` uses composed built-in
+    /// instructions, while `Some("")` intentionally blanks the system
+    /// prompt.
+    pub system_prompt: Option<String>,
     /// Explicit theme directories, in precedence order after global/project.
     pub theme_paths: Vec<PathBuf>,
     pub color: ColorMode,
@@ -446,6 +451,7 @@ pub struct Config {
     /// Trust the workspace and load project config, context, and skills.
     pub workspace_trusted: bool,
 }
+
 
 impl Config {
     /// Whether a tool will survive both the model-visible allowlist and the

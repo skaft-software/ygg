@@ -59,6 +59,13 @@ pub enum AgentEvent {
         messages: Vec<String>,
     },
 
+    /// Follow-up messages were appended after the preceding assistant turn
+    /// completed and before the next model turn starts.
+    FollowUpDelivered {
+        /// Single-line summaries of the delivered inputs, in FIFO order.
+        messages: Vec<String>,
+    },
+
     /// Autonomous context compaction has started and the next provider call
     /// is the tool-free summary request, not a normal model turn.
     CompactionStarted {
@@ -124,6 +131,8 @@ pub enum AgentEvent {
     TurnFinished {
         /// The complete assistant message for the turn.
         message: AssistantMessage,
+        /// Provider-reported reason this turn stopped.
+        stop_reason: ygg_ai::StopReason,
         /// Provider-reported usage for this single request/response turn.
         ///
         /// Prompt buckets are disjoint; `reasoning_tokens` is a subset of
@@ -208,6 +217,16 @@ pub enum FinishReason {
     MaxTurns,
 }
 
+/// How queued user messages are delivered at an agent turn boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QueueDeliveryMode {
+    /// Deliver one queued message per eligible boundary.
+    #[default]
+    OneAtATime,
+    /// Deliver every message currently queued at the same boundary.
+    All,
+}
+
 /// Control messages accepted by an active run via [`RunControl`](crate::RunControl).
 #[derive(Debug)]
 pub enum Control {
@@ -218,6 +237,10 @@ pub enum Control {
     /// turn without tool calls). The run then continues with this input
     /// instead of finishing.
     FollowUp(crate::input::UserInput),
+    /// Change how pending steering messages are delivered.
+    SetSteeringMode(QueueDeliveryMode),
+    /// Change how pending follow-up messages are delivered.
+    SetFollowUpMode(QueueDeliveryMode),
     /// Abort the run at the next safe boundary.
     Abort,
 }
