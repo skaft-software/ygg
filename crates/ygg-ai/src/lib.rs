@@ -67,15 +67,15 @@ pub use responses::{
 pub use stream::{ResponseStream, StreamEvent};
 pub use transform::transform_messages;
 pub use types::{
-    AssistantMessage, AssistantPart, AudioFormat, AudioMedia, AudioOutputOptions, AudioPayload,
-    AudioVoice, CacheCompatibility, CacheControlFormat, CacheRetention, Capabilities, Endpoint,
-    EndpointId, EndpointTransport, ImageDetail, ImageMedia, ImageSource, JsonSchemaFormat, Media,
-    Message, Modality, ModalitySet, ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode,
-    OutputFormat, OutputModalities, Protocol, ProviderMediaRef, ReasoningCapability,
-    ReasoningConfig, ReasoningControl, ReasoningEffort, ReasoningEffortBudgets, ReasoningMode,
-    ReasoningPart, ReasoningState, ReasoningStateKind, Request, Response, SessionAffinityFormat,
-    StopReason, ToolCall, ToolCallId, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage,
-    UserMessage, UserPart,
+    AssistantMessage, AssistantPart, AudioCapabilities, AudioFormat, AudioMedia,
+    AudioOutputDelivery, AudioOutputOptions, AudioPayload, AudioVoice, CacheCompatibility,
+    CacheControlFormat, CacheRetention, Capabilities, Endpoint, EndpointId, EndpointTransport,
+    ImageDetail, ImageMedia, ImageSource, JsonSchemaFormat, Media, Message, Modality, ModalitySet,
+    ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode, OutputFormat, OutputModalities,
+    Protocol, ProviderMediaRef, ReasoningCapability, ReasoningConfig, ReasoningControl,
+    ReasoningEffort, ReasoningEffortBudgets, ReasoningMode, ReasoningPart, ReasoningState,
+    ReasoningStateKind, Request, Response, SessionAffinityFormat, StopReason, ToolCall, ToolCallId,
+    ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
 };
 
 /// Strictness for cross-protocol / capability degradation.

@@ -288,6 +288,9 @@ pub enum ValidationError {
     /// Structured output format name is malformed.
     #[error("Invalid output format name: {0}")]
     InvalidOutputFormatName(String),
+    /// Audio output voice name/reference is empty.
+    #[error("Audio output voice must not be empty")]
+    InvalidAudioVoice,
     /// Requested output token limit exceeds model capability.
     #[error("Invalid max output tokens requested: {requested}, model max: {model_max}")]
     InvalidMaxOutputTokens {

@@ -191,6 +191,17 @@ impl ModalitySet {
         }
     }
 
+    /// Returns a new set without the given modality.
+    pub fn without(self, m: Modality) -> Self {
+        let bit = match m {
+            Modality::Image => 1 << 0,
+            Modality::Audio => 1 << 1,
+        };
+        Self {
+            bits: self.bits & !bit,
+        }
+    }
+
     /// Returns whether this set contains the given modality.
     pub fn contains(self, m: Modality) -> bool {
         let bit = match m {
@@ -474,6 +485,112 @@ pub enum AudioFormat {
     Opus,
     /// Raw 16-bit linear PCM.
     Pcm16,
+}
+
+/// How generated audio is delivered by a model route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioOutputDelivery {
+    /// One complete clip after the provider response body has finished.
+    Completed,
+    /// Incremental audio chunks while generation is still in progress.
+    Streaming,
+}
+
+/// Route-effective audio formats and output delivery behavior.
+///
+/// This combines a model's advertised modality bits with the selected wire
+/// protocol's implemented codec support. Applications should use this instead
+/// of interpreting the raw audio modality bit alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioCapabilities {
+    /// Accepted inline input formats.
+    pub input_formats: &'static [AudioFormat],
+    /// Requestable generated-audio formats.
+    pub output_formats: &'static [AudioFormat],
+    /// Delivery behavior when generated audio is supported.
+    pub output_delivery: Option<AudioOutputDelivery>,
+}
+
+const OPENAI_CHAT_AUDIO_INPUT_FORMATS: &[AudioFormat] = &[AudioFormat::Wav, AudioFormat::Mp3];
+const OPENAI_CHAT_AUDIO_OUTPUT_FORMATS: &[AudioFormat] = &[
+    AudioFormat::Wav,
+    AudioFormat::Aac,
+    AudioFormat::Mp3,
+    AudioFormat::Flac,
+    AudioFormat::Opus,
+    AudioFormat::Pcm16,
+];
+
+impl ModelSpec {
+    /// Returns route-effective audio capabilities, or `None` when neither audio
+    /// input nor generated audio is available through the selected protocol.
+    pub fn audio_capabilities(&self) -> Option<AudioCapabilities> {
+        if self.protocol != Protocol::OpenAiChat {
+            return None;
+        }
+
+        let input_formats = if self.capabilities.input_modalities.contains(Modality::Audio) {
+            OPENAI_CHAT_AUDIO_INPUT_FORMATS
+        } else {
+            &[]
+        };
+        let output_formats = if self
+            .capabilities
+            .output_modalities
+            .contains(Modality::Audio)
+        {
+            OPENAI_CHAT_AUDIO_OUTPUT_FORMATS
+        } else {
+            &[]
+        };
+        if input_formats.is_empty() && output_formats.is_empty() {
+            return None;
+        }
+        Some(AudioCapabilities {
+            input_formats,
+            output_formats,
+            output_delivery: (!output_formats.is_empty()).then_some(AudioOutputDelivery::Completed),
+        })
+    }
+
+    /// Returns whether this route accepts the given inline audio input format.
+    pub fn supports_audio_input(&self, format: AudioFormat) -> bool {
+        self.audio_capabilities()
+            .is_some_and(|capabilities| capabilities.input_formats.contains(&format))
+    }
+
+    /// Returns whether this route can generate the requested audio format.
+    pub fn supports_audio_output(&self, format: AudioFormat) -> bool {
+        self.audio_capabilities()
+            .is_some_and(|capabilities| capabilities.output_formats.contains(&format))
+    }
+
+    /// Returns the input modalities usable through both the model and selected
+    /// protocol implementation.
+    pub fn effective_input_modalities(&self) -> ModalitySet {
+        if self
+            .audio_capabilities()
+            .is_some_and(|capabilities| !capabilities.input_formats.is_empty())
+        {
+            self.capabilities.input_modalities
+        } else {
+            self.capabilities.input_modalities.without(Modality::Audio)
+        }
+    }
+
+    /// Returns the output modalities usable through both the model and selected
+    /// protocol implementation.
+    pub fn effective_output_modalities(&self) -> ModalitySet {
+        if self
+            .audio_capabilities()
+            .is_some_and(|capabilities| !capabilities.output_formats.is_empty())
+        {
+            self.capabilities.output_modalities
+        } else {
+            self.capabilities.output_modalities.without(Modality::Audio)
+        }
+    }
 }
 
 /// Reference to a file/media resource stored on the provider's servers.

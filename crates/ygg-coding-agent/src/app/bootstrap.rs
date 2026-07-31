@@ -904,7 +904,9 @@ fn register_openai_compatible_models(
         } else {
             ModalitySet::none()
         };
-        if model.audio {
+        // Audio inventory metadata is only actionable on the Chat codec; the
+        // Responses and Anthropic codecs intentionally have no audio mapping.
+        if model.audio && protocol == Protocol::OpenAiChat {
             input_modalities = input_modalities.with(ygg_ai::Modality::Audio);
         }
         let cache = crate::providers::cache_compatibility(preset.id, &model.id, protocol);

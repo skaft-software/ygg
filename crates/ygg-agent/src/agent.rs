@@ -224,6 +224,7 @@ pub struct Agent {
     session_id: String,
     tool_scope: String,
     completion_policy: CompletionPolicy,
+    output_modalities: OutputModalities,
     max_output_tokens: u64,
     /// Stable semantic source key persisted with user-submitted prompts.
     prompt_model_source: Option<String>,
@@ -258,6 +259,8 @@ impl Drop for Agent {
 pub struct RunOutput {
     /// Concatenated visible text from all turns.
     pub text: String,
+    /// Completed generated media from committed turns, in event order.
+    pub media: Vec<Media>,
     /// Total token usage across the run.
     pub usage: Usage,
     /// Total microdollar cost accrued during this run.
@@ -484,7 +487,12 @@ fn message_visible_text(message: &Message) -> Option<String> {
             .iter()
             .filter_map(|part| match part {
                 UserPart::Text(text) => Some(text.as_str()),
-                UserPart::Media(_) => Some("[media]"),
+                UserPart::Media(Media::Audio(audio)) => audio
+                    .transcript
+                    .as_deref()
+                    .filter(|transcript| !transcript.trim().is_empty())
+                    .or(Some("[audio]")),
+                UserPart::Media(Media::Image(_)) => Some("[image]"),
                 UserPart::ToolResult(_) => None,
             })
             .collect::<Vec<_>>()
@@ -494,7 +502,12 @@ fn message_visible_text(message: &Message) -> Option<String> {
             .iter()
             .filter_map(|part| match part {
                 AssistantPart::Text(text) => Some(text.as_str()),
-                AssistantPart::Media(_) => Some("[generated media]"),
+                AssistantPart::Media(Media::Audio(audio)) => audio
+                    .transcript
+                    .as_deref()
+                    .filter(|transcript| !transcript.trim().is_empty())
+                    .or(Some("[generated audio]")),
+                AssistantPart::Media(Media::Image(_)) => Some("[generated image]"),
                 AssistantPart::Reasoning(_) | AssistantPart::ToolCall(_) => None,
             })
             .collect::<Vec<_>>()
@@ -2277,6 +2290,7 @@ impl Agent {
             session_id,
             tool_scope,
             completion_policy: CompletionPolicy::Natural,
+            output_modalities: OutputModalities::Text,
             max_output_tokens,
             prompt_model_source: None,
             prompt_color: None,
@@ -2294,6 +2308,21 @@ impl Agent {
     /// Read-only access to the selected model.
     pub fn model(&self) -> &Model {
         &self.model
+    }
+
+    /// Requested output modalities for subsequent model turns.
+    ///
+    /// Text is the default. Generated audio is currently delivered as a
+    /// complete [`AgentEvent::OutputMedia`] event and retained in
+    /// [`RunOutput::media`]; unsupported requests fail through `ygg-ai`'s
+    /// normal capability validation.
+    pub fn output_modalities(&self) -> &OutputModalities {
+        &self.output_modalities
+    }
+
+    /// Configure output modalities for subsequent runs.
+    pub fn set_output_modalities(&mut self, output_modalities: OutputModalities) {
+        self.output_modalities = output_modalities;
     }
 
     /// Replace the system prompt at an idle boundary. Product frontends use
@@ -2745,6 +2774,7 @@ impl Agent {
         let session_id = self.session_id.clone();
         let tool_scope = self.tool_scope.clone();
         let completion_policy = self.completion_policy;
+        let output_modalities = self.output_modalities.clone();
         let max_output_tokens = self.max_output_tokens;
         let max_session_cost_microdollars = self.max_session_cost_microdollars;
         let auto_compaction_mode = self.auto_compaction_mode;
@@ -2925,7 +2955,7 @@ impl Agent {
                     reasoning_mode,
                     responses,
                     output_format: OutputFormat::Text,
-                    output_modalities: OutputModalities::Text,
+                    output_modalities: output_modalities.clone(),
                     compatibility: CompatibilityMode::Strict,
                     cache_retention,
                     session_id: Some(session_id.clone()),
@@ -3234,9 +3264,14 @@ impl Agent {
                             // are deliberately not exposed.
                             StreamEvent::ToolCallStart { .. }
                             | StreamEvent::ToolCallArgsDelta { .. }
-                            | StreamEvent::ToolCallEnd { .. }
-                            | StreamEvent::MediaCompleted { .. } => {
+                            | StreamEvent::ToolCallEnd { .. } => {
                                 attempt_saw_generation = true;
+                            }
+                            StreamEvent::MediaCompleted { index, media } => {
+                                attempt_saw_generation = true;
+                                let ev = AgentEvent::OutputMedia { index, media };
+                                notify_observers(&observers, &ev);
+                                yield ev;
                             }
                             StreamEvent::Finished(response) => break Ok(response),
                             _ => {}
@@ -3825,10 +3860,12 @@ impl Agent {
     pub async fn complete(&mut self, input: impl Into<UserInput>) -> Result<RunOutput, AgentError> {
         let mut run = self.prompt(input).await?;
         let mut text = String::new();
-        // Deltas are provisional until their provider turn reaches `Finished`.
-        // A retry invalidates only the current attempt, not text committed by
+        let mut media = Vec::new();
+        // Output is provisional until its provider turn reaches `Finished`.
+        // A retry invalidates only the current attempt, not output committed by
         // earlier tool turns in the same autonomous run.
         let mut committed_text_len = 0usize;
+        let mut committed_media_len = 0usize;
         let mut usage = Usage::default();
         let mut run_cost: u64 = 0;
         while let Some(event) = run.next().await {
@@ -3837,12 +3874,20 @@ impl Agent {
                     channel: OutputChannel::Text,
                     text: delta,
                 } => text.push_str(&delta),
-                AgentEvent::ProviderRetry { .. } => text.truncate(committed_text_len),
+                AgentEvent::OutputMedia {
+                    media: output_media,
+                    ..
+                } => media.push(output_media),
+                AgentEvent::ProviderRetry { .. } => {
+                    text.truncate(committed_text_len);
+                    media.truncate(committed_media_len);
+                }
                 AgentEvent::CandidateRejected {
                     usage: total,
                     run_cost_microdollars: cost,
                 } => {
                     text.truncate(committed_text_len);
+                    media.truncate(committed_media_len);
                     usage = total;
                     run_cost = cost;
                 }
@@ -3855,6 +3900,7 @@ impl Agent {
                     ..
                 } => {
                     committed_text_len = text.len();
+                    committed_media_len = media.len();
                     usage = total;
                     run_cost = cost;
                 }
@@ -3863,6 +3909,7 @@ impl Agent {
                         FinishReason::Failed(e) => Err(e),
                         reason => Ok(RunOutput {
                             text,
+                            media,
                             usage,
                             cost_microdollars: run_cost,
                             head,

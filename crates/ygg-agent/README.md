@@ -7,8 +7,8 @@ requests from a persistent, branchable JSONL session, drives the model
 stream, executes tool calls through a small extension boundary, persists
 every semantic boundary (complete messages and individual tool results —
 never streaming deltas), and emits a streaming event surface including
-`OutputDelta`, batched `SteeringDelivered`, tool lifecycle events,
-`TurnFinished`, and `RunFinished` to the caller.
+`OutputDelta`, completed `OutputMedia`, batched `SteeringDelivered`, tool
+lifecycle events, `TurnFinished`, and `RunFinished` to the caller.
 
 Included:
 
@@ -16,6 +16,9 @@ Included:
   `follow_up`: ordered text and media parts (`ygg_ai::Media`) pass through
   the agent to the model unchanged; text-only callers remain compatible via
   `From<String>` / `From<&str>`.
+- Configurable generated output modalities. Completed clips arrive as
+  `AgentEvent::OutputMedia`; `Agent::complete` retains committed clips in
+  `RunOutput::media` and removes output from retried or rejected attempts.
 - Five built-in tools — `read`, `search`, `edit`, `write`, `bash` — registered through
   the same `Extension` boundary available to third-party tools.
 - A concrete `SandboxConfig`: relative paths use the workspace and hosts may

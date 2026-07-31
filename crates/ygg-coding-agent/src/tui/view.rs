@@ -1334,6 +1334,11 @@ impl InteractiveShell {
                     .saturating_add(text.len() as u64);
                 state.append_text_block(*channel, text);
             }
+            AgentEvent::OutputMedia { .. } => {
+                // Generated media is binary and may still be invalidated by a
+                // provider retry. TurnFinished carries the durable assembled
+                // message; embedded callers receive the payload here directly.
+            }
             AgentEvent::ProviderRetry { .. } | AgentEvent::CandidateRejected { .. } => {
                 state.discard_streaming_blocks();
                 state.open_reasoning_status();

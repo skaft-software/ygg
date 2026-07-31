@@ -307,6 +307,7 @@ async fn run_prompt(
                             write_log(output, &mut response_open, theme, "[working] Thinking")?;
                         }
                     }
+                    AgentEvent::OutputMedia { .. } => {}
                     AgentEvent::ProviderRetry {
                         attempt,
                         max_attempts,
