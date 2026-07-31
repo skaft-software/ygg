@@ -1019,6 +1019,89 @@ describe("conversation composer", () => {
     ).toBeVisible();
   });
 
+  it("animates only the latest work group in the active run", () => {
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    const createdAt = new Date().toISOString();
+    session.status = "working";
+    session.activeRunId = "run-current";
+    session.items = [
+      {
+        id: "reasoning-prior",
+        runId: "run-current",
+        turnId: "turn-prior",
+        kind: "reasoning",
+        summary: "Inspecting the first pass",
+        content: "The first pass is still provisional.",
+        state: "streaming",
+        createdAt,
+      },
+    ];
+    const props = {
+      bootstrap: structuredClone(fixtureBootstrap),
+      onSubmit: noOp,
+      onInterrupt: noOp,
+      onConfigure: noOp,
+      onResolveApproval: noOp,
+      onResolveUserInput: noOp,
+      onOpenOutput: () => {},
+      onOpenSource: () => {},
+    };
+
+    const { container, rerender } = render(
+      <Conversation session={session} {...props} />,
+    );
+    const priorGroup = container
+      .querySelector('[data-item-id="reasoning-prior"]')
+      ?.closest(".work-group");
+    expect(
+      screen.getByRole("button", { name: "Working" }).closest(".work-group"),
+    ).toBe(priorGroup);
+
+    const update = structuredClone(session);
+    update.items.push(
+      {
+        id: "assistant-between",
+        runId: "run-current",
+        turnId: "turn-prior",
+        kind: "assistant_message",
+        content: "The first pass is complete. I’ll check the final state.",
+        state: "streaming",
+        createdAt,
+      },
+      {
+        id: "reasoning-latest",
+        runId: "run-current",
+        turnId: "turn-latest",
+        kind: "reasoning",
+        summary: "Checking the final state",
+        content: "The final check is in progress.",
+        state: "streaming",
+        createdAt,
+      },
+    );
+    rerender(<Conversation session={update} {...props} />);
+
+    const workingIndicators = screen.getAllByRole("button", {
+      name: "Working",
+    });
+    const latestGroup = container
+      .querySelector('[data-item-id="reasoning-latest"]')
+      ?.closest(".work-group");
+
+    expect(workingIndicators).toHaveLength(1);
+    expect(workingIndicators[0]!.closest(".work-group")).toBe(latestGroup);
+    expect(priorGroup).toHaveClass("is-complete");
+    expect(priorGroup?.querySelector(".work-group-summary")).toHaveTextContent(
+      "Inspecting the first pass",
+    );
+    expect(
+      priorGroup?.querySelector(".work-group-summary .live-dots"),
+    ).toBeNull();
+    expect(
+      container.querySelectorAll(".live-dots:not(.is-static)"),
+    ).toHaveLength(1);
+  });
+
   it("keeps prior live work collapsed and lets the user reopen it", async () => {
     const user = userEvent.setup();
     const session = structuredClone(fixtureSessions["session-live"]!);
@@ -1478,6 +1561,7 @@ describe("conversation composer", () => {
     session.items = [
       {
         id: "item-tool",
+        runId: "run-evidence",
         turnId: "turn-evidence",
         kind: "action",
         actionKind: "file_write",

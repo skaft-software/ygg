@@ -339,6 +339,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     sequence: 28,
     title: "Refine onboarding preview",
     status: "working",
+    activeRunId: "run-live",
     projectId: "project-ygg",
     modelId: "gpt-5.4",
     reasoning: "high",

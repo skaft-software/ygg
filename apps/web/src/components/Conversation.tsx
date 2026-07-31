@@ -1784,8 +1784,28 @@ function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
   return rows;
 }
 
+function latestActiveWorkRowId(
+  rows: readonly TranscriptRow[],
+  status: SessionSnapshot["status"],
+  activeRunId: SessionSnapshot["activeRunId"],
+): string | undefined {
+  if (status !== "working" || !activeRunId) return undefined;
+
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index]!;
+    if (
+      row.kind === "work" &&
+      row.items.some((item) => item.runId === activeRunId)
+    ) {
+      return row.id;
+    }
+  }
+  return undefined;
+}
+
 interface WorkGroupProps {
   row: Extract<TranscriptRow, { kind: "work" }>;
+  active: boolean;
   initialItemIds: ReadonlySet<string>;
   onResolveApproval: ConversationProps["onResolveApproval"];
   onResolveUserInput: ConversationProps["onResolveUserInput"];
@@ -1808,6 +1828,7 @@ interface WorkGroupProps {
 
 const WorkGroup = memo(function WorkGroup({
   row,
+  active,
   initialItemIds,
   onResolveApproval,
   onResolveUserInput,
@@ -1823,7 +1844,7 @@ const WorkGroup = memo(function WorkGroup({
   attachmentContentUrl,
   onPreviewAttachment,
 }: WorkGroupProps) {
-  const live = row.items.some((item) => item.state === "streaming");
+  const live = active;
   const [userOpen, setUserOpen] = useState(false);
   const itemDuration = row.items.reduce(
     (total, item) =>
@@ -1982,6 +2003,7 @@ const WorkGroup = memo(function WorkGroup({
     if (previous.row.items[index] !== next.row.items[index]) return false;
   }
   return (
+    previous.active === next.active &&
     previous.initialItemIds === next.initialItemIds &&
     previous.onResolveApproval === next.onResolveApproval &&
     previous.onResolveUserInput === next.onResolveUserInput &&
@@ -4458,6 +4480,10 @@ export function Conversation({
     return byOrigin;
   }, [availableSources]);
   const rows = useMemo(() => transcriptRows(session.items), [session.items]);
+  const activeWorkRowId = useMemo(
+    () => latestActiveWorkRowId(rows, session.status, session.activeRunId),
+    [rows, session.status, session.activeRunId],
+  );
   const previewAttachment = useCallback(
     (source: string, name: string, trigger: HTMLElement) => {
       setAttachmentPreview({ source, name, trigger });
@@ -4640,6 +4666,7 @@ export function Conversation({
                 <WorkGroup
                   key={row.id}
                   row={row}
+                  active={row.id === activeWorkRowId}
                   initialItemIds={initialItemIds}
                   sessionId={session.sessionId}
                   resourceContentUrl={resourceContentUrl}
