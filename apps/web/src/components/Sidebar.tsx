@@ -478,12 +478,12 @@ function SidebarView({
     setSearchLoading(contentSearchEnabled && Boolean(nextQuery.trim()));
   };
 
+  const matchesSessionMetadata = (session: SessionSummary) =>
+    !normalizedQuery ||
+    session.title.toLocaleLowerCase().includes(normalizedQuery) ||
+    session.preview.toLocaleLowerCase().includes(normalizedQuery);
   const visibleSessions = sessions.filter(
-    (session) =>
-      session.lifecycle === view &&
-      (!normalizedQuery ||
-        session.title.toLocaleLowerCase().includes(normalizedQuery) ||
-        session.preview.toLocaleLowerCase().includes(normalizedQuery)),
+    (session) => session.lifecycle === view && matchesSessionMetadata(session),
   );
   const searchHitsBySession = new Map<string, TranscriptSearchHit[]>();
   if (searchResult) {
@@ -495,7 +495,12 @@ function SidebarView({
   }
   const searchMode = contentSearchEnabled && Boolean(searchQuery);
   const searchVisibleSessions = searchMode
-    ? sessions.filter((session) => searchHitsBySession.has(session.id))
+    ? sessions.filter(
+        (session) =>
+          session.lifecycle === view &&
+          (searchHitsBySession.has(session.id) ||
+            matchesSessionMetadata(session)),
+      )
     : visibleSessions;
   const projectsById = new Map(projects.map((project) => [project.id, project]));
   const workspaceSessions = new Map<string, SessionSummary[]>();
