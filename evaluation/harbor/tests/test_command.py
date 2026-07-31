@@ -31,6 +31,19 @@ class CommandTests(unittest.TestCase):
         self.assertIn("--print", command.argv)
         self.assertIn("--workspace-trusted", command.argv)
 
+    def test_command_accepts_instruction_starting_with_dash(self) -> None:
+        instruction = "- "
+        command = build_ygg_command(
+            "/tmp/ygg",
+            instruction,
+            model=None,
+            reasoning=None,
+            session_dir="/logs/agent/sessions",
+        )
+
+        self.assertEqual(shlex.split(command.shell), list(command.argv))
+        self.assertEqual(command.argv[-2:], ("--", instruction))
+
     def test_argv_rejects_invalid_limits(self) -> None:
         with self.assertRaises(ValueError):
             build_ygg_argv(

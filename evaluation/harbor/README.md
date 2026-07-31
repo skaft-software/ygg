@@ -48,16 +48,19 @@ runtime dependencies too.
 
 ## Build and verify the Ygg binary
 
-Build from a clean checkout at the Ygg pin. A native build is sufficient on a
-Linux host:
+Build from a clean checkout at the Ygg pin. The release executable is built
+for `x86_64-unknown-linux-musl` so it runs in Alpine and other minimal Linux
+images:
 
 ```bash
 git clone https://github.com/skaft-software/ygg.git /tmp/ygg-pinned
 git -C /tmp/ygg-pinned checkout 06cc784ef52a60b173f6d04bd90d8d30954e7501
 rustup toolchain install 1.86.0
 cd /tmp/ygg-pinned
-cargo +1.86.0 build --locked --release -p ygg-coding-agent --bin ygg
-install -m 0755 target/release/ygg /tmp/ygg-0.3.2-alpha
+rustup target add --toolchain 1.86.0 x86_64-unknown-linux-musl
+cargo +1.86.0 build --locked --release --target x86_64-unknown-linux-musl \
+  -p ygg-coding-agent --bin ygg
+install -m 0755 target/x86_64-unknown-linux-musl/release/ygg /tmp/ygg-0.3.2-alpha
 export YGG_BINARY=/tmp/ygg-0.3.2-alpha
 export YGG_SHA256=$(sha256sum "$YGG_BINARY" | awk '{print $1}')
 "$YGG_BINARY" --version
