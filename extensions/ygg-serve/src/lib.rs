@@ -112,10 +112,10 @@ pub use pty::{
 };
 pub use repository_context::{
     refresh_repository_context, ContextRefreshState, ContextRefreshStatus,
-    FolderInstructionContext, FolderInstructionFile, GitBranchState, GitRepositoryContext,
-    GitWorktreeState, InstructionLoadError, InstructionLoadErrorCode, InstructionOrigin,
-    InstructionStateSource, RepositoryContextError, RepositoryContextLoader,
-    RepositoryContextSnapshot, RepositoryStateSource, RepositoryTrust,
+    FolderInstructionContext, FolderInstructionFile, GitBranchState, GitFileStatus,
+    GitFileStatusKind, GitRepositoryContext, GitWorktreeState, InstructionLoadError,
+    InstructionLoadErrorCode, InstructionOrigin, InstructionStateSource, RepositoryContextError,
+    RepositoryContextLoader, RepositoryContextSnapshot, RepositoryStateSource, RepositoryTrust,
 };
 pub use resource::{ResourceReference, ResourceStore, ResourceStoreError};
 pub use runtime_status::*;

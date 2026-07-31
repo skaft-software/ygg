@@ -15,6 +15,7 @@ import type {
   LifetimeUsage,
   ModelSummary,
   ProjectCatalog,
+  ProjectFileGitStatus,
   ProjectFileRead,
   ProjectFileSearchResult,
   ProjectFileTree,
@@ -362,6 +363,7 @@ export class ProjectFileConflictError extends Error {
 interface FixtureProjectFile {
   content: string;
   modifiedAtMs: number;
+  gitStatus?: ProjectFileGitStatus[];
 }
 
 function fixtureProjectFileHash(content: string): string {
@@ -375,6 +377,19 @@ function fixtureProjectFileHash(content: string): string {
 
 function fixtureProjectFileByteLength(content: string): number {
   return new TextEncoder().encode(content).byteLength;
+}
+
+function mergeFixtureGitStatuses(
+  current: ProjectFileGitStatus[] | undefined,
+  next: ProjectFileGitStatus[] | undefined,
+): ProjectFileGitStatus[] | undefined {
+  const merged = [...(current ?? [])];
+  for (const status of next ?? []) {
+    const existing = merged.find((candidate) => candidate.kind === status.kind);
+    if (!existing) merged.push({ ...status });
+    else if (!existing.oldPath && status.oldPath) existing.oldPath = status.oldPath;
+  }
+  return merged.length > 0 ? merged : undefined;
 }
 
 async function projectFileWriteError(response: Response): Promise<Error> {
@@ -874,7 +889,12 @@ export class FixtureTransport implements YggTransport {
     const prefix = path ? `${path}/` : "";
     const entries = new Map<
       string,
-      { kind: "directory" | "file"; size: number; modifiedAtMs?: number }
+      {
+        kind: "directory" | "file";
+        size: number;
+        modifiedAtMs?: number;
+        gitStatus?: ProjectFileGitStatus[];
+      }
     >();
     for (const [filePath, file] of files) {
       if (!filePath.startsWith(prefix)) continue;
@@ -882,14 +902,18 @@ export class FixtureTransport implements YggTransport {
       const separator = remainder.indexOf("/");
       if (separator >= 0) {
         const name = remainder.slice(0, separator);
-        if (!entries.has(name)) {
-          entries.set(name, { kind: "directory", size: 0 });
-        }
+        const current = entries.get(name);
+        entries.set(name, {
+          kind: "directory",
+          size: 0,
+          gitStatus: mergeFixtureGitStatuses(current?.gitStatus, file.gitStatus),
+        });
       } else {
         entries.set(remainder, {
           kind: "file",
           size: fixtureProjectFileByteLength(file.content),
           modifiedAtMs: file.modifiedAtMs,
+          gitStatus: file.gitStatus,
         });
       }
     }
@@ -903,6 +927,7 @@ export class FixtureTransport implements YggTransport {
             left.name.localeCompare(right.name),
         ),
       truncated: false,
+      gitStatusTruncated: false,
     };
   }
 
@@ -1092,6 +1117,7 @@ export class FixtureTransport implements YggTransport {
           content:
             "# ygg fixture project\n\nThis browser edits only trusted project files.\n",
           modifiedAtMs: initialModifiedAtMs,
+          gitStatus: [{ kind: "modified" }],
         },
       ],
       [
@@ -1100,6 +1126,7 @@ export class FixtureTransport implements YggTransport {
           content:
             "# Serve\n\nThe local web client connects through an authenticated loopback API.\n",
           modifiedAtMs: initialModifiedAtMs,
+          gitStatus: [{ kind: "added" }],
         },
       ],
       [
@@ -1108,6 +1135,7 @@ export class FixtureTransport implements YggTransport {
           content:
             'export const greeting = "Hello from ygg";\n',
           modifiedAtMs: initialModifiedAtMs,
+          gitStatus: [{ kind: "untracked" }],
         },
       ],
     ]);

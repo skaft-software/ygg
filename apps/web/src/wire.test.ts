@@ -153,10 +153,12 @@ describe("authoritative Rust wire contract", () => {
           kind: "file",
           size: 42,
           modifiedAtMs: 1_753_626_615_000,
+          gitStatus: [{ kind: "renamed", oldPath: "src/old.rs" }],
         },
         { name: "nested", kind: "directory", size: 0 },
       ],
       truncated: false,
+      gitStatusTruncated: false,
     };
     const read = {
       path: "src/lib.rs",
@@ -184,6 +186,12 @@ describe("authoritative Rust wire contract", () => {
     expect(projectProjectFileWrite(write)).toEqual(write);
     expect(() =>
       projectProjectFileTree({ ...tree, path: "../outside" }),
+    ).toThrow(WireContractError);
+    expect(() =>
+      projectProjectFileTree({
+        ...tree,
+        entries: [{ ...tree.entries[0], gitStatus: [{ kind: "unknown" }] }],
+      }),
     ).toThrow(WireContractError);
     expect(() =>
       projectProjectFileRead({ ...read, sha256: "A".repeat(64) }),

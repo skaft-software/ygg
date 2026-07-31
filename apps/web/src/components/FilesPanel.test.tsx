@@ -21,10 +21,17 @@ function renderFilesPanel(
   const tree: ProjectFileTree = {
     path: "",
     entries: [
-      { name: "src", kind: "directory", size: 0 },
-      { name: "README.md", kind: "file", size: 24 },
+      { name: "src", kind: "directory", size: 0, gitStatus: [
+        { kind: "modified" },
+        { kind: "added" },
+        { kind: "deleted" },
+        { kind: "renamed", oldPath: "old-src" },
+        { kind: "untracked" },
+      ] },
+      { name: "README.md", kind: "file", size: 24, gitStatus: [{ kind: "modified" }] },
     ],
     truncated: false,
+    gitStatusTruncated: false,
   };
   const read: ProjectFileRead = {
     path: "README.md",
@@ -87,6 +94,17 @@ describe("FilesPanel", () => {
     expect(getTree).toHaveBeenCalledWith(project.id, "");
     expect(readFile).toHaveBeenCalledWith(project.id, "README.md");
     expect(screen.queryByText("Unsaved")).toBeNull();
+  });
+
+  it("shows accessible Git status indicators for tree entries", async () => {
+    renderFilesPanel();
+
+    expect(
+      await screen.findByRole("img", {
+        name: "Git status: Modified, Added, Deleted, Renamed from old-src, Untracked",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByTitle("Git status: Modified")).toBeTruthy();
   });
 
   it("requires an explicit overwrite after an optimistic conflict", async () => {
