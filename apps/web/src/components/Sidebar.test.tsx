@@ -299,6 +299,67 @@ describe("sidebar session lifecycle", () => {
     expect(screen.queryByText("No matching sessions")).toBeNull();
   });
 
+  it("shows working spinners and unread update dots in session rows", () => {
+    const sessions = [
+      activeSession({
+        id: "session-working",
+        title: "Working session",
+        status: "working",
+      }),
+      activeSession({
+        id: "session-complete",
+        title: "Completed session",
+        status: "done",
+        unread: true,
+      }),
+      activeSession({
+        id: "session-attention",
+        title: "Needs input",
+        status: "needs_attention",
+        attentionCount: 1,
+      }),
+      activeSession({
+        id: "session-idle",
+        title: "Idle session",
+        status: "idle",
+      }),
+    ];
+
+    const { container } = render(
+      <Sidebar {...sidebarProps({ sessions, selectedSessionId: null })} />,
+    );
+
+    const working = screen.getByRole("button", {
+      name: "Open session Working session, Working",
+    });
+    expect(working.querySelector(".session-loader")).not.toBeNull();
+    expect(working.querySelector(".session-loader .spin")).not.toBeNull();
+    expect(working.querySelector(".session-unread")).toBeNull();
+
+    const complete = screen.getByRole("button", {
+      name: "Open session Completed session, Done",
+    });
+    expect(complete.querySelector(".session-loader")).toBeNull();
+    expect(complete.querySelector(".session-unread")).toHaveAttribute(
+      "aria-label",
+      "Unread activity",
+    );
+
+    const attention = screen.getByRole("button", {
+      name: "Open session Needs input, Needs attention",
+    });
+    expect(attention.querySelector(".session-unread")).toHaveAttribute(
+      "aria-label",
+      "Needs attention",
+    );
+
+    const idle = screen.getByRole("button", {
+      name: "Open session Idle session, Ready",
+    });
+    expect(idle.querySelector(".session-row-meta")).toBeNull();
+    expect(container.querySelectorAll(".session-loader")).toHaveLength(1);
+  });
+
   it("shows title-only rows and gates pull-request marks on structured evidence", () => {
     const sessions = [
       activeSession({ id: "session-none", title: "No PR evidence" }),

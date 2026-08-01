@@ -731,6 +731,29 @@ kbd {
   );
 }
 
+.session-row-meta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+  min-width: 17px;
+}
+
+.session-loader {
+  width: 14px;
+  height: 14px;
+  display: grid;
+  place-items: center;
+  color: var(--session-accent);
+}
+
+.session-loader > svg {
+  width: 12px;
+  height: 12px;
+  stroke-width: 2.25;
+  animation-duration: 1.15s;
+}
+
 .session-status-dot {
   width: 7px;
   height: 7px;
