@@ -511,6 +511,7 @@ Example `~/.ygg/config.toml`:
 model = "custom/Qwen3 Coder Next"
 reasoning = "high"
 reasoning_mode = "standard"
+system_prompt = "You are a careful and concise reviewer."
 cache_retention = "short"
 theme = "default"
 color = "auto"
@@ -541,7 +542,7 @@ keep_recent_turns = 4
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_REASONING_MODE`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_REASONING_MODE`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
 ### CLI reference
 
@@ -554,7 +555,7 @@ Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, 
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
 | Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--shell-path` |
 | Limits | `--bash-timeout-secs`, `--max-output-bytes` |
-| Customization | `--theme`, `--theme-dir`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
+| Customization | `--theme`, `--theme-dir`, `--system-prompt`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
 
 Run `ygg --help` and `ygg sessions --help` for the authoritative generated reference.
 
@@ -573,7 +574,9 @@ Roots are resolved global → trusted project → explicit. Inputs must be bound
 
 ### Prompt templates
 
-Markdown and TOML prompt templates can accept arguments and include bounded files. Selection name and content hash are persisted as session provenance. `--debug-prompt` exposes the exact final expansion before it reaches the provider.
+Markdown and TOML prompt templates can accept arguments and include bounded files. Selection name and content hash are persisted as session provenance. `--debug-prompt` exposes the exact final expansion before it reaches the provider. 
+
+You can also replace the entire composed system instructions via `system_prompt` (config), `YGG_SYSTEM_PROMPT`, or `--system-prompt`; AGENTS/context/skills are ignored when it is set. Passing `--system-prompt` with no argument sets an explicit empty prompt.
 
 ### Skills
 

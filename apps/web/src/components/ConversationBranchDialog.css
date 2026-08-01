@@ -1,0 +1,243 @@
+.conversation-branch-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 96;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--text) 34%, transparent);
+}
+
+.conversation-branch-dialog {
+  width: min(560px, 100%);
+  max-height: min(760px, calc(100dvh - 48px));
+  overflow: auto;
+  border: 0;
+  border-radius: 18px;
+  color: var(--text);
+  background: var(--surface-raised);
+  box-shadow: 0 24px 80px color-mix(in srgb, var(--text) 24%, transparent);
+}
+
+.conversation-branch-dialog > header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 18px 18px 14px;
+  border-bottom: 0;
+}
+
+.conversation-branch-dialog > header > span {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 10px;
+  color: var(--accent-strong);
+  background: var(--accent-wash);
+}
+
+.conversation-branch-dialog > header svg {
+  width: 17px;
+  height: 17px;
+}
+
+.conversation-branch-dialog > header small,
+.conversation-branch-dialog > header h2 {
+  display: block;
+  margin: 0;
+}
+
+.conversation-branch-dialog > header small {
+  color: var(--text-muted);
+  font-size: var(--font-meta);
+}
+
+.conversation-branch-dialog > header h2 {
+  margin-top: 2px;
+  font-size: var(--font-body);
+  line-height: 1.2;
+}
+
+.conversation-branch-dialog > header button {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 0;
+  border-radius: 9px;
+  color: var(--text-muted);
+  background: transparent;
+}
+
+.conversation-branch-dialog > header button:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.conversation-branch-field,
+.conversation-branch-fields {
+  margin: 16px 18px 0;
+}
+
+.conversation-branch-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(140px, 0.45fr);
+  gap: 12px;
+}
+
+.conversation-branch-fields .conversation-branch-field {
+  margin: 0;
+}
+
+.conversation-branch-field {
+  display: grid;
+  gap: 7px;
+}
+
+.conversation-branch-field > span {
+  color: var(--text-muted);
+  font-size: var(--font-meta);
+  font-weight: 620;
+}
+
+.conversation-branch-field textarea,
+.conversation-branch-field select {
+  width: 100%;
+  border: 0;
+  border-radius: 10px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+}
+
+.conversation-branch-field textarea {
+  min-height: 132px;
+  resize: vertical;
+  padding: 11px 12px;
+  line-height: 1.5;
+}
+
+.conversation-branch-field select {
+  min-height: 40px;
+  padding: 0 10px;
+}
+
+.conversation-branch-field textarea:focus-visible,
+.conversation-branch-field select:focus-visible,
+.conversation-branch-dialog button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.conversation-branch-warning {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  margin: 16px 18px 0;
+  padding: 12px;
+  border: 0;
+  border-radius: 11px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--warning) 9%, var(--surface));
+}
+
+.conversation-branch-warning > svg {
+  width: 17px;
+  height: 17px;
+  margin-top: 2px;
+  color: var(--warning);
+}
+
+.conversation-branch-warning p,
+.conversation-branch-warning strong {
+  margin: 0;
+}
+
+.conversation-branch-warning strong {
+  display: block;
+  margin-bottom: 3px;
+}
+
+.conversation-branch-dialog > p[role="alert"] {
+  margin: 12px 18px 0;
+  color: var(--danger);
+  font-size: var(--font-meta);
+}
+
+.conversation-branch-dialog > footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  padding: 18px;
+}
+
+.branch-message-actions {
+  margin-top: 8px;
+}
+
+.conversation-branch-provenance {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  margin-top: 9px;
+  padding: 9px 10px;
+  border-radius: 9px;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--accent-wash) 70%, var(--surface));
+}
+
+.conversation-branch-provenance > svg {
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+  color: var(--accent-strong);
+}
+
+.conversation-branch-provenance strong,
+.conversation-branch-provenance small {
+  display: block;
+}
+
+.conversation-branch-provenance strong {
+  color: var(--text);
+  font-size: var(--font-meta);
+}
+
+.conversation-branch-provenance small {
+  margin-top: 2px;
+  font-size: var(--font-meta);
+  line-height: 1.4;
+}
+
+@media (max-width: 640px) {
+  .conversation-branch-backdrop {
+    align-items: end;
+    padding: 0;
+    background: var(--surface);
+  }
+
+  .conversation-branch-dialog {
+    width: 100%;
+    max-height: 92dvh;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 18px 18px 0 0;
+    box-shadow: none;
+  }
+
+  .conversation-branch-fields {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conversation-branch-backdrop,
+  .conversation-branch-dialog {
+    animation: none;
+    transition: none;
+  }
+}

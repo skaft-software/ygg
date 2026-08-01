@@ -19,6 +19,8 @@ const MAX_RESOURCE_ENTRIES_PER_ROOT: usize = 4096;
 pub enum ResourceKind {
     Theme,
     Prompt,
+    /// Legacy skill discovery retained for resolver compatibility tests.
+    #[allow(dead_code)]
     Skill,
     Extension,
 }

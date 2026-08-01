@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -49,6 +50,23 @@ pub struct SkillDescriptor {
     pub name: String,
     /// A short description of the skill's purpose.
     pub description: String,
+    /// Optional license name or a path to bundled license text.
+    #[serde(default)]
+    pub license: Option<String>,
+    /// Optional environment or product compatibility guidance.
+    #[serde(default)]
+    pub compatibility: Option<String>,
+    /// Arbitrary Agent Skills metadata retained for inspection.
+    #[serde(default)]
+    pub metadata: BTreeMap<String, serde_json::Value>,
+    /// Tools pre-approved by an Agent Skills manifest. Ygg exposes this as
+    /// metadata only; it is not a hard runtime requirement.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    /// Whether this skill is available only through explicit `/skill:name`
+    /// invocation and must be omitted from model-visible discovery metadata.
+    #[serde(default)]
+    pub disable_model_invocation: bool,
     /// Optional version string.
     pub version: Option<String>,
     /// The location source of the skill.

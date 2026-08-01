@@ -93,10 +93,13 @@ pub use compaction::{
     BranchHandoffPreparation, CompactionDetails, HandoffPreparation, BRANCH_SUMMARY_PREAMBLE,
     SUMMARIZATION_SYSTEM_PROMPT,
 };
-pub use context::ContextSnapshot;
+pub use context::{
+    ActiveContextCompaction, ContextBreakdown, ContextSnapshot, FinishedContextCompaction,
+    RunPhase, RunTerminalState,
+};
 pub use events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
-    OutputChannel,
+    OutputChannel, QueueDeliveryMode,
 };
 pub use extension::{EventObserver, Extension, ExtensionHost, ToolCallHook};
 pub use extension_process::{
@@ -119,7 +122,7 @@ pub use input::{InputPart, UserInput};
 pub use sandbox::SandboxConfig;
 pub use session::{
     Checkpoint, Entry, EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRecord,
-    UsageRecord, UsageRecordKind,
+    SessionRunOutcome, SessionRunOutcomeStatus, UsageRecord, UsageRecordKind,
 };
 pub use skills::{
     ContentHash, LoadedSkill, SkillActivationId, SkillDescriptor, SkillId, SkillLoadError,

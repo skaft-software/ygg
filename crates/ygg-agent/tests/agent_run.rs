@@ -2081,6 +2081,37 @@ async fn text_only_completion() {
 }
 
 #[tokio::test]
+async fn consuming_an_unfinished_run_returns_its_dropped_context_snapshot() {
+    let mut h = harness(vec![text_turn("unused")], Some(4)).await;
+    let run = h.agent.prompt("stop before polling").await.unwrap();
+
+    let snapshot = run.into_context_snapshot();
+
+    assert_eq!(snapshot.phase, ygg_agent::RunPhase::Finished);
+    assert_eq!(
+        snapshot.terminal_state,
+        Some(ygg_agent::RunTerminalState::Dropped)
+    );
+    assert!(snapshot.context.total_tokens > 0);
+    assert!(snapshot.context.context_limit > 0);
+}
+
+#[tokio::test]
+async fn context_snapshot_polling_does_not_mutate_durable_history() {
+    let mut h = harness(vec![text_turn("unused")], Some(4)).await;
+    let session_path = h.session_path.clone();
+    let run = h.agent.prompt("observe without writing").await.unwrap();
+    let durable_before = std::fs::read(&session_path).unwrap();
+
+    let first = run.context_snapshot();
+    let second = run.context_snapshot();
+
+    assert_eq!(first, second);
+    assert_eq!(std::fs::read(&session_path).unwrap(), durable_before);
+    drop(run);
+}
+
+#[tokio::test]
 async fn run_context_snapshot_updates_without_a_presentation_layer() {
     let mut h = harness(vec![text_turn("streamed context")], Some(4)).await;
     let mut run = h.agent.prompt("track it").await.unwrap();
@@ -2093,6 +2124,11 @@ async fn run_context_snapshot_updates_without_a_presentation_layer() {
     let snapshot = run.context_snapshot();
     assert_eq!(snapshot.responses_started, 1);
     assert_eq!(snapshot.responses_finished, 1);
+    assert_eq!(snapshot.phase, ygg_agent::RunPhase::Finished);
+    assert_eq!(
+        snapshot.terminal_state,
+        Some(ygg_agent::RunTerminalState::Completed)
+    );
     assert!(snapshot.response_text_bytes >= "streamed context".len() as u64);
     assert!(snapshot.response_usage.total_tokens > 0);
     assert_eq!(snapshot.run_usage, snapshot.response_usage);
@@ -2873,6 +2909,7 @@ async fn steering_enters_at_the_next_turn_boundary() {
     .await;
     std::fs::write(h.workspace.join("f.txt"), "data\n").unwrap();
 
+    h.agent.set_prompt_display_text(Some("start".to_owned()));
     let mut run = h.agent.prompt("start").await.unwrap();
     let control = run.control();
     let mut events = Vec::new();
@@ -2913,6 +2950,32 @@ async fn steering_enters_at_the_next_turn_boundary() {
     let session_texts = format!("{:?}", h.agent.session().entries());
     assert!(session_texts.contains("also check the docs"));
     assert!(session_texts.contains("and run the tests"));
+
+    // Only the initial composed prompt owns the initial draft's display
+    // override. Reopening the durable session must reveal each steer under its
+    // own text instead of aliasing all three user entries to "start".
+    let reopened = Session::open_read_only(&h.session_path).unwrap();
+    let display_texts = reopened
+        .entries()
+        .iter()
+        .filter_map(|entry| match &entry.value {
+            EntryValue::Message(Message::User(message))
+                if message
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, UserPart::Text(_))) =>
+            {
+                Some(
+                    entry
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.display_text.as_deref()),
+                )
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(display_texts, vec![Some("start"), None, None]);
 }
 
 #[tokio::test]
@@ -3361,6 +3424,11 @@ impl Tool for QueuedActivationTool {
                 id: "queued-skill".into(),
                 name: "Queued Skill".into(),
                 description: "Cancellation regression fixture".into(),
+                license: None,
+                compatibility: None,
+                metadata: Default::default(),
+                allowed_tools: vec![],
+                disable_model_invocation: false,
                 version: None,
                 source: ygg_agent::SkillSource::BuiltIn,
                 trust: ygg_agent::SkillTrust::BuiltIn,

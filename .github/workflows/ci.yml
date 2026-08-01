@@ -29,7 +29,11 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --doc --locked
-      - run: cargo package --workspace --locked --no-verify
+      # The serve feature depends on the publish-excluded optional extension.
+      - run: cargo package --workspace --exclude ygg-coding-agent --locked --no-verify
+      - run: cargo fmt --manifest-path extensions/ygg-serve/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path extensions/ygg-serve/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo test --manifest-path extensions/ygg-serve/Cargo.toml --locked
 
   test:
     strategy:
@@ -52,12 +56,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --all-features --locked
 
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: apps/web/.node-version
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run check:fonts
+      - run: npm run build
+      - run: npm run check:external
+      - run: npm run bundle:check
+      - run: cargo build -p ygg-coding-agent --bin ygg --features serve --locked
+        working-directory: ${{ github.workspace }}
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - run: npm run test:e2e:live
+
   smoke-install:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install --debug --locked --path crates/ygg-coding-agent --bin ygg --root "$RUNNER_TEMP/ygg-install"
+      - run: cargo install --debug --locked --path crates/ygg-coding-agent --bin ygg --features serve --root "$RUNNER_TEMP/ygg-install"
       - run: "$RUNNER_TEMP/ygg-install/bin/ygg --version"
       - run: "$RUNNER_TEMP/ygg-install/bin/ygg --help"
+      - run: scripts/smoke-ygg-serve-installed.sh "$RUNNER_TEMP/ygg-install/bin/ygg"

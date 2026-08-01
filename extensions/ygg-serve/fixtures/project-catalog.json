@@ -1,0 +1,22 @@
+{
+  "protocol": 1,
+  "host": {
+    "id": "host-demo",
+    "name": "Local Ygg"
+  },
+  "catalogCursor": 9,
+  "lifecycleMutationsSupported": true,
+  "importSupported": false,
+  "projects": [
+    {
+      "id": "project-ygg",
+      "name": "ygg",
+      "trusted": true,
+      "archived": false,
+      "available": true,
+      "isDefault": true,
+      "sessionCount": 1,
+      "liveSessionCount": 1
+    }
+  ]
+}

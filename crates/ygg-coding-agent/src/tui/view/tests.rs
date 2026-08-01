@@ -1009,6 +1009,7 @@ fn context_uses_single_turn_provider_total_not_cumulative_run_usage() {
             model: ModelId("gpt-5".into()),
             protocol: ygg_ai::Protocol::OpenAiResponses,
         },
+        stop_reason: ygg_ai::StopReason::EndTurn,
         turn_usage,
         usage: Usage {
             input_tokens: 20_000,
@@ -5496,6 +5497,7 @@ fn scripted_agent_events_map_to_distinct_transcript_and_tool_state() {
                 model: ModelId("m".into()),
                 protocol: Protocol::OpenAiChat,
             },
+            stop_reason: ygg_ai::StopReason::EndTurn,
             turn_usage: Usage {
                 input_tokens: 12,
                 output_tokens: 3,

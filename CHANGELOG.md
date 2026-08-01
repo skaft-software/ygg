@@ -18,6 +18,33 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Added source-located diagnostics for unknown global and trusted-project config
   keys, typo suggestions, and strict rejection through `--strict-config`,
   `strict_config`, or `YGG_STRICT_CONFIG`.
+- Added `SessionRunOutcome` persistence, root-head checkpoints, durable run
+  terminal state, and independent display metadata for steering and follow-up
+  inputs.
+
+### Ygg Serve (experimental, feature-gated)
+
+- Added the loopback-only Ygg Serve backend under `extensions/ygg-serve/`, with
+  bounded host/session contracts, deterministic snapshots and replay,
+  authenticated HTTP/WebSocket transport, session supervision, evidence and
+  attachment storage, document and test-result ingestion, repository context,
+  project files, terminals, transcript search, runtime status, and prompt
+  context.
+- Added the React 19 and TypeScript web client under `apps/web/`, with responsive
+  session navigation, transcript and activity views, composer controls,
+  attachments, completion review, branching, project files, terminal access,
+  usage and context views, settings, search, local themes and fonts, and
+  Playwright acceptance coverage.
+- Added the feature-gated adapter in
+  `crates/ygg-coding-agent/src/extensions/serve.rs`, boundary enforcement,
+  deterministic embedded assets, installed-runtime smoke coverage, and
+  target-specific release packaging for GNU/Linux x86-64 and both supported
+  macOS architectures.
+
+### Documentation
+
+- Added architecture, current-state, lifecycle safety, LAN pairing, native
+  delivery, P0/P1 delivery, and web acceptance documentation for Ygg Serve.
 
 ### Changed
 

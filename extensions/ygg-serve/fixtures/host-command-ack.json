@@ -1,0 +1,11 @@
+{
+  "protocol": 1,
+  "hostId": "host-demo",
+  "commandId": "command-create",
+  "acknowledgedAtMs": 1721000000061,
+  "catalogCursor": 8,
+  "disposition": {
+    "status": "accepted",
+    "createdSessionId": "session-created"
+  }
+}

@@ -618,6 +618,7 @@ mod tests {
                     prompt_model_source: Some("deepseek".into()),
                     prompt_color: Some("#123456".into()),
                     display_text: None,
+                    run_outcome: None,
                     local_synthetic_assistant: false,
                 }),
             )
@@ -637,6 +638,7 @@ mod tests {
                     prompt_model_source: Some("anthropic".into()),
                     prompt_color: Some("#abcdef".into()),
                     display_text: None,
+                    run_outcome: None,
                     local_synthetic_assistant: false,
                 }),
             )

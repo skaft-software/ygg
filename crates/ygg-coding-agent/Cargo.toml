@@ -12,6 +12,10 @@ default-run = "ygg"
 keywords = ["ai", "coding-agent", "terminal", "local-first", "llm"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+default = []
+serve = ["dep:getrandom", "dep:ygg-serve-backend", "tokio/net", "tokio/signal"]
+
 [lints]
 workspace = true
 
@@ -63,6 +67,8 @@ tempfile = "3"
 signal-hook = "0.3"
 sha2 = "0.10"
 libc = "0.2"
+getrandom = { version = "0.3", optional = true }
+ygg-serve-backend = { version = "0.1.0", path = "../../extensions/ygg-serve", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

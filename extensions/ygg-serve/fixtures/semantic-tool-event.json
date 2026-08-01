@@ -1,0 +1,37 @@
+{
+  "protocol": 1,
+  "sessionId": "session-demo",
+  "cursor": {
+    "actorGeneration": 3,
+    "sequence": 44
+  },
+  "timestampMs": 1721000000350,
+  "event": {
+    "type": "item.delta",
+    "data": {
+      "itemId": "item-tool-cargo-test",
+      "delta": {
+        "type": "toolActivity",
+        "data": {
+          "activity": {
+            "rawToolName": "bash",
+            "kind": "command",
+            "phase": "verified",
+            "status": "succeeded",
+            "title": "Run cargo test",
+            "summary": "Completed",
+            "cwd": ".",
+            "commandPreview": "cargo test",
+            "exitCode": 0,
+            "startedAtMs": 1721000000100,
+            "completedAtMs": 1721000000350,
+            "durationMs": 250,
+            "outputSummary": "Verification completed",
+            "observedOutputBytes": 4096,
+            "droppedOutputBytes": 128
+          }
+        }
+      }
+    }
+  }
+}

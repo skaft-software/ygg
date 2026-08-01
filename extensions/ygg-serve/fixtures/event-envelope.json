@@ -1,0 +1,21 @@
+{
+  "protocol": 1,
+  "sessionId": "session-demo",
+  "cursor": {
+    "actorGeneration": 3,
+    "sequence": 43
+  },
+  "timestampMs": 1721000000043,
+  "event": {
+    "type": "item.delta",
+    "data": {
+      "itemId": "item-stream",
+      "delta": {
+        "type": "assistantText",
+        "data": {
+          "append": " world"
+        }
+      }
+    }
+  }
+}

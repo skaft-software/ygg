@@ -63,6 +63,7 @@ async fn run() -> anyhow::Result<()> {
     if let Some(cli::TopLevelCommand::Extension { command }) = top_level_command.clone() {
         return extension_package::run(command).await;
     }
+    #[cfg(not(feature = "serve"))]
     if let Some(cli::TopLevelCommand::Serve {
         no_open,
         port,
@@ -73,11 +74,28 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let cwd = std::env::current_dir()?;
-    tui::terminal::install_panic_hook();
-    tui::terminal::install_signal_restore()?;
+    #[cfg(feature = "serve")]
+    let is_serve = matches!(&top_level_command, Some(cli::TopLevelCommand::Serve { .. }));
+    #[cfg(not(feature = "serve"))]
+    let is_serve = false;
+    if !is_serve {
+        // Preserve the original startup/error boundary for every terminal and
+        // non-Serve invocation.
+        tui::terminal::install_panic_hook();
+        tui::terminal::install_signal_restore()?;
+    }
     let config = cli::build_config(cli, &cwd)?;
-    if let Some(cli::TopLevelCommand::Sessions { command }) = top_level_command {
+    if let Some(cli::TopLevelCommand::Sessions { command }) = top_level_command.clone() {
         return session_commands::run(command, &config);
+    }
+    #[cfg(feature = "serve")]
+    if let Some(cli::TopLevelCommand::Serve {
+        no_open,
+        port,
+        web_root,
+    }) = top_level_command
+    {
+        return extensions::serve::run(config, port, no_open, web_root).await;
     }
     let mode = config.mode.clone();
     let initial_prompt = config.initial_prompt.clone();
@@ -89,6 +107,7 @@ async fn run() -> anyhow::Result<()> {
         }
         config::Mode::Interactive => modes::plain::run_plain(boot, initial_prompt).await,
         config::Mode::Print { prompt } => modes::print::run_print(boot, prompt).await,
+        config::Mode::Rpc => modes::rpc::run_rpc(boot).await,
     };
     // Mode owners have now aborted active work and shut down their children.
     // Preserve the conventional signal status even when cleanup itself found

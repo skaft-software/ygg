@@ -809,6 +809,12 @@ mod tests {
             title: "provider title\x1b]52;c;YXR0YWNr\x07\nforged\tcolumn".into(),
             name: None,
             tags: vec!["safe".into()],
+            pinned: false,
+            archived: false,
+            trashed_at_ms: None,
+            purge_after_ms: None,
+            forked_from_session_id: None,
+            forked_from_entry_id: None,
             modified: now,
         };
 
@@ -830,6 +836,12 @@ mod tests {
             title: "provider title\x1b]0;raw\x07\nsecond\tcolumn".into(),
             name: None,
             tags: Vec::new(),
+            pinned: false,
+            archived: false,
+            trashed_at_ms: None,
+            purge_after_ms: None,
+            forked_from_session_id: None,
+            forked_from_entry_id: None,
             modified: now,
         };
 
@@ -1428,6 +1440,12 @@ mod tests {
             title: "Compiler investigation".into(),
             name: Some("Compiler investigation".into()),
             tags: vec!["rust".into(), "local-model".into()],
+            pinned: false,
+            archived: false,
+            trashed_at_ms: None,
+            purge_after_ms: None,
+            forked_from_session_id: None,
+            forked_from_entry_id: None,
             modified: UNIX_EPOCH,
         };
         for query in ["compiler", "local-model", "2026-07", "project"] {

@@ -36,19 +36,54 @@ pub struct SessionMeta {
     pub title: String,
     pub name: Option<String>,
     pub tags: Vec<String>,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub pinned: bool,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub archived: bool,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub trashed_at_ms: Option<u64>,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub purge_after_ms: Option<u64>,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub forked_from_session_id: Option<String>,
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub forked_from_entry_id: Option<String>,
     pub modified: SystemTime,
 }
 
 /// Small user-owned metadata kept next to, but separate from, append-only
 /// session records. Sidecars let older Ygg binaries continue to open JSONL
-/// sessions while names and tags remain easy to export and recover.
+/// sessions while catalog metadata remains easy to export and recover.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionUserMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trashed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_entry_id: Option<String>,
 }
+
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionStorageLifecycle {
+    Active,
+    Archived,
+    Trash,
+}
+
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+pub const SESSION_TRASH_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 
 #[derive(Debug)]
 struct SessionCandidate {
@@ -494,6 +529,7 @@ enum SummaryRecord {
     Head {
         id: EntryId,
     },
+    RootHead {},
     Checkpoint {
         prompt: EntryId,
         head: EntryId,
@@ -614,6 +650,33 @@ fn sanitize_session_tags(tags: &[String]) -> anyhow::Result<Vec<String>> {
         }
     }
     Ok(sanitized)
+}
+
+fn validate_session_metadata(metadata: &SessionUserMetadata) -> anyhow::Result<()> {
+    if metadata.trashed_at_ms.is_some() != metadata.purge_after_ms.is_some()
+        || metadata
+            .trashed_at_ms
+            .zip(metadata.purge_after_ms)
+            .is_some_and(|(trashed, purge)| trashed == 0 || purge <= trashed)
+        || metadata.trashed_at_ms.is_some() && !metadata.archived
+    {
+        anyhow::bail!("invalid session trash retention metadata");
+    }
+    match (
+        metadata.forked_from_session_id.as_deref(),
+        metadata.forked_from_entry_id.as_deref(),
+    ) {
+        (None, None) => Ok(()),
+        (Some(session), Some(entry))
+            if session_id_is_valid(session)
+                && !entry.is_empty()
+                && entry.len() <= 256
+                && !entry.chars().any(char::is_control) =>
+        {
+            Ok(())
+        }
+        _ => anyhow::bail!("invalid session fork provenance metadata"),
+    }
 }
 
 pub(crate) fn absolute_read_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -802,6 +865,9 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                 }
                 head = Some(id);
             }
+            SummaryRecord::RootHead {} => {
+                head = None;
+            }
             SummaryRecord::Checkpoint {
                 prompt,
                 head: checkpoint_head,
@@ -922,13 +988,28 @@ impl SessionStore {
             .name
             .clone()
             .unwrap_or_else(|| fallback_title.clone());
+        let modified = self
+            .metadata_path(&id)
+            .ok()
+            .and_then(|path| path.symlink_metadata().ok())
+            .filter(|metadata| metadata.file_type().is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .map_or(candidate.modified, |metadata_modified| {
+                std::cmp::max(candidate.modified, metadata_modified)
+            });
         Some(SessionMeta {
             id,
             path: candidate.path,
             title,
             name: metadata.name,
             tags: metadata.tags,
-            modified: candidate.modified,
+            pinned: metadata.pinned,
+            archived: metadata.archived,
+            trashed_at_ms: metadata.trashed_at_ms,
+            purge_after_ms: metadata.purge_after_ms,
+            forked_from_session_id: metadata.forked_from_session_id,
+            forked_from_entry_id: metadata.forked_from_entry_id,
+            modified,
         })
     }
 
@@ -948,19 +1029,33 @@ impl SessionStore {
             .ok_or_else(|| anyhow::anyhow!("no sessions for this workspace yet"))
     }
 
-    /// Resolve a filename stem without enumerating or parsing unrelated sessions.
-    pub fn path_by_id(&self, id: &str) -> anyhow::Result<PathBuf> {
+    /// Reports whether the canonical transcript currently exists.
+    ///
+    /// A non-regular entry is an error, not absence. Permanent-deletion
+    /// recovery uses this distinction so it never crosses the irreversible
+    /// boundary merely because an existing transcript could not be validated.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn session_file_exists(&self, id: &str) -> anyhow::Result<bool> {
         if !session_id_is_valid(id) {
             anyhow::bail!("invalid session id {id:?}");
         }
         let path = self.dir.join(format!("{id}.jsonl"));
-        let metadata = path
-            .symlink_metadata()
-            .map_err(|error| anyhow::anyhow!("session {id:?} was not found: {error}"))?;
-        if !metadata.file_type().is_file() {
-            anyhow::bail!("session {id:?} is not a regular file");
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+            Ok(_) => anyhow::bail!("session {id:?} is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(anyhow::anyhow!(
+                "session {id:?} could not be inspected: {error}"
+            )),
         }
-        Ok(path)
+    }
+
+    /// Resolve a filename stem without enumerating or parsing unrelated sessions.
+    pub fn path_by_id(&self, id: &str) -> anyhow::Result<PathBuf> {
+        if !self.session_file_exists(id)? {
+            anyhow::bail!("session {id:?} was not found");
+        }
+        Ok(self.dir.join(format!("{id}.jsonl")))
     }
 
     fn metadata_dir(&self) -> PathBuf {
@@ -974,7 +1069,7 @@ impl SessionStore {
         Ok(self.metadata_dir().join(format!("{id}.json")))
     }
 
-    /// Read optional session name/tags without opening the conversation file.
+    /// Read optional user-owned session catalog metadata.
     pub fn load_metadata(&self, id: &str) -> anyhow::Result<SessionUserMetadata> {
         let path = self.metadata_path(id)?;
         let bytes = match crate::auth::read_bounded_regular(&path, MAX_SESSION_METADATA_BYTES) {
@@ -985,7 +1080,7 @@ impl SessionStore {
         let parsed: SessionUserMetadata = serde_json::from_slice(&bytes).map_err(|error| {
             anyhow::anyhow!("invalid session metadata {}: {error}", path.display())
         })?;
-        Ok(SessionUserMetadata {
+        let metadata = SessionUserMetadata {
             name: parsed
                 .name
                 .as_deref()
@@ -993,10 +1088,18 @@ impl SessionStore {
                 .transpose()?
                 .flatten(),
             tags: sanitize_session_tags(&parsed.tags)?,
-        })
+            pinned: parsed.pinned,
+            archived: parsed.archived,
+            trashed_at_ms: parsed.trashed_at_ms,
+            purge_after_ms: parsed.purge_after_ms,
+            forked_from_session_id: parsed.forked_from_session_id,
+            forked_from_entry_id: parsed.forked_from_entry_id,
+        };
+        validate_session_metadata(&metadata)?;
+        Ok(metadata)
     }
 
-    /// Atomically replace user-owned name/tags. The target session must exist.
+    /// Atomically replace user-owned catalog metadata. The target session must exist.
     pub fn save_metadata(&self, id: &str, metadata: &SessionUserMetadata) -> anyhow::Result<()> {
         self.path_by_id(id)?;
         let metadata = SessionUserMetadata {
@@ -1007,7 +1110,14 @@ impl SessionStore {
                 .transpose()?
                 .flatten(),
             tags: sanitize_session_tags(&metadata.tags)?,
+            pinned: metadata.pinned,
+            archived: metadata.archived,
+            trashed_at_ms: metadata.trashed_at_ms,
+            purge_after_ms: metadata.purge_after_ms,
+            forked_from_session_id: metadata.forked_from_session_id.clone(),
+            forked_from_entry_id: metadata.forked_from_entry_id.clone(),
         };
+        validate_session_metadata(&metadata)?;
         let bytes = serde_json::to_vec_pretty(&metadata)?;
         if bytes.len() > MAX_SESSION_METADATA_BYTES {
             anyhow::bail!("session metadata exceeds {MAX_SESSION_METADATA_BYTES} bytes");
@@ -1028,6 +1138,239 @@ impl SessionStore {
         self.save_metadata(id, &metadata)?;
         Ok(metadata)
     }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn set_pinned(&self, id: &str, pinned: bool) -> anyhow::Result<SessionUserMetadata> {
+        let mut metadata = self.load_metadata(id)?;
+        metadata.pinned = pinned;
+        self.save_metadata(id, &metadata)?;
+        Ok(metadata)
+    }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn set_archived(&self, id: &str, archived: bool) -> anyhow::Result<SessionUserMetadata> {
+        let mut metadata = self.load_metadata(id)?;
+        metadata.archived = archived;
+        metadata.trashed_at_ms = None;
+        metadata.purge_after_ms = None;
+        self.save_metadata(id, &metadata)?;
+        Ok(metadata)
+    }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn set_lifecycle(
+        &self,
+        id: &str,
+        lifecycle: SessionStorageLifecycle,
+        changed_at_ms: u64,
+    ) -> anyhow::Result<SessionUserMetadata> {
+        if changed_at_ms == 0 {
+            anyhow::bail!("session lifecycle timestamp must be positive");
+        }
+        let mut metadata = self.load_metadata(id)?;
+        match lifecycle {
+            SessionStorageLifecycle::Active => {
+                metadata.archived = false;
+                metadata.trashed_at_ms = None;
+                metadata.purge_after_ms = None;
+            }
+            SessionStorageLifecycle::Archived => {
+                metadata.archived = true;
+                metadata.trashed_at_ms = None;
+                metadata.purge_after_ms = None;
+            }
+            SessionStorageLifecycle::Trash => {
+                metadata.archived = true;
+                metadata.pinned = false;
+                if metadata.trashed_at_ms.is_none() {
+                    metadata.trashed_at_ms = Some(changed_at_ms);
+                    metadata.purge_after_ms = changed_at_ms.checked_add(SESSION_TRASH_RETENTION_MS);
+                }
+                if metadata.purge_after_ms.is_none() {
+                    anyhow::bail!("session trash retention timestamp overflow");
+                }
+            }
+        }
+        self.save_metadata(id, &metadata)?;
+        Ok(metadata)
+    }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn set_fork_provenance(
+        &self,
+        id: &str,
+        source_session_id: &str,
+        source_entry_id: &str,
+    ) -> anyhow::Result<SessionUserMetadata> {
+        if !session_id_is_valid(source_session_id)
+            || source_entry_id.is_empty()
+            || source_entry_id.len() > 256
+            || source_entry_id.chars().any(char::is_control)
+        {
+            anyhow::bail!("invalid session fork provenance");
+        }
+        let mut metadata = self.load_metadata(id)?;
+        metadata.forked_from_session_id = Some(source_session_id.to_owned());
+        metadata.forked_from_entry_id = Some(source_entry_id.to_owned());
+        self.save_metadata(id, &metadata)?;
+        Ok(metadata)
+    }
+
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn delete_permanently(&self, id: &str, expected_trashed_at_ms: u64) -> anyhow::Result<()> {
+        let metadata = self.load_metadata(id)?;
+        if metadata.trashed_at_ms != Some(expected_trashed_at_ms) {
+            anyhow::bail!("session trash confirmation is stale");
+        }
+        let session_path = self.path_by_id(id)?;
+        let metadata_path = self.metadata_path(id)?;
+        match metadata_path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => anyhow::bail!("session metadata path is not a regular file"),
+            Err(error) => return Err(error.into()),
+        }
+        let suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed);
+        let staged_session = self.dir.join(format!(".delete-{id}-{suffix:016x}"));
+        let staged_metadata = self
+            .metadata_dir()
+            .join(format!(".delete-{id}-{suffix:016x}"));
+
+        std::fs::rename(&session_path, &staged_session)?;
+        if !staged_session
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            let _ = std::fs::rename(&staged_session, &session_path);
+            anyhow::bail!("staged session transcript is not a regular file");
+        }
+        if let Err(error) = std::fs::rename(&metadata_path, &staged_metadata) {
+            let _ = std::fs::rename(&staged_session, &session_path);
+            return Err(error.into());
+        }
+        if !staged_metadata
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            let _ = std::fs::rename(&staged_metadata, &metadata_path);
+            let _ = std::fs::rename(&staged_session, &session_path);
+            anyhow::bail!("staged session metadata is not a regular file");
+        }
+        if let Err(error) = std::fs::remove_file(&staged_session) {
+            let _ = std::fs::rename(&staged_metadata, &metadata_path);
+            let _ = std::fs::rename(&staged_session, &session_path);
+            return Err(error.into());
+        }
+        std::fs::remove_file(&staged_metadata)?;
+        self.finish_permanent_delete(id)
+    }
+
+    /// Rolls back an interrupted permanent deletion while the canonical
+    /// transcript still exists.
+    ///
+    /// The intent journal is written before the transcript rename. If a crash
+    /// occurs before the irreversible transcript-removal boundary, metadata may
+    /// already have been staged. This restores that metadata and removes only
+    /// deletion staging files, making pre-commit recovery idempotent.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn rollback_permanent_delete(&self, id: &str) -> anyhow::Result<()> {
+        self.path_by_id(id)?;
+        let metadata_dir = self.metadata_dir();
+        let metadata_path = self.metadata_path(id)?;
+        match metadata_path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => anyhow::bail!("session metadata path is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let staged = staged_deletion_files(&metadata_dir, id)?;
+                let [staged_metadata] = staged.as_slice() else {
+                    anyhow::bail!("interrupted session metadata cannot be restored");
+                };
+                std::fs::rename(staged_metadata, &metadata_path)?;
+                std::fs::File::open(&metadata_dir)?.sync_all()?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        remove_staged_deletion_files(&self.dir, id)?;
+        remove_staged_deletion_files(&metadata_dir, id)?;
+        std::fs::File::open(&self.dir)?.sync_all()?;
+        std::fs::File::open(metadata_dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Finishes an already-confirmed permanent deletion after interruption.
+    ///
+    /// This idempotently removes both canonical files and transaction staging
+    /// files. Callers must establish the destructive confirmation boundary
+    /// before invoking it.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn finish_permanent_delete(&self, id: &str) -> anyhow::Result<()> {
+        if !session_id_is_valid(id) {
+            anyhow::bail!("invalid session ID");
+        }
+        remove_regular_file_if_exists(&self.dir.join(format!("{id}.jsonl")))?;
+        remove_regular_file_if_exists(&self.metadata_path(id)?)?;
+        remove_staged_deletion_files(&self.dir, id)?;
+        let metadata_dir = self.metadata_dir();
+        remove_staged_deletion_files(&metadata_dir, id)?;
+        std::fs::File::open(&self.dir)?.sync_all()?;
+        std::fs::File::open(metadata_dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Removes a just-created session and sidecar during a higher-level
+    /// transaction rollback. This is intentionally not a user-facing delete
+    /// path and must only be used before the new session is acknowledged.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn discard_unacknowledged(&self, id: &str) -> anyhow::Result<()> {
+        let session_path = self.path_by_id(id)?;
+        std::fs::remove_file(session_path)?;
+        let metadata_path = self.metadata_path(id)?;
+        match metadata_path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                std::fs::remove_file(metadata_path)?;
+            }
+            Ok(_) => anyhow::bail!("session metadata path is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+}
+
+fn remove_regular_file_if_exists(path: &Path) -> anyhow::Result<()> {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!("session deletion path is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_staged_deletion_files(directory: &Path, id: &str) -> anyhow::Result<()> {
+    for path in staged_deletion_files(directory, id)? {
+        remove_regular_file_if_exists(&path)?;
+    }
+    Ok(())
+}
+
+fn staged_deletion_files(directory: &Path, id: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let prefix = format!(".delete-{id}-");
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+            continue;
+        };
+        if suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 #[cfg(test)]
@@ -1059,6 +1402,209 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("2026-07-12T14-30-05Z-")));
+    }
+
+    #[test]
+    fn catalog_metadata_round_trips_without_rewriting_the_session() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("metadata.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("original title".into())],
+            })))
+            .unwrap();
+        drop(session);
+        let session_bytes = std::fs::read(&path).unwrap();
+
+        store
+            .set_tags("metadata", vec!["work".into(), "active".into()])
+            .unwrap();
+        store.rename("metadata", "  Renamed session  ").unwrap();
+        store.set_pinned("metadata", true).unwrap();
+        store.set_archived("metadata", true).unwrap();
+
+        let reopened = SessionStore::new(root.path(), workspace.path());
+        let metadata = reopened.load_metadata("metadata").unwrap();
+        assert_eq!(metadata.name.as_deref(), Some("Renamed session"));
+        assert_eq!(metadata.tags, ["work", "active"]);
+        assert!(metadata.pinned);
+        assert!(metadata.archived);
+        let listed = reopened.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "Renamed session");
+        assert!(listed[0].pinned);
+        assert!(listed[0].archived);
+        assert_eq!(std::fs::read(path).unwrap(), session_bytes);
+    }
+
+    #[test]
+    fn trash_lifecycle_is_recoverable_and_preserves_its_retention_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("lifecycle.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("recover me".into())],
+            })))
+            .unwrap();
+        drop(session);
+        store.set_pinned("lifecycle", true).unwrap();
+
+        let trashed = store
+            .set_lifecycle("lifecycle", SessionStorageLifecycle::Trash, 1_000)
+            .unwrap();
+        assert!(trashed.archived);
+        assert!(!trashed.pinned);
+        assert_eq!(trashed.trashed_at_ms, Some(1_000));
+        assert_eq!(
+            trashed.purge_after_ms,
+            Some(1_000 + SESSION_TRASH_RETENTION_MS)
+        );
+
+        let repeated = store
+            .set_lifecycle("lifecycle", SessionStorageLifecycle::Trash, 9_000)
+            .unwrap();
+        assert_eq!(repeated.trashed_at_ms, trashed.trashed_at_ms);
+        assert_eq!(repeated.purge_after_ms, trashed.purge_after_ms);
+        let listed = store.list();
+        assert_eq!(listed[0].trashed_at_ms, Some(1_000));
+        assert_eq!(
+            listed[0].purge_after_ms,
+            Some(1_000 + SESSION_TRASH_RETENTION_MS)
+        );
+
+        let restored = store
+            .set_lifecycle("lifecycle", SessionStorageLifecycle::Active, 10_000)
+            .unwrap();
+        assert!(!restored.archived);
+        assert_eq!(restored.trashed_at_ms, None);
+        assert_eq!(restored.purge_after_ms, None);
+
+        let archived = store
+            .set_lifecycle("lifecycle", SessionStorageLifecycle::Archived, 11_000)
+            .unwrap();
+        assert!(archived.archived);
+        assert_eq!(archived.trashed_at_ms, None);
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn permanent_delete_requires_the_current_trash_confirmation() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("delete-me.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("delete me".into())],
+            })))
+            .unwrap();
+        drop(session);
+        store
+            .set_lifecycle("delete-me", SessionStorageLifecycle::Trash, 2_000)
+            .unwrap();
+        let metadata_path = store.metadata_path("delete-me").unwrap();
+
+        let error = store.delete_permanently("delete-me", 1_999).unwrap_err();
+        assert!(error.to_string().contains("confirmation is stale"));
+        assert!(path.is_file());
+        assert!(metadata_path.is_file());
+
+        std::fs::write(
+            store.dir().join(".delete-delete-me-deadbeefdeadbeef"),
+            b"staged transcript",
+        )
+        .unwrap();
+        std::fs::write(
+            store
+                .metadata_dir()
+                .join(".delete-delete-me-deadbeefdeadbeef"),
+            b"staged metadata",
+        )
+        .unwrap();
+        store.delete_permanently("delete-me", 2_000).unwrap();
+        store.finish_permanent_delete("delete-me").unwrap();
+        assert!(!path.exists());
+        assert!(!metadata_path.exists());
+        assert!(store.path_by_id("delete-me").is_err());
+    }
+
+    #[test]
+    fn interrupted_pre_commit_delete_restores_metadata_idempotently() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("rollback-delete.jsonl");
+        drop(Session::create(&path).unwrap());
+        store.rename("rollback-delete", "Keep this name").unwrap();
+        store
+            .set_lifecycle("rollback-delete", SessionStorageLifecycle::Trash, 12_000)
+            .unwrap();
+        let metadata_path = store.metadata_path("rollback-delete").unwrap();
+        let staged_metadata = store
+            .metadata_dir()
+            .join(".delete-rollback-delete-deadbeefdeadbeef");
+        std::fs::rename(&metadata_path, &staged_metadata).unwrap();
+        let staged_transcript = store.dir().join(".delete-rollback-delete-deadbeefdeadbeef");
+        std::fs::write(&staged_transcript, b"stale staging file").unwrap();
+
+        store.rollback_permanent_delete("rollback-delete").unwrap();
+        store.rollback_permanent_delete("rollback-delete").unwrap();
+
+        let metadata = store.load_metadata("rollback-delete").unwrap();
+        assert_eq!(metadata.name.as_deref(), Some("Keep this name"));
+        assert_eq!(metadata.trashed_at_ms, Some(12_000));
+        assert!(path.is_file());
+        assert!(metadata_path.is_file());
+        assert!(!staged_metadata.exists());
+        assert!(!staged_transcript.exists());
+    }
+
+    #[test]
+    fn fork_provenance_round_trips_as_an_atomic_pair() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("fork.jsonl");
+        let mut session = Session::create(path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("fork".into())],
+            })))
+            .unwrap();
+        drop(session);
+
+        let metadata = store
+            .set_fork_provenance("fork", "source-session", "0042")
+            .unwrap();
+        assert_eq!(
+            metadata.forked_from_session_id.as_deref(),
+            Some("source-session")
+        );
+        assert_eq!(metadata.forked_from_entry_id.as_deref(), Some("0042"));
+        let listed = store.list();
+        assert_eq!(
+            listed[0].forked_from_session_id.as_deref(),
+            Some("source-session")
+        );
+        assert_eq!(listed[0].forked_from_entry_id.as_deref(), Some("0042"));
+
+        let invalid = SessionUserMetadata {
+            forked_from_session_id: Some("source-session".into()),
+            ..SessionUserMetadata::default()
+        };
+        assert!(store.save_metadata("fork", &invalid).is_err());
     }
 
     #[test]
@@ -1593,15 +2139,19 @@ mod tests {
         std::fs::create_dir(store.dir().join("directory.jsonl")).unwrap();
 
         assert_eq!(store.path_by_id("one").unwrap(), one_path);
+        assert!(store.session_file_exists("one").unwrap());
+        assert!(!store.session_file_exists("missing").unwrap());
         for invalid in ["", ".", "..", "../one", "one/two", "one\n"] {
             assert!(store.path_by_id(invalid).is_err(), "accepted {invalid:?}");
         }
         assert!(store.path_by_id("directory").is_err());
+        assert!(store.session_file_exists("directory").is_err());
 
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&one_path, store.dir().join("linked.jsonl")).unwrap();
             assert!(store.path_by_id("linked").is_err());
+            assert!(store.session_file_exists("linked").is_err());
             assert!(!store.list().iter().any(|session| {
                 session.path.file_stem().and_then(|stem| stem.to_str()) == Some("linked")
             }));

@@ -3,6 +3,7 @@
 pub mod interactive;
 pub mod plain;
 pub mod print;
+pub mod rpc;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

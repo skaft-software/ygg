@@ -137,6 +137,7 @@ pub async fn run(command: ExtensionCommand) -> anyhow::Result<()> {
     }
 }
 
+#[allow(dead_code)]
 pub fn run_serve(no_open: bool, port: u16, web_root: Option<PathBuf>) -> anyhow::Result<()> {
     let root = extensions_root()?;
     let manifest = load_installed(&root).with_context(|| {

@@ -608,7 +608,8 @@ struct CancellationState {
 }
 
 impl CancellationToken {
-    pub(crate) fn cancel(&self) {
+    /// Signal cooperative cancellation to all holders of this token.
+    pub fn cancel(&self) {
         if !self.0.cancelled.swap(true, Ordering::AcqRel) {
             self.0.notify.notify_waiters();
         }

@@ -1,0 +1,3 @@
+Running unittests src/lib.rs (target/debug/deps/example)
+running 2 tests
+test first_case ... ok

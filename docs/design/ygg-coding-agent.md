@@ -51,6 +51,20 @@ Repository content, tool output, and external content remain data rather than
 instructions; project or skill guidance is authoritative only when the host
 labels it as such.
 
+System instructions are composed through `compose_instructions(&Config)`.
+
+- If `Config::system_prompt` is `Some(value)`, composition is replaced entirely
+  by that exact value (including `""`), bypassing AGENTS and skill instructions.
+- If `system_prompt` is `None`, the default flow composes the base prompt,
+  trusted workspace/global `AGENTS.md` context, and active skill instructions.
+- Layer precedence for `system_prompt` follows the same startup precedence model
+  as `model` and `reasoning`: CLI `--system-prompt` overrides project config,
+  which overrides global config, with `YGG_SYSTEM_PROMPT` as the lowest optional
+  layer.
+- The override does not persist through session metadata; startup and rebuild
+  compose instructions from the current live config across `interactive`,
+  `plain`, `print`, and `rpc`.
+
 The environment block truthfully distinguishes the workspace root from the
 invocation directory. Relative tool paths and the default `bash` working
 directory resolve from the workspace root. Enabled core-tool names are listed,

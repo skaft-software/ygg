@@ -321,6 +321,7 @@ pub(crate) struct ShellState {
     /// Selection and viewport for the slash-command popup. Filtering resets
     /// both; Escape dismisses it until the command token changes again.
     prompt_templates: Arc<[crate::prompts::PromptTemplateDescriptor]>,
+    skill_commands: Arc<[(String, String)]>,
     extension_commands: Arc<[(String, String)]>,
     slash_selection: usize,
     slash_scroll: usize,
@@ -1364,6 +1365,20 @@ impl InteractiveShell {
                 }
                 state.open_reasoning_status();
             }
+            AgentEvent::FollowUpDelivered { messages } => {
+                state.close_streaming_blocks();
+                let model_lab = state.executing_model_lab();
+                let prompt_color = state.executing_prompt_color();
+                for message in messages {
+                    state.push_block(TranscriptBlock::User {
+                        text: message.clone(),
+                        model_lab,
+                        prompt_color: prompt_color.clone(),
+                        persisted: true,
+                    });
+                }
+                state.open_reasoning_status();
+            }
             AgentEvent::CompactionStarted { .. } => {
                 // Overflow recovery can begin after a partial provider
                 // attempt. Its deltas were never durable and must not survive
@@ -1953,6 +1968,13 @@ impl InteractiveShell {
     ) {
         let mut state = self.state.borrow_mut();
         state.prompt_templates = templates;
+        state.slash_selection = 0;
+        state.slash_scroll = 0;
+    }
+
+    pub fn set_skill_commands(&mut self, commands: Arc<[(String, String)]>) {
+        let mut state = self.state.borrow_mut();
+        state.skill_commands = commands;
         state.slash_selection = 0;
         state.slash_scroll = 0;
     }
