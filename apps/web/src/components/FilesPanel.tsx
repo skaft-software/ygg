@@ -877,7 +877,7 @@ function ProjectFilesWorkspace({
                   path={selectedFile.path}
                   value={draft}
                   readOnly={!writeAvailable || selectedFile.truncated || !selectedFile.sha256}
-                  showLineNumbers={markdownFile}
+                  showLineNumbers
                   onChange={(value) => {
                     setDraft(value);
                     setCopyState("idle");
