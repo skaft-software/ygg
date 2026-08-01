@@ -110,14 +110,13 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 logs_dir,
                 SimpleNamespace(return_code=124, stdout="", stderr="Terminated"),
             )
-            agent = Ygg(logs_dir, agent_timeout_sec=2, bash_timeout_secs=600)
+            agent = Ygg(logs_dir, agent_timeout_sec=2)
             await agent.setup(environment)
             with self.assertRaises(YggBenchmarkTimeoutError):
                 await agent.run("task", environment, AgentContext())
             run_call = environment.calls[-1]
             self.assertTrue(run_call["command"].startswith("timeout --signal=TERM"))
             self.assertIn(" 2s /tmp/ygg ", run_call["command"])
-            self.assertIn("--bash-timeout-secs 600", run_call["command"])
             self.assertEqual(run_call["timeout_sec"], 17)
             self.assertEqual(
                 (logs_dir / "failure-classification.txt").read_text(),

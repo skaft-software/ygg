@@ -24,17 +24,12 @@ class CommandTests(unittest.TestCase):
             reasoning="medium",
             session_dir="/logs/agent/sessions",
             max_turns=8,
-            bash_timeout_secs=600,
         )
 
         self.assertEqual(shlex.split(command.shell), list(command.argv))
         self.assertEqual(command.argv[-1], instruction)
         self.assertIn("--print", command.argv)
         self.assertIn("--workspace-trusted", command.argv)
-        self.assertEqual(
-            command.argv[command.argv.index("--bash-timeout-secs") + 1],
-            "600",
-        )
 
     def test_command_accepts_instruction_starting_with_dash(self) -> None:
         instruction = "- "
@@ -50,20 +45,15 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(command.argv[-2:], ("--", instruction))
 
     def test_argv_rejects_invalid_limits(self) -> None:
-        for kwargs in (
-            {"max_turns": 0},
-            {"bash_timeout_secs": 0},
-            {"bash_timeout_secs": 3_601},
-        ):
-            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                build_ygg_argv(
-                    "/tmp/ygg",
-                    "prompt",
-                    model=None,
-                    reasoning=None,
-                    session_dir="/logs/agent/sessions",
-                    **kwargs,
-                )
+        with self.assertRaises(ValueError):
+            build_ygg_argv(
+                "/tmp/ygg",
+                "prompt",
+                model=None,
+                reasoning=None,
+                session_dir="/logs/agent/sessions",
+                max_turns=0,
+            )
 
     def test_version_parser_accepts_ygg_output(self) -> None:
         self.assertEqual(parse_ygg_version("ygg 0.3.2-alpha\n"), "0.3.2-alpha")
