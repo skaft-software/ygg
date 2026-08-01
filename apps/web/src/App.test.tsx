@@ -8,7 +8,7 @@ import { fixtureBootstrap } from "./fixtures";
 
 vi.mock("@xterm/xterm", () => ({ Terminal: class {} }));
 
-import { SessionHeader } from "./App";
+import { SessionHeader, SessionSelectionErrorBanner } from "./App";
 
 function renderHeader(
   sessionExportAvailable: boolean,
@@ -88,5 +88,26 @@ describe("session header safe export", () => {
     );
     expect(download).toHaveAttribute("download");
     expect(download.tagName).toBe("A");
+  });
+});
+
+describe("session selection errors", () => {
+  afterEach(cleanup);
+
+  it("surfaces the failure and offers a retry", async () => {
+    const user = userEvent.setup();
+    const onRetry = vi.fn();
+    render(
+      <SessionSelectionErrorBanner
+        message="Session failed with 500"
+        onRetry={onRetry}
+      />,
+    );
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Could not open that session.");
+    expect(alert).toHaveTextContent("Session failed with 500");
+    await user.click(screen.getByRole("button", { name: "Try again" }));
+    expect(onRetry).toHaveBeenCalledOnce();
   });
 });

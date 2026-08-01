@@ -405,6 +405,37 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("keeps the current session visible and reports a failed selection", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+    transport.sessionLoader = async (sessionId) => {
+      if (sessionId === "session-done") {
+        throw new Error("Session failed with 500");
+      }
+      return clone(fixtureSessions[sessionId]);
+    };
+
+    await expect(store.selectSession("session-done")).rejects.toThrow(
+      "Session failed with 500",
+    );
+
+    expect(store.getSnapshot()).toMatchObject({
+      selectedSessionId: "session-fresh",
+      selectionError: {
+        sessionId: "session-done",
+        message: "Session failed with 500",
+      },
+    });
+    expect(store.selectedSession?.sessionId).toBe("session-fresh");
+
+    transport.sessionLoader = async (sessionId) =>
+      clone(fixtureSessions[sessionId]);
+    await store.selectSession("session-done");
+    expect(store.getSnapshot().selectionError).toBeNull();
+    store.dispose();
+  });
+
   it("does not let a stale session load replace a newer selection", async () => {
     const transport = new TestTransport();
     const delayed = deferred<SessionSnapshot>();

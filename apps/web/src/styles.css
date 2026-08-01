@@ -1492,6 +1492,61 @@ kbd {
   color: var(--text-soft);
 }
 
+.session-selection-error {
+  position: absolute;
+  z-index: 13;
+  top: 108px;
+  left: 50%;
+  max-width: min(680px, calc(100% - 32px));
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 24%, var(--line));
+  border-radius: 12px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--danger) 8%, var(--surface-raised));
+  box-shadow: var(--shadow-float);
+  transform: translateX(-50%);
+  animation: connection-banner-enter 220ms cubic-bezier(0.23, 1, 0.32, 1)
+    both;
+}
+
+.session-selection-error > svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: var(--danger);
+}
+
+.session-selection-error > span {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.session-selection-error small {
+  overflow: hidden;
+  color: var(--text-soft);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-selection-error button {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border: 1px solid color-mix(in srgb, var(--danger) 26%, var(--line));
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+  cursor: pointer;
+}
+
+.session-selection-error button:hover {
+  border-color: color-mix(in srgb, var(--danger) 48%, var(--line));
+  background: var(--surface-hover);
+}
 /* Transcript */
 
 .conversation {
