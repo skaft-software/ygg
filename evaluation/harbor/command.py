@@ -31,6 +31,9 @@ class YggCommand:
         return shlex.join(self.argv)
 
 
+_MAX_BASH_TIMEOUT_SECS = 3_600
+
+
 def build_ygg_argv(
     binary: str,
     instruction: str,
@@ -39,6 +42,7 @@ def build_ygg_argv(
     reasoning: str | None,
     session_dir: str,
     max_turns: int | None = None,
+    bash_timeout_secs: int | None = None,
     workspace_trusted: bool = True,
 ) -> tuple[str, ...]:
     """Build the explicit headless Ygg argument vector.
@@ -57,6 +61,11 @@ def build_ygg_argv(
         raise ValueError("session_dir must not be empty")
     if max_turns is not None and max_turns < 1:
         raise ValueError("max_turns must be greater than zero")
+    if (
+        bash_timeout_secs is not None
+        and not 1 <= bash_timeout_secs <= _MAX_BASH_TIMEOUT_SECS
+    ):
+        raise ValueError("bash_timeout_secs must be between 1 and 3,600 seconds")
 
     argv: list[str] = [binary, "--print"]
     if model:
@@ -68,6 +77,8 @@ def build_ygg_argv(
         argv.append("--workspace-trusted")
     if max_turns is not None:
         argv.extend(("--max-turns", str(max_turns)))
+    if bash_timeout_secs is not None:
+        argv.extend(("--bash-timeout-secs", str(bash_timeout_secs)))
     argv.extend(("--", instruction))
     return tuple(argv)
 
@@ -80,6 +91,7 @@ def build_ygg_command(
     reasoning: str | None,
     session_dir: str,
     max_turns: int | None = None,
+    bash_timeout_secs: int | None = None,
     workspace_trusted: bool = True,
 ) -> YggCommand:
     """Build a shell-safe Ygg command."""
@@ -92,6 +104,7 @@ def build_ygg_command(
             reasoning=reasoning,
             session_dir=session_dir,
             max_turns=max_turns,
+            bash_timeout_secs=bash_timeout_secs,
             workspace_trusted=workspace_trusted,
         )
     )

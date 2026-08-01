@@ -176,7 +176,10 @@ The adapter's optional inner timeout can be set with
 `--agent-kwarg agent_timeout_sec=<seconds>`. Keep it below Harbor's task agent
 timeout so the adapter's `timeout` wrapper gets a chance to terminate Ygg and
 retain its artifacts. A timeout is classified as `benchmark_timeout`, not as a
-provider failure.
+provider failure. For long-running shell commands, pass
+`--agent-kwarg bash_timeout_secs=<seconds>` to raise Ygg's per-command ceiling
+(up to the CLI's 3,600-second limit); this is separate from Harbor's outer task
+timeout. Record this setting when comparing runs.
 
 ## Baselines and interpretation
 
