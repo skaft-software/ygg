@@ -320,6 +320,7 @@ pub enum AttachError {
     Unreadable(String),
     TooLarge { limit_bytes: u64 },
     UnsupportedModality { modality: &'static str },
+    UnsupportedAudioFormat(AudioFormat),
 }
 
 impl std::fmt::Display for AttachError {
@@ -336,6 +337,10 @@ impl std::fmt::Display for AttachError {
             Self::UnsupportedModality { modality } => {
                 write!(f, "the active model does not accept {modality} input")
             }
+            Self::UnsupportedAudioFormat(format) => write!(
+                f,
+                "the active provider route does not accept {format:?} audio input (use WAV or MP3)",
+            ),
         }
     }
 }
@@ -391,6 +396,11 @@ impl AttachmentLedger {
             return Err(AttachError::UnsupportedModality {
                 modality: modality_name,
             });
+        }
+        if let MediaKind::Audio(format) = &kind {
+            if !matches!(format, AudioFormat::Wav | AudioFormat::Mp3) {
+                return Err(AttachError::UnsupportedAudioFormat(*format));
+            }
         }
         let metadata = fs::metadata(path).map_err(|e| AttachError::Unreadable(e.to_string()))?;
         if metadata.len() > limit {
@@ -839,6 +849,20 @@ mod tests {
         assert!(matches!(
             ledger.attach_media(&big, all_modalities()),
             Err(AttachError::TooLarge { .. })
+        ));
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn attach_media_rejects_audio_formats_the_chat_codec_cannot_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let audio = dir.path().join("memo.flac");
+        fs::write(&audio, b"fLaC").unwrap();
+
+        let mut ledger = AttachmentLedger::default();
+        assert!(matches!(
+            ledger.attach_media(&audio, all_modalities()),
+            Err(AttachError::UnsupportedAudioFormat(AudioFormat::Flac))
         ));
         assert!(ledger.is_empty());
     }

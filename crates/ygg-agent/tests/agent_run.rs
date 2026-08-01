@@ -20,8 +20,9 @@ use ygg_agent::{
     SandboxConfig, Session, Tool, ToolContext, ToolError, ToolOutput, UsageRecordKind, UserInput,
 };
 use ygg_ai::{
-    AiClient, AssistantMessage, AssistantPart, Auth, Capabilities, Endpoint, EndpointId, Media,
-    Message, Modality, ModalitySet, Model, ModelId, ModelLimits, ModelSpec, Pricing, Protocol,
+    AiClient, AssistantMessage, AssistantPart, AudioFormat, AudioOutputOptions, AudioPayload,
+    AudioVoice, Auth, Capabilities, Endpoint, EndpointId, Media, Message, Modality, ModalitySet,
+    Model, ModelId, ModelLimits, ModelSpec, OutputModalities, Pricing, Protocol,
     ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningEffortBudgets, TokenRate,
     ToolCall, Usage, UserMessage, UserPart,
 };
@@ -322,6 +323,38 @@ impl Respond for Script {
         ResponseTemplate::new(200)
             .set_body_string(body)
             .insert_header("content-type", "text/event-stream")
+    }
+}
+
+/// Replays JSON or SSE responses in sequence according to each request's stream flag.
+struct JsonScript {
+    bodies: Vec<String>,
+    next: AtomicUsize,
+}
+
+impl Respond for JsonScript {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let i = self.next.fetch_add(1, Ordering::SeqCst);
+        let body = self
+            .bodies
+            .get(i)
+            .or_else(|| self.bodies.last())
+            .expect("script must have at least one body")
+            .clone();
+        let streaming = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("stream").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        ResponseTemplate::new(200)
+            .set_body_string(body)
+            .insert_header(
+                "content-type",
+                if streaming {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            )
     }
 }
 
@@ -641,6 +674,48 @@ fn openai_multimodal_model(uri: &str) -> Model {
             timeout: Duration::from_secs(10),
         }),
     }
+}
+
+fn openai_audio_model(uri: &str) -> Model {
+    let mut model = openai_multimodal_model(uri);
+    let spec = Arc::make_mut(&mut model.spec);
+    spec.capabilities.input_modalities = spec.capabilities.input_modalities.with(Modality::Audio);
+    spec.capabilities.output_modalities = spec.capabilities.output_modalities.with(Modality::Audio);
+    model
+}
+
+fn openai_audio_turn(id: &str, data: &[u8], transcript: &str) -> String {
+    use base64::Engine as _;
+
+    serde_json::json!({
+        "id": id,
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "audio": {
+                    "id": format!("{id}-audio"),
+                    "data": base64::engine::general_purpose::STANDARD.encode(data),
+                    "transcript": transcript,
+                    "expires_at": 4_102_444_800_u64
+                }
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 3,
+            "total_tokens": 8
+        }
+    })
+    .to_string()
+}
+
+fn configure_audio_output(agent: &mut Agent) {
+    agent.set_output_modalities(OutputModalities::TextAndAudio(AudioOutputOptions {
+        format: AudioFormat::Wav,
+        voice: AudioVoice::Named("alloy".to_string()),
+    }));
 }
 
 fn scripted_responses_model(uri: &str) -> Model {
@@ -2079,6 +2154,175 @@ async fn openai_compatible_agent_sends_inline_image_end_to_end() {
         &agent.session().context().unwrap()[0],
         Message::User(user) if user.content.iter().any(|part| matches!(part, UserPart::Media(_)))
     ));
+}
+
+#[tokio::test]
+async fn openai_audio_request_emits_output_media_and_commits_transcript() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(JsonScript {
+            bodies: vec![openai_audio_turn(
+                "audio-event",
+                b"generated wav",
+                "Spoken response.",
+            )],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let mut agent = build_agent_with_reasoning(
+        openai_audio_model(&server.uri()),
+        &sessions.path().join("audio-events.jsonl"),
+        workspace.path(),
+        ReasoningConfig::Off,
+        Some(4),
+    );
+    configure_audio_output(&mut agent);
+
+    let input = UserInput::from(vec![
+        InputPart::Text("answer aloud".into()),
+        InputPart::Media(Media::audio_bytes(
+            bytes::Bytes::from_static(b"input wav"),
+            AudioFormat::Wav,
+        )),
+    ]);
+    let mut run = agent.prompt(input).await.unwrap();
+    let events = collect(&mut run).await;
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    let (index, media) = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::OutputMedia { index, media } => Some((*index, media)),
+            _ => None,
+        })
+        .expect("completed output media event");
+    assert_eq!(index, 0);
+    let Media::Audio(audio) = media else {
+        panic!("expected generated audio");
+    };
+    assert_eq!(audio.format, AudioFormat::Wav);
+    assert_eq!(audio.transcript.as_deref(), Some("Spoken response."));
+    let AudioPayload::InlineWithProviderRef { data, reference } = &audio.payload else {
+        panic!("expected output bytes with a reusable provider reference");
+    };
+    assert_eq!(data.as_ref(), b"generated wav");
+    assert_eq!(reference.id, "audio-event-audio");
+
+    let turn = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnFinished { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("committed turn");
+    assert!(turn.content.iter().any(|part| {
+        matches!(part, AssistantPart::Media(Media::Audio(audio))
+            if audio.transcript.as_deref() == Some("Spoken response."))
+    }));
+    drop(run);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let request: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(request["stream"], false);
+    assert_eq!(request["modalities"], serde_json::json!(["text", "audio"]));
+    assert_eq!(
+        request["audio"],
+        serde_json::json!({"voice":"alloy", "format":"wav"})
+    );
+    let user_content = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        user_content[0],
+        serde_json::json!({"type":"text", "text":"answer aloud"})
+    );
+    assert_eq!(
+        user_content[1],
+        serde_json::json!({
+            "type": "input_audio",
+            "input_audio": {"data": "aW5wdXQgd2F2", "format": "wav"}
+        })
+    );
+}
+
+#[tokio::test]
+async fn complete_discards_rejected_audio_and_returns_only_committed_media() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(JsonScript {
+            bodies: vec![
+                openai_audio_turn("rejected", b"reject me", "Unverified answer."),
+                openai_text_turn("C"),
+                openai_audio_turn("accepted", b"keep me", "Verified answer."),
+                openai_text_turn("R"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let mut agent = build_agent_with_reasoning(
+        openai_audio_model(&server.uri()),
+        &sessions.path().join("audio-complete.jsonl"),
+        workspace.path(),
+        ReasoningConfig::Off,
+        Some(4),
+    );
+    configure_audio_output(&mut agent);
+    agent.set_completion_policy(CompletionPolicy::TerminalGate);
+
+    let output = agent.complete("answer with verified audio").await.unwrap();
+    assert!(matches!(output.reason, FinishReason::Completed));
+    assert!(output.text.is_empty());
+    assert_eq!(output.media.len(), 1);
+    let Media::Audio(audio) = &output.media[0] else {
+        panic!("expected generated audio");
+    };
+    assert_eq!(audio.transcript.as_deref(), Some("Verified answer."));
+    let AudioPayload::InlineWithProviderRef { data, reference } = &audio.payload else {
+        panic!("expected output bytes with a reusable provider reference");
+    };
+    assert_eq!(data.as_ref(), b"keep me");
+    assert_eq!(reference.id, "accepted-audio");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4);
+    for index in [0, 2] {
+        let request: serde_json::Value = serde_json::from_slice(&requests[index].body).unwrap();
+        assert_eq!(request["modalities"], serde_json::json!(["text", "audio"]));
+        assert_eq!(request["stream"], false);
+    }
+    for index in [1, 3] {
+        let request: serde_json::Value = serde_json::from_slice(&requests[index].body).unwrap();
+        assert!(request.get("modalities").is_none());
+        assert_eq!(request["stream"], true);
+    }
+    let decisions = agent
+        .session()
+        .usage_records()
+        .iter()
+        .filter_map(|record| match record.kind {
+            UsageRecordKind::TerminalGate { returned } => Some(returned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decisions, vec![Some(false), Some(true)]);
 }
 
 #[tokio::test]

@@ -8,8 +8,8 @@ use crate::auth::CredentialResolverRegistry;
 use crate::error::ConfigError;
 use crate::pricing::Pricing;
 use crate::types::{
-    Capabilities, Endpoint, EndpointId, ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode,
-    Protocol, ReasoningControl,
+    Capabilities, Endpoint, EndpointId, Modality, ModelId, ModelLimits, ModelSpec,
+    OpenAiChatReasoningMode, Protocol, ReasoningControl,
 };
 
 fn default_timeout_secs() -> u64 {
@@ -272,6 +272,12 @@ pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
         || spec.limits.context_window == 0
         || spec.limits.max_output_tokens == 0
         || spec.limits.max_output_tokens > spec.limits.context_window
+        || (spec.protocol != Protocol::OpenAiChat
+            && (spec.capabilities.input_modalities.contains(Modality::Audio)
+                || spec
+                    .capabilities
+                    .output_modalities
+                    .contains(Modality::Audio)))
     {
         return Err(ConfigError::InvalidModel(spec.id.clone()));
     }
@@ -544,6 +550,56 @@ mod tests {
             sonnet.spec.pricing.as_ref().unwrap().cache_write_1h,
             Some(crate::pricing::TokenRate(6_000_000))
         );
+    }
+
+    #[test]
+    fn builtin_audio_capabilities_are_route_effective_and_format_specific() {
+        let catalog = ModelCatalog::builtin().unwrap();
+        let audio = catalog.resolve(&ModelId("gpt-audio-1.5".into())).unwrap();
+        let capabilities = audio.spec.audio_capabilities().unwrap();
+        assert_eq!(
+            capabilities.input_formats,
+            &[
+                crate::types::AudioFormat::Wav,
+                crate::types::AudioFormat::Mp3
+            ]
+        );
+        assert!(capabilities
+            .output_formats
+            .contains(&crate::types::AudioFormat::Pcm16));
+        assert_eq!(
+            capabilities.output_delivery,
+            Some(crate::types::AudioOutputDelivery::Completed)
+        );
+        assert!(audio
+            .spec
+            .effective_input_modalities()
+            .contains(Modality::Audio));
+
+        let responses = catalog
+            .resolve(&ModelId("gpt-5.4-mini-responses".into()))
+            .unwrap();
+        assert!(responses.spec.audio_capabilities().is_none());
+        assert!(!responses
+            .spec
+            .effective_input_modalities()
+            .contains(Modality::Audio));
+    }
+
+    #[test]
+    fn catalog_rejects_audio_bits_on_protocols_without_audio_codecs() {
+        let catalog = ModelCatalog::builtin().unwrap();
+        let mut spec = (*catalog
+            .resolve(&ModelId("gpt-5.4-mini-responses".into()))
+            .unwrap()
+            .spec)
+            .clone();
+        spec.capabilities.input_modalities =
+            spec.capabilities.input_modalities.with(Modality::Audio);
+        assert!(matches!(
+            validate_model_spec(&spec),
+            Err(ConfigError::InvalidModel(_))
+        ));
     }
 
     #[test]

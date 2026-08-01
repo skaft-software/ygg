@@ -713,6 +713,9 @@ impl RunTracker {
                 };
                 run.transition(phase, now);
             }
+            AgentEvent::OutputMedia { .. } => {
+                run.transition(RunPhase::StreamingResponse, now);
+            }
             AgentEvent::ProviderRetry { .. } | AgentEvent::CandidateRejected { .. } => {
                 let provider = run.provider.clone();
                 run.transition(RunPhase::AwaitingProvider { provider }, now);

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ygg_ai::{AssistantMessage, ToolCallId, Usage};
+use ygg_ai::{AssistantMessage, Media, ToolCallId, Usage};
 
 use crate::agent::AgentError;
 use crate::session::EntryId;
@@ -28,6 +28,18 @@ pub enum AgentEvent {
         channel: OutputChannel,
         /// The delta text.
         text: String,
+    },
+
+    /// A complete generated media part from the current provider attempt.
+    ///
+    /// Like [`AgentEvent::OutputDelta`], this is provisional until the matching
+    /// [`AgentEvent::TurnFinished`]. A later `ProviderRetry` or
+    /// `CandidateRejected` discards it.
+    OutputMedia {
+        /// Canonical content-part index within the assistant message.
+        index: usize,
+        /// Complete generated image or audio payload.
+        media: Media,
     },
 
     /// The current provider attempt ended transiently and the same logical

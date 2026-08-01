@@ -285,10 +285,15 @@ pub fn prepare_handoff(
     })
 }
 
-fn media_label(media: &Media) -> &'static str {
+fn media_summary(media: &Media) -> String {
     match media {
-        Media::Image(_) => "[image]",
-        Media::Audio(_) => "[audio]",
+        Media::Image(_) => "[image]".to_owned(),
+        Media::Audio(audio) => audio
+            .transcript
+            .as_ref()
+            .filter(|transcript| !transcript.trim().is_empty())
+            .map(|transcript| format!("[audio transcript]: {transcript}"))
+            .unwrap_or_else(|| "[audio]".to_owned()),
     }
 }
 
@@ -310,7 +315,7 @@ fn tool_result_text(result: &ToolResult) -> String {
         .iter()
         .map(|part| match part {
             ToolResultPart::Text(text) => text.clone(),
-            ToolResultPart::Media(media) => media_label(media).to_owned(),
+            ToolResultPart::Media(media) => media_summary(media),
         })
         .collect::<Vec<_>>()
         .join("")
@@ -350,7 +355,7 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                 for part in &user.content {
                     match part {
                         UserPart::Text(text) => user_content.push(text.clone()),
-                        UserPart::Media(media) => user_content.push(media_label(media).to_owned()),
+                        UserPart::Media(media) => user_content.push(media_summary(media)),
                         UserPart::ToolResult(result) => {
                             let text = tool_result_text(result);
                             if !text.is_empty() {
@@ -379,7 +384,7 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                             }
                         }
                         AssistantPart::ToolCall(call) => calls.push(tool_call_text(call)),
-                        AssistantPart::Media(media) => text.push(media_label(media).to_owned()),
+                        AssistantPart::Media(media) => text.push(media_summary(media)),
                     }
                 }
                 if !thinking.is_empty() {
@@ -497,7 +502,8 @@ pub fn finish_handoff(summary: String, details: &CompactionDetails) -> String {
 mod tests {
     use super::*;
     use ygg_ai::{
-        AssistantMessage, ModelId, Protocol, ToolCall, ToolCallId, ToolResult, ToolResultPart,
+        AssistantMessage, AudioFormat, AudioMedia, AudioPayload, ModelId, Protocol, ToolCall,
+        ToolCallId, ToolResult, ToolResultPart,
     };
 
     fn assistant(parts: Vec<AssistantPart>) -> Message {
@@ -617,6 +623,35 @@ mod tests {
         assert!(serialized.contains("[Assistant tool calls]: read(path=\"src/lib.rs\")"));
         assert!(serialized.contains("[Tool result]:"));
         assert!(serialized.contains("[... 100 more characters truncated]"));
+    }
+
+    #[test]
+    fn serialization_preserves_audio_transcripts_for_every_message_role() {
+        let audio = |transcript: &str| {
+            Media::Audio(AudioMedia {
+                payload: AudioPayload::Inline(bytes::Bytes::from_static(b"audio")),
+                format: AudioFormat::Wav,
+                transcript: Some(transcript.into()),
+            })
+        };
+        let messages = vec![
+            Message::User(UserMessage {
+                content: vec![
+                    UserPart::Media(audio("user recording")),
+                    UserPart::ToolResult(ToolResult {
+                        tool_call_id: ToolCallId("call".into()),
+                        content: vec![ToolResultPart::Media(audio("tool recording"))],
+                        is_error: false,
+                    }),
+                ],
+            }),
+            assistant(vec![AssistantPart::Media(audio("assistant recording"))]),
+        ];
+
+        let serialized = serialize_conversation(&messages);
+        assert!(serialized.contains("[User]: [audio transcript]: user recording"));
+        assert!(serialized.contains("[Tool result]: [audio transcript]: tool recording"));
+        assert!(serialized.contains("[Assistant]: [audio transcript]: assistant recording"));
     }
 
     #[test]

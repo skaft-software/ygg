@@ -4,8 +4,8 @@ use std::collections::HashSet;
 
 use crate::catalog::Model;
 use crate::types::{
-    AssistantMessage, AssistantPart, AudioFormat, AudioPayload, ImageSource, Media, Message,
-    Modality, ToolCallId, ToolResult, ToolResultPart, UserMessage, UserPart,
+    AssistantMessage, AssistantPart, AudioPayload, ImageSource, Media, Message, Modality,
+    ToolCallId, ToolResult, ToolResultPart, UserMessage, UserPart,
 };
 
 const IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
@@ -23,6 +23,15 @@ const ASSISTANT_IMAGE_PLACEHOLDER: &str =
 const ASSISTANT_AUDIO_PLACEHOLDER: &str =
     "(assistant audio omitted: provider media reference is unavailable)";
 const MISSING_TOOL_RESULT: &str = "No result provided";
+
+fn audio_fallback_text(audio: &crate::types::AudioMedia, placeholder: &str) -> String {
+    audio
+        .transcript
+        .as_ref()
+        .filter(|transcript| !transcript.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| placeholder.to_owned())
+}
 
 /// Returns a target-compatible copy of canonical conversation history.
 ///
@@ -204,7 +213,7 @@ fn transform_user_part(part: &UserPart, target: &Model) -> UserPart {
                 if user_audio_is_replayable(audio, target) {
                     UserPart::Media(media.clone())
                 } else {
-                    UserPart::Text(AUDIO_PLACEHOLDER.to_string())
+                    UserPart::Text(audio_fallback_text(audio, AUDIO_PLACEHOLDER))
                 }
             }
         },
@@ -247,7 +256,8 @@ fn transform_user_part_owned(part: UserPart, target: &Model) -> UserPart {
             if user_audio_is_replayable(&audio, target) {
                 UserPart::Media(Media::Audio(audio))
             } else {
-                UserPart::Text(AUDIO_PLACEHOLDER.to_string())
+                let fallback = audio_fallback_text(&audio, AUDIO_PLACEHOLDER);
+                UserPart::Text(fallback)
             }
         }
         UserPart::ToolResult(result) => UserPart::ToolResult(ToolResult {
@@ -288,7 +298,9 @@ fn transform_tool_result_part(part: &ToolResultPart, target: &Model) -> ToolResu
                     ToolResultPart::Media(media.clone())
                 }
             }
-            Media::Audio(_) => ToolResultPart::Text(TOOL_AUDIO_PLACEHOLDER.to_string()),
+            Media::Audio(audio) => {
+                ToolResultPart::Text(audio_fallback_text(audio, TOOL_AUDIO_PLACEHOLDER))
+            }
         },
     }
 }
@@ -318,8 +330,9 @@ fn transform_tool_result_part_owned(part: ToolResultPart, target: &Model) -> Too
                 ToolResultPart::Media(Media::Image(image))
             }
         }
-        ToolResultPart::Media(Media::Audio(_)) => {
-            ToolResultPart::Text(TOOL_AUDIO_PLACEHOLDER.to_string())
+        ToolResultPart::Media(Media::Audio(audio)) => {
+            let fallback = audio_fallback_text(&audio, TOOL_AUDIO_PLACEHOLDER);
+            ToolResultPart::Text(fallback)
         }
     }
 }
@@ -366,7 +379,10 @@ fn transform_assistant_part(
             if assistant_audio_is_replayable(audio, target) {
                 Some(part.clone())
             } else {
-                Some(AssistantPart::Text(ASSISTANT_AUDIO_PLACEHOLDER.to_string()))
+                Some(AssistantPart::Text(audio_fallback_text(
+                    audio,
+                    ASSISTANT_AUDIO_PLACEHOLDER,
+                )))
             }
         }
     }
@@ -407,7 +423,8 @@ fn transform_assistant_part_owned(
             if assistant_audio_is_replayable(&audio, target) {
                 Some(AssistantPart::Media(Media::Audio(audio)))
             } else {
-                Some(AssistantPart::Text(ASSISTANT_AUDIO_PLACEHOLDER.to_string()))
+                let fallback = audio_fallback_text(&audio, ASSISTANT_AUDIO_PLACEHOLDER);
+                Some(AssistantPart::Text(fallback))
             }
         }
     }
@@ -422,13 +439,7 @@ fn normalize_id_owned(id: ToolCallId) -> ToolCallId {
 }
 
 fn user_audio_is_replayable(audio: &crate::types::AudioMedia, target: &Model) -> bool {
-    target.spec.protocol == crate::types::Protocol::OpenAiChat
-        && target
-            .spec
-            .capabilities
-            .input_modalities
-            .contains(Modality::Audio)
-        && matches!(audio.format, AudioFormat::Wav | AudioFormat::Mp3)
+    target.spec.supports_audio_input(audio.format)
         && matches!(
             audio.payload,
             AudioPayload::Inline(_) | AudioPayload::InlineWithProviderRef { .. }
@@ -436,7 +447,7 @@ fn user_audio_is_replayable(audio: &crate::types::AudioMedia, target: &Model) ->
 }
 
 fn assistant_audio_is_replayable(audio: &crate::types::AudioMedia, target: &Model) -> bool {
-    if target.spec.protocol != crate::types::Protocol::OpenAiChat {
+    if !target.spec.supports_audio_output(audio.format) {
         return false;
     }
     let reference = match &audio.payload {
@@ -515,8 +526,9 @@ mod tests {
 
     use super::*;
     use crate::types::{
-        Capabilities, Endpoint, EndpointId, ImageMedia, ModalitySet, ModelId, ModelLimits,
-        ModelSpec, Protocol, ReasoningPart, ReasoningState, ReasoningStateKind, ToolCall,
+        AudioFormat, AudioMedia, Capabilities, Endpoint, EndpointId, ImageMedia, ModalitySet,
+        ModelId, ModelLimits, ModelSpec, Protocol, ProviderMediaRef, ReasoningPart, ReasoningState,
+        ReasoningStateKind, ToolCall,
     };
 
     fn model(id: &str, protocol: Protocol, images: bool) -> Model {
@@ -668,6 +680,70 @@ mod tests {
         };
         assert!(
             matches!(&result.content[0], ToolResultPart::Text(text) if text == TOOL_IMAGE_PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn audio_transcripts_replace_unreplayable_user_tool_and_assistant_media() {
+        let user_audio = Media::Audio(AudioMedia {
+            payload: AudioPayload::Inline(bytes::Bytes::from_static(b"wav")),
+            format: AudioFormat::Wav,
+            transcript: Some("user said hello".into()),
+        });
+        let tool_audio = Media::Audio(AudioMedia {
+            payload: AudioPayload::Inline(bytes::Bytes::from_static(b"wav")),
+            format: AudioFormat::Wav,
+            transcript: Some("tool heard a warning".into()),
+        });
+        let assistant_audio = Media::Audio(AudioMedia {
+            payload: AudioPayload::ProviderRef(ProviderMediaRef {
+                protocol: Protocol::OpenAiChat,
+                id: "expired-audio".into(),
+                expires_at: Some(std::time::SystemTime::UNIX_EPOCH),
+            }),
+            format: AudioFormat::Wav,
+            transcript: Some("assistant spoke the answer".into()),
+        });
+        let messages = vec![
+            Message::User(UserMessage {
+                content: vec![
+                    UserPart::Media(user_audio),
+                    UserPart::ToolResult(ToolResult {
+                        tool_call_id: ToolCallId("call_1".into()),
+                        content: vec![ToolResultPart::Media(tool_audio)],
+                        is_error: false,
+                    }),
+                ],
+            }),
+            Message::Assistant(AssistantMessage {
+                model: ModelId("source".into()),
+                protocol: Protocol::OpenAiChat,
+                content: vec![AssistantPart::Media(assistant_audio)],
+            }),
+        ];
+        let target = model("target", Protocol::AnthropicMessages, false);
+
+        let transformed = transform_messages(&messages, &target);
+        let Message::User(user) = &transformed[0] else {
+            panic!("expected user")
+        };
+        assert!(matches!(&user.content[0], UserPart::Text(text) if text == "user said hello"));
+        let UserPart::ToolResult(result) = &user.content[1] else {
+            panic!("expected tool result")
+        };
+        assert!(
+            matches!(&result.content[0], ToolResultPart::Text(text) if text == "tool heard a warning")
+        );
+        assert!(matches!(
+            &transformed[1],
+            Message::Assistant(AssistantMessage { content, .. })
+                if matches!(&content[0], AssistantPart::Text(text) if text == "assistant spoke the answer")
+        ));
+
+        let owned = transform_request_messages_owned(messages, &target);
+        assert_eq!(
+            serde_json::to_value(owned).unwrap(),
+            serde_json::to_value(transformed).unwrap()
         );
     }
 

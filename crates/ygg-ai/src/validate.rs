@@ -2,9 +2,9 @@
 
 use crate::error::{AiError, Diagnostic, UnsupportedError, ValidationError};
 use crate::types::{
-    AssistantPart, AudioFormat, AudioPayload, Capabilities, ImageSource, Media, Message, ModelId,
-    ModelLimits, OutputFormat, OutputModalities, Protocol, ReasoningConfig, ReasoningMode, Request,
-    ToolCallId, ToolChoice, ToolResultPart, UserPart,
+    AssistantPart, AudioFormat, AudioPayload, AudioVoice, Capabilities, ImageSource, Media,
+    Message, ModelId, ModelLimits, OutputFormat, OutputModalities, Protocol, ReasoningConfig,
+    ReasoningMode, Request, ToolCallId, ToolChoice, ToolResultPart, UserPart,
 };
 use crate::CompatibilityMode;
 use std::borrow::Cow;
@@ -665,8 +665,14 @@ pub(crate) fn validate_request(
         OutputFormat::Text => {}
     }
 
-    // 9. Audio output capability check
-    if let OutputModalities::TextAndAudio(_) = req.output_modalities {
+    // 9. Audio output capability and options checks
+    if let OutputModalities::TextAndAudio(options) = &req.output_modalities {
+        let voice = match &options.voice {
+            AudioVoice::Named(voice) | AudioVoice::ProviderRef(voice) => voice,
+        };
+        if voice.trim().is_empty() {
+            return Err(AiError::Validation(ValidationError::InvalidAudioVoice));
+        }
         let supported = protocol == Protocol::OpenAiChat
             && caps
                 .output_modalities
@@ -1208,6 +1214,34 @@ mod matrix_tests {
             .unwrap(),
             "downgraded_audio_output"
         ));
+    }
+
+    #[test]
+    fn audio_output_rejects_empty_voices() {
+        for voice in [
+            AudioVoice::Named("   ".into()),
+            AudioVoice::ProviderRef(String::new()),
+        ] {
+            let mut req = base();
+            req.output_modalities = OutputModalities::TextAndAudio(AudioOutputOptions {
+                format: AudioFormat::Wav,
+                voice,
+            });
+            let error = run(
+                &req,
+                &caps(false, false, true, false, false, false),
+                Protocol::OpenAiChat,
+            )
+            .unwrap_err();
+            let AiError::Validation(validation) = &error else {
+                panic!("expected validation error, got {error}");
+            };
+            assert!(matches!(validation, ValidationError::InvalidAudioVoice));
+            assert_eq!(
+                validation.to_string(),
+                "Audio output voice must not be empty"
+            );
+        }
     }
 
     // --- tools without capability ---
