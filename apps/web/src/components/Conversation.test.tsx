@@ -772,7 +772,7 @@ describe("conversation composer", () => {
     expect(onInvokeSlashCommand.mock.calls[1]?.[1]).not.toBe(firstKey);
   });
 
-  it("queues by default and keeps Steer in a themed secondary menu", async () => {
+  it("steers by default and keeps Follow up in a themed secondary menu", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     render(
@@ -791,18 +791,18 @@ describe("conversation composer", () => {
 
     expect(screen.getByRole("button", { name: "Stop ygg" })).toBeVisible();
     const delivery = screen.getByRole("button", {
-      name: "While ygg is working: Follow up",
+      name: "While ygg is working: Steer now",
     });
     expect(
       screen.queryByRole("combobox", { name: "Active run delivery" }),
     ).toBeNull();
-    await user.type(screen.getByLabelText("Message ygg"), "Queue this");
-    await user.click(screen.getByRole("button", { name: "Queue follow-up" }));
+    await user.type(screen.getByLabelText("Message ygg"), "Steer this");
+    await user.click(screen.getByRole("button", { name: "Steer active run" }));
 
     expect(onSubmit).toHaveBeenCalledWith(
-      "Queue this",
+      "Steer this",
       [],
-      "followUp",
+      "steer",
       expect.any(String),
       [],
       [],
@@ -813,7 +813,7 @@ describe("conversation composer", () => {
       screen.getByRole("menu", { name: "While ygg is working" }),
     ).toBeVisible();
     expect(
-      screen.getByRole("menuitemradio", { name: /Steer now/ }),
+      screen.getByRole("menuitemradio", { name: /Follow up/ }),
     ).toBeVisible();
     await user.keyboard("{Escape}");
     expect(

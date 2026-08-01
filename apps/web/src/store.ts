@@ -984,7 +984,7 @@ export class YggStore {
   async submit(
     prompt: string,
     attachments: AttachmentRef[],
-    activeDelivery: "steer" | "followUp" = "followUp",
+    activeDelivery: "steer" | "followUp" = "steer",
     idempotencyKey?: string,
     documents: DocumentReference[] = [],
     projectFiles: TrustedFileEntry[] = [],
