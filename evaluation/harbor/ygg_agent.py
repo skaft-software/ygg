@@ -77,6 +77,7 @@ class Ygg(BaseAgent):
         reasoning: str | None = DEFAULT_REASONING,
         session_dir: str = DEFAULT_SESSION_DIR,
         max_turns: int | None = None,
+        bash_timeout_secs: int | None = None,
         workspace_trusted: bool = True,
         agent_timeout_sec: float | None = None,
         extra_env: dict[str, str] | None = None,
@@ -95,6 +96,7 @@ class Ygg(BaseAgent):
         self._session_dir = session_dir
         self._session_relative = self._validate_session_dir(session_dir)
         self._max_turns = max_turns
+        self._bash_timeout_secs = bash_timeout_secs
         self._workspace_trusted = workspace_trusted
         self._agent_timeout_sec = (
             max(1, ceil(agent_timeout_sec)) if agent_timeout_sec else None
@@ -267,6 +269,7 @@ class Ygg(BaseAgent):
                 "model": self.model_name,
                 "reasoning": self._reasoning,
                 "max_turns": self._max_turns,
+                "bash_timeout_secs": self._bash_timeout_secs,
                 "workspace_trusted": self._workspace_trusted,
                 "timeout_sec": self._agent_timeout_sec,
             },
@@ -445,6 +448,7 @@ class Ygg(BaseAgent):
             reasoning=self._reasoning,
             session_dir=self._session_dir,
             max_turns=self._max_turns,
+            bash_timeout_secs=self._bash_timeout_secs,
             workspace_trusted=self._workspace_trusted,
         )
         self._write_invocation(command, instruction)
