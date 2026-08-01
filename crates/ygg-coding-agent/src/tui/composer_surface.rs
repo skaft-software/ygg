@@ -569,7 +569,6 @@ enum FooterKind {
     Extension,
     ExtensionStatus,
     Tokens,
-    Throughput,
     CacheHit,
     Context,
     Cost,
@@ -626,19 +625,66 @@ fn compact_footer_kind(segments: &mut [FooterSegment], kind: FooterKind) {
 }
 
 fn format_microdollars(microdollars: u64) -> String {
-    let dollars = microdollars as f64 / 1_000_000.0;
-    if dollars >= 1.0 {
-        format!("${dollars:.2}")
+    const MICRODOLLARS_PER_DOLLAR: u128 = 1_000_000;
+    const SIGNIFICANT_FIGURES: i32 = 3;
+
+    let microdollars = u128::from(microdollars);
+    if microdollars == 0 {
+        return "$0.000".to_owned();
+    }
+
+    let whole = microdollars / MICRODOLLARS_PER_DOLLAR;
+    let exponent = if whole > 0 {
+        whole.ilog10() as i32
     } else {
-        let formatted = format!("{dollars:.6}");
-        let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
-        let decimals = trimmed.split_once('.').map_or(0, |(_, value)| value.len());
-        if decimals < 3 {
-            format!("${dollars:.3}")
+        microdollars.ilog10() as i32 - 6
+    };
+    let decimal_places = SIGNIFICANT_FIGURES - 1 - exponent;
+    let rounding_power = 6 - decimal_places;
+    let rounding_unit = if rounding_power > 0 {
+        10u128.pow(rounding_power as u32)
+    } else {
+        1
+    };
+    let quotient = microdollars / rounding_unit;
+    let remainder = microdollars % rounding_unit;
+    let rounded = (quotient
+        + if remainder >= rounding_unit.div_ceil(2) {
+            1
         } else {
-            format!("${trimmed}")
+            0
+        })
+        * rounding_unit;
+
+    // A carry can change the number of digits, e.g. 9.999 becomes 10.0.
+    let rounded_whole = rounded / MICRODOLLARS_PER_DOLLAR;
+    let rounded_exponent = if rounded_whole > 0 {
+        rounded_whole.ilog10() as i32
+    } else {
+        rounded.ilog10() as i32 - 6
+    };
+    let decimal_places = SIGNIFICANT_FIGURES - 1 - rounded_exponent;
+    if decimal_places <= 0 {
+        return format!("${rounded_whole}");
+    }
+
+    let decimal_places = decimal_places as u32;
+    let fraction = rounded % MICRODOLLARS_PER_DOLLAR;
+    let fraction = if decimal_places <= 6 {
+        fraction / 10u128.pow(6 - decimal_places)
+    } else {
+        fraction * 10u128.pow(decimal_places - 6)
+    };
+    let mut fraction = format!("{fraction:0width$}", width = decimal_places as usize);
+    if rounded_whole == 0 {
+        while fraction.len() > 3 && fraction.ends_with('0') {
+            fraction.pop();
+        }
+        while fraction.len() < 3 {
+            fraction.push('0');
         }
     }
+    format!("${rounded_whole}.{fraction}")
 }
 
 fn push_narrower_variant(variants: &mut Vec<String>, candidate: String) {
@@ -817,33 +863,9 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
         segments.push(FooterSegment::new(FooterKind::Tokens, variants));
     }
 
-    let live_rate = show_turn_telemetry.then_some(()).and_then(|()| {
-        state.turn_generation_started_at.and_then(|started| {
-            let elapsed = now.saturating_duration_since(started);
-            let tokens = state.live_generated_tokens()?;
-            (elapsed >= Duration::from_millis(250) && tokens >= 2)
-                .then(|| tokens as f64 / elapsed.as_secs_f64())
-                .filter(|rate| rate.is_finite() && *rate > 0.0)
-        })
-    });
-    if let Some((rate, estimated)) = live_rate.map(|rate| (rate, true)).or_else(|| {
-        show_turn_telemetry
-            .then(|| {
-                state
-                    .last_turn_tokens_per_second
-                    .filter(|rate| rate.is_finite() && *rate > 0.0)
-                    .map(|rate| (rate, false))
-            })
-            .flatten()
-    }) {
-        segments.push(FooterSegment::new(
-            FooterKind::Throughput,
-            vec![format!(
-                "{}{rate:.1} tok/s",
-                if estimated { "~" } else { "" }
-            )],
-        ));
-    }
+    // Keep throughput in `/status`, where its completed-turn provenance is
+    // explicit. A live wall-clock average becomes misleading whenever output
+    // pauses and adds constantly changing noise to this pinned summary.
 
     let price_display = if active {
         state.run_price_display.unwrap_or(state.price_display)
@@ -892,7 +914,6 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
     if !layout.show_status_line {
         for kind in [
             FooterKind::Tokens,
-            FooterKind::Throughput,
             FooterKind::CacheHit,
             FooterKind::Context,
             FooterKind::Cost,
@@ -935,10 +956,8 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
             break;
         }
     }
-    for kind in [FooterKind::Cost, FooterKind::Throughput] {
-        if footer_width(&segments, gap) > available {
-            hide_footer_kind(&mut segments, kind);
-        }
+    if footer_width(&segments, gap) > available {
+        hide_footer_kind(&mut segments, FooterKind::Cost);
     }
     if footer_width(&segments, gap) > available {
         // An active state always remains observable. At extremely narrow
@@ -1237,6 +1256,22 @@ mod tests {
         assert_eq!(composer_content_rows(12, 10), 3);
         // 20-row terminal → max 5 rows
         assert_eq!(composer_content_rows(20, 7), 5); // capped at 5
+    }
+
+    #[test]
+    fn footer_cost_rounds_to_three_significant_figures() {
+        for (microdollars, expected) in [
+            (0, "$0.000"),
+            (123_456, "$0.123"),
+            (12_345, "$0.0123"),
+            (1, "$0.000001"),
+            (1_234_567, "$1.23"),
+            (12_345_678, "$12.3"),
+            (123_456_789, "$123"),
+            (9_999_999, "$10.0"),
+        ] {
+            assert_eq!(format_microdollars(microdollars), expected);
+        }
     }
 
     #[test]

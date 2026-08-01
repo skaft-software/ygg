@@ -1643,14 +1643,17 @@ fn deferred_history_keeps_local_outcome_before_a_later_persisted_prompt() {
     shell
         .state
         .borrow_mut()
-        .push_block(TranscriptBlock::Outcome(RunOutcome::Completed {
-            elapsed: Duration::from_secs(1),
-            summary: crate::presentation::RunSummary {
-                files_changed: 0,
-                tool_calls: 0,
-                warnings: 0,
+        .push_block(TranscriptBlock::Outcome(OutcomeBlock::new(
+            RunOutcome::Completed {
+                elapsed: Duration::from_secs(1),
+                summary: crate::presentation::RunSummary {
+                    files_changed: 0,
+                    tool_calls: 0,
+                    warnings: 0,
+                },
             },
-        }));
+            None,
+        )));
     session
         .append(EntryValue::Message(Message::User(UserMessage {
             content: vec![UserPart::Text("persisted after local outcome".into())],
@@ -3994,14 +3997,17 @@ fn ascii_plain_and_unicode_no_colour_keep_the_same_structure() {
             None,
             None,
         ))));
-        state.push_block(TranscriptBlock::Outcome(RunOutcome::Completed {
-            elapsed: Duration::from_secs(1),
-            summary: crate::presentation::RunSummary {
-                files_changed: 1,
-                tool_calls: 1,
-                warnings: 0,
+        state.push_block(TranscriptBlock::Outcome(OutcomeBlock::new(
+            RunOutcome::Completed {
+                elapsed: Duration::from_secs(1),
+                summary: crate::presentation::RunSummary {
+                    files_changed: 1,
+                    tool_calls: 1,
+                    warnings: 0,
+                },
             },
-        }));
+            None,
+        )));
     }
     ascii.set_size(40, 20);
     let ascii = render_shell(&ascii.state.borrow(), 40)
@@ -5164,15 +5170,18 @@ fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
         event_margin_marker(&reasoning, &theme, false, true),
         Some(" ".into())
     );
-    let outcome = TranscriptBlock::Outcome(RunOutcome::CompletedWithWarnings {
-        elapsed: Duration::from_secs(1),
-        warnings: 1,
-        summary: crate::presentation::RunSummary {
-            files_changed: 0,
-            tool_calls: 1,
+    let outcome = TranscriptBlock::Outcome(OutcomeBlock::new(
+        RunOutcome::CompletedWithWarnings {
+            elapsed: Duration::from_secs(1),
             warnings: 1,
+            summary: crate::presentation::RunSummary {
+                files_changed: 0,
+                tool_calls: 1,
+                warnings: 1,
+            },
         },
-    });
+        None,
+    ));
     assert_eq!(event_margin_marker(&outcome, &theme, true, false), None);
 }
 
@@ -5729,17 +5738,17 @@ fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
     let now = Instant::now();
     assert_eq!(
         plain_footer(&shell, 100, now),
-        "  Qwen3.6 35B A3B · high   5.6k/246k   ↑26.8k ↓422   41.9 tok/s   $0"
+        "  Qwen3.6 35B A3B · high   5.6k/246k   ↑26.8k ↓422   $0"
     );
     assert_eq!(
         plain_footer(&shell, 68, now),
-        "  Qwen3.6 35B A3B   5.6k/246k   ↑26.8k ↓422   41.9 tok/s   $0"
+        "  Qwen3.6 35B A3B · high   5.6k/246k   ↑26.8k ↓422   $0"
     );
     assert_eq!(
         plain_footer(&shell, 44, now),
-        "  Qwen3.6 35B A3B   41.9 tok/s   $0"
+        "  Qwen3.6 35B A3B   5.6k/246k   $0"
     );
-    assert_eq!(plain_footer(&shell, 30, now), "  Qwen3.6  41.9 tok/s  $0");
+    assert_eq!(plain_footer(&shell, 30, now), "  Qwen3.6 35B A3B  $0");
 
     let surface = plain_composer_surface(&shell, 100, now);
     assert_eq!(surface.len(), 4, "one editor row, two borders, one footer");
@@ -5749,7 +5758,7 @@ fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
 }
 
 #[test]
-fn footer_omits_unknown_cost_and_shows_live_throughput_with_active_status() {
+fn footer_omits_noisy_throughput_but_keeps_final_rate_in_status() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("openai", "gpt-5.6", "high");
     let started = Instant::now();
@@ -5782,8 +5791,8 @@ fn footer_omits_unknown_cost_and_shows_live_throughput_with_active_status() {
     assert!(!live.contains("Working"), "{live:?}");
     assert!(!live.contains("waiting for API"), "{live:?}");
     assert!(
-        live.contains("~72.4 tok/s"),
-        "live estimate missing: {live:?}"
+        !live.contains("tok/s"),
+        "noisy live throughput leaked into footer: {live:?}"
     );
     assert!(
         live.contains("~↓630"),
@@ -5847,8 +5856,8 @@ fn footer_omits_unknown_cost_and_shows_live_throughput_with_active_status() {
     }
     let active_sample = plain_footer(&shell, 100, now);
     assert!(
-        active_sample.contains("72.4 tok/s"),
-        "provider-final throughput should remain visible while tools run: {active_sample:?}"
+        !active_sample.contains("tok/s"),
+        "final throughput leaked into footer while tools run: {active_sample:?}"
     );
     assert!(
         !active_sample.contains("8.7s"),
@@ -5865,8 +5874,8 @@ fn footer_omits_unknown_cost_and_shows_live_throughput_with_active_status() {
     }
     let completed_sample = plain_footer(&shell, 100, now);
     assert!(
-        completed_sample.contains("72.4 tok/s"),
-        "final metrics should appear after the whole run settles: {completed_sample:?}"
+        !completed_sample.contains("tok/s"),
+        "final throughput leaked into settled footer: {completed_sample:?}"
     );
     assert!(!completed_sample.contains('~'), "{completed_sample:?}");
 }
@@ -7265,14 +7274,17 @@ fn populate_theme_fixture(shell: &mut InteractiveShell) {
     state.push_block(TranscriptBlock::Notice(
         "Extension reloaded with one status contribution.".into(),
     ));
-    state.push_block(TranscriptBlock::Outcome(RunOutcome::Completed {
-        elapsed: Duration::from_millis(13700),
-        summary: crate::presentation::RunSummary {
-            files_changed: 1,
-            tool_calls: 2,
-            warnings: 0,
+    state.push_block(TranscriptBlock::Outcome(OutcomeBlock::new(
+        RunOutcome::Completed {
+            elapsed: Duration::from_millis(13700),
+            summary: crate::presentation::RunSummary {
+                files_changed: 1,
+                tool_calls: 2,
+                warnings: 0,
+            },
         },
-    }));
+        None,
+    )));
     state.extension_header = Some(("workspace · main".into(), None));
     state.extension_status = Some(("git clean".into(), None));
     state.editor = "draft a local patch".into();
