@@ -5200,7 +5200,7 @@ fn semantic_tool_activity(
         kind,
         phase,
         status: ToolActivityStatus::Running,
-        title: bounded_text(&title, 512),
+        title: bounded_single_line_text(&title, 512),
         summary: Some("Running".into()),
         target,
         cwd,
@@ -7402,7 +7402,7 @@ fn branch_entry_label(entry: &Entry) -> String {
         | EntryValue::SkillDeactivated { .. } => "Internal session state",
     };
     let first_line = candidate.lines().find(|line| !line.trim().is_empty());
-    bounded_text(first_line.unwrap_or("Session entry"), 256)
+    bounded_single_line_text(first_line.unwrap_or("Session entry"), 256)
 }
 
 fn attachment_refs_for_entry(
@@ -8646,6 +8646,10 @@ fn event(payload: EventPayload) -> TimestampedEvent {
 
 fn bounded_text(text: &str, max: usize) -> String {
     ygg_serve_backend::sanitize_public_text(text, max, true)
+}
+
+fn bounded_single_line_text(text: &str, max: usize) -> String {
+    ygg_serve_backend::sanitize_public_text(text, max, false)
 }
 
 fn next_actor_generation() -> u64 {
@@ -11638,6 +11642,85 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn historical_projection_sanitizes_single_line_labels_and_tool_titles() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("hostile-historical-text.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        let hostile_label = format!(
+            "label\t\u{1b}\u{7}\u{202e}{}",
+            " long historical branch text".repeat(24)
+        );
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text(hostile_label)],
+            })))
+            .unwrap();
+        let hostile_command = format!(
+            "echo\t\u{1b}\u{7}\u{202e}{}",
+            " long historical command".repeat(32)
+        );
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::ToolCall(ygg_ai::ToolCall {
+                    id: ToolCallId("call-hostile-historical-text".into()),
+                    name: "bash".into(),
+                    arguments_json: serde_json::to_string(&serde_json::json!({
+                        "command": hostile_command,
+                    }))
+                    .unwrap(),
+                })],
+                model: ModelId("test-model".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+
+        let seed = seed_from_session(
+            &session,
+            SessionId::new("hostile-historical-text").unwrap(),
+            SessionSeedOptions {
+                workspace: workspace.path(),
+                project_id: None,
+                model: ModelSelection {
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    reasoning: "off".into(),
+                },
+                authority: AuthorityProfile::FullAccess,
+                generation: 1,
+                meta: None,
+                attachment_store: None,
+                resource_store: None,
+            },
+        )
+        .unwrap();
+
+        seed.validate().unwrap();
+        let label = seed
+            .snapshot
+            .branches
+            .entries
+            .iter()
+            .find(|entry| entry.kind == SessionBranchEntryKind::UserMessage)
+            .map(|entry| entry.label.as_str())
+            .unwrap();
+        let title = seed
+            .snapshot
+            .items
+            .iter()
+            .find_map(|item| match &item.payload {
+                ItemPayload::ToolCall(activity) => Some(activity.title.as_str()),
+                _ => None,
+            })
+            .unwrap();
+        for projected in [label, title] {
+            assert!(projected.len() <= 512);
+            assert!(!projected.chars().any(char::is_control));
+            assert!(!projected.contains('\u{202e}'));
+        }
+        assert!(label.len() <= 256);
     }
 
     #[test]

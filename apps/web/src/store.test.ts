@@ -405,6 +405,61 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("keeps the current session visible and reports a failed selection", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+    transport.sessionLoader = async (sessionId) => {
+      if (sessionId === "session-done") {
+        throw new Error("Session failed with 500");
+      }
+      return clone(fixtureSessions[sessionId]);
+    };
+
+    await expect(store.selectSession("session-done")).rejects.toThrow(
+      "Session failed with 500",
+    );
+
+    expect(store.getSnapshot()).toMatchObject({
+      selectedSessionId: "session-fresh",
+      selectionError: {
+        sessionId: "session-done",
+        message: "Session failed with 500",
+        routeMode: "push",
+      },
+    });
+    expect(store.selectedSession?.sessionId).toBe("session-fresh");
+
+    transport.sessionLoader = async (sessionId) =>
+      clone(fixtureSessions[sessionId]);
+    await store.selectSession("session-done");
+    expect(store.getSnapshot().selectionError).toBeNull();
+
+    transport.sessionLoader = async (sessionId) => {
+      if (sessionId === "session-live") {
+        throw new Error("Session failed with 503");
+      }
+      return clone(fixtureSessions[sessionId]);
+    };
+    await expect(store.selectSession("session-live", "none")).rejects.toThrow(
+      "Session failed with 503",
+    );
+    expect(store.getSnapshot().selectionError).toMatchObject({
+      sessionId: "session-live",
+      routeMode: "none",
+    });
+
+    transport.sessionLoader = async (sessionId) =>
+      clone(fixtureSessions[sessionId]);
+    await store.selectSession(
+      "session-live",
+      store.getSnapshot().selectionError!.routeMode,
+    );
+    expect(store.getSnapshot().selectionError).toBeNull();
+    expect(store.getSnapshot().selectedSessionId).toBe("session-live");
+    store.dispose();
+  });
+
   it("does not let a stale session load replace a newer selection", async () => {
     const transport = new TestTransport();
     const delayed = deferred<SessionSnapshot>();

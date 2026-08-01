@@ -216,6 +216,27 @@ function ConnectionBanner({
   );
 }
 
+export function SessionSelectionErrorBanner({
+  message,
+  onRetry,
+}: {
+  message: string;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="session-selection-error" role="alert">
+      <X aria-hidden="true" />
+      <span>
+        <strong>Could not open that session.</strong>
+        <small>{message}</small>
+      </span>
+      <button type="button" onClick={onRetry}>
+        Try again
+      </button>
+    </div>
+  );
+}
+
 function LoadingState() {
   return (
     <div className="app-loading" role="status" aria-live="polite">
@@ -824,7 +845,9 @@ export default function App() {
   useEffect(() => {
     const onPopState = () => {
       const sessionId = sessionIdFromPathname(window.location.pathname);
-      if (sessionId) void store.selectSession(sessionId, "none");
+      if (sessionId) {
+        void store.selectSession(sessionId, "none").catch(() => undefined);
+      }
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -1059,6 +1082,17 @@ export default function App() {
     "--inspector-width": `${inspectorPaneWidth}px`,
     "--terminal-width": `${terminalPaneWidth}px`,
   } as CSSProperties;
+  const selectionError = state.selectionError;
+  const selectionErrorBanner = selectionError ? (
+    <SessionSelectionErrorBanner
+      message={selectionError.message}
+      onRetry={() => {
+        void store
+          .selectSession(selectionError.sessionId, selectionError.routeMode)
+          .catch(() => undefined);
+      }}
+    />
+  ) : null;
   const toggleTerminal = useCallback(() => {
     if (!terminalAvailable) return;
     if (terminalOpen) {
@@ -1083,7 +1117,7 @@ export default function App() {
       if (sessionId !== state.selectedSessionId) {
         setActivityOpen(false);
       }
-      void store.selectSession(sessionId);
+      void store.selectSession(sessionId).catch(() => undefined);
       if (window.matchMedia("(max-width: 760px)").matches) {
         setSidebarOpen(false);
       }
@@ -1129,7 +1163,7 @@ export default function App() {
           );
           break;
         }
-      })();
+      })().catch(() => undefined);
     },
     [],
   );
@@ -1572,6 +1606,7 @@ const getCommandDiscovery = useCallback(
           />
           <FixtureModeLabel />
           <ConnectionBanner connection={state.connection} />
+          {selectionErrorBanner}
           <Conversation
             key={session.sessionId}
             session={session}
@@ -1631,6 +1666,7 @@ const getCommandDiscovery = useCallback(
             sidebarButtonRef={sidebarButtonRef}
           />
           <ConnectionBanner connection={state.connection} />
+          {selectionErrorBanner}
           <FixtureModeLabel />
           {surface === "files" ? (
             <Suspense

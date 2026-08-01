@@ -49,6 +49,11 @@ export interface YggState {
   connecting: boolean;
   connection: TransportConnectionState;
   error: string | null;
+  selectionError: {
+    sessionId: string;
+    message: string;
+    routeMode: SessionRouteMode;
+  } | null;
   bootstrap: HostBootstrap | null;
   projectCatalog: ProjectCatalog | null;
   selectedSessionId: string | null;
@@ -61,6 +66,7 @@ const initialState: YggState = {
   connecting: true,
   connection: "connecting",
   error: null,
+  selectionError: null,
   bootstrap: null,
   projectCatalog: null,
   selectedSessionId: null,
@@ -519,6 +525,7 @@ export class YggStore {
       ...this.state,
       connecting: true,
       error: null,
+      selectionError: null,
     });
     this.unsubscribeTransport?.();
     this.unsubscribeConnection?.();
@@ -545,6 +552,7 @@ export class YggStore {
           connecting: false,
           connection: this.state.connection,
           error: null,
+          selectionError: null,
           bootstrap: null,
           projectCatalog,
           selectedSessionId: null,
@@ -603,6 +611,7 @@ export class YggStore {
         connecting: false,
         connection: this.state.connection,
         error: null,
+        selectionError: null,
         bootstrap: { ...bootstrap, sessions: summaries },
         projectCatalog,
         selectedSessionId: installedSelected.sessionId,
@@ -781,6 +790,9 @@ export class YggStore {
       this.selectionGeneration += 1;
       this.selectionAbort?.abort();
       this.selectionAbort = null;
+      if (this.state.selectionError) {
+        this.publish({ ...this.state, selectionError: null });
+      }
       if (routeMode !== "none") writeSessionRoute(sessionId, routeMode);
       return;
     }
@@ -788,6 +800,9 @@ export class YggStore {
     this.selectionAbort?.abort();
     const controller = new AbortController();
     this.selectionAbort = controller;
+    if (this.state.selectionError) {
+      this.publish({ ...this.state, selectionError: null });
+    }
 
     try {
       const [snapshot, goal] = await Promise.all([
@@ -831,6 +846,7 @@ export class YggStore {
             }
           : this.state.bootstrap,
         selectedSessionId: sessionId,
+        selectionError: null,
         goal,
         sessions: {
           ...this.state.sessions,
@@ -840,7 +856,25 @@ export class YggStore {
       if (routeMode !== "none") writeSessionRoute(sessionId, routeMode);
       this.selectionAbort = null;
     } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") return;
+      if (
+        (error instanceof DOMException && error.name === "AbortError") ||
+        generation !== this.selectionGeneration ||
+        controller.signal.aborted
+      ) {
+        return;
+      }
+      this.selectionAbort = null;
+      this.publish({
+        ...this.state,
+        selectionError: {
+          sessionId,
+          routeMode,
+          message:
+            error instanceof Error
+              ? error.message
+              : "The session could not be opened.",
+        },
+      });
       throw error;
     }
   }
