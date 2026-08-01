@@ -46,8 +46,10 @@ so `extensions/ygg-serve` remains independently buildable.
 
 Project filesystem operations begin with an opaque project ID resolved through
 the private project registry. On Unix, the registry records the imported root's
-device and inode. Every operation reopens the root without following a symlink
-and verifies that identity.
+device, inode, and creation time. Every operation reopens the root
+without following a symlink and verifies that identity. The creation time also
+disambiguates filesystems that immediately reuse an inode for a replacement
+directory.
 
 Traversal below the root is descriptor-relative:
 
@@ -70,9 +72,9 @@ permissions.
 If the directory at the registered canonical path is explicitly replaced, the
 registry marks it unavailable and retains the old trust bit without using it.
 The host's explicit launch-workspace trust action may rebind that same canonical
-path to its new device/inode, revoke the old trust, and grant trust again in the
-same user-directed flow. It cannot rebind another project or accept a browser-
-supplied path.
+path to its new device, inode, and creation time, revoke the old
+trust, and grant trust again in the same user-directed flow. It cannot rebind
+another project or accept a browser-supplied path.
 
 ## Bounded durable stores
 

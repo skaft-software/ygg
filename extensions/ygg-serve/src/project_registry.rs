@@ -11,6 +11,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -119,7 +120,7 @@ impl ProjectRoot {
 
     /// Checks an opened root descriptor against the imported directory identity.
     pub(crate) fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
-        root_identity_matches(self.identity, metadata)
+        root_identity_matches(self.identity, metadata, Some(&self.path))
     }
 }
 
@@ -263,6 +264,11 @@ struct StoredRootIdentity {
     device: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     file: Option<u64>,
+    /// Creation time disambiguates immediate inode reuse after replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    creation_time_nsec: Option<u32>,
 }
 
 /// Single-writer durable registry for local project roots.
@@ -370,12 +376,13 @@ impl ProjectRegistry {
         let metadata = canonical_root
             .symlink_metadata()
             .map_err(map_root_metadata_error)?;
+        let root_identity = capture_root_identity(&metadata, &canonical_root);
         let id = self.mint_project_id()?;
         let project = StoredProject {
             id: id.clone(),
             display_name,
             canonical_root,
-            root_identity: capture_root_identity(&metadata),
+            root_identity,
             trusted: false,
             archived: false,
         };
@@ -537,7 +544,7 @@ impl ProjectRegistry {
         let metadata = canonical_root
             .symlink_metadata()
             .map_err(map_root_metadata_error)?;
-        let identity = capture_root_identity(&metadata);
+        let identity = capture_root_identity(&metadata, &canonical_root);
         if current.root_identity != identity {
             let mut next = self.state.clone();
             let project = project_mut(&mut next, id)?;
@@ -880,23 +887,63 @@ fn map_root_metadata_error(error: std::io::Error) -> ProjectRegistryError {
     }
 }
 
-fn capture_root_identity(metadata: &std::fs::Metadata) -> StoredRootIdentity {
+fn capture_root_identity(metadata: &std::fs::Metadata, path: &Path) -> StoredRootIdentity {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
+        let (creation_time, creation_time_nsec) = capture_creation_time(metadata, Some(path));
         StoredRootIdentity {
             device: Some(metadata.dev()),
             file: Some(metadata.ino()),
+            creation_time,
+            creation_time_nsec,
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = metadata;
+        let _ = (metadata, path);
         StoredRootIdentity {
             device: None,
             file: None,
+            creation_time: None,
+            creation_time_nsec: None,
         }
     }
+}
+
+fn capture_creation_time(
+    metadata: &std::fs::Metadata,
+    path: Option<&Path>,
+) -> (Option<i64>, Option<u32>) {
+    #[cfg(target_os = "linux")]
+    if let Some(path) = path {
+        use rustix::fs::{AtFlags, StatxFlags};
+        if let Ok(stat) = rustix::fs::statx(
+            rustix::fs::CWD,
+            path,
+            AtFlags::SYMLINK_NOFOLLOW,
+            StatxFlags::BTIME,
+        ) {
+            if stat.stx_mask & StatxFlags::BTIME.bits() != 0 {
+                return (Some(stat.stx_btime.tv_sec), Some(stat.stx_btime.tv_nsec));
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = path;
+
+    let Some(duration) = metadata
+        .created()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+    else {
+        return (None, None);
+    };
+    let Ok(seconds) = i64::try_from(duration.as_secs()) else {
+        return (None, None);
+    };
+    (Some(seconds), Some(duration.subsec_nanos()))
 }
 
 fn validate_live_root(project: &StoredProject) -> Result<PathBuf, ProjectRegistryError> {
@@ -915,22 +962,39 @@ fn validate_live_root(project: &StoredProject) -> Result<PathBuf, ProjectRegistr
         .canonicalize()
         .map_err(map_root_metadata_error)?;
     if canonical != project.canonical_root
-        || !root_identity_matches(project.root_identity, &metadata)
+        || !root_identity_matches(
+            project.root_identity,
+            &metadata,
+            Some(&project.canonical_root),
+        )
     {
         return Err(ProjectRegistryError::RootIdentityChanged);
     }
     Ok(canonical)
 }
 
-fn root_identity_matches(identity: StoredRootIdentity, metadata: &std::fs::Metadata) -> bool {
+fn root_identity_matches(
+    identity: StoredRootIdentity,
+    metadata: &std::fs::Metadata,
+    path: Option<&Path>,
+) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        identity.device == Some(metadata.dev()) && identity.file == Some(metadata.ino())
+        if identity.device != Some(metadata.dev()) || identity.file != Some(metadata.ino()) {
+            return false;
+        }
+        match (identity.creation_time, identity.creation_time_nsec) {
+            (Some(seconds), Some(nanoseconds)) => {
+                capture_creation_time(metadata, path) == (Some(seconds), Some(nanoseconds))
+            }
+            (None, None) => true,
+            _ => false,
+        }
     }
     #[cfg(not(unix))]
     {
-        let _ = (identity, metadata);
+        let _ = (identity, metadata, path);
         true
     }
 }
@@ -1019,11 +1083,21 @@ fn validate_stored_root(project: &StoredProject) -> Result<(), ProjectRegistryEr
         return Err(ProjectRegistryError::CorruptState);
     }
     #[cfg(unix)]
-    if project.root_identity.device.is_none() || project.root_identity.file.is_none() {
-        return Err(ProjectRegistryError::CorruptState);
+    {
+        if project.root_identity.device.is_none()
+            || project.root_identity.file.is_none()
+            || project.root_identity.creation_time.is_some()
+                != project.root_identity.creation_time_nsec.is_some()
+        {
+            return Err(ProjectRegistryError::CorruptState);
+        }
     }
     #[cfg(not(unix))]
-    if project.root_identity.device.is_some() || project.root_identity.file.is_some() {
+    if project.root_identity.device.is_some()
+        || project.root_identity.file.is_some()
+        || project.root_identity.creation_time.is_some()
+        || project.root_identity.creation_time_nsec.is_some()
+    {
         return Err(ProjectRegistryError::CorruptState);
     }
     Ok(())

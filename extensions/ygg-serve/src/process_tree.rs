@@ -79,9 +79,22 @@ impl ProcessTree {
         };
         #[cfg(unix)]
         {
-            let owns_group = rustix::process::Pid::from_raw(group_id).is_some_and(|process| {
-                rustix::process::getpgid(Some(process)).is_ok_and(|group| group == process)
-            });
+            let owns_group = {
+                #[cfg(target_os = "linux")]
+                {
+                    process_snapshot().is_some_and(|processes| {
+                        processes
+                            .iter()
+                            .any(|process| process.pid == group_id && process.group == group_id)
+                    })
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    rustix::process::Pid::from_raw(group_id).is_some_and(|process| {
+                        rustix::process::getpgid(Some(process)).is_ok_and(|group| group == process)
+                    })
+                }
+            };
             owner.track_descendants.store(owns_group, Ordering::Release);
         }
         owner
@@ -97,9 +110,24 @@ impl ProcessTree {
         #[cfg(unix)]
         {
             let raw = owner.group_id.load(Ordering::Acquire);
-            if let Some(process) = rustix::process::Pid::from_raw(raw) {
-                let owns_session =
-                    rustix::process::getsid(Some(process)).is_ok_and(|session| session == process);
+            if raw > 0 {
+                let owns_session = {
+                    #[cfg(target_os = "linux")]
+                    {
+                        process_snapshot().is_some_and(|processes| {
+                            processes
+                                .iter()
+                                .any(|process| process.pid == raw && process.session == raw)
+                        })
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        rustix::process::Pid::from_raw(raw).is_some_and(|process| {
+                            rustix::process::getsid(Some(process))
+                                .is_ok_and(|session| session == process)
+                        })
+                    }
+                };
                 owner
                     .track_descendants
                     .store(owns_session, Ordering::Release);
@@ -241,7 +269,16 @@ fn process_snapshot() -> Option<Vec<ProcessRecord>> {
         .into_iter()
         .find(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()))?;
     let output = Command::new(executable)
-        .args(["-axo", "pid=,ppid=,pgid="])
+        .args({
+            #[cfg(target_os = "linux")]
+            {
+                ["-axo", "pid=,ppid=,pgid=,sess="]
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                ["-axo", "pid=,ppid=,pgid="]
+            }
+        })
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .env_clear()
@@ -258,8 +295,13 @@ fn process_snapshot() -> Option<Vec<ProcessRecord>> {
                 let pid = fields.next()?.parse().ok()?;
                 let parent = fields.next()?.parse().ok()?;
                 let group = fields.next()?.parse().ok()?;
-                let process = rustix::process::Pid::from_raw(pid)?;
-                let session = rustix::process::getsid(Some(process)).ok()?.as_raw_pid();
+                #[cfg(target_os = "linux")]
+                let session = fields.next()?.parse().ok()?;
+                #[cfg(not(target_os = "linux"))]
+                let session = {
+                    let process = rustix::process::Pid::from_raw(pid)?;
+                    rustix::process::getsid(Some(process)).ok()?.as_raw_pid()
+                };
                 Some(ProcessRecord {
                     pid,
                     parent,
