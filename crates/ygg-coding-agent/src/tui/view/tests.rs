@@ -780,7 +780,8 @@ fn slash_command_menu_lists_commands_and_tab_completes_a_unique_prefix() {
     assert!(popup.contains("commands"));
     assert!(!popup.contains("Session"));
     assert!(!popup.contains("opens picker"));
-    assert!(!popup.contains("/help"));
+    assert!(popup.contains("/help"));
+    assert!(popup.contains("/docs"));
     assert!(popup.contains("› /new"));
 
     shell.slash_menu(SlashMenuAction::Last);

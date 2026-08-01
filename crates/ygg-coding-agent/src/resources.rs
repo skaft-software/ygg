@@ -54,6 +54,70 @@ fn prompt_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn ygg_source_checkout(workspace: &Path) -> bool {
+    workspace.is_absolute()
+        && workspace.join("README.md").is_file()
+        && workspace.join("Cargo.toml").is_file()
+        && workspace.join("docs").is_dir()
+        && workspace.join("examples").is_dir()
+        && workspace.join("crates").is_dir()
+        && workspace
+            .join("crates")
+            .join("ygg-coding-agent")
+            .join("Cargo.toml")
+            .is_file()
+}
+
+fn ygg_documentation_paths(workspace: &Path) -> Option<[PathBuf; 5]> {
+    if !ygg_source_checkout(workspace) {
+        return None;
+    }
+    Some([
+        workspace.join("README.md"),
+        workspace.join("docs"),
+        workspace.join("examples"),
+        workspace.join("crates"),
+        workspace.join("crates/ygg-coding-agent"),
+    ])
+}
+
+fn self_documentation_prompt(workspace: &Path) -> Option<String> {
+    let [readme, docs, examples, crates, coding_agent] = ygg_documentation_paths(workspace)?;
+    Some(format!(
+        r#"Self-documentation:
+- This workspace is Ygg's source checkout, so Ygg can explain and extend itself here.
+- When asked about Ygg, its commands, architecture, customization, or extension API, consult the relevant documentation or source before answering. Do not rely on memory when the checkout can answer.
+- The following absolute paths are the canonical starting points; read files or inspect directories with the available tools as needed:
+  - README: {}
+  - Documentation: {}
+  - Examples: {}
+  - Rust crates: {}
+  - Coding-agent crate: {}
+- When asked to change Ygg, inspect the relevant Rust crate, tests, docs, or examples first, then make the requested change and run appropriate checks."#,
+        prompt_path(&readme),
+        prompt_path(&docs),
+        prompt_path(&examples),
+        prompt_path(&crates),
+        prompt_path(&coding_agent),
+    ))
+}
+
+/// Render the self-documentation locations used by `/docs` and `/help`.
+pub fn self_documentation_help(workspace: &Path) -> String {
+    let Some([readme, docs, examples, crates, coding_agent]) = ygg_documentation_paths(workspace)
+    else {
+        return "Ygg's source documentation is not present in this workspace. Run Ygg from its source checkout to let it inspect the local README, docs, examples, and Rust crates. The published documentation is available at https://skaft.org/ygg/docs.".to_owned();
+    };
+    format!(
+        "Ygg source documentation (read these with the available tools):\n  README: {}\n  Documentation: {}\n  Examples: {}\n  Rust crates: {}\n  Coding-agent crate: {}",
+        prompt_path(&readme),
+        prompt_path(&docs),
+        prompt_path(&examples),
+        prompt_path(&crates),
+        prompt_path(&coding_agent),
+    )
+}
+
 fn xml_attribute(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -116,6 +180,10 @@ Tools:
     prompt.push_str(
         "\n- Relative tool paths and `bash` without an explicit `cwd` resolve from the workspace root.",
     );
+    if let Some(self_documentation) = self_documentation_prompt(&config.workspace) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&self_documentation);
+    }
     prompt
 }
 
@@ -1277,6 +1345,48 @@ Environment:
             prompt_path(&config.workspace),
             prompt_path(&config.invocation_cwd),
         )
+    }
+
+    #[test]
+    fn source_checkout_prompt_points_to_canonical_ygg_documentation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs")).unwrap();
+        std::fs::create_dir_all(root.path().join("examples")).unwrap();
+        std::fs::create_dir_all(root.path().join("crates/ygg-coding-agent")).unwrap();
+        std::fs::create_dir_all(root.path().join("crates")).unwrap();
+        std::fs::write(root.path().join("README.md"), "# Ygg").unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]").unwrap();
+        std::fs::write(
+            root.path().join("crates/ygg-coding-agent/Cargo.toml"),
+            "[package]\nname = \"ygg-coding-agent\"",
+        )
+        .unwrap();
+
+        let config = config(root.path().to_owned(), root.path().to_owned());
+        let prompt = base_prompt(&config);
+        for path in [
+            root.path().join("README.md"),
+            root.path().join("docs"),
+            root.path().join("examples"),
+            root.path().join("crates"),
+            root.path().join("crates/ygg-coding-agent"),
+        ] {
+            assert!(
+                prompt.contains(&prompt_path(&path)),
+                "missing {}",
+                path.display()
+            );
+        }
+        assert!(prompt.contains("consult the relevant documentation or source"));
+        assert!(prompt.contains("Ygg can explain and extend itself"));
+    }
+
+    #[test]
+    fn self_documentation_help_explains_when_the_checkout_is_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let help = self_documentation_help(root.path());
+        assert!(help.contains("not present in this workspace"));
+        assert!(help.contains("https://skaft.org/ygg/docs"));
     }
 
     #[test]
