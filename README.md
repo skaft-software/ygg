@@ -552,6 +552,15 @@ Extensions are JSON-RPC processes over bounded line-delimited frames. Discovery 
 
 Start with [examples/README.md](examples/README.md), then read [docs/resources.md](docs/resources.md) and [docs/extensions.md](docs/extensions.md).
 
+### Self-documentation
+
+When Ygg runs from its source checkout, its system prompt points the model to
+absolute paths for `README.md`, `docs/`, `examples/`, `crates/`, and the
+`ygg-coding-agent` crate and tells it to consult them when answering Ygg
+questions or making Ygg changes. In the interactive frontend, `/help [command]`
+shows local command help and `/docs` shows those documentation locations. From
+any other workspace, the commands point to the published documentation instead.
+
 ## Architecture
 
 ```mermaid

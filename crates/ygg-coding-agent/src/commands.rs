@@ -1,5 +1,7 @@
 #![allow(missing_docs)]
 
+use std::path::Path;
+
 use crate::app::{reasoning_label, App, Reconfig};
 use crate::compaction::{context_window, estimate_next_request_tokens};
 use crate::config::CompactionMode;
@@ -33,6 +35,8 @@ pub enum Command {
     Checkout(String),
     Status,
     Context,
+    Help(Option<String>),
+    Docs,
     Cost,
     Cache,
     Update,
@@ -101,7 +105,7 @@ macro_rules! slash {
 }
 
 // The popup is the command-discovery surface, so this stays a single flat list:
-// no one-off `Session` header and no `/help` entry that merely repeats it.
+// no one-off `Session` header; self-help commands live in the same catalog.
 const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
     slash!("new", "/new", "start a fresh conversation", false),
     slash!(
@@ -175,6 +179,13 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
         "show what occupies the model context",
         false
     ),
+    slash!(
+        "help",
+        "/help [command]",
+        "show commands and Ygg self-documentation",
+        true
+    ),
+    slash!("docs", "/docs", "show Ygg documentation locations", false),
     slash!("cost", "/cost", "show turn and session cost", false),
     slash!("cache", "/cache", "show prompt-cache diagnostics", false),
     slash!("update", "/update", "check for a newer Ygg release", false),
@@ -210,6 +221,46 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
 /// Complete TUI-ordered built-in slash-command catalog.
 pub fn slash_commands() -> &'static [SlashCommandSuggestion] {
     SLASH_COMMANDS
+}
+
+/// Render local command help without contacting a model.
+pub fn help_text(workspace: &Path, topic: Option<&str>) -> String {
+    let mut text = String::from("Ygg help\n\n");
+    text.push_str(
+        "Ygg can explain and extend itself. Ask it about behavior, or request an explicit change; in a Ygg source checkout it is told where to read the canonical docs and Rust source.\n\n",
+    );
+
+    if let Some(topic) = topic.map(str::trim).filter(|topic| !topic.is_empty()) {
+        let topic = topic.trim_start_matches('/');
+        let matches = SLASH_COMMANDS
+            .iter()
+            .filter(|command| command.name == topic || command.name.starts_with(topic))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [command] => {
+                text.push_str(&format!("{} — {}", command.usage, command.description));
+            }
+            [] => text.push_str(&format!("No built-in command matches /{topic}.")),
+            _ => {
+                text.push_str(&format!("Several commands match /{topic}:\n"));
+                for command in matches {
+                    text.push_str(&format!("  {} — {}\n", command.usage, command.description));
+                }
+            }
+        }
+        text.push_str("\n\n");
+    } else {
+        text.push_str("Slash commands:\n");
+        for command in SLASH_COMMANDS {
+            text.push_str(&format!("  {} — {}\n", command.usage, command.description));
+        }
+        text.push_str(
+            "\nProject prompt templates, skills, and executable extensions are discovered at runtime; use /prompt, /skills, and /extensions to inspect them.\n\n",
+        );
+    }
+
+    text.push_str(&crate::resources::self_documentation_help(workspace));
+    text
 }
 
 /// Suggestions for an editor value while its first token is a slash command.
@@ -302,6 +353,23 @@ pub fn parse(input: &str) -> Command {
             [] => Command::Extensions(ExtensionsSubcommand::List),
             ["reload"] => Command::Extensions(ExtensionsSubcommand::Reload),
             _ => Command::Unknown(input.to_owned()),
+        };
+    }
+
+    if full_name == "help" {
+        let args = parts.collect::<Vec<_>>();
+        return match args.as_slice() {
+            [] => Command::Help(None),
+            [topic] => Command::Help(Some((*topic).to_owned())),
+            _ => Command::Unknown(input.to_owned()),
+        };
+    }
+
+    if full_name == "docs" {
+        return if parts.next().is_none() {
+            Command::Docs
+        } else {
+            Command::Unknown(input.to_owned())
         };
     }
 
@@ -860,6 +928,9 @@ mod tests {
         assert_eq!(parse("/checkout 001"), Command::Checkout("001".into()));
         assert_eq!(parse("/status"), Command::Status);
         assert_eq!(parse("/context"), Command::Context);
+        assert_eq!(parse("/help"), Command::Help(None));
+        assert_eq!(parse("/help status"), Command::Help(Some("status".into())));
+        assert_eq!(parse("/docs"), Command::Docs);
         assert_eq!(parse("/cost"), Command::Cost);
         assert_eq!(parse("/cache"), Command::Cache);
         assert_eq!(parse("/update"), Command::Update);
@@ -868,7 +939,6 @@ mod tests {
             parse("/prompt review staged changes"),
             Command::Prompt(Some("review staged changes".into()))
         );
-        assert_eq!(parse("/help"), Command::Unknown("/help".into()));
         assert_eq!(parse("/quit"), Command::Quit);
         assert_eq!(parse("/skills"), Command::Skills(SkillsSubcommand::List));
         assert_eq!(
@@ -912,8 +982,9 @@ mod tests {
     }
 
     #[test]
-    fn popup_registry_is_flat_and_help_is_not_a_duplicate_command() {
-        assert!(SLASH_COMMANDS.iter().all(|command| command.name != "help"));
+    fn popup_registry_includes_self_help_without_a_duplicate_session_entry() {
+        assert!(SLASH_COMMANDS.iter().any(|command| command.name == "help"));
+        assert!(SLASH_COMMANDS.iter().any(|command| command.name == "docs"));
         assert!(SLASH_COMMANDS
             .iter()
             .all(|command| command.name != "Session"));

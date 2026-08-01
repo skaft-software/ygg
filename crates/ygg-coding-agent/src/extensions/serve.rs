@@ -2892,6 +2892,18 @@ impl SlashInvocationOutcome {
     }
 }
 
+fn self_help_prompt(topic: Option<&str>, documentation_only: bool) -> String {
+    if documentation_only {
+        return "Explain where Ygg's canonical documentation lives and how to use it. If this workspace is a Ygg source checkout, inspect its README.md, docs/, examples/, and relevant Rust crates with the available tools before answering. Include practical next steps for understanding or extending Ygg.".to_owned();
+    }
+    let subject = topic
+        .map(|topic| format!("the Ygg command or topic `{topic}`"))
+        .unwrap_or_else(|| "Ygg's commands and workflow".to_owned());
+    format!(
+        "Give a concise self-help answer about {subject}. If this workspace is a Ygg source checkout, consult its README.md, docs/, examples/, and relevant Rust crates with the available tools before answering. Include practical details and mention how a user can inspect or extend Ygg when relevant."
+    )
+}
+
 /// Executes one slash invocation at an idle worker boundary. The command is
 /// parsed from the same grammar as the TUI, but only durable/session-safe
 /// outcomes cross the graphical protocol boundary.
@@ -2903,6 +2915,28 @@ async fn invoke_idle_slash_command(
 ) -> (Option<App>, Result<SlashInvocationOutcome, ServiceError>) {
     let parsed = commands::parse(&invocation.invocation);
     match parsed {
+        commands::Command::Help(topic) => (
+            Some(app),
+            Ok(SlashInvocationOutcome::Start(RunPromptInput::New(
+                PromptInput {
+                    text: self_help_prompt(topic.as_deref(), false),
+                    attachments: Vec::new(),
+                    document_ids: Vec::new(),
+                    project_file_ids: Vec::new(),
+                },
+            ))),
+        ),
+        commands::Command::Docs => (
+            Some(app),
+            Ok(SlashInvocationOutcome::Start(RunPromptInput::New(
+                PromptInput {
+                    text: self_help_prompt(None, true),
+                    attachments: Vec::new(),
+                    document_ids: Vec::new(),
+                    project_file_ids: Vec::new(),
+                },
+            ))),
+        ),
         commands::Command::Compact => {
             let mut app = app;
             let original_keep_recent_turns = app.config.compaction.keep_recent_turns;

@@ -56,7 +56,10 @@ The environment block truthfully distinguishes the workspace root from the
 invocation directory. Relative tool paths and the default `bash` working
 directory resolve from the workspace root. Enabled core-tool names are listed,
 while the contract acknowledges extension and skill tools supplied alongside
-them. Behavioral changes require regression tests rather than model-specific
+them. When the workspace has the Ygg source-checkout markers, the base prompt
+also includes absolute paths to the README, `docs/`, `examples/`, `crates/`, and
+the coding-agent crate and tells the model to consult them for Ygg questions or
+changes. Behavioral changes require regression tests rather than model-specific
 prompt tuning.
 
 Global and trusted workspace `AGENTS.md` files retain root-to-leaf precedence
@@ -152,7 +155,9 @@ need Agent/session ownership.
 - `/prompt [name] [arguments]` — inspect or expand prompt templates.
 - `/skills search|load|reload|off ...` — inspect and explicitly activate skills.
 - `/extensions [reload]` — inspect or reload trusted executable extensions.
-- `/status`, `/help`, `/quit` — product status and lifecycle controls.
+- `/help [command]` — show local command help and Ygg self-documentation.
+- `/docs` — show the Ygg documentation locations, when available.
+- `/status`, `/quit` — product status and lifecycle controls.
 
 Checkout appends a durable head record. The subsequent consuming rebuild
 restores configuration on the selected branch and appends current provenance;

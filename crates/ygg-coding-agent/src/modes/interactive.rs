@@ -789,6 +789,9 @@ fn handle_active_command(
         Command::Extensions(_) => {
             shell.notice("extension inspection and reload are available at the next idle boundary")
         }
+        Command::Help(_) | Command::Docs => {
+            shell.notice("help and documentation are available at the next idle boundary")
+        }
         Command::Name(_) | Command::Sessions | Command::Export(_) => {
             shell.notice("session management commands are available at the next idle boundary")
         }
@@ -2062,6 +2065,14 @@ async fn run_idle_command(
     command: Command,
 ) -> anyhow::Result<IdleCommandOutcome> {
     match command {
+        Command::Help(topic) => {
+            shell.show_overlay_text(commands::help_text(&app.config.workspace, topic.as_deref()));
+        }
+        Command::Docs => {
+            shell.show_overlay_text(crate::resources::self_documentation_help(
+                &app.config.workspace,
+            ));
+        }
         Command::Status => {
             shell.show_status_text_with_telemetry(commands::status_text(&app, None));
         }
