@@ -1033,7 +1033,6 @@ mod tests {
             "Context",
             "Model turns",
             "Tool calls",
-            "Skills         0 active / 0 discovered",
             "Security model: local agent with workspace trust gates",
             "Built-in file paths: current-user paths (absolute, ~/ and relative)",
             "File edits: enabled",
@@ -1049,5 +1048,13 @@ mod tests {
                 "missing {expected:?} in {status}"
             );
         }
+        let expected_skills = format!(
+            "Skills         0 active / {} discovered",
+            app.skills.descriptors().len()
+        );
+        assert!(
+            status.contains(&expected_skills),
+            "missing {expected_skills:?} in {status}"
+        );
     }
 }

@@ -3,7 +3,7 @@
 //! Default-off adapter from the graphical host contracts to the real Ygg App.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,42 +14,47 @@ use sexy_tui_rs::{Color as TuiColor, TextStyle as TuiTextStyle};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use ygg_agent::{
-    AgentEvent, Entry, EntryId, EntryValue, FinishReason, InputPart, OutputChannel, RunControl,
-    Session, SessionRunOutcome, SessionRunOutcomeStatus, ToolError, ToolOutput, ToolProgress,
-    UserInput,
+    AgentEvent, CompactionReason, ContextBreakdown as AgentContextBreakdown,
+    ContextSnapshot as AgentContextSnapshot, Entry, EntryId, EntryValue, FinishReason, InputPart,
+    OutputChannel, RunControl, RunPhase as AgentRunPhase,
+    RunTerminalState as AgentRunTerminalState, Session, SessionRunOutcome, SessionRunOutcomeStatus,
+    ToolError, ToolOutput, ToolProgress, UserInput,
 };
 use ygg_ai::{
     AssistantPart, ImageSource, Media, Message, Modality, Model, ModelCatalog, ModelId,
     ReasoningConfig, ToolCallId, ToolResultPart, UserPart,
 };
 use ygg_serve_backend::{
-    parse_test_output, refresh_repository_context, ActivityPhase, ActivityPhaseSummary,
-    ActorOwnerState, ArtifactId, ArtifactKind, ArtifactRef, AttachmentError, AttachmentFingerprint,
-    AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState, AuthorityProfile,
-    ColorScheme, CommandDiscovery, CommandSuggestion, CommandSuggestionKind, CompletionReview,
-    ContextUsage, ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
+    parse_test_output, refresh_repository_context, ActiveCompaction, ActivityPhase,
+    ActivityPhaseSummary, ActorOwnerState, AgentRunPhase as ServeRunPhase, AgentRunTelemetry,
+    AgentRunTerminalState as ServeRunTerminalState, ArtifactId, ArtifactKind, ArtifactRef,
+    AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef, AttachmentStore,
+    AttentionState, AuthorityProfile, ColorScheme, CommandDiscovery, CommandSuggestion,
+    CommandSuggestionKind, CompletedCompaction, CompletionReview, ContextCategory,
+    ContextCategoryTotal, ContextCompactionReason, ContextStatus, ContextTotals, ContextUsage,
+    ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
     DocumentReference, DocumentStore, DocumentStoreError, DriverCommandOutcome, DurableEntryId,
     EventPayload, EvidenceCoverage, FileChange, FileEntryId, FinalizeCompletion, FinalizeDecision,
-    HostCapabilities, HostDescriptor, HostId, HostService, InferenceRequest, InferenceRequestStore,
-    InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload, LifetimeUsage, LoopbackConfig,
-    LoopbackServer, ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary,
-    PendingRequest, PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult,
-    ProjectFileSystem, ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ProjectId,
-    ProjectRegistry, ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation,
-    RegistryProjectId, RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot,
-    RequestAnswer, RequestId, RequestKind, RequestState, RunId, SearchDocument, SearchDocumentKind,
-    SearchError, SemanticRole, ServiceError, SessionBranchEntry, SessionBranchEntryKind,
-    SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor, SessionDriver,
-    SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot,
-    SessionSummary, SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId,
-    SourceKind, SourceRef, StoredAttachment, StoredResource, StructuredTestResults,
-    SupervisorConfig, TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput,
-    ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle,
-    ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity, ToolActivityStatus,
-    ToolKind, ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest,
-    TranscriptSearchResult, TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary,
-    TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId, UsageActivity,
-    UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
+    GoalStore, HostCapabilities, HostDescriptor, HostId, HostService, InferenceRequest,
+    InferenceRequestStore, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
+    LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing, ModelInputPricingTier,
+    ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProjectFileRead,
+    ProjectFileSearchResult, ProjectFileSystem, ProjectFileSystemError, ProjectFileTree,
+    ProjectFileWrite, ProjectId, ProjectRegistry, ProjectRegistryError, ProjectSummary,
+    PromptInput, ProtocolValidation, RegistryProjectId, RegistryProjectState,
+    RepositoryContextError, RepositoryContextSnapshot, RequestAnswer, RequestId, RequestKind,
+    RequestState, RunId, RuntimeId, SearchDocument, SearchDocumentKind, SearchError, SemanticRole,
+    ServiceError, SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph,
+    SessionCatalogState, SessionCommand, SessionCursor, SessionDriver, SessionId, SessionItem,
+    SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot, SessionSummary,
+    SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId, SourceKind, SourceRef,
+    StoredAttachment, StoredResource, StructuredTestResults, SupervisorConfig, TestCommandOutcome,
+    TestCommandStatus, TestFramework, TestOutputInput, ThemeColor, ThemeDensity, ThemeDto, ThemeId,
+    ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent,
+    ToolActivity, ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
+    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
+    TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
+    UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
     MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES,
     PROTOCOL_VERSION,
 };
@@ -203,11 +208,13 @@ struct YggHost {
     selected_theme_id: ThemeId,
     attachments: Option<AttachmentStore>,
     documents: Option<DocumentStore>,
+    goals: GoalStore,
     trusted_files: Arc<Mutex<HashMap<String, TrustedProjectFiles>>>,
     search_index: Arc<Mutex<TranscriptSearchIndex>>,
     resources: Option<ygg_serve_backend::ResourceStore>,
     usage: Arc<Mutex<InferenceRequestStore>>,
     serve_state_dir: PathBuf,
+    session_deletion_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     checkout_hooks: Arc<Mutex<VecDeque<CheckoutTestHooks>>>,
     #[cfg(test)]
@@ -218,6 +225,43 @@ struct ProjectContext {
     project_id: ProjectId,
     config: Config,
     sessions: SessionStore,
+}
+
+const SESSION_DELETION_VERSION: u16 = 1;
+const SESSION_DELETION_DIRECTORY: &str = "session-deletions-v1";
+const MAX_SESSION_DELETION_RECORD_BYTES: u64 = 4 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PendingSessionDeletion {
+    version: u16,
+    session_id: String,
+    project_id: String,
+    trashed_at_ms: u64,
+    committed: bool,
+}
+
+impl PendingSessionDeletion {
+    fn new(
+        session_id: &SessionId,
+        project_id: &ProjectId,
+        trashed_at_ms: u64,
+    ) -> PendingSessionDeletion {
+        Self {
+            version: SESSION_DELETION_VERSION,
+            session_id: session_id.as_str().to_owned(),
+            project_id: project_id.as_str().to_owned(),
+            trashed_at_ms,
+            committed: false,
+        }
+    }
+
+    fn validate(&self) -> bool {
+        self.version == SESSION_DELETION_VERSION
+            && self.trashed_at_ms > 0
+            && SessionId::new(self.session_id.clone()).is_ok()
+            && ProjectId::new(self.project_id.clone()).is_ok()
+    }
 }
 
 impl YggHost {
@@ -294,6 +338,7 @@ impl YggHost {
                 None
             }
         };
+        let goals = GoalStore::open(&state_dir.join("goals"))?;
         let resources = match ygg_serve_backend::ResourceStore::open(&state_dir) {
             Ok(store) => Some(store),
             Err(_) => {
@@ -305,7 +350,7 @@ impl YggHost {
         };
         let mut usage = InferenceRequestStore::open(&state_dir)?;
         backfill_usage_store(&config, &projects, &mut usage)?;
-        Ok(Self {
+        let host = Self {
             config,
             catalog: boot.catalog,
             models,
@@ -316,16 +361,150 @@ impl YggHost {
             selected_theme_id,
             attachments,
             documents,
+            goals,
             trusted_files: Arc::new(Mutex::new(HashMap::new())),
             search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources,
             usage: Arc::new(Mutex::new(usage)),
             serve_state_dir: state_dir,
+            session_deletion_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             checkout_hooks: Arc::new(Mutex::new(VecDeque::new())),
             #[cfg(test)]
             open_count: Arc::new(AtomicU64::new(0)),
-        })
+        };
+        host.recover_pending_session_deletions();
+        Ok(host)
+    }
+
+    fn cleanup_session_sidecars(&self, project_id: &ProjectId, session_id: &SessionId) -> bool {
+        // InferenceRequestStore is intentionally excluded: its
+        // conversation-content-free, append-only records are host-level
+        // accounting history, not replayable session content. Permanent
+        // deletion removes every session-rehydratable
+        // sidecar while preserving lifetime usage totals.
+        let mut complete = true;
+        match &self.attachments {
+            Some(store) => complete &= store.delete_session(session_id).is_ok(),
+            None => complete = false,
+        }
+        match &self.documents {
+            Some(store) => {
+                complete &= store
+                    .delete_session(project_id.as_str(), session_id.as_str())
+                    .is_ok();
+            }
+            None => complete = false,
+        }
+        match &self.resources {
+            Some(store) => complete &= store.delete_session(session_id).is_ok(),
+            None => complete = false,
+        }
+        complete &= self.goals.delete_session(session_id).is_ok();
+        match self.search_index.lock() {
+            Ok(mut search_index) => {
+                complete &= search_index.remove_session(session_id.as_str()).is_ok();
+            }
+            Err(_) => complete = false,
+        }
+        complete
+    }
+
+    fn recover_pending_session_deletions(&self) {
+        // Construction performs recovery before the host is published, so the
+        // deletion mutex must be immediately available. Keep recovery under
+        // the same lock as live deletion in case this method gains another
+        // caller later.
+        let Ok(_deletion_guard) = self.session_deletion_lock.try_lock() else {
+            crate::output::stderr_line(
+                "warning: pending permanent session deletions are already being recovered",
+            );
+            return;
+        };
+        let Ok(records) = load_pending_session_deletions(&self.serve_state_dir) else {
+            crate::output::stderr_line(
+                "warning: pending permanent session deletions could not be inspected",
+            );
+            return;
+        };
+        for mut record in records {
+            let Ok(session_id) = SessionId::new(record.session_id.clone()) else {
+                continue;
+            };
+            let Ok(project_id) = ProjectId::new(record.project_id.clone()) else {
+                continue;
+            };
+            let Ok(registry_id) = RegistryProjectId::parse(record.project_id.clone()) else {
+                continue;
+            };
+            let sessions = {
+                let Ok(projects) = self.projects.lock() else {
+                    continue;
+                };
+                let Ok(root) = projects.resolve_root_for_cleanup(&registry_id) else {
+                    continue;
+                };
+                SessionStore::new(&self.config.session_dir, root.as_path())
+            };
+
+            if !record.committed {
+                match sessions.session_file_exists(session_id.as_str()) {
+                    Ok(true) => {
+                        let rolled_back = sessions
+                            .rollback_permanent_delete(session_id.as_str())
+                            .is_ok();
+                        let rebound = rolled_back
+                            && self.projects.lock().is_ok_and(|mut projects| {
+                                projects
+                                    .bind_session(session_id.as_str(), &registry_id)
+                                    .is_ok()
+                            });
+                        if rebound
+                            && remove_pending_session_deletion(
+                                &self.serve_state_dir,
+                                session_id.as_str(),
+                            )
+                            .is_ok()
+                        {
+                            continue;
+                        }
+                        crate::output::stderr_line(format!(
+                            "warning: pre-commit permanent deletion rollback for session {} remains pending",
+                            session_id.as_str()
+                        ));
+                        continue;
+                    }
+                    Ok(false) => {
+                        record.committed = true;
+                        let _ = write_pending_session_deletion(&self.serve_state_dir, &record);
+                    }
+                    Err(_) => {
+                        crate::output::stderr_line(format!(
+                            "warning: pre-commit permanent deletion for session {} could not inspect its transcript and remains pending",
+                            session_id.as_str()
+                        ));
+                        continue;
+                    }
+                }
+            }
+
+            let primary_clean = sessions
+                .finish_permanent_delete(session_id.as_str())
+                .is_ok();
+            let unbound = self
+                .projects
+                .lock()
+                .is_ok_and(|mut projects| projects.unbind_session(session_id.as_str()).is_ok());
+            let sidecars_clean = self.cleanup_session_sidecars(&project_id, &session_id);
+            if primary_clean && unbound && sidecars_clean {
+                let _ = remove_pending_session_deletion(&self.serve_state_dir, session_id.as_str());
+            } else {
+                crate::output::stderr_line(format!(
+                    "warning: permanent deletion cleanup for session {} remains pending",
+                    session_id.as_str()
+                ));
+            }
+        }
     }
 
     fn default_selection(&self) -> Result<ModelSelection, ServiceError> {
@@ -1497,9 +1676,19 @@ impl HostService for YggHost {
     ) -> Result<ProjectSummary, ServiceError> {
         let projects = Arc::clone(&self.projects);
         let project_id = registry_project_id(project_id)?;
+        let launch_project_id = self.launch_project_id.clone();
+        let launch_workspace = self.config.workspace.clone();
         tokio::task::spawn_blocking(move || {
             let mut projects = projects.lock().map_err(|_| ServiceError::Internal)?;
             let project = if trusted {
+                // A replaced checkout at the exact launch path can be restored
+                // only by an explicit trust action. Never rebind another
+                // project or accept a browser-supplied filesystem path.
+                if project_id.as_str() == launch_project_id.as_str() {
+                    projects
+                        .rebind_root(&project_id, &launch_workspace)
+                        .map_err(project_registry_service_error)?;
+                }
                 projects.grant_trust(&project_id)
             } else {
                 projects.revoke_trust(&project_id)
@@ -1569,28 +1758,67 @@ impl HostService for YggHost {
         {
             return Err(ServiceError::InvalidBoundary);
         }
+        // Distinct idempotency keys may execute concurrently. Serialize the
+        // destructive state machine so one request cannot overwrite or remove
+        // another request's recovery journal.
+        let _deletion_guard = self.session_deletion_lock.lock().await;
         let context = self.storage_context_for_session(session_id)?;
-        let previous_project = {
-            let mut projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
-            projects
-                .unbind_session(session_id.as_str())
-                .map_err(project_registry_service_error)?
-        };
-        if let Err(error) = context
-            .sessions
-            .delete_permanently(session_id.as_str(), confirmation.trashed_at_ms)
-        {
-            if let Some(project_id) = previous_project {
-                let mut projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
-                projects
-                    .bind_session(session_id.as_str(), &project_id)
-                    .map_err(project_registry_service_error)?;
-            }
-            let _ = error;
-            return Err(ServiceError::InvalidBoundary);
+        if self.attachments.is_none() || self.documents.is_none() || self.resources.is_none() {
+            return Err(ServiceError::Unavailable);
         }
-        if let Ok(mut search_index) = self.search_index.lock() {
-            let _ = search_index.remove_session(session_id.as_str());
+        let mut deletion = PendingSessionDeletion::new(
+            session_id,
+            &context.project_id,
+            confirmation.trashed_at_ms,
+        );
+        write_pending_session_deletion(&self.serve_state_dir, &deletion)
+            .map_err(|_| ServiceError::Internal)?;
+
+        let delete_result = context
+            .sessions
+            .delete_permanently(session_id.as_str(), confirmation.trashed_at_ms);
+        if delete_result.is_err() {
+            match context.sessions.session_file_exists(session_id.as_str()) {
+                Ok(true) => {
+                    context
+                        .sessions
+                        .rollback_permanent_delete(session_id.as_str())
+                        .map_err(|_| ServiceError::Internal)?;
+                    remove_pending_session_deletion(&self.serve_state_dir, session_id.as_str())
+                        .map_err(|_| ServiceError::Internal)?;
+                    return Err(ServiceError::InvalidBoundary);
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    // Preserve the durable intent. Startup recovery must not
+                    // infer commitment from a transcript it could not inspect.
+                    return Err(ServiceError::Internal);
+                }
+            }
+        }
+
+        // The JSONL disappearance is the irreversible commit boundary. Every
+        // later step is idempotent and journaled so interruption cannot turn a
+        // completed user-visible delete into permanently leaked sidecars.
+        deletion.committed = true;
+        let marker_committed =
+            write_pending_session_deletion(&self.serve_state_dir, &deletion).is_ok();
+        let primary_clean = context
+            .sessions
+            .finish_permanent_delete(session_id.as_str())
+            .is_ok();
+        let unbound = self
+            .projects
+            .lock()
+            .is_ok_and(|mut projects| projects.unbind_session(session_id.as_str()).is_ok());
+        let sidecars_clean = self.cleanup_session_sidecars(&context.project_id, session_id);
+        if marker_committed && primary_clean && unbound && sidecars_clean {
+            let _ = remove_pending_session_deletion(&self.serve_state_dir, session_id.as_str());
+        } else {
+            crate::output::stderr_line(format!(
+                "warning: permanent deletion cleanup for session {} will retry on startup",
+                session_id.as_str()
+            ));
         }
         Ok(())
     }
@@ -1841,7 +2069,54 @@ struct PendingUserItem {
     turn_id: TurnId,
     documents: Vec<DocumentReference>,
     project_files: Vec<TrustedFileEntry>,
+    document_context_tokens: u64,
+    project_file_context_tokens: u64,
+    context_attributed: bool,
     branch_provenance: Option<ConversationBranchProvenance>,
+}
+
+struct RunContextProjection {
+    last_agent_snapshot: Option<AgentContextSnapshot>,
+    last_published: Option<ContextUsage>,
+    current_totals: Option<ContextTotals>,
+    context_updated_at_ms: u64,
+    active_compaction: Option<(u64, ActiveCompaction)>,
+    last_compaction: Option<(u64, CompletedCompaction)>,
+    project_instruction_tokens: u64,
+    document_context_tokens: u64,
+    project_file_context_tokens: u64,
+}
+
+impl RunContextProjection {
+    fn new(
+        project_instruction_tokens: u64,
+        document_context_tokens: u64,
+        project_file_context_tokens: u64,
+    ) -> Self {
+        Self {
+            last_agent_snapshot: None,
+            last_published: None,
+            current_totals: None,
+            context_updated_at_ms: 0,
+            active_compaction: None,
+            last_compaction: None,
+            project_instruction_tokens,
+            document_context_tokens,
+            project_file_context_tokens,
+        }
+    }
+
+    fn attribute_sources(&mut self, document_tokens: u64, project_file_tokens: u64) {
+        self.document_context_tokens = self.document_context_tokens.saturating_add(document_tokens);
+        self.project_file_context_tokens = self
+            .project_file_context_tokens
+            .saturating_add(project_file_tokens);
+    }
+
+    fn clear_auxiliary_sources(&mut self) {
+        self.document_context_tokens = 0;
+        self.project_file_context_tokens = 0;
+    }
 }
 
 struct ResolvedPromptInput {
@@ -1850,6 +2125,8 @@ struct ResolvedPromptInput {
     attachments: Vec<AttachmentRef>,
     documents: Vec<DocumentReference>,
     project_files: Vec<TrustedFileEntry>,
+    document_context_tokens: u64,
+    project_file_context_tokens: u64,
 }
 
 enum RunPromptInput {
@@ -2423,7 +2700,7 @@ async fn run_worker(
                     }
                     (Some(owned_app), Ok(SlashInvocationOutcome::Immediate(outcome))) => {
                         app = Some(owned_app);
-                        let _ = message.response.send(Ok(outcome));
+                        let _ = message.response.send(Ok(*outcome));
                     }
                     (Some(owned_app), Err(error)) => {
                         app = Some(owned_app);
@@ -2606,7 +2883,13 @@ async fn run_worker(
 
 enum SlashInvocationOutcome {
     Start(RunPromptInput),
-    Immediate(DriverCommandOutcome),
+    Immediate(Box<DriverCommandOutcome>),
+}
+
+impl SlashInvocationOutcome {
+    fn immediate(outcome: DriverCommandOutcome) -> Self {
+        Self::Immediate(Box::new(outcome))
+    }
 }
 
 /// Executes one slash invocation at an idle worker boundary. The command is
@@ -2630,7 +2913,7 @@ async fn invoke_idle_slash_command(
                 Ok(_) => {
                     let _ = sync_session_usage(&plan.usage, &plan.session_id, app.agent.session());
                     idle_mutation_outcome(&app, plan, projection)
-                        .map(SlashInvocationOutcome::Immediate)
+                        .map(SlashInvocationOutcome::immediate)
                 }
                 Err(_) => Err(ServiceError::Internal),
             };
@@ -2687,7 +2970,7 @@ async fn invoke_idle_slash_command(
         commands::Command::Skills(subcommand) => {
             let mut app = app;
             let outcome = execute_slash_skills_command(&mut app, subcommand, plan, projection)
-                .map(SlashInvocationOutcome::Immediate);
+                .map(SlashInvocationOutcome::immediate);
             (Some(app), outcome)
         }
         commands::Command::Prompt(Some(invocation)) => {
@@ -2706,13 +2989,13 @@ async fn invoke_idle_slash_command(
         }
         commands::Command::Name(Some(title)) => (
             Some(app),
-            rename_session_outcome(plan, &title).map(SlashInvocationOutcome::Immediate),
+            rename_session_outcome(plan, &title).map(SlashInvocationOutcome::immediate),
         ),
         commands::Command::Name(None)
         | commands::Command::Prompt(None)
         | commands::Command::Extensions(commands::ExtensionsSubcommand::List) => (
             Some(app),
-            Ok(SlashInvocationOutcome::Immediate(
+            Ok(SlashInvocationOutcome::immediate(
                 DriverCommandOutcome::default(),
             )),
         ),
@@ -2735,7 +3018,7 @@ fn apply_slash_reconfiguration(
             let selection = selection_for_model(&rebuilt.model, &rebuilt.reasoning, &plan.config);
             let outcome =
                 reconfiguration_outcome(&rebuilt, plan, projection, selection, plan.authority)
-                    .map(SlashInvocationOutcome::Immediate);
+                    .map(SlashInvocationOutcome::immediate);
             (Some(rebuilt), outcome)
         }
         Err(_) => (build_worker_app(plan).ok(), Err(ServiceError::Internal)),
@@ -2761,7 +3044,7 @@ fn reload_slash_resources(
             plan.launch.session =
                 SessionSelection::OpenExisting(rebuilt.agent.session().path().to_owned());
             let outcome = idle_mutation_outcome(&rebuilt, plan, projection)
-                .map(SlashInvocationOutcome::Immediate);
+                .map(SlashInvocationOutcome::immediate);
             (Some(rebuilt), outcome)
         }
         Err(_) => (build_worker_app(plan).ok(), Err(ServiceError::Internal)),
@@ -2903,7 +3186,7 @@ async fn invoke_dynamic_slash_command(
         .execute_command_without_confirmation(name, extension_arguments)
         .await
     {
-        Ok(Some(_)) => Ok(SlashInvocationOutcome::Immediate(
+        Ok(Some(_)) => Ok(SlashInvocationOutcome::immediate(
             DriverCommandOutcome::default(),
         )),
         Ok(None) => start_prompt_template(app, name, arguments).map(SlashInvocationOutcome::Start),
@@ -3134,12 +3417,24 @@ fn replay_prompt_input(
         &plan.session_id,
         &entry.id.0,
     );
+    let document_context_tokens = documents
+        .iter()
+        .map(|document| document.extracted_text_byte_count)
+        .fold(0_u64, u64::saturating_add)
+        .div_ceil(4);
+    let project_file_context_tokens = project_files
+        .iter()
+        .map(|file| file.byte_len)
+        .fold(0_u64, u64::saturating_add)
+        .div_ceil(4);
     Ok(ResolvedPromptInput {
         display_text,
         model_text,
         attachments,
         documents,
         project_files,
+        document_context_tokens,
+        project_file_context_tokens,
     })
 }
 
@@ -3177,6 +3472,9 @@ fn stored_prompt_context_for_entry(
     (Vec::new(), Vec::new())
 }
 
+// These explicit actor-state and channel borrows document which branch owns
+// each mutable subsystem; combining them into a broad context would weaken that boundary.
+#[allow(clippy::too_many_arguments)]
 async fn drive_sibling_conversation_branch(
     mut owned_app: App,
     source_user_entry_id: EntryId,
@@ -3630,6 +3928,24 @@ fn resolve_stored_media(
         .collect()
 }
 
+fn token_hint_for_bytes(bytes: usize) -> u64 {
+    (bytes as u64).div_ceil(4)
+}
+
+fn project_instruction_token_hint(system: &str) -> u64 {
+    const START: &str = "<project_context>\n";
+    const END: &str = "\n</project_context>";
+
+    let Some(start) = system.find(START) else {
+        return 0;
+    };
+    let section_start = start.saturating_add(START.len());
+    let Some(relative_end) = system[section_start..].find(END) else {
+        return 0;
+    };
+    token_hint_for_bytes(relative_end)
+}
+
 async fn resolve_prompt_input(
     plan: &WorkerPlan,
     input: PromptInput,
@@ -3695,6 +4011,8 @@ async fn resolve_prompt_input(
         | ygg_serve_backend::PromptContextError::AuxiliaryContextTooLarge
         | ygg_serve_backend::PromptContextError::PromptTooLarge => ServiceError::PayloadTooLarge,
     })?;
+    let document_context_tokens = token_hint_for_bytes(composed.document_context_bytes());
+    let project_file_context_tokens = token_hint_for_bytes(composed.project_file_context_bytes());
     Ok(ResolvedPromptInput {
         display_text: text,
         model_text: composed.into_string(),
@@ -3705,6 +4023,8 @@ async fn resolve_prompt_input(
         project_files: project_file_context
             .map(|context| context.files)
             .unwrap_or_default(),
+        document_context_tokens,
+        project_file_context_tokens,
     })
 }
 
@@ -3753,6 +4073,9 @@ fn resource_store_service_error(error: ygg_serve_backend::ResourceStoreError) ->
     }
 }
 
+// Run orchestration keeps its independently borrowed actor state and channels
+// visible rather than hiding them behind a mutable catch-all context.
+#[allow(clippy::too_many_arguments)]
 async fn start_and_drive_run(
     app: &mut App,
     input: RunPromptInput,
@@ -3786,6 +4109,8 @@ async fn start_and_drive_run(
         attachments,
         documents,
         project_files,
+        document_context_tokens,
+        project_file_context_tokens,
     } = resolved;
     let media = match resolve_attachment_media(app, plan, &attachments) {
         Ok(media) => media,
@@ -3817,9 +4142,10 @@ async fn start_and_drive_run(
         Ok(discovery) => discovery,
         Err(error) => return Ok(RunDriveOutcome::Rejected { admission, error }),
     };
-    let (pending_context_count, model_prompt) = if replay_exact {
+    let (pending_context_count, model_prompt, project_instruction_tokens) = if replay_exact {
+        let project_instruction_tokens = project_instruction_token_hint(&app.system);
         app.agent.set_system_prompt(app.system.clone());
-        (0, prompt)
+        (0, prompt, project_instruction_tokens)
     } else {
         let composition = match app
             .executable_extensions
@@ -3836,8 +4162,13 @@ async fn start_and_drive_run(
         };
         let pending_context_count = composition.pending_context_count;
         let model_prompt = composition.prompt;
+        let project_instruction_tokens = project_instruction_token_hint(&composition.system);
         app.agent.set_system_prompt(composition.system);
-        (pending_context_count, model_prompt)
+        (
+            pending_context_count,
+            model_prompt,
+            project_instruction_tokens,
+        )
     };
     app.agent
         .set_prompt_display_text(Some(display_text.clone()));
@@ -3873,6 +4204,11 @@ async fn start_and_drive_run(
             });
         }
     };
+    let mut context_projection = RunContextProjection::new(
+        project_instruction_tokens,
+        document_context_tokens,
+        project_file_context_tokens,
+    );
     if !attachments.is_empty() {
         projection
             .pending_attachments
@@ -3884,12 +4220,14 @@ async fn start_and_drive_run(
         turn_id: turn_id.clone(),
         documents: documents.clone(),
         project_files: project_files.clone(),
+        document_context_tokens,
+        project_file_context_tokens,
+        context_attributed: true,
         branch_provenance: branch_provenance.clone(),
     });
     app.executable_extensions
         .commit_prompt_context(pending_context_count);
     let control = run.control();
-    let context_limit = app.model.spec.limits.context_window;
     let mut immediate = Vec::with_capacity(3);
     if let Some(title) = changed_session_title(
         &plan.sessions,
@@ -3943,17 +4281,24 @@ async fn start_and_drive_run(
                     terminal = TerminalProjection::failed("The run stream ended unexpectedly.");
                     break;
                 };
-                if let Some(outcome) = project_agent_event(
+                let outcome = project_agent_event(
                     agent_event,
                     &run_id,
-                    context_limit,
                     plan,
                     projection,
+                    &mut context_projection,
                     events,
                     &mut response_text,
                 )
-                .await?
-                {
+                .await?;
+                publish_context_snapshot(
+                    run.context_snapshot(),
+                    &run_id,
+                    &mut context_projection,
+                    events,
+                )
+                .await?;
+                if let Some(outcome) = outcome {
                     completed = outcome.state == SessionLiveState::Done;
                     terminal = outcome;
                     break;
@@ -3976,15 +4321,21 @@ async fn start_and_drive_run(
             }
         }
     }
-    drop(run);
+    let final_context_snapshot = run.into_context_snapshot();
+    publish_context_snapshot(
+        final_context_snapshot,
+        &run_id,
+        &mut context_projection,
+        events,
+    )
+    .await?;
     sync_session_usage(&plan.usage, &plan.session_id, app.agent.session())?;
     let settled_at_ms = now_ms();
     let unfinished = projection
         .tool_calls
         .iter()
-        .filter_map(|(tool_call_id, tool)| {
-            (tool.activity.status == ToolActivityStatus::Running).then(|| tool_call_id.clone())
-        })
+        .filter(|(_, tool)| tool.activity.status == ToolActivityStatus::Running)
+        .map(|(tool_call_id, _)| tool_call_id.clone())
         .collect::<Vec<_>>();
     let mut stopped_updates = Vec::new();
     for tool_call_id in unfinished {
@@ -4368,6 +4719,8 @@ async fn publish_control_user_item(
         attachments,
         documents,
         project_files,
+        document_context_tokens,
+        project_file_context_tokens,
     } = resolved;
     let item_id = projection.next_user_item_id(run_id)?;
     let turn_id = projection.turn_id(run_id)?;
@@ -4377,6 +4730,9 @@ async fn publish_control_user_item(
         turn_id: turn_id.clone(),
         documents: documents.clone(),
         project_files: project_files.clone(),
+        document_context_tokens,
+        project_file_context_tokens,
+        context_attributed: false,
         branch_provenance: None,
     });
     projection
@@ -5002,12 +5358,336 @@ fn stable_tool_item_id(tool_call_id: &str) -> Result<ItemId, ServiceError> {
     ItemId::new(format!("item-tool-{}", &hash[..24])).map_err(|_| ServiceError::Internal)
 }
 
+fn public_compaction_reason(reason: CompactionReason) -> ContextCompactionReason {
+    match reason {
+        CompactionReason::Threshold => ContextCompactionReason::Threshold,
+        CompactionReason::Overflow => ContextCompactionReason::Overflow,
+    }
+}
+
+fn public_run_phase(phase: AgentRunPhase) -> ServeRunPhase {
+    match phase {
+        AgentRunPhase::Preparing => ServeRunPhase::Preparing,
+        AgentRunPhase::Responding => ServeRunPhase::Responding,
+        AgentRunPhase::Retrying => ServeRunPhase::Retrying,
+        AgentRunPhase::Compacting => ServeRunPhase::Compacting,
+        AgentRunPhase::ExecutingTool => ServeRunPhase::ExecutingTool,
+        AgentRunPhase::Finished => ServeRunPhase::Finished,
+    }
+}
+
+fn public_terminal_state(state: AgentRunTerminalState) -> ServeRunTerminalState {
+    match state {
+        AgentRunTerminalState::Completed => ServeRunTerminalState::Completed,
+        AgentRunTerminalState::Aborted => ServeRunTerminalState::Aborted,
+        AgentRunTerminalState::Failed => ServeRunTerminalState::Failed,
+        AgentRunTerminalState::MaxTurns => ServeRunTerminalState::MaxTurns,
+        AgentRunTerminalState::Dropped => ServeRunTerminalState::Dropped,
+    }
+}
+
+fn public_context_totals(
+    context: &AgentContextBreakdown,
+    projection: &RunContextProjection,
+) -> Result<ContextTotals, ServiceError> {
+    if context.categorized_tokens() != context.total_tokens {
+        return Err(ServiceError::Internal);
+    }
+    let project_instructions = projection
+        .project_instruction_tokens
+        .min(context.instruction_tokens);
+    let base_instructions = context
+        .instruction_tokens
+        .saturating_sub(project_instructions);
+    let system = context
+        .system_tokens
+        .checked_add(base_instructions)
+        .ok_or(ServiceError::Internal)?;
+    let documents = projection
+        .document_context_tokens
+        .min(context.conversation_tokens);
+    let remaining_conversation = context.conversation_tokens.saturating_sub(documents);
+    let project_files = projection
+        .project_file_context_tokens
+        .min(remaining_conversation);
+    let conversation = remaining_conversation.saturating_sub(project_files);
+    ContextTotals::try_new(
+        vec![
+            ContextCategoryTotal {
+                category: ContextCategory::System,
+                tokens: system,
+            },
+            ContextCategoryTotal {
+                category: ContextCategory::ProjectInstructions,
+                tokens: project_instructions,
+            },
+            ContextCategoryTotal {
+                category: ContextCategory::Conversation,
+                tokens: conversation,
+            },
+            ContextCategoryTotal {
+                category: ContextCategory::ToolResults,
+                tokens: context.tool_result_tokens,
+            },
+            ContextCategoryTotal {
+                category: ContextCategory::Attachments,
+                tokens: context.attachment_tokens,
+            },
+            ContextCategoryTotal {
+                category: ContextCategory::Documents,
+                tokens: documents,
+            },
+            ContextCategoryTotal {
+                category: ContextCategory::ProjectFiles,
+                tokens: project_files,
+            },
+            ContextCategoryTotal {
+                category: ContextCategory::CompactionSummaries,
+                tokens: context.compaction_summary_tokens,
+            },
+            ContextCategoryTotal {
+                category: ContextCategory::Other,
+                tokens: context.other_tokens,
+            },
+        ],
+        context.total_tokens,
+    )
+    .map_err(|_| ServiceError::Internal)
+}
+
+fn public_compaction_id(run_id: &RunId, compaction_id: u64) -> Result<RuntimeId, ServiceError> {
+    let source = format!("{}:{compaction_id}", run_id.as_str());
+    RuntimeId::new(format!(
+        "compaction.{}",
+        &stable_hash(source.as_bytes())[..24]
+    ))
+    .map_err(|_| ServiceError::Internal)
+}
+
+fn project_context_snapshot(
+    snapshot: AgentContextSnapshot,
+    run_id: &RunId,
+    projection: &mut RunContextProjection,
+) -> Result<Option<ContextUsage>, ServiceError> {
+    if let Some(previous) = &projection.last_agent_snapshot {
+        if snapshot.revision < previous.revision {
+            return Err(ServiceError::Internal);
+        }
+        if snapshot.revision == previous.revision {
+            return if &snapshot == previous {
+                Ok(None)
+            } else {
+                Err(ServiceError::Internal)
+            };
+        }
+    }
+    let observed_at_ms = now_ms().max(projection.context_updated_at_ms);
+    let new_finished = snapshot.last_compaction.as_ref().is_some_and(|finished| {
+        projection
+            .last_compaction
+            .as_ref()
+            .is_none_or(|(id, _)| *id != finished.id)
+    });
+
+    if new_finished {
+        let finished = snapshot
+            .last_compaction
+            .as_ref()
+            .ok_or(ServiceError::Internal)?;
+        let (started_at_ms, before) = match projection.active_compaction.as_ref() {
+            Some((id, active)) if *id == finished.id => {
+                (active.started_at_ms, active.before.clone())
+            }
+            Some(_) => return Err(ServiceError::Internal),
+            None => (
+                observed_at_ms,
+                public_context_totals(&finished.before, projection)?,
+            ),
+        };
+        if finished.succeeded {
+            projection.clear_auxiliary_sources();
+        }
+        let after = public_context_totals(&finished.after, projection)?;
+        let reclaimed_tokens = before
+            .total_tokens
+            .checked_sub(after.total_tokens)
+            .ok_or(ServiceError::Internal)?;
+        if !finished.succeeded && (before != after || reclaimed_tokens != 0) {
+            return Err(ServiceError::Internal);
+        }
+        let finished_at_ms = observed_at_ms.max(started_at_ms);
+        projection.last_compaction = Some((
+            finished.id,
+            CompletedCompaction {
+                id: public_compaction_id(run_id, finished.id)?,
+                reason: public_compaction_reason(finished.reason),
+                before,
+                after,
+                reclaimed_tokens,
+                succeeded: finished.succeeded,
+                started_at_ms,
+                finished_at_ms,
+            },
+        ));
+        projection.active_compaction = None;
+        projection.context_updated_at_ms = finished_at_ms;
+    }
+
+    let current = public_context_totals(&snapshot.context, projection)?;
+    if new_finished
+        && projection
+            .last_compaction
+            .as_ref()
+            .is_none_or(|(_, completed)| completed.after != current)
+    {
+        return Err(ServiceError::Internal);
+    }
+    if projection.current_totals.as_ref() != Some(&current) {
+        projection.current_totals = Some(current.clone());
+        let mut updated_at_ms = observed_at_ms;
+        if !new_finished {
+            if let Some((_, completed)) = &projection.last_compaction {
+                if updated_at_ms <= completed.finished_at_ms && current != completed.after {
+                    updated_at_ms = completed
+                        .finished_at_ms
+                        .checked_add(1)
+                        .ok_or(ServiceError::Internal)?;
+                }
+            }
+        }
+        projection.context_updated_at_ms = updated_at_ms;
+    }
+
+    if let Some(active) = &snapshot.active_compaction {
+        let before = public_context_totals(&active.before, projection)?;
+        if before != current {
+            return Err(ServiceError::Internal);
+        }
+        match projection.active_compaction.as_ref() {
+            Some((id, existing)) if *id == active.id => {
+                if existing.before != before
+                    || existing.reason != public_compaction_reason(active.reason)
+                {
+                    return Err(ServiceError::Internal);
+                }
+            }
+            Some(_) => return Err(ServiceError::Internal),
+            None => {
+                let started_at_ms = observed_at_ms.max(projection.context_updated_at_ms);
+                projection.active_compaction = Some((
+                    active.id,
+                    ActiveCompaction {
+                        id: public_compaction_id(run_id, active.id)?,
+                        reason: public_compaction_reason(active.reason),
+                        before,
+                        started_at_ms,
+                    },
+                ));
+            }
+        }
+    } else if !new_finished && projection.active_compaction.is_some() {
+        return Err(ServiceError::Internal);
+    }
+
+    let compactions =
+        u32::try_from(snapshot.compactions_completed).map_err(|_| ServiceError::Internal)?;
+    let usage = &snapshot.run_usage;
+    let context = ContextUsage {
+        usage: UsageSnapshot {
+            input_tokens: usage
+                .input_tokens
+                .saturating_add(usage.cache_read_tokens)
+                .saturating_add(usage.cache_write_tokens),
+            output_tokens: usage.output_tokens,
+            context_tokens: current.total_tokens,
+            context_limit: Some(snapshot.context.context_limit),
+        },
+        compactions,
+        status: ContextStatus {
+            current,
+            updated_at_ms: projection.context_updated_at_ms,
+            active_compaction: projection
+                .active_compaction
+                .as_ref()
+                .map(|(_, active)| active.clone()),
+            last_compaction: projection
+                .last_compaction
+                .as_ref()
+                .map(|(_, completed)| completed.clone()),
+        },
+        run: Some(AgentRunTelemetry {
+            phase: public_run_phase(snapshot.phase),
+            terminal_state: snapshot.terminal_state.map(public_terminal_state),
+            responses_started: snapshot.responses_started,
+            responses_finished: snapshot.responses_finished,
+            responses_discarded: snapshot.responses_discarded,
+            response_active: snapshot.response_active,
+            tool_calls_started: snapshot.tool_calls_started,
+            tool_calls_finished: snapshot.tool_calls_finished,
+            tool_executions_started: snapshot.tool_executions_started,
+            tool_executions_finished: snapshot.tool_executions_finished,
+            compactions_started: snapshot.compactions_started,
+            compactions_completed: snapshot.compactions_completed,
+            compactions_failed: snapshot.compactions_failed,
+        }),
+    };
+    context.validate().map_err(|_| ServiceError::Internal)?;
+    projection.last_agent_snapshot = Some(snapshot);
+    if projection.last_published.as_ref() == Some(&context) {
+        return Ok(None);
+    }
+    projection.last_published = Some(context.clone());
+    Ok(Some(context))
+}
+
+async fn publish_context_snapshot(
+    snapshot: AgentContextSnapshot,
+    run_id: &RunId,
+    projection: &mut RunContextProjection,
+    events: &mpsc::Sender<TimestampedEvent>,
+) -> Result<(), ServiceError> {
+    let Some(context) = project_context_snapshot(snapshot, run_id, projection)? else {
+        return Ok(());
+    };
+    events
+        .send(event(EventPayload::ContextUpdated { context }))
+        .await
+        .map_err(|_| ServiceError::Unavailable)
+}
+
+fn attribute_delivered_prompt_context(
+    projection: &mut ProjectionState,
+    context_projection: &mut RunContextProjection,
+    delivery: UserMessageDelivery,
+    delivered_count: usize,
+) -> Result<(), ServiceError> {
+    let mut attributed = 0usize;
+    for pending in &mut projection.pending_user_items {
+        if attributed == delivered_count {
+            break;
+        }
+        if pending.delivery != delivery || pending.context_attributed {
+            continue;
+        }
+        context_projection.attribute_sources(
+            pending.document_context_tokens,
+            pending.project_file_context_tokens,
+        );
+        pending.context_attributed = true;
+        attributed = attributed.saturating_add(1);
+    }
+    if attributed != delivered_count {
+        return Err(ServiceError::Internal);
+    }
+    Ok(())
+}
+
 async fn project_agent_event(
     agent_event: AgentEvent,
     run_id: &RunId,
-    context_limit: u64,
     plan: &WorkerPlan,
     projection: &mut ProjectionState,
+    context_projection: &mut RunContextProjection,
     events: &mpsc::Sender<TimestampedEvent>,
     response_text: &mut String,
 ) -> Result<Option<TerminalProjection>, ServiceError> {
@@ -5167,27 +5847,9 @@ async fn project_agent_event(
                     });
             }
         }
-        AgentEvent::TurnFinished {
-            message,
-            turn_usage,
-            ..
-        } => {
+        AgentEvent::TurnFinished { message, .. } => {
             response_text.clear();
             response_text.push_str(&super::assistant_text(&message));
-            events
-                .send(event(EventPayload::UsageUpdated {
-                    usage: UsageSnapshot {
-                        input_tokens: turn_usage
-                            .input_tokens
-                            .saturating_add(turn_usage.cache_read_tokens)
-                            .saturating_add(turn_usage.cache_write_tokens),
-                        output_tokens: turn_usage.output_tokens,
-                        context_tokens: turn_usage.total_tokens,
-                        context_limit: Some(context_limit),
-                    },
-                }))
-                .await
-                .map_err(|_| ServiceError::Unavailable)?;
             projection.finish_turn();
         }
         AgentEvent::RunFinished { reason, .. } => {
@@ -5201,9 +5863,23 @@ async fn project_agent_event(
             };
             return Ok(Some(terminal));
         }
-        AgentEvent::SteeringDelivered { .. }
-        | AgentEvent::CompactionStarted { .. }
-        | AgentEvent::CompactionFinished { .. } => {}
+        AgentEvent::SteeringDelivered { messages } => {
+            attribute_delivered_prompt_context(
+                projection,
+                context_projection,
+                UserMessageDelivery::Steer,
+                messages.len(),
+            )?;
+        }
+        AgentEvent::FollowUpDelivered { messages } => {
+            attribute_delivered_prompt_context(
+                projection,
+                context_projection,
+                UserMessageDelivery::FollowUp,
+                messages.len(),
+            )?;
+        }
+        AgentEvent::CompactionStarted { .. } | AgentEvent::CompactionFinished { .. } => {}
     }
     Ok(None)
 }
@@ -6091,6 +6767,9 @@ fn build_completion_review(
     }
 }
 
+// Keep the immutable run identity, timing, projection, and review inputs explicit
+// at the one durable serialization boundary.
+#[allow(clippy::too_many_arguments)]
 fn persist_run_projection(
     resources: &ygg_serve_backend::ResourceStore,
     session_id: &SessionId,
@@ -6776,6 +7455,9 @@ fn references_match_fingerprints(
         }))
 }
 
+// Entry projection has several independent identity hints and output indexes;
+// keeping them explicit avoids an ambiguous partially populated parameter bag.
+#[allow(clippy::too_many_arguments)]
 fn project_entry(
     entry: &Entry,
     workspace: &Path,
@@ -8034,6 +8716,167 @@ fn secure_serve_state_dir(session_dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(state_dir)
 }
 
+fn session_deletion_directory(serve_state_dir: &Path) -> anyhow::Result<PathBuf> {
+    let directory = serve_state_dir.join(SESSION_DELETION_DIRECTORY);
+    match directory.symlink_metadata() {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                anyhow::bail!("session deletion journal must be a real directory");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            builder.create(&directory)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(directory)
+}
+
+fn pending_session_deletion_path(directory: &Path, session_id: &str) -> PathBuf {
+    directory.join(format!("{}.json", stable_hash(session_id.as_bytes())))
+}
+
+fn write_pending_session_deletion(
+    serve_state_dir: &Path,
+    deletion: &PendingSessionDeletion,
+) -> anyhow::Result<()> {
+    if !deletion.validate() {
+        anyhow::bail!("invalid pending session deletion");
+    }
+    let directory = session_deletion_directory(serve_state_dir)?;
+    let file_key = stable_hash(deletion.session_id.as_bytes());
+    let destination = pending_session_deletion_path(&directory, &deletion.session_id);
+    match destination.symlink_metadata() {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                anyhow::bail!("session deletion journal entry is unsafe");
+            }
+            let existing = read_pending_session_deletion(&destination, &file_key)?;
+            let same_intent = existing.version == deletion.version
+                && existing.session_id == deletion.session_id
+                && existing.project_id == deletion.project_id
+                && existing.trashed_at_ms == deletion.trashed_at_ms;
+            if !same_intent {
+                anyhow::bail!("session deletion journal intent cannot be replaced");
+            }
+            if existing.committed && !deletion.committed {
+                anyhow::bail!("committed session deletion cannot be downgraded");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let bytes = serde_json::to_vec(deletion)?;
+    if bytes.len() as u64 > MAX_SESSION_DELETION_RECORD_BYTES {
+        anyhow::bail!("session deletion journal entry is too large");
+    }
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)?;
+    let temporary = directory.join(format!(".tmp-{}", stable_hash(&random)));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, &destination)?;
+        std::fs::File::open(&directory)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn read_pending_session_deletion(
+    path: &Path,
+    expected_file_key: &str,
+) -> anyhow::Result<PendingSessionDeletion> {
+    let metadata = path.symlink_metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_SESSION_DELETION_RECORD_BYTES
+    {
+        anyhow::bail!("session deletion journal entry is unsafe");
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    options
+        .open(path)?
+        .take(MAX_SESSION_DELETION_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SESSION_DELETION_RECORD_BYTES {
+        anyhow::bail!("session deletion journal entry is too large");
+    }
+    let deletion = serde_json::from_slice::<PendingSessionDeletion>(&bytes)?;
+    if !deletion.validate() || stable_hash(deletion.session_id.as_bytes()) != expected_file_key {
+        anyhow::bail!("session deletion journal entry is invalid");
+    }
+    Ok(deletion)
+}
+
+fn load_pending_session_deletions(
+    serve_state_dir: &Path,
+) -> anyhow::Result<Vec<PendingSessionDeletion>> {
+    let directory = session_deletion_directory(serve_state_dir)?;
+    let mut deletions = Vec::new();
+    for entry in std::fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(file_key) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            if name.to_string_lossy().starts_with(".tmp-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            continue;
+        };
+        if file_key.len() != 64 || !file_key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        deletions.push(read_pending_session_deletion(&entry.path(), file_key)?);
+    }
+    deletions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    Ok(deletions)
+}
+
+fn remove_pending_session_deletion(serve_state_dir: &Path, session_id: &str) -> anyhow::Result<()> {
+    let directory = session_deletion_directory(serve_state_dir)?;
+    let path = pending_session_deletion_path(&directory, session_id);
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_file(path)?;
+            std::fs::File::open(directory)?.sync_all()?;
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!("session deletion journal entry is unsafe"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn now_ms() -> u64 {
     system_time_ms(SystemTime::now())
 }
@@ -8064,6 +8907,7 @@ mod tests {
             invocation_cwd: directory.to_path_buf(),
             model: None,
             model_explicit: false,
+            system_prompt: None,
             reasoning: ReasoningConfig::Off,
             reasoning_explicit: false,
             reasoning_mode: ygg_ai::ReasoningMode::Standard,
@@ -8123,6 +8967,481 @@ mod tests {
         restricted.sandbox.allow_process = false;
         let disabled = YggHost::new(restricted).unwrap();
         assert!(!disabled.capabilities().terminal);
+    }
+
+    #[tokio::test]
+    async fn permanent_delete_fails_closed_before_commit_when_a_required_store_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        config.workspace = config.workspace.canonicalize().unwrap();
+        config.invocation_cwd = config.workspace.clone();
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let session_id = SessionId::new("unavailable-delete-store").unwrap();
+        let mut session =
+            Session::create(sessions.dir().join("unavailable-delete-store.jsonl")).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("retain on unavailable delete".into())],
+            })))
+            .unwrap();
+        drop(session);
+        sessions
+            .set_lifecycle(session_id.as_str(), SessionStorageLifecycle::Trash, 41_000)
+            .unwrap();
+        let mut host = YggHost::new(config).unwrap();
+        host.attachments = None;
+
+        let error = host
+            .delete_session_permanently(
+                &session_id,
+                &PermanentDeleteConfirmation {
+                    session_id: session_id.clone(),
+                    trashed_at_ms: 41_000,
+                    phrase: format!("permanently delete {}", session_id.as_str()),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ServiceError::Unavailable),
+            "unexpected permanent-delete error: {error:?}"
+        );
+        assert!(sessions.path_by_id(session_id.as_str()).is_ok());
+        assert_eq!(
+            sessions
+                .load_metadata(session_id.as_str())
+                .unwrap()
+                .trashed_at_ms,
+            Some(41_000)
+        );
+        assert!(load_pending_session_deletions(&host.serve_state_dir)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn permanent_delete_reclaims_all_session_sidecars_and_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        config.workspace = config.workspace.canonicalize().unwrap();
+        config.invocation_cwd = config.workspace.clone();
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let session_id = SessionId::new("permanent-sidecars").unwrap();
+        let mut session = Session::create(sessions.dir().join("permanent-sidecars.jsonl")).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("delete everything".into())],
+            })))
+            .unwrap();
+        drop(session);
+        sessions
+            .set_lifecycle(session_id.as_str(), SessionStorageLifecycle::Trash, 42_000)
+            .unwrap();
+
+        let host = YggHost::new(config.clone()).unwrap();
+        let project_id = host.launch_project_id.clone();
+        host.usage
+            .lock()
+            .unwrap()
+            .record(InferenceRequest {
+                session_id: session_id.as_str().to_owned(),
+                request_ordinal: 0,
+                provider: "local".into(),
+                model: "test-model".into(),
+                timestamp_ms: 42_001,
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 15,
+            })
+            .unwrap();
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        png.extend_from_slice(&[0, 0, 0, 0]);
+        png.extend_from_slice(&0u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&[0, 0, 0, 0]);
+        let attachment = host
+            .attachments
+            .as_ref()
+            .unwrap()
+            .ingest("remove.png", "image/png", bytes::Bytes::from(png))
+            .unwrap();
+        host.attachments
+            .as_ref()
+            .unwrap()
+            .associate(
+                &session_id,
+                "attachment-entry",
+                std::slice::from_ref(&attachment),
+            )
+            .unwrap();
+        let document = host
+            .documents
+            .as_ref()
+            .unwrap()
+            .ingest(
+                project_id.as_str(),
+                session_id.as_str(),
+                "remove.txt",
+                "text/plain",
+                bytes::Bytes::from_static(b"remove document"),
+            )
+            .unwrap();
+        let resource_entry = DurableEntryId::new("resource-entry").unwrap();
+        let run_entry = DurableEntryId::new("run-entry").unwrap();
+        let resource = host
+            .resources
+            .as_ref()
+            .unwrap()
+            .register(
+                &session_id,
+                "resource-call",
+                "source",
+                "remove.rs",
+                "text/plain",
+                bytes::Bytes::from_static(b"remove resource"),
+            )
+            .unwrap();
+        host.resources
+            .as_ref()
+            .unwrap()
+            .persist_record(
+                &session_id,
+                &resource_entry,
+                "resource-call",
+                br#"{"version":1}"#,
+            )
+            .unwrap();
+        host.resources
+            .as_ref()
+            .unwrap()
+            .persist_run_record(&session_id, &run_entry, br#"{"version":1}"#)
+            .unwrap();
+        host.goals
+            .set(&session_id, "Remove the session goal", None)
+            .unwrap();
+
+        host.delete_session_permanently(
+            &session_id,
+            &PermanentDeleteConfirmation {
+                session_id: session_id.clone(),
+                trashed_at_ms: 42_000,
+                phrase: format!("permanently delete {}", session_id.as_str()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(sessions.path_by_id(session_id.as_str()).is_err());
+        assert!(host
+            .projects
+            .lock()
+            .unwrap()
+            .project_for_session(session_id.as_str())
+            .is_none());
+        assert_eq!(
+            host.attachments
+                .as_ref()
+                .unwrap()
+                .refs_for_entry(&session_id, "attachment-entry")
+                .unwrap(),
+            None
+        );
+        assert!(host
+            .documents
+            .as_ref()
+            .unwrap()
+            .list_for_session(project_id.as_str(), session_id.as_str())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            host.documents.as_ref().unwrap().get_for_session(
+                project_id.as_str(),
+                session_id.as_str(),
+                &document.id,
+            ),
+            Err(DocumentStoreError::NotFound)
+        );
+        assert!(host
+            .resources
+            .as_ref()
+            .unwrap()
+            .content(&session_id, &resource.handle)
+            .is_err());
+        assert!(host
+            .resources
+            .as_ref()
+            .unwrap()
+            .run_record(&session_id, &run_entry)
+            .is_err());
+        assert_eq!(host.goals.get(&session_id).unwrap(), None);
+        assert_eq!(host.usage.lock().unwrap().lifetime().request_count, 1);
+        assert!(load_pending_session_deletions(&host.serve_state_dir)
+            .unwrap()
+            .is_empty());
+
+        drop(host);
+        let reopened = YggHost::new(config).unwrap();
+        assert_eq!(reopened.usage.lock().unwrap().lifetime().request_count, 1);
+        assert!(reopened
+            .documents
+            .as_ref()
+            .unwrap()
+            .list_for_session(project_id.as_str(), session_id.as_str())
+            .unwrap()
+            .is_empty());
+        assert!(load_pending_session_deletions(&reopened.serve_state_dir)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn committed_deletion_journal_cannot_be_downgraded_or_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new("journal-monotonic").unwrap();
+        let project_id = ProjectId::new("project-monotonic").unwrap();
+        let mut deletion = PendingSessionDeletion::new(&session_id, &project_id, 75_000);
+        write_pending_session_deletion(directory.path(), &deletion).unwrap();
+        deletion.committed = true;
+        write_pending_session_deletion(directory.path(), &deletion).unwrap();
+
+        let mut downgrade = deletion.clone();
+        downgrade.committed = false;
+        assert!(write_pending_session_deletion(directory.path(), &downgrade).is_err());
+        let replacement = PendingSessionDeletion::new(&session_id, &project_id, 75_001);
+        assert!(write_pending_session_deletion(directory.path(), &replacement).is_err());
+        assert_eq!(
+            load_pending_session_deletions(directory.path()).unwrap(),
+            vec![deletion]
+        );
+    }
+
+    #[test]
+    fn startup_rolls_back_an_uncommitted_permanent_deletion_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        config.workspace = config.workspace.canonicalize().unwrap();
+        config.invocation_cwd = config.workspace.clone();
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let session_id = SessionId::new("interrupted-pre-commit-delete").unwrap();
+        drop(Session::create(sessions.dir().join("interrupted-pre-commit-delete.jsonl")).unwrap());
+        sessions
+            .rename(session_id.as_str(), "Retained title")
+            .unwrap();
+        sessions
+            .set_lifecycle(session_id.as_str(), SessionStorageLifecycle::Trash, 76_000)
+            .unwrap();
+
+        let host = YggHost::new(config.clone()).unwrap();
+        let project_id = host.launch_project_id.clone();
+        let metadata_directory = sessions.dir().join(".metadata");
+        let metadata_path = metadata_directory.join(format!("{}.json", session_id.as_str()));
+        let staged_metadata =
+            metadata_directory.join(".delete-interrupted-pre-commit-delete-deadbeefdeadbeef");
+        std::fs::rename(&metadata_path, &staged_metadata).unwrap();
+        write_pending_session_deletion(
+            &host.serve_state_dir,
+            &PendingSessionDeletion::new(&session_id, &project_id, 76_000),
+        )
+        .unwrap();
+        drop(host);
+
+        let reopened = YggHost::new(config).unwrap();
+        let metadata = sessions.load_metadata(session_id.as_str()).unwrap();
+        assert_eq!(metadata.name.as_deref(), Some("Retained title"));
+        assert_eq!(metadata.trashed_at_ms, Some(76_000));
+        assert!(sessions.path_by_id(session_id.as_str()).is_ok());
+        assert!(!staged_metadata.exists());
+        assert!(reopened
+            .projects
+            .lock()
+            .unwrap()
+            .project_for_session(session_id.as_str())
+            .is_some());
+        assert!(load_pending_session_deletions(&reopened.serve_state_dir)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn startup_does_not_commit_when_a_transcript_cannot_be_validated() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        config.workspace = config.workspace.canonicalize().unwrap();
+        config.invocation_cwd = config.workspace.clone();
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let session_id = SessionId::new("unsafe-pre-commit-delete").unwrap();
+        let session_path = sessions.dir().join("unsafe-pre-commit-delete.jsonl");
+        let mut session = Session::create(&session_path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("retain this transcript".into())],
+            })))
+            .unwrap();
+        drop(session);
+        sessions
+            .set_lifecycle(session_id.as_str(), SessionStorageLifecycle::Trash, 76_500)
+            .unwrap();
+
+        let host = YggHost::new(config.clone()).unwrap();
+        let project_id = host.launch_project_id.clone();
+        host.goals
+            .set(&session_id, "Retain while transcript is unsafe", None)
+            .unwrap();
+        write_pending_session_deletion(
+            &host.serve_state_dir,
+            &PendingSessionDeletion::new(&session_id, &project_id, 76_500),
+        )
+        .unwrap();
+        std::fs::remove_file(&session_path).unwrap();
+        std::fs::create_dir(&session_path).unwrap();
+        drop(host);
+
+        let reopened = YggHost::new(config).unwrap();
+        let pending = load_pending_session_deletions(&reopened.serve_state_dir).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].committed);
+        assert!(reopened.goals.get(&session_id).unwrap().is_some());
+        assert!(reopened
+            .projects
+            .lock()
+            .unwrap()
+            .project_for_session(session_id.as_str())
+            .is_some());
+    }
+
+    #[test]
+    fn recovery_does_not_race_an_active_session_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        config.workspace = config.workspace.canonicalize().unwrap();
+        config.invocation_cwd = config.workspace.clone();
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let session_id = SessionId::new("locked-recovery-delete").unwrap();
+        drop(Session::create(sessions.dir().join("locked-recovery-delete.jsonl")).unwrap());
+        sessions
+            .set_lifecycle(session_id.as_str(), SessionStorageLifecycle::Trash, 76_750)
+            .unwrap();
+
+        let host = YggHost::new(config).unwrap();
+        let project_id = host.launch_project_id.clone();
+        sessions
+            .delete_permanently(session_id.as_str(), 76_750)
+            .unwrap();
+        let deletion = PendingSessionDeletion {
+            committed: true,
+            ..PendingSessionDeletion::new(&session_id, &project_id, 76_750)
+        };
+        write_pending_session_deletion(&host.serve_state_dir, &deletion).unwrap();
+
+        let deletion_guard = host.session_deletion_lock.try_lock().unwrap();
+        host.recover_pending_session_deletions();
+        assert_eq!(
+            load_pending_session_deletions(&host.serve_state_dir).unwrap(),
+            vec![deletion]
+        );
+        drop(deletion_guard);
+
+        host.recover_pending_session_deletions();
+        assert!(load_pending_session_deletions(&host.serve_state_dir)
+            .unwrap()
+            .is_empty());
+        assert!(!sessions
+            .dir()
+            .join(".metadata")
+            .read_dir()
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".delete-locked-recovery-delete-")));
+    }
+
+    #[test]
+    fn startup_finishes_a_committed_deletion_after_project_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        config.workspace = config.workspace.canonicalize().unwrap();
+        config.invocation_cwd = config.workspace.clone();
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let session_id = SessionId::new("interrupted-delete").unwrap();
+        let mut session = Session::create(sessions.dir().join("interrupted-delete.jsonl")).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("interrupt deletion".into())],
+            })))
+            .unwrap();
+        drop(session);
+        sessions
+            .set_lifecycle(session_id.as_str(), SessionStorageLifecycle::Trash, 77_000)
+            .unwrap();
+
+        let host = YggHost::new(config.clone()).unwrap();
+        let project_id = host.launch_project_id.clone();
+        host.documents
+            .as_ref()
+            .unwrap()
+            .ingest(
+                project_id.as_str(),
+                session_id.as_str(),
+                "interrupted.txt",
+                "text/plain",
+                bytes::Bytes::from_static(b"pending cleanup"),
+            )
+            .unwrap();
+        let deletion = PendingSessionDeletion {
+            committed: true,
+            ..PendingSessionDeletion::new(&session_id, &project_id, 77_000)
+        };
+        write_pending_session_deletion(&host.serve_state_dir, &deletion).unwrap();
+        sessions
+            .finish_permanent_delete(session_id.as_str())
+            .unwrap();
+        assert!(host
+            .projects
+            .lock()
+            .unwrap()
+            .project_for_session(session_id.as_str())
+            .is_some());
+        let registry_project_id = RegistryProjectId::parse(project_id.as_str()).unwrap();
+        host.projects
+            .lock()
+            .unwrap()
+            .archive(&registry_project_id)
+            .unwrap();
+        drop(host);
+
+        let reopened = YggHost::new(config).unwrap();
+        assert!(reopened
+            .projects
+            .lock()
+            .unwrap()
+            .project_for_session(session_id.as_str())
+            .is_none());
+        assert!(reopened
+            .documents
+            .as_ref()
+            .unwrap()
+            .list_for_session(project_id.as_str(), session_id.as_str())
+            .unwrap()
+            .is_empty());
+        assert!(load_pending_session_deletions(&reopened.serve_state_dir)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -8209,7 +9528,7 @@ mod tests {
         config.invocation_cwd = config.workspace.clone();
         let sessions = SessionStore::new(&config.session_dir, &config.workspace);
         std::fs::create_dir_all(sessions.dir()).unwrap();
-        let mut session = Session::create(&sessions.dir().join("usage-backfill.jsonl")).unwrap();
+        let mut session = Session::create(sessions.dir().join("usage-backfill.jsonl")).unwrap();
         session
             .append(EntryValue::Message(Message::User(UserMessage {
                 content: vec![UserPart::Text("measure usage".into())],
@@ -8338,6 +9657,36 @@ mod tests {
             reopened.create_session(request).await,
             Err(ServiceError::Unauthorized)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_trust_recovers_a_replaced_launch_workspace() {
+        let fixture = tempfile::tempdir().unwrap();
+        let config = project_test_config(fixture.path(), false);
+        let host = YggHost::new(config.clone()).unwrap();
+        let launch_project = host.launch_project_id.clone();
+        host.set_project_trust(&launch_project, true).await.unwrap();
+        drop(host);
+
+        std::fs::remove_dir(&config.workspace).unwrap();
+        std::fs::create_dir(&config.workspace).unwrap();
+
+        let host = YggHost::new(config.clone()).unwrap();
+        let stale = host
+            .list_projects()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|project| project.id == launch_project)
+            .unwrap();
+        assert!(stale.trusted);
+        assert!(!stale.available);
+
+        let recovered = host.set_project_trust(&launch_project, true).await.unwrap();
+        assert!(recovered.trusted);
+        assert!(recovered.available);
+        assert_eq!(recovered.id, launch_project);
     }
 
     #[cfg(unix)]
@@ -9941,6 +11290,7 @@ mod tests {
             id: ygg_agent::EntryId("entry-1".into()),
             parent: None,
             metadata: None,
+            timestamp_unix_ms: None,
             value: EntryValue::Message(Message::User(UserMessage {
                 content: vec![UserPart::Media(Media::image_bytes(
                     bytes::Bytes::from(image),
@@ -10013,6 +11363,9 @@ mod tests {
             turn_id: TurnId::new("turn-live-original").unwrap(),
             documents: Vec::new(),
             project_files: Vec::new(),
+            document_context_tokens: 0,
+            project_file_context_tokens: 0,
+            context_attributed: true,
             branch_provenance: None,
         });
         projection.pending_user_items.push_back(PendingUserItem {
@@ -10021,6 +11374,9 @@ mod tests {
             turn_id: TurnId::new("turn-live-steer").unwrap(),
             documents: Vec::new(),
             project_files: Vec::new(),
+            document_context_tokens: 0,
+            project_file_context_tokens: 0,
+            context_attributed: false,
             branch_provenance: None,
         });
         let live = project_new_entries(
@@ -10113,6 +11469,8 @@ mod tests {
                     attachments: Vec::new(),
                     documents: Vec::new(),
                     project_files: Vec::new(),
+                    document_context_tokens: 0,
+                    project_file_context_tokens: 0,
                 },
                 delivery,
                 &mut projection,
@@ -10701,6 +12059,9 @@ mod tests {
             turn_id: TurnId::new("turn-stable-user").unwrap(),
             documents: Vec::new(),
             project_files: Vec::new(),
+            document_context_tokens: 0,
+            project_file_context_tokens: 0,
+            context_attributed: true,
             branch_provenance: None,
         });
         projection
@@ -10796,6 +12157,418 @@ mod tests {
         assert_eq!(outcome, &review);
         assert_eq!(outcome.duration_ms, 500);
         assert_eq!(outcome.evidence_coverage, EvidenceCoverage::Partial);
+    }
+
+    fn agent_context_breakdown(
+        system_tokens: u64,
+        instruction_tokens: u64,
+        conversation_tokens: u64,
+        tool_result_tokens: u64,
+        attachment_tokens: u64,
+        compaction_summary_tokens: u64,
+        other_tokens: u64,
+    ) -> AgentContextBreakdown {
+        let total_tokens = system_tokens
+            .checked_add(instruction_tokens)
+            .and_then(|total| total.checked_add(conversation_tokens))
+            .and_then(|total| total.checked_add(tool_result_tokens))
+            .and_then(|total| total.checked_add(attachment_tokens))
+            .and_then(|total| total.checked_add(compaction_summary_tokens))
+            .and_then(|total| total.checked_add(other_tokens))
+            .unwrap();
+        AgentContextBreakdown {
+            system_tokens,
+            instruction_tokens,
+            conversation_tokens,
+            tool_result_tokens,
+            attachment_tokens,
+            compaction_summary_tokens,
+            other_tokens,
+            total_tokens,
+            structural_tokens: total_tokens,
+            provider_tokens: Some(total_tokens),
+            context_limit: 1_000,
+        }
+    }
+
+    fn agent_context_snapshot(
+        revision: u64,
+        context: AgentContextBreakdown,
+    ) -> AgentContextSnapshot {
+        AgentContextSnapshot {
+            revision,
+            context,
+            ..AgentContextSnapshot::default()
+        }
+    }
+
+    fn category_tokens(totals: &ContextTotals, category: ContextCategory) -> u64 {
+        totals
+            .categories
+            .iter()
+            .find(|total| total.category == category)
+            .map_or(0, |total| total.tokens)
+    }
+
+    #[test]
+    fn context_projection_reconciles_authoritative_sources_and_replays_exactly() {
+        let context = agent_context_breakdown(10, 50, 100, 5, 6, 7, 8);
+        let mut snapshot = agent_context_snapshot(1, context);
+        snapshot.phase = AgentRunPhase::Responding;
+        snapshot.responses_started = 2;
+        snapshot.responses_finished = 1;
+        snapshot.response_active = true;
+        snapshot.tool_calls_started = 2;
+        snapshot.tool_calls_finished = 1;
+        snapshot.tool_executions_started = 1;
+        snapshot.run_usage = ygg_ai::Usage {
+            input_tokens: 11,
+            cache_read_tokens: 12,
+            cache_write_tokens: 13,
+            output_tokens: 14,
+            total_tokens: 50,
+            ..ygg_ai::Usage::default()
+        };
+        let run_id = RunId::new("run-context-sources").unwrap();
+        let mut projection = RunContextProjection::new(20, 30, 40);
+
+        let projected = project_context_snapshot(snapshot.clone(), &run_id, &mut projection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected.status.current.total_tokens, 186);
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::System),
+            40
+        );
+        assert_eq!(
+            category_tokens(
+                &projected.status.current,
+                ContextCategory::ProjectInstructions
+            ),
+            20
+        );
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::Conversation),
+            30
+        );
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::Documents),
+            30
+        );
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::ProjectFiles),
+            40
+        );
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::ToolResults),
+            5
+        );
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::Attachments),
+            6
+        );
+        assert_eq!(
+            category_tokens(
+                &projected.status.current,
+                ContextCategory::CompactionSummaries
+            ),
+            7
+        );
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::Other),
+            8
+        );
+        assert_eq!(projected.usage.input_tokens, 36);
+        assert_eq!(projected.usage.output_tokens, 14);
+        assert_eq!(projected.usage.context_tokens, 186);
+        assert_eq!(projected.usage.context_limit, Some(1_000));
+        assert_eq!(
+            projected.run.as_ref().map(|run| run.phase),
+            Some(ServeRunPhase::Responding)
+        );
+        projected.validate().unwrap();
+
+        assert!(
+            project_context_snapshot(snapshot.clone(), &run_id, &mut projection)
+                .unwrap()
+                .is_none()
+        );
+        snapshot.phase = AgentRunPhase::Retrying;
+        assert!(matches!(
+            project_context_snapshot(snapshot, &run_id, &mut projection),
+            Err(ServiceError::Internal)
+        ));
+    }
+
+    #[tokio::test]
+    async fn context_publication_emits_complete_state_once_per_revision() {
+        let snapshot = agent_context_snapshot(1, agent_context_breakdown(2, 3, 5, 7, 11, 13, 17));
+        let run_id = RunId::new("run-context-publication").unwrap();
+        let mut projection = RunContextProjection::new(3, 2, 1);
+        let (events, mut received) = mpsc::channel(2);
+
+        publish_context_snapshot(snapshot.clone(), &run_id, &mut projection, &events)
+            .await
+            .unwrap();
+        let event = received.recv().await.unwrap();
+        let EventPayload::ContextUpdated { context } = event.payload else {
+            panic!("expected a complete context update");
+        };
+        assert_eq!(context.status.current.total_tokens, 58);
+        context.validate().unwrap();
+
+        publish_context_snapshot(snapshot, &run_id, &mut projection, &events)
+            .await
+            .unwrap();
+        assert!(matches!(
+            received.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn queued_prompt_sources_are_attributed_only_at_matching_delivery_boundaries() {
+        let mut items = ProjectionState::new(0);
+        items.pending_user_items.extend([
+            PendingUserItem {
+                id: ItemId::new("queued-steer-1").unwrap(),
+                delivery: UserMessageDelivery::Steer,
+                turn_id: TurnId::new("queued-turn-1").unwrap(),
+                documents: Vec::new(),
+                project_files: Vec::new(),
+                document_context_tokens: 11,
+                project_file_context_tokens: 7,
+                context_attributed: false,
+                branch_provenance: None,
+            },
+            PendingUserItem {
+                id: ItemId::new("queued-follow-up").unwrap(),
+                delivery: UserMessageDelivery::FollowUp,
+                turn_id: TurnId::new("queued-turn-2").unwrap(),
+                documents: Vec::new(),
+                project_files: Vec::new(),
+                document_context_tokens: 13,
+                project_file_context_tokens: 5,
+                context_attributed: false,
+                branch_provenance: None,
+            },
+            PendingUserItem {
+                id: ItemId::new("queued-steer-2").unwrap(),
+                delivery: UserMessageDelivery::Steer,
+                turn_id: TurnId::new("queued-turn-3").unwrap(),
+                documents: Vec::new(),
+                project_files: Vec::new(),
+                document_context_tokens: 17,
+                project_file_context_tokens: 3,
+                context_attributed: false,
+                branch_provenance: None,
+            },
+        ]);
+        let mut context = RunContextProjection::new(0, 0, 0);
+        assert_eq!(context.document_context_tokens, 0);
+        assert_eq!(context.project_file_context_tokens, 0);
+
+        attribute_delivered_prompt_context(&mut items, &mut context, UserMessageDelivery::Steer, 1)
+            .unwrap();
+        assert_eq!(context.document_context_tokens, 11);
+        assert_eq!(context.project_file_context_tokens, 7);
+        assert!(items.pending_user_items[0].context_attributed);
+        assert!(!items.pending_user_items[1].context_attributed);
+        assert!(!items.pending_user_items[2].context_attributed);
+
+        attribute_delivered_prompt_context(
+            &mut items,
+            &mut context,
+            UserMessageDelivery::FollowUp,
+            1,
+        )
+        .unwrap();
+        assert_eq!(context.document_context_tokens, 24);
+        assert_eq!(context.project_file_context_tokens, 12);
+
+        attribute_delivered_prompt_context(&mut items, &mut context, UserMessageDelivery::Steer, 1)
+            .unwrap();
+        assert_eq!(context.document_context_tokens, 41);
+        assert_eq!(context.project_file_context_tokens, 15);
+        assert!(items
+            .pending_user_items
+            .iter()
+            .all(|pending| pending.context_attributed));
+    }
+
+    #[test]
+    fn successful_context_compaction_reconciles_sources_and_later_timestamps() {
+        let before = agent_context_breakdown(10, 60, 100, 10, 5, 0, 5);
+        let after = agent_context_breakdown(10, 20, 20, 5, 0, 50, 5);
+        let run_id = RunId::new("run-successful-compaction").unwrap();
+        let mut projection = RunContextProjection::new(20, 30, 40);
+
+        let mut active = agent_context_snapshot(1, before.clone());
+        active.phase = AgentRunPhase::Compacting;
+        active.active_compaction = Some(ygg_agent::ActiveContextCompaction {
+            id: 1,
+            reason: CompactionReason::Threshold,
+            before: before.clone(),
+        });
+        active.compactions_started = 1;
+        let projected_active = project_context_snapshot(active, &run_id, &mut projection)
+            .unwrap()
+            .unwrap();
+        let active_status = projected_active.status.active_compaction.unwrap();
+        assert_eq!(active_status.before, projected_active.status.current);
+        assert_eq!(
+            category_tokens(&active_status.before, ContextCategory::Documents),
+            30
+        );
+        assert_eq!(
+            category_tokens(&active_status.before, ContextCategory::ProjectFiles),
+            40
+        );
+
+        let mut finished = agent_context_snapshot(2, after.clone());
+        finished.last_compaction = Some(ygg_agent::FinishedContextCompaction {
+            id: 1,
+            reason: CompactionReason::Threshold,
+            before,
+            after: after.clone(),
+            succeeded: true,
+        });
+        finished.compactions_started = 1;
+        finished.compactions_completed = 1;
+        let projected = project_context_snapshot(finished.clone(), &run_id, &mut projection)
+            .unwrap()
+            .unwrap();
+        let completed = projected.status.last_compaction.as_ref().unwrap();
+        assert!(completed.succeeded);
+        assert_eq!(completed.id, active_status.id);
+        assert_eq!(completed.reclaimed_tokens, 80);
+        assert_eq!(completed.before.total_tokens, 190);
+        assert_eq!(completed.after.total_tokens, 110);
+        assert_eq!(projected.status.current, completed.after);
+        assert!(projected.status.active_compaction.is_none());
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::Documents),
+            0
+        );
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::ProjectFiles),
+            0
+        );
+        assert_eq!(projection.document_context_tokens, 0);
+        assert_eq!(projection.project_file_context_tokens, 0);
+        projected.validate().unwrap();
+
+        let forced_finish = u64::MAX - 2;
+        projection.context_updated_at_ms = forced_finish;
+        projection
+            .last_compaction
+            .as_mut()
+            .unwrap()
+            .1
+            .finished_at_ms = forced_finish;
+        let mut later = finished;
+        later.revision = 3;
+        later.context = agent_context_breakdown(10, 20, 20, 5, 0, 50, 6);
+        let projected_later = project_context_snapshot(later, &run_id, &mut projection)
+            .unwrap()
+            .unwrap();
+        assert_eq!(projected_later.status.updated_at_ms, forced_finish + 1);
+        assert!(
+            projected_later.status.updated_at_ms
+                > projected_later
+                    .status
+                    .last_compaction
+                    .as_ref()
+                    .unwrap()
+                    .finished_at_ms
+        );
+        projected_later.validate().unwrap();
+    }
+
+    #[test]
+    fn completed_compaction_projects_correctly_when_active_revision_was_not_observed() {
+        let before = agent_context_breakdown(10, 60, 100, 10, 5, 0, 5);
+        let after = agent_context_breakdown(10, 20, 20, 5, 0, 50, 5);
+        let mut snapshot = agent_context_snapshot(2, after.clone());
+        snapshot.last_compaction = Some(ygg_agent::FinishedContextCompaction {
+            id: 1,
+            reason: CompactionReason::Overflow,
+            before,
+            after,
+            succeeded: true,
+        });
+        snapshot.compactions_started = 1;
+        snapshot.compactions_completed = 1;
+        let mut projection = RunContextProjection::new(20, 30, 40);
+        let projected = project_context_snapshot(
+            snapshot,
+            &RunId::new("run-missed-active-compaction").unwrap(),
+            &mut projection,
+        )
+        .unwrap()
+        .unwrap();
+        let completed = projected.status.last_compaction.unwrap();
+        assert_eq!(
+            category_tokens(&completed.before, ContextCategory::Documents),
+            30
+        );
+        assert_eq!(
+            category_tokens(&completed.before, ContextCategory::ProjectFiles),
+            40
+        );
+        assert_eq!(
+            category_tokens(&completed.after, ContextCategory::Documents),
+            0
+        );
+        assert_eq!(completed.reclaimed_tokens, 80);
+    }
+
+    #[test]
+    fn failed_context_compaction_preserves_totals_and_source_attribution() {
+        let before = agent_context_breakdown(10, 60, 100, 10, 5, 0, 5);
+        let run_id = RunId::new("run-failed-compaction").unwrap();
+        let mut projection = RunContextProjection::new(20, 30, 40);
+        let mut active = agent_context_snapshot(1, before.clone());
+        active.phase = AgentRunPhase::Compacting;
+        active.active_compaction = Some(ygg_agent::ActiveContextCompaction {
+            id: 1,
+            reason: CompactionReason::Overflow,
+            before: before.clone(),
+        });
+        active.compactions_started = 1;
+        project_context_snapshot(active, &run_id, &mut projection)
+            .unwrap()
+            .unwrap();
+
+        let mut failed = agent_context_snapshot(2, before.clone());
+        failed.last_compaction = Some(ygg_agent::FinishedContextCompaction {
+            id: 1,
+            reason: CompactionReason::Overflow,
+            before: before.clone(),
+            after: before,
+            succeeded: false,
+        });
+        failed.compactions_started = 1;
+        failed.compactions_failed = 1;
+        let projected = project_context_snapshot(failed, &run_id, &mut projection)
+            .unwrap()
+            .unwrap();
+        let completed = projected.status.last_compaction.as_ref().unwrap();
+        assert!(!completed.succeeded);
+        assert_eq!(completed.before, completed.after);
+        assert_eq!(completed.reclaimed_tokens, 0);
+        assert_eq!(projected.status.current, completed.after);
+        assert_eq!(projection.document_context_tokens, 30);
+        assert_eq!(projection.project_file_context_tokens, 40);
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::Documents),
+            30
+        );
+        assert_eq!(
+            category_tokens(&projected.status.current, ContextCategory::ProjectFiles),
+            40
+        );
+        projected.validate().unwrap();
     }
 
     #[test]

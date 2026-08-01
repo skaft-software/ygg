@@ -7,6 +7,10 @@ mod project_registry {
 }
 
 #[allow(dead_code)]
+#[path = "../src/process_tree.rs"]
+mod process_tree;
+
+#[allow(dead_code)]
 #[path = "../src/repository_context.rs"]
 mod repository_context;
 

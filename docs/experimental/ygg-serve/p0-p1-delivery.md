@@ -2,9 +2,13 @@
 
 This checklist turns the July 27 Claude.app comparison audit into observable
 delivery requirements. Audit claims are requirements only after they have been
-confirmed against the current checkout. A checked item must have production
-implementation evidence and an automated or explicitly recorded validation;
+confirmed against the current checkout. A checked item has production
+implementation evidence and automated or explicitly recorded validation;
 fixture-only behavior does not count.
+
+At the current hardening checkpoint, completed rows are checked below. Rows left
+unchecked are deliberate product gaps, not implied fixture capabilities. The
+full verification evidence is recorded in [Current state](current-state.md).
 
 ## Constraints
 
@@ -27,61 +31,61 @@ fixture-only behavior does not count.
 
 ### Semantic activity
 
-- [ ] Project every supported tool to a deterministic semantic kind, title,
+- [x] Project every supported tool to a deterministic semantic kind, title,
       target, full bounded command/cwd preview, state, exit information, and
       duration.
-- [ ] Keep raw non-command tool arguments, progress, and results out of the
+- [x] Keep raw non-command tool arguments, progress, and results out of the
       public protocol.
-- [ ] Group work into deterministic investigate/change/verify/produce phases.
-- [ ] Aggregate repeated commands and expose compact summaries by default.
-- [ ] Link actions to sources, changed paths, diffs, outputs, approvals, and
+- [x] Group work into deterministic investigate/change/verify/produce phases.
+- [x] Aggregate repeated commands and expose compact summaries by default.
+- [x] Link actions to sources, changed paths, diffs, outputs, approvals, and
       actors when the runtime can prove those relationships.
-- [ ] Preserve action/run/turn identity across live streaming, replay,
+- [x] Preserve action/run/turn identity across live streaming, replay,
       hydration, restart, and conversation-checkpoint checkout.
 
 ### Working-state hierarchy
 
-- [ ] Use a static sidebar state marker.
-- [ ] Remove the composer perimeter and generic activity-rail animation.
-- [ ] Show at most one continuous indicator beside the current visible
+- [x] Use a static sidebar state marker.
+- [x] Remove the composer perimeter and generic activity-rail animation.
+- [x] Show at most one continuous indicator beside the current visible
       operation.
-- [ ] Replace generic `Working…` copy with the current deterministic phase.
-- [ ] Make reduced-motion and product motion settings remove nonessential
+- [x] Replace generic `Working…` copy with the current deterministic phase.
+- [x] Make reduced-motion and product motion settings remove nonessential
       motion.
 
 ### Reviewable completion
 
-- [ ] Emit a structured run review with outcome, duration, actions, changed
+- [x] Emit a structured run review with outcome, duration, actions, changed
       files, verification, warnings/failures, outputs, and evidence coverage.
-- [ ] Render a dominant completion review in the transcript and activity rail.
-- [ ] Open exact changed-file diffs and snapshots after host restart.
-- [ ] Never claim a test count unless a supported parser proves it.
+- [x] Render a dominant completion review in the transcript and activity rail.
+- [x] Open exact changed-file diffs and snapshots after host restart.
+- [x] Never claim a test count unless a supported parser proves it.
 
 ### Streaming performance
 
-- [ ] Isolate store subscriptions so unrelated shell/sidebar/inspector surfaces
+- [x] Isolate store subscriptions so unrelated shell/sidebar/inspector surfaces
       do not rerender for selected-message deltas.
-- [ ] Coalesce compatible deltas and avoid rebuilding catalog summaries for
+- [x] Coalesce compatible deltas and avoid rebuilding catalog summaries for
       transcript-only events.
-- [ ] Index item updates and resource-to-action links.
-- [ ] Memoize completed rows and parse Markdown only after commit (or at a
+- [x] Index item updates and resource-to-action links.
+- [x] Memoize completed rows and parse Markdown only after commit (or at a
       measured bounded cadence).
-- [ ] Use one coalesced scroll-follow scheduler and preserve manual scroll-away.
-- [ ] Apply long-transcript containment and keep mobile overlays opaque.
+- [x] Use one coalesced scroll-follow scheduler and preserve manual scroll-away.
+- [x] Apply long-transcript containment and keep mobile overlays opaque.
 
 ### Performance and visual gates
 
-- [ ] Add a gated 1,000-item/100-command fixture with long code, concurrent
+- [x] Add a gated 1,000-item/100-command fixture with long code, concurrent
       sessions, reconnect/replay, and mobile inspection.
-- [ ] Prove one publication per frame for a 120-delta batch and stable sidebar
+- [x] Prove one publication per frame for a 120-delta batch and stable sidebar
       identity for transcript-only events.
-- [ ] Prove completed Markdown does not reparse during an unrelated live delta.
-- [ ] Prove manual scroll-away survives at least 50 streamed deltas.
-- [ ] Assert no persistent sidebar/composer animation and at most one visible
+- [x] Prove completed Markdown does not reparse during an unrelated live delta.
+- [x] Prove manual scroll-away survives at least 50 streamed deltas.
+- [x] Assert no persistent sidebar/composer animation and at most one visible
       conversation animation.
-- [ ] Add settled screenshot comparison for the mobile inspector and completion
+- [x] Add settled screenshot comparison for the mobile inspector and completion
       review.
-- [ ] Record a realistic performance trace meeting 55 FPS steady-state and no
+- [x] Record a realistic performance trace meeting 55 FPS steady-state and no
       task above 50 ms on the reference laptop.
 
 ## P1 — complete the local coding-agent product
@@ -90,15 +94,20 @@ fixture-only behavior does not count.
 
 - [ ] Persist a real project registry with canonical roots, stable identity,
       create/import/update/archive, defaults, and session binding.
-- [ ] Explain, grant, persist, and revoke project trust before loading
+- [x] Explain, grant, persist, and revoke project trust before loading
       project-controlled config, instructions, skills, or extensions.
-- [ ] Show loaded folder instructions with origin, precedence, and errors.
-- [ ] Project repository/worktree/HEAD/branch/dirty/ahead-behind state without
+- [x] Show loaded folder instructions with origin, precedence, and errors.
+- [x] Project repository/worktree/HEAD/branch/dirty/ahead-behind state without
       confusing it with conversation history.
-- [ ] Ingest bounded, MIME-sniffed UTF-8 text, Markdown, and ordinary PDFs with
+- [x] Ingest bounded, MIME-sniffed UTF-8 text, Markdown, and ordinary PDFs with
       immutable extraction provenance and hostile-document limits.
-- [ ] Browse/search only inside trusted roots and attach immutable file
+- [x] Browse/search only inside trusted roots and attach immutable file
       snapshots as context without accepting client-authored host paths.
+
+The registry, launch-workspace import, rename, archive, defaults, trust, and
+session bindings are durable. The combined first row remains unchecked because
+production browser import/create still awaits a host-native picker that can mint
+a one-use opaque folder candidate; the browser must never submit a host path.
 
 ### Review workflow
 
@@ -107,7 +116,7 @@ fixture-only behavior does not count.
 - [ ] Add split/unified diff modes, hunk navigation, and large/binary states.
 - [ ] Persist redacted command history with cwd, exit, duration, bounded streams,
       and authenticated full-log handles.
-- [ ] Parse supported test frameworks into honest suite/case/pass/fail/skip
+- [x] Parse supported test frameworks into honest suite/case/pass/fail/skip
       records linked to the originating command.
 - [ ] Implement host-owned preview start/readiness/failure/restart/stop and
       reconnect lifecycle.
@@ -115,21 +124,27 @@ fixture-only behavior does not count.
       that never accept arbitrary paths or URL schemes from the client.
 - [ ] Project Git and pull-request status with explicit source and refresh state.
 
+The unchecked review rows remain real limitations. Durable evidence is complete
+for successful built-in `read`, `read_skill_resource`, `edit`, and `write`
+operations, but arbitrary Bash/extension mutations, comprehensive binary and
+large-file review, full command logs, preview ownership, host-open actions, and
+pull-request integration are not generalized end to end.
+
 ### Conversation and recovery
 
-- [ ] Edit an earlier user turn by creating a sibling conversation branch.
-- [ ] Retry a response, retry once with another model, and retain provenance.
-- [ ] Fork a checkpoint into a new session without implying external side
+- [x] Edit an earlier user turn by creating a sibling conversation branch.
+- [x] Retry a response, retry once with another model, and retain provenance.
+- [x] Fork a checkpoint into a new session without implying external side
       effects were rolled back.
-- [ ] Search persisted user/assistant/tool/error/attachment text with snippets,
+- [x] Search persisted user/assistant/tool/error/attachment text with snippets,
       filters, highlighting, and jump-to-item while excluding hidden secrets.
-- [ ] Persist independent text and attachment drafts per session; clear only
+- [x] Persist independent text and attachment drafts per session; clear only
       after acknowledged submission.
-- [ ] Send deduplicated opt-in notifications for background attention
+- [x] Send deduplicated opt-in notifications for background attention
       transitions with deep links and graceful denial.
-- [ ] Surface classified reconnect/provider/command recovery with manual retry
+- [x] Surface classified reconnect/provider/command recovery with manual retry
       or cancel while preserving idempotency.
-- [ ] Add archive browsing, restore, trash retention, and guarded permanent
+- [x] Add archive browsing, restore, trash retention, and guarded permanent
       deletion.
 
 ### Runtime, context, and policy
@@ -140,22 +155,58 @@ fixture-only behavior does not count.
 - [ ] Add trusted skill/extension catalog, enable/disable/reload, generation,
       contribution, and atomic failure visibility.
 - [ ] Add project/language LSP lifecycle and diagnostics status.
-- [ ] Export context categories and replayable compaction start/finish with
+- [x] Export context categories and replayable compaction start/finish with
       totals that reconcile.
 - [ ] Replace coarse authority labels with enforced filesystem/tool/command/
       remote-read/process-network/approval/secrets consequences and explicit
       command/domain policies.
 
+The unchecked runtime rows are intentionally unavailable rather than synthesized
+from UI state. The production authority catalog advertises `FullAccess` only;
+child-agent capability remains false, and MCP, extension/skill, and LSP status
+must stay limited to facts supplied by real host integrations.
+
+## Hardening closure
+
+- [x] Own Git and PTY process trees with bounded graceful/forced descendant
+      termination and bounded output-reader settlement.
+- [x] Use descriptor-relative trusted-root traversal, root identity checks,
+      no-follow opens, conflict detection, and synced atomic writes.
+- [x] Reserve attachment count and bytes across concurrent ingest and recover
+      duplicate fingerprints only when the mapping is unambiguous.
+- [x] Scope WebSocket callbacks, replay, initialization, retries, and timers to a
+      monotonic client generation.
+- [x] Emit source-aware unknown-configuration diagnostics that warn by default
+      and fail only under explicit strict mode.
+- [x] Decode PTY output incrementally and truncate replay only at UTF-8
+      boundaries.
+- [x] Journal permanent deletion around the transcript boundary, recover
+      idempotently after interruption, reclaim session-owned sidecars, retain
+      shared payloads and host accounting, and fail closed on missing stores.
+- [x] Publish exact, replayable context/run lifecycle state without mutating
+      durable conversation history or fabricating provider attribution.
+- [x] Cover hostile process, filesystem, document, quota, deletion, reconnect,
+      terminal, and telemetry cases with adversarial tests.
+- [x] Document the trusted-local-agent security model, persistence contracts,
+      and configuration diagnostic behavior.
+
 ## Final gates
 
-- [ ] Web unit, typecheck, lint, production build, boundary, external-request,
+- [x] Web unit, typecheck, lint, production build, boundary, external-request,
       font, embedded-bundle, fixture Playwright, and production-host Playwright
       gates pass.
-- [ ] Serve Rust unit/golden tests, coding-agent Serve tests, strict Clippy,
+- [x] Serve Rust unit/golden tests, coding-agent Serve tests, strict Clippy,
       formatting, exact-feature build, installed-binary smoke, and full
       workspace gates pass.
 - [ ] Real configured-provider acceptance covers fresh/restore, concurrent
       sessions, tools, files/documents, steer/follow-up/stop, reconnect,
       conversation branching, review, search, and restart.
-- [ ] The package-boundary gate passes and documentation describes only shipped
+- [x] The package-boundary gate passes and documentation describes only shipped
       production behavior.
+
+All automated web checks above were rerun under Node `22.13.0`; Rust 1.86 checks
+passed for both the workspace and independent Serve manifest. Publishable core
+package assembly (`--workspace --exclude ygg-coding-agent`) passed with
+`--allow-dirty`; omitting it is expected to reject this intentionally
+uncommitted checkpoint. See [Current state](current-state.md#validation-evidence)
+for the command-level matrix.

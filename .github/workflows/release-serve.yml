@@ -1,0 +1,133 @@
+name: Experimental ygg serve release
+
+on:
+  push:
+    tags:
+      - "v*-alpha*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to package and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_OFFLINE: "false"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: serve-release-${{ matrix.target }}
+      - name: Build optimized feature-enabled binary
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p ygg-coding-agent --features serve
+      - name: Verify binary and embedded web bundle
+        run: |
+          target="${{ matrix.target }}"
+          binary="target/$target/release/ygg"
+          test -x "$binary"
+          "$binary" --version
+          scripts/smoke-ygg-serve-installed.sh "$binary"
+      - name: Package release artifact
+        run: |
+          version="${{ inputs.tag || github.ref_name }}"
+          scripts/package-ygg-serve-release.sh \
+            "${{ matrix.target }}" \
+            "$RUNNER_TEMP/ygg-release" \
+            "$version"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ygg-serve-${{ matrix.target }}
+          path: ${{ runner.temp }}/ygg-release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Sign and publish experimental artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ygg-serve-*
+          path: release-assets
+          merge-multiple: true
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.8.1
+      - name: Create checksums and keyless signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum ./*.tar.gz | sort -k2 > SHA256SUMS
+          for artifact in ./*.tar.gz; do
+            cosign sign-blob \
+              --yes \
+              --bundle "${artifact}.sigstore.json" \
+              "$artifact"
+          done
+          cosign sign-blob \
+            --yes \
+            --bundle SHA256SUMS.sigstore.json \
+            SHA256SUMS
+          cat SHA256SUMS
+      - name: Verify checksums and signatures
+        shell: bash
+        env:
+          COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          COSIGN_IDENTITY: ^https://github.com/${{ github.repository }}/.github/workflows/release-serve.yml@.*$
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum --check SHA256SUMS
+          for artifact in ./*.tar.gz; do
+            cosign verify-blob \
+              --bundle "${artifact}.sigstore.json" \
+              --certificate-identity-regexp "$COSIGN_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+              "$artifact"
+          done
+          cosign verify-blob \
+            --bundle SHA256SUMS.sigstore.json \
+            --certificate-identity-regexp "$COSIGN_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+            SHA256SUMS
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --title "Ygg $RELEASE_TAG (experimental serve)" \
+            --prerelease \
+            --generate-notes

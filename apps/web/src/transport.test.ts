@@ -57,6 +57,14 @@ const jsonResponse = (value: unknown) =>
     headers: { "Content-Type": "application/json" },
   });
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((accept) => {
+    resolve = accept;
+  });
+  return { promise, resolve };
+}
+
 describe("HTTP Ygg transport", () => {
   beforeEach(() => {
     FakeWebSocket.instances = [];
@@ -648,6 +656,146 @@ describe("HTTP Ygg transport", () => {
         expectedActorGeneration: 3,
       },
     );
+    transport.close();
+  });
+
+  it("ignores a bootstrap that completes after a newer connect attempt", async () => {
+    const older = deferred<Response>();
+    const newer = deferred<Response>();
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockImplementationOnce(() => older.promise)
+        .mockImplementationOnce(() => newer.promise),
+    );
+    const transport = new HttpTransport("device-browser");
+
+    const olderConnect = transport.connect();
+    const newerConnect = transport.connect();
+    newer.resolve(jsonResponse(hostBootstrapGolden));
+    await newerConnect;
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    older.resolve(jsonResponse(hostBootstrapGolden));
+    await olderConnect;
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    transport.close();
+  });
+
+  it("ignores stale socket messages and stale socket close events", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockImplementation(() => Promise.resolve(jsonResponse(hostBootstrapGolden))),
+    );
+    const transport = new HttpTransport("device-browser");
+    const received: unknown[] = [];
+    transport.subscribe((event) => received.push(event));
+    await transport.connect();
+    await transport.connect();
+    const staleSocket = FakeWebSocket.instances[0]!;
+    const currentSocket = FakeWebSocket.instances[1]!;
+
+    staleSocket.emit(
+      "message",
+      new MessageEvent("message", {
+        data: JSON.stringify({
+          protocol: 1,
+          hostSequence: 8,
+          event: eventEnvelopeGolden,
+        }),
+      }),
+    );
+    currentSocket.emit(
+      "message",
+      new MessageEvent("message", {
+        data: JSON.stringify({
+          protocol: 1,
+          hostSequence: 9,
+          event: eventEnvelopeGolden,
+        }),
+      }),
+    );
+    expect(received).toHaveLength(1);
+
+    vi.useFakeTimers();
+    staleSocket.emit("close", new Event("close"));
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    vi.useRealTimers();
+    transport.close();
+  });
+
+  it("keeps replay buffers local to the socket attempt", async () => {
+    const olderReplay = deferred<Response>();
+    const newerReplay = deferred<Response>();
+    let replayCall = 0;
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      if (String(input).includes("/replay?")) {
+        replayCall += 1;
+        return replayCall === 1 ? olderReplay.promise : newerReplay.promise;
+      }
+      return Promise.resolve(jsonResponse(hostBootstrapGolden));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+    const received: unknown[] = [];
+    transport.subscribe((event) => received.push(event));
+
+    await transport.connect();
+    const staleSocket = FakeWebSocket.instances[0]!;
+    staleSocket.emit("open", new Event("open"));
+    await vi.waitFor(() => expect(replayCall).toBe(1));
+
+    await transport.connect();
+    const currentSocket = FakeWebSocket.instances[1]!;
+    currentSocket.emit("open", new Event("open"));
+    await vi.waitFor(() => expect(replayCall).toBe(2));
+    currentSocket.emit(
+      "message",
+      new MessageEvent("message", {
+        data: JSON.stringify({
+          protocol: 1,
+          hostSequence: 12,
+          event: eventEnvelopeGolden,
+        }),
+      }),
+    );
+    expect(received).toEqual([]);
+
+    newerReplay.resolve(
+      jsonResponse({
+        type: "events",
+        after: { actorGeneration: 3, sequence: 42 },
+        through: { actorGeneration: 3, sequence: 42 },
+        events: [],
+      }),
+    );
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+
+    olderReplay.resolve(
+      jsonResponse({
+        type: "events",
+        after: { actorGeneration: 3, sequence: 42 },
+        through: { actorGeneration: 3, sequence: 43 },
+        events: [eventEnvelopeGolden],
+      }),
+    );
+    staleSocket.emit(
+      "message",
+      new MessageEvent("message", {
+        data: JSON.stringify({
+          protocol: 1,
+          hostSequence: 13,
+          event: eventEnvelopeGolden,
+        }),
+      }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(received).toHaveLength(1);
     transport.close();
   });
 

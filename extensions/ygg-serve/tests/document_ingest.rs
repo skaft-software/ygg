@@ -164,6 +164,14 @@ fn rejects_truncated_malformed_and_empty_text_pdfs() {
         Err(DocumentIngestError::MalformedPdf)
     );
 
+    let invalid_header = Bytes::from_static(
+        b"%PDF-1.4 trailing\nxref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\nstartxref\n18\n%%EOF",
+    );
+    assert_eq!(
+        ingest_document("header.pdf", "application/pdf", invalid_header),
+        Err(DocumentIngestError::MediaTypeMismatch)
+    );
+
     let blank = ordinary_pdf(&[""], false, None);
     assert_eq!(
         ingest_document("blank.pdf", "application/pdf", Bytes::from(blank)),

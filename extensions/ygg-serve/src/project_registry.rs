@@ -106,12 +106,20 @@ pub struct ProjectSummary {
 /// representation is redacted. It should be consumed only by trusted host
 /// code after a project ID has been resolved.
 #[derive(Clone, PartialEq, Eq)]
-pub struct ProjectRoot(PathBuf);
+pub struct ProjectRoot {
+    path: PathBuf,
+    identity: StoredRootIdentity,
+}
 
 impl ProjectRoot {
     /// Returns the canonical server-side path.
     pub fn as_path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+
+    /// Checks an opened root descriptor against the imported directory identity.
+    pub(crate) fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        root_identity_matches(self.identity, metadata)
     }
 }
 
@@ -248,7 +256,7 @@ struct StoredProject {
     archived: bool,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredRootIdentity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -507,6 +515,39 @@ impl ProjectRegistry {
         self.get(id).ok_or(ProjectRegistryError::CorruptState)
     }
 
+    /// Rebinds an explicitly selected launch root after its directory identity
+    /// changed, preserving the opaque project ID and session bindings.
+    ///
+    /// The canonical path must remain the same. A changed identity revokes
+    /// trust before the caller explicitly grants it again, so replacing a
+    /// directory can never silently retain execution authority.
+    pub fn rebind_root(
+        &mut self,
+        id: &ProjectId,
+        root: impl AsRef<Path>,
+    ) -> Result<ProjectSummary, ProjectRegistryError> {
+        let canonical_root = validate_import_root(root.as_ref(), &self.state_directory)?;
+        let current = self
+            .project(id)
+            .ok_or(ProjectRegistryError::ProjectNotFound)?;
+        ensure_active(current)?;
+        if current.canonical_root != canonical_root {
+            return Err(ProjectRegistryError::RootIdentityChanged);
+        }
+        let metadata = canonical_root
+            .symlink_metadata()
+            .map_err(map_root_metadata_error)?;
+        let identity = capture_root_identity(&metadata);
+        if current.root_identity != identity {
+            let mut next = self.state.clone();
+            let project = project_mut(&mut next, id)?;
+            project.root_identity = identity;
+            project.trusted = false;
+            self.commit(next)?;
+        }
+        self.get(id).ok_or(ProjectRegistryError::CorruptState)
+    }
+
     /// Grants trust to the exact imported directory identity.
     pub fn grant_trust(&mut self, id: &ProjectId) -> Result<ProjectSummary, ProjectRegistryError> {
         let current = self
@@ -539,7 +580,30 @@ impl ProjectRegistry {
             .project(id)
             .ok_or(ProjectRegistryError::ProjectNotFound)?;
         ensure_active(project)?;
-        validate_live_root(project).map(ProjectRoot)
+        let path = validate_live_root(project)?;
+        Ok(ProjectRoot {
+            path,
+            identity: project.root_identity,
+        })
+    }
+
+    /// Resolves a registered project into a revalidated root for durable-state
+    /// cleanup, including after the project was archived.
+    ///
+    /// This does not grant execution trust. Callers must use it only to finish
+    /// cleanup that was authorized while the project was active.
+    pub fn resolve_root_for_cleanup(
+        &self,
+        id: &ProjectId,
+    ) -> Result<ProjectRoot, ProjectRegistryError> {
+        let project = self
+            .project(id)
+            .ok_or(ProjectRegistryError::ProjectNotFound)?;
+        let path = validate_live_root(project)?;
+        Ok(ProjectRoot {
+            path,
+            identity: project.root_identity,
+        })
     }
 
     /// Resolves an active and explicitly trusted project into a server-only
@@ -555,7 +619,11 @@ impl ProjectRegistry {
         if !project.trusted {
             return Err(ProjectRegistryError::ProjectUntrusted);
         }
-        validate_live_root(project).map(ProjectRoot)
+        let path = validate_live_root(project)?;
+        Ok(ProjectRoot {
+            path,
+            identity: project.root_identity,
+        })
     }
 
     fn summary(&self, project: &StoredProject) -> ProjectSummary {
@@ -1066,9 +1134,7 @@ fn atomic_replace_with_hook(
         before_replace(&temporary_path)?;
         std::fs::rename(&temporary_path, destination)?;
         #[cfg(unix)]
-        {
-            let _ = File::open(directory).and_then(|directory| directory.sync_all());
-        }
+        File::open(directory)?.sync_all()?;
         Ok(())
     })();
 

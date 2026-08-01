@@ -142,9 +142,18 @@ curl -fsS \
     --connect-timeout 2 \
     --max-time 10 \
     --cookie "$cookie_jar" \
+    --dump-header "$work_directory/language-chunk.headers" \
+    --output "$work_directory/download/assets/chunk-file-languages.js" \
+    "$origin/assets/chunk-file-languages.js"
+curl -fsS \
+    --noproxy '*' \
+    --proto '=http' \
+    --connect-timeout 2 \
+    --max-time 10 \
+    --cookie "$cookie_jar" \
     --dump-header "$work_directory/jsx-runtime-chunk.headers" \
-    --output "$work_directory/download/assets/chunk-jsx-runtime.js" \
-    "$origin/assets/chunk-jsx-runtime.js"
+    --output "$work_directory/download/assets/chunk-rolldown-runtime.js" \
+    "$origin/assets/chunk-rolldown-runtime.js"
 curl -fsS \
     --noproxy '*' \
     --proto '=http' \
@@ -162,8 +171,11 @@ cmp \
     "$work_directory/download/assets/chunk-FilesPanel.js" \
     "$expected_directory/assets/chunk-FilesPanel.js"
 cmp \
-    "$work_directory/download/assets/chunk-jsx-runtime.js" \
-    "$expected_directory/assets/chunk-jsx-runtime.js"
+    "$work_directory/download/assets/chunk-file-languages.js" \
+    "$expected_directory/assets/chunk-file-languages.js"
+cmp \
+    "$work_directory/download/assets/chunk-rolldown-runtime.js" \
+    "$expected_directory/assets/chunk-rolldown-runtime.js"
 cmp \
     "$work_directory/download/assets/chunk-MarkdownMessage.js" \
     "$expected_directory/assets/chunk-MarkdownMessage.js"
@@ -184,6 +196,9 @@ tr -d '\r' \
     <"$work_directory/files-panel-chunk.headers" \
     >"$work_directory/files-panel-chunk.headers.clean"
 tr -d '\r' \
+    <"$work_directory/language-chunk.headers" \
+    >"$work_directory/language-chunk.headers.clean"
+tr -d '\r' \
     <"$work_directory/jsx-runtime-chunk.headers" \
     >"$work_directory/jsx-runtime-chunk.headers.clean"
 tr -d '\r' \
@@ -196,6 +211,7 @@ grep -Fxi "content-type: text/html; charset=utf-8" "$work_directory/index.header
 grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/app-js.headers.clean" >/dev/null
 grep -Fxi "content-type: text/css; charset=utf-8" "$work_directory/app-css.headers.clean" >/dev/null
 grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/files-panel-chunk.headers.clean" >/dev/null
+grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/language-chunk.headers.clean" >/dev/null
 grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/jsx-runtime-chunk.headers.clean" >/dev/null
 grep -Fxi "content-type: text/javascript; charset=utf-8" "$work_directory/markdown-chunk.headers.clean" >/dev/null
 for headers in \
@@ -203,6 +219,7 @@ for headers in \
     "$work_directory/app-js.headers.clean" \
     "$work_directory/app-css.headers.clean" \
     "$work_directory/files-panel-chunk.headers.clean" \
+    "$work_directory/language-chunk.headers.clean" \
     "$work_directory/jsx-runtime-chunk.headers.clean" \
     "$work_directory/markdown-chunk.headers.clean"
 do

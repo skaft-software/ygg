@@ -3,7 +3,7 @@
 //! Text and Markdown share the same UTF-8 byte grammar, so their exact media
 //! distinction is the declared media type plus a matching safe filename
 //! extension. PDF input additionally requires a strict header, terminal EOF,
-//! classic single-revision cross-reference table, and successful strict parse.
+//! classic single-revision cross-reference table, and successful parsing.
 //!
 //! PDF extraction is deliberately text-only and partial. Modern object/xref
 //! streams and incremental revisions are rejected before parsing because the
@@ -425,9 +425,7 @@ fn valid_pdf_header(bytes: &[u8]) -> bool {
             &bytes[5..8],
             b"1.0" | b"1.1" | b"1.2" | b"1.3" | b"1.4" | b"1.5" | b"1.6" | b"1.7" | b"2.0"
         )
-        && bytes
-            .get(8)
-            .is_none_or(|byte| is_pdf_whitespace(*byte) || *byte == b'%')
+        && matches!(bytes.get(8), Some(b'\n' | b'\r'))
 }
 
 fn preflight_classic_xref(bytes: &[u8], offset: usize) -> Result<usize, DocumentIngestError> {

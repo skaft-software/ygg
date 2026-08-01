@@ -2,10 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, oneshot, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 
 use crate::{
     ActorConfig, ActorError, ActorView, AuthorityProfile, CatalogCursor, CommandAdmission,
@@ -95,6 +95,9 @@ enum HostCommandCacheEntry {
 struct SupervisorState {
     actors: BTreeMap<SessionId, SessionActorHandle>,
     blocked_projects: BTreeSet<ProjectId>,
+    project_gates: BTreeMap<ProjectId, Weak<RwLock<()>>>,
+    blocked_sessions: BTreeSet<SessionId>,
+    session_gates: BTreeMap<SessionId, Weak<RwLock<()>>>,
     session_openings:
         BTreeMap<SessionId, Vec<oneshot::Sender<Result<SessionActorHandle, SupervisorError>>>>,
     host_commands: BTreeMap<HostCommandKey, HostCommandCacheEntry>,
@@ -137,6 +140,9 @@ impl<H: HostService> SessionSupervisor<H> {
             state: Arc::new(Mutex::new(SupervisorState {
                 actors: BTreeMap::new(),
                 blocked_projects: BTreeSet::new(),
+                project_gates: BTreeMap::new(),
+                blocked_sessions: BTreeSet::new(),
+                session_gates: BTreeMap::new(),
                 session_openings: BTreeMap::new(),
                 host_commands: BTreeMap::new(),
                 host_command_order: VecDeque::new(),
@@ -186,6 +192,9 @@ impl<H: HostService> SessionSupervisor<H> {
         loop {
             let begin = {
                 let mut state = self.state.lock().await;
+                if state.blocked_sessions.contains(session_id) {
+                    return Err(ServiceError::Unavailable.into());
+                }
                 if state.actors.get(session_id).is_some_and(|handle| {
                     handle
                         .view()
@@ -556,6 +565,9 @@ impl<H: HostService> SessionSupervisor<H> {
         media_type: &str,
         bytes: bytes::Bytes,
     ) -> Result<crate::DocumentReference, crate::ServiceError> {
+        let gate = self.session_gate(session_id).await;
+        let _operation = gate.read().await;
+        self.ensure_session_unblocked(session_id).await?;
         self.host
             .ingest_document(session_id, display_name, media_type, bytes)
             .await
@@ -566,6 +578,9 @@ impl<H: HostService> SessionSupervisor<H> {
         &self,
         session_id: &crate::SessionId,
     ) -> Result<Vec<crate::DocumentReference>, crate::ServiceError> {
+        let gate = self.session_gate(session_id).await;
+        let _operation = gate.read().await;
+        self.ensure_session_unblocked(session_id).await?;
         self.host.list_documents(session_id).await
     }
 
@@ -699,6 +714,9 @@ impl<H: HostService> SessionSupervisor<H> {
         session_id: &crate::SessionId,
         handle: &str,
     ) -> Result<crate::StoredResource, crate::ServiceError> {
+        let gate = self.session_gate(session_id).await;
+        let _operation = gate.read().await;
+        self.ensure_session_unblocked(session_id).await?;
         self.host.resource_content(session_id, handle).await
     }
 
@@ -707,6 +725,9 @@ impl<H: HostService> SessionSupervisor<H> {
         &self,
         session_id: &crate::SessionId,
     ) -> Result<bytes::Bytes, crate::ServiceError> {
+        let gate = self.session_gate(session_id).await;
+        let _operation = gate.read().await;
+        self.ensure_session_unblocked(session_id).await?;
         self.host.session_export(session_id).await
     }
 
@@ -740,11 +761,38 @@ impl<H: HostService> SessionSupervisor<H> {
         &self,
         request: CreateSessionRequest,
     ) -> Result<SessionActorHandle, SupervisorError> {
+        // Project lifecycle mutations take the write side of this gate, so a
+        // creation cannot persist a session after trust/archive fencing starts.
+        let project_gate = if let Some(project_id) = request.project_id.as_ref() {
+            Some(self.project_gate(project_id).await)
+        } else {
+            None
+        };
+        let _project_operation = if let Some(gate) = &project_gate {
+            Some(gate.clone().read_owned().await)
+        } else {
+            None
+        };
+        if let Some(project_id) = request.project_id.as_ref() {
+            if self
+                .state
+                .lock()
+                .await
+                .blocked_projects
+                .contains(project_id)
+            {
+                return Err(SupervisorError::Service(ServiceError::Unauthorized));
+            }
+        }
+
         // The potentially slow factory is deliberately outside the actor-map
         // lock. Duplicate IDs are resolved before an actor task is spawned.
         let driver = self.host.create_session(request).await?;
         let session_id = driver.seed().summary.id;
         let mut state = self.state.lock().await;
+        if state.blocked_sessions.contains(&session_id) {
+            return Err(SupervisorError::Service(ServiceError::Unavailable));
+        }
         if driver
             .seed()
             .summary
@@ -795,6 +843,9 @@ impl<H: HostService> SessionSupervisor<H> {
         }
 
         let mut state = self.state.lock().await;
+        if state.blocked_sessions.contains(session_id) {
+            return Err(SupervisorError::Service(ServiceError::Unavailable));
+        }
         if driver
             .seed()
             .summary
@@ -980,6 +1031,8 @@ impl<H: HostService> SessionSupervisor<H> {
                 project_id,
                 trusted,
             } => {
+                let gate = self.project_gate(project_id).await;
+                let _mutation = gate.write().await;
                 if !trusted {
                     self.block_and_retire_project(project_id).await;
                 }
@@ -1005,6 +1058,8 @@ impl<H: HostService> SessionSupervisor<H> {
                 }
             }
             HostCommand::ArchiveProject { project_id } => {
+                let gate = self.project_gate(project_id).await;
+                let _mutation = gate.write().await;
                 self.block_and_retire_project(project_id).await;
                 match self.host.archive_project(project_id).await {
                     Ok(project) => HostCommandAck::accepted_project(
@@ -1024,12 +1079,15 @@ impl<H: HostService> SessionSupervisor<H> {
                 session_id,
                 lifecycle,
             } => {
-                self.retire_session_owner(session_id).await;
-                match self
+                let gate = self.session_gate(session_id).await;
+                let _mutation = gate.write().await;
+                self.block_and_retire_session(session_id).await;
+                let result = self
                     .host
                     .set_session_lifecycle(session_id, *lifecycle, acknowledged_at_ms)
-                    .await
-                {
+                    .await;
+                self.unblock_session(session_id).await;
+                match result {
                     Ok(_) => HostCommandAck::accepted_project(
                         host_id,
                         envelope.command_id.clone(),
@@ -1044,12 +1102,15 @@ impl<H: HostService> SessionSupervisor<H> {
                 session_id,
                 confirmation,
             } => {
-                self.retire_session_owner(session_id).await;
-                match self
+                let gate = self.session_gate(session_id).await;
+                let _mutation = gate.write().await;
+                self.block_and_retire_session(session_id).await;
+                let result = self
                     .host
                     .delete_session_permanently(session_id, confirmation)
-                    .await
-                {
+                    .await;
+                self.unblock_session(session_id).await;
+                match result {
                     Ok(()) => HostCommandAck::accepted_project(
                         host_id,
                         envelope.command_id.clone(),
@@ -1074,15 +1135,25 @@ impl<H: HostService> SessionSupervisor<H> {
             state
                 .actors
                 .values()
-                .filter(|handle| {
-                    handle.view().summary.project_id.as_ref() == Some(project_id)
-                        && !handle.is_closed()
-                })
+                .filter(|handle| handle.view().summary.project_id.as_ref() == Some(project_id))
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        for actor in actors {
+        for actor in &actors {
             actor.retire().await;
+        }
+        for actor in actors {
+            actor.closed().await;
+            actor.quiesced().await;
+            let session_id = actor.session_id().clone();
+            let mut state = self.state.lock().await;
+            if state
+                .actors
+                .get(&session_id)
+                .is_some_and(|current| current.same_actor(&actor))
+            {
+                state.actors.remove(&session_id);
+            }
         }
     }
 
@@ -1090,9 +1161,71 @@ impl<H: HostService> SessionSupervisor<H> {
         self.state.lock().await.blocked_projects.remove(project_id);
     }
 
-    async fn retire_session_owner(&self, session_id: &SessionId) {
-        let actor = self.state.lock().await.actors.get(session_id).cloned();
-        if let Some(actor) = actor {
+    async fn project_gate(&self, project_id: &ProjectId) -> Arc<RwLock<()>> {
+        let mut state = self.state.lock().await;
+        state
+            .project_gates
+            .retain(|_, candidate| candidate.strong_count() > 0);
+        if let Some(gate) = state.project_gates.get(project_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(RwLock::new(()));
+        state
+            .project_gates
+            .insert(project_id.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    async fn session_gate(&self, session_id: &SessionId) -> Arc<RwLock<()>> {
+        let mut state = self.state.lock().await;
+        state
+            .session_gates
+            .retain(|_, candidate| candidate.strong_count() > 0);
+        if let Some(gate) = state.session_gates.get(session_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(RwLock::new(()));
+        state
+            .session_gates
+            .insert(session_id.clone(), Arc::downgrade(&gate));
+        gate
+    }
+
+    async fn ensure_session_unblocked(&self, session_id: &SessionId) -> Result<(), ServiceError> {
+        if self
+            .state
+            .lock()
+            .await
+            .blocked_sessions
+            .contains(session_id)
+        {
+            Err(ServiceError::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn block_and_retire_session(&self, session_id: &SessionId) {
+        loop {
+            let (opening, actor) = {
+                let mut state = self.state.lock().await;
+                state.blocked_sessions.insert(session_id.clone());
+                if let Some(waiters) = state.session_openings.get_mut(session_id) {
+                    let (sender, receiver) = oneshot::channel();
+                    waiters.push(sender);
+                    (Some(receiver), None)
+                } else {
+                    (None, state.actors.get(session_id).cloned())
+                }
+            };
+
+            if let Some(opening) = opening {
+                let _ = opening.await;
+                continue;
+            }
+            let Some(actor) = actor else {
+                return;
+            };
             actor.retire().await;
             actor.closed().await;
             actor.quiesced().await;
@@ -1105,6 +1238,10 @@ impl<H: HostService> SessionSupervisor<H> {
                 state.actors.remove(session_id);
             }
         }
+    }
+
+    async fn unblock_session(&self, session_id: &SessionId) {
+        self.state.lock().await.blocked_sessions.remove(session_id);
     }
 
     async fn complete_host_command(
@@ -2522,6 +2659,80 @@ mod tests {
         assert_eq!(refreshed.summary.title, "Refreshed durable session");
         assert_eq!(refreshed.snapshot.actor_generation, 2);
         assert_eq!(refreshed.snapshot.cursor, SessionCursor::zero(2));
+    }
+
+    #[tokio::test]
+    async fn session_mutation_fence_waits_for_an_inflight_open() {
+        let (host, entered, release) = MockHost::with_gated_open();
+        let host = Arc::new(host);
+        let seed = host
+            .create_session(CreateSessionRequest {
+                project_id: None,
+                provisional: false,
+                authority: AuthorityProfile::FullAccess,
+                model: None,
+            })
+            .await
+            .unwrap()
+            .seed();
+        let session_id = seed.summary.id;
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig::default(),
+        ));
+
+        host.open_gate_armed.store(true, Ordering::Release);
+        let opening = {
+            let supervisor = Arc::clone(&supervisor);
+            let session_id = session_id.clone();
+            tokio::spawn(async move { supervisor.open_session(&session_id).await })
+        };
+        entered.wait().await;
+
+        let fencing = {
+            let supervisor = Arc::clone(&supervisor);
+            let session_id = session_id.clone();
+            tokio::spawn(async move { supervisor.block_and_retire_session(&session_id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if supervisor
+                    .state
+                    .lock()
+                    .await
+                    .blocked_sessions
+                    .contains(&session_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the lifecycle fence must become visible");
+
+        assert!(matches!(
+            supervisor.open_session(&session_id).await,
+            Err(SupervisorError::Service(ServiceError::Unavailable))
+        ));
+        assert!(!fencing.is_finished());
+        release.wait().await;
+        assert!(matches!(
+            opening.await.unwrap(),
+            Err(SupervisorError::Service(ServiceError::Unavailable))
+        ));
+        fencing.await.unwrap();
+        assert_eq!(supervisor.active_session_count().await, 0);
+
+        supervisor.unblock_session(&session_id).await;
+        assert_eq!(
+            supervisor
+                .open_session(&session_id)
+                .await
+                .unwrap()
+                .session_id(),
+            &session_id
+        );
     }
 
     #[tokio::test]

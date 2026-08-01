@@ -180,6 +180,64 @@ fn project_and_session_associations_are_authoritative() {
 }
 
 #[test]
+fn permanent_session_deletion_reclaims_only_owned_documents() {
+    let fixture = tempfile::tempdir().unwrap();
+    let state = private_state(&fixture);
+    let store = DocumentStore::open(&state).unwrap();
+    let removed = store
+        .ingest(
+            "project-a",
+            "session-removed",
+            "removed.txt",
+            "text/plain",
+            Bytes::from_static(b"remove this document"),
+        )
+        .unwrap();
+    let retained = store
+        .ingest(
+            "project-a",
+            "session-retained",
+            "retained.txt",
+            "text/plain",
+            Bytes::from_static(b"retain this document"),
+        )
+        .unwrap();
+
+    store
+        .delete_session("project-a", "session-removed")
+        .unwrap();
+    store
+        .delete_session("project-a", "session-removed")
+        .unwrap();
+
+    assert!(store
+        .list_for_session("project-a", "session-removed")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.get_for_session("project-a", "session-removed", &removed.id),
+        Err(DocumentStoreError::NotFound)
+    );
+    assert_eq!(
+        store
+            .list_for_session("project-a", "session-retained")
+            .unwrap(),
+        vec![retained.clone()]
+    );
+    assert!(!source_path(&state, &removed.id).exists());
+    assert!(!metadata_path(&state, &removed.id).exists());
+
+    drop(store);
+    let reopened = DocumentStore::open(&state).unwrap();
+    assert_eq!(
+        reopened
+            .list_for_session("project-a", "session-retained")
+            .unwrap(),
+        vec![retained]
+    );
+}
+
+#[test]
 fn prompt_context_is_visible_deduplicated_and_aggregate_bounded() {
     let fixture = tempfile::tempdir().unwrap();
     let state = private_state(&fixture);

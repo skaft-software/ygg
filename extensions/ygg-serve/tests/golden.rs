@@ -8,17 +8,18 @@ use serde::Serialize;
 use serde_json::Value;
 use ygg_serve_backend::{
     ActivityPhase, ActivityPhaseSummary, ActorOwnerState, AttachmentPolicy, AttentionState,
-    AuthorityProfile, CatalogCursor, ColorScheme, CommandId, CompletionReview, ContextUsage,
-    DeviceId, DurableEntryId, EventEnvelope, EventPayload, EvidenceCoverage, HostAckDisposition,
-    HostBootstrap, HostCapabilities, HostCommand, HostCommandAck, HostCommandEnvelope,
-    HostDescriptor, HostId, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
-    ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary, ProjectCatalog,
-    ProjectId, ProjectSummary, PromptInput, ProtocolValidation, PullRequestState,
-    PullRequestSummary, RunId, RunOutcome, SessionBranchEntry, SessionBranchEntryKind,
-    SessionBranchGraph, SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId,
-    SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity,
-    ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography,
-    ToolActivity, ToolActivityStatus, ToolKind, TurnId, UsageSnapshot, UserMessageDelivery,
+    AuthorityProfile, CatalogCursor, ColorScheme, CommandId, CompletionReview, ContextCategory,
+    ContextCategoryTotal, ContextStatus, ContextTotals, ContextUsage, DeviceId, DurableEntryId,
+    EventEnvelope, EventPayload, EvidenceCoverage, HostAckDisposition, HostBootstrap,
+    HostCapabilities, HostCommand, HostCommandAck, HostCommandEnvelope, HostDescriptor, HostId,
+    InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload, ModelInputPricing,
+    ModelInputPricingTier, ModelSelection, ModelSummary, ProjectCatalog, ProjectId, ProjectSummary,
+    PromptInput, ProtocolValidation, PullRequestState, PullRequestSummary, RunId, RunOutcome,
+    SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionCommand,
+    SessionCommandEnvelope, SessionCursor, SessionId, SessionItem, SessionLiveState,
+    SessionSnapshot, SessionSummary, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion,
+    ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, ToolActivity,
+    ToolActivityStatus, ToolKind, TurnId, UsageSnapshot, UserMessageDelivery,
 };
 
 fn model_selection() -> ModelSelection {
@@ -94,6 +95,20 @@ fn snapshot() -> SessionSnapshot {
                 context_limit: Some(128_000),
             },
             compactions: 1,
+            status: ContextStatus {
+                current: ContextTotals::try_new(
+                    vec![ContextCategoryTotal {
+                        category: ContextCategory::Other,
+                        tokens: 165,
+                    }],
+                    165,
+                )
+                .unwrap(),
+                updated_at_ms: 1_721_000_000_042,
+                active_compaction: None,
+                last_compaction: None,
+            },
+            run: None,
         },
         items: vec![session_item()],
         pending_requests: Vec::new(),

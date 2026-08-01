@@ -140,6 +140,8 @@ struct StoreIndex {
     metadata: BTreeMap<String, StoredMetadata>,
     associations: BTreeMap<AssociationKey, Vec<String>>,
     stored_bytes: u64,
+    in_flight_count: usize,
+    in_flight_bytes: u64,
 }
 
 struct StoreInner {
@@ -148,7 +150,55 @@ struct StoreInner {
     blobs: PathBuf,
     metadata: PathBuf,
     associations: PathBuf,
+    association_mutations: Mutex<()>,
     index: Mutex<StoreIndex>,
+}
+
+struct QuotaReservation {
+    inner: Arc<StoreInner>,
+    byte_len: u64,
+    active: bool,
+}
+
+impl QuotaReservation {
+    fn commit(mut self, stored: StoredMetadata) -> Result<(), AttachmentError> {
+        let mut index = self
+            .inner
+            .index
+            .lock()
+            .map_err(|_| AttachmentError::Storage)?;
+        if index.metadata.contains_key(&stored.handle)
+            || index.in_flight_count == 0
+            || index.in_flight_bytes < self.byte_len
+        {
+            return Err(AttachmentError::Storage);
+        }
+        let stored_bytes = index
+            .stored_bytes
+            .checked_add(stored.byte_len)
+            .ok_or(AttachmentError::Storage)?;
+        index.in_flight_count -= 1;
+        index.in_flight_bytes -= self.byte_len;
+        index.stored_bytes = stored_bytes;
+        index.metadata.insert(stored.handle.clone(), stored);
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for QuotaReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let Ok(mut index) = self.inner.index.lock() else {
+            return;
+        };
+        debug_assert!(index.in_flight_count > 0);
+        debug_assert!(index.in_flight_bytes >= self.byte_len);
+        index.in_flight_count = index.in_flight_count.saturating_sub(1);
+        index.in_flight_bytes = index.in_flight_bytes.saturating_sub(self.byte_len);
+    }
 }
 
 /// Cloneable private attachment store shared by the HTTP host and session drivers.
@@ -169,15 +219,15 @@ impl AttachmentStore {
         ensure_private_directory(&metadata)?;
         ensure_private_directory(&associations)?;
 
-        cleanup_temporary_files(&blobs);
-        cleanup_temporary_files(&metadata);
-        cleanup_temporary_files(&associations);
+        cleanup_temporary_files(&blobs)?;
+        cleanup_temporary_files(&metadata)?;
+        cleanup_temporary_files(&associations)?;
 
         let mut index = StoreIndex::default();
         load_metadata(&metadata, &blobs, &mut index)?;
-        cleanup_unindexed_metadata(&metadata, &blobs, &index);
+        cleanup_unindexed_metadata(&metadata, &blobs, &index)?;
         load_associations(&associations, &mut index)?;
-        cleanup_unindexed_associations(&associations, &index);
+        cleanup_unindexed_associations(&associations, &index)?;
         Ok(Self {
             inner: Arc::new(StoreInner {
                 #[cfg(test)]
@@ -185,6 +235,7 @@ impl AttachmentStore {
                 blobs,
                 metadata,
                 associations,
+                association_mutations: Mutex::new(()),
                 index: Mutex::new(index),
             }),
         })
@@ -193,6 +244,48 @@ impl AttachmentStore {
     /// Advertised image policy for this store.
     pub fn policy(&self) -> AttachmentPolicy {
         AttachmentPolicy::image_defaults()
+    }
+
+    fn reserve_quota(
+        &self,
+        byte_len: u64,
+        handle: &str,
+    ) -> Result<QuotaReservation, AttachmentError> {
+        let mut index = self
+            .inner
+            .index
+            .lock()
+            .map_err(|_| AttachmentError::Storage)?;
+        let reserved_count = index
+            .metadata
+            .len()
+            .checked_add(index.in_flight_count)
+            .and_then(|count| count.checked_add(1));
+        let reserved_bytes = index
+            .stored_bytes
+            .checked_add(index.in_flight_bytes)
+            .and_then(|bytes| bytes.checked_add(byte_len));
+        if reserved_count.is_none_or(|count| count > MAX_STORED_ATTACHMENTS)
+            || reserved_bytes.is_none_or(|bytes| bytes > MAX_STORED_ATTACHMENT_BYTES)
+        {
+            return Err(AttachmentError::QuotaExceeded);
+        }
+        if index.metadata.contains_key(handle) {
+            return Err(AttachmentError::Storage);
+        }
+        index.in_flight_count = index
+            .in_flight_count
+            .checked_add(1)
+            .ok_or(AttachmentError::Storage)?;
+        index.in_flight_bytes = index
+            .in_flight_bytes
+            .checked_add(byte_len)
+            .ok_or(AttachmentError::Storage)?;
+        Ok(QuotaReservation {
+            inner: Arc::clone(&self.inner),
+            byte_len,
+            active: true,
+        })
     }
 
     /// Ingests one fully buffered, transport-bounded image.
@@ -223,24 +316,7 @@ impl AttachmentStore {
             created_at_ms,
         };
 
-        {
-            let index = self
-                .inner
-                .index
-                .lock()
-                .map_err(|_| AttachmentError::Storage)?;
-            if index.metadata.len() >= MAX_STORED_ATTACHMENTS
-                || index
-                    .stored_bytes
-                    .checked_add(stored.byte_len)
-                    .is_none_or(|total| total > MAX_STORED_ATTACHMENT_BYTES)
-            {
-                return Err(AttachmentError::QuotaExceeded);
-            }
-            if index.metadata.contains_key(&handle) {
-                return Err(AttachmentError::Storage);
-            }
-        }
+        let reservation = self.reserve_quota(stored.byte_len, &handle)?;
 
         let blob_path = self.inner.blobs.join(format!("{handle}.blob"));
         atomic_write(&self.inner.blobs, &blob_path, &bytes)?;
@@ -252,13 +328,11 @@ impl AttachmentStore {
         }
 
         let reference = stored.attachment_ref();
-        let mut index = self
-            .inner
-            .index
-            .lock()
-            .map_err(|_| AttachmentError::Storage)?;
-        index.stored_bytes = index.stored_bytes.saturating_add(stored.byte_len);
-        index.metadata.insert(handle, stored);
+        if let Err(error) = reservation.commit(stored) {
+            let _ = std::fs::remove_file(&metadata_path);
+            let _ = std::fs::remove_file(&blob_path);
+            return Err(error);
+        }
         Ok(reference)
     }
 
@@ -321,6 +395,15 @@ impl AttachmentStore {
         durable_entry_id: &str,
         references: &[AttachmentRef],
     ) -> Result<(), AttachmentError> {
+        // Keep reference validation, durable publication, and index publication
+        // atomic with respect to permanent-session cleanup. Otherwise cleanup
+        // can reclaim a handle after validation but before the association is
+        // published, leaving a durable association to missing bytes.
+        let _mutation = self
+            .inner
+            .association_mutations
+            .lock()
+            .map_err(|_| AttachmentError::Storage)?;
         let resolved = self.resolve_many(references)?;
         let handles = resolved
             .iter()
@@ -381,11 +464,15 @@ impl AttachmentStore {
                 .lock()
                 .map_err(|_| AttachmentError::Storage)?;
             let mut references = Vec::with_capacity(fingerprints.len());
+            let mut assigned_handles = BTreeSet::new();
             for fingerprint in fingerprints {
                 let candidate = index
                     .metadata
                     .values()
-                    .filter(|metadata| metadata.matches_fingerprint(fingerprint))
+                    .filter(|metadata| {
+                        metadata.matches_fingerprint(fingerprint)
+                            && !assigned_handles.contains(&metadata.handle)
+                    })
                     .max_by(|left, right| {
                         left.created_at_ms
                             .cmp(&right.created_at_ms)
@@ -394,12 +481,83 @@ impl AttachmentStore {
                 let Some(candidate) = candidate else {
                     return Ok(None);
                 };
+                assigned_handles.insert(candidate.handle.clone());
                 references.push(candidate.attachment_ref());
             }
             references
         };
         self.associate(session_id, durable_entry_id, &references)?;
         Ok(Some(references))
+    }
+
+    /// Removes every association owned by a permanently deleted session.
+    ///
+    /// Attachment bytes are removed only when no retained association refers to
+    /// their handle, so a handle shared by another session remains available.
+    /// The operation is idempotent to support retry from a deletion journal.
+    pub fn delete_session(&self, session_id: &SessionId) -> Result<(), AttachmentError> {
+        let _mutation = self
+            .inner
+            .association_mutations
+            .lock()
+            .map_err(|_| AttachmentError::Storage)?;
+        let mut index = self
+            .inner
+            .index
+            .lock()
+            .map_err(|_| AttachmentError::Storage)?;
+        let removed_keys = index
+            .associations
+            .keys()
+            .filter(|key| key.session_id == session_id.as_str())
+            .cloned()
+            .collect::<Vec<_>>();
+        if removed_keys.is_empty() {
+            return Ok(());
+        }
+        let removed_key_set = removed_keys.iter().cloned().collect::<BTreeSet<_>>();
+        let candidate_handles = removed_keys
+            .iter()
+            .filter_map(|key| index.associations.get(key))
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let retained_handles = index
+            .associations
+            .iter()
+            .filter(|(key, _)| !removed_key_set.contains(*key))
+            .flat_map(|(_, handles)| handles.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let orphaned_handles = candidate_handles
+            .difference(&retained_handles)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // Reclaim unshared bytes before removing the durable associations that
+        // identify their owner. If deletion is interrupted, recovery can still
+        // rediscover this session until its bytes are durably gone.
+        for handle in &orphaned_handles {
+            remove_file_if_exists(&self.inner.metadata.join(format!("{handle}.json")))?;
+            remove_file_if_exists(&self.inner.blobs.join(format!("{handle}.blob")))?;
+        }
+        sync_directory(&self.inner.metadata)?;
+        sync_directory(&self.inner.blobs)?;
+
+        for key in &removed_keys {
+            let file_key = sha256_hex(format!("{}\0{}", key.session_id, key.durable_entry_id));
+            remove_file_if_exists(&self.inner.associations.join(format!("{file_key}.json")))?;
+        }
+        sync_directory(&self.inner.associations)?;
+
+        for key in removed_keys {
+            index.associations.remove(&key);
+        }
+        for handle in orphaned_handles {
+            if let Some(metadata) = index.metadata.remove(&handle) {
+                index.stored_bytes = index.stored_bytes.saturating_sub(metadata.byte_len);
+            }
+        }
+        Ok(())
     }
 
     fn read_metadata_content(
@@ -602,16 +760,16 @@ fn ensure_private_directory(path: &Path) -> Result<(), AttachmentError> {
     Ok(())
 }
 
-fn cleanup_temporary_files(directory: &Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn cleanup_temporary_files(directory: &Path) -> Result<(), AttachmentError> {
+    let entries = std::fs::read_dir(directory).map_err(|_| AttachmentError::Storage)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| AttachmentError::Storage)?;
         let name = entry.file_name();
         if name.to_string_lossy().starts_with(".tmp-") {
-            let _ = std::fs::remove_file(entry.path());
+            remove_file_if_exists(&entry.path())?;
         }
     }
+    sync_directory(directory)
 }
 
 fn load_metadata(
@@ -694,38 +852,49 @@ fn load_associations(
     Ok(())
 }
 
-fn cleanup_unindexed_metadata(metadata_dir: &Path, blobs_dir: &Path, index: &StoreIndex) {
+fn cleanup_unindexed_metadata(
+    metadata_dir: &Path,
+    blobs_dir: &Path,
+    index: &StoreIndex,
+) -> Result<(), AttachmentError> {
     cleanup_handle_files(metadata_dir, ".json", |handle| {
         index.metadata.contains_key(handle)
-    });
+    })?;
     cleanup_handle_files(blobs_dir, ".blob", |handle| {
         index.metadata.contains_key(handle)
-    });
+    })
 }
 
-fn cleanup_handle_files(directory: &Path, suffix: &str, keep: impl Fn(&str) -> bool) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn cleanup_handle_files(
+    directory: &Path,
+    suffix: &str,
+    keep: impl Fn(&str) -> bool,
+) -> Result<(), AttachmentError> {
+    let entries = std::fs::read_dir(directory).map_err(|_| AttachmentError::Storage)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| AttachmentError::Storage)?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let Some(handle) = name.strip_suffix(suffix) else {
             continue;
         };
         if valid_handle(handle) && !keep(handle) {
-            let _ = std::fs::remove_file(entry.path());
+            remove_file_if_exists(&entry.path())?;
         }
     }
+    sync_directory(directory)
 }
 
-fn cleanup_unindexed_associations(directory: &Path, index: &StoreIndex) {
+fn cleanup_unindexed_associations(
+    directory: &Path,
+    index: &StoreIndex,
+) -> Result<(), AttachmentError> {
     let expected = index
         .associations
         .keys()
         .map(|key| sha256_hex(format!("{}\0{}", key.session_id, key.durable_entry_id).as_bytes()))
         .collect::<BTreeSet<_>>();
-    cleanup_handle_files(directory, ".json", |handle| expected.contains(handle));
+    cleanup_handle_files(directory, ".json", |handle| expected.contains(handle))
 }
 
 fn valid_stored_metadata(metadata: &StoredMetadata, expected_handle: &str) -> bool {
@@ -741,6 +910,14 @@ fn valid_stored_metadata(metadata: &StoredMetadata, expected_handle: &str) -> bo
             .sha256
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), AttachmentError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(AttachmentError::Storage),
+    }
 }
 
 fn atomic_write(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<(), AttachmentError> {
@@ -764,7 +941,7 @@ fn atomic_write(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<()
         let _ = std::fs::remove_file(&temp_path);
         return Err(AttachmentError::Storage);
     }
-    sync_directory(directory);
+    sync_directory(directory)?;
     Ok(())
 }
 
@@ -798,10 +975,9 @@ fn read_regular_file(path: &Path, expected_or_max_bytes: u64) -> Result<Vec<u8>,
     Ok(bytes)
 }
 
-fn sync_directory(path: &Path) {
-    if let Ok(directory) = File::open(path) {
-        let _ = directory.sync_all();
-    }
+fn sync_directory(path: &Path) -> Result<(), AttachmentError> {
+    let directory = File::open(path).map_err(|_| AttachmentError::Storage)?;
+    directory.sync_all().map_err(|_| AttachmentError::Storage)
 }
 
 fn random_hex(byte_len: usize) -> Result<String, AttachmentError> {
@@ -994,6 +1170,174 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_fingerprints_recover_to_distinct_uploaded_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new("session-duplicate-recovery").unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let first = store.ingest("first.png", "image/png", png()).unwrap();
+        let second = store.ingest("second.png", "image/png", png()).unwrap();
+        let fingerprint = AttachmentFingerprint {
+            media_type: "image/png".to_owned(),
+            byte_len: png().len() as u64,
+            sha256: sha256_hex(png()),
+        };
+
+        let recovered = store
+            .recover_association(
+                &session_id,
+                "entry-with-duplicates",
+                &[fingerprint.clone(), fingerprint],
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(recovered.len(), 2);
+        assert_ne!(recovered[0].handle, recovered[1].handle);
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|reference| reference.handle.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first.handle.as_str(), second.handle.as_str()])
+        );
+        assert_eq!(
+            store
+                .refs_for_entry(&session_id, "entry-with-duplicates")
+                .unwrap(),
+            Some(recovered)
+        );
+    }
+
+    #[test]
+    fn deleting_a_session_reclaims_only_its_unshared_attachments() {
+        let directory = tempfile::tempdir().unwrap();
+        let deleted_session = SessionId::new("session-deleted").unwrap();
+        let retained_session = SessionId::new("session-retained").unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let unique = store.ingest("unique.png", "image/png", png()).unwrap();
+        let shared = store.ingest("shared.png", "image/png", png()).unwrap();
+        store
+            .associate(
+                &deleted_session,
+                "deleted-entry",
+                &[unique.clone(), shared.clone()],
+            )
+            .unwrap();
+        store
+            .associate(
+                &retained_session,
+                "retained-entry",
+                std::slice::from_ref(&shared),
+            )
+            .unwrap();
+
+        store.delete_session(&deleted_session).unwrap();
+        store.delete_session(&deleted_session).unwrap();
+
+        assert_eq!(
+            store
+                .refs_for_entry(&deleted_session, "deleted-entry")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.content(&unique.handle).unwrap_err(),
+            AttachmentError::NotFound
+        );
+        assert_eq!(
+            store
+                .refs_for_entry(&retained_session, "retained-entry")
+                .unwrap(),
+            Some(vec![shared.clone()])
+        );
+        assert_eq!(store.content(&shared.handle).unwrap().reference, shared);
+
+        drop(store);
+        let reopened = AttachmentStore::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened
+                .refs_for_entry(&retained_session, "retained-entry")
+                .unwrap(),
+            Some(vec![shared])
+        );
+    }
+
+    #[test]
+    fn concurrent_association_and_deletion_never_publish_dangling_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+
+        for iteration in 0..32 {
+            let deleted_session = SessionId::new(format!("session-deleted-{iteration}")).unwrap();
+            let retained_session = SessionId::new(format!("session-retained-{iteration}")).unwrap();
+            let reference = store
+                .ingest(&format!("shared-{iteration}.png"), "image/png", png())
+                .unwrap();
+            store
+                .associate(
+                    &deleted_session,
+                    "deleted-entry",
+                    std::slice::from_ref(&reference),
+                )
+                .unwrap();
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let associating = {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                let retained_session = retained_session.clone();
+                let reference = reference.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.associate(&retained_session, "retained-entry", &[reference])
+                })
+            };
+            let deleting = {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                let deleted_session = deleted_session.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.delete_session(&deleted_session)
+                })
+            };
+
+            let associated = associating.join().unwrap();
+            deleting.join().unwrap().unwrap();
+            match associated {
+                Ok(()) => {
+                    assert_eq!(
+                        store
+                            .refs_for_entry(&retained_session, "retained-entry")
+                            .unwrap(),
+                        Some(vec![reference.clone()])
+                    );
+                    assert_eq!(
+                        store.content(&reference.handle).unwrap().reference,
+                        reference
+                    );
+                }
+                Err(AttachmentError::NotFound) => {
+                    assert_eq!(
+                        store
+                            .refs_for_entry(&retained_session, "retained-entry")
+                            .unwrap(),
+                        None
+                    );
+                    assert_eq!(
+                        store.content(&reference.handle),
+                        Err(AttachmentError::NotFound)
+                    );
+                }
+                Err(error) => panic!("unexpected association result: {error}"),
+            }
+        }
+
+        drop(store);
+        AttachmentStore::open(directory.path()).unwrap();
+    }
+
+    #[test]
     fn startup_removes_only_unusable_orphan_store_files() {
         let directory = tempfile::tempdir().unwrap();
         let store = AttachmentStore::open(directory.path()).unwrap();
@@ -1016,6 +1360,92 @@ mod tests {
         assert!(!orphan_blob.exists());
         assert!(!orphan_metadata.exists());
         assert!(!orphan_association.exists());
+    }
+
+    fn fake_metadata(handle: String) -> StoredMetadata {
+        StoredMetadata {
+            version: METADATA_VERSION,
+            handle,
+            display_name: "existing.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            byte_len: 1,
+            sha256: "0".repeat(64),
+            created_at_ms: 0,
+        }
+    }
+
+    fn concurrent_ingests(
+        store: &AttachmentStore,
+        workers: usize,
+    ) -> Vec<Result<AttachmentRef, AttachmentError>> {
+        let barrier = Arc::new(std::sync::Barrier::new(workers));
+        (0..workers)
+            .map(|worker| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.ingest(&format!("image-{worker}.png"), "image/png", png())
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn in_flight_count_reservations_close_the_concurrent_quota_race() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        {
+            let mut index = store.inner.index.lock().unwrap();
+            for slot in 0..MAX_STORED_ATTACHMENTS - 1 {
+                let handle = format!("slot-{slot}");
+                index.metadata.insert(handle.clone(), fake_metadata(handle));
+            }
+        }
+
+        let results = concurrent_ingests(&store, 24);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AttachmentError::QuotaExceeded)))
+                .count(),
+            23
+        );
+        let index = store.inner.index.lock().unwrap();
+        assert_eq!(index.metadata.len(), MAX_STORED_ATTACHMENTS);
+        assert_eq!(index.in_flight_count, 0);
+        assert_eq!(index.in_flight_bytes, 0);
+        assert_eq!(
+            AttachmentError::QuotaExceeded.to_string(),
+            "attachment storage quota reached"
+        );
+    }
+
+    #[test]
+    fn in_flight_byte_reservations_close_the_concurrent_quota_race() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let attachment_bytes = png().len() as u64;
+        store.inner.index.lock().unwrap().stored_bytes =
+            MAX_STORED_ATTACHMENT_BYTES - attachment_bytes;
+
+        let results = concurrent_ingests(&store, 24);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(AttachmentError::QuotaExceeded)))
+                .count(),
+            23
+        );
+        let index = store.inner.index.lock().unwrap();
+        assert_eq!(index.stored_bytes, MAX_STORED_ATTACHMENT_BYTES);
+        assert_eq!(index.in_flight_count, 0);
+        assert_eq!(index.in_flight_bytes, 0);
     }
 
     #[cfg(unix)]

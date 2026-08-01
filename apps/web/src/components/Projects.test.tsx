@@ -128,6 +128,39 @@ describe("projects", () => {
     expect(setTrust).toHaveBeenCalledWith("prj_safe", true);
   });
 
+  it("offers an explicit launch-folder recovery for stale roots", async () => {
+    const user = userEvent.setup();
+    const setTrust = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ProjectsView
+        catalog={{
+          ...catalog,
+          projects: [
+            {
+              ...catalog.projects[0]!,
+              trusted: true,
+              available: false,
+            },
+          ],
+        }}
+        onboarding
+        onRename={vi.fn()}
+        onSetDefault={vi.fn()}
+        onSetTrust={setTrust}
+        onArchive={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Folder unavailable")).toBeVisible();
+    expect(
+      screen.getByText(/restore it and grant trust below/),
+    ).toBeVisible();
+    await user.click(
+      screen.getByRole("button", { name: "Restore folder and trust" }),
+    );
+    expect(setTrust).toHaveBeenCalledWith("prj_safe", true);
+  });
+
   it("guards archive and supports an inline path-free rename", async () => {
     const user = userEvent.setup();
     const rename = vi.fn().mockResolvedValue(undefined);

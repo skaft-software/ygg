@@ -170,6 +170,13 @@ function appendBranchEntries(
   };
 }
 
+function contextPercent(snapshot: SessionSnapshot["context"]): number {
+  const { contextTokens, contextLimit } = snapshot.usage;
+  return contextLimit && contextLimit > 0
+    ? Math.min(100, Math.round((contextTokens / contextLimit) * 100))
+    : 0;
+}
+
 export function reduceSessionEvent(
   snapshot: SessionSnapshot,
   event: SessionEvent,
@@ -232,6 +239,42 @@ export function reduceSessionEvent(
         ...event.patch,
         sequence: event.sequence,
       };
+
+    case "context.updated":
+      return {
+        ...snapshot,
+        sequence: event.sequence,
+        context: event.context,
+        contextTokens: event.context.usage.contextTokens,
+        contextPercent: contextPercent(event.context),
+      };
+
+    case "usage.updated": {
+      // Legacy usage events carry no category or compaction projection. Keep
+      // their token count honest by treating it as unattributed instead of
+      // retaining stale or fabricated category precision.
+      const context: SessionSnapshot["context"] = {
+        ...snapshot.context,
+        usage: event.usage,
+        status: {
+          current: {
+            categories:
+              event.usage.contextTokens === 0
+                ? []
+                : [{ category: "other", tokens: event.usage.contextTokens }],
+            totalTokens: event.usage.contextTokens,
+          },
+          updatedAtMs: event.observedAtMs,
+        },
+      };
+      return {
+        ...snapshot,
+        sequence: event.sequence,
+        context,
+        contextTokens: event.usage.contextTokens,
+        contextPercent: contextPercent(context),
+      };
+    }
 
     case "session.branchEntriesAppended":
       return {

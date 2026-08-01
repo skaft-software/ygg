@@ -1,5 +1,6 @@
 import type {
   ConnectedDevice,
+  ContextUsage,
   HostBootstrap,
   SessionSnapshot,
   ThemeOption,
@@ -8,6 +9,23 @@ import { PROTOCOL_VERSION } from "./protocol";
 
 const at = (minutes: number) =>
   new Date(Date.UTC(2026, 6, 26, 16, minutes, 0)).toISOString();
+
+const contextUsage = (tokens: number): ContextUsage => ({
+  usage: {
+    inputTokens: tokens,
+    outputTokens: 0,
+    contextTokens: tokens,
+    contextLimit: 200_000,
+  },
+  compactions: 0,
+  status: {
+    current: {
+      categories: tokens === 0 ? [] : [{ category: "other", tokens }],
+      totalTokens: tokens,
+    },
+    updatedAtMs: 0,
+  },
+});
 
 const rgb = (hex: string) => {
   const value = Number.parseInt(hex.slice(1), 16);
@@ -323,6 +341,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     modelId: "claude-sonnet-4-6",
     reasoning: "high",
     authority: "fullAccess",
+    context: contextUsage(0),
     contextTokens: 0,
     contextPercent: 0,
     startedAt: at(58),
@@ -344,6 +363,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     modelId: "gpt-5.4",
     reasoning: "high",
     authority: "workspace",
+    context: contextUsage(72_000),
     contextTokens: 72_000,
     contextPercent: 36,
     startedAt: at(42),
@@ -516,6 +536,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     modelId: "claude-sonnet-4-6",
     reasoning: "medium",
     authority: "readOnly",
+    context: contextUsage(42_000),
     contextTokens: 42_000,
     contextPercent: 21,
     startedAt: at(35),
@@ -617,6 +638,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     modelId: "qwen3.5-27b",
     reasoning: "high",
     authority: "workspace",
+    context: contextUsage(96_000),
     contextTokens: 96_000,
     contextPercent: 48,
     startedAt: at(8),
@@ -854,6 +876,7 @@ export const fixtureSessions: Record<string, SessionSnapshot> = {
     modelId: "qwen3.5-27b",
     reasoning: "medium",
     authority: "readOnly",
+    context: contextUsage(36_000),
     contextTokens: 36_000,
     contextPercent: 18,
     startedAt: at(2),
@@ -1027,6 +1050,7 @@ function createPerformanceSession(): SessionSnapshot {
     modelId: "gpt-5.4",
     reasoning: "high",
     authority: "workspace",
+    context: contextUsage(164_000),
     contextTokens: 164_000,
     contextPercent: 82,
     startedAt: new Date(Date.UTC(2026, 6, 26, 12, 0, 0)).toISOString(),
@@ -1061,6 +1085,7 @@ function createPerformanceReplaySession(): SessionSnapshot {
     modelId: "claude-sonnet-4-6",
     reasoning: "high",
     authority: "workspace",
+    context: contextUsage(94_000),
     contextTokens: 94_000,
     contextPercent: 47,
     startedAt,

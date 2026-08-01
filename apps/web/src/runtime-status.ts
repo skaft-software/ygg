@@ -130,6 +130,8 @@ export type ContextCategory =
   | "conversation"
   | "toolResults"
   | "attachments"
+  | "documents"
+  | "projectFiles"
   | "compactionSummaries"
   | "other";
 
@@ -143,17 +145,22 @@ export interface ContextTotals {
   totalTokens: number;
 }
 
+export type ContextCompactionReason = "threshold" | "overflow";
+
 export interface ActiveCompaction {
   id: string;
+  reason: ContextCompactionReason;
   before: ContextTotals;
   startedAtMs: number;
 }
 
 export interface CompletedCompaction {
   id: string;
+  reason: ContextCompactionReason;
   before: ContextTotals;
   after: ContextTotals;
   reclaimedTokens: number;
+  succeeded: boolean;
   startedAtMs: number;
   finishedAtMs: number;
 }
@@ -830,6 +837,8 @@ function contextTotals(value: unknown, path: string): ContextTotals {
           "conversation",
           "toolResults",
           "attachments",
+          "documents",
+          "projectFiles",
           "compactionSummaries",
           "other",
         ]),
@@ -871,9 +880,10 @@ function sameTotals(left: ContextTotals, right: ContextTotals): boolean {
 }
 
 function activeCompaction(value: unknown, path: string): ActiveCompaction {
-  const wire = objectValue(value, path, ["id", "before", "startedAtMs"]);
+  const wire = objectValue(value, path, ["id", "reason", "before", "startedAtMs"]);
   return {
     id: runtimeId(wire.id, `${path}.id`),
+    reason: enumValue(wire.reason, `${path}.reason`, ["threshold", "overflow"]),
     before: contextTotals(wire.before, `${path}.before`),
     startedAtMs: unsignedInteger(wire.startedAtMs, `${path}.startedAtMs`),
   };
@@ -882,27 +892,34 @@ function activeCompaction(value: unknown, path: string): ActiveCompaction {
 function completedCompaction(value: unknown, path: string): CompletedCompaction {
   const wire = objectValue(value, path, [
     "id",
+    "reason",
     "before",
     "after",
     "reclaimedTokens",
+    "succeeded",
     "startedAtMs",
     "finishedAtMs",
   ]);
   const completed: CompletedCompaction = {
     id: runtimeId(wire.id, `${path}.id`),
+    reason: enumValue(wire.reason, `${path}.reason`, ["threshold", "overflow"]),
     before: contextTotals(wire.before, `${path}.before`),
     after: contextTotals(wire.after, `${path}.after`),
     reclaimedTokens: unsignedInteger(
       wire.reclaimedTokens,
       `${path}.reclaimedTokens`,
     ),
+    succeeded: booleanValue(wire.succeeded, `${path}.succeeded`),
     startedAtMs: unsignedInteger(wire.startedAtMs, `${path}.startedAtMs`),
     finishedAtMs: unsignedInteger(wire.finishedAtMs, `${path}.finishedAtMs`),
   };
   if (
     completed.finishedAtMs < completed.startedAtMs ||
     completed.before.totalTokens - completed.after.totalTokens !==
-      completed.reclaimedTokens
+      completed.reclaimedTokens ||
+    (!completed.succeeded &&
+      (!sameTotals(completed.before, completed.after) ||
+        completed.reclaimedTokens !== 0))
   ) {
     invalid(path, "contains contradictory completed-compaction facts");
   }
@@ -942,8 +959,9 @@ function contextStatus(value: unknown, path: string): ContextStatus {
   if (
     status.lastCompaction &&
     !status.activeCompaction &&
-    (!sameTotals(status.current, status.lastCompaction.after) ||
-      status.updatedAtMs < status.lastCompaction.finishedAtMs)
+    (status.updatedAtMs < status.lastCompaction.finishedAtMs ||
+      (status.updatedAtMs === status.lastCompaction.finishedAtMs &&
+        !sameTotals(status.current, status.lastCompaction.after)))
   ) {
     invalid(path, "contains contradictory completed-compaction state");
   }

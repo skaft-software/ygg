@@ -114,6 +114,9 @@ impl WebBundle {
         )
     }
 
+    // The fixed arguments mirror the seven audited bundle payloads plus their
+    // two integrity manifests; grouping them would only hide that correspondence.
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         index_html: Bytes,
         app_css: Bytes,

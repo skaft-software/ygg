@@ -2179,12 +2179,12 @@ fn goal_error_response(error: GoalStoreError) -> Response {
                 "The requested goal was not be found.",
             ),
         ),
-        GoalStoreError::CorruptState
-        | GoalStoreError::UnsafePath
-        | GoalStoreError::Storage(_) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            SanitizedError::internal(),
-        ),
+        GoalStoreError::CorruptState | GoalStoreError::UnsafePath | GoalStoreError::Storage(_) => {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                SanitizedError::internal(),
+            )
+        }
     }
 }
 
@@ -3222,7 +3222,10 @@ mod tests {
     #[tokio::test]
     async fn terminal_socket_authenticates_replays_and_stops_with_the_server() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(
+            host.clone(),
+            SupervisorConfig::default(),
+        ));
         let workspace = tempfile::tempdir().unwrap();
         let server = LoopbackServer::start(
             supervisor,
@@ -3319,7 +3322,7 @@ mod tests {
                 serde_json::json!({
                     "type": "input",
                     "id": id.clone(),
-                    "data": "printf 'terminal websocket works\\n'\\n",
+                    "data": "printf 'terminal websocket works\\n'\n",
                 })
                 .to_string()
                 .into(),
@@ -3486,7 +3489,10 @@ mod tests {
     #[tokio::test]
     async fn usage_transport_is_authenticated_and_validates_periods() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(
+            host.clone(),
+            SupervisorConfig::default(),
+        ));
         let server = LoopbackServer::start(
             supervisor,
             LoopbackConfig {
@@ -3717,7 +3723,10 @@ mod tests {
     #[tokio::test]
     async fn project_file_transport_honors_host_capabilities() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(
+            host.clone(),
+            SupervisorConfig::default(),
+        ));
         let server = LoopbackServer::start(
             supervisor,
             LoopbackConfig {
@@ -3810,11 +3819,7 @@ mod tests {
             .split(';')
             .next()
             .unwrap();
-        let restored = request(
-            address,
-            authenticated_get_request(address, &path, cookie),
-        )
-        .await;
+        let restored = request(address, authenticated_get_request(address, &path, cookie)).await;
         assert!(restored.starts_with("HTTP/1.1 200"));
         assert_eq!(response_json(&restored)["objective"], "Ship the README");
 
@@ -3839,11 +3844,7 @@ mod tests {
         .await;
         assert!(cleared.starts_with("HTTP/1.1 200"));
         assert_eq!(response_json(&cleared), serde_json::Value::Null);
-        let after_clear = request(
-            address,
-            authenticated_get_request(address, &path, cookie),
-        )
-        .await;
+        let after_clear = request(address, authenticated_get_request(address, &path, cookie)).await;
         assert!(after_clear.starts_with("HTTP/1.1 200"));
         assert_eq!(response_json(&after_clear), serde_json::Value::Null);
         server.shutdown().await.unwrap();
@@ -3852,7 +3853,10 @@ mod tests {
     #[tokio::test]
     async fn loopback_transport_rejects_cross_origin_and_oversized_requests() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(
+            host.clone(),
+            SupervisorConfig::default(),
+        ));
         let server = LoopbackServer::start(
             supervisor,
             LoopbackConfig {
@@ -3988,7 +3992,10 @@ mod tests {
     #[tokio::test]
     async fn attachment_transport_is_authenticated_bounded_and_path_free() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(
+            host.clone(),
+            SupervisorConfig::default(),
+        ));
         let server = LoopbackServer::start(
             supervisor,
             LoopbackConfig {
@@ -4265,7 +4272,10 @@ mod tests {
     #[tokio::test]
     async fn opaque_resource_transport_requires_auth_and_never_interprets_handles() {
         let host = Arc::new(MockHost::new());
-        let supervisor = Arc::new(SessionSupervisor::new(host.clone(), SupervisorConfig::default()));
+        let supervisor = Arc::new(SessionSupervisor::new(
+            host.clone(),
+            SupervisorConfig::default(),
+        ));
         let server = LoopbackServer::start(
             supervisor,
             LoopbackConfig {

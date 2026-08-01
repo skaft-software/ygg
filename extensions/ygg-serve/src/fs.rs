@@ -7,9 +7,16 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
@@ -50,6 +57,49 @@ pub const MAX_PROJECT_FILE_SEARCH_DEPTH: usize = 32;
 pub const MAX_PROJECT_FILE_SEARCH_ENTRIES_PER_DIRECTORY: usize = 1_000;
 /// Maximum physical directory entries inspected by one full-text search.
 pub const MAX_PROJECT_FILE_SEARCH_DIRECTORY_ENTRIES: usize = 20_000;
+
+const TEMP_FILE_PREFIX: &str = ".ygg-write.tmp-";
+static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static TEST_ATOMIC_WRITE_TARGET: Mutex<Option<String>> = Mutex::new(None);
+#[cfg(test)]
+static TEST_ATOMIC_WRITE_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static TEST_ATOMIC_WRITE_FAIL_AFTER_SYNC: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn configure_atomic_write_test(
+    target_name: Option<&str>,
+    pause_ms: u64,
+    fail_after_sync: bool,
+) {
+    *TEST_ATOMIC_WRITE_TARGET
+        .lock()
+        .expect("atomic write test target lock") = target_name.map(str::to_owned);
+    TEST_ATOMIC_WRITE_PAUSE_MS.store(pause_ms, Ordering::SeqCst);
+    TEST_ATOMIC_WRITE_FAIL_AFTER_SYNC.store(fail_after_sync, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn atomic_write_test_checkpoint(opened: &OpenedFile) -> Result<(), ProjectFileSystemError> {
+    if TEST_ATOMIC_WRITE_TARGET
+        .lock()
+        .expect("atomic write test target lock")
+        .as_deref()
+        != Some(opened.name.as_str())
+    {
+        return Ok(());
+    }
+    let pause_ms = TEST_ATOMIC_WRITE_PAUSE_MS.load(Ordering::SeqCst);
+    if pause_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+    }
+    if TEST_ATOMIC_WRITE_FAIL_AFTER_SYNC.swap(false, Ordering::SeqCst) {
+        return Err(ProjectFileSystemError::Storage);
+    }
+    Ok(())
+}
 
 /// Kind of one immediate project directory entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,10 +266,26 @@ struct FileIdentity {
     modified_nanoseconds: i64,
 }
 
-struct OpenedFile {
+struct OpenedRoot {
     path: PathBuf,
+    directory: OpenedDirectory,
+}
+
+struct OpenedDirectory {
+    #[cfg(unix)]
+    file: File,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+struct OpenedFile {
+    parent: OpenedDirectory,
+    parent_relative: PathBuf,
+    parent_node: FileIdentity,
+    name: String,
     file: File,
     identity: FileIdentity,
+    permissions: std::fs::Permissions,
 }
 
 /// Stateless filesystem operations for a registry-managed trusted project.
@@ -235,7 +301,7 @@ impl ProjectFileSystem {
     ) -> Result<ProjectFileTree, ProjectFileSystemError> {
         let relative = parse_relative_path(path, true)?;
         let root = trusted_root(registry, project_id)?;
-        let git_status = refresh_git_file_status(&root, DEFAULT_GIT_TIMEOUT);
+        let git_status = refresh_git_file_status(&root.path, DEFAULT_GIT_TIMEOUT);
         let directory = match resolve_directory(&root, &relative.path) {
             Ok(directory) => Some(directory),
             Err(ProjectFileSystemError::NotFound)
@@ -248,34 +314,13 @@ impl ProjectFileSystem {
         let mut public_entries = Vec::new();
         let mut present_names = BTreeSet::new();
         let mut truncated = false;
-        let mut scanned_entries = 0usize;
 
         if let Some(directory) = directory {
-            let entries = std::fs::read_dir(&directory).map_err(map_read_error)?;
-            for entry in entries {
-                if scanned_entries >= MAX_PROJECT_FILE_TREE_SCANNED_ENTRIES {
-                    truncated = true;
-                    break;
-                }
-                scanned_entries = scanned_entries.saturating_add(1);
-                let entry = entry.map_err(|_| ProjectFileSystemError::Storage)?;
-                let name = match entry.file_name().into_string() {
-                    Ok(name) if safe_path_component(&name) => name,
-                    _ => continue,
-                };
+            let (names, directory_truncated) = tree_directory_names(&directory)?;
+            truncated |= directory_truncated;
+            for name in names {
                 present_names.insert(name.clone());
-                let metadata = entry
-                    .path()
-                    .symlink_metadata()
-                    .map_err(|_| ProjectFileSystemError::Storage)?;
-                if metadata.file_type().is_symlink() {
-                    continue;
-                }
-                let kind = if metadata.file_type().is_dir() {
-                    ProjectFileEntryKind::Directory
-                } else if metadata.file_type().is_file() && hard_link_count(&metadata) <= 1 {
-                    ProjectFileEntryKind::File
-                } else {
+                let Some((kind, metadata)) = open_entry_metadata(&directory, &name)? else {
                     continue;
                 };
                 if public_entries.len() >= MAX_PROJECT_FILE_TREE_ENTRIES {
@@ -332,7 +377,7 @@ impl ProjectFileSystem {
         validate_line_range(start_line, end_line)?;
         let relative = parse_relative_path(path, false)?;
         let root = trusted_root(registry, project_id)?;
-        let mut opened = open_regular_file(&root, &relative.path, false)?;
+        let mut opened = open_regular_file(&root, &relative.path)?;
         let metadata = opened
             .file
             .metadata()
@@ -352,7 +397,7 @@ impl ProjectFileSystem {
             .file
             .metadata()
             .map_err(|_| ProjectFileSystemError::Storage)?;
-        if capture_identity(&after) != opened.identity {
+        if capture_identity(&after) != opened.identity || !opened_path_unchanged(&opened)? {
             return Err(ProjectFileSystemError::Conflict);
         }
 
@@ -396,31 +441,20 @@ impl ProjectFileSystem {
             let (entries, directory_truncated) =
                 bounded_directory_entries(&directory, &mut scanned_directory_entries)?;
             truncated |= directory_truncated;
-            for entry in entries {
-                let name = match entry.file_name().into_string() {
-                    Ok(name) if safe_path_component(&name) => name,
-                    _ => continue,
-                };
+            for name in entries {
                 let relative_path = relative_directory.join(&name);
                 let Some(display_path) = display_relative_path(&relative_path) else {
                     continue;
                 };
-                let metadata = entry
-                    .path()
-                    .symlink_metadata()
-                    .map_err(|_| ProjectFileSystemError::Storage)?;
-                if metadata.file_type().is_symlink() {
+                let Some((kind, metadata)) = open_entry_metadata(&directory, &name)? else {
                     continue;
-                }
-                if metadata.file_type().is_dir() {
+                };
+                if matches!(kind, ProjectFileEntryKind::Directory) {
                     if depth >= MAX_PROJECT_FILE_SEARCH_DEPTH {
                         truncated = true;
                     } else {
                         stack.push((relative_path, depth.saturating_add(1)));
                     }
-                    continue;
-                }
-                if !metadata.file_type().is_file() || hard_link_count(&metadata) > 1 {
                     continue;
                 }
                 if scanned_files >= MAX_PROJECT_FILE_SEARCH_FILES {
@@ -511,36 +545,14 @@ impl ProjectFileSystem {
         }
         let relative = parse_relative_path(path, false)?;
         let root = trusted_root(registry, project_id)?;
-        let mut opened = open_regular_file(&root, &relative.path, true)?;
+        let mut opened = open_regular_file(&root, &relative.path)?;
         let current = read_opened_complete_text(&mut opened)?;
         let current_sha256 = sha256_hex(current.as_bytes());
         if !force && current_sha256 != expected_sha256 {
             return Err(ProjectFileSystemError::Conflict);
         }
 
-        opened
-            .file
-            .seek(SeekFrom::Start(0))
-            .and_then(|_| opened.file.set_len(0))
-            .and_then(|_| opened.file.write_all(content.as_bytes()))
-            .and_then(|_| opened.file.sync_data())
-            .map_err(|_| ProjectFileSystemError::Storage)?;
-        let written = opened
-            .file
-            .metadata()
-            .map_err(|_| ProjectFileSystemError::Storage)?;
-        if !written.file_type().is_file() || hard_link_count(&written) > 1 {
-            return Err(ProjectFileSystemError::Conflict);
-        }
-        let path_metadata = opened
-            .path
-            .symlink_metadata()
-            .map_err(|_| ProjectFileSystemError::Conflict)?;
-        if path_metadata.file_type().is_symlink()
-            || !same_file_node(capture_identity(&path_metadata), capture_identity(&written))
-        {
-            return Err(ProjectFileSystemError::Conflict);
-        }
+        let written = atomic_replace_file(&root, &opened, content.as_bytes())?;
         Ok(ProjectFileWrite {
             path: relative.display,
             sha256: sha256_hex(content.as_bytes()),
@@ -666,25 +678,48 @@ fn append_virtual_git_entries(
 fn trusted_root(
     registry: &ProjectRegistry,
     project_id: &RegistryProjectId,
-) -> Result<PathBuf, ProjectFileSystemError> {
-    let root = registry
+) -> Result<OpenedRoot, ProjectFileSystemError> {
+    let capability = registry
         .resolve_trusted_root(project_id)
-        .map_err(map_registry_error)?
-        .as_path()
-        .to_owned();
-    let metadata = root
-        .symlink_metadata()
+        .map_err(map_registry_error)?;
+    let path = capability.as_path().to_owned();
+
+    #[cfg(unix)]
+    let directory = {
+        let descriptor = rustix::fs::open(
+            capability.as_path(),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
         .map_err(|_| ProjectFileSystemError::RootChanged)?;
-    if !metadata.file_type().is_dir()
-        || metadata.file_type().is_symlink()
-        || root
-            .canonicalize()
-            .map_err(|_| ProjectFileSystemError::RootChanged)?
-            != root
-    {
-        return Err(ProjectFileSystemError::RootChanged);
-    }
-    Ok(root)
+        let file = File::from(descriptor);
+        let metadata = file
+            .metadata()
+            .map_err(|_| ProjectFileSystemError::RootChanged)?;
+        if !metadata.is_dir() || !capability.matches_metadata(&metadata) {
+            return Err(ProjectFileSystemError::RootChanged);
+        }
+        OpenedDirectory { file }
+    };
+
+    #[cfg(not(unix))]
+    let directory = {
+        let metadata = path
+            .symlink_metadata()
+            .map_err(|_| ProjectFileSystemError::RootChanged)?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || !capability.matches_metadata(&metadata)
+        {
+            return Err(ProjectFileSystemError::RootChanged);
+        }
+        OpenedDirectory { path: path.clone() }
+    };
+
+    Ok(OpenedRoot { path, directory })
 }
 
 fn parse_relative_path(
@@ -731,95 +766,279 @@ fn parse_relative_path(
     })
 }
 
-fn resolve_directory(root: &Path, relative: &Path) -> Result<PathBuf, ProjectFileSystemError> {
-    let mut current = root.to_owned();
-    for component in relative.components() {
-        let Component::Normal(component) = component else {
-            return Err(ProjectFileSystemError::InvalidPath);
-        };
-        current.push(component);
-        let metadata = current.symlink_metadata().map_err(map_read_error)?;
-        if metadata.file_type().is_symlink() {
-            return Err(ProjectFileSystemError::InvalidPath);
-        }
-        if !metadata.file_type().is_dir() {
-            return Err(ProjectFileSystemError::NotDirectory);
-        }
-    }
-    let canonical = current.canonicalize().map_err(map_read_error)?;
-    if canonical != current || !canonical.starts_with(root) {
-        return Err(ProjectFileSystemError::InvalidPath);
-    }
-    Ok(current)
-}
-
-fn open_regular_file(
-    root: &Path,
+fn resolve_directory(
+    root: &OpenedRoot,
     relative: &Path,
-    write: bool,
-) -> Result<OpenedFile, ProjectFileSystemError> {
-    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
-    let directory = resolve_directory(root, parent)?;
-    let file_name = relative
-        .file_name()
-        .ok_or(ProjectFileSystemError::InvalidPath)?;
-    let path = directory.join(file_name);
-    let metadata = path.symlink_metadata().map_err(map_read_error)?;
-    if metadata.file_type().is_symlink() {
-        return Err(ProjectFileSystemError::InvalidPath);
-    }
-    if !metadata.file_type().is_file() || hard_link_count(&metadata) > 1 {
-        return Err(ProjectFileSystemError::NotFile);
-    }
-    let mut options = OpenOptions::new();
-    options.read(true).write(write);
+) -> Result<OpenedDirectory, ProjectFileSystemError> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
+        let mut current = OpenedDirectory {
+            file: root
+                .directory
+                .file
+                .try_clone()
+                .map_err(|_| ProjectFileSystemError::Storage)?,
+        };
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                return Err(ProjectFileSystemError::InvalidPath);
+            };
+            let descriptor = rustix::fs::openat(
+                &current.file,
+                component,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(map_directory_open_error)?;
+            current = OpenedDirectory {
+                file: File::from(descriptor),
+            };
+        }
+        Ok(current)
     }
-    let file = options.open(&path).map_err(map_read_error)?;
-    let opened = file
-        .metadata()
-        .map_err(|_| ProjectFileSystemError::Storage)?;
-    if !opened.file_type().is_file()
-        || hard_link_count(&opened) > 1
-        || !same_file_node(capture_identity(&metadata), capture_identity(&opened))
+
+    #[cfg(not(unix))]
     {
-        return Err(ProjectFileSystemError::Conflict);
+        let mut current = root.path.clone();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                return Err(ProjectFileSystemError::InvalidPath);
+            };
+            current.push(component);
+            let metadata = current.symlink_metadata().map_err(map_read_error)?;
+            if metadata.file_type().is_symlink() {
+                return Err(ProjectFileSystemError::InvalidPath);
+            }
+            if !metadata.file_type().is_dir() {
+                return Err(ProjectFileSystemError::NotDirectory);
+            }
+        }
+        Ok(OpenedDirectory { path: current })
     }
-    Ok(OpenedFile {
-        path,
-        file,
-        identity: capture_identity(&opened),
-    })
+}
+
+fn tree_directory_names(
+    directory: &OpenedDirectory,
+) -> Result<(Vec<String>, bool), ProjectFileSystemError> {
+    let mut names = Vec::new();
+    let mut inspected = 0usize;
+    let mut truncated = false;
+
+    #[cfg(unix)]
+    let entries = rustix::fs::Dir::read_from(&directory.file)
+        .map_err(map_rustix_read_error)?
+        .map(|entry| {
+            entry
+                .map_err(map_rustix_read_error)
+                .map(|entry| entry.file_name().to_bytes().to_vec())
+        });
+    #[cfg(not(unix))]
+    let entries = std::fs::read_dir(&directory.path)
+        .map_err(map_read_error)?
+        .map(|entry| {
+            entry
+                .map_err(|_| ProjectFileSystemError::Storage)
+                .map(|entry| entry.file_name().to_string_lossy().as_bytes().to_vec())
+        });
+
+    for entry in entries {
+        let bytes = entry?;
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        if inspected >= MAX_PROJECT_FILE_TREE_SCANNED_ENTRIES {
+            truncated = true;
+            break;
+        }
+        inspected = inspected.saturating_add(1);
+        let Ok(name) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if !safe_path_component(name) {
+            continue;
+        }
+        if names.len() >= MAX_PROJECT_FILE_TREE_ENTRIES {
+            truncated = true;
+            continue;
+        }
+        names.push(name.to_owned());
+    }
+    names.sort();
+    Ok((names, truncated))
 }
 
 fn bounded_directory_entries(
-    directory: &Path,
+    directory: &OpenedDirectory,
     scanned_entries: &mut usize,
-) -> Result<(Vec<std::fs::DirEntry>, bool), ProjectFileSystemError> {
-    let mut entries = Vec::new();
+) -> Result<(Vec<String>, bool), ProjectFileSystemError> {
+    let mut names = Vec::new();
     let mut truncated = false;
-    for entry in std::fs::read_dir(directory).map_err(map_read_error)? {
+
+    #[cfg(unix)]
+    let entries = rustix::fs::Dir::read_from(&directory.file)
+        .map_err(map_rustix_read_error)?
+        .map(|entry| {
+            entry
+                .map_err(map_rustix_read_error)
+                .map(|entry| entry.file_name().to_bytes().to_vec())
+        });
+    #[cfg(not(unix))]
+    let entries = std::fs::read_dir(&directory.path)
+        .map_err(map_read_error)?
+        .map(|entry| {
+            entry
+                .map_err(|_| ProjectFileSystemError::Storage)
+                .map(|entry| entry.file_name().to_string_lossy().as_bytes().to_vec())
+        });
+
+    for entry in entries {
+        let bytes = entry?;
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
         if *scanned_entries >= MAX_PROJECT_FILE_SEARCH_DIRECTORY_ENTRIES
-            || entries.len() >= MAX_PROJECT_FILE_SEARCH_ENTRIES_PER_DIRECTORY
+            || names.len() >= MAX_PROJECT_FILE_SEARCH_ENTRIES_PER_DIRECTORY
         {
             truncated = true;
             break;
         }
-        entries.push(entry.map_err(|_| ProjectFileSystemError::Storage)?);
         *scanned_entries = scanned_entries.saturating_add(1);
+        let Ok(name) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        if safe_path_component(name) {
+            names.push(name.to_owned());
+        }
     }
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    Ok((entries, truncated))
+    names.sort();
+    Ok((names, truncated))
+}
+
+fn open_entry_metadata(
+    directory: &OpenedDirectory,
+    name: &str,
+) -> Result<Option<(ProjectFileEntryKind, std::fs::Metadata)>, ProjectFileSystemError> {
+    #[cfg(unix)]
+    let file = match rustix::fs::openat(
+        &directory.file,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => File::from(descriptor),
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(None),
+        Err(error) => return Err(map_rustix_read_error(error)),
+    };
+
+    #[cfg(not(unix))]
+    let file = {
+        let path = directory.path.join(name);
+        let metadata = match path.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(ProjectFileSystemError::Storage),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(None);
+        }
+        match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(ProjectFileSystemError::Storage),
+        }
+    };
+
+    let metadata = file
+        .metadata()
+        .map_err(|_| ProjectFileSystemError::Storage)?;
+    let kind = if metadata.file_type().is_dir() {
+        ProjectFileEntryKind::Directory
+    } else if metadata.file_type().is_file() && hard_link_count(&metadata) <= 1 {
+        ProjectFileEntryKind::File
+    } else {
+        return Ok(None);
+    };
+    Ok(Some((kind, metadata)))
+}
+
+fn open_regular_file(
+    root: &OpenedRoot,
+    relative: &Path,
+) -> Result<OpenedFile, ProjectFileSystemError> {
+    let parent_path = relative.parent().unwrap_or_else(|| Path::new(""));
+    let parent = resolve_directory(root, parent_path)?;
+    let name = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| safe_path_component(name))
+        .ok_or(ProjectFileSystemError::InvalidPath)?
+        .to_owned();
+
+    #[cfg(unix)]
+    let file = rustix::fs::openat(
+        &parent.file,
+        &name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(map_regular_file_open_error)?;
+
+    #[cfg(not(unix))]
+    let file = {
+        let path = parent.path.join(&name);
+        let path_metadata = path.symlink_metadata().map_err(map_read_error)?;
+        if path_metadata.file_type().is_symlink() {
+            return Err(ProjectFileSystemError::InvalidPath);
+        }
+        File::open(path).map_err(map_read_error)?
+    };
+
+    let metadata = file.metadata().map_err(map_read_error)?;
+    if !metadata.file_type().is_file() || hard_link_count(&metadata) > 1 {
+        return Err(ProjectFileSystemError::NotFile);
+    }
+    let identity = capture_identity(&metadata);
+    let permissions = metadata.permissions();
+    #[cfg(unix)]
+    let parent_node = capture_identity(
+        &parent
+            .file
+            .metadata()
+            .map_err(|_| ProjectFileSystemError::Storage)?,
+    );
+    #[cfg(not(unix))]
+    let parent_node = capture_identity(
+        &parent
+            .path
+            .metadata()
+            .map_err(|_| ProjectFileSystemError::Storage)?,
+    );
+    Ok(OpenedFile {
+        parent,
+        parent_relative: parent_path.to_owned(),
+        parent_node,
+        name,
+        file,
+        identity,
+        permissions,
+    })
 }
 
 fn read_complete_text(
-    root: &Path,
+    root: &OpenedRoot,
     relative: &Path,
 ) -> Result<(String, u64), ProjectFileSystemError> {
-    let mut opened = open_regular_file(root, relative, false)?;
+    let mut opened = open_regular_file(root, relative)?;
     let text = read_opened_complete_text(&mut opened)?;
     Ok((text, opened.identity.size))
 }
@@ -845,10 +1064,226 @@ fn read_opened_complete_text(opened: &mut OpenedFile) -> Result<String, ProjectF
     if capture_identity(&after) != opened.identity
         || bytes.len() as u64 > MAX_PROJECT_FILE_READ_BYTES
         || bytes.len() as u64 != opened.identity.size
+        || !opened_path_unchanged(opened)?
     {
         return Err(ProjectFileSystemError::Conflict);
     }
     Ok(decoded_text(&bytes)?.to_owned())
+}
+
+fn opened_path_unchanged(opened: &OpenedFile) -> Result<bool, ProjectFileSystemError> {
+    #[cfg(unix)]
+    let current = match rustix::fs::openat(
+        &opened.parent.file,
+        &opened.name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => File::from(descriptor),
+        Err(rustix::io::Errno::NOENT | rustix::io::Errno::LOOP) => return Ok(false),
+        Err(error) => return Err(map_rustix_read_error(error)),
+    };
+
+    #[cfg(not(unix))]
+    let current = {
+        let path = opened.parent.path.join(&opened.name);
+        let path_metadata = match path.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(ProjectFileSystemError::Storage),
+        };
+        if path_metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(ProjectFileSystemError::Storage),
+        }
+    };
+
+    let metadata = current
+        .metadata()
+        .map_err(|_| ProjectFileSystemError::Storage)?;
+    Ok(metadata.file_type().is_file()
+        && hard_link_count(&metadata) <= 1
+        && capture_identity(&metadata) == opened.identity)
+}
+
+fn opened_parent_unchanged(
+    root: &OpenedRoot,
+    opened: &OpenedFile,
+) -> Result<bool, ProjectFileSystemError> {
+    let current = match resolve_directory(root, &opened.parent_relative) {
+        Ok(current) => current,
+        Err(
+            ProjectFileSystemError::NotFound
+            | ProjectFileSystemError::NotDirectory
+            | ProjectFileSystemError::InvalidPath,
+        ) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    let metadata = current
+        .file
+        .metadata()
+        .map_err(|_| ProjectFileSystemError::Storage)?;
+    #[cfg(not(unix))]
+    let metadata = current
+        .path
+        .metadata()
+        .map_err(|_| ProjectFileSystemError::Storage)?;
+    Ok(metadata.file_type().is_dir()
+        && same_file_node(capture_identity(&metadata), opened.parent_node))
+}
+
+fn atomic_replace_file(
+    root: &OpenedRoot,
+    opened: &OpenedFile,
+    content: &[u8],
+) -> Result<std::fs::Metadata, ProjectFileSystemError> {
+    if !opened_parent_unchanged(root, opened)? || !opened_path_unchanged(opened)? {
+        return Err(ProjectFileSystemError::Conflict);
+    }
+    #[cfg(unix)]
+    {
+        let (temp_name, mut temp_file) = create_temporary_file(&opened.parent)?;
+        let result = (|| {
+            temp_file
+                .write_all(content)
+                .and_then(|_| temp_file.set_permissions(opened.permissions.clone()))
+                .and_then(|_| temp_file.sync_all())
+                .map_err(|_| ProjectFileSystemError::Storage)?;
+            #[cfg(test)]
+            atomic_write_test_checkpoint(opened)?;
+            if !opened_parent_unchanged(root, opened)? || !opened_path_unchanged(opened)? {
+                return Err(ProjectFileSystemError::Conflict);
+            }
+            let written = temp_file
+                .metadata()
+                .map_err(|_| ProjectFileSystemError::Storage)?;
+            if !written.file_type().is_file() || hard_link_count(&written) > 1 {
+                return Err(ProjectFileSystemError::Conflict);
+            }
+            rustix::fs::renameat(
+                &opened.parent.file,
+                &temp_name,
+                &opened.parent.file,
+                &opened.name,
+            )
+            .map_err(|_| ProjectFileSystemError::Storage)?;
+            rustix::fs::fsync(&opened.parent.file).map_err(|_| ProjectFileSystemError::Storage)?;
+            if !opened_parent_unchanged(root, opened)? {
+                return Err(ProjectFileSystemError::Conflict);
+            }
+            Ok(written)
+        })();
+        if result.is_err() {
+            let _ = rustix::fs::unlinkat(
+                &opened.parent.file,
+                &temp_name,
+                rustix::fs::AtFlags::empty(),
+            );
+        }
+        result
+    }
+
+    #[cfg(not(unix))]
+    {
+        let directory = &opened.parent.path;
+        let (temp_path, mut temp_file) = create_temporary_file(directory)?;
+        let result = (|| {
+            temp_file
+                .write_all(content)
+                .and_then(|_| temp_file.set_permissions(opened.permissions.clone()))
+                .and_then(|_| temp_file.sync_all())
+                .map_err(|_| ProjectFileSystemError::Storage)?;
+            #[cfg(test)]
+            atomic_write_test_checkpoint(opened)?;
+            if !opened_parent_unchanged(root, opened)? || !opened_path_unchanged(opened)? {
+                return Err(ProjectFileSystemError::Conflict);
+            }
+            let written = temp_file
+                .metadata()
+                .map_err(|_| ProjectFileSystemError::Storage)?;
+            std::fs::rename(&temp_path, directory.join(&opened.name))
+                .map_err(|_| ProjectFileSystemError::Storage)?;
+            if !opened_parent_unchanged(root, opened)? {
+                return Err(ProjectFileSystemError::Conflict);
+            }
+            Ok(written)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        result
+    }
+}
+
+#[cfg(unix)]
+fn create_temporary_file(
+    directory: &OpenedDirectory,
+) -> Result<(String, File), ProjectFileSystemError> {
+    for _ in 0..128 {
+        let nonce = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let name = format!("{TEMP_FILE_PREFIX}{}-{nonce}", std::process::id());
+        match rustix::fs::openat(
+            &directory.file,
+            &name,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        ) {
+            Ok(descriptor) => return Ok((name, File::from(descriptor))),
+            Err(rustix::io::Errno::EXIST) => continue,
+            Err(_) => return Err(ProjectFileSystemError::Storage),
+        }
+    }
+    Err(ProjectFileSystemError::Storage)
+}
+
+#[cfg(not(unix))]
+fn create_temporary_file(directory: &Path) -> Result<(PathBuf, File), ProjectFileSystemError> {
+    for _ in 0..128 {
+        let nonce = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!("{TEMP_FILE_PREFIX}{}-{nonce}", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(ProjectFileSystemError::Storage),
+        }
+    }
+    Err(ProjectFileSystemError::Storage)
+}
+
+#[cfg(unix)]
+fn map_rustix_read_error(error: rustix::io::Errno) -> ProjectFileSystemError {
+    map_read_error(std::io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(unix)]
+fn map_directory_open_error(error: rustix::io::Errno) -> ProjectFileSystemError {
+    match error {
+        rustix::io::Errno::NOENT => ProjectFileSystemError::NotFound,
+        rustix::io::Errno::LOOP => ProjectFileSystemError::InvalidPath,
+        rustix::io::Errno::NOTDIR => ProjectFileSystemError::NotDirectory,
+        _ => ProjectFileSystemError::Storage,
+    }
+}
+
+#[cfg(unix)]
+fn map_regular_file_open_error(error: rustix::io::Errno) -> ProjectFileSystemError {
+    match error {
+        rustix::io::Errno::NOENT => ProjectFileSystemError::NotFound,
+        rustix::io::Errno::LOOP => ProjectFileSystemError::InvalidPath,
+        _ => ProjectFileSystemError::Storage,
+    }
 }
 
 fn validate_line_range(

@@ -152,6 +152,12 @@ export function ProjectsView({
           const projectPending = pending?.endsWith(`:${project.id}`) ?? false;
           const canRun =
             project.available && !project.archived && project.trusted;
+          const trustAction = !project.available
+            ? "Restore folder and trust"
+            : project.trusted
+              ? "Revoke trust"
+              : "Trust project";
+          const nextTrust = !project.available || !project.trusted;
           return (
             <article
               className="project-card"
@@ -225,9 +231,9 @@ export function ProjectsView({
 
               {!project.available ? (
                 <p className="project-warning">
-                  The registered folder identity changed or is unavailable.
-                  Trust cannot be granted until the host sees the original
-                  folder again.
+                  The registered folder identity changed or is unavailable. If
+                  this is the folder that launched the host, restore it and
+                  grant trust below.
                 </p>
               ) : null}
 
@@ -238,16 +244,16 @@ export function ProjectsView({
                     disabled={projectPending}
                     onClick={() =>
                       void act(`trust:${project.id}`, () =>
-                        onSetTrust(project.id, !project.trusted),
+                        onSetTrust(project.id, nextTrust),
                       )
                     }
                   >
-                    {project.trusted ? (
-                      <ShieldAlert aria-hidden="true" />
-                    ) : (
+                    {nextTrust ? (
                       <ShieldCheck aria-hidden="true" />
+                    ) : (
+                      <ShieldAlert aria-hidden="true" />
                     )}
-                    {project.trusted ? "Revoke trust" : "Trust project"}
+                    {trustAction}
                   </button>
                   <button
                     type="button"

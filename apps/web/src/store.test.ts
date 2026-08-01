@@ -429,6 +429,45 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("does not let an older initialization overwrite a newer one", async () => {
+    const transport = new TestTransport();
+    const firstConnect = deferred<HostBootstrap>();
+    const newerBootstrap = clone(fixtureBootstrap);
+    newerBootstrap.selectedSessionId = "session-done";
+    newerBootstrap.catalogRevision += 1;
+    let connectCall = 0;
+    transport.connect = async () => {
+      connectCall += 1;
+      return connectCall === 1
+        ? firstConnect.promise
+        : clone(newerBootstrap);
+    };
+    const loadedSessions: string[] = [];
+    transport.sessionLoader = async (sessionId) => {
+      loadedSessions.push(sessionId);
+      return clone(fixtureSessions[sessionId]);
+    };
+    const store = new YggStore(transport);
+
+    const olderInitialization = store.initialize();
+    await vi.waitFor(() => expect(connectCall).toBe(1));
+    const newerInitialization = store.initialize();
+    await newerInitialization;
+    firstConnect.resolve(clone(fixtureBootstrap));
+    await olderInitialization;
+
+    expect(store.getSnapshot()).toMatchObject({
+      ready: true,
+      connecting: false,
+      error: null,
+      selectedSessionId: "session-done",
+      bootstrap: { selectedSessionId: "session-done" },
+    });
+    expect(Object.keys(store.getSnapshot().sessions)).toEqual(["session-done"]);
+    expect(loadedSessions).toEqual(["session-done"]);
+    store.dispose();
+  });
+
   it("batches ordered events into one rendered store publication", async () => {
     const transport = new TestTransport();
     const store = new YggStore(transport);

@@ -1054,6 +1054,7 @@ impl ExecutableExtensions {
     /// failed invocation because no trusted confirmation surface is available to
     /// the caller. Commands that do not request confirmation retain ordinary
     /// output and queued-context handling.
+    #[cfg(any(feature = "serve", test))]
     pub async fn execute_command_without_confirmation(
         &mut self,
         name: &str,

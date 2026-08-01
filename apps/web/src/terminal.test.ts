@@ -60,13 +60,15 @@ describe("terminal WebSocket transport", () => {
   });
 
   it("opens, forwards terminal I/O, and detaches without replacing the shell", () => {
-    const terminal = new TerminalWebSocket("ws://terminal.test/api/v1/terminal");
+    const terminal = new TerminalWebSocket();
     const events: string[] = [];
     terminal.subscribe((event) => events.push(event.type));
 
     terminal.open({ cols: 80, rows: 24, ownerKey: "owner-initial" });
     const socket = FakeTerminalWebSocket.instances[0];
-    expect(socket?.url).toBe("ws://terminal.test/api/v1/terminal");
+    expect(socket?.url).toBe(
+      `ws://${window.location.host}/api/v1/terminal`,
+    );
     socket?.open();
     expect(socket && sent(socket)).toEqual([
       {
@@ -103,7 +105,7 @@ describe("terminal WebSocket transport", () => {
 
   it("reopens with the server-provided owner key after a connection loss", () => {
     vi.useFakeTimers();
-    const terminal = new TerminalWebSocket("ws://terminal.test/api/v1/terminal");
+    const terminal = new TerminalWebSocket();
 
     terminal.open({ cols: 80, rows: 24, ownerKey: "owner-initial" });
     const first = FakeTerminalWebSocket.instances[0];
@@ -131,9 +133,46 @@ describe("terminal WebSocket transport", () => {
     terminal.dispose();
   });
 
+  it("invalidates the prior terminal identity when explicitly reopening", () => {
+    vi.useFakeTimers();
+    const terminal = new TerminalWebSocket();
+    const events: string[] = [];
+    terminal.subscribe((event) => events.push(event.type));
+
+    terminal.open({ cols: 80, rows: 24, ownerKey: "owner-initial" });
+    const first = FakeTerminalWebSocket.instances[0];
+    first?.open();
+    first?.message({
+      type: "opened",
+      id: "terminal-old",
+      ownerKey: "owner-returned",
+    });
+
+    terminal.open({ cols: 100, rows: 30, ownerKey: "owner-returned" });
+    const second = FakeTerminalWebSocket.instances[1];
+    second?.open();
+    terminal.input("must not target the prior terminal");
+    second?.message({ type: "exit", id: "terminal-old", exitCode: 0 });
+
+    expect(second && sent(second)).toEqual([
+      {
+        type: "open",
+        cols: 100,
+        rows: 30,
+        ownerKey: "owner-returned",
+      },
+    ]);
+    expect(events).not.toContain("exit");
+
+    second?.close();
+    vi.advanceTimersByTime(250);
+    expect(FakeTerminalWebSocket.instances).toHaveLength(3);
+    terminal.dispose();
+  });
+
   it("does not reconnect after the shell exits", () => {
     vi.useFakeTimers();
-    const terminal = new TerminalWebSocket("ws://terminal.test/api/v1/terminal");
+    const terminal = new TerminalWebSocket();
 
     terminal.open({ cols: 80, rows: 24 });
     const socket = FakeTerminalWebSocket.instances[0];

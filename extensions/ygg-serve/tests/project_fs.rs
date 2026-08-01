@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[allow(dead_code)]
+#[path = "../src/process_tree.rs"]
+mod process_tree;
+
+#[allow(dead_code)]
 #[path = "../src/repository_context.rs"]
 mod repository_context;
 
@@ -436,6 +440,276 @@ fn writes_require_the_read_version_and_an_explicit_force_after_conflict() {
         fs::read_to_string(fixture.root.join("editable.txt")).unwrap(),
         "mine\n"
     );
+}
+
+const WRITE_TEMP_PREFIX: &str = ".ygg-write.tmp-";
+static ATOMIC_WRITE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct AtomicWriteTestReset;
+
+impl Drop for AtomicWriteTestReset {
+    fn drop(&mut self) {
+        project_fs::configure_atomic_write_test(None, 0, false);
+    }
+}
+
+fn configure_atomic_write_test(
+    target_name: &str,
+    pause_ms: u64,
+    fail_after_sync: bool,
+) -> AtomicWriteTestReset {
+    project_fs::configure_atomic_write_test(Some(target_name), pause_ms, fail_after_sync);
+    AtomicWriteTestReset
+}
+
+fn temporary_files(directory: &Path) -> Vec<PathBuf> {
+    fs::read_dir(directory)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(WRITE_TEMP_PREFIX)
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+fn wait_for_temporary_file(directory: &Path) -> PathBuf {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(path) = temporary_files(directory).into_iter().next() {
+            return path;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for atomic write temporary file in {}",
+            directory.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_write_preserves_existing_file_permissions() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let fixture = Fixture::new(|root| {
+        fs::write(root.join("executable.sh"), "before\n").unwrap();
+    });
+    fs::set_permissions(
+        fixture.root.join("executable.sh"),
+        fs::Permissions::from_mode(0o751),
+    )
+    .unwrap();
+    let original = ProjectFileSystem::read(
+        &fixture.registry,
+        &fixture.project_id,
+        "executable.sh",
+        None,
+        None,
+    )
+    .unwrap();
+
+    ProjectFileSystem::write(
+        &fixture.registry,
+        &fixture.project_id,
+        "executable.sh",
+        "after\n",
+        original.sha256.as_deref().unwrap(),
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::metadata(fixture.root.join("executable.sh"))
+            .unwrap()
+            .mode()
+            & 0o7777,
+        0o751
+    );
+}
+
+#[test]
+fn failed_atomic_write_keeps_the_destination_and_cleans_its_temporary_file() {
+    let _serial = ATOMIC_WRITE_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(|root| {
+        fs::write(root.join("failure-target.txt"), "before\n").unwrap();
+    });
+    let original = ProjectFileSystem::read(
+        &fixture.registry,
+        &fixture.project_id,
+        "failure-target.txt",
+        None,
+        None,
+    )
+    .unwrap();
+    let _reset = configure_atomic_write_test("failure-target.txt", 0, true);
+
+    let result = ProjectFileSystem::write(
+        &fixture.registry,
+        &fixture.project_id,
+        "failure-target.txt",
+        "after\n",
+        original.sha256.as_deref().unwrap(),
+        false,
+    );
+
+    assert_eq!(result, Err(ProjectFileSystemError::Storage));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("failure-target.txt")).unwrap(),
+        "before\n"
+    );
+    assert!(temporary_files(&fixture.root).is_empty());
+}
+
+#[test]
+fn atomic_write_does_not_publish_content_before_the_final_rename() {
+    let _serial = ATOMIC_WRITE_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(|root| {
+        fs::write(root.join("visibility-target.txt"), "before\n").unwrap();
+    });
+    let original = ProjectFileSystem::read(
+        &fixture.registry,
+        &fixture.project_id,
+        "visibility-target.txt",
+        None,
+        None,
+    )
+    .unwrap();
+    let _reset = configure_atomic_write_test("visibility-target.txt", 250, false);
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            ProjectFileSystem::write(
+                &fixture.registry,
+                &fixture.project_id,
+                "visibility-target.txt",
+                "after\n",
+                original.sha256.as_deref().unwrap(),
+                false,
+            )
+        });
+        let temporary = wait_for_temporary_file(&fixture.root);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("visibility-target.txt")).unwrap(),
+            "before\n"
+        );
+        assert_eq!(fs::read_to_string(temporary).unwrap(), "after\n");
+        writer.join().unwrap().unwrap();
+    });
+
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("visibility-target.txt")).unwrap(),
+        "after\n"
+    );
+    assert!(temporary_files(&fixture.root).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn destination_replacement_race_conflicts_without_overwriting_the_replacement() {
+    let _serial = ATOMIC_WRITE_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(|root| {
+        fs::write(root.join("destination-race.txt"), "before\n").unwrap();
+    });
+    let original = ProjectFileSystem::read(
+        &fixture.registry,
+        &fixture.project_id,
+        "destination-race.txt",
+        None,
+        None,
+    )
+    .unwrap();
+    let _reset = configure_atomic_write_test("destination-race.txt", 250, false);
+
+    let result = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            ProjectFileSystem::write(
+                &fixture.registry,
+                &fixture.project_id,
+                "destination-race.txt",
+                "writer\n",
+                original.sha256.as_deref().unwrap(),
+                false,
+            )
+        });
+        wait_for_temporary_file(&fixture.root);
+        fs::rename(
+            fixture.root.join("destination-race.txt"),
+            fixture.root.join("destination-race-original.txt"),
+        )
+        .unwrap();
+        fs::write(fixture.root.join("destination-race.txt"), "replacement\n").unwrap();
+        writer.join().unwrap()
+    });
+
+    assert_eq!(result, Err(ProjectFileSystemError::Conflict));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("destination-race.txt")).unwrap(),
+        "replacement\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("destination-race-original.txt")).unwrap(),
+        "before\n"
+    );
+    assert!(temporary_files(&fixture.root).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_symlink_swap_race_cannot_move_a_write_outside_the_project() {
+    use std::os::unix::fs::symlink;
+
+    let _serial = ATOMIC_WRITE_TEST_LOCK.lock().unwrap();
+    let fixture = Fixture::new(|root| {
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::write(root.join("nested/parent-race.txt"), "inside\n").unwrap();
+    });
+    let outside = fixture._temporary.path().join("outside");
+    let moved_parent = fixture._temporary.path().join("moved-parent");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("parent-race.txt"), "outside\n").unwrap();
+    let original = ProjectFileSystem::read(
+        &fixture.registry,
+        &fixture.project_id,
+        "nested/parent-race.txt",
+        None,
+        None,
+    )
+    .unwrap();
+    let _reset = configure_atomic_write_test("parent-race.txt", 250, false);
+
+    let result = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            ProjectFileSystem::write(
+                &fixture.registry,
+                &fixture.project_id,
+                "nested/parent-race.txt",
+                "writer\n",
+                original.sha256.as_deref().unwrap(),
+                false,
+            )
+        });
+        wait_for_temporary_file(&fixture.root.join("nested"));
+        fs::rename(fixture.root.join("nested"), &moved_parent).unwrap();
+        symlink(&outside, fixture.root.join("nested")).unwrap();
+        writer.join().unwrap()
+    });
+
+    assert_eq!(result, Err(ProjectFileSystemError::Conflict));
+    assert_eq!(
+        fs::read_to_string(moved_parent.join("parent-race.txt")).unwrap(),
+        "inside\n"
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("parent-race.txt")).unwrap(),
+        "outside\n"
+    );
+    assert!(temporary_files(&moved_parent).is_empty());
+    assert!(temporary_files(&outside).is_empty());
 }
 
 #[test]

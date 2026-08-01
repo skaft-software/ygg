@@ -21,6 +21,22 @@ const base: SessionSnapshot = {
   modelId: "model-1",
   reasoning: "medium",
   authority: "readOnly",
+  context: {
+    usage: {
+      inputTokens: 24_000,
+      outputTokens: 0,
+      contextTokens: 24_000,
+      contextLimit: 200_000,
+    },
+    compactions: 0,
+    status: {
+      current: {
+        categories: [{ category: "other", tokens: 24_000 }],
+        totalTokens: 24_000,
+      },
+      updatedAtMs: 1_774_180_800_000,
+    },
+  },
   contextTokens: 24_000,
   contextPercent: 12,
   startedAt: "2026-07-26T12:00:00.000Z",
@@ -228,6 +244,112 @@ describe("reduceSessionEvent", () => {
     expect(next.sequence).toBe(8);
     expect(next.title).toBe("Middle event");
     expect(next.items[0]).toMatchObject({ content: "Before after" });
+  });
+
+  it("atomically replaces context telemetry without mutating conversation history", () => {
+    const context: SessionSnapshot["context"] = {
+      usage: {
+        inputTokens: 80_000,
+        outputTokens: 2_000,
+        contextTokens: 50_000,
+        contextLimit: 100_000,
+      },
+      compactions: 1,
+      status: {
+        current: {
+          categories: [
+            { category: "conversation", tokens: 30_000 },
+            { category: "documents", tokens: 8_000 },
+            { category: "projectFiles", tokens: 7_000 },
+            { category: "other", tokens: 5_000 },
+          ],
+          totalTokens: 50_000,
+        },
+        updatedAtMs: 1_774_180_801_000,
+        lastCompaction: {
+          id: "run-1:compaction:1",
+          reason: "threshold",
+          before: {
+            categories: [{ category: "conversation", tokens: 70_000 }],
+            totalTokens: 70_000,
+          },
+          after: {
+            categories: [
+              { category: "conversation", tokens: 30_000 },
+              { category: "documents", tokens: 8_000 },
+              { category: "projectFiles", tokens: 7_000 },
+              { category: "other", tokens: 5_000 },
+            ],
+            totalTokens: 50_000,
+          },
+          reclaimedTokens: 20_000,
+          succeeded: true,
+          startedAtMs: 1_774_180_800_500,
+          finishedAtMs: 1_774_180_801_000,
+        },
+      },
+      run: {
+        phase: "retrying",
+        responsesStarted: 2,
+        responsesFinished: 1,
+        responsesDiscarded: 1,
+        responseActive: false,
+        toolCallsStarted: 0,
+        toolCallsFinished: 0,
+        toolExecutionsStarted: 0,
+        toolExecutionsFinished: 0,
+        compactionsStarted: 1,
+        compactionsCompleted: 1,
+        compactionsFailed: 0,
+      },
+    };
+
+    const next = reduceSessionEvent(base, {
+      type: "context.updated",
+      sessionId: base.sessionId,
+      sequence: 5,
+      context,
+    });
+
+    expect(next.context).toBe(context);
+    expect(next.contextTokens).toBe(50_000);
+    expect(next.contextPercent).toBe(50);
+    expect(next.items).toBe(base.items);
+    expect(next.branches).toBe(base.branches);
+
+    const stale = reduceSessionEvent(next, {
+      type: "context.updated",
+      sessionId: base.sessionId,
+      sequence: 5,
+      context: base.context,
+    });
+    expect(stale).toBe(next);
+  });
+
+  it("keeps legacy usage-only updates reconciled as unattributed context", () => {
+    const next = reduceSessionEvent(base, {
+      type: "usage.updated",
+      sessionId: base.sessionId,
+      sequence: 5,
+      observedAtMs: 1_774_180_802_000,
+      usage: {
+        inputTokens: 30_000,
+        outputTokens: 1_000,
+        contextTokens: 25_000,
+        contextLimit: 50_000,
+      },
+    });
+
+    expect(next.contextTokens).toBe(25_000);
+    expect(next.contextPercent).toBe(50);
+    expect(next.context.status).toEqual({
+      current: {
+        categories: [{ category: "other", tokens: 25_000 }],
+        totalTokens: 25_000,
+      },
+      updatedAtMs: 1_774_180_802_000,
+    });
+    expect(next.items).toBe(base.items);
   });
 
   it("ignores duplicate and stale events", () => {

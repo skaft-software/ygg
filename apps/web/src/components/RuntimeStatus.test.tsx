@@ -130,6 +130,7 @@ describe("RuntimeStatus", () => {
         updatedAtMs: 400,
         activeCompaction: {
           id: "compact-active",
+          reason: "overflow",
           before: {
             categories: [
               { category: "conversation", tokens: 90 },
@@ -141,6 +142,7 @@ describe("RuntimeStatus", () => {
         },
         lastCompaction: {
           id: "compact-previous",
+          reason: "threshold",
           before: {
             categories: [{ category: "conversation", tokens: 200 }],
             totalTokens: 200,
@@ -150,6 +152,7 @@ describe("RuntimeStatus", () => {
             totalTokens: 120,
           },
           reclaimedTokens: 80,
+          succeeded: true,
           startedAtMs: 250,
           finishedAtMs: 300,
         },

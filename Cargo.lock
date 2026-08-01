@@ -1188,8 +1188,6 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 [[package]]
 name = "lopdf"
 version = "0.42.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25aab26d99567469098e64a02f42679f8965c6401263eefa31d8f2dcc37a221c"
 dependencies = [
  "aes",
  "bitflags 2.13.0",
@@ -1844,6 +1842,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.150"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2115,7 +2123,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -2997,6 +3005,7 @@ dependencies = [
  "schemars",
  "semver",
  "serde",
+ "serde_ignored",
  "serde_json",
  "serde_yaml",
  "sexy-tui-rs",
@@ -3008,6 +3017,7 @@ dependencies = [
  "tokio-stream",
  "tokio-test",
  "toml",
+ "toml_edit",
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "url",
@@ -3031,6 +3041,7 @@ dependencies = [
  "libc",
  "lopdf",
  "portable-pty",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",

@@ -636,11 +636,7 @@ test("matches the settled desktop workbench shell", async ({
   await page.emulateMedia({ reducedMotion: "reduce" });
   await selectSession(page, "Review release readiness");
   await ensureActivityOpen(page);
-  await expect(
-    page.locator(".activity-rail").getByText("release-pulse.html", {
-      exact: true,
-    }),
-  ).toBeVisible();
+  await expect(releasePulseArtifact(page)).toBeVisible();
   await expect(page.getByLabel("Message ygg")).toHaveAttribute(
     "placeholder",
     "Reply…",

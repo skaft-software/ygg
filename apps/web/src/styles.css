@@ -8610,6 +8610,7 @@ body {
 
 .transcript-scroll {
   scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  scrollbar-gutter: stable both-edges;
   -webkit-mask-image: none;
   mask-image: none;
 }

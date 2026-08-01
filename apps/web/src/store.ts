@@ -42,10 +42,7 @@ import {
   SessionSequenceGapError,
 } from "./reducer";
 import { isUntitledSession } from "./session-title";
-import type {
-  TransportConnectionState,
-  YggTransport,
-} from "./transport";
+import type { TransportConnectionState, YggTransport } from "./transport";
 
 export interface YggState {
   ready: boolean;
@@ -206,6 +203,7 @@ export class YggStore {
   private resyncing = new Set<string>();
   private deferredDuringResync = new Map<string, SessionEvent[]>();
   private createSessionTail: Promise<void> = Promise.resolve();
+  private initializationGeneration = 0;
   private disposed = false;
 
   constructor(private readonly transport: YggTransport) {}
@@ -216,6 +214,10 @@ export class YggStore {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   };
+
+  private isCurrentInitialization(generation: number): boolean {
+    return !this.disposed && generation === this.initializationGeneration;
+  }
 
   private publish(next: YggState): void {
     if (this.disposed) return;
@@ -244,10 +246,7 @@ export class YggStore {
       const event = events[eventIndex]!;
       if (event.type === "catalog.summary") {
         const bootstrap = next.bootstrap;
-        if (
-          !bootstrap ||
-          event.catalogRevision < bootstrap.catalogRevision
-        ) {
+        if (!bootstrap || event.catalogRevision < bootstrap.catalogRevision) {
           continue;
         }
         const existingSummary = bootstrap.sessions.find(
@@ -509,7 +508,13 @@ export class YggStore {
   }
 
   async initialize(): Promise<void> {
+    const generation = ++this.initializationGeneration;
     this.disposed = false;
+    if (this.animationFrame !== null) {
+      window.cancelAnimationFrame(this.animationFrame);
+      this.animationFrame = null;
+    }
+    this.queuedEvents = [];
     this.publish({
       ...this.state,
       connecting: true,
@@ -518,19 +523,21 @@ export class YggStore {
     this.unsubscribeTransport?.();
     this.unsubscribeConnection?.();
     this.unsubscribeTransport = this.transport.subscribe((event) => {
-      this.queueEvent(event);
+      if (this.isCurrentInitialization(generation)) this.queueEvent(event);
     });
     this.unsubscribeConnection =
       this.transport.subscribeConnection?.((connection) => {
-        this.publish({ ...this.state, connection });
+        if (this.isCurrentInitialization(generation)) {
+          this.publish({ ...this.state, connection });
+        }
       }) ?? null;
 
     try {
       const routedSessionId = sessionIdFromPathname(window.location.pathname);
       const projectCatalog = await this.transport.getProjectCatalog();
+      if (!this.isCurrentInitialization(generation)) return;
       const hasRunnableProject = projectCatalog.projects.some(
-        (project) =>
-          project.trusted && project.available && !project.archived,
+        (project) => project.trusted && project.available && !project.archived,
       );
       if (!hasRunnableProject) {
         this.publish({
@@ -562,17 +569,18 @@ export class YggStore {
             project.available &&
             !project.archived,
         );
-      const hostBootstrap = await this.transport.connect(
+      const bootstrap = await this.transport.connect(
         routedProjectRunnable ? routedSessionId ?? undefined : undefined,
       );
-      const bootstrap = hostBootstrap;
+      if (!this.isCurrentInitialization(generation)) return;
       const [selected, goal] = await Promise.all([
         this.transport.getSession(bootstrap.selectedSessionId),
         this.transport.getGoal(bootstrap.selectedSessionId),
       ]);
-      const selectedSummaryTitle = bootstrap.sessions
-        .find((summary) => summary.id === selected.sessionId)
-        ?.title;
+      if (!this.isCurrentInitialization(generation)) return;
+      const selectedSummaryTitle = bootstrap.sessions.find(
+        (summary) => summary.id === selected.sessionId,
+      )?.title;
       const installedSelected = selectedSummaryTitle
         ? {
             ...selected,
@@ -589,6 +597,7 @@ export class YggStore {
             }
           : summary,
       );
+      if (!this.isCurrentInitialization(generation)) return;
       this.publish({
         ready: true,
         connecting: false,
@@ -600,13 +609,15 @@ export class YggStore {
         goal,
         sessions: { [installedSelected.sessionId]: installedSelected },
       });
-      writeSessionRoute(installedSelected.sessionId, "replace");
+      if (this.isCurrentInitialization(generation)) {
+        writeSessionRoute(installedSelected.sessionId, "replace");
+      }
     } catch (error) {
+      if (!this.isCurrentInitialization(generation)) return;
       this.publish({
         ...this.state,
         connecting: false,
-        error:
-          error instanceof Error ? error.message : "ygg could not connect.",
+        error: error instanceof Error ? error.message : "ygg could not connect.",
       });
     }
   }
@@ -694,7 +705,8 @@ export class YggStore {
 
   setGoal(objective: string): Promise<GoalState | null> {
     const value = objective.trim();
-    if (!value) return Promise.reject(new Error("A goal objective is required."));
+    if (!value)
+      return Promise.reject(new Error("A goal objective is required."));
     return this.applyGoalMutation({ objective: value });
   }
 
@@ -793,7 +805,10 @@ export class YggStore {
           }
         : snapshot;
       primeSessionItemIndex(installedSnapshot);
-      if (generation !== this.selectionGeneration || controller.signal.aborted) {
+      if (
+        generation !== this.selectionGeneration ||
+        controller.signal.aborted
+      ) {
         return;
       }
       this.publish({
@@ -928,10 +943,7 @@ export class YggStore {
       projectFileIds: projectFiles.map((file) => file.id),
     });
     if (!ack.accepted) {
-      throw rejectedCommandError(
-        ack,
-        "The ygg host rejected this message.",
-      );
+      throw rejectedCommandError(ack, "The ygg host rejected this message.");
     }
   }
 
@@ -1028,13 +1040,11 @@ export class YggStore {
     });
   }
 
-  async configure(
-    patch: {
-      modelId?: string;
-      reasoning?: ReasoningEffort;
-      authority?: AuthorityProfile;
-    },
-  ): Promise<void> {
+  async configure(patch: {
+    modelId?: string;
+    reasoning?: ReasoningEffort;
+    authority?: AuthorityProfile;
+  }): Promise<void> {
     const session = this.selectedSession;
     if (!session) return;
     await this.sendCommand({
@@ -1259,9 +1269,7 @@ export class YggStore {
 
   async resolveUserInput(
     requestId: string,
-    answer:
-      | { type: "text"; text: string }
-      | { type: "choice"; choice: string },
+    answer: { type: "text"; text: string } | { type: "choice"; choice: string },
   ): Promise<void> {
     const session = this.selectedSession;
     if (!session) return;
@@ -1379,6 +1387,7 @@ export class YggStore {
 
   dispose(): void {
     this.disposed = true;
+    this.initializationGeneration += 1;
     this.selectionGeneration += 1;
     this.selectionAbort?.abort();
     if (this.animationFrame !== null) {

@@ -11,13 +11,15 @@ LAN/native-client layer is still specification-only.
 
 The immediate release blockers are:
 
-- the Serve package-boundary gate does not yet accept seven committed core
-  integration changes;
-- some acceptance documentation is ahead of the real adapter producers;
-- the current production host has not completed final acceptance against a
-  user's actual configured model provider; and
-- several workbench-level product surfaces remain deliberately out of scope or
-  incomplete.
+- the forward package-boundary gate passes, but the branch's older stacked
+  history still needs a target-branch review rather than being hidden in a
+  blanket allowlist;
+- final acceptance against a user's actual configured model provider remains
+  outstanding;
+- the experimental release workflow is defined but has not yet been executed
+  against a release tag, so no signed serve artifact is published; and
+- LAN/native delivery and several workbench-level product surfaces remain
+  deliberately out of scope or incomplete.
 
 ## Current status at a glance
 
@@ -27,10 +29,13 @@ The immediate release blockers are:
 | Streaming, tools, approvals, stop, steer, follow-up | Yes |
 | Multiple independent sessions | Yes |
 | Reconnect, replay, resume, and branch checkout | Yes |
-| Images and multimodal composer | Images only |
+| Attachments and prompt documents | PNG/JPEG/GIF/WebP images plus bounded text, Markdown, and PDF context; no audio |
 | Sources, diffs, and outputs | Real but limited to specific built-in tools |
 | Live generated-site previews | Fixture UI exists; production capability is off |
-| Projects and folder management | One synthetic launch workspace only |
+| Projects and folder management | Durable private multi-project registry, trust/default/archive/session binding, repository context, and trusted file browsing; a host-native folder picker is not yet available |
+| Session retention | Archive, recoverable trash/restore, guarded permanent deletion, and startup recovery |
+| Context and compaction telemetry | Authoritative replayable accounting in the agent, protocol, runtime inspector, and composer |
+| Integrated terminal | Production PTY panel when session process execution is allowed |
 | Extension, skills, MCP, or LSP GUI | Composer discovery supports trusted skills, prompt templates, and enabled extension commands; no dedicated management GUI, MCP, or LSP |
 | Child-agent visualization | Not implemented; the runtime does not expose it |
 | LAN-connected devices | Designed, not implemented |
@@ -57,7 +62,9 @@ graphical `ygg`:
   agent runtime.
 - The transcript is primary. Sources, actions, outputs, previews, and progress
   appear only when structured events justify them.
-- There is no account, login, hosted control plane, or telemetry.
+- There is no account, login, hosted control plane, or outbound product
+  telemetry. Local context, lifecycle, and usage accounting remain part of the
+  workbench state.
 - Ygg retains broad local authority by default. Network authentication remains
   separate from agent authority.
 - The interface is a deterministic projection of real Ygg events. It does not
@@ -202,6 +209,13 @@ cargo run --features serve -- serve
 `--features serve` remains necessary because the graphical host is an opt-in
 experiment. `--port 0` may be added to request an ephemeral port.
 
+Configuration loading reports unknown global and trusted-project TOML keys with
+source path, line, column, dotted key, and a bounded typo suggestion. Unknown
+keys warn by default for compatibility. The global `--strict-config` flag,
+`strict_config = true`, or `YGG_STRICT_CONFIG=true` makes the collected
+unknown-key diagnostics fatal. Known compatibility aliases remain accepted.
+See [Configuration diagnostics](../../design/config-diagnostics.md).
+
 ## What is genuinely implemented
 
 ### Real host and sessions
@@ -218,10 +232,36 @@ experiment. `--port 0` may be added to request an ephemeral port.
 - Explicit session restoration.
 - Concurrent independent graphical sessions.
 - Exactly one mutable `App` owner per session.
-- Rename, pin, and archive.
+- A durable, owner-private project registry with opaque IDs, root-identity
+  revalidation, explicit trust, defaults, archive, and session bindings.
+- Session rename and pin plus active/archive/trash lifecycle views.
+- Restore from trash and exact-phrase permanent deletion through a durable,
+  crash-recoverable cleanup journal.
 - Host-authoritative session titles and catalog updates.
-- Authenticated, redacted JSON export.
+- Authenticated bounded transcript search and redacted JSON export.
 - Branch graph projection and safe idle-boundary branch checkout.
+
+### Lifecycle and persistence safety
+
+- Git probes and PTY shells own Unix process groups and use bounded graceful/
+  forced descendant cleanup; retained output descriptors cannot hang shutdown.
+- PTY output uses incremental UTF-8 decoding and valid-boundary replay
+  truncation.
+- Trusted project reads and writes use root-identity revalidation,
+  descriptor-relative no-follow traversal, conflict checks, atomic replacement,
+  content synchronization, and owning-directory synchronization.
+- WebSocket connections and store initialization are generation-scoped, so
+  stale callbacks, replay responses, and timers cannot replace newer state.
+- Permanent deletion journals intent before the transcript boundary, rolls back
+  interrupted pre-commit work, and retries committed cleanup idempotently after
+  restart. It removes session-owned attachments, documents, resources, run
+  records, goals, project bindings, and search data while retaining shared
+  payloads and conversation-content-free inference accounting.
+- Missing required stores fail permanent deletion before commit rather than
+  producing a partially deleted session.
+
+See [Serve lifecycle and safety](../../design/serve-lifecycle-safety.md) for the
+full trust and recovery contracts.
 
 ### Agent interaction
 
@@ -232,7 +272,11 @@ experiment. `--port 0` may be added to request an ephemeral port.
 - Stop.
 - Steering.
 - Queued follow-up.
+- Prior-turn edit, response retry (including model override), conversation
+  fork, and whole-session fork at idle durable boundaries.
 - Durable run outcomes.
+- Authoritative context categories, response/tool lifecycle counters, and
+  compaction start/finish/failure projections.
 - Model catalog and model selection.
 - Reasoning-effort selection.
 - Composer `@` completion backed by trusted project-file IDs; selected files remain
@@ -241,22 +285,34 @@ experiment. `--port 0` may be added to request an ephemeral port.
   commands, prompt templates, host-admitted skills, and enabled extension
   commands.
 
+Context and run lifecycle state is derived from the active agent run and
+published as replayable full-state `context.updated` replacements. Polling does
+not mutate durable conversation history. Every started provider response is
+reconciled as finished, discarded, or active, and adapter source attribution is
+added only where authoritative metadata exists; unmatched provider totals stay
+in `other`. Legacy `usage.updated` events remain accepted.
+
 The actual production authority catalog currently exposes `FullAccess` only.
 Narrower authority values exist in the protocol and UI vocabulary but are not
-advertised by the real adapter until they can retain their correct sandbox
+advertised by the real adapter until they can retain their correct enforcement
 meaning.
 
-### Attachments
+### Attachments and prompt documents
 
-- PNG, JPEG, GIF, and WebP.
+- PNG, JPEG, GIF, and WebP image attachments.
 - MIME sniffing and byte limits.
 - Paste, drop, picker, and attachment-only submission.
-- Private persistent attachment storage.
+- Private persistent attachment storage with count/byte reservations that remain
+  correct under concurrent ingest.
 - Thumbnails and authenticated retrieval.
 - Native image input for models that support it.
+- Bounded UTF-8 text, Markdown, and ordinary PDF document ingest with immutable
+  extraction provenance, hostile-input limits, private storage, and explicit
+  prompt-context selection.
+- Immutable trusted project-file snapshots selected by opaque file ID.
 
-Audio, documents, and other protocol modality names are not implemented by the
-production host.
+Audio and other media attachment types are not implemented by the production
+host.
 
 ### Sources, changes, and outputs
 
@@ -307,7 +363,12 @@ comprehensively.
 - A blue reasoning slider for ordinary effort, locally floating varied white
   particles for exact `xhigh` and `max`, an animated rainbow reserved for exact
   `max`, and static, particle-free reduced motion.
-- Settings, review, command history, progress, artifacts, and context.
+- Settings, review, command history, progress, artifacts, repository context,
+  and authoritative context/compaction inspection.
+- Project trust/default/archive management and active/archive/trash session
+  navigation with guarded permanent deletion.
+- A retained, bounded PTY terminal panel when the host advertises process
+  execution authority.
 - Responsive desktop, tablet, and phone layouts.
 
 The earlier fixture response:
@@ -325,27 +386,36 @@ transport from becoming reachable as production behavior.
 
 ### Projects and context
 
-- Only one synthetic project derived from the launch workspace.
-- No project registry, CRUD, trusted-root picker, multi-folder model, or
-  project defaults.
-- No project-scoped extension set.
-- No host-side full-text transcript search.
-- No tags UI, archive browser, restore, delete, duplicate/fork, or import.
-- No command palette.
-- No general deep-link system beyond sessions and branches.
+- The project model is a real durable private registry, not a synthetic
+  launch-workspace row. It supports multiple opaque project IDs, one canonical
+  root per project, explicit trust, defaults, archive, and durable session
+  bindings.
+- The loopback browser cannot mint filesystem authority, so it cannot import an
+  arbitrary folder. Launching the host for a workspace registers that real
+  root; a future host-native picker must supply one-use opaque candidates.
+- There is no multi-root project or project-scoped extension-set model, and an
+  archived project has no restore UI yet.
+- Authenticated, bounded transcript-content search is implemented alongside
+  client-side title/preview filtering.
+- There is still no tags UI or general session import workflow.
+- There is no global command palette; composer `/` discovery is the implemented
+  command surface.
+- There is no general deep-link system beyond sessions and branches.
 
 ### Session semantics
 
-- No prior-message edit, retry, or regenerate workflow.
-- No fork-to-new-session UI.
-- No filesystem rollback tied to conversation checkout.
-- Draft and queued-follow-up durability remains incomplete.
-- Queued follow-ups cannot be fully edited, removed, or reordered.
+- Edit, retry, conversation fork, and session fork are implemented only at
+  validated idle/committed boundaries; there is still no filesystem rollback
+  tied to conversation checkout.
+- Bounded independent text and attachment drafts persist per host/session in
+  browser storage and clear only after an acknowledged submission.
+- Accepted queued follow-ups are not durable across a host restart and cannot be
+  fully edited, removed, or reordered.
 - Provider retries are not shown with attempt count, delay, and sanitized
   cause.
-- Live `SteeringDelivered`, `CompactionStarted`, and `CompactionFinished`
-  events are currently ignored, although durable compaction records can appear
-  after hydration.
+- Context and compaction lifecycle is now projected live and replayed within a
+  host run, but the operational tracker is intentionally not conversation
+  persistence.
 - Structured PR state is optional in `SessionSummary` and covered by fixtures,
   but production has no PR evidence producer yet and therefore omits it.
 - Structured plans exist in DTOs and fixtures, but the real adapter does not
@@ -382,12 +452,13 @@ The first web release still excludes:
 - extension diagnostics and a dedicated extension-output surface;
 - LSP;
 - scheduling;
-- interactive terminal;
 - TUI synchronization; and
 - child-agent runtime trees.
 
-The production host advertises `terminal: false` and `childAgents: false`. The
-UI does not fake either feature.
+The production host advertises `terminal: true` only when configured authority
+allows process execution. The terminal is a bounded retained local PTY whose
+WebSocket authority is derived from the authenticated page origin.
+`childAgents` remains false; the UI does not fake child-agent state.
 
 ### LAN and native
 
@@ -429,44 +500,39 @@ There are currently:
 
 ## Validation evidence
 
-The web and focused `ygg-serve` rows below were rerun after the workbench
-visual pass. Production-host and broader coding-agent rows retain the earlier
-integration-checkpoint evidence.
+The final hardening matrix was run with locked dependencies. Web checks used the
+pinned `apps/web/.node-version` runtime, Node `v22.13.0`.
 
 | Gate | Result |
 | --- | --- |
-| Web typecheck | Pass |
-| ESLint | Pass |
-| Production frontend build | Pass |
-| Fixture/production boundary check | Pass |
-| External request and CSP policy | Pass |
-| Font policy | Pass |
-| Embedded bundle synchronization and integrity | Pass |
-| Web unit tests | 151/151 pass |
-| Fixture Playwright matrix | 74 pass, 70 intentional skips, 1 system-Chrome timing failure |
-| Production-host Playwright | 1/1 pass at the integration checkpoint |
-| `ygg-serve` Rust tests | 69 library tests and associated suites pass |
-| Golden protocol tests | 9/9 pass |
-| Coding-agent tests with `serve` | 624 unit and 9 SIGTERM pass at the integration checkpoint |
-| Strict Clippy | Pass at the integration checkpoint |
-| Rust formatting | Repository-wide check still encounters pre-existing formatting differences outside this change |
-| `git diff --check` | Pass |
-| Exact-feature binary build | Pass at the integration checkpoint |
-| Installed-binary embedded-web smoke | Pass at the integration checkpoint |
-| Package-boundary gate | **Fail** |
+| Web install | `npm ci` passed with zero reported vulnerabilities |
+| Web lint, typecheck, typography, production build, same-origin/CSP audit, and embedded-bundle check | Pass |
+| Web unit tests | Full Vitest suite passed |
+| Fixture Playwright matrix | Every applicable test passed for desktop, tablet landscape, tablet portrait, mobile, and mobile-small |
+| Production-host Playwright | 1/1 passed against the real Rust host and a deterministic local OpenAI-compatible provider |
+| `ygg-agent` tests | 200 passed |
+| Coding-agent tests with `serve` | 671 passed |
+| Full Rust workspace tests | All targets/all features and documentation tests passed |
+| No-default-feature workspace check | Pass |
+| Independent `extensions/ygg-serve` tests | 108 library tests and every integration suite passed |
+| Strict workspace and independent-extension Clippy | Pass |
+| Rust 1.86 workspace and independent-extension checks | Pass |
+| Rust formatting and `git diff --check` | Pass |
+| Package-boundary script | Pass |
+| Publishable core workspace package assembly | `cargo package --workspace --exclude ygg-coding-agent` passed with `--allow-dirty`; the clean-tree form is blocked only by the intentionally uncommitted worktree |
+| Installed `ygg-coding-agent --features serve` smoke | Pass; installed `ygg 0.3.2-alpha` served the synchronized embedded bundle |
+| Optimized feature-enabled build and bundle smoke | Pass locally with the release binary; no signed tag artifact published |
+| Optimized signed serve release | Workflow defined; not yet run against a release tag |
 
-The installed system Chrome was used because Playwright's configured Chromium
-binary is not present locally. Its only full-project failure was the existing
-60-delta performance probe: scroll-retention, stream-time, and frame-rate
-assertions passed, but Chrome reported one 110ms long task. The unmodified Git
-`HEAD` reproduces one or two long tasks under the same browser, so this is not a
-regression from the workbench styling. It still needs confirmation with the
-locked Playwright Chromium before the matrix can be called fully green.
+`lopdf` is pinned to `0.42.0`; the independent serve manifest and lockfile are
+kept explicit so the PDF parser remains on the audited version. Serve retains
+its own strict PDF header, envelope, classic-xref, revision, size, and object
+limits around that parser.
 
-Earlier web-unit runs exposed a focus assertion that executed before the
-composer menu's scheduled animation-frame focus restoration. The checkpoint
-now waits for that asynchronous accessibility contract rather than making an
-immediate assertion.
+The fixture matrix was split by configured Playwright project after the combined
+155-test invocation exceeded the command runner's 120-second limit; no test
+failure caused that timeout. Every project then passed independently under the
+pinned Node runtime.
 
 The production-host Playwright test uses the real Rust host, real session
 adapter, and real provider request path with a deterministic local
@@ -474,66 +540,51 @@ OpenAI-compatible provider. It proves the integration without requiring an
 external model. Final acceptance against a user's actual configured provider
 remains outstanding.
 
-The synchronized embedded bundle after the compact-activity and slider pass has
-SHA-256:
+The synchronized embedded bundle has SHA-256:
 
 ```text
-6339e9e630069c1adb9f3bd1a430956fe6269a122320bbd54e406d15d0aa9f45
+35321c707b58a5146428a7d0e805ac4b9f38e61b078bc9d3b12a2260b0bc35d7
 ```
 
 ## Repository checkpoint
 
 - Repository: `skaft-software/ygg`
 - Experimental branch: `explore/ygg-serve-web-v2`
-- Parent before this checkpoint: `374a2a9`
-- The branch contains 40 earlier Serve commits beyond its merge base.
-- The main checkout remained clean and untouched while this checkpoint was
-  prepared.
-- Main contains two later TUI commits that are not yet incorporated into this
-  branch.
+- Pre-hardening branch tip and forward boundary checkpoint:
+  `eebe7389097cdcf27cc22b26da75b57a06e4e8e8`.
+- This hardening pass remains an uncommitted working-tree change; no merge,
+  commit, or push is implied.
+- The separate main checkout is intentionally untouched.
 - The rejected frontend remains separately archived.
 
-No merge or push is implied by this checkpoint.
+## Package boundary
 
-## Package-boundary failure
+The intended boundary still keeps the web product in `apps/web`, the optional
+backend in `extensions/ygg-serve`, and only narrow generic seams in core crates.
+The old default comparison against `c6ec60f` is not meaningful for this stacked
+branch: it predates later unrelated core/TUI merges and reports dozens of files.
+The earlier documented count of seven violations was therefore stale. Adding
+all of those historical paths to an allowlist would conceal rather than enforce
+the boundary.
 
-The intended boundary keeps the feature in the extension and app packages with
-only a minimal coding-agent seam. The branch currently violates the strict
-boundary gate because seven out-of-allowlist core files changed:
+`scripts/check-ygg-serve-boundaries.sh` now uses `eebe738` as an explicit
+forward-enforcement checkpoint. It requires the selected base to be an ancestor
+of `HEAD` and admits only:
 
-- `crates/ygg-agent/src/agent.rs`
-- `crates/ygg-agent/src/lib.rs`
-- `crates/ygg-agent/src/session.rs`
-- `crates/ygg-agent/tests/agent_run.rs`
-- `crates/ygg-coding-agent/src/hydrate.rs`
-- `crates/ygg-coding-agent/src/session_commands.rs`
-- `crates/ygg-coding-agent/src/session_store.rs`
+- the application, optional extension, integration adapter, and their owned
+  documentation/build paths;
+- generic agent-owned context accounting in
+  `crates/ygg-agent/src/{agent,context,lib}.rs` and its agent-run tests;
+- generic coding-agent configuration diagnostics in `config.rs`,
+  `resource_resolver.rs`, and `resources.rs`; and
+- the generic primary-session deletion primitive in `session_store.rs`.
 
-These changes came from:
-
-- `77f7c65`, which persisted run outcomes and corrected steering attribution;
-  and
-- `237a068`, which persisted pin and archive metadata.
-
-The boundary audit found that one part is a legitimate cross-frontend core
-fix: steering and follow-up messages must not inherit the initial prompt's
-display text. Without that correction, resumed transcripts can repeat the
-first visible prompt for every steering message.
-
-The preferred repair is:
-
-1. Keep the small generic steering-attribution fix as an independently
-   justified core bug fix.
-2. Move Serve run outcomes into an extension-local
-   `.serve/session-state-v1` store.
-3. Move pin and archive state into the same extension-owned store.
-4. Keep existing core title rename support.
-5. Migrate experimental metadata before removing the temporary core schema.
-6. Restore the remaining core files and make the boundary gate pass.
-
-A strict zero-core approach is possible, but it requires a more complicated
-extension-side prompt-intent mapping and would reintroduce the native steering
-attribution bug.
+The default gate passes for this hardening work. An explicit audit from the old
+base still fails on the unrelated/historical paths, so the new baseline does
+not silently bless them. This is a forward delta gate, not a claim that the
+branch's entire pre-checkpoint history is boundary-clean. Before merge, the
+branch still needs comparison or rebase against its actual target and an
+explicit review of any surviving pre-checkpoint core delta.
 
 ## Visual truth
 
@@ -561,30 +612,31 @@ another chat-product skin:
 
 The remaining visual truth is product-data debt rather than another styling
 pass: production Activity can be sparse because plans and previews have limited
-real producers, the repository model is still synthetic, and fixture sessions
-cannot represent every long-running real-agent shape. The Activity pane remains
-user-controlled rather than appearing without structured evidence.
+real producers, project import still lacks a host-native folder picker, and
+fixture sessions cannot represent every long-running real-agent shape. The
+Activity pane remains user-controlled rather than appearing without structured
+evidence.
 
 ## Recommended next sequence
 
-1. Resolve the seven-file package-boundary issue using the extension-local
-   state plan.
-2. Incorporate the two newer main commits without changing the clean main
-   checkout.
+1. Rebase or compare the forward-gated delta against the intended merge target
+   and review any surviving pre-`eebe738` core changes explicitly.
+2. Run the experimental release workflow against a clean `v0.3.2-alpha` (or
+   later alpha) tag and retain the checksum/signature verification output.
 3. Run `ygg serve` against a user's real provider and exercise:
    - fresh-session creation;
    - real prompt and streaming;
-   - tool activity;
+   - tool activity and context/compaction accounting;
    - image attachment;
-   - steer and follow-up;
-   - stop;
-   - reconnect;
-   - branch checkout; and
-   - source, diff, and output reopening after host restart.
+   - steer, follow-up, edit, retry, and fork;
+   - stop and reconnect;
+   - terminal reopen and host shutdown;
+   - archive, trash, restore, and permanent deletion; and
+   - branch checkout plus source, diff, and output reopening after host restart.
 4. Iterate on bugs and high-impact layout discrepancies found during that real
    use.
-5. Build the project and trusted-root model and generalized evidence/preview
-   pipeline.
+5. Add a host-native project picker and broaden the generalized
+   evidence/preview pipeline.
 6. Implement secure LAN pairing.
 7. Create thin macOS, iOS, and Android shells only after the web and LAN
    contracts are stable.

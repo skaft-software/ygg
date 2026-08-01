@@ -9,12 +9,14 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::broadcast;
+
+use crate::process_tree::{ProcessTree, TerminationSignal};
 
 /// Maximum number of retained terminal sessions for one graphical host.
 pub const MAX_PTY_SESSIONS: usize = 4;
@@ -169,17 +171,67 @@ struct PtySession {
     last_used_at: AtomicU64,
     last_used_order: AtomicU64,
     alive: AtomicBool,
+    stopping: AtomicBool,
+    process_tree: ProcessTree,
     master: Mutex<Option<Box<dyn MasterPty>>>,
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    settlement: (Mutex<PtySettlement>, Condvar),
     output: Mutex<PtyOutput>,
     events: broadcast::Sender<PtyEvent>,
+}
+
+#[derive(Default)]
+struct PtySettlement {
+    output_reader_done: bool,
+    child_waiter_done: bool,
 }
 
 #[derive(Default)]
 struct PtyOutput {
     replay: VecDeque<u8>,
     exit: Option<PtyExit>,
+}
+
+#[derive(Default)]
+struct IncrementalUtf8Decoder {
+    pending: Vec<u8>,
+}
+
+impl IncrementalUtf8Decoder {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.pending.extend_from_slice(bytes);
+        let mut output = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(valid) => {
+                    output.push_str(valid);
+                    self.pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    if valid_up_to > 0 {
+                        output.push_str(
+                            std::str::from_utf8(&self.pending[..valid_up_to])
+                                .expect("UTF-8 validator marked the prefix valid"),
+                        );
+                        self.pending.drain(..valid_up_to);
+                    }
+                    let Some(error_len) = error.error_len() else {
+                        break;
+                    };
+                    output.push('\u{fffd}');
+                    self.pending.drain(..error_len.min(self.pending.len()));
+                }
+            }
+        }
+        output
+    }
+
+    fn finish(&mut self) -> String {
+        String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned()
+    }
 }
 
 impl PtyManager {
@@ -380,10 +432,11 @@ impl PtySession {
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         command.env("YGG_TERMINAL", "1");
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(command)
             .map_err(|_| PtyError::Start)?;
+        let process_tree = ProcessTree::from_session_id(child.process_id());
         let killer = child.clone_killer();
         let (events, _) = broadcast::channel(PTY_OUTPUT_CHANNEL_CAPACITY);
         let created_at = now_millis();
@@ -396,9 +449,12 @@ impl PtySession {
             last_used_at: AtomicU64::new(created_at),
             last_used_order: AtomicU64::new(last_used_order),
             alive: AtomicBool::new(true),
+            stopping: AtomicBool::new(false),
+            process_tree,
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(Some(writer)),
             killer: Mutex::new(killer),
+            settlement: (Mutex::new(PtySettlement::default()), Condvar::new()),
             output: Mutex::new(PtyOutput::default()),
             events,
         });
@@ -409,6 +465,15 @@ impl PtySession {
             .spawn(move || read_output(reader, output_session))
             .is_err()
         {
+            session.mark_output_reader_done();
+            session.process_tree.signal(TerminationSignal::Force);
+            let _ = session
+                .killer
+                .lock()
+                .expect("terminal killer poisoned")
+                .kill();
+            let _ = child.wait();
+            session.mark_child_waiter_done();
             session.stop();
             return Err(PtyError::Start);
         }
@@ -418,6 +483,7 @@ impl PtySession {
             .spawn(move || wait_for_exit(child, exit_session))
             .is_err()
         {
+            session.mark_child_waiter_done();
             session.stop();
             return Err(PtyError::Start);
         }
@@ -429,8 +495,8 @@ impl PtySession {
         // snapshotting under the same lock keeps replay and live output ordered.
         let output = self.output.lock().expect("terminal output poisoned");
         let events = self.events.subscribe();
-        let replay = String::from_utf8_lossy(&output.replay.iter().copied().collect::<Vec<_>>())
-            .into_owned();
+        let replay = String::from_utf8(output.replay.iter().copied().collect::<Vec<_>>())
+            .expect("terminal replay contains only decoded UTF-8");
         PtyAttachment {
             id: self.id.clone(),
             owner_key: self.owner_key.clone(),
@@ -440,19 +506,23 @@ impl PtySession {
         }
     }
 
-    fn append_output(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
+    fn append_output(&self, output: &str) {
+        if output.is_empty() {
             return;
         }
-        let output = String::from_utf8_lossy(bytes).into_owned();
         let mut retained = self.output.lock().expect("terminal output poisoned");
-        for byte in bytes {
-            if retained.replay.len() == MAX_PTY_REPLAY_BYTES {
-                retained.replay.pop_front();
-            }
-            retained.replay.push_back(*byte);
+        retained.replay.extend(output.bytes());
+        while retained.replay.len() > MAX_PTY_REPLAY_BYTES {
+            retained.replay.pop_front();
         }
-        let _ = self.events.send(PtyEvent::Output(output));
+        while retained
+            .replay
+            .front()
+            .is_some_and(|byte| *byte & 0b1100_0000 == 0b1000_0000)
+        {
+            retained.replay.pop_front();
+        }
+        let _ = self.events.send(PtyEvent::Output(output.to_owned()));
     }
 
     fn finish(&self, exit: PtyExit) {
@@ -491,9 +561,63 @@ impl PtySession {
     }
 
     fn stop(&self) {
+        self.alive.store(false, Ordering::Release);
         self.writer.lock().expect("terminal writer poisoned").take();
-        self.master.lock().expect("terminal master poisoned").take();
-        let _ = self.killer.lock().expect("terminal killer poisoned").kill();
+
+        if !self.stopping.swap(true, Ordering::AcqRel) {
+            const GRACE_PERIOD: Duration = Duration::from_millis(100);
+            const FORCE_PERIOD: Duration = Duration::from_millis(400);
+
+            // Snapshot job-control descendants while the controlling PTY and
+            // session leader are still available.
+            self.process_tree.signal(TerminationSignal::Graceful);
+            self.master.lock().expect("terminal master poisoned").take();
+            self.wait_for_settlement(GRACE_PERIOD);
+            // PTY job control may place background jobs in process groups other
+            // than the shell's foreground group. Session-wide force signalling
+            // prevents those jobs from surviving a server shutdown.
+            self.process_tree.signal(TerminationSignal::Force);
+            let _ = self.killer.lock().expect("terminal killer poisoned").kill();
+            self.wait_for_settlement(FORCE_PERIOD);
+            // Cleanup is deliberately bounded. Retaining numeric process-group
+            // identities after this point could target unrelated processes if
+            // an escaped descendant keeps a PTY reader alive long enough for
+            // the identifiers to be reused.
+            self.process_tree.disarm();
+        } else {
+            self.wait_for_settlement(Duration::from_millis(400));
+        }
+    }
+
+    fn mark_output_reader_done(&self) {
+        let (settlement, changed) = &self.settlement;
+        let mut settlement = settlement.lock().unwrap_or_else(|error| error.into_inner());
+        settlement.output_reader_done = true;
+        changed.notify_all();
+    }
+
+    fn mark_child_waiter_done(&self) {
+        let (settlement, changed) = &self.settlement;
+        let mut settlement = settlement.lock().unwrap_or_else(|error| error.into_inner());
+        settlement.child_waiter_done = true;
+        changed.notify_all();
+    }
+
+    fn wait_for_settlement(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let (settlement, changed) = &self.settlement;
+        let mut settlement = settlement.lock().unwrap_or_else(|error| error.into_inner());
+        while !(settlement.output_reader_done && settlement.child_waiter_done) {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next, _) = changed
+                .wait_timeout(settlement, remaining.min(Duration::from_millis(10)))
+                .unwrap_or_else(|error| error.into_inner());
+            settlement = next;
+        }
     }
 
     fn touch(&self) {
@@ -516,14 +640,17 @@ impl PtySession {
 
 fn read_output(mut reader: Box<dyn Read + Send>, session: Arc<PtySession>) {
     let mut buffer = [0; PTY_READ_BUFFER_BYTES];
+    let mut decoder = IncrementalUtf8Decoder::default();
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => break,
-            Ok(count) => session.append_output(&buffer[..count]),
+            Ok(count) => session.append_output(&decoder.push(&buffer[..count])),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
+    session.append_output(&decoder.finish());
+    session.mark_output_reader_done();
 }
 
 fn wait_for_exit(mut child: Box<dyn Child + Send + Sync>, session: Arc<PtySession>) {
@@ -538,6 +665,11 @@ fn wait_for_exit(mut child: Box<dyn Child + Send + Sync>, session: Arc<PtySessio
         },
     };
     session.finish(exit);
+    session.mark_child_waiter_done();
+    // A shell may exit while background job-control groups remain alive. Settle
+    // the complete owned session immediately rather than retaining numeric
+    // process identities until a later manager operation or shutdown.
+    session.stop();
 }
 
 fn remove_session(sessions: &mut PtySessions, id: &str) -> Option<Arc<PtySession>> {
@@ -681,6 +813,29 @@ mod tests {
         assert!(validate_owner_key("pane-01_b.c").is_ok());
     }
 
+    #[test]
+    fn incremental_utf8_decoder_preserves_codepoints_split_across_reads() {
+        let expected = "ASCII é — 世界 🙂";
+        let mut decoder = IncrementalUtf8Decoder::default();
+        let mut decoded = String::new();
+        for byte in expected.as_bytes() {
+            decoded.push_str(&decoder.push(std::slice::from_ref(byte)));
+        }
+        decoded.push_str(&decoder.finish());
+
+        assert_eq!(decoded, expected);
+        assert!(!decoded.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn incremental_utf8_decoder_replaces_only_invalid_or_incomplete_input() {
+        let mut decoder = IncrementalUtf8Decoder::default();
+        assert_eq!(decoder.push(b"valid\xf0"), "valid");
+        assert_eq!(decoder.push(b"("), "\u{fffd}(");
+        assert_eq!(decoder.push(&[0xe2, 0x82]), "");
+        assert_eq!(decoder.finish(), "\u{fffd}");
+    }
+
     #[cfg(unix)]
     fn test_manager() -> PtyManager {
         PtyManager::new(TerminalConfig {
@@ -700,6 +855,25 @@ mod tests {
                 cwd: None,
             })
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_file(path: &Path) -> rustix::process::Pid {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(raw_pid) = text.trim().parse::<i32>() {
+                    if let Some(pid) = rustix::process::Pid::from_raw(raw_pid) {
+                        return pid;
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant did not record a valid PID"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(unix)]
@@ -752,6 +926,85 @@ mod tests {
             Err(PtyError::Exited)
         ));
         manager.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_exit_settles_signal_ignoring_descendants() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manager = PtyManager::new(TerminalConfig {
+            cwd: temporary.path().to_owned(),
+            shell: Some(PathBuf::from("/bin/sh")),
+        })
+        .unwrap();
+        let mut attachment = open(&manager, "owner-exiting-tree");
+        let pid_path = temporary.path().join("exiting-descendant.pid");
+        manager
+            .input(
+                &attachment.id,
+                &format!(
+                    "/bin/sh -c 'trap \"\" HUP TERM; echo $$ > \"{}\"; while :; do /bin/sleep 1; done' &\nexit 0\n",
+                    pid_path.display()
+                ),
+            )
+            .unwrap();
+
+        let exit = recv_exit(&mut attachment.events).await;
+        assert_eq!(exit.exit_code, 0);
+        let pid = wait_for_pid_file(&pid_path);
+        let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(pid).is_ok()
+            && std::time::Instant::now() < cleanup_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "PTY descendant survived its shell"
+        );
+        manager.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_kills_signal_ignoring_descendants() {
+        let temporary = tempfile::tempdir().unwrap();
+        let manager = PtyManager::new(TerminalConfig {
+            cwd: temporary.path().to_owned(),
+            shell: Some(PathBuf::from("/bin/sh")),
+        })
+        .unwrap();
+        let attachment = open(&manager, "owner-tree");
+        let pid_path = temporary.path().join("descendant.pid");
+        manager
+            .input(
+                &attachment.id,
+                &format!(
+                    "/bin/sh -c 'trap \"\" HUP TERM; echo $$ > \"{}\"; while :; do /bin/sleep 1; done' &\n",
+                    pid_path.display()
+                ),
+            )
+            .unwrap();
+
+        let pid = wait_for_pid_file(&pid_path);
+
+        let started = std::time::Instant::now();
+        manager.shutdown();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "PTY cleanup exceeded its bound: {:?}",
+            started.elapsed()
+        );
+        let cleanup_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(pid).is_ok()
+            && std::time::Instant::now() < cleanup_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "PTY descendant survived manager shutdown"
+        );
     }
 
     #[cfg(unix)]

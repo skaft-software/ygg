@@ -48,6 +48,8 @@ const categoryLabel: Record<ContextCategory, string> = {
   conversation: "Conversation",
   toolResults: "Tool results",
   attachments: "Attachments",
+  documents: "Documents",
+  projectFiles: "Project files",
   compactionSummaries: "Compaction summaries",
   other: "Other",
 };
@@ -476,7 +478,8 @@ function Context({
             <div>
               <strong>Compaction in progress</strong>
               <p>
-                <code>{context.activeCompaction.id}</code> started with{" "}
+                <code>{context.activeCompaction.id}</code> started for a{" "}
+                {context.activeCompaction.reason} trigger with{" "}
                 {number.format(context.activeCompaction.before.totalTokens)} tokens.
               </p>
             </div>
@@ -494,12 +497,26 @@ function Context({
           <article className="runtime-compaction">
             <Database aria-hidden="true" />
             <div>
-              <strong>Last completed compaction</strong>
+              <strong>
+                {context.lastCompaction.succeeded
+                  ? "Last completed compaction"
+                  : "Last compaction failed"}
+              </strong>
               <p>
-                Reclaimed{" "}
-                {number.format(context.lastCompaction.reclaimedTokens)} tokens (
-                {number.format(context.lastCompaction.before.totalTokens)} to{" "}
-                {number.format(context.lastCompaction.after.totalTokens)}).
+                {context.lastCompaction.succeeded ? (
+                  <>
+                    Reclaimed{" "}
+                    {number.format(context.lastCompaction.reclaimedTokens)} tokens ({
+                      number.format(context.lastCompaction.before.totalTokens)
+                    }{" "}
+                    to {number.format(context.lastCompaction.after.totalTokens)}).
+                  </>
+                ) : (
+                  <>
+                    The {context.lastCompaction.reason} attempt retained all{" "}
+                    {number.format(context.lastCompaction.before.totalTokens)} tokens.
+                  </>
+                )}
               </p>
             </div>
           </article>

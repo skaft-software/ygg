@@ -660,8 +660,12 @@ pub enum ContextCategory {
     Conversation,
     /// Public tool calls and results.
     ToolResults,
-    /// User-approved attachments and documents.
+    /// User-approved multimodal attachments.
     Attachments,
+    /// User-approved uploaded document context.
+    Documents,
+    /// User-approved trusted project-file context.
+    ProjectFiles,
     /// Compaction summaries.
     CompactionSummaries,
     /// Other explicitly measured public context.
@@ -749,30 +753,46 @@ impl<'de> Deserialize<'de> for ContextTotals {
     }
 }
 
+/// Public reason for one context-compaction attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextCompactionReason {
+    /// A proactive context threshold was reached.
+    Threshold,
+    /// The request exceeded local or provider context capacity.
+    Overflow,
+}
+
 /// Active compaction projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActiveCompaction {
     /// Stable compaction identity.
     pub id: RuntimeId,
+    /// Why compaction was requested.
+    pub reason: ContextCompactionReason,
     /// Exact context totals at start.
     pub before: ContextTotals,
     /// Start timestamp.
     pub started_at_ms: u64,
 }
 
-/// Completed compaction projection.
+/// Completed compaction-attempt projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompletedCompaction {
     /// Stable compaction identity.
     pub id: RuntimeId,
+    /// Why compaction was requested.
+    pub reason: ContextCompactionReason,
     /// Exact context totals at start.
     pub before: ContextTotals,
-    /// Exact context totals after completion.
+    /// Exact context totals after completion. Failed attempts retain `before`.
     pub after: ContextTotals,
-    /// Exact `before.total_tokens - after.total_tokens`.
+    /// Exact `before.total_tokens - after.total_tokens`, or zero on failure.
     pub reclaimed_tokens: u64,
+    /// Whether the compaction committed successfully.
+    pub succeeded: bool,
     /// Start timestamp.
     pub started_at_ms: u64,
     /// Finish timestamp.
@@ -780,8 +800,8 @@ pub struct CompletedCompaction {
 }
 
 /// Replayable context accounting state.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContextStatus {
     /// Current reconciled totals.
     pub current: ContextTotals,
@@ -807,6 +827,45 @@ impl ContextStatus {
             active_compaction: None,
             last_compaction: None,
         }
+    }
+
+    /// Validates category reconciliation and compaction relationships.
+    pub fn validate_projection(&self) -> Result<(), RuntimeStatusError> {
+        validate_context_status(self)
+    }
+}
+
+impl Default for ContextStatus {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for ContextStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Wire {
+            current: ContextTotals,
+            updated_at_ms: u64,
+            #[serde(default)]
+            active_compaction: Option<ActiveCompaction>,
+            #[serde(default)]
+            last_compaction: Option<CompletedCompaction>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let status = Self {
+            current: wire.current,
+            updated_at_ms: wire.updated_at_ms,
+            active_compaction: wire.active_compaction,
+            last_compaction: wire.last_compaction,
+        };
+        status.validate_projection().map_err(de::Error::custom)?;
+        Ok(status)
     }
 }
 
@@ -1706,19 +1765,23 @@ pub enum RuntimeEvent {
     CompactionStarted {
         /// Stable compaction identity.
         id: RuntimeId,
+        /// Why compaction was requested.
+        reason: ContextCompactionReason,
         /// Exact current totals.
         before: ContextTotals,
         /// Start timestamp.
         at_ms: u64,
     },
-    /// Finishes a replayable compaction and reconciles the reclaimed total.
+    /// Finishes a replayable compaction attempt and reconciles its result.
     CompactionFinished {
         /// Stable compaction identity.
         id: RuntimeId,
-        /// Exact resulting totals.
+        /// Exact resulting totals. Failed attempts must retain the start totals.
         after: ContextTotals,
-        /// Exact number of reclaimed tokens.
+        /// Exact number of reclaimed tokens, or zero on failure.
         reclaimed_tokens: u64,
+        /// Whether the compaction committed successfully.
+        succeeded: bool,
         /// Finish timestamp.
         at_ms: u64,
     },
@@ -1780,7 +1843,7 @@ impl<'de> Deserialize<'de> for RuntimeSnapshot {
 }
 
 /// In-memory reducer for authoritative runtime observations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RuntimeStatusState {
     child_agents: BTreeMap<RuntimeId, ChildAgentStatus>,
     mcp_servers: BTreeMap<RuntimeId, McpServerStatus>,
@@ -1788,19 +1851,6 @@ pub struct RuntimeStatusState {
     lsp_servers: BTreeMap<(RuntimeId, RuntimeId), LspServerStatus>,
     context: ContextStatus,
     policy: Option<RuntimePolicyStatus>,
-}
-
-impl Default for RuntimeStatusState {
-    fn default() -> Self {
-        Self {
-            child_agents: BTreeMap::new(),
-            mcp_servers: BTreeMap::new(),
-            catalog: TrustedCatalogStatus::default(),
-            lsp_servers: BTreeMap::new(),
-            context: ContextStatus::empty(),
-            policy: None,
-        }
-    }
 }
 
 impl RuntimeStatusState {
@@ -1915,15 +1965,19 @@ impl RuntimeStatusState {
                 at_ms,
             } => self.publish_lsp_diagnostics(&project_id, &language_id, revision, counts, at_ms),
             RuntimeEvent::ContextUpdated { totals, at_ms } => self.update_context(totals, at_ms),
-            RuntimeEvent::CompactionStarted { id, before, at_ms } => {
-                self.start_compaction(id, before, at_ms)
-            }
+            RuntimeEvent::CompactionStarted {
+                id,
+                reason,
+                before,
+                at_ms,
+            } => self.start_compaction(id, reason, before, at_ms),
             RuntimeEvent::CompactionFinished {
                 id,
                 after,
                 reclaimed_tokens,
+                succeeded,
                 at_ms,
-            } => self.finish_compaction(id, after, reclaimed_tokens, at_ms),
+            } => self.finish_compaction(id, after, reclaimed_tokens, succeeded, at_ms),
             RuntimeEvent::PolicyPublished { policy } => self.publish_policy(*policy),
         }
     }
@@ -2509,18 +2563,27 @@ impl RuntimeStatusState {
     fn start_compaction(
         &mut self,
         id: RuntimeId,
+        reason: ContextCompactionReason,
         before: ContextTotals,
         at_ms: u64,
     ) -> Result<ApplyOutcome, RuntimeStatusError> {
         before.validate()?;
         if let Some(active) = &self.context.active_compaction {
-            if active.id == id && active.before == before && active.started_at_ms == at_ms {
+            if active.id == id
+                && active.reason == reason
+                && active.before == before
+                && active.started_at_ms == at_ms
+            {
                 return Ok(ApplyOutcome::Replay);
             }
             return Err(RuntimeStatusError::OperationInProgress { kind: "compaction" });
         }
         if let Some(last) = &self.context.last_compaction {
-            if last.id == id && last.before == before && last.started_at_ms == at_ms {
+            if last.id == id
+                && last.reason == reason
+                && last.before == before
+                && last.started_at_ms == at_ms
+            {
                 return Ok(ApplyOutcome::Replay);
             }
         }
@@ -2534,6 +2597,7 @@ impl RuntimeStatusState {
         }
         self.context.active_compaction = Some(ActiveCompaction {
             id,
+            reason,
             before,
             started_at_ms: at_ms,
         });
@@ -2545,6 +2609,7 @@ impl RuntimeStatusState {
         id: RuntimeId,
         after: ContextTotals,
         reclaimed_tokens: u64,
+        succeeded: bool,
         at_ms: u64,
     ) -> Result<ApplyOutcome, RuntimeStatusError> {
         after.validate()?;
@@ -2553,6 +2618,7 @@ impl RuntimeStatusState {
                 && last.id == id
                 && last.after == after
                 && last.reclaimed_tokens == reclaimed_tokens
+                && last.succeeded == succeeded
                 && last.finished_at_ms == at_ms
             {
                 return Ok(ApplyOutcome::Replay);
@@ -2576,16 +2642,20 @@ impl RuntimeStatusState {
             .ok_or(RuntimeStatusError::ContradictoryFacts {
                 field: "compactionTotals",
             })?;
-        if expected != reclaimed_tokens {
+        if expected != reclaimed_tokens
+            || (!succeeded && (after != active.before || reclaimed_tokens != 0))
+        {
             return Err(RuntimeStatusError::ContradictoryFacts {
                 field: "compactionTotals",
             });
         }
         let completed = CompletedCompaction {
             id,
+            reason: active.reason,
             before: active.before.clone(),
             after: after.clone(),
             reclaimed_tokens,
+            succeeded,
             started_at_ms: active.started_at_ms,
             finished_at_ms: at_ms,
         };
@@ -2833,20 +2903,25 @@ fn validate_context_status(status: &ContextStatus) -> Result<(), RuntimeStatusEr
     if let Some(completed) = &status.last_compaction {
         completed.before.validate()?;
         completed.after.validate()?;
+        let reconciles = completed
+            .before
+            .total_tokens
+            .checked_sub(completed.after.total_tokens)
+            == Some(completed.reclaimed_tokens);
+        let failed_attempt_is_unchanged = completed.succeeded
+            || (completed.before == completed.after && completed.reclaimed_tokens == 0);
         if completed.finished_at_ms < completed.started_at_ms
-            || completed
-                .before
-                .total_tokens
-                .checked_sub(completed.after.total_tokens)
-                != Some(completed.reclaimed_tokens)
+            || !reconciles
+            || !failed_attempt_is_unchanged
         {
             return Err(RuntimeStatusError::ContradictoryFacts {
                 field: "completedCompaction",
             });
         }
         if status.active_compaction.is_none()
-            && (status.current != completed.after
-                || status.updated_at_ms < completed.finished_at_ms)
+            && (status.updated_at_ms < completed.finished_at_ms
+                || (status.updated_at_ms == completed.finished_at_ms
+                    && status.current != completed.after))
         {
             return Err(RuntimeStatusError::ContradictoryFacts {
                 field: "completedCompaction",

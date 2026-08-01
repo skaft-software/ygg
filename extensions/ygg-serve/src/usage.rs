@@ -80,10 +80,11 @@ impl InferenceRequest {
 }
 
 /// Time span accepted by the usage stats endpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsagePeriod {
     /// The current UTC calendar day.
+    #[default]
     Daily,
     /// The trailing seven UTC calendar days, including today.
     Weekly,
@@ -141,12 +142,6 @@ pub struct UsageStats {
     pub models: Vec<ModelUsage>,
     /// Whether additional lower-usage model rows were omitted.
     pub models_truncated: bool,
-}
-
-impl Default for UsagePeriod {
-    fn default() -> Self {
-        Self::Daily
-    }
 }
 
 /// Lifetime token totals retained by the serve host.

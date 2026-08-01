@@ -452,7 +452,6 @@ pub struct Config {
     pub workspace_trusted: bool,
 }
 
-
 impl Config {
     /// Whether a tool will survive both the model-visible allowlist and the
     /// matching execution capability gate for this process.

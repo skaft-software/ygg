@@ -185,6 +185,41 @@ describe("TerminalPanel", () => {
     expect(terminal?.write).toHaveBeenLastCalledWith("reconnected replay\r\n");
   });
 
+  it("routes terminal links through an audited noopener anchor", async () => {
+    render(<TerminalPanel hostId="host-links" onClose={vi.fn()} />);
+    await waitFor(() => expect(xtermMocks.FakeTerminal.instances).toHaveLength(1));
+    const options = xtermMocks.FakeTerminal.instances[0]?.options;
+    const linkHandler = options?.linkHandler as
+      | {
+          activate: (event: MouseEvent, uri: string) => void;
+          allowNonHttpProtocols: boolean;
+        }
+      | undefined;
+    expect(linkHandler?.allowNonHttpProtocols).toBe(false);
+
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+    const preventDefault = vi.fn();
+    linkHandler?.activate(
+      { preventDefault } as unknown as MouseEvent,
+      "https://example.test/output",
+    );
+
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(click).toHaveBeenCalledOnce();
+    const clicked = click.mock.instances[0] as HTMLAnchorElement;
+    expect(clicked.href).toBe("https://example.test/output");
+    expect(clicked.target).toBe("_blank");
+    expect(clicked.rel).toBe("noopener noreferrer");
+
+    linkHandler?.activate(
+      { preventDefault } as unknown as MouseEvent,
+      "javascript:alert(1)",
+    );
+    expect(click).toHaveBeenCalledOnce();
+  });
+
   it("keeps four terminal tabs and supports font-size shortcuts", async () => {
     render(<TerminalPanel hostId="host-tabs" onClose={vi.fn()} />);
     await waitFor(() => expect(FakeTerminalWebSocket.instances).toHaveLength(1));

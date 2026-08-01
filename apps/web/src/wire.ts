@@ -9,6 +9,9 @@ import type {
   CommandAck,
   CommandDiscovery,
   CommandSuggestion,
+  ContextStatus,
+  ContextTotals,
+  ContextUsage,
   CompletionReview,
   DocumentReference,
   HostBootstrap,
@@ -46,6 +49,7 @@ import type {
   TrustedFileRead,
   TrustedFileSearchResult,
   UsageActivity,
+  UsageSnapshot,
   UsageStats,
   UsageTotals,
 } from "./protocol";
@@ -2248,6 +2252,346 @@ interface SnapshotContext {
   models?: readonly ModelSummary[];
 }
 
+const contextCategories = [
+  "system",
+  "projectInstructions",
+  "conversation",
+  "toolResults",
+  "attachments",
+  "documents",
+  "projectFiles",
+  "compactionSummaries",
+  "other",
+] as const;
+
+function projectUsageSnapshot(value: unknown, path: string): UsageSnapshot {
+  const usage = object(value, path, [
+    "inputTokens",
+    "outputTokens",
+    "contextTokens",
+    "contextLimit",
+  ]);
+  return {
+    inputTokens: number(usage.inputTokens, `${path}.inputTokens`),
+    outputTokens: number(usage.outputTokens, `${path}.outputTokens`),
+    contextTokens: number(usage.contextTokens, `${path}.contextTokens`),
+    contextLimit:
+      usage.contextLimit === undefined
+        ? undefined
+        : number(usage.contextLimit, `${path}.contextLimit`),
+  };
+}
+
+function projectContextTotals(value: unknown, path: string): ContextTotals {
+  const wire = object(value, path, ["categories", "totalTokens"]);
+  const rawCategories = array(wire.categories, `${path}.categories`);
+  if (rawCategories.length > 16) {
+    throw new WireContractError(
+      `${path}.categories`,
+      "must contain at most 16 categories",
+    );
+  }
+  const seen = new Set<string>();
+  const categories = rawCategories.map((value, index) => {
+    const categoryPath = `${path}.categories[${index}]`;
+    const entry = object(value, categoryPath, ["category", "tokens"]);
+    const category = enumeration(
+      entry.category,
+      `${categoryPath}.category`,
+      contextCategories,
+    );
+    if (seen.has(category)) {
+      throw new WireContractError(
+        `${path}.categories`,
+        `contains duplicate category ${category}`,
+      );
+    }
+    seen.add(category);
+    return {
+      category,
+      tokens: number(entry.tokens, `${categoryPath}.tokens`),
+    };
+  });
+  const totalTokens = number(wire.totalTokens, `${path}.totalTokens`);
+  const categorizedTokens = categories.reduce((total, category) => {
+    const next = total + category.tokens;
+    if (!Number.isSafeInteger(next)) {
+      throw new WireContractError(path, "category sum exceeds the safe integer range");
+    }
+    return next;
+  }, 0);
+  if (categorizedTokens !== totalTokens) {
+    throw new WireContractError(
+      path,
+      "category tokens must reconcile exactly with totalTokens",
+    );
+  }
+  return { categories, totalTokens };
+}
+
+function sameContextTotals(left: ContextTotals, right: ContextTotals): boolean {
+  return (
+    left.totalTokens === right.totalTokens &&
+    left.categories.length === right.categories.length &&
+    left.categories.every(
+      (entry, index) =>
+        entry.category === right.categories[index]?.category &&
+        entry.tokens === right.categories[index]?.tokens,
+    )
+  );
+}
+
+function projectContextStatus(value: unknown, path: string): ContextStatus {
+  const wire = object(value, path, [
+    "current",
+    "updatedAtMs",
+    "activeCompaction",
+    "lastCompaction",
+  ]);
+  const current = projectContextTotals(wire.current, `${path}.current`);
+  const updatedAtMs = number(wire.updatedAtMs, `${path}.updatedAtMs`);
+  const activeCompaction =
+    wire.activeCompaction === undefined || wire.activeCompaction === null
+      ? undefined
+      : (() => {
+          const activePath = `${path}.activeCompaction`;
+          const active = object(wire.activeCompaction, activePath, [
+            "id",
+            "reason",
+            "before",
+            "startedAtMs",
+          ]);
+          const projected = {
+            id: boundedString(active.id, `${activePath}.id`, 128),
+            reason: enumeration(active.reason, `${activePath}.reason`, [
+              "threshold",
+              "overflow",
+            ] as const),
+            before: projectContextTotals(active.before, `${activePath}.before`),
+            startedAtMs: number(active.startedAtMs, `${activePath}.startedAtMs`),
+          };
+          if (
+            !sameContextTotals(projected.before, current) ||
+            projected.startedAtMs < updatedAtMs
+          ) {
+            throw new WireContractError(
+              activePath,
+              "contains contradictory active-compaction facts",
+            );
+          }
+          return projected;
+        })();
+  const lastCompaction =
+    wire.lastCompaction === undefined || wire.lastCompaction === null
+      ? undefined
+      : (() => {
+          const completedPath = `${path}.lastCompaction`;
+          const completed = object(wire.lastCompaction, completedPath, [
+            "id",
+            "reason",
+            "before",
+            "after",
+            "reclaimedTokens",
+            "succeeded",
+            "startedAtMs",
+            "finishedAtMs",
+          ]);
+          const projected = {
+            id: boundedString(completed.id, `${completedPath}.id`, 128),
+            reason: enumeration(completed.reason, `${completedPath}.reason`, [
+              "threshold",
+              "overflow",
+            ] as const),
+            before: projectContextTotals(
+              completed.before,
+              `${completedPath}.before`,
+            ),
+            after: projectContextTotals(completed.after, `${completedPath}.after`),
+            reclaimedTokens: number(
+              completed.reclaimedTokens,
+              `${completedPath}.reclaimedTokens`,
+            ),
+            succeeded: boolean(completed.succeeded, `${completedPath}.succeeded`),
+            startedAtMs: number(
+              completed.startedAtMs,
+              `${completedPath}.startedAtMs`,
+            ),
+            finishedAtMs: number(
+              completed.finishedAtMs,
+              `${completedPath}.finishedAtMs`,
+            ),
+          };
+          const reconciled =
+            projected.before.totalTokens >= projected.after.totalTokens &&
+            projected.before.totalTokens - projected.after.totalTokens ===
+              projected.reclaimedTokens;
+          const failedAttemptIsUnchanged =
+            projected.succeeded ||
+            (sameContextTotals(projected.before, projected.after) &&
+              projected.reclaimedTokens === 0);
+          if (
+            projected.finishedAtMs < projected.startedAtMs ||
+            !reconciled ||
+            !failedAttemptIsUnchanged
+          ) {
+            throw new WireContractError(
+              completedPath,
+              "contains contradictory completed-compaction facts",
+            );
+          }
+          if (
+            activeCompaction === undefined &&
+            (updatedAtMs < projected.finishedAtMs ||
+              (updatedAtMs === projected.finishedAtMs &&
+                !sameContextTotals(current, projected.after)))
+          ) {
+            throw new WireContractError(
+              completedPath,
+              "does not reconcile with the current context state",
+            );
+          }
+          return projected;
+        })();
+  return { current, updatedAtMs, activeCompaction, lastCompaction };
+}
+
+function projectAgentRunTelemetry(
+  value: unknown,
+  path: string,
+): NonNullable<ContextUsage["run"]> {
+  const wire = object(value, path, [
+    "phase",
+    "terminalState",
+    "responsesStarted",
+    "responsesFinished",
+    "responsesDiscarded",
+    "responseActive",
+    "toolCallsStarted",
+    "toolCallsFinished",
+    "toolExecutionsStarted",
+    "toolExecutionsFinished",
+    "compactionsStarted",
+    "compactionsCompleted",
+    "compactionsFailed",
+  ]);
+  const run: NonNullable<ContextUsage["run"]> = {
+    phase: enumeration(wire.phase, `${path}.phase`, [
+      "preparing",
+      "responding",
+      "retrying",
+      "compacting",
+      "executingTool",
+      "finished",
+    ] as const),
+    terminalState:
+      wire.terminalState === undefined || wire.terminalState === null
+        ? undefined
+        : enumeration(wire.terminalState, `${path}.terminalState`, [
+            "completed",
+            "aborted",
+            "failed",
+            "maxTurns",
+            "dropped",
+          ] as const),
+    responsesStarted: number(wire.responsesStarted, `${path}.responsesStarted`),
+    responsesFinished: number(
+      wire.responsesFinished,
+      `${path}.responsesFinished`,
+    ),
+    responsesDiscarded: number(
+      wire.responsesDiscarded,
+      `${path}.responsesDiscarded`,
+    ),
+    responseActive: boolean(wire.responseActive, `${path}.responseActive`),
+    toolCallsStarted: number(
+      wire.toolCallsStarted,
+      `${path}.toolCallsStarted`,
+    ),
+    toolCallsFinished: number(
+      wire.toolCallsFinished,
+      `${path}.toolCallsFinished`,
+    ),
+    toolExecutionsStarted: number(
+      wire.toolExecutionsStarted,
+      `${path}.toolExecutionsStarted`,
+    ),
+    toolExecutionsFinished: number(
+      wire.toolExecutionsFinished,
+      `${path}.toolExecutionsFinished`,
+    ),
+    compactionsStarted: number(
+      wire.compactionsStarted,
+      `${path}.compactionsStarted`,
+    ),
+    compactionsCompleted: number(
+      wire.compactionsCompleted,
+      `${path}.compactionsCompleted`,
+    ),
+    compactionsFailed: number(
+      wire.compactionsFailed,
+      `${path}.compactionsFailed`,
+    ),
+  };
+  if ((run.phase === "finished") !== (run.terminalState !== undefined)) {
+    throw new WireContractError(
+      `${path}.terminalState`,
+      "must be present exactly for a finished run",
+    );
+  }
+  const settledResponses = run.responsesFinished + run.responsesDiscarded;
+  const accountedResponses = settledResponses + (run.responseActive ? 1 : 0);
+  if (
+    !Number.isSafeInteger(accountedResponses) ||
+    accountedResponses !== run.responsesStarted ||
+    (run.phase === "responding") !== run.responseActive ||
+    run.toolCallsFinished > run.toolCallsStarted ||
+    run.toolExecutionsFinished > run.toolExecutionsStarted ||
+    run.compactionsCompleted + run.compactionsFailed > run.compactionsStarted
+  ) {
+    throw new WireContractError(path, "contains contradictory lifecycle counters");
+  }
+  return run;
+}
+
+export function projectContextUsage(value: unknown, path = "context"): ContextUsage {
+  const wire = object(value, path, ["usage", "compactions", "status", "run"]);
+  const usage = projectUsageSnapshot(wire.usage, `${path}.usage`);
+  const compactions = number(wire.compactions, `${path}.compactions`);
+  if (compactions > 0xffff_ffff) {
+    throw new WireContractError(`${path}.compactions`, "must fit in an unsigned 32-bit integer");
+  }
+  const status =
+    wire.status === undefined
+      ? { current: { categories: [], totalTokens: 0 }, updatedAtMs: 0 }
+      : projectContextStatus(wire.status, `${path}.status`);
+  const run =
+    wire.run === undefined || wire.run === null
+      ? undefined
+      : projectAgentRunTelemetry(wire.run, `${path}.run`);
+  if (usage.contextTokens !== status.current.totalTokens) {
+    throw new WireContractError(
+      `${path}.usage.contextTokens`,
+      "must equal the reconciled context total",
+    );
+  }
+  if (run && compactions !== run.compactionsCompleted) {
+    throw new WireContractError(
+      `${path}.compactions`,
+      "must equal the successful run-compaction count",
+    );
+  }
+  return { usage, compactions, status, run };
+}
+
+function contextPercent(usage: UsageSnapshot): number {
+  return usage.contextLimit && usage.contextLimit > 0
+    ? Math.min(
+        100,
+        Math.round((usage.contextTokens / usage.contextLimit) * 100),
+      )
+    : 0;
+}
+
 function projectBranchEntry(
   value: unknown,
   path: string,
@@ -2397,30 +2741,11 @@ export function projectSessionSnapshot(
     "sessionSnapshot.model",
     context.models,
   );
-  const contextUsage = object(snapshot.context, "sessionSnapshot.context", [
-    "usage",
-    "compactions",
-  ]);
-  const usage = object(contextUsage.usage, "sessionSnapshot.context.usage", [
-    "inputTokens",
-    "outputTokens",
-    "contextTokens",
-    "contextLimit",
-  ]);
-  number(usage.inputTokens, "sessionSnapshot.context.usage.inputTokens");
-  number(usage.outputTokens, "sessionSnapshot.context.usage.outputTokens");
-  const contextTokens = number(
-    usage.contextTokens,
-    "sessionSnapshot.context.usage.contextTokens",
+  const contextUsage = projectContextUsage(
+    snapshot.context,
+    "sessionSnapshot.context",
   );
-  const contextLimit =
-    usage.contextLimit === undefined
-      ? undefined
-      : number(
-          usage.contextLimit,
-          "sessionSnapshot.context.usage.contextLimit",
-        );
-  number(contextUsage.compactions, "sessionSnapshot.context.compactions");
+  const contextTokens = contextUsage.usage.contextTokens;
   const timestampMs =
     context.timestampMs ??
     (context.summary ? Date.parse(context.summary.updatedAt) : 0);
@@ -2570,11 +2895,9 @@ export function projectSessionSnapshot(
       snapshot.authority,
       "sessionSnapshot.authority",
     ),
+    context: contextUsage,
     contextTokens,
-    contextPercent:
-      contextLimit && contextLimit > 0
-        ? Math.min(100, Math.round((contextTokens / contextLimit) * 100))
-        : 0,
+    contextPercent: contextPercent(contextUsage.usage),
     startedAt: context.summary?.updatedAt ?? iso(timestampMs),
     branches,
     items: [...items, ...requests],
@@ -3737,39 +4060,28 @@ export function projectEventEnvelope(
         ],
       };
     }
-    case "usage.updated": {
-      const data = object(event.data, "event.event.data", ["usage"]);
-      const usage = object(data.usage, "event.event.data.usage", [
-        "inputTokens",
-        "outputTokens",
-        "contextTokens",
-        "contextLimit",
-      ]);
-      number(usage.inputTokens, "event.event.data.usage.inputTokens");
-      number(usage.outputTokens, "event.event.data.usage.outputTokens");
-      const tokens = number(
-        usage.contextTokens,
-        "event.event.data.usage.contextTokens",
-      );
-      const limit =
-        usage.contextLimit === undefined
-          ? undefined
-          : number(
-              usage.contextLimit,
-              "event.event.data.usage.contextLimit",
-            );
+    case "context.updated": {
+      const data = object(event.data, "event.event.data", ["context"]);
       return {
-        type: "session.updated",
+        type: "context.updated",
         sessionId,
         actorGeneration,
         sequence,
-        patch: {
-          contextTokens: tokens,
-          contextPercent:
-            limit && limit > 0
-              ? Math.min(100, Math.round((tokens / limit) * 100))
-              : 0,
-        },
+        context: projectContextUsage(
+          data.context,
+          "event.event.data.context",
+        ),
+      };
+    }
+    case "usage.updated": {
+      const data = object(event.data, "event.event.data", ["usage"]);
+      return {
+        type: "usage.updated",
+        sessionId,
+        actorGeneration,
+        sequence,
+        observedAtMs: timestampMs,
+        usage: projectUsageSnapshot(data.usage, "event.event.data.usage"),
       };
     }
     default:

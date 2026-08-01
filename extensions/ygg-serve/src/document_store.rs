@@ -306,13 +306,13 @@ impl DocumentStore {
         ensure_private_directory(&source)?;
         ensure_private_directory(&text)?;
         ensure_private_directory(&metadata)?;
-        cleanup_temporary_files(&source);
-        cleanup_temporary_files(&text);
-        cleanup_temporary_files(&metadata);
+        cleanup_temporary_files(&source)?;
+        cleanup_temporary_files(&text)?;
+        cleanup_temporary_files(&metadata)?;
 
         let index = load_index(&source, &text, &metadata)?;
-        cleanup_orphans(&source, ".source", &index);
-        cleanup_orphans(&text, ".txt", &index);
+        cleanup_orphans(&source, ".source", &index)?;
+        cleanup_orphans(&text, ".txt", &index)?;
 
         Ok(Self {
             inner: Arc::new(StoreInner {
@@ -466,6 +466,63 @@ impl DocumentStore {
             documents.push(stored.reference);
         }
         Ok(DocumentPromptContext { documents, text })
+    }
+
+    /// Removes all immutable documents owned by one permanently deleted session.
+    ///
+    /// The project/session pair is authoritative, and repeated deletion is a
+    /// no-op so a durable deletion journal can safely retry after interruption.
+    pub fn delete_session(
+        &self,
+        project_id: &str,
+        session_id: &str,
+    ) -> Result<(), DocumentStoreError> {
+        let project_id = validate_association_id(project_id)?;
+        let session_id = validate_association_id(session_id)?;
+        let mut index = self
+            .inner
+            .index
+            .lock()
+            .map_err(|_| DocumentStoreError::Storage)?;
+        let removed_ids = index
+            .metadata
+            .values()
+            .filter(|metadata| {
+                metadata.project_id == project_id && metadata.session_id == session_id
+            })
+            .map(|metadata| metadata.id.clone())
+            .collect::<Vec<_>>();
+        if removed_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Remove and sync ownership metadata first. If deletion is interrupted,
+        // startup orphan reconciliation removes the now-unindexed payloads
+        // before the deletion journal is allowed to complete.
+        for id in &removed_ids {
+            remove_file_if_exists(&self.inner.metadata.join(format!("{id}.json")))?;
+        }
+        sync_directory(&self.inner.metadata)?;
+        for id in &removed_ids {
+            remove_file_if_exists(&self.inner.source.join(format!("{id}.source")))?;
+            remove_file_if_exists(&self.inner.text.join(format!("{id}.txt")))?;
+        }
+        sync_directory(&self.inner.source)?;
+        sync_directory(&self.inner.text)?;
+
+        let removed_ids = removed_ids.into_iter().collect::<BTreeSet<_>>();
+        let retained = index
+            .metadata
+            .values()
+            .filter(|metadata| !removed_ids.contains(&metadata.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut rebuilt = StoreIndex::default();
+        for metadata in retained {
+            apply_usage(&mut rebuilt, metadata)?;
+        }
+        *index = rebuilt;
+        Ok(())
     }
 
     fn commit_ingested(
@@ -845,6 +902,14 @@ fn owner_private_file(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
+fn remove_file_if_exists(path: &Path) -> Result<(), DocumentStoreError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(DocumentStoreError::Storage),
+    }
+}
+
 fn atomic_create(
     directory: &Path,
     destination: &Path,
@@ -871,7 +936,7 @@ fn atomic_create(
         return Err(DocumentStoreError::Storage);
     }
     let _ = std::fs::remove_file(&temporary);
-    sync_directory(directory);
+    sync_directory(directory)?;
     Ok(())
 }
 
@@ -922,45 +987,50 @@ fn read_private_file(
     Ok(bytes)
 }
 
-fn cleanup_temporary_files(directory: &Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn cleanup_temporary_files(directory: &Path) -> Result<(), DocumentStoreError> {
+    let entries = std::fs::read_dir(directory).map_err(|_| DocumentStoreError::Storage)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| DocumentStoreError::Storage)?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.strip_prefix(".tmp-").is_some_and(|suffix| {
             suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
         }) {
-            let _ = std::fs::remove_file(entry.path());
+            remove_file_if_exists(&entry.path())?;
         }
     }
+    sync_directory(directory)
 }
 
-fn cleanup_orphans(directory: &Path, suffix: &str, index: &StoreIndex) {
+fn cleanup_orphans(
+    directory: &Path,
+    suffix: &str,
+    index: &StoreIndex,
+) -> Result<(), DocumentStoreError> {
     let expected = index
         .metadata
         .keys()
         .map(|id| format!("{id}{suffix}"))
         .collect::<BTreeSet<_>>();
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(directory).map_err(|_| DocumentStoreError::Storage)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| DocumentStoreError::Storage)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
         if name.ends_with(suffix) && !expected.contains(name) {
-            let _ = std::fs::remove_file(entry.path());
+            remove_file_if_exists(&entry.path())?;
         }
     }
+    sync_directory(directory)
 }
 
-fn sync_directory(path: &Path) {
-    if let Ok(directory) = File::open(path) {
-        let _ = directory.sync_all();
-    }
+fn sync_directory(path: &Path) -> Result<(), DocumentStoreError> {
+    let directory = File::open(path).map_err(|_| DocumentStoreError::Storage)?;
+    directory
+        .sync_all()
+        .map_err(|_| DocumentStoreError::Storage)
 }
 
 fn random_hex(byte_len: usize) -> Result<String, DocumentStoreError> {

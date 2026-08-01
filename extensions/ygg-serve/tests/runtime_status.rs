@@ -705,6 +705,7 @@ fn compaction_start_finish_replays_and_reconciles_totals_exactly() {
         .unwrap();
     let start = RuntimeEvent::CompactionStarted {
         id: id("compact.1"),
+        reason: ContextCompactionReason::Threshold,
         before: before.clone(),
         at_ms: 11,
     };
@@ -726,6 +727,7 @@ fn compaction_start_finish_replays_and_reconciles_totals_exactly() {
             id: id("compact.1"),
             after: after.clone(),
             reclaimed_tokens: 799,
+            succeeded: true,
             at_ms: 12,
         })
         .is_err());
@@ -733,6 +735,7 @@ fn compaction_start_finish_replays_and_reconciles_totals_exactly() {
         id: id("compact.1"),
         after: after.clone(),
         reclaimed_tokens: 800,
+        succeeded: true,
         at_ms: 12,
     };
     assert_eq!(state.apply(finish.clone()).unwrap(), ApplyOutcome::Applied);
@@ -741,6 +744,7 @@ fn compaction_start_finish_replays_and_reconciles_totals_exactly() {
         state
             .apply(RuntimeEvent::CompactionStarted {
                 id: id("compact.1"),
+                reason: ContextCompactionReason::Threshold,
                 before,
                 at_ms: 11,
             })
@@ -761,6 +765,7 @@ fn durable_event_replay_reconstructs_identical_context_state() {
         },
         RuntimeEvent::CompactionStarted {
             id: id("compact"),
+            reason: ContextCompactionReason::Overflow,
             before: totals(&[(ContextCategory::Conversation, 1_000)]),
             at_ms: 2,
         },
@@ -771,6 +776,7 @@ fn durable_event_replay_reconstructs_identical_context_state() {
                 (ContextCategory::CompactionSummaries, 50),
             ]),
             reclaimed_tokens: 700,
+            succeeded: true,
             at_ms: 3,
         },
     ];

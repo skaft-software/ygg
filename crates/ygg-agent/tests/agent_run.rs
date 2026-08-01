@@ -1832,6 +1832,37 @@ async fn text_only_completion() {
 }
 
 #[tokio::test]
+async fn consuming_an_unfinished_run_returns_its_dropped_context_snapshot() {
+    let mut h = harness(vec![text_turn("unused")], Some(4)).await;
+    let run = h.agent.prompt("stop before polling").await.unwrap();
+
+    let snapshot = run.into_context_snapshot();
+
+    assert_eq!(snapshot.phase, ygg_agent::RunPhase::Finished);
+    assert_eq!(
+        snapshot.terminal_state,
+        Some(ygg_agent::RunTerminalState::Dropped)
+    );
+    assert!(snapshot.context.total_tokens > 0);
+    assert!(snapshot.context.context_limit > 0);
+}
+
+#[tokio::test]
+async fn context_snapshot_polling_does_not_mutate_durable_history() {
+    let mut h = harness(vec![text_turn("unused")], Some(4)).await;
+    let session_path = h.session_path.clone();
+    let run = h.agent.prompt("observe without writing").await.unwrap();
+    let durable_before = std::fs::read(&session_path).unwrap();
+
+    let first = run.context_snapshot();
+    let second = run.context_snapshot();
+
+    assert_eq!(first, second);
+    assert_eq!(std::fs::read(&session_path).unwrap(), durable_before);
+    drop(run);
+}
+
+#[tokio::test]
 async fn run_context_snapshot_updates_without_a_presentation_layer() {
     let mut h = harness(vec![text_turn("streamed context")], Some(4)).await;
     let mut run = h.agent.prompt("track it").await.unwrap();
@@ -1844,6 +1875,11 @@ async fn run_context_snapshot_updates_without_a_presentation_layer() {
     let snapshot = run.context_snapshot();
     assert_eq!(snapshot.responses_started, 1);
     assert_eq!(snapshot.responses_finished, 1);
+    assert_eq!(snapshot.phase, ygg_agent::RunPhase::Finished);
+    assert_eq!(
+        snapshot.terminal_state,
+        Some(ygg_agent::RunTerminalState::Completed)
+    );
     assert!(snapshot.response_text_bytes >= "streamed context".len() as u64);
     assert!(snapshot.response_usage.total_tokens > 0);
     assert_eq!(snapshot.run_usage, snapshot.response_usage);

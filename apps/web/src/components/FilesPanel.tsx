@@ -141,6 +141,7 @@ function GitStatusIndicators({
       ))}
     </span>
   );
+}
 
 async function copyText(text: string): Promise<void> {
   try {

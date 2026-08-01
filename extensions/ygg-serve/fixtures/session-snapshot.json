@@ -32,7 +32,19 @@
       "contextTokens": 165,
       "contextLimit": 128000
     },
-    "compactions": 1
+    "compactions": 1,
+    "status": {
+      "current": {
+        "categories": [
+          {
+            "category": "other",
+            "tokens": 165
+          }
+        ],
+        "totalTokens": 165
+      },
+      "updatedAtMs": 1721000000042
+    }
   },
   "items": [
     {

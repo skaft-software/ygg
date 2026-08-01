@@ -211,7 +211,11 @@ function openTerminalLink(event: MouseEvent, uri: string): void {
   try {
     const link = new URL(uri);
     if (link.protocol === "http:" || link.protocol === "https:") {
-      window.open(link.toString(), "_blank", "noopener,noreferrer");
+      const anchor = document.createElement("a");
+      anchor.href = link.toString();
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+      anchor.click();
     }
   } catch {
     // The link addon only recognizes web URLs; ignore malformed output safely.
@@ -286,6 +290,10 @@ function createCachedTerminal(ownerKey: string): CachedTerminal {
     cursorStyle: "bar",
     fontFamily: cssColor("--mono-family", "ui-monospace, monospace"),
     lineHeight: 1.2,
+    linkHandler: {
+      activate: openTerminalLink,
+      allowNonHttpProtocols: false,
+    },
     macOptionIsMeta: true,
     rightClickSelectsWord: true,
     scrollback: 5_000,

@@ -110,6 +110,73 @@ describe("projectRuntimeSnapshot", () => {
     );
   });
 
+  it("projects explicit compaction reasons, failure semantics, and context sources", () => {
+    const snapshot = emptySnapshot();
+    snapshot.context = {
+      current: {
+        categories: [
+          { category: "documents", tokens: 40 },
+          { category: "projectFiles", tokens: 60 },
+        ],
+        totalTokens: 100,
+      },
+      updatedAtMs: 20,
+      lastCompaction: {
+        id: "compaction-1",
+        reason: "overflow",
+        before: {
+          categories: [
+            { category: "documents", tokens: 40 },
+            { category: "projectFiles", tokens: 60 },
+          ],
+          totalTokens: 100,
+        },
+        after: {
+          categories: [
+            { category: "documents", tokens: 40 },
+            { category: "projectFiles", tokens: 60 },
+          ],
+          totalTokens: 100,
+        },
+        reclaimedTokens: 0,
+        succeeded: false,
+        startedAtMs: 10,
+        finishedAtMs: 20,
+      },
+    };
+
+    const projected = projectRuntimeSnapshot(snapshot);
+    expect(
+      projected.context.current.categories.map(({ category }) => category),
+    ).toEqual(["documents", "projectFiles"]);
+    expect(projected.context.lastCompaction).toMatchObject({
+      reason: "overflow",
+      succeeded: false,
+      reclaimedTokens: 0,
+    });
+
+    const changedFailure = structuredClone(snapshot);
+    const completed = (
+      changedFailure.context as {
+        lastCompaction: {
+          after: {
+            categories: Array<{ category: string; tokens: number }>;
+            totalTokens: number;
+          };
+          reclaimedTokens: number;
+        };
+      }
+    ).lastCompaction;
+    completed.after = {
+      categories: [{ category: "projectFiles", tokens: 80 }],
+      totalTokens: 80,
+    };
+    completed.reclaimedTokens = 20;
+    expect(() => projectRuntimeSnapshot(changedFailure)).toThrow(
+      /contradictory completed-compaction facts/,
+    );
+  });
+
   it("projects strict tagged catalog and policy variants", () => {
     const snapshot = emptySnapshot();
     snapshot.catalog = {

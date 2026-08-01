@@ -453,6 +453,22 @@ describe("conversation composer", () => {
     session.modelId = "claude-sonnet-4-6";
     session.contextTokens = 240_000;
     session.contextPercent = 60;
+    session.context = {
+      usage: {
+        inputTokens: 240_000,
+        outputTokens: 0,
+        contextTokens: 240_000,
+        contextLimit: 400_000,
+      },
+      compactions: 0,
+      status: {
+        current: {
+          categories: [{ category: "other", tokens: 240_000 }],
+          totalTokens: 240_000,
+        },
+        updatedAtMs: 1,
+      },
+    };
     render(
       <Conversation
         session={session}
@@ -470,9 +486,76 @@ describe("conversation composer", () => {
     expect(screen.getByText("~$1.44")).toBeVisible();
     expect(
       screen.getByLabelText(
-        "60% of context used; estimated next-turn input cost ~$1.44",
+        "60% of context used (240,000 of 400,000 tokens); Breakdown: unattributed 240,000; Estimated next-turn input cost ~$1.44",
       ),
     ).toBeVisible();
+  });
+
+  it("projects live context sources and compaction lifecycle in the composer", () => {
+    const session = structuredClone(fixtureSessions["session-live"]!);
+    const totals = {
+      categories: [
+        { category: "documents" as const, tokens: 20_000 },
+        { category: "projectFiles" as const, tokens: 30_000 },
+      ],
+      totalTokens: 50_000,
+    };
+    session.contextTokens = 50_000;
+    session.contextPercent = 25;
+    session.context = {
+      usage: {
+        inputTokens: 50_000,
+        outputTokens: 1_000,
+        contextTokens: 50_000,
+        contextLimit: 200_000,
+      },
+      compactions: 0,
+      status: {
+        current: totals,
+        updatedAtMs: 100,
+        activeCompaction: {
+          id: "run-live:compaction:1",
+          reason: "overflow",
+          before: totals,
+          startedAtMs: 101,
+        },
+      },
+      run: {
+        phase: "compacting",
+        responsesStarted: 1,
+        responsesFinished: 0,
+        responsesDiscarded: 1,
+        responseActive: false,
+        toolCallsStarted: 0,
+        toolCallsFinished: 0,
+        toolExecutionsStarted: 0,
+        toolExecutionsFinished: 0,
+        compactionsStarted: 1,
+        compactionsCompleted: 0,
+        compactionsFailed: 0,
+      },
+    };
+
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Compacting")).toBeVisible();
+    const context = screen.getByLabelText(/Compacting after overflow trigger/);
+    expect(context).toHaveAttribute("data-run-phase", "compacting");
+    expect(context).toHaveAttribute("data-compaction-active", "true");
+    expect(context).toHaveAccessibleName(/documents 20,000/);
+    expect(context).toHaveAccessibleName(/project files 30,000/);
   });
 
   it("edits, retries with a model, and forks only from durable checkpoints", async () => {

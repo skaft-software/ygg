@@ -1,1 +1,2 @@
 extensions/ygg-serve/web/** -text
+extensions/ygg-serve/vendor/lopdf/** whitespace=-trailing-space,-blank-at-eof

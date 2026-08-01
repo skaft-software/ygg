@@ -26,6 +26,8 @@ const MAX_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_RUN_RECORD_BYTES: u64 = 512 * 1024;
 const MAX_RUN_RECORD_COUNT: usize = 16_384;
 const MAX_RUN_RECORD_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+const RUN_RECORD_OWNER_VERSION: u16 = 1;
+const MAX_RUN_RECORD_OWNER_BYTES: u64 = 4 * 1024;
 const MAX_COMMIT_BYTES: u64 = 64 * 1024;
 const MAX_COMMIT_BINDINGS: usize = 64;
 const METADATA_VERSION: u16 = 1;
@@ -132,6 +134,14 @@ struct StoredCommit {
     bindings: Vec<StoredCommitBinding>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredRunRecordOwner {
+    version: u16,
+    session_id: String,
+    durable_entry_id: String,
+}
+
 #[derive(Default)]
 struct StoreIndex {
     metadata: BTreeMap<String, StoredMetadata>,
@@ -151,6 +161,7 @@ struct StoreInner {
     bindings: PathBuf,
     records: PathBuf,
     run_records: PathBuf,
+    run_record_owners: PathBuf,
     commits: PathBuf,
     index: Mutex<StoreIndex>,
 }
@@ -181,19 +192,23 @@ impl ResourceStore {
         let bindings = root.join("bindings");
         let records = root.join("records");
         let run_records = root.join("run-records");
+        let run_record_owners = root.join("run-record-owners");
         let commits = root.join("commits");
         ensure_private_directory(&blobs)?;
         ensure_private_directory(&metadata)?;
         ensure_private_directory(&bindings)?;
         ensure_private_directory(&records)?;
         ensure_private_directory(&run_records)?;
+        ensure_private_directory(&run_record_owners)?;
         ensure_private_directory(&commits)?;
-        cleanup_temporary_files(&blobs);
-        cleanup_temporary_files(&metadata);
-        cleanup_temporary_files(&bindings);
-        cleanup_temporary_files(&records);
-        cleanup_temporary_files(&run_records);
-        cleanup_temporary_files(&commits);
+        cleanup_temporary_files(&blobs)?;
+        cleanup_temporary_files(&metadata)?;
+        cleanup_temporary_files(&bindings)?;
+        cleanup_temporary_files(&records)?;
+        cleanup_temporary_files(&run_records)?;
+        cleanup_temporary_files(&run_record_owners)?;
+        cleanup_run_record_state(&run_records, &run_record_owners)?;
+        cleanup_temporary_files(&commits)?;
 
         let mut candidates = BTreeMap::new();
         let mut corrupt_candidates = BTreeSet::new();
@@ -269,10 +284,10 @@ impl ResourceStore {
         index
             .sessions_by_handle
             .retain(|handle, _| index.metadata.contains_key(handle));
-        cleanup_unbound_resources(&metadata, &blobs, &index.metadata);
-        cleanup_invalid_bindings(&bindings, &index.bindings);
-        cleanup_invalid_records(&records, &index.commits);
-        cleanup_invalid_records(&commits, &index.commits);
+        cleanup_unbound_resources(&metadata, &blobs, &index.metadata)?;
+        cleanup_invalid_bindings(&bindings, &index.bindings)?;
+        cleanup_invalid_records(&records, &index.commits)?;
+        cleanup_invalid_records(&commits, &index.commits)?;
 
         Ok(Self {
             inner: Arc::new(StoreInner {
@@ -283,6 +298,7 @@ impl ResourceStore {
                 bindings,
                 records,
                 run_records,
+                run_record_owners,
                 commits,
                 index: Mutex::new(index),
             }),
@@ -478,34 +494,76 @@ impl ResourceStore {
         {
             return Err(ResourceStoreError::InvalidBoundary);
         }
+        let _index = self
+            .inner
+            .index
+            .lock()
+            .map_err(|_| ResourceStoreError::Storage)?;
         let file_key = run_record_file_key(session_id, durable_entry_id);
         let path = self.inner.run_records.join(format!("{file_key}.json"));
-        match read_regular_file(&path, MAX_RUN_RECORD_BYTES) {
-            Ok(existing) if existing == bytes => return Ok(()),
+        let record_preexisted = match read_regular_file(&path, MAX_RUN_RECORD_BYTES) {
+            Ok(existing) if existing == bytes => true,
             Ok(_) => return Err(ResourceStoreError::Storage),
-            Err(ResourceStoreError::NotFound) => {}
+            Err(ResourceStoreError::NotFound) => false,
             Err(error) => return Err(error),
-        }
-        let mut count = 0usize;
-        let mut total = 0u64;
-        let entries =
-            std::fs::read_dir(&self.inner.run_records).map_err(|_| ResourceStoreError::Storage)?;
-        for entry in entries {
-            let entry = entry.map_err(|_| ResourceStoreError::Storage)?;
-            let metadata = entry.metadata().map_err(|_| ResourceStoreError::Storage)?;
-            if metadata.is_file() {
-                count = count.saturating_add(1);
-                total = total.saturating_add(metadata.len());
+        };
+        if !record_preexisted {
+            let mut count = 0usize;
+            let mut total = 0u64;
+            let entries = std::fs::read_dir(&self.inner.run_records)
+                .map_err(|_| ResourceStoreError::Storage)?;
+            for entry in entries {
+                let entry = entry.map_err(|_| ResourceStoreError::Storage)?;
+                let metadata = entry.metadata().map_err(|_| ResourceStoreError::Storage)?;
+                if metadata.is_file() {
+                    count = count.saturating_add(1);
+                    total = total.saturating_add(metadata.len());
+                }
+            }
+            if count >= MAX_RUN_RECORD_COUNT
+                || total
+                    .checked_add(bytes.len() as u64)
+                    .is_none_or(|size| size > MAX_RUN_RECORD_TOTAL_BYTES)
+            {
+                return Err(ResourceStoreError::QuotaExceeded);
             }
         }
-        if count >= MAX_RUN_RECORD_COUNT
-            || total
-                .checked_add(bytes.len() as u64)
-                .is_none_or(|size| size > MAX_RUN_RECORD_TOTAL_BYTES)
-        {
-            return Err(ResourceStoreError::QuotaExceeded);
+
+        let owner = StoredRunRecordOwner {
+            version: RUN_RECORD_OWNER_VERSION,
+            session_id: session_id.as_str().to_owned(),
+            durable_entry_id: durable_entry_id.as_str().to_owned(),
+        };
+        let owner_bytes = serde_json::to_vec(&owner).map_err(|_| ResourceStoreError::Storage)?;
+        let owner_path = self
+            .inner
+            .run_record_owners
+            .join(format!("{file_key}.json"));
+        let owner_preexisted = match read_regular_file(&owner_path, MAX_RUN_RECORD_OWNER_BYTES) {
+            Ok(existing) => match serde_json::from_slice::<StoredRunRecordOwner>(&existing) {
+                Ok(existing) if existing == owner => true,
+                Ok(_) | Err(_) => return Err(ResourceStoreError::Storage),
+            },
+            Err(ResourceStoreError::NotFound) => false,
+            Err(error) => return Err(error),
+        };
+        if !owner_preexisted {
+            // Commit ownership first. An interrupted write can leave an orphan
+            // owner manifest, but permanent-deletion recovery can then derive
+            // and remove the corresponding record path. The inverse ordering
+            // could leave an ownerless record that cannot be recovered safely.
+            atomic_write(&self.inner.run_record_owners, &owner_path, &owner_bytes)?;
         }
-        atomic_write(&self.inner.run_records, &path, bytes)
+        if !record_preexisted {
+            if let Err(error) = atomic_write(&self.inner.run_records, &path, bytes) {
+                if !owner_preexisted {
+                    let _ = remove_file_if_exists(&owner_path);
+                    let _ = sync_directory(&self.inner.run_record_owners);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Loads one immutable adapter-owned run/review projection.
@@ -521,6 +579,108 @@ impl ResourceStore {
             return Err(ResourceStoreError::Corrupt);
         }
         Ok(Bytes::from(bytes))
+    }
+
+    /// Removes evidence, records, and semantic run sidecars for one permanently
+    /// deleted session.
+    ///
+    /// Resource bytes survive only when another session still has a binding to
+    /// the same handle. Repeated calls are safe for deletion-journal recovery.
+    pub fn delete_session(&self, session_id: &SessionId) -> Result<(), ResourceStoreError> {
+        let mut index = self
+            .inner
+            .index
+            .lock()
+            .map_err(|_| ResourceStoreError::Storage)?;
+        let removed_bindings = index
+            .bindings
+            .keys()
+            .filter(|key| key.session_id == session_id.as_str())
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed_records = index
+            .commits
+            .keys()
+            .filter(|key| key.session_id == session_id.as_str())
+            .cloned()
+            .collect::<Vec<_>>();
+        let candidate_handles = removed_bindings
+            .iter()
+            .filter_map(|key| index.bindings.get(key).cloned())
+            .collect::<BTreeSet<_>>();
+        let removed_binding_set = removed_bindings.iter().cloned().collect::<BTreeSet<_>>();
+        let retained_handles = index
+            .bindings
+            .iter()
+            .filter(|(key, _)| !removed_binding_set.contains(*key))
+            .map(|(_, handle)| handle.clone())
+            .collect::<BTreeSet<_>>();
+        let orphaned_handles = candidate_handles
+            .difference(&retained_handles)
+            .cloned()
+            .collect::<Vec<_>>();
+        let run_record_paths = run_record_paths_for_session(
+            &self.inner.run_records,
+            &self.inner.run_record_owners,
+            session_id,
+        )?;
+
+        // Delete payloads first and fsync each owning directory before
+        // deleting the manifests that make an interrupted operation
+        // discoverable. This makes every durable prefix safe to retry.
+        for key in &removed_records {
+            let entry_id = DurableEntryId::new(key.durable_entry_id.clone())
+                .map_err(|_| ResourceStoreError::Storage)?;
+            let file_key = record_file_key(session_id, &entry_id);
+            remove_file_if_exists(&self.inner.records.join(format!("{file_key}.json")))?;
+        }
+        sync_directory(&self.inner.records)?;
+        for path in &run_record_paths.records {
+            remove_file_if_exists(path)?;
+        }
+        sync_directory(&self.inner.run_records)?;
+        for handle in &orphaned_handles {
+            remove_file_if_exists(&self.inner.blobs.join(format!("{handle}.blob")))?;
+        }
+        sync_directory(&self.inner.blobs)?;
+        for handle in &orphaned_handles {
+            remove_file_if_exists(&self.inner.metadata.join(format!("{handle}.json")))?;
+        }
+        sync_directory(&self.inner.metadata)?;
+
+        for key in &removed_records {
+            let entry_id = DurableEntryId::new(key.durable_entry_id.clone())
+                .map_err(|_| ResourceStoreError::Storage)?;
+            let file_key = record_file_key(session_id, &entry_id);
+            remove_file_if_exists(&self.inner.commits.join(format!("{file_key}.json")))?;
+        }
+        sync_directory(&self.inner.commits)?;
+        for path in &run_record_paths.owners {
+            remove_file_if_exists(path)?;
+        }
+        sync_directory(&self.inner.run_record_owners)?;
+        for key in &removed_bindings {
+            remove_file_if_exists(
+                &self
+                    .inner
+                    .bindings
+                    .join(format!("{}.json", binding_file_key(key))),
+            )?;
+        }
+        sync_directory(&self.inner.bindings)?;
+
+        for key in removed_bindings {
+            index.bindings.remove(&key);
+        }
+        for key in removed_records {
+            index.commits.remove(&key);
+        }
+        for handle in orphaned_handles {
+            index.metadata.remove(&handle);
+            index.corrupt_handles.remove(&handle);
+        }
+        rebuild_resource_usage(&mut index);
+        Ok(())
     }
 
     /// Commits one adapter-owned evidence record after all resource bindings.
@@ -790,15 +950,15 @@ fn ensure_private_directory(path: &Path) -> Result<(), ResourceStoreError> {
     Ok(())
 }
 
-fn cleanup_temporary_files(directory: &Path) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn cleanup_temporary_files(directory: &Path) -> Result<(), ResourceStoreError> {
+    let entries = std::fs::read_dir(directory).map_err(|_| ResourceStoreError::Storage)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| ResourceStoreError::Storage)?;
         if entry.file_name().to_string_lossy().starts_with(".tmp-") {
-            let _ = std::fs::remove_file(entry.path());
+            remove_file_if_exists(&entry.path())?;
         }
     }
+    sync_directory(directory)
 }
 
 fn load_metadata(
@@ -976,41 +1136,241 @@ fn cleanup_unbound_resources(
     metadata_dir: &Path,
     blobs_dir: &Path,
     metadata: &BTreeMap<String, StoredMetadata>,
-) {
+) -> Result<(), ResourceStoreError> {
     cleanup_handle_files(metadata_dir, ".json", |handle| {
         metadata.contains_key(handle)
-    });
-    cleanup_handle_files(blobs_dir, ".blob", |handle| metadata.contains_key(handle));
+    })?;
+    cleanup_handle_files(blobs_dir, ".blob", |handle| metadata.contains_key(handle))
 }
 
-fn cleanup_invalid_bindings(directory: &Path, bindings: &BTreeMap<BindingKey, String>) {
+fn cleanup_invalid_bindings(
+    directory: &Path,
+    bindings: &BTreeMap<BindingKey, String>,
+) -> Result<(), ResourceStoreError> {
     let expected = bindings
         .keys()
         .map(binding_file_key)
         .collect::<BTreeSet<_>>();
-    cleanup_handle_files(directory, ".json", |key| expected.contains(key));
+    cleanup_handle_files(directory, ".json", |key| expected.contains(key))
 }
 
-fn cleanup_invalid_records(directory: &Path, commits: &BTreeMap<RecordKey, StoredCommit>) {
+fn cleanup_invalid_records(
+    directory: &Path,
+    commits: &BTreeMap<RecordKey, StoredCommit>,
+) -> Result<(), ResourceStoreError> {
     let expected = commits
         .keys()
         .map(|key| sha256_hex(format!("{}\0{}", key.session_id, key.durable_entry_id).as_bytes()))
         .collect::<BTreeSet<_>>();
-    cleanup_handle_files(directory, ".json", |key| expected.contains(key));
+    cleanup_handle_files(directory, ".json", |key| expected.contains(key))
 }
 
-fn cleanup_handle_files(directory: &Path, suffix: &str, keep: impl Fn(&str) -> bool) {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn cleanup_handle_files(
+    directory: &Path,
+    suffix: &str,
+    keep: impl Fn(&str) -> bool,
+) -> Result<(), ResourceStoreError> {
+    let entries = std::fs::read_dir(directory).map_err(|_| ResourceStoreError::Storage)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| ResourceStoreError::Storage)?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let Some(key) = name.strip_suffix(suffix) else {
             continue;
         };
         if valid_handle(key) && !keep(key) {
-            let _ = std::fs::remove_file(entry.path());
+            remove_file_if_exists(&entry.path())?;
+        }
+    }
+    sync_directory(directory)
+}
+
+fn cleanup_run_record_state(run_records: &Path, owners: &Path) -> Result<(), ResourceStoreError> {
+    let owner_entries = std::fs::read_dir(owners).map_err(|_| ResourceStoreError::Storage)?;
+    for entry in owner_entries {
+        let entry = entry.map_err(|_| ResourceStoreError::Storage)?;
+        let name = entry.file_name();
+        let Some(file_key) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            continue;
+        };
+        if !valid_handle(file_key) {
+            continue;
+        }
+        let owner = read_regular_file(&entry.path(), MAX_RUN_RECORD_OWNER_BYTES)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StoredRunRecordOwner>(&bytes).ok());
+        let valid_owner = owner.is_some_and(|owner| {
+            let Ok(session_id) = SessionId::new(owner.session_id) else {
+                return false;
+            };
+            let Ok(entry_id) = DurableEntryId::new(owner.durable_entry_id) else {
+                return false;
+            };
+            owner.version == RUN_RECORD_OWNER_VERSION
+                && run_record_file_key(&session_id, &entry_id) == file_key
+        });
+        let record_path = run_records.join(format!("{file_key}.json"));
+        let valid_record = read_regular_file(&record_path, MAX_RUN_RECORD_BYTES)
+            .ok()
+            .is_some_and(|bytes| {
+                !bytes.is_empty() && serde_json::from_slice::<serde_json::Value>(&bytes).is_ok()
+            });
+        if !valid_owner || !valid_record {
+            // A corrupt owner cannot safely attribute its same-key record to a
+            // session. Remove both halves rather than retaining an unreachable
+            // permanent-deletion sidecar.
+            remove_file_if_exists(&record_path)?;
+            remove_file_if_exists(&entry.path())?;
+        }
+    }
+    sync_directory(owners)?;
+    sync_directory(run_records)?;
+
+    // Valid ownerless JSON records predate owner manifests. Keep those for
+    // compatibility; permanent deletion attributes them through their bounded
+    // top-level `sessionId`. Invalid records are never useful and must not
+    // consume the bounded run-record quota forever.
+    let record_entries = std::fs::read_dir(run_records).map_err(|_| ResourceStoreError::Storage)?;
+    for entry in record_entries {
+        let entry = entry.map_err(|_| ResourceStoreError::Storage)?;
+        let name = entry.file_name();
+        let Some(file_key) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            continue;
+        };
+        if !valid_handle(file_key) {
+            continue;
+        }
+        let valid = read_regular_file(&entry.path(), MAX_RUN_RECORD_BYTES)
+            .ok()
+            .is_some_and(|bytes| {
+                !bytes.is_empty() && serde_json::from_slice::<serde_json::Value>(&bytes).is_ok()
+            });
+        if !valid {
+            remove_file_if_exists(&entry.path())?;
+        }
+    }
+    sync_directory(run_records)
+}
+
+struct RunRecordDeletionPaths {
+    records: BTreeSet<PathBuf>,
+    owners: BTreeSet<PathBuf>,
+}
+
+fn run_record_paths_for_session(
+    run_records: &Path,
+    owners: &Path,
+    session_id: &SessionId,
+) -> Result<RunRecordDeletionPaths, ResourceStoreError> {
+    let mut paths = RunRecordDeletionPaths {
+        records: BTreeSet::new(),
+        owners: BTreeSet::new(),
+    };
+    let owner_entries = std::fs::read_dir(owners).map_err(|_| ResourceStoreError::Storage)?;
+    for entry in owner_entries {
+        let entry = entry.map_err(|_| ResourceStoreError::Storage)?;
+        if !entry
+            .file_type()
+            .map_err(|_| ResourceStoreError::Storage)?
+            .is_file()
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(file_key) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+            continue;
+        };
+        if !valid_handle(file_key) {
+            continue;
+        }
+        let Ok(bytes) = read_regular_file(&entry.path(), MAX_RUN_RECORD_OWNER_BYTES) else {
+            continue;
+        };
+        let Ok(owner) = serde_json::from_slice::<StoredRunRecordOwner>(&bytes) else {
+            continue;
+        };
+        let Ok(owner_session) = SessionId::new(owner.session_id.clone()) else {
+            continue;
+        };
+        let Ok(entry_id) = DurableEntryId::new(owner.durable_entry_id.clone()) else {
+            continue;
+        };
+        if owner.version != RUN_RECORD_OWNER_VERSION
+            || run_record_file_key(&owner_session, &entry_id) != file_key
+            || owner_session.as_str() != session_id.as_str()
+        {
+            continue;
+        }
+        paths.owners.insert(entry.path());
+        paths
+            .records
+            .insert(run_records.join(format!("{file_key}.json")));
+    }
+
+    // Run records created before ownership manifests were introduced contain
+    // the adapter's bounded public DTO. Migrate their ownership lazily during
+    // deletion by reading only the top-level session identifier.
+    let record_entries = std::fs::read_dir(run_records).map_err(|_| ResourceStoreError::Storage)?;
+    for entry in record_entries {
+        let entry = entry.map_err(|_| ResourceStoreError::Storage)?;
+        if paths.records.contains(&entry.path())
+            || !entry
+                .file_type()
+                .map_err(|_| ResourceStoreError::Storage)?
+                .is_file()
+        {
+            continue;
+        }
+        let Ok(bytes) = read_regular_file(&entry.path(), MAX_RUN_RECORD_BYTES) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if value.get("sessionId").and_then(serde_json::Value::as_str) == Some(session_id.as_str()) {
+            paths.records.insert(entry.path());
+        }
+    }
+    Ok(paths)
+}
+
+fn rebuild_resource_usage(index: &mut StoreIndex) {
+    index.stored_bytes = index
+        .metadata
+        .values()
+        .map(|metadata| metadata.byte_len)
+        .fold(0u64, u64::saturating_add);
+    index.sessions_by_handle.clear();
+    index.session_usage.clear();
+    let bindings = index
+        .bindings
+        .iter()
+        .map(|(key, handle)| (key.session_id.clone(), handle.clone()))
+        .collect::<Vec<_>>();
+    for (session_id, handle) in bindings {
+        if index.metadata.contains_key(&handle) {
+            index
+                .sessions_by_handle
+                .entry(handle)
+                .or_default()
+                .insert(session_id);
+        }
+    }
+    let ownership = index
+        .sessions_by_handle
+        .iter()
+        .filter_map(|(handle, sessions)| {
+            index
+                .metadata
+                .get(handle)
+                .map(|metadata| (metadata.byte_len, sessions.clone()))
+        })
+        .collect::<Vec<_>>();
+    for (byte_len, sessions) in ownership {
+        for session_id in sessions {
+            let usage = index.session_usage.entry(session_id).or_default();
+            usage.0 = usage.0.saturating_add(1);
+            usage.1 = usage.1.saturating_add(byte_len);
         }
     }
 }
@@ -1083,9 +1443,11 @@ fn rollback_uncommitted_tool_locked(
         index.sessions_by_handle.remove(&handle);
         index.corrupt_handles.remove(&handle);
     }
-    sync_directory(&inner.bindings);
-    sync_directory(&inner.metadata);
-    sync_directory(&inner.blobs);
+    for directory in [&inner.bindings, &inner.metadata, &inner.blobs] {
+        if sync_directory(directory).is_err() {
+            clean = false;
+        }
+    }
     clean
 }
 
@@ -1123,7 +1485,7 @@ fn atomic_write(
         return Err(ResourceStoreError::Storage);
     }
     let _ = std::fs::remove_file(&temp_path);
-    sync_directory(directory);
+    sync_directory(directory)?;
     Ok(())
 }
 
@@ -1162,10 +1524,11 @@ fn read_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ResourceSto
     Ok(bytes)
 }
 
-fn sync_directory(path: &Path) {
-    if let Ok(directory) = File::open(path) {
-        let _ = directory.sync_all();
-    }
+fn sync_directory(path: &Path) -> Result<(), ResourceStoreError> {
+    let directory = File::open(path).map_err(|_| ResourceStoreError::Storage)?;
+    directory
+        .sync_all()
+        .map_err(|_| ResourceStoreError::Storage)
 }
 
 fn random_hex(byte_len: usize) -> Result<String, ResourceStoreError> {
@@ -1290,6 +1653,151 @@ mod tests {
                 )
                 .unwrap_err(),
             ResourceStoreError::InvalidBoundary
+        );
+    }
+
+    #[test]
+    fn startup_reclaims_corrupt_run_records_and_preserves_deletable_legacy_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let corrupt_session = SessionId::new("session-corrupt-owner").unwrap();
+        let corrupt_entry = DurableEntryId::new("entry-corrupt-owner").unwrap();
+        let legacy_session = SessionId::new("session-legacy-run").unwrap();
+        let legacy_entry = DurableEntryId::new("entry-legacy-run").unwrap();
+        let invalid_entry = DurableEntryId::new("entry-invalid-run").unwrap();
+        let store = ResourceStore::open(directory.path()).unwrap();
+        store
+            .persist_run_record(&corrupt_session, &corrupt_entry, br#"{"version":1}"#)
+            .unwrap();
+        let root = directory.path().join(ROOT_NAME);
+        let run_records = root.join("run-records");
+        let owners = root.join("run-record-owners");
+        let corrupt_key = run_record_file_key(&corrupt_session, &corrupt_entry);
+        std::fs::write(owners.join(format!("{corrupt_key}.json")), b"{corrupt").unwrap();
+
+        let legacy_key = run_record_file_key(&legacy_session, &legacy_entry);
+        let legacy_bytes = br#"{"version":1,"sessionId":"session-legacy-run"}"#;
+        std::fs::write(run_records.join(format!("{legacy_key}.json")), legacy_bytes).unwrap();
+        let invalid_key = run_record_file_key(&legacy_session, &invalid_entry);
+        std::fs::write(run_records.join(format!("{invalid_key}.json")), b"{invalid").unwrap();
+        drop(store);
+
+        let reopened = ResourceStore::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened.run_record(&corrupt_session, &corrupt_entry),
+            Err(ResourceStoreError::NotFound)
+        );
+        assert_eq!(
+            reopened.run_record(&legacy_session, &legacy_entry).unwrap(),
+            Bytes::from_static(legacy_bytes)
+        );
+        assert!(!owners.join(format!("{corrupt_key}.json")).exists());
+        assert!(!run_records.join(format!("{corrupt_key}.json")).exists());
+        assert!(!run_records.join(format!("{invalid_key}.json")).exists());
+
+        reopened.delete_session(&legacy_session).unwrap();
+        assert_eq!(
+            reopened.run_record(&legacy_session, &legacy_entry),
+            Err(ResourceStoreError::NotFound)
+        );
+    }
+
+    #[test]
+    fn permanent_session_deletion_reclaims_resources_records_and_run_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        let removed_session = SessionId::new("session-removed").unwrap();
+        let retained_session = SessionId::new("session-retained").unwrap();
+        let removed_entry = DurableEntryId::new("entry-removed").unwrap();
+        let retained_entry = DurableEntryId::new("entry-retained").unwrap();
+        let removed_run = DurableEntryId::new("run-entry-removed").unwrap();
+        let retained_run = DurableEntryId::new("run-entry-retained").unwrap();
+        let store = ResourceStore::open(directory.path()).unwrap();
+        let removed = store
+            .register(
+                &removed_session,
+                "call-removed",
+                "source",
+                "removed.txt",
+                "text/plain",
+                Bytes::from_static(b"removed resource"),
+            )
+            .unwrap();
+        store
+            .persist_record(
+                &removed_session,
+                &removed_entry,
+                "call-removed",
+                br#"{"version":1}"#,
+            )
+            .unwrap();
+        store
+            .persist_run_record(&removed_session, &removed_run, br#"{"version":1}"#)
+            .unwrap();
+        let retained = store
+            .register(
+                &retained_session,
+                "call-retained",
+                "source",
+                "retained.txt",
+                "text/plain",
+                Bytes::from_static(b"retained resource"),
+            )
+            .unwrap();
+        store
+            .persist_record(
+                &retained_session,
+                &retained_entry,
+                "call-retained",
+                br#"{"version":1}"#,
+            )
+            .unwrap();
+        store
+            .persist_run_record(&retained_session, &retained_run, br#"{"version":1}"#)
+            .unwrap();
+
+        store.delete_session(&removed_session).unwrap();
+        store.delete_session(&removed_session).unwrap();
+
+        assert_eq!(
+            store
+                .content(&removed_session, &removed.handle)
+                .unwrap_err(),
+            ResourceStoreError::NotFound
+        );
+        assert_eq!(
+            store.record(&removed_session, &removed_entry).unwrap_err(),
+            ResourceStoreError::NotFound
+        );
+        assert_eq!(
+            store
+                .run_record(&removed_session, &removed_run)
+                .unwrap_err(),
+            ResourceStoreError::NotFound
+        );
+        assert_eq!(
+            store
+                .content(&retained_session, &retained.handle)
+                .unwrap()
+                .bytes,
+            Bytes::from_static(b"retained resource")
+        );
+        assert_eq!(
+            store.record(&retained_session, &retained_entry).unwrap(),
+            Bytes::from_static(br#"{"version":1}"#)
+        );
+
+        drop(store);
+        let reopened = ResourceStore::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened
+                .run_record(&retained_session, &retained_run)
+                .unwrap(),
+            Bytes::from_static(br#"{"version":1}"#)
+        );
+        assert_eq!(
+            reopened
+                .content(&removed_session, &removed.handle)
+                .unwrap_err(),
+            ResourceStoreError::NotFound
         );
     }
 

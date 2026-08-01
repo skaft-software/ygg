@@ -20,6 +20,7 @@ mod goal;
 mod ids;
 mod journal;
 mod model;
+mod process_tree;
 mod project_registry;
 mod prompt_context;
 mod pty;
@@ -64,7 +65,6 @@ pub use document_store::{
     StoredDocument, MAX_DOCUMENTS_PER_PROMPT, MAX_STORED_DOCUMENTS_PER_SESSION,
 };
 pub use error::{ErrorCode, SanitizedError};
-pub use goal::{GoalAction, GoalState, GoalStatus, GoalStore, GoalStoreError};
 pub use event::{
     EventEnvelope, EventPayload, HostCatalogChange, HostStreamEvent, ItemDelta, ReplayGap,
     ReplayResponse, TimestampedEvent,
@@ -77,24 +77,25 @@ pub use fs::{
     MAX_PROJECT_FILE_SEARCH_FILES, MAX_PROJECT_FILE_SEARCH_QUERY_BYTES,
     MAX_PROJECT_FILE_SEARCH_RESULTS, MAX_PROJECT_FILE_TREE_ENTRIES, MAX_PROJECT_FILE_WRITE_BYTES,
 };
+pub use goal::{GoalAction, GoalState, GoalStatus, GoalStore, GoalStoreError};
 pub use ids::{
     ArtifactId, CommandId, DeviceId, DurableEntryId, HostId, ItemId, ProjectId, RequestId, RunId,
     SessionId, SourceId, ThemeId, TurnId,
 };
 pub use journal::{EventJournal, JournalConfig, JournalError};
 pub use model::{
-    ActivityPhase, ActivityPhaseSummary, ActorOwnerState, ArtifactKind, ArtifactRef,
-    AttachmentPolicy, AttentionState, AuthorityProfile, CatalogCursor, CommandDiscovery,
-    CommandSuggestion, CommandSuggestionKind, CompletionReview, ContextUsage,
-    ConversationBranchOperation, ConversationBranchProvenance, EvidenceCoverage, FileChange,
-    HostBootstrap, HostCapabilities, HostDescriptor, InputModality, ItemLifecycle, ItemPayload,
-    ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary, PendingRequest,
-    PlanStep, PlanStepState, PreviewRef, ProjectCatalog, ProjectSummary, PullRequestState,
-    PullRequestSummary, RequestKind, RequestState, RunOutcome, SessionBranchEntry,
-    SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState, SessionCursor, SessionItem,
-    SessionLiveState, SessionRetention, SessionSnapshot, SessionSummary, SkillSuggestion,
-    SourceKind, SourceRef, ToolActivity, ToolActivityStatus, ToolKind, ToolResultSummary,
-    UsageSnapshot, UserMessageDelivery, MAX_MODEL_INPUT_PRICING_TIERS,
+    ActivityPhase, ActivityPhaseSummary, ActorOwnerState, AgentRunPhase, AgentRunTelemetry,
+    AgentRunTerminalState, ArtifactKind, ArtifactRef, AttachmentPolicy, AttentionState,
+    AuthorityProfile, CatalogCursor, CommandDiscovery, CommandSuggestion, CommandSuggestionKind,
+    CompletionReview, ContextUsage, ConversationBranchOperation, ConversationBranchProvenance,
+    EvidenceCoverage, FileChange, HostBootstrap, HostCapabilities, HostDescriptor, InputModality,
+    ItemLifecycle, ItemPayload, ModelInputPricing, ModelInputPricingTier, ModelSelection,
+    ModelSummary, PendingRequest, PlanStep, PlanStepState, PreviewRef, ProjectCatalog,
+    ProjectSummary, PullRequestState, PullRequestSummary, RequestKind, RequestState, RunOutcome,
+    SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState,
+    SessionCursor, SessionItem, SessionLiveState, SessionRetention, SessionSnapshot,
+    SessionSummary, SkillSuggestion, SourceKind, SourceRef, ToolActivity, ToolActivityStatus,
+    ToolKind, ToolResultSummary, UsageSnapshot, UserMessageDelivery, MAX_MODEL_INPUT_PRICING_TIERS,
 };
 pub use project_registry::{
     ProjectId as RegistryProjectId, ProjectRegistry, ProjectRegistryError, ProjectRoot,

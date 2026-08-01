@@ -132,16 +132,14 @@ fn spawn_input_reader() -> mpsc::Receiver<RpcInput> {
                     }
                     start = index + 1;
                 }
-                if start < read {
-                    if !discarding_oversized {
-                        pending.extend_from_slice(&chunk[start..read]);
-                        if pending.len() > MAX_RPC_LINE_BYTES {
-                            pending.clear();
-                            discarding_oversized = true;
-                            let _ = tx.blocking_send(RpcInput::ParseError(format!(
-                                "Failed to parse command: JSONL record exceeds {MAX_RPC_LINE_BYTES} bytes"
-                            )));
-                        }
+                if start < read && !discarding_oversized {
+                    pending.extend_from_slice(&chunk[start..read]);
+                    if pending.len() > MAX_RPC_LINE_BYTES {
+                        pending.clear();
+                        discarding_oversized = true;
+                        let _ = tx.blocking_send(RpcInput::ParseError(format!(
+                            "Failed to parse command: JSONL record exceeds {MAX_RPC_LINE_BYTES} bytes"
+                        )));
                     }
                 }
             }
@@ -587,9 +585,11 @@ fn rpc_messages(app: &App) -> Vec<Value> {
         .session()
         .usage_records()
         .iter()
-        .filter_map(|record| match &record.kind {
-            ygg_agent::UsageRecordKind::AssistantTurn { .. } => Some(record),
-            _ => None,
+        .filter(|record| {
+            matches!(
+                &record.kind,
+                ygg_agent::UsageRecordKind::AssistantTurn { .. }
+            )
         })
         .collect::<Vec<_>>();
     let mut usage_index = 0usize;
@@ -1710,6 +1710,9 @@ fn queued_input(
     })
 }
 
+// RPC active-run routing intentionally exposes the independently borrowed
+// protocol registries, queues, settings, and output sink at this dispatch boundary.
+#[allow(clippy::too_many_arguments)]
 async fn active_input(
     command: Value,
     control: &RunControl,
@@ -1816,6 +1819,9 @@ async fn active_input(
     Ok(())
 }
 
+// The run loop coordinates independently owned protocol state and channels;
+// retaining explicit borrows makes mutation and queue ownership auditable.
+#[allow(clippy::too_many_arguments)]
 async fn drive_run(
     run: &mut Run<'_>,
     input: &mut mpsc::Receiver<RpcInput>,

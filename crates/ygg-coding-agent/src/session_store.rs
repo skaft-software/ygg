@@ -1029,19 +1029,33 @@ impl SessionStore {
             .ok_or_else(|| anyhow::anyhow!("no sessions for this workspace yet"))
     }
 
-    /// Resolve a filename stem without enumerating or parsing unrelated sessions.
-    pub fn path_by_id(&self, id: &str) -> anyhow::Result<PathBuf> {
+    /// Reports whether the canonical transcript currently exists.
+    ///
+    /// A non-regular entry is an error, not absence. Permanent-deletion
+    /// recovery uses this distinction so it never crosses the irreversible
+    /// boundary merely because an existing transcript could not be validated.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn session_file_exists(&self, id: &str) -> anyhow::Result<bool> {
         if !session_id_is_valid(id) {
             anyhow::bail!("invalid session id {id:?}");
         }
         let path = self.dir.join(format!("{id}.jsonl"));
-        let metadata = path
-            .symlink_metadata()
-            .map_err(|error| anyhow::anyhow!("session {id:?} was not found: {error}"))?;
-        if !metadata.file_type().is_file() {
-            anyhow::bail!("session {id:?} is not a regular file");
+        match path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+            Ok(_) => anyhow::bail!("session {id:?} is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(anyhow::anyhow!(
+                "session {id:?} could not be inspected: {error}"
+            )),
         }
-        Ok(path)
+    }
+
+    /// Resolve a filename stem without enumerating or parsing unrelated sessions.
+    pub fn path_by_id(&self, id: &str) -> anyhow::Result<PathBuf> {
+        if !self.session_file_exists(id)? {
+            anyhow::bail!("session {id:?} was not found");
+        }
+        Ok(self.dir.join(format!("{id}.jsonl")))
     }
 
     fn metadata_dir(&self) -> PathBuf {
@@ -1210,6 +1224,11 @@ impl SessionStore {
         }
         let session_path = self.path_by_id(id)?;
         let metadata_path = self.metadata_path(id)?;
+        match metadata_path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => anyhow::bail!("session metadata path is not a regular file"),
+            Err(error) => return Err(error.into()),
+        }
         let suffix = NEXT_SESSION_SUFFIX.fetch_add(1, Ordering::Relaxed);
         let staged_session = self.dir.join(format!(".delete-{id}-{suffix:016x}"));
         let staged_metadata = self
@@ -1217,25 +1236,84 @@ impl SessionStore {
             .join(format!(".delete-{id}-{suffix:016x}"));
 
         std::fs::rename(&session_path, &staged_session)?;
-        let metadata_present = metadata_path
+        if !staged_session
             .symlink_metadata()
-            .is_ok_and(|metadata| metadata.file_type().is_file());
-        if metadata_present {
-            if let Err(error) = std::fs::rename(&metadata_path, &staged_metadata) {
-                let _ = std::fs::rename(&staged_session, &session_path);
-                return Err(error.into());
-            }
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            let _ = std::fs::rename(&staged_session, &session_path);
+            anyhow::bail!("staged session transcript is not a regular file");
         }
-        if let Err(error) = std::fs::remove_file(&staged_session) {
-            if metadata_present {
-                let _ = std::fs::rename(&staged_metadata, &metadata_path);
-            }
+        if let Err(error) = std::fs::rename(&metadata_path, &staged_metadata) {
             let _ = std::fs::rename(&staged_session, &session_path);
             return Err(error.into());
         }
-        if metadata_present {
-            std::fs::remove_file(&staged_metadata)?;
+        if !staged_metadata
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            let _ = std::fs::rename(&staged_metadata, &metadata_path);
+            let _ = std::fs::rename(&staged_session, &session_path);
+            anyhow::bail!("staged session metadata is not a regular file");
         }
+        if let Err(error) = std::fs::remove_file(&staged_session) {
+            let _ = std::fs::rename(&staged_metadata, &metadata_path);
+            let _ = std::fs::rename(&staged_session, &session_path);
+            return Err(error.into());
+        }
+        std::fs::remove_file(&staged_metadata)?;
+        self.finish_permanent_delete(id)
+    }
+
+    /// Rolls back an interrupted permanent deletion while the canonical
+    /// transcript still exists.
+    ///
+    /// The intent journal is written before the transcript rename. If a crash
+    /// occurs before the irreversible transcript-removal boundary, metadata may
+    /// already have been staged. This restores that metadata and removes only
+    /// deletion staging files, making pre-commit recovery idempotent.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn rollback_permanent_delete(&self, id: &str) -> anyhow::Result<()> {
+        self.path_by_id(id)?;
+        let metadata_dir = self.metadata_dir();
+        let metadata_path = self.metadata_path(id)?;
+        match metadata_path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => anyhow::bail!("session metadata path is not a regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let staged = staged_deletion_files(&metadata_dir, id)?;
+                let [staged_metadata] = staged.as_slice() else {
+                    anyhow::bail!("interrupted session metadata cannot be restored");
+                };
+                std::fs::rename(staged_metadata, &metadata_path)?;
+                std::fs::File::open(&metadata_dir)?.sync_all()?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        remove_staged_deletion_files(&self.dir, id)?;
+        remove_staged_deletion_files(&metadata_dir, id)?;
+        std::fs::File::open(&self.dir)?.sync_all()?;
+        std::fs::File::open(metadata_dir)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Finishes an already-confirmed permanent deletion after interruption.
+    ///
+    /// This idempotently removes both canonical files and transaction staging
+    /// files. Callers must establish the destructive confirmation boundary
+    /// before invoking it.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn finish_permanent_delete(&self, id: &str) -> anyhow::Result<()> {
+        if !session_id_is_valid(id) {
+            anyhow::bail!("invalid session ID");
+        }
+        remove_regular_file_if_exists(&self.dir.join(format!("{id}.jsonl")))?;
+        remove_regular_file_if_exists(&self.metadata_path(id)?)?;
+        remove_staged_deletion_files(&self.dir, id)?;
+        let metadata_dir = self.metadata_dir();
+        remove_staged_deletion_files(&metadata_dir, id)?;
+        std::fs::File::open(&self.dir)?.sync_all()?;
+        std::fs::File::open(metadata_dir)?.sync_all()?;
         Ok(())
     }
 
@@ -1257,6 +1335,42 @@ impl SessionStore {
         }
         Ok(())
     }
+}
+
+fn remove_regular_file_if_exists(path: &Path) -> anyhow::Result<()> {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!("session deletion path is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_staged_deletion_files(directory: &Path, id: &str) -> anyhow::Result<()> {
+    for path in staged_deletion_files(directory, id)? {
+        remove_regular_file_if_exists(&path)?;
+    }
+    Ok(())
+}
+
+fn staged_deletion_files(directory: &Path, id: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let prefix = format!(".delete-{id}-");
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+            continue;
+        };
+        if suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 #[cfg(test)]
@@ -1405,10 +1519,55 @@ mod tests {
         assert!(path.is_file());
         assert!(metadata_path.is_file());
 
+        std::fs::write(
+            store.dir().join(".delete-delete-me-deadbeefdeadbeef"),
+            b"staged transcript",
+        )
+        .unwrap();
+        std::fs::write(
+            store
+                .metadata_dir()
+                .join(".delete-delete-me-deadbeefdeadbeef"),
+            b"staged metadata",
+        )
+        .unwrap();
         store.delete_permanently("delete-me", 2_000).unwrap();
+        store.finish_permanent_delete("delete-me").unwrap();
         assert!(!path.exists());
         assert!(!metadata_path.exists());
         assert!(store.path_by_id("delete-me").is_err());
+    }
+
+    #[test]
+    fn interrupted_pre_commit_delete_restores_metadata_idempotently() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("rollback-delete.jsonl");
+        drop(Session::create(&path).unwrap());
+        store.rename("rollback-delete", "Keep this name").unwrap();
+        store
+            .set_lifecycle("rollback-delete", SessionStorageLifecycle::Trash, 12_000)
+            .unwrap();
+        let metadata_path = store.metadata_path("rollback-delete").unwrap();
+        let staged_metadata = store
+            .metadata_dir()
+            .join(".delete-rollback-delete-deadbeefdeadbeef");
+        std::fs::rename(&metadata_path, &staged_metadata).unwrap();
+        let staged_transcript = store.dir().join(".delete-rollback-delete-deadbeefdeadbeef");
+        std::fs::write(&staged_transcript, b"stale staging file").unwrap();
+
+        store.rollback_permanent_delete("rollback-delete").unwrap();
+        store.rollback_permanent_delete("rollback-delete").unwrap();
+
+        let metadata = store.load_metadata("rollback-delete").unwrap();
+        assert_eq!(metadata.name.as_deref(), Some("Keep this name"));
+        assert_eq!(metadata.trashed_at_ms, Some(12_000));
+        assert!(path.is_file());
+        assert!(metadata_path.is_file());
+        assert!(!staged_metadata.exists());
+        assert!(!staged_transcript.exists());
     }
 
     #[test]
@@ -1980,15 +2139,19 @@ mod tests {
         std::fs::create_dir(store.dir().join("directory.jsonl")).unwrap();
 
         assert_eq!(store.path_by_id("one").unwrap(), one_path);
+        assert!(store.session_file_exists("one").unwrap());
+        assert!(!store.session_file_exists("missing").unwrap());
         for invalid in ["", ".", "..", "../one", "one/two", "one\n"] {
             assert!(store.path_by_id(invalid).is_err(), "accepted {invalid:?}");
         }
         assert!(store.path_by_id("directory").is_err());
+        assert!(store.session_file_exists("directory").is_err());
 
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&one_path, store.dir().join("linked.jsonl")).unwrap();
             assert!(store.path_by_id("linked").is_err());
+            assert!(store.session_file_exists("linked").is_err());
             assert!(!store.list().iter().any(|session| {
                 session.path.file_stem().and_then(|stem| stem.to_str()) == Some("linked")
             }));

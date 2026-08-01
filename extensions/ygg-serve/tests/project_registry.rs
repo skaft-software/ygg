@@ -92,6 +92,9 @@ fn lifecycle_and_trust_decisions_survive_restart_without_public_paths() {
         reopened.resolve_root(&id),
         Err(ProjectRegistryError::ProjectArchived)
     ));
+    let cleanup_root = reopened.resolve_root_for_cleanup(&id).unwrap();
+    assert_eq!(cleanup_root.as_path(), root.canonicalize().unwrap());
+    assert!(cleanup_root.matches_metadata(&std::fs::metadata(&root).unwrap()));
     drop(reopened);
 
     let reopened = ProjectRegistry::open(&state_directory).unwrap();
@@ -132,6 +135,11 @@ fn durable_session_bindings_are_atomic_private_and_survive_restart() {
             "a rejected collision must not partially mutate memory"
         );
         registry.bind_session("session-three", &second.id).unwrap();
+        registry.bind_session("session-four", &second.id).unwrap();
+        assert_eq!(
+            registry.unbind_session("session-four").unwrap(),
+            Some(second.id.clone())
+        );
         (first.id, second.id)
     };
 
@@ -141,6 +149,7 @@ fn durable_session_bindings_are_atomic_private_and_survive_restart() {
         registry.project_for_session("session-three"),
         Some(second_id)
     );
+    assert_eq!(registry.project_for_session("session-four"), None);
     let public_json = serde_json::to_string(&registry.list()).unwrap();
     assert!(!public_json.contains("session-one"));
     assert!(!public_json.contains("first-private-root"));
@@ -295,6 +304,13 @@ fn replaced_directory_identity_never_inherits_existing_trust() {
         registry.grant_trust(&id),
         Err(ProjectRegistryError::RootIdentityChanged)
     ));
+
+    let rebound = registry.rebind_root(&id, &root).unwrap();
+    assert_eq!(rebound.state, ProjectState::Untrusted);
+    assert!(rebound.available);
+    let trusted = registry.grant_trust(&id).unwrap();
+    assert_eq!(trusted.state, ProjectState::Trusted);
+    assert!(trusted.available);
 }
 
 #[test]

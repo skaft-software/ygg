@@ -5,8 +5,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 #[cfg(test)]
-use crate::resource_resolver::ResourceResolver;
-use crate::resource_resolver::{ResourceKind, ResourceSnapshot, ResourceTrust};
+use crate::resource_resolver::{ResourceKind, ResourceResolver, ResourceSnapshot, ResourceTrust};
 
 /// Stable identity applied before the dynamic environment and tool contract.
 pub const BASE_PERSONA: &str = "You are Ygg, an expert coding assistant.";
@@ -389,7 +388,7 @@ fn parse_manifest_header_with_diagnostics(
             .as_ref()
             .filter(|id| !id.trim().is_empty())
             .cloned()
-            .unwrap_or_else(|| declared_name.clone())
+            .unwrap_or_else(|| fallback.clone())
     } else {
         declared_name.clone()
     };
@@ -464,6 +463,7 @@ fn parse_manifest_header_with_diagnostics(
     })
 }
 
+#[cfg(test)]
 fn parse_manifest_header(
     skill_md: &Path,
     trust: SkillTrust,
@@ -691,8 +691,29 @@ fn project_skill_directories(workspace: &Path, invocation_cwd: &Path) -> Vec<Pat
         .collect()
 }
 
+/// Validates a skill's declared tool requirements against the tools available
+/// to the running agent.
+#[cfg(feature = "serve")]
+pub fn validate_skill_requirements(
+    descriptor: &SkillDescriptor,
+    registered_tools: &[String],
+) -> Result<(), SkillLoadError> {
+    let missing = descriptor
+        .required_tools
+        .iter()
+        .filter(|required| !registered_tools.iter().any(|name| name == *required))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(SkillLoadError::MissingRequiredTools(missing))
+    }
+}
+
 impl FileSystemSkillRegistry {
     /// Creates a catalog using the workspace as both repository and invocation directory.
+    #[cfg(test)]
     pub fn new(
         workspace_root: PathBuf,
         additional_paths: Vec<PathBuf>,
@@ -834,13 +855,7 @@ impl FileSystemSkillRegistry {
             }
             let root = match real_path.parent() {
                 Some(parent) => parent.to_path_buf(),
-                None => {
-                    diagnostics.push(skill_diagnostic(
-                        &real_path,
-                        "skill entrypoint has no parent",
-                    ));
-                    continue;
-                }
+                None => candidate.root,
             };
             let mut parsed_diagnostics = Vec::new();
             match parse_manifest_header_with_diagnostics(
@@ -891,6 +906,7 @@ impl FileSystemSkillRegistry {
     }
 
     /// Parse the legacy shared-resolver snapshot retained for embedders and migration tests.
+    #[cfg(test)]
     pub fn from_snapshot(
         _workspace_root: PathBuf,
         _additional_paths: Vec<PathBuf>,
@@ -1172,11 +1188,6 @@ pub fn expand_skill_command(
         format!("{block}\n\n{arguments}")
     }))
 }
-
-/// Validates a skill's declared tool requirements against the exact final tool
-/// registry supplied to a running Agent. The frontend has already applied
-/// explicit allowlists, sandbox capability gates, and executable-extension
-/// registration before these names reach a [`ToolContext`].
 
 #[cfg(test)]
 mod tests {

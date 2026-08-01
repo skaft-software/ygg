@@ -7,15 +7,18 @@ use crate::bounds::{
     MAX_EVENT_BYTES, MAX_PUBLIC_TEXT_BYTES,
 };
 use crate::{
-    ArtifactRef, AuthorityProfile, CatalogCursor, DurableEntryId, ItemId, ItemLifecycle,
-    ModelSelection, PendingRequest, RunId, SessionBranchEntry, SessionCursor, SessionId,
-    SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, SourceRef, ToolActivity,
-    UsageSnapshot, PROTOCOL_VERSION,
+    ArtifactRef, AuthorityProfile, CatalogCursor, ContextUsage, DurableEntryId, ItemId,
+    ItemLifecycle, ModelSelection, PendingRequest, RunId, SessionBranchEntry, SessionCursor,
+    SessionId, SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, SourceRef,
+    ToolActivity, UsageSnapshot, PROTOCOL_VERSION,
 };
 
 const MAX_BRANCH_DELTA_ENTRIES: usize = 128;
 
 /// Typed provisional item delta.
+// Keep the public wire DTO value-shaped; boxing only this variant would expose
+// heap indirection in the Rust protocol API without changing its bounded wire form.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -152,6 +155,12 @@ pub enum EventPayload {
     UsageUpdated {
         /// Latest usage.
         usage: UsageSnapshot,
+    },
+    /// Reconciled context accounting and active-run lifecycle changed.
+    #[serde(rename = "context.updated")]
+    ContextUpdated {
+        /// Complete replayable context projection.
+        context: ContextUsage,
     },
 }
 
@@ -393,7 +402,8 @@ impl ProtocolValidation for EventPayload {
             Self::PendingRequestChanged { request } => request.validate()?,
             Self::SourceUpserted { source } => source.validate()?,
             Self::ArtifactUpserted { artifact } => artifact.validate()?,
-            Self::UsageUpdated { .. } => {}
+            Self::UsageUpdated { usage } => usage.validate()?,
+            Self::ContextUpdated { context } => context.validate()?,
         }
         Ok(())
     }

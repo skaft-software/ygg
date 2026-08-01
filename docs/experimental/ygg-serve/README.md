@@ -102,6 +102,14 @@ that installer is a release gate: the installer pin, `--features serve`, signed
 artifacts, and the installed-binary web-bundle smoke check must ship atomically
 with a future `v0.3.2-alpha` or later tag.
 
+The experimental release workflow at
+`.github/workflows/release-serve.yml` builds optimized `serve` binaries for
+Linux x86_64 and macOS x86_64/arm64, checks the embedded web bundle with the
+installed-binary smoke test, packages archives, writes SHA-256 checksums, and
+signs both archives and the checksum manifest with keyless Sigstore bundles.
+It is deliberately separate from the default feature-disabled build and does
+not change the public installer.
+
 ## Explicit exclusions
 
 The first web release does not include skills, MCP, plugins, extension

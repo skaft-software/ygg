@@ -4,9 +4,9 @@
 //! extension and a future continuation driver can both open the same private
 //! directory and use this API without coupling their lifetimes.
 
-use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::fs::Permissions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -214,6 +214,15 @@ impl GoalStore {
         Ok(Some(state))
     }
 
+    /// Removes a permanently deleted session's goal, if present.
+    ///
+    /// This is idempotent so a host deletion journal can retry it after a
+    /// process interruption.
+    pub fn delete_session(&self, session_id: &SessionId) -> Result<(), GoalStoreError> {
+        let _guard = self.lock()?;
+        self.remove_locked(session_id)
+    }
+
     /// Records one continuation turn and enforces the configured budget.
     pub fn record_turn(&self, session_id: &SessionId) -> Result<GoalState, GoalStoreError> {
         let _guard = self.lock()?;
@@ -349,6 +358,7 @@ impl GoalStore {
             let _ = std::fs::remove_file(&temp_path);
             return Err(GoalStoreError::Storage(error));
         }
+        sync_directory(&self.inner.root)?;
         Ok(())
     }
 
@@ -359,7 +369,8 @@ impl GoalStore {
                 if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
                     return Err(GoalStoreError::UnsafePath);
                 }
-                std::fs::remove_file(path).map_err(GoalStoreError::Storage)
+                std::fs::remove_file(path).map_err(GoalStoreError::Storage)?;
+                sync_directory(&self.inner.root)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(GoalStoreError::Storage(error)),
@@ -397,6 +408,12 @@ fn ensure_private_directory(path: &Path) -> Result<(), GoalStoreError> {
             .map_err(GoalStoreError::Storage)?;
     }
     Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<(), GoalStoreError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(GoalStoreError::Storage)
 }
 
 fn open_read_no_follow(path: &Path) -> Result<std::fs::File, GoalStoreError> {
@@ -494,6 +511,23 @@ mod tests {
         assert_eq!(store.apply(&session, GoalAction::Clear).unwrap(), None);
         assert_eq!(store.apply(&session, GoalAction::Clear).unwrap(), None);
         assert_eq!(store.get(&session).unwrap(), None);
+    }
+
+    #[test]
+    fn permanent_session_deletion_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = SessionId::new("goal-deleted").unwrap();
+        let store = GoalStore::open(directory.path()).unwrap();
+        store.set(&session, "Remove this goal", None).unwrap();
+
+        store.delete_session(&session).unwrap();
+        store.delete_session(&session).unwrap();
+
+        assert_eq!(store.get(&session).unwrap(), None);
+        assert!(!directory
+            .path()
+            .join(format!("{}.json", session.as_str()))
+            .exists());
     }
 
     #[test]

@@ -221,9 +221,222 @@ describe("authoritative Rust wire contract", () => {
 
     expect(snapshot.sequence).toBe(42);
     expect(snapshot.contextTokens).toBe(165);
+    expect(snapshot.context.status.current).toEqual({
+      categories: [{ category: "other", tokens: 165 }],
+      totalTokens: 165,
+    });
     expect(snapshot.contextPercent).toBe(0);
     expect(snapshot.title).toBe("New session");
     expect(snapshot.items).toHaveLength(1);
+  });
+
+  it("strictly projects replayable context lifecycle and compaction updates", () => {
+    const context = {
+      usage: {
+        inputTokens: 300,
+        outputTokens: 20,
+        contextTokens: 120,
+        contextLimit: 1_000,
+      },
+      compactions: 1,
+      status: {
+        current: {
+          categories: [
+            { category: "conversation", tokens: 80 },
+            { category: "documents", tokens: 20 },
+            { category: "projectFiles", tokens: 10 },
+            { category: "other", tokens: 10 },
+          ],
+          totalTokens: 120,
+        },
+        updatedAtMs: 500,
+        lastCompaction: {
+          id: "run-1:compaction:1",
+          reason: "threshold",
+          before: {
+            categories: [{ category: "conversation", tokens: 200 }],
+            totalTokens: 200,
+          },
+          after: {
+            categories: [
+              { category: "conversation", tokens: 80 },
+              { category: "documents", tokens: 20 },
+              { category: "projectFiles", tokens: 10 },
+              { category: "other", tokens: 10 },
+            ],
+            totalTokens: 120,
+          },
+          reclaimedTokens: 80,
+          succeeded: true,
+          startedAtMs: 450,
+          finishedAtMs: 500,
+        },
+      },
+      run: {
+        phase: "retrying",
+        responsesStarted: 2,
+        responsesFinished: 1,
+        responsesDiscarded: 1,
+        responseActive: false,
+        toolCallsStarted: 1,
+        toolCallsFinished: 1,
+        toolExecutionsStarted: 1,
+        toolExecutionsFinished: 1,
+        compactionsStarted: 1,
+        compactionsCompleted: 1,
+        compactionsFailed: 0,
+      },
+    };
+    const envelope = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    envelope.cursor.sequence = 44;
+    envelope.event = {
+      type: "context.updated",
+      data: { context },
+    };
+
+    const projected = projectEventEnvelope(envelope);
+    expect(projected).toMatchObject({
+      type: "context.updated",
+      sequence: 44,
+      context: {
+        compactions: 1,
+        run: {
+          phase: "retrying",
+          responsesStarted: 2,
+          responsesDiscarded: 1,
+        },
+        status: {
+          current: { totalTokens: 120 },
+          lastCompaction: {
+            reason: "threshold",
+            reclaimedTokens: 80,
+            succeeded: true,
+          },
+        },
+      },
+    });
+
+    const unknown = clone(envelope) as typeof envelope & {
+      event: { data: { context: { status: Record<string, unknown> } } };
+    };
+    unknown.event.data.context.status.providerAttribution = true;
+    expect(() => projectEventEnvelope(unknown)).toThrow(
+      /context\.status\.providerAttribution is not supported/,
+    );
+
+    const contradictory = clone(envelope) as typeof envelope & {
+      event: {
+        data: {
+          context: {
+            run: {
+              phase: string;
+              responsesStarted: number;
+              responseActive: boolean;
+            };
+          };
+        };
+      };
+    };
+    contradictory.event.data.context.run.responsesStarted = 3;
+    expect(() => projectEventEnvelope(contradictory)).toThrow(
+      /contradictory lifecycle counters/,
+    );
+
+    contradictory.event.data.context.run.responsesStarted = 2;
+    contradictory.event.data.context.run.phase = "responding";
+    contradictory.event.data.context.run.responseActive = false;
+    expect(() => projectEventEnvelope(contradictory)).toThrow(
+      /contradictory lifecycle counters/,
+    );
+  });
+
+  it("accepts unchanged failed compactions and rejects fabricated reclamation", () => {
+    const totals = {
+      categories: [{ category: "conversation", tokens: 120 }],
+      totalTokens: 120,
+    };
+    const context = {
+      usage: {
+        inputTokens: 120,
+        outputTokens: 0,
+        contextTokens: 120,
+      },
+      compactions: 0,
+      status: {
+        current: totals,
+        updatedAtMs: 600,
+        lastCompaction: {
+          id: "run-2:compaction:1",
+          reason: "overflow",
+          before: totals,
+          after: totals,
+          reclaimedTokens: 0,
+          succeeded: false,
+          startedAtMs: 550,
+          finishedAtMs: 600,
+        },
+      },
+      run: {
+        phase: "preparing",
+        responsesStarted: 1,
+        responsesFinished: 0,
+        responsesDiscarded: 1,
+        responseActive: false,
+        toolCallsStarted: 0,
+        toolCallsFinished: 0,
+        toolExecutionsStarted: 0,
+        toolExecutionsFinished: 0,
+        compactionsStarted: 1,
+        compactionsCompleted: 0,
+        compactionsFailed: 1,
+      },
+    };
+    const envelope = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    envelope.cursor.sequence = 44;
+    envelope.event = { type: "context.updated", data: { context } };
+
+    expect(projectEventEnvelope(envelope)).toMatchObject({
+      type: "context.updated",
+      context: {
+        status: {
+          lastCompaction: {
+            reason: "overflow",
+            reclaimedTokens: 0,
+            succeeded: false,
+          },
+        },
+        run: { compactionsFailed: 1 },
+      },
+    });
+
+    const malformed = clone(envelope) as typeof envelope & {
+      event: {
+        data: {
+          context: {
+            status: {
+              lastCompaction: {
+                after: { categories: unknown[]; totalTokens: number };
+                reclaimedTokens: number;
+              };
+            };
+          };
+        };
+      };
+    };
+    malformed.event.data.context.status.lastCompaction.after = {
+      categories: [{ category: "conversation", tokens: 100 }],
+      totalTokens: 100,
+    };
+    malformed.event.data.context.status.lastCompaction.reclaimedTokens = 20;
+    expect(() => projectEventEnvelope(malformed)).toThrow(
+      /contradictory completed-compaction facts/,
+    );
   });
 
   it("rehydrates durable evidence origins and exact file handles from a snapshot", () => {

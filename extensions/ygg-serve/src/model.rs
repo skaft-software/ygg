@@ -7,8 +7,8 @@ use crate::bounds::{
     MAX_BOOTSTRAP_BYTES, MAX_ITEM_TEXT_BYTES, MAX_PROMPT_BYTES, MAX_SNAPSHOT_BYTES,
 };
 use crate::{
-    ArtifactId, DurableEntryId, HostId, ItemId, ProjectId, RequestId, RunId, SessionId, SourceId,
-    ThemeId, ThemeOption, TurnId, PROTOCOL_VERSION,
+    ArtifactId, ContextStatus, DurableEntryId, HostId, ItemId, ProjectId, RequestId, RunId,
+    SessionId, SourceId, ThemeId, ThemeOption, TurnId, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
@@ -472,6 +472,116 @@ pub struct UsageSnapshot {
     pub context_limit: Option<u64>,
 }
 
+impl ProtocolValidation for UsageSnapshot {
+    fn validate(&self) -> Result<(), ValidationError> {
+        Ok(())
+    }
+}
+
+/// Coarse lifecycle phase for an active agent run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentRunPhase {
+    /// Preparing the next model request.
+    Preparing,
+    /// Receiving a model response.
+    Responding,
+    /// Retrying a discarded provider attempt.
+    Retrying,
+    /// Compacting model-visible context.
+    Compacting,
+    /// Executing a model-requested tool.
+    ExecutingTool,
+    /// The run reached a terminal boundary.
+    Finished,
+}
+
+/// Sanitized terminal outcome for run telemetry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentRunTerminalState {
+    /// The model completed normally.
+    Completed,
+    /// The caller stopped the run.
+    Aborted,
+    /// The run failed.
+    Failed,
+    /// The configured model-turn limit was reached.
+    MaxTurns,
+    /// The run stream was dropped before a terminal event.
+    Dropped,
+}
+
+/// Bounded, content-free counters for one active or most recently finished run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentRunTelemetry {
+    /// Current lifecycle phase.
+    pub phase: AgentRunPhase,
+    /// Sanitized terminal state, present exactly when `phase` is `finished`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_state: Option<AgentRunTerminalState>,
+    /// Provider response attempts opened.
+    pub responses_started: u64,
+    /// Provider responses assembled successfully.
+    pub responses_finished: u64,
+    /// Provider attempts discarded before completion.
+    pub responses_discarded: u64,
+    /// Whether a provider response is currently being assembled.
+    pub response_active: bool,
+    /// Structured tool calls whose generation began.
+    pub tool_calls_started: u64,
+    /// Structured tool calls whose generation completed.
+    pub tool_calls_finished: u64,
+    /// Tool executions started.
+    pub tool_executions_started: u64,
+    /// Tool executions completed, including tool errors.
+    pub tool_executions_finished: u64,
+    /// Context-compaction attempts opened.
+    pub compactions_started: u64,
+    /// Context compactions committed successfully.
+    pub compactions_completed: u64,
+    /// Context-compaction attempts failed or were cancelled.
+    pub compactions_failed: u64,
+}
+
+impl AgentRunTelemetry {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if (self.phase == AgentRunPhase::Finished) != self.terminal_state.is_some() {
+            return Err(ValidationError::new(
+                "context.run.terminal_state",
+                "must be present exactly for a finished run",
+            ));
+        }
+        let settled_responses = self
+            .responses_finished
+            .checked_add(self.responses_discarded)
+            .ok_or_else(|| {
+                ValidationError::new("context.run", "contains overflowing response counters")
+            })?;
+        let expected_started = settled_responses
+            .checked_add(u64::from(self.response_active))
+            .ok_or_else(|| {
+                ValidationError::new("context.run", "contains overflowing response counters")
+            })?;
+        if expected_started != self.responses_started
+            || (self.phase == AgentRunPhase::Responding) != self.response_active
+            || self.tool_calls_finished > self.tool_calls_started
+            || self.tool_executions_finished > self.tool_executions_started
+            || self
+                .compactions_completed
+                .saturating_add(self.compactions_failed)
+                > self.compactions_started
+        {
+            return Err(ValidationError::new(
+                "context.run",
+                "contains contradictory lifecycle counters",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Context display state.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -480,6 +590,42 @@ pub struct ContextUsage {
     pub usage: UsageSnapshot,
     /// Number of completed compactions.
     pub compactions: u32,
+    /// Reconciled category and compaction state.
+    #[serde(default)]
+    pub status: ContextStatus,
+    /// Ephemeral lifecycle counters for the active or most recent run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<AgentRunTelemetry>,
+}
+
+impl ContextUsage {
+    fn validate(&self) -> Result<(), ValidationError> {
+        self.status
+            .validate_projection()
+            .map_err(|error| ValidationError::new("context.status", error.to_string()))?;
+        if self.usage.context_tokens != self.status.current.total_tokens {
+            return Err(ValidationError::new(
+                "context.usage.context_tokens",
+                "must equal the reconciled context total",
+            ));
+        }
+        if let Some(run) = &self.run {
+            run.validate()?;
+            if u64::from(self.compactions) != run.compactions_completed {
+                return Err(ValidationError::new(
+                    "context.compactions",
+                    "must equal the successful run-compaction count",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ProtocolValidation for ContextUsage {
+    fn validate(&self) -> Result<(), ValidationError> {
+        ContextUsage::validate(self)
+    }
 }
 
 /// Bounded sidebar entry.
@@ -2211,6 +2357,7 @@ impl ProtocolValidation for SessionSnapshot {
         }
         self.branches.validate()?;
         self.model.validate()?;
+        self.context.validate()?;
         if self.items.len() > MAX_SESSION_ITEMS {
             return Err(ValidationError::new(
                 "snapshot.items",
@@ -2462,6 +2609,41 @@ fn authority_rank(authority: AuthorityProfile) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_telemetry() -> AgentRunTelemetry {
+        AgentRunTelemetry {
+            phase: AgentRunPhase::Responding,
+            terminal_state: None,
+            responses_started: 2,
+            responses_finished: 1,
+            responses_discarded: 0,
+            response_active: true,
+            tool_calls_started: 0,
+            tool_calls_finished: 0,
+            tool_executions_started: 0,
+            tool_executions_finished: 0,
+            compactions_started: 0,
+            compactions_completed: 0,
+            compactions_failed: 0,
+        }
+    }
+
+    #[test]
+    fn run_telemetry_requires_exact_response_lifecycle_reconciliation() {
+        run_telemetry().validate().unwrap();
+
+        let mut unaccounted = run_telemetry();
+        unaccounted.responses_started = 3;
+        assert!(unaccounted.validate().is_err());
+
+        let mut inactive_response = run_telemetry();
+        inactive_response.response_active = false;
+        assert!(inactive_response.validate().is_err());
+
+        let mut wrong_phase = run_telemetry();
+        wrong_phase.phase = AgentRunPhase::Preparing;
+        assert!(wrong_phase.validate().is_err());
+    }
 
     #[test]
     fn model_input_pricing_requires_bounded_safe_ascending_tiers() {

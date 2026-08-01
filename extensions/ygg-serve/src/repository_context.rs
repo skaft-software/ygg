@@ -12,7 +12,8 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::process_tree::{isolate_process_group, ProcessTree, TerminationSignal};
 use crate::project_registry::{ProjectId, ProjectRegistry, ProjectRegistryError, ProjectRoot};
 
 /// Maximum bytes read from one `AGENTS.md`, matching Ygg's runtime loader.
@@ -832,6 +834,16 @@ fn run_git(root: &Path, args: &[&str], timeout: Duration, stdout_limit: usize) -
     let Some(git_executable) = safe_git_executable(root) else {
         return GitRunResult::Unavailable;
     };
+    run_git_executable(&git_executable, root, args, timeout, stdout_limit)
+}
+
+fn run_git_executable(
+    git_executable: &Path,
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+    stdout_limit: usize,
+) -> GitRunResult {
     let mut command = Command::new(git_executable);
     command
         .args(args)
@@ -856,49 +868,150 @@ fn run_git(root: &Path, args: &[&str], timeout: Duration, stdout_limit: usize) -
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")
         .env("LANG", "C");
+    isolate_process_group(&mut command);
 
+    let started = Instant::now();
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return GitRunResult::Unavailable,
     };
+    let process_tree = ProcessTree::from_process_id(Some(child.id()));
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
+        terminate_git_process(&mut child, &process_tree, None);
         return GitRunResult::Unavailable;
     };
     let Some(stderr) = child.stderr.take() else {
-        let _ = child.kill();
+        terminate_git_process(&mut child, &process_tree, None);
         return GitRunResult::Unavailable;
     };
-    let stdout_reader = thread::spawn(move || read_bounded(stdout, stdout_limit));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr, MAX_GIT_STDERR_BYTES));
-    let started = Instant::now();
-    let (status, timed_out) = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break (Some(status), false),
-            Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                break (child.wait().ok(), true);
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(5)),
-            Err(_) => {
-                let _ = child.kill();
-                break (child.wait().ok(), false);
-            }
+
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let output = read_bounded(stdout, stdout_limit);
+        let _ = stdout_tx.send(output);
+    });
+    thread::spawn(move || {
+        let _ = read_bounded(stderr, MAX_GIT_STDERR_BYTES);
+        let _ = stderr_tx.send(());
+    });
+
+    let mut state = GitProcessState::default();
+    loop {
+        poll_git_process(&mut child, &stdout_rx, &stderr_rx, &mut state);
+        if state.failed {
+            terminate_git_process(&mut child, &process_tree, Some((&stdout_rx, &stderr_rx)));
+            return GitRunResult::Unavailable;
         }
-    };
-    let stdout = stdout_reader.join().ok();
-    let _ = stderr_reader.join();
-    if timed_out {
-        return GitRunResult::TimedOut;
+        if state.settled() {
+            // A helper may outlive the direct Git process without retaining its
+            // pipes. It is still part of this invocation and must not escape.
+            process_tree.signal(TerminationSignal::Force);
+            process_tree.disarm();
+            let status = state.status.take().expect("settled Git process has status");
+            let (stdout, truncated) = state.stdout.take().expect("settled Git process has stdout");
+            return GitRunResult::Finished(BoundedProcessOutput {
+                status,
+                stdout,
+                truncated,
+            });
+        }
+        if started.elapsed() >= timeout {
+            terminate_git_process(&mut child, &process_tree, Some((&stdout_rx, &stderr_rx)));
+            return GitRunResult::TimedOut;
+        }
+        thread::sleep(Duration::from_millis(5));
     }
-    match (status, stdout) {
-        (Some(status), Some((stdout, truncated))) => GitRunResult::Finished(BoundedProcessOutput {
-            status,
-            stdout,
-            truncated,
-        }),
-        _ => GitRunResult::Unavailable,
+}
+
+type GitStdout = (Vec<u8>, bool);
+type GitReaders<'a> = (&'a Receiver<GitStdout>, &'a Receiver<()>);
+
+#[derive(Default)]
+struct GitProcessState {
+    status: Option<ExitStatus>,
+    stdout: Option<GitStdout>,
+    stderr_done: bool,
+    failed: bool,
+}
+
+impl GitProcessState {
+    fn settled(&self) -> bool {
+        self.status.is_some() && self.stdout.is_some() && self.stderr_done
     }
+}
+
+fn poll_git_process(
+    child: &mut Child,
+    stdout_rx: &Receiver<GitStdout>,
+    stderr_rx: &Receiver<()>,
+    state: &mut GitProcessState,
+) {
+    if state.status.is_none() {
+        match child.try_wait() {
+            Ok(status) => state.status = status,
+            Err(_) => state.failed = true,
+        }
+    }
+    if state.stdout.is_none() {
+        match stdout_rx.try_recv() {
+            Ok(stdout) => state.stdout = Some(stdout),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => state.failed = true,
+        }
+    }
+    if !state.stderr_done {
+        match stderr_rx.try_recv() {
+            Ok(()) => state.stderr_done = true,
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => state.failed = true,
+        }
+    }
+}
+
+fn terminate_git_process(
+    child: &mut Child,
+    process_tree: &ProcessTree,
+    readers: Option<GitReaders<'_>>,
+) {
+    const GRACE_PERIOD: Duration = Duration::from_millis(100);
+    const FORCE_PERIOD: Duration = Duration::from_millis(400);
+
+    let mut state = GitProcessState::default();
+    process_tree.signal(TerminationSignal::Graceful);
+    let graceful_deadline = Instant::now() + GRACE_PERIOD;
+    while Instant::now() < graceful_deadline {
+        if let Some((stdout_rx, stderr_rx)) = readers {
+            poll_git_process(child, stdout_rx, stderr_rx, &mut state);
+        } else if state.status.is_none() {
+            state.status = child.try_wait().ok().flatten();
+        }
+        if !process_tree.is_alive() && (readers.is_none() || state.settled()) {
+            process_tree.disarm();
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    process_tree.signal(TerminationSignal::Force);
+    // `Child::kill` is the direct-child fallback on platforms without process
+    // groups and is harmless if the group signal already settled the child.
+    let _ = child.kill();
+    let force_deadline = Instant::now() + FORCE_PERIOD;
+    while Instant::now() < force_deadline {
+        if let Some((stdout_rx, stderr_rx)) = readers {
+            poll_git_process(child, stdout_rx, stderr_rx, &mut state);
+        } else if state.status.is_none() {
+            state.status = child.try_wait().ok().flatten();
+        }
+        if !process_tree.is_alive() && (readers.is_none() || state.settled()) {
+            process_tree.disarm();
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Keep the guard armed through return so Drop makes one final group-wide
+    // kill attempt. Reader handles are deliberately detached, never joined.
 }
 
 fn safe_git_executable(root: &Path) -> Option<PathBuf> {
@@ -1532,6 +1645,13 @@ fn refresh_status(
 mod tests {
     use super::{parse_git_status, GitFileStatusKind};
 
+    #[cfg(unix)]
+    use super::{run_git_executable, GitRunResult};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+
     fn status_output(records: &[&[u8]], truncated: bool) -> (Vec<super::GitFileStatusEntry>, bool) {
         let mut bytes = Vec::new();
         for record in records {
@@ -1611,5 +1731,49 @@ mod tests {
         let (statuses, file_statuses_truncated) = status_output(&records, false);
         assert!(statuses.is_empty());
         assert!(file_statuses_truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_timeout_kills_descendant_that_keeps_output_pipes_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("fake-git");
+        let descendant_pid = directory.path().join("descendant.pid");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\n/bin/sh -c 'trap \"\" TERM; echo $$ > \"{}\"; while :; do /bin/sleep 1; done' &\nwhile [ ! -s \"{}\" ]; do /bin/sleep 0.01; done\nexit 0\n",
+                descendant_pid.display(),
+                descendant_pid.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let started = Instant::now();
+        let result = run_git_executable(
+            &wrapper,
+            directory.path(),
+            &["status"],
+            Duration::from_millis(500),
+            1024,
+        );
+        assert!(matches!(result, GitRunResult::TimedOut));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout cleanup exceeded its bound: {:?}",
+            started.elapsed()
+        );
+
+        let pid_text = std::fs::read_to_string(&descendant_pid).unwrap();
+        let pid = rustix::process::Pid::from_raw(pid_text.trim().parse().unwrap()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rustix::process::test_kill_process(pid).is_ok() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "Git descendant survived timeout cleanup"
+        );
     }
 }

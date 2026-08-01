@@ -93,7 +93,10 @@ pub use compaction::{
     BranchHandoffPreparation, CompactionDetails, HandoffPreparation, BRANCH_SUMMARY_PREAMBLE,
     SUMMARIZATION_SYSTEM_PROMPT,
 };
-pub use context::ContextSnapshot;
+pub use context::{
+    ActiveContextCompaction, ContextBreakdown, ContextSnapshot, FinishedContextCompaction,
+    RunPhase, RunTerminalState,
+};
 pub use events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
     OutputChannel, QueueDeliveryMode,

@@ -1,7 +1,4 @@
-import {
-  fixtureBootstrap,
-  fixtureSessions,
-} from "./fixtures";
+import { fixtureBootstrap, fixtureSessions } from "./fixtures";
 import type {
   AttachmentRef,
   ClientCommand,
@@ -34,10 +31,7 @@ import type {
   UsagePeriod,
   UsageStats,
 } from "./protocol";
-import {
-  primeSessionItemIndex,
-  reduceSessionEvent,
-} from "./reducer";
+import { primeSessionItemIndex, reduceSessionEvent } from "./reducer";
 import {
   decodeWireCommandAck,
   encodeClientCommand,
@@ -64,9 +58,7 @@ import {
 
 type EventListener = (event: HostEvent) => void;
 export type TransportConnectionState =
-  | "connecting"
-  | "connected"
-  | "reconnecting";
+  "connecting" | "connected" | "reconnecting";
 type ConnectionListener = (state: TransportConnectionState) => void;
 
 export interface YggTransport {
@@ -92,11 +84,11 @@ export interface YggTransport {
     projectId: string,
     query: string,
   ): Promise<TrustedFileSearchResult>;
-  readTrustedFile(
+  readTrustedFile(projectId: string, entryId: string): Promise<TrustedFileRead>;
+  getProjectFileTree(
     projectId: string,
-    entryId: string,
-  ): Promise<TrustedFileRead>;
-  getProjectFileTree(projectId: string, path?: string): Promise<ProjectFileTree>;
+    path?: string,
+  ): Promise<ProjectFileTree>;
   readProjectFile(
     projectId: string,
     path: string,
@@ -122,11 +114,7 @@ export interface YggTransport {
 }
 
 export type TerminalConnectionState =
-  | "connecting"
-  | "connected"
-  | "reconnecting"
-  | "detached"
-  | "exited";
+  "connecting" | "connected" | "reconnecting" | "detached" | "exited";
 
 export interface TerminalOpenRequest {
   cols: number;
@@ -148,18 +136,16 @@ type TerminalServerMessage = Exclude<TerminalEvent, { type: "state" }>;
 
 const terminalReconnectMaximumDelayMs = 8_000;
 
-function terminalWebSocketUrl(): string {
-  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${scheme}//${window.location.host}/api/v1/terminal`;
-}
-
 function terminalServerMessage(value: unknown): TerminalServerMessage | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
   }
   const message = value as Record<string, unknown>;
   if (message.type === "opened") {
-    if (typeof message.id !== "string" || typeof message.ownerKey !== "string") {
+    if (
+      typeof message.id !== "string" ||
+      typeof message.ownerKey !== "string"
+    ) {
       return null;
     }
     if (message.replay !== undefined && typeof message.replay !== "string") {
@@ -211,8 +197,6 @@ export class TerminalWebSocket {
   private exited = false;
   private currentState: TerminalConnectionState = "detached";
 
-  constructor(private readonly url = terminalWebSocketUrl()) {}
-
   subscribe(listener: TerminalListener): () => void {
     this.listeners.add(listener);
     listener({ type: "state", state: this.currentState });
@@ -223,6 +207,8 @@ export class TerminalWebSocket {
     this.openRequest = { ...request };
     this.closedByClient = false;
     this.exited = false;
+    this.terminalId = null;
+    this.reconnectAttempt = 0;
     this.clearReconnectTimer();
     const previousSocket = this.socket;
     this.socket = null;
@@ -251,7 +237,11 @@ export class TerminalWebSocket {
     this.openRequest = null;
     this.terminalId = null;
     this.clearReconnectTimer();
-    if (this.socket && terminalId && this.socket.readyState === WebSocket.OPEN) {
+    if (
+      this.socket &&
+      terminalId &&
+      this.socket.readyState === WebSocket.OPEN
+    ) {
       this.send({ type: "detach", id: terminalId });
     }
     this.socket?.close();
@@ -267,7 +257,10 @@ export class TerminalWebSocket {
   private connect(): void {
     if (!this.openRequest || this.closedByClient || this.socket) return;
     this.setState(this.reconnectAttempt === 0 ? "connecting" : "reconnecting");
-    const socket = new WebSocket(this.url);
+    const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const socket = new WebSocket(
+      `${scheme}//${window.location.host}/api/v1/terminal`,
+    );
     this.socket = socket;
     socket.onopen = () => {
       if (this.socket !== socket || !this.openRequest) return;
@@ -287,12 +280,24 @@ export class TerminalWebSocket {
     try {
       decoded = JSON.parse(event.data);
     } catch {
-      this.emit({ type: "error", message: "The terminal sent an invalid response." });
+      this.emit({
+        type: "error",
+        message: "The terminal sent an invalid response.",
+      });
       return;
     }
     const message = terminalServerMessage(decoded);
     if (!message) {
-      this.emit({ type: "error", message: "The terminal sent an invalid response." });
+      this.emit({
+        type: "error",
+        message: "The terminal sent an invalid response.",
+      });
+      return;
+    }
+    if (
+      (message.type === "output" || message.type === "exit") &&
+      message.id !== this.terminalId
+    ) {
       return;
     }
     if (message.type === "opened") {
@@ -350,7 +355,7 @@ export class TerminalWebSocket {
   }
 }
 
-const clone = <T,>(value: T): T => structuredClone(value);
+const clone = <T>(value: T): T => structuredClone(value);
 
 /** Raised only when a write's optimistic SHA-256 version is stale. */
 export class ProjectFileConflictError extends Error {
@@ -387,7 +392,8 @@ function mergeFixtureGitStatuses(
   for (const status of next ?? []) {
     const existing = merged.find((candidate) => candidate.kind === status.kind);
     if (!existing) merged.push({ ...status });
-    else if (!existing.oldPath && status.oldPath) existing.oldPath = status.oldPath;
+    else if (!existing.oldPath && status.oldPath)
+      existing.oldPath = status.oldPath;
   }
   return merged.length > 0 ? merged : undefined;
 }
@@ -906,7 +912,10 @@ export class FixtureTransport implements YggTransport {
         entries.set(name, {
           kind: "directory",
           size: 0,
-          gitStatus: mergeFixtureGitStatuses(current?.gitStatus, file.gitStatus),
+          gitStatus: mergeFixtureGitStatuses(
+            current?.gitStatus,
+            file.gitStatus,
+          ),
         });
       } else {
         entries.set(remainder, {
@@ -939,7 +948,9 @@ export class FixtureTransport implements YggTransport {
   ): Promise<ProjectFileRead> {
     const file = this.fixtureProjectFiles(projectId).get(path);
     if (!file) throw new Error("Project file is not available.");
-    const lines = file.content ? file.content.match(/[^\n]*\n|[^\n]+$/gu) ?? [] : [];
+    const lines = file.content
+      ? (file.content.match(/[^\n]*\n|[^\n]+$/gu) ?? [])
+      : [];
     const lineCount = lines.length;
     const first = startLine ?? 1;
     const last = endLine ?? lineCount;
@@ -978,7 +989,9 @@ export class FixtureTransport implements YggTransport {
         {
           path,
           line,
-          snippet: text.slice(lineStart, lineEnd < 0 ? text.length : lineEnd).trim(),
+          snippet: text
+            .slice(lineStart, lineEnd < 0 ? text.length : lineEnd)
+            .trim(),
         },
       ];
     });
@@ -1070,10 +1083,12 @@ export class FixtureTransport implements YggTransport {
                 : [],
             titleMatchRanges:
               titleStart >= 0
-                ? [{
-                    startChar: titleStart,
-                    endChar: titleStart + queryLength,
-                  }]
+                ? [
+                    {
+                      startChar: titleStart,
+                      endChar: titleStart + queryLength,
+                    },
+                  ]
                 : [],
             timestampMs: Date.parse(item.createdAt),
             score: 100,
@@ -1132,8 +1147,7 @@ export class FixtureTransport implements YggTransport {
       [
         "src/main.ts",
         {
-          content:
-            'export const greeting = "Hello from ygg";\n',
+          content: 'export const greeting = "Hello from ygg";\n',
           modifiedAtMs: initialModifiedAtMs,
           gitStatus: [{ kind: "untracked" }],
         },
@@ -1187,8 +1201,7 @@ export class FixtureTransport implements YggTransport {
                   ...item,
                   ...event.activity,
                   detail:
-                    event.activity.outputSummary ??
-                    event.activity.summary,
+                    event.activity.outputSummary ?? event.activity.summary,
                   state:
                     event.activity.status === "running"
                       ? "streaming"
@@ -1210,8 +1223,7 @@ export class FixtureTransport implements YggTransport {
               ? {
                   ...item,
                   ...event.result,
-                  detail:
-                    event.result.outputSummary ?? event.result.summary,
+                  detail: event.result.outputSummary ?? event.result.summary,
                   state:
                     event.result.status === "running"
                       ? "streaming"
@@ -1231,9 +1243,7 @@ export class FixtureTransport implements YggTransport {
         ): T[] => {
           if (!incomingItems) return currentItems;
           if (!event.merge) return clone(incomingItems);
-          const merged = new Map(
-            currentItems.map((item) => [item.id, item]),
-          );
+          const merged = new Map(currentItems.map((item) => [item.id, item]));
           for (const item of incomingItems) merged.set(item.id, clone(item));
           return [...merged.values()];
         };
@@ -1263,7 +1273,9 @@ export class FixtureTransport implements YggTransport {
 
   async send(command: ClientCommand): Promise<CommandAck> {
     if (command.type === "theme.select") {
-      if (!this.bootstrap.themes.some((theme) => theme.id === command.themeId)) {
+      if (
+        !this.bootstrap.themes.some((theme) => theme.id === command.themeId)
+      ) {
         return {
           commandId: command.id,
           accepted: false,
@@ -1346,6 +1358,19 @@ export class FixtureTransport implements YggTransport {
         modelId: command.modelId,
         reasoning: command.reasoning,
         authority: command.authority,
+        context: {
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            contextTokens: 0,
+            contextLimit: 200_000,
+          },
+          compactions: 0,
+          status: {
+            current: { categories: [], totalTokens: 0 },
+            updatedAtMs: Date.parse(now),
+          },
+        },
         contextTokens: 0,
         contextPercent: 0,
         startedAt: now,
@@ -1417,8 +1442,7 @@ export class FixtureTransport implements YggTransport {
         !summary ||
         summary.lifecycle !== "trash" ||
         !summary.retention ||
-        summary.retention.trashedAtMs !==
-          command.confirmation.trashedAtMs ||
+        summary.retention.trashedAtMs !== command.confirmation.trashedAtMs ||
         command.confirmation.sessionId !== command.sessionId ||
         command.confirmation.phrase !== expectedPhrase
       ) {
@@ -1448,7 +1472,10 @@ export class FixtureTransport implements YggTransport {
     }
 
     if (command.type === "session.invokeSlashCommand") {
-      if (snapshot.status === "working" || snapshot.status === "needs_attention") {
+      if (
+        snapshot.status === "working" ||
+        snapshot.status === "needs_attention"
+      ) {
         return {
           commandId: command.id,
           accepted: false,
@@ -1755,8 +1782,7 @@ export class FixtureTransport implements YggTransport {
         };
       }
       const target = snapshot.branches.entries.find(
-        (entry) =>
-          entry.entryId === command.entryId && entry.checkoutable,
+        (entry) => entry.entryId === command.entryId && entry.checkoutable,
       );
       if (!target) {
         return {
@@ -2002,11 +2028,8 @@ export class HttpTransport implements YggTransport {
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
   private closedByClient = false;
-  private replaying = false;
-  private bufferedEvents: Array<{
-    hostSequence: number;
-    event: HostEvent;
-  }> = [];
+  private connectGeneration = 0;
+  private socketGeneration = 0;
   private hostId: string | null = null;
   private catalogRevision = 0;
   private catalogAnchorSessionId: string | null = null;
@@ -2098,6 +2121,7 @@ export class HttpTransport implements YggTransport {
 
   async connect(selectedSessionId?: string): Promise<HostBootstrap> {
     this.closedByClient = false;
+    const generation = ++this.connectGeneration;
     const request: RequestInit = {
       headers: { Accept: "application/json" },
       credentials: "same-origin",
@@ -2114,6 +2138,9 @@ export class HttpTransport implements YggTransport {
     const { bootstrap, selectedSession } = projectHostBootstrap(
       await response.json(),
     );
+    if (generation !== this.connectGeneration || this.closedByClient) {
+      return bootstrap;
+    }
     this.hostId = bootstrap.host.id;
     this.catalogRevision = bootstrap.catalogRevision;
     this.catalogAnchorSessionId = bootstrap.selectedSessionId;
@@ -2292,10 +2319,7 @@ export class HttpTransport implements YggTransport {
   }
 
   private rememberForkedSession(
-    command: Extract<
-      ClientCommand,
-      { type: "session.forkConversation" }
-    >,
+    command: Extract<ClientCommand, { type: "session.forkConversation" }>,
     sessionId: string,
   ): void {
     const source = this.summaries.get(command.sessionId);
@@ -2319,8 +2343,7 @@ export class HttpTransport implements YggTransport {
         sourceSessionId: command.sessionId,
         sourceEntryId: command.entryId,
         externalEffectsPreserved: true,
-        warning:
-          "External side effects from the source session are preserved.",
+        warning: "External side effects from the source session are preserved.",
       },
       unread: false,
       modelId,
@@ -2586,13 +2609,14 @@ export class HttpTransport implements YggTransport {
 
   close(): void {
     this.closedByClient = true;
+    this.connectGeneration += 1;
+    this.socketGeneration += 1;
     if (this.reconnectTimer !== null) {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
     this.socket?.close();
     this.socket = null;
-    this.bufferedEvents = [];
     this.replacementBarrierBySession.clear();
     this.listeners.clear();
     this.connectionListeners.clear();
@@ -2600,43 +2624,71 @@ export class HttpTransport implements YggTransport {
 
   private openSocket(): void {
     if (this.closedByClient) return;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    const generation = ++this.socketGeneration;
+    const previous = this.socket;
+    this.socket = null;
+    previous?.close();
+
     const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(
       `${scheme}//${window.location.host}/api/v1/events`,
     );
     this.socket = socket;
+    let opened = false;
+    let replaying = false;
+    const bufferedEvents: Array<{
+      hostSequence: number;
+      event: HostEvent;
+    }> = [];
+    const isCurrent = () => this.isCurrentSocket(socket, generation);
 
     socket.addEventListener("open", () => {
+      if (!isCurrent()) {
+        socket.close();
+        return;
+      }
+      if (opened) return;
+      opened = true;
       this.reconnectAttempt = 0;
       this.setConnectionState("connected");
-      this.replaying = true;
-      void Promise.all([this.replayAll(), this.refreshCatalog()]).then(
+      replaying = true;
+      void Promise.all([
+        this.replayAll(socket, generation),
+        this.refreshCatalog(socket, generation),
+      ]).then(
         () => {
-          if (this.socket !== socket) return;
-          this.replaying = false;
-          const buffered = this.bufferedEvents
+          if (!isCurrent()) return;
+          replaying = false;
+          const buffered = bufferedEvents
             .splice(0)
             .sort((left, right) => left.hostSequence - right.hostSequence);
           for (const projection of buffered) {
+            this.rememberEvent(projection.event);
             this.dispatch(projection.event);
           }
         },
         () => {
-          if (this.socket === socket) socket.close();
+          if (isCurrent()) socket.close();
         },
       );
     });
 
     socket.addEventListener("message", (message) => {
+      if (!isCurrent()) return;
       try {
         const projection = projectHostStreamEvent(
           JSON.parse(String(message.data)),
           { models: this.models },
         );
-        this.rememberEvent(projection.event);
-        if (this.replaying) {
-          this.bufferedEvents.push(projection);
+        if (replaying) {
+          bufferedEvents.push(projection);
         } else {
+          this.rememberEvent(projection.event);
           this.dispatch(projection.event);
         }
       } catch {
@@ -2645,16 +2697,34 @@ export class HttpTransport implements YggTransport {
     });
 
     socket.addEventListener("close", () => {
-      if (this.socket === socket) this.socket = null;
+      if (!isCurrent()) return;
+      this.socket = null;
+      replaying = false;
+      bufferedEvents.length = 0;
       if (this.closedByClient) return;
       this.setConnectionState("reconnecting");
       const delay = Math.min(5_000, 250 * 2 ** this.reconnectAttempt);
       this.reconnectAttempt += 1;
       this.reconnectTimer = window.setTimeout(() => {
         this.reconnectTimer = null;
+        if (
+          this.closedByClient ||
+          this.socketGeneration !== generation ||
+          this.socket !== null
+        ) {
+          return;
+        }
         this.openSocket();
       }, delay);
     });
+  }
+
+  private isCurrentSocket(socket: WebSocket, generation: number): boolean {
+    return (
+      !this.closedByClient &&
+      this.socket === socket &&
+      this.socketGeneration === generation
+    );
   }
 
   private dispatch(event: HostEvent): void {
@@ -2762,7 +2832,10 @@ export class HttpTransport implements YggTransport {
     }
   }
 
-  private async refreshCatalog(): Promise<void> {
+  private async refreshCatalog(
+    socket: WebSocket,
+    generation: number,
+  ): Promise<void> {
     const anchor =
       this.catalogAnchorSessionId ?? this.cursorBySession.keys().next().value;
     if (!anchor) return;
@@ -2773,11 +2846,17 @@ export class HttpTransport implements YggTransport {
         credentials: "same-origin",
       },
     );
+    if (!this.isCurrentSocket(socket, generation)) return;
     if (!response.ok) {
       throw new Error(`Catalog refresh failed with ${response.status}`);
     }
     const { bootstrap } = projectHostBootstrap(await response.json());
-    if (bootstrap.catalogRevision <= this.catalogRevision) return;
+    if (
+      !this.isCurrentSocket(socket, generation) ||
+      bootstrap.catalogRevision <= this.catalogRevision
+    ) {
+      return;
+    }
 
     const previous = this.summaries;
     this.catalogRevision = bootstrap.catalogRevision;
@@ -2798,7 +2877,10 @@ export class HttpTransport implements YggTransport {
     }
   }
 
-  private async replayAll(): Promise<void> {
+  private async replayAll(
+    socket: WebSocket,
+    generation: number,
+  ): Promise<void> {
     const cursors = [...this.cursorBySession.entries()];
     await Promise.all(
       cursors.map(async ([sessionId, cursor]) => {
@@ -2813,6 +2895,7 @@ export class HttpTransport implements YggTransport {
             credentials: "same-origin",
           },
         );
+        if (!this.isCurrentSocket(socket, generation)) return;
         if (!response.ok) {
           throw new Error(`Replay failed with ${response.status}`);
         }
@@ -2820,6 +2903,7 @@ export class HttpTransport implements YggTransport {
           summary: this.summaries.get(sessionId),
           models: this.models,
         });
+        if (!this.isCurrentSocket(socket, generation)) return;
         if (replay.type === "gap") {
           this.rememberSnapshot(replay.snapshot);
           this.dispatch({
@@ -2870,8 +2954,7 @@ export function resolveClientDeviceId(): string | undefined {
   const injected =
     document
       .querySelector<HTMLMetaElement>('meta[name="ygg-device-id"]')
-      ?.content.trim() ||
-    document.documentElement.dataset.yggDeviceId?.trim();
+      ?.content.trim() || document.documentElement.dataset.yggDeviceId?.trim();
   if (injected && validDeviceId.test(injected)) return injected;
 
   const host = window.location.hostname;

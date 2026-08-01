@@ -53,8 +53,10 @@ import { CommandRejectedError } from "../command-error";
 import { SessionDraftStore } from "../drafts";
 import type {
   ActionItem,
+  AgentRunPhase,
   AttachmentRef,
   AuthorityProfile,
+  ContextCategory,
   DocumentReference,
   CommandDiscovery,
   CommandSuggestion,
@@ -2966,6 +2968,71 @@ function estimatedContextInputCost(
   });
 }
 
+const contextCategoryLabel: Record<ContextCategory, string> = {
+  system: "system",
+  projectInstructions: "project instructions",
+  conversation: "conversation",
+  toolResults: "tool results",
+  attachments: "attachments",
+  documents: "documents",
+  projectFiles: "project files",
+  compactionSummaries: "compaction summaries",
+  other: "unattributed",
+};
+
+const runPhaseLabel: Record<AgentRunPhase, string> = {
+  preparing: "Preparing",
+  responding: "Responding",
+  retrying: "Retrying",
+  compacting: "Compacting",
+  executingTool: "Using tool",
+  finished: "Finished",
+};
+
+function contextActivityLabel(session: SessionSnapshot): string | undefined {
+  if (session.context.status.activeCompaction) return "Compacting";
+  const phase = session.context.run?.phase;
+  if (!phase || phase === "finished") return undefined;
+  return runPhaseLabel[phase];
+}
+
+function contextTelemetryDescription(
+  session: SessionSnapshot,
+  contextCost: string | undefined,
+): string {
+  const usage = session.context.usage;
+  const details = [
+    `${session.contextPercent}% of context used (${usage.contextTokens.toLocaleString()}${
+      usage.contextLimit
+        ? ` of ${usage.contextLimit.toLocaleString()}`
+        : ""
+    } tokens)`,
+  ];
+  const categories = session.context.status.current.categories
+    .filter((category) => category.tokens > 0)
+    .map(
+      (category) =>
+        `${contextCategoryLabel[category.category]} ${category.tokens.toLocaleString()}`,
+    );
+  if (categories.length > 0) details.push(`Breakdown: ${categories.join(", ")}`);
+  const activeCompaction = session.context.status.activeCompaction;
+  if (activeCompaction) {
+    details.push(`Compacting after ${activeCompaction.reason} trigger`);
+  } else if (session.context.run) {
+    const run = session.context.run;
+    details.push(
+      run.phase === "finished" && run.terminalState
+        ? `Run finished: ${run.terminalState}`
+        : `Run phase: ${runPhaseLabel[run.phase]}`,
+    );
+  }
+  if (session.context.status.lastCompaction?.succeeded === false) {
+    details.push("Last compaction failed without changing context");
+  }
+  if (contextCost) details.push(`Estimated next-turn input cost ~${contextCost}`);
+  return details.join("; ");
+}
+
 function Composer({
   session,
   bootstrap,
@@ -3095,9 +3162,8 @@ function Composer({
     session.contextTokens,
     activeModel,
   );
-  const contextDescription = `${session.contextPercent}% of context used${
-    contextCost ? `; estimated next-turn input cost ~${contextCost}` : ""
-  }`;
+  const contextDescription = contextTelemetryDescription(session, contextCost);
+  const contextActivity = contextActivityLabel(session);
   const providerKey =
     `${activeModel?.provider ?? ""} ${activeModel?.id ?? ""}`.toLowerCase();
   const modelAccent =
@@ -4344,9 +4410,18 @@ function Composer({
               className="composer-context-cost"
               aria-label={contextDescription}
               title={contextDescription}
+              data-run-phase={session.context.run?.phase}
+              data-compaction-active={
+                session.context.status.activeCompaction ? "true" : undefined
+              }
             >
               <span>{session.contextPercent}%</span>
-              {contextCost ? (
+              {contextActivity ? (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <strong>{contextActivity}</strong>
+                </>
+              ) : contextCost ? (
                 <>
                   <span aria-hidden="true">·</span>
                   <strong>~{contextCost}</strong>
@@ -4441,6 +4516,7 @@ const MemoizedComposer = memo(Composer, (previous, next) => {
     previousSession.modelId === nextSession.modelId &&
     previousSession.reasoning === nextSession.reasoning &&
     previousSession.authority === nextSession.authority &&
+    previousSession.context === nextSession.context &&
     previousSession.contextTokens === nextSession.contextTokens &&
     previousSession.contextPercent === nextSession.contextPercent &&
     previousSession.branches.head === nextSession.branches.head &&

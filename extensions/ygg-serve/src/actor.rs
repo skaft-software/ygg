@@ -890,13 +890,16 @@ fn reduce_snapshot(snapshot: &mut SessionSnapshot, event: &EventPayload) -> Resu
         EventPayload::UsageUpdated { usage } => {
             snapshot.context.usage = usage.clone();
         }
+        EventPayload::ContextUpdated { context } => {
+            snapshot.context = context.clone();
+        }
     }
     Ok(())
 }
 
 enum ActorMessage {
     Command {
-        envelope: SessionCommandEnvelope,
+        envelope: Box<SessionCommandEnvelope>,
         acknowledged_at_ms: u64,
         response: oneshot::Sender<CommandAdmission>,
     },
@@ -986,7 +989,7 @@ impl SessionActorHandle {
         let (response, receiver) = oneshot::channel();
         self.sender
             .send(ActorMessage::Command {
-                envelope,
+                envelope: Box::new(envelope),
                 acknowledged_at_ms,
                 response,
             })
@@ -1045,6 +1048,9 @@ impl SessionActor {
             let mut driver_events_open = true;
 
             loop {
+                // Boxing every streamed driver event would add an allocation on
+                // the actor's hottest path; this value lives only across one select.
+                #[allow(clippy::large_enum_variant)]
                 enum Input {
                     Message(Option<ActorMessage>),
                     DriverEvent(Option<TimestampedEvent>),
@@ -1066,7 +1072,7 @@ impl SessionActor {
                         response,
                     })) => {
                         let admission = core
-                            .admit_command(envelope, acknowledged_at_ms, |command| {
+                            .admit_command(*envelope, acknowledged_at_ms, |command| {
                                 driver.dispatch(command)
                             })
                             .await;

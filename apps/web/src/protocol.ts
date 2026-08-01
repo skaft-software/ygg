@@ -238,6 +238,103 @@ export interface UsageActivity {
   longestStreak: number;
 }
 
+/** Provider usage and current model-visible context totals for one session. */
+export interface UsageSnapshot {
+  inputTokens: number;
+  outputTokens: number;
+  contextTokens: number;
+  contextLimit?: number;
+}
+
+export type ContextCategory =
+  | "system"
+  | "projectInstructions"
+  | "conversation"
+  | "toolResults"
+  | "attachments"
+  | "documents"
+  | "projectFiles"
+  | "compactionSummaries"
+  | "other";
+
+export interface ContextCategoryTotal {
+  category: ContextCategory;
+  tokens: number;
+}
+
+/** Reconciled totals whose categories sum exactly to totalTokens. */
+export interface ContextTotals {
+  categories: ContextCategoryTotal[];
+  totalTokens: number;
+}
+
+export type ContextCompactionReason = "threshold" | "overflow";
+
+export interface ActiveContextCompaction {
+  id: string;
+  reason: ContextCompactionReason;
+  before: ContextTotals;
+  startedAtMs: number;
+}
+
+export interface FinishedContextCompaction {
+  id: string;
+  reason: ContextCompactionReason;
+  before: ContextTotals;
+  after: ContextTotals;
+  reclaimedTokens: number;
+  succeeded: boolean;
+  startedAtMs: number;
+  finishedAtMs: number;
+}
+
+export interface ContextStatus {
+  current: ContextTotals;
+  updatedAtMs: number;
+  activeCompaction?: ActiveContextCompaction;
+  lastCompaction?: FinishedContextCompaction;
+}
+
+export type AgentRunPhase =
+  | "preparing"
+  | "responding"
+  | "retrying"
+  | "compacting"
+  | "executingTool"
+  | "finished";
+
+export type AgentRunTerminalState =
+  | "completed"
+  | "aborted"
+  | "failed"
+  | "maxTurns"
+  | "dropped";
+
+/** Content-free lifecycle counters for the active or most recent run. */
+export interface AgentRunTelemetry {
+  phase: AgentRunPhase;
+  terminalState?: AgentRunTerminalState;
+  responsesStarted: number;
+  responsesFinished: number;
+  responsesDiscarded: number;
+  responseActive: boolean;
+  toolCallsStarted: number;
+  toolCallsFinished: number;
+  toolExecutionsStarted: number;
+  toolExecutionsFinished: number;
+  compactionsStarted: number;
+  compactionsCompleted: number;
+  compactionsFailed: number;
+}
+
+/** Complete replayable context and run-lifecycle projection. */
+export interface ContextUsage {
+  usage: UsageSnapshot;
+  compactions: number;
+  status: ContextStatus;
+  run?: AgentRunTelemetry;
+}
+
 export interface SessionSummary {
   id: string;
   projectId: string;
@@ -803,7 +900,11 @@ export interface SessionSnapshot {
   modelId: string;
   reasoning: ReasoningEffort;
   authority: AuthorityProfile;
+  /** Complete authoritative context projection. */
+  context: ContextUsage;
+  /** Convenience projection of context.usage.contextTokens. */
   contextTokens: number;
+  /** Convenience projection against context.usage.contextLimit. */
   contextPercent: number;
   startedAt: string;
   branches: SessionBranchGraph;
@@ -840,6 +941,23 @@ export type SessionEvent =
           | "contextPercent"
         >
       >;
+    }
+  | {
+      /** Complete replayable replacement emitted by context.updated. */
+      type: "context.updated";
+      sessionId: string;
+      actorGeneration?: number;
+      sequence: number;
+      context: ContextUsage;
+    }
+  | {
+      /** Backward-compatible usage-only update. */
+      type: "usage.updated";
+      sessionId: string;
+      actorGeneration?: number;
+      sequence: number;
+      observedAtMs: number;
+      usage: UsageSnapshot;
     }
   | {
       type: "item.started";
