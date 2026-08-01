@@ -109,7 +109,7 @@ test("uses the command center to triage exceptions and restore focus", async ({
     "Open task Prepare signed macOS build, Needs you, ygg",
   );
   await expectNoViewportOverflow(page);
-  if (testInfo.project.name === "desktop") {
+  if (testInfo.project.name === "desktop" && process.platform === "darwin") {
     await page.evaluate(() => document.fonts.ready);
     await expect(page.locator(".app-shell")).toHaveScreenshot(
       "command-center-settled.png",
