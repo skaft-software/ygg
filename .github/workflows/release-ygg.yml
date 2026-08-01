@@ -3,7 +3,7 @@ name: Ygg binary release
 on:
   push:
     tags:
-      - "v*-alpha*"
+      - "ygg-binaries-v*-alpha*"
   workflow_dispatch:
     inputs:
       release_tag:
@@ -41,7 +41,11 @@ jobs:
           if [[ -n "$INPUT_RELEASE_TAG" ]]; then
             tag="$INPUT_RELEASE_TAG"
           elif [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            tag="$GITHUB_REF_NAME"
+            tag=${GITHUB_REF_NAME#ygg-binaries-}
+            if [[ "$tag" == "$GITHUB_REF_NAME" ]]; then
+              echo "binary source tags must start with ygg-binaries-" >&2
+              exit 1
+            fi
           else
             echo "release_tag is required when this workflow is not running for a tag" >&2
             exit 1
