@@ -43,9 +43,10 @@ def build_ygg_argv(
 ) -> tuple[str, ...]:
     """Build the explicit headless Ygg argument vector.
 
-    The instruction remains one positional argument. Callers should pass the
-    resulting vector through :func:`shlex.join` (or an equivalent shell
-    quoting function) rather than concatenating the instruction into a command.
+    The ``--`` separator keeps a leading dash in the instruction from being
+    interpreted as another option. Callers should pass the resulting vector
+    through :func:`shlex.join` (or an equivalent shell quoting function) rather
+    than concatenating the instruction into a command.
     """
 
     if not instruction.strip():
@@ -67,7 +68,7 @@ def build_ygg_argv(
         argv.append("--workspace-trusted")
     if max_turns is not None:
         argv.extend(("--max-turns", str(max_turns)))
-    argv.append(instruction)
+    argv.extend(("--", instruction))
     return tuple(argv)
 
 

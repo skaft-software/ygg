@@ -258,3 +258,44 @@ The SDK-backed examples remain small and copyable:
   tool, command, and semantic renderer.
 - [`local-model-workflow`](../examples/extensions/local-model-workflow)
   demonstrates prompt hooks, deterministic context, status, and notifications.
+
+## First-party application packages
+
+Application packages are separate from the executable-extension protocol above.
+They distribute a complete first-party application runtime rather than JSON-RPC
+tools or hooks, use `package.toml` instead of `extension.toml`, and are never
+loaded during ordinary agent startup. The `0.3.2-alpha` package manager supports
+only the official `ygg-serve` package and local copies of that release archive.
+It is intentionally not a general package registry.
+
+```console
+ygg extension install ygg-serve
+ygg extension list
+ygg extension update ygg-serve
+ygg extension remove ygg-serve
+ygg serve
+```
+
+Packages are installed under `~/.ygg/extensions/ygg-serve/`:
+
+```text
+package.toml
+bin/ygg-serve-runtime
+install.json
+```
+
+The manifest is schema-versioned and declares the package ID and version, an
+exact required Ygg version, target triple, entrypoint arguments and SHA-256,
+and loopback/process/workspace capabilities. Official installs download the
+matching release archive and `SHA256SUMS` over HTTPS. Local archives use:
+
+```console
+ygg extension install --path ./ygg-serve-0.3.2-alpha-TARGET.tar.gz
+```
+
+Installation validates the bounded archive and embedded executable checksum,
+rejects links and unexpected paths, and publishes the package with an atomic
+same-filesystem rename. `ygg serve` revalidates compatibility and the executable
+checksum before replacing the launcher process with the installed runtime.
+Removal deletes only package files; sessions, project metadata, and other user
+data remain outside the package directory.

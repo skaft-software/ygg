@@ -2,7 +2,22 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## 0.3.2-alpha — 2026-07-26 (experimental)
+## 0.3.2-alpha — 2026-08-01 (experimental)
+
+### Added
+
+- Added target-specific prebuilt Ygg binaries and a version-pinned installer for
+  GNU/Linux x86-64, macOS x86-64, and macOS Apple silicon; compiling with Cargo
+  remains an explicit `--from-source` option.
+- Added the minimal first-party application-extension workflow: `ygg extension
+  install`, `list`, `update`, and `remove` download or accept a local package,
+  verify its checksums and exact Ygg compatibility, and install it atomically.
+- Added external `ygg serve` dispatch to the separately installed, loopback-only
+  Ygg Serve runtime. The ordinary Ygg binary does not include the Serve backend
+  or web application.
+- Added source-located diagnostics for unknown global and trusted-project config
+  keys, typo suggestions, and strict rejection through `--strict-config`,
+  `strict_config`, or `YGG_STRICT_CONFIG`.
 
 ### Changed
 
@@ -18,6 +33,9 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Fixed
 
+- Replaced line-based configuration updates with structural, comment-preserving
+  TOML editing so multiline values, similarly prefixed keys, and table sections
+  cannot be corrupted when Ygg persists model or reasoning selections.
 - Rebuilt cached transcript rows whenever the requested width changes, even when
   no content block is dirty, preventing wide rows from leaking into a narrow
   render.
