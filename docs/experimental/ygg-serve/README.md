@@ -36,10 +36,12 @@ Substantial implementation belongs outside Ygg's four core packages:
 - `apps/web/` owns the shared React client.
 - Later thin native applications live under `apps/`.
 
-`ygg-coding-agent` may contain only the smallest feature-gated adapter required
-to construct and control its private `App` from the extension service, plus a
-small `ygg serve` command dispatch. The default CLI, TUI, agent, AI, and
-`sexy-tui-rs` behavior must not change when the feature is disabled.
+For this alpha, the release package is binary-modular: the feature-enabled
+runtime contains the smallest adapter needed to construct and control Ygg's
+private `App`, while the ordinary Ygg binary owns only package management and a
+small external `ygg serve` dispatcher. Source-level extraction behind a stable
+Runtime API is deferred. The default TUI, agent, AI, and `sexy-tui-rs` behavior
+must not depend on the web surface.
 
 The adapter and client are presentation-only boundaries. They must not add
 presentation instructions to the model, alter the system prompt or active tool
@@ -72,14 +74,33 @@ fixtures. It includes:
 
 Fixtures remain a development and test input only.
 
-## Experimental build and test gates
+## Build, install, and release gates
 
-The shipping binary keeps this surface disabled by default. Build or install
-the experimental distribution explicitly with:
+With canonical Ygg `v0.3.2-alpha` installed, install the matching first-party
+package and launch it with:
 
 ```console
-cargo build --release -p ygg-coding-agent --features serve
-cargo install --locked --path crates/ygg-coding-agent --bin ygg --features serve
+ygg extension install ygg-serve
+ygg extension list
+ygg serve
+```
+
+`ygg extension update ygg-serve` reinstalls the package matching the running
+Ygg version. `ygg extension remove ygg-serve` removes only package files and
+preserves Serve sessions and other user data. A downloaded release archive can
+be installed without network access to GitHub:
+
+```console
+ygg extension install --path ygg-serve-0.3.2-alpha-TARGET.tar.gz
+```
+
+The package requires exactly `=0.3.2-alpha` and supports GNU/Linux x86_64
+(`x86_64-unknown-linux-gnu`) plus macOS x86_64/arm64. Linux musl targets are not
+supported in this alpha. For development, run the embedded feature build
+directly:
+
+```console
+cargo run --features serve -- serve
 ```
 
 Because `extensions/ygg-serve` is deliberately workspace-excluded, its focused
@@ -96,19 +117,13 @@ API or event-stream access. This transport authentication is distinct from
 Ygg's agent authority and from the future LAN device identity described in the
 pairing plan.
 
-The public installer remains pinned to the current published release and must
-not request the `serve` feature from a tag that predates it. Enabling `serve` in
-that installer is a release gate: the installer pin, `--features serve`, signed
-artifacts, and the installed-binary web-bundle smoke check must ship atomically
-with a future `v0.3.2-alpha` or later tag.
-
-The experimental release workflow at
-`.github/workflows/release-serve.yml` builds optimized `serve` binaries for
-Linux x86_64 and macOS x86_64/arm64, checks the embedded web bundle with the
-installed-binary smoke test, packages archives, writes SHA-256 checksums, and
-signs both archives and the checksum manifest with keyless Sigstore bundles.
-It is deliberately separate from the default feature-disabled build and does
-not change the public installer.
+The release workflow at `.github/workflows/release-serve.yml` builds optimized
+runtimes for the three supported targets, verifies both direct and
+package-dispatched launch, and emits archives named
+`ygg-serve-0.3.2-alpha-TARGET.tar.gz`. It writes SHA-256 checksums, signs the
+archives and checksum manifest with keyless Sigstore bundles, and attaches them
+to the existing canonical Ygg prerelease. Serve source tags use the form
+`ygg-serve-v0.3.2-alpha`; they do not replace the canonical Ygg tag.
 
 ## Explicit exclusions
 

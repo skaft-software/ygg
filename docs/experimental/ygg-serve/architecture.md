@@ -54,9 +54,10 @@ The allowed adapter:
 - depends on the extension's host-facing trait rather than making the extension
   depend on coding-agent internals.
 
-The `ygg serve` CLI and main dispatch should be tiny feature-gated shims into
-this adapter. Broader changes to the AI, agent, TUI, or terminal packages are
-out of scope.
+The feature-enabled package runtime keeps the internal dispatch into this
+adapter tiny. The ordinary Ygg binary instead keeps a tiny external `ygg serve`
+dispatch into the installed runtime. Broader changes to the AI, agent, TUI, or
+terminal packages are out of scope.
 
 ## Session ownership
 

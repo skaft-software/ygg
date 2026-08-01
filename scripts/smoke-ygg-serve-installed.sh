@@ -23,6 +23,7 @@ script_directory=$(cd "$(dirname "$0")" && pwd)
 repository_directory=$(cd "$script_directory/.." && pwd)
 expected_directory="$repository_directory/extensions/ygg-serve/web"
 work_directory=$(mktemp -d "${TMPDIR:-/tmp}/ygg-serve-smoke.XXXXXX")
+home_directory=${HOME:-"$work_directory/home"}
 server_pid=
 
 cleanup() {
@@ -45,6 +46,7 @@ cookie_jar="$work_directory/cookies"
 (
     cd "$work_directory/run"
     exec env -i \
+        HOME="$home_directory" \
         PATH="$PATH" \
         XDG_CONFIG_HOME="$work_directory/config" \
         OPENAI_API_KEY=ygg-serve-smoke-not-a-secret \

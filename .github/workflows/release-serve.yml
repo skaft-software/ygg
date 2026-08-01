@@ -1,14 +1,18 @@
-name: Experimental ygg serve release
+name: Ygg Serve extension release
 
 on:
   push:
     tags:
-      - "v*-alpha*"
+      - "ygg-serve-v*-alpha*"
   workflow_dispatch:
     inputs:
-      tag:
-        description: Existing tag to package and publish
+      release_tag:
+        description: Existing canonical Ygg tag to receive the extension assets
         required: true
+        type: string
+      source_ref:
+        description: Serve source ref (defaults to the selected workflow ref)
+        required: false
         type: string
 
 permissions:
@@ -35,40 +39,98 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.source_ref || github.ref }}
+      - id: release
+        name: Resolve canonical release tag
+        shell: bash
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_RELEASE_TAG" ]]; then
+            tag="$INPUT_RELEASE_TAG"
+          else
+            tag=${GITHUB_REF_NAME#ygg-serve-}
+            if [[ "$tag" == "$GITHUB_REF_NAME" ]]; then
+              echo "Serve release tags must start with ygg-serve-" >&2
+              exit 1
+            fi
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-alpha[0-9A-Za-z.-]*$ ]]; then
+            echo "invalid canonical alpha release tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: serve-release-${{ matrix.target }}
-      - name: Build optimized feature-enabled binary
+          key: serve-extension-release-${{ matrix.target }}
+      - name: Build optimized Serve runtime
         run: cargo build --release --locked --target "${{ matrix.target }}" -p ygg-coding-agent --features serve
-      - name: Verify binary and embedded web bundle
+      - name: Verify runtime and embedded web bundle
         run: |
           target="${{ matrix.target }}"
           binary="target/$target/release/ygg"
           test -x "$binary"
           "$binary" --version
           scripts/smoke-ygg-serve-installed.sh "$binary"
-      - name: Package release artifact
+      - name: Package standalone extension archive
+        shell: bash
         run: |
-          version="${{ inputs.tag || github.ref_name }}"
+          set -euo pipefail
+          version="${{ steps.release.outputs.tag }}"
+          version=${version#v}
           scripts/package-ygg-serve-release.sh \
             "${{ matrix.target }}" \
-            "$RUNNER_TEMP/ygg-release" \
-            "$version"
+            "$RUNNER_TEMP/ygg-serve-release" \
+            "${{ steps.release.outputs.tag }}"
+          test -f "$RUNNER_TEMP/ygg-serve-release/ygg-serve-$version-${{ matrix.target }}.tar.gz"
+      - name: Verify install, launch, list, and removal
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          version="${{ steps.release.outputs.tag }}"
+          version=${version#v}
+          archive="$RUNNER_TEMP/ygg-serve-release/ygg-serve-$version-$target.tar.gz"
+          test -f "$archive"
+          cargo build --locked --target "$target" -p ygg-coding-agent --no-default-features
+          launcher="target/$target/debug/ygg"
+          package_home="$RUNNER_TEMP/ygg-package-home"
+          mkdir -p "$package_home/.ygg/serve-data"
+          printf 'preserve\n' > "$package_home/.ygg/serve-data/sentinel"
+          HOME="$package_home" "$launcher" extension install --path "$archive"
+          test -f "$package_home/.ygg/extensions/ygg-serve/package.toml"
+          test -x "$package_home/.ygg/extensions/ygg-serve/bin/ygg-serve-runtime"
+          test -f "$package_home/.ygg/extensions/ygg-serve/install.json"
+          HOME="$package_home" "$launcher" extension list | grep -F "ygg-serve"
+          HOME="$package_home" scripts/smoke-ygg-serve-installed.sh "$launcher"
+          HOME="$package_home" "$launcher" extension remove ygg-serve
+          test ! -e "$package_home/.ygg/extensions/ygg-serve"
+          grep -Fx "preserve" "$package_home/.ygg/serve-data/sentinel"
+      - name: Preserve Linux launcher for published-package verification
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ygg-extension-test-launcher
+          path: target/x86_64-unknown-linux-gnu/debug/ygg
+          if-no-files-found: error
+          retention-days: 2
       - uses: actions/upload-artifact@v4
         with:
           name: ygg-serve-${{ matrix.target }}
-          path: ${{ runner.temp }}/ygg-release/*.tar.gz
+          path: ${{ runner.temp }}/ygg-serve-release/*.tar.gz
           if-no-files-found: error
           retention-days: 14
 
   publish:
-    name: Sign and publish experimental artifacts
+    name: Sign and attach extension artifacts
     needs: build
     runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release.outputs.tag }}
     permissions:
       actions: read
       contents: write
@@ -76,7 +138,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.source_ref || github.ref }}
+      - id: release
+        name: Resolve canonical release tag
+        shell: bash
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_RELEASE_TAG" ]]; then
+            tag="$INPUT_RELEASE_TAG"
+          else
+            tag=${GITHUB_REF_NAME#ygg-serve-}
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-alpha[0-9A-Za-z.-]*$ ]]; then
+            echo "invalid canonical alpha release tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           pattern: ygg-serve-*
@@ -122,12 +201,59 @@ jobs:
             --certificate-identity-regexp "$COSIGN_IDENTITY" \
             --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
             SHA256SUMS
-      - name: Publish GitHub prerelease
+      - name: Attach assets to the canonical Ygg prerelease
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
-          gh release create "$RELEASE_TAG" release-assets/* \
-            --title "Ygg $RELEASE_TAG (experimental serve)" \
-            --prerelease \
-            --generate-notes
+          set -euo pipefail
+          if ! prerelease=$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease'); then
+            echo "canonical release $RELEASE_TAG does not exist; publish Ygg first" >&2
+            exit 1
+          fi
+          if [[ "$prerelease" != true ]]; then
+            echo "canonical release $RELEASE_TAG is not marked as a prerelease" >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+  verify-published:
+    name: Verify official install and update
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ygg-extension-test-launcher
+          path: test-bin
+      - name: Install, update, and remove from the published release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          launcher="$PWD/test-bin/ygg"
+          chmod 0755 "$launcher"
+          test_home="$RUNNER_TEMP/ygg-published-package-home"
+          mkdir -p "$test_home/.ygg/serve-data"
+          printf 'preserve\n' > "$test_home/.ygg/serve-data/sentinel"
+
+          installed=false
+          for attempt in 1 2 3 4 5; do
+            if HOME="$test_home" "$launcher" extension install ygg-serve; then
+              installed=true
+              break
+            fi
+            echo "release assets for $RELEASE_TAG are not readable yet (attempt $attempt)" >&2
+            sleep $((attempt * 2))
+          done
+          if [[ "$installed" != true ]]; then
+            echo "could not install ygg-serve from $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          HOME="$test_home" "$launcher" extension update ygg-serve
+          HOME="$test_home" "$launcher" extension list | grep -F "ygg-serve"
+          HOME="$test_home" "$launcher" extension remove ygg-serve
+          test ! -e "$test_home/.ygg/extensions/ygg-serve"
+          grep -Fx "preserve" "$test_home/.ygg/serve-data/sentinel"

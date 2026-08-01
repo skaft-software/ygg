@@ -187,11 +187,17 @@ Intended package ownership is:
 
 The optional backend is deliberately excluded from the ordinary Cargo
 workspace. The `serve` feature is disabled by default, so the normal TUI and
-CLI do not depend on the web surface.
+agent do not depend on the web surface. The default binary can install and
+launch the separately packaged feature-enabled runtime.
 
-The actual CLI supports:
+The actual package and launch CLI supports:
 
 ```text
+ygg extension install ygg-serve
+ygg extension install --path <archive>
+ygg extension list
+ygg extension update ygg-serve
+ygg extension remove ygg-serve
 ygg serve
   --no-open
   --port <u16>
@@ -200,14 +206,15 @@ ygg serve
 
 There is no implemented `--lan`, `--demo`, or `--local-only` switch.
 
-From the repository root, the shortest development launch command is:
+From the repository root, the shortest direct development launch command is:
 
 ```console
 cargo run --features serve -- serve
 ```
 
-`--features serve` remains necessary because the graphical host is an opt-in
-experiment. `--port 0` may be added to request an ephemeral port.
+The feature remains necessary only when building the packaged runtime from
+source. An ordinary release installation dispatches `ygg serve` to that runtime.
+`--port 0` may be added to request an ephemeral port.
 
 Configuration loading reports unknown global and trusted-project TOML keys with
 source path, line, column, dotted key, and a bounded typo suggestion. Unknown

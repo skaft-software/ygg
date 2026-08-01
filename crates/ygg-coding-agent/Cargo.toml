@@ -41,6 +41,8 @@ serde_yaml = "0.9"
 schemars = "0.8"
 toml = "0.8"
 toml_edit = "0.22"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = "0.4"
 dirs = "5"
 anyhow = "1"
 thiserror = "1"

@@ -6,6 +6,7 @@ mod cli;
 mod commands;
 mod compaction;
 mod config;
+mod extension_package;
 mod extensions;
 mod hydrate;
 mod modes;
@@ -57,6 +58,19 @@ async fn run() -> anyhow::Result<()> {
     }
     if let Some(provider) = cli.logout.as_deref() {
         return run_auth_command(provider, AuthCommand::Logout).await;
+    }
+
+    if let Some(cli::TopLevelCommand::Extension { command }) = top_level_command.clone() {
+        return extension_package::run(command).await;
+    }
+    #[cfg(not(feature = "serve"))]
+    if let Some(cli::TopLevelCommand::Serve {
+        no_open,
+        port,
+        web_root,
+    }) = top_level_command.clone()
+    {
+        return extension_package::run_serve(no_open, port, web_root);
     }
 
     let cwd = std::env::current_dir()?;

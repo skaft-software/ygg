@@ -12,6 +12,7 @@ use crate::config::{
     self, ColorMode, CompactionMode, CompactionPolicy, Config, Mode, ResumeSelector, SandboxPolicy,
     ToolPolicy,
 };
+use crate::extension_package::ExtensionCommand;
 use crate::session_commands::SessionCommand;
 
 #[derive(Clone, Debug, Subcommand)]
@@ -21,8 +22,12 @@ pub enum TopLevelCommand {
         #[command(subcommand)]
         command: SessionCommand,
     },
-    /// Run the experimental local graphical host.
-    #[cfg(feature = "serve")]
+    /// Install and manage application extension packages.
+    Extension {
+        #[command(subcommand)]
+        command: ExtensionCommand,
+    },
+    /// Launch the loopback-only Ygg Serve application.
     Serve {
         /// Do not open the graphical client in the default browser.
         #[arg(long)]
@@ -1890,17 +1895,52 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "serve")]
     #[test]
-    fn serve_accepts_ephemeral_port_without_consuming_a_prompt() {
-        let cli = Cli::try_parse_from(["ygg", "serve", "--no-open", "--port", "0"]).unwrap();
+    fn application_extension_commands_parse_without_a_prompt() {
+        let cli = Cli::try_parse_from(["ygg", "extension", "install", "ygg-serve"]).unwrap();
+        assert!(cli.message.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Extension {
+                command: ExtensionCommand::Install {
+                    name: Some(ref name),
+                    path: None,
+                }
+            }) if name == "ygg-serve"
+        ));
+
+        let cli = Cli::try_parse_from(["ygg", "extension", "install", "--path", "./serve.tar.gz"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Extension {
+                command: ExtensionCommand::Install {
+                    name: None,
+                    path: Some(_),
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn serve_command_parses_forwarded_loopback_options() {
+        let cli = Cli::try_parse_from([
+            "ygg",
+            "serve",
+            "--no-open",
+            "--port",
+            "0",
+            "--web-root",
+            "./web",
+        ])
+        .unwrap();
         assert!(cli.message.is_none());
         assert!(matches!(
             cli.command,
             Some(TopLevelCommand::Serve {
                 no_open: true,
                 port: 0,
-                web_root: None,
+                web_root: Some(_),
             })
         ));
     }
