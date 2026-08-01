@@ -382,7 +382,7 @@ pub struct StreamingRenderCache {
     tail_lines: Vec<RenderedLine>,
     /// Pre-built merged result, invalidated when either committed or tail changes.
     merged_lines: Vec<RenderedLine>,
-    merged_revision: u64,
+    merged_revision: Option<u64>,
     finished: bool,
 }
 
@@ -419,12 +419,7 @@ impl StreamingRenderCache {
         }
     }
 
-    pub fn render(
-        &mut self,
-        stream: &StreamingMarkdown,
-        renderer: &RichRenderer,
-        width: u16,
-    ) -> RenderedDocument {
+    fn update(&mut self, stream: &StreamingMarkdown, renderer: &RichRenderer, width: u16) {
         let full_reflow = self.width != Some(width)
             || self.options != Some(renderer.options())
             || self.theme_revision != renderer.theme().revision()
@@ -458,19 +453,22 @@ impl StreamingRenderCache {
         self.width = Some(width);
         self.options = Some(renderer.options());
         self.theme_revision = renderer.theme().revision();
+        if full_reflow {
+            // Width/theme/options changes rebuild the source caches without
+            // changing stream revisions, so the merged view must be rebuilt.
+            self.merged_revision = None;
+        }
         self.committed_revision = stream.committed_revision();
         self.tail_revision = stream.tail_revision();
         self.finished = stream.is_finished();
+    }
 
-        // Rebuild the merged view only when the committed portion or the
-        // mutable tail actually changed.  On a typical streaming frame only
-        // the tail revision increments; the committed prefix stays stable
-        // and we avoid cloning hundreds of RenderedLine strings per frame.
+    fn merged_lines(&mut self) -> &[RenderedLine] {
         let merge_rev = self
             .committed_revision
             .wrapping_mul(2)
             .wrapping_add(self.tail_revision);
-        if self.merged_revision != merge_rev || full_reflow {
+        if self.merged_revision != Some(merge_rev) {
             let total = self.committed_lines.len()
                 + if self.committed_lines.is_empty() || self.tail_lines.is_empty() {
                     0
@@ -486,13 +484,63 @@ impl StreamingRenderCache {
                 self.merged_lines.push(RenderedLine::default());
             }
             self.merged_lines.extend(self.tail_lines.iter().cloned());
-            self.merged_revision = merge_rev;
+            self.merged_revision = Some(merge_rev);
         }
+        &self.merged_lines
+    }
 
+    pub fn render(
+        &mut self,
+        stream: &StreamingMarkdown,
+        renderer: &RichRenderer,
+        width: u16,
+    ) -> RenderedDocument {
+        self.update(stream, renderer, width);
+        let lines = self.merged_lines().to_vec();
         RenderedDocument {
-            lines: self.merged_lines.clone(),
+            lines,
             copy_text: renderer.sanitize_copy(&stream.copy_text()),
         }
+    }
+
+    /// Render one terminal representation without constructing the semantic
+    /// copy text or cloning the unused styled/plain representation. This is the
+    /// hot path for transcript surfaces, which already store copy text in their
+    /// source block and only need one display representation.
+    pub fn render_lines(
+        &mut self,
+        stream: &StreamingMarkdown,
+        renderer: &RichRenderer,
+        width: u16,
+        styled: bool,
+    ) -> Vec<String> {
+        self.update(stream, renderer, width);
+        let total = self.committed_lines.len()
+            + if self.committed_lines.is_empty() || self.tail_lines.is_empty() {
+                0
+            } else {
+                1
+            }
+            + self.tail_lines.len();
+        let mut lines = Vec::with_capacity(total);
+        for line in &self.committed_lines {
+            lines.push(if styled {
+                line.styled.clone()
+            } else {
+                line.plain.clone()
+            });
+        }
+        if !self.committed_lines.is_empty() && !self.tail_lines.is_empty() {
+            lines.push(String::new());
+        }
+        for line in &self.tail_lines {
+            lines.push(if styled {
+                line.styled.clone()
+            } else {
+                line.plain.clone()
+            });
+        }
+        lines
     }
 }
 
@@ -619,6 +667,7 @@ fn is_list_marker(line: &str) -> bool {
 mod tests {
     use super::*;
     use crate::rich_text::render::RichRenderer;
+    use crate::{ColorDepth, TerminalCapabilities, Theme};
 
     const ADVERSARIAL: &str = "# Heading\n\nA **strong** link to [docs](https://example.com) and `code`.\n\n- first\n  - nested\n- second\n\n```rust\nfn main() {\n    println!(\"界\");\n}\n```\n";
 
@@ -772,6 +821,53 @@ mod tests {
             assert_eq!(narrow.last().copied(), Some(cache.committed_rows()));
             assert!(narrow.windows(2).all(|ends| ends[0] < ends[1]));
         }
+    }
+
+    #[test]
+    fn lines_only_render_matches_the_selected_document_lines() {
+        let capabilities = TerminalCapabilities::interactive(ColorDepth::TrueColor, true);
+        let renderer = RichRenderer::new(
+            Theme::with_capabilities(capabilities),
+            capabilities,
+            RenderOptions::default(),
+        );
+        let mut stream = StreamingMarkdown::new();
+        stream.push_str("**committed**\n\nmutable");
+        let mut document_cache = StreamingRenderCache::default();
+        let mut lines_cache = StreamingRenderCache::default();
+
+        let document = document_cache.render(&stream, &renderer, 80);
+        let plain = lines_cache.render_lines(&stream, &renderer, 80, false);
+        assert_eq!(
+            plain,
+            document
+                .lines
+                .iter()
+                .map(|line| line.plain.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let styled = lines_cache.render_lines(&stream, &renderer, 80, true);
+        assert_eq!(
+            styled,
+            document
+                .lines
+                .iter()
+                .map(|line| line.styled.clone())
+                .collect::<Vec<_>>()
+        );
+
+        stream.push_str(" tail");
+        let next_document = document_cache.render(&stream, &renderer, 80);
+        let next_plain = lines_cache.render_lines(&stream, &renderer, 80, false);
+        assert_eq!(
+            next_plain,
+            next_document
+                .lines
+                .iter()
+                .map(|line| line.plain.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

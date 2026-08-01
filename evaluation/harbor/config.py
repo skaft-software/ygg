@@ -1,7 +1,7 @@
 """Pinned inputs used by the Harbor smoke and benchmark workflow."""
 
 YGG_REPOSITORY = "https://github.com/skaft-software/ygg.git"
-PINNED_YGG_COMMIT = "06cc784ef52a60b173f6d04bd90d8d30954e7501"
+PINNED_YGG_COMMIT = "a2351bacd61311705c5480a714af65de1c6aaed6"
 PINNED_YGG_VERSION = "0.3.2-alpha"
 
 HARBOR_REPOSITORY = "https://github.com/harbor-framework/harbor.git"

@@ -35,7 +35,8 @@ use std::path::PathBuf;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use ygg_ai::{
-    Cost, EndpointId, Message, ModelId, Usage, UserMessage, UserPart, PICODOLLARS_PER_MICRODOLLAR,
+    Cost, EndpointId, Message, ModelId, StopReason, Usage, UserMessage, UserPart,
+    PICODOLLARS_PER_MICRODOLLAR,
 };
 
 /// Identifier of a session entry. Unique within one session file.
@@ -89,6 +90,10 @@ pub struct UsageRecord {
     pub kind: UsageRecordKind,
     /// Provider-reported, disjoint token buckets.
     pub usage: Usage,
+    /// Provider-authoritative terminal reason for an assistant turn.
+    /// Legacy usage records and non-assistant operations omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
     /// Endpoint/provider route used for this operation.
     #[serde(default)]
     pub endpoint: Option<EndpointId>,
@@ -137,10 +142,40 @@ pub struct EntryMetadata {
     /// replayable model input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
+    /// Durable terminal state for a completed frontend run.
+    ///
+    /// This is presentation-only metadata attached to a non-model-visible
+    /// marker entry. Keeping it on a known entry variant lets older Ygg
+    /// binaries safely ignore the additional field while newer frontends can
+    /// reconstruct run boundaries after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_outcome: Option<SessionRunOutcome>,
     /// Marks a locally generated assistant boundary that intentionally has no
     /// authoritative provider sidecar.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_synthetic_assistant: bool,
+}
+
+/// Durable terminal state for one frontend-owned agent run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRunOutcome {
+    /// Coarse terminal status shared by graphical and native frontends.
+    pub status: SessionRunOutcomeStatus,
+    /// Optional bounded user-safe explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Coarse terminal status persisted at a frontend run boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRunOutcomeStatus {
+    /// The run completed successfully.
+    Completed,
+    /// The user stopped the run.
+    Stopped,
+    /// The run failed.
+    Failed,
 }
 
 impl EntryMetadata {
@@ -170,10 +205,20 @@ impl EntryMetadata {
                     .any(|character| character.is_control() && !matches!(character, '\n' | '\t')))
             .then_some(text)
         });
+        if let Some(outcome) = self.run_outcome.as_mut() {
+            outcome.message = outcome.message.take().and_then(|message| {
+                (message.len() <= 8 * 1024
+                    && !message.chars().any(|character| {
+                        character.is_control() && !matches!(character, '\n' | '\t')
+                    }))
+                .then_some(message)
+            });
+        }
         (self.prompt_model.is_some()
             || self.prompt_model_source.is_some()
             || self.prompt_color.is_some()
             || self.display_text.is_some()
+            || self.run_outcome.is_some()
             || self.local_synthetic_assistant)
             .then_some(self)
     }
@@ -189,6 +234,10 @@ pub struct Entry {
     /// Stable presentation metadata. Legacy sessions omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<EntryMetadata>,
+    /// Wall-clock creation time for protocol/session presentation. Legacy
+    /// entries omit it because historical append times cannot be recovered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_unix_ms: Option<u64>,
     /// The payload.
     pub value: EntryValue,
 }
@@ -348,6 +397,16 @@ pub enum SessionRecord {
         #[serde(default)]
         total_cost_picodollars_remainder: u32,
     },
+    /// A durable checkout before the first entry. Subsequent appends create a
+    /// new root branch while preserving every existing root and descendant.
+    RootHead {
+        /// Cumulative whole-microdollar session cost.
+        #[serde(default)]
+        total_cost_microdollars: u64,
+        /// Picodollar remainder paired with `total_cost_microdollars`.
+        #[serde(default)]
+        total_cost_picodollars_remainder: u32,
+    },
     /// A completed prompt's durable restore point. Checkpoints do not alter
     /// the active head or model-visible context.
     Checkpoint {
@@ -378,6 +437,10 @@ enum SessionRecordRef<'a> {
     Entry(&'a Entry),
     Head {
         id: &'a EntryId,
+        total_cost_microdollars: &'a u64,
+        total_cost_picodollars_remainder: &'a u32,
+    },
+    RootHead {
         total_cost_microdollars: &'a u64,
         total_cost_picodollars_remainder: &'a u32,
     },
@@ -847,6 +910,14 @@ impl Session {
                     total_cost_microdollars = cost;
                     total_cost_picodollars_remainder = remainder;
                 }
+                SessionRecord::RootHead {
+                    total_cost_microdollars: cost,
+                    total_cost_picodollars_remainder: remainder,
+                } => {
+                    head = None;
+                    total_cost_microdollars = cost;
+                    total_cost_picodollars_remainder = remainder;
+                }
                 SessionRecord::Checkpoint {
                     prompt,
                     head: checkpoint_head,
@@ -1054,6 +1125,28 @@ impl Session {
         self.append_with_metadata(value, None)
     }
 
+    /// Append a durable, non-model-visible terminal marker for a frontend run.
+    ///
+    /// The marker uses the long-standing configuration entry envelope for
+    /// backwards-compatible replay. Its typed outcome lives in presentation
+    /// metadata and therefore never enters provider-visible context.
+    pub fn append_run_outcome(
+        &mut self,
+        outcome: SessionRunOutcome,
+    ) -> Result<EntryId, SessionError> {
+        self.append_with_metadata(
+            EntryValue::Config {
+                model: None,
+                reasoning: None,
+                reasoning_mode: None,
+            },
+            Some(EntryMetadata {
+                run_outcome: Some(outcome),
+                ..EntryMetadata::default()
+            }),
+        )
+    }
+
     /// Appends an entry with stable semantic presentation metadata.
     ///
     /// Metadata is intentionally kept outside [`EntryValue`] so model-visible
@@ -1109,6 +1202,7 @@ impl Session {
             id: id.clone(),
             parent: self.head.clone(),
             metadata,
+            timestamp_unix_ms: Some(now_unix_millis()),
             value,
         };
         let mut buf = Vec::with_capacity(256);
@@ -1169,6 +1263,70 @@ impl Session {
         self.head = Some(id);
         *self.context_cache.get_mut() = None;
         Ok(())
+    }
+
+    /// Durably selects the empty pre-entry boundary. Future appends create a
+    /// new root branch; all existing roots and descendants remain preserved.
+    pub fn checkout_root(&mut self) -> Result<(), SessionError> {
+        let mut buf = Vec::with_capacity(64);
+        write_json_line(
+            &mut buf,
+            &SessionRecordRef::RootHead {
+                total_cost_microdollars: &self.total_cost_microdollars,
+                total_cost_picodollars_remainder: &self.total_cost_picodollars_remainder,
+            },
+        )?;
+        self.persist(&buf)?;
+        self.head = None;
+        *self.context_cache.get_mut() = None;
+        Ok(())
+    }
+
+    /// Copies exactly one committed ancestor chain into a new session file.
+    ///
+    /// Entry IDs and semantic sidecar references are preserved, but sibling
+    /// branches, usage telemetry, and later checkpoints are deliberately not
+    /// copied. The destination is created atomically enough to remain absent
+    /// on every validation/write failure.
+    pub fn fork_to(
+        &self,
+        path: impl Into<PathBuf>,
+        checkpoint: EntryId,
+    ) -> Result<Self, SessionError> {
+        let path = path.into();
+        let mut newest_first = Vec::<&Entry>::new();
+        let mut cursor = Some(&checkpoint);
+        while let Some(id) = cursor {
+            let entry = self
+                .entry(id)
+                .ok_or_else(|| SessionError::UnknownEntry(id.clone()))?;
+            newest_first.push(entry);
+            cursor = entry.parent.as_ref();
+        }
+        newest_first.reverse();
+
+        let mut destination = Session::create(path.clone())?;
+        let result = (|| {
+            let mut bytes = Vec::new();
+            for entry in newest_first {
+                write_json_line(&mut bytes, &SessionRecordRef::Entry(entry))?;
+            }
+            write_json_line(
+                &mut bytes,
+                &SessionRecordRef::Head {
+                    id: &checkpoint,
+                    total_cost_microdollars: &0,
+                    total_cost_picodollars_remainder: &0,
+                },
+            )?;
+            destination.persist(&bytes)?;
+            drop(destination);
+            Session::open(&path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+        result
     }
 
     /// Persist a restore point for a completed prompt without changing the
@@ -1265,6 +1423,39 @@ impl Session {
         usage: Usage,
         cost: Option<Cost>,
     ) -> Result<(), SessionError> {
+        self.record_assistant_usage_inner(assistant, endpoint, model, usage, cost, None)
+    }
+
+    /// Persist usage and the provider-authoritative stop reason for one
+    /// completed assistant turn.
+    pub fn record_assistant_usage_with_stop_reason(
+        &mut self,
+        assistant: EntryId,
+        endpoint: EndpointId,
+        model: ModelId,
+        usage: Usage,
+        cost: Option<Cost>,
+        stop_reason: StopReason,
+    ) -> Result<(), SessionError> {
+        self.record_assistant_usage_inner(
+            assistant,
+            endpoint,
+            model,
+            usage,
+            cost,
+            Some(stop_reason),
+        )
+    }
+
+    fn record_assistant_usage_inner(
+        &mut self,
+        assistant: EntryId,
+        endpoint: EndpointId,
+        model: ModelId,
+        usage: Usage,
+        cost: Option<Cost>,
+        stop_reason: Option<StopReason>,
+    ) -> Result<(), SessionError> {
         let valid_assistant = self.entry(&assistant).is_some_and(|entry| {
             matches!(&entry.value, EntryValue::Message(Message::Assistant(_)))
         });
@@ -1274,6 +1465,7 @@ impl Session {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::AssistantTurn { assistant },
             usage,
+            stop_reason,
             endpoint: Some(endpoint),
             model: Some(model),
             completed_at_unix_ms: Some(now_unix_millis()),
@@ -1295,6 +1487,7 @@ impl Session {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::Compaction,
             usage,
+            stop_reason: None,
             endpoint: Some(endpoint),
             model: Some(model),
             completed_at_unix_ms: Some(now_unix_millis()),
@@ -1317,6 +1510,7 @@ impl Session {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::RejectedResponsesTurn,
             usage,
+            stop_reason: None,
             endpoint: Some(endpoint),
             model: Some(model),
             completed_at_unix_ms: Some(now_unix_millis()),
@@ -1339,6 +1533,7 @@ impl Session {
         self.record_usage(UsageRecord {
             kind: UsageRecordKind::TerminalGate { returned },
             usage,
+            stop_reason: None,
             endpoint: Some(endpoint),
             model: Some(model),
             completed_at_unix_ms: Some(now_unix_millis()),
@@ -2160,6 +2355,11 @@ mod tests {
             id: id.to_string(),
             name: id.to_string(),
             description: String::new(),
+            license: None,
+            compatibility: None,
+            metadata: Default::default(),
+            allowed_tools: vec![],
+            disable_model_invocation: false,
             version: None,
             source: crate::skills::SkillSource::BuiltIn,
             trust: crate::skills::SkillTrust::BuiltIn,
@@ -2181,6 +2381,7 @@ mod tests {
                     prompt_model_source: Some("  deepseek  ".into()),
                     prompt_color: Some("  #22AACC  ".into()),
                     display_text: Some("visible\ndraft".into()),
+                    run_outcome: None,
                     local_synthetic_assistant: false,
                 }),
             )
@@ -2193,6 +2394,7 @@ mod tests {
                     prompt_model_source: Some("#2243e6".into()),
                     prompt_color: Some("rgb(1,2,3)\u{1b}".into()),
                     display_text: Some("bad\u{1b}".into()),
+                    run_outcome: None,
                     local_synthetic_assistant: false,
                 }),
             )
@@ -2207,6 +2409,7 @@ mod tests {
                 prompt_model_source: Some("deepseek".into()),
                 prompt_color: Some("#22aacc".into()),
                 display_text: Some("visible\ndraft".into()),
+                run_outcome: None,
                 local_synthetic_assistant: false,
             })
         );
@@ -2215,6 +2418,44 @@ mod tests {
         assert!(!persisted.contains("#2243e6"));
         assert!(persisted.contains("#22aacc"));
         assert!(!persisted.contains("[31m"));
+    }
+
+    #[test]
+    fn run_outcome_marker_is_durable_and_not_model_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut session = Session::create(&path).unwrap();
+        session.append(user("question")).unwrap();
+        session.append(assistant("answer")).unwrap();
+        let outcome_id = session
+            .append_run_outcome(SessionRunOutcome {
+                status: SessionRunOutcomeStatus::Failed,
+                message: Some("bounded failure".into()),
+            })
+            .unwrap();
+        drop(session);
+
+        let session = Session::open(&path).unwrap();
+        let marker = session.entry(&outcome_id).expect("outcome marker");
+        assert!(matches!(
+            marker.value,
+            EntryValue::Config {
+                model: None,
+                reasoning: None,
+                reasoning_mode: None,
+            }
+        ));
+        assert_eq!(
+            marker
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.run_outcome.as_ref()),
+            Some(&SessionRunOutcome {
+                status: SessionRunOutcomeStatus::Failed,
+                message: Some("bounded failure".into()),
+            })
+        );
+        assert_eq!(session.context().unwrap().len(), 2);
     }
 
     #[test]
@@ -2500,6 +2741,77 @@ mod tests {
     }
 
     #[test]
+    fn checkout_root_and_continue_preserves_the_original_root_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+
+        let mut session = Session::create(&path).unwrap();
+        let original_user = session.append(user("original prompt")).unwrap();
+        let original_assistant = session.append(assistant("original answer")).unwrap();
+        session.checkout_root().unwrap();
+        let edited_user = session.append(user("edited prompt")).unwrap();
+
+        assert_eq!(session.entry(&original_user).unwrap().parent, None);
+        assert_eq!(
+            session.entry(&original_assistant).unwrap().parent,
+            Some(original_user.clone())
+        );
+        assert_eq!(session.entry(&edited_user).unwrap().parent, None);
+        assert_eq!(session.entries().len(), 3);
+        assert_eq!(session.context().unwrap().len(), 1);
+        assert_eq!(
+            text_of(&session.context().unwrap()[0]),
+            "edited prompt",
+            "the active branch starts at the edited root"
+        );
+
+        drop(session);
+        let reopened = Session::open(path).unwrap();
+        assert_eq!(reopened.entries().len(), 3);
+        assert_eq!(reopened.head(), Some(edited_user));
+        assert!(reopened.entry(&original_assistant).is_some());
+    }
+
+    #[test]
+    fn fork_to_copies_only_the_selected_committed_ancestor_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.jsonl");
+        let fork_path = dir.path().join("fork.jsonl");
+        let mut source = Session::create(&source_path).unwrap();
+
+        let root = source.append(user("root")).unwrap();
+        let selected = source.append(assistant("selected answer")).unwrap();
+        let later = source.append(user("later work")).unwrap();
+        source.checkout(root.clone()).unwrap();
+        let sibling = source.append(assistant("sibling answer")).unwrap();
+
+        let mut fork = source.fork_to(&fork_path, selected.clone()).unwrap();
+        assert_eq!(fork.head(), Some(selected.clone()));
+        assert_eq!(fork.entries().len(), 2);
+        assert!(fork.entry(&root).is_some());
+        assert!(fork.entry(&selected).is_some());
+        assert!(fork.entry(&later).is_none());
+        assert!(fork.entry(&sibling).is_none());
+        let context = fork.context().unwrap();
+        assert_eq!(context.len(), 2);
+        assert_eq!(text_of(&context[0]), "root");
+        assert_eq!(text_of(&context[1]), "selected answer");
+
+        let continuation = fork.append(user("fork-only continuation")).unwrap();
+        assert_eq!(
+            fork.entry(&continuation).unwrap().parent,
+            Some(selected.clone())
+        );
+        drop(fork);
+        let reopened = Session::open(fork_path).unwrap();
+        assert_eq!(reopened.head(), Some(continuation));
+        assert_eq!(reopened.entries().len(), 3);
+
+        assert_eq!(source.head(), Some(sibling));
+        assert_eq!(source.entries().len(), 4);
+    }
+
+    #[test]
     fn completed_prompt_checkpoint_round_trips_and_restores_a_branch() {
         let dir = tempfile::tempdir().unwrap();
         let path = temp_path(&dir);
@@ -2753,6 +3065,7 @@ mod tests {
                 id: id.clone(),
                 parent: parent.clone(),
                 metadata: None,
+                timestamp_unix_ms: None,
                 value: if number == 1 {
                     user("checkpoint root")
                 } else {

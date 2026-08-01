@@ -18,6 +18,9 @@ Ygg nevertheless treats its own policy and persistence boundaries as security in
 - Arbitrary process execution and shell execution are treated as equivalent authority. `bash` requires both compatibility gates to be enabled.
 - Mutating or unknown tool calls left unresolved by a crash are never replayed automatically. They are paired with an indeterminate result for explicit reconciliation.
 - Session mutation uses advisory interprocess locking, stale-generation checks, private permissions, bounded parsing, and synced records. Session listing is byte-for-byte read-only.
+- Serve project browsing and editing resolves opaque project IDs to a revalidated root identity, then uses descriptor-relative no-follow traversal. Atomic writes recheck target identity and sync both content and the owning directory.
+- Serve owns Git and PTY process groups through bounded graceful/forced cleanup, including descendants that retain output descriptors. This prevents ordinary timeout/shutdown leaks; it does not restrict what an enabled command may access.
+- Serve permanent deletion journals intent before removing the transcript, retries idempotent sidecar cleanup after interruption, retains payloads referenced by another session, and fails before commit when a required store is unavailable. Conversation-content-free append-only inference accounting remains host-level history.
 - Provider streams, discovery responses, context, configuration, credentials, sessions, tool arguments/results, and local file reads have hard aggregate limits.
 - Run cancellation reaches provider streaming, retry waits, tools, and autonomous compaction. Once cancellation wins a request race, no summary or usage record from that request is committed.
 

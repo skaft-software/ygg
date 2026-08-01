@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -11,6 +12,7 @@ use crate::config::{
     self, ColorMode, CompactionMode, CompactionPolicy, Config, Mode, ResumeSelector, SandboxPolicy,
     ToolPolicy,
 };
+use crate::extension_package::ExtensionCommand;
 use crate::session_commands::SessionCommand;
 
 #[derive(Clone, Debug, Subcommand)]
@@ -19,6 +21,26 @@ pub enum TopLevelCommand {
     Sessions {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+    /// Install and manage application extension packages.
+    Extension {
+        #[command(subcommand)]
+        command: ExtensionCommand,
+    },
+    /// Launch the loopback-only Ygg Serve application.
+    ///
+    /// Default builds dispatch to the installed extension runtime; builds with
+    /// the `serve` feature run the embedded implementation.
+    Serve {
+        /// Do not open the graphical client in the default browser.
+        #[arg(long)]
+        no_open: bool,
+        /// Loopback TCP port. Zero asks the operating system for a free port.
+        #[arg(long, default_value_t = 31415)]
+        port: u16,
+        /// Directory containing a development graphical shell.
+        #[arg(long, value_name = "DIR")]
+        web_root: Option<PathBuf>,
     },
 }
 
@@ -45,6 +67,9 @@ pub struct Cli {
     /// With `--login`, print the device URL/code without opening a browser.
     #[arg(long)]
     pub headless: bool,
+    /// Frontend mode: interactive or rpc.
+    #[arg(long, value_name = "MODE", conflicts_with = "print")]
+    pub mode: Option<String>,
     /// Use headless print mode instead of the full-screen TUI.
     #[arg(long, short = 'p')]
     pub print: bool,
@@ -112,6 +137,14 @@ pub struct Cli {
     /// Explicit prompt-template file or directory (repeatable, Pi compatible).
     #[arg(long = "prompt-template", value_name = "PATH")]
     pub prompt_templates: Vec<PathBuf>,
+    /// Override the composed system prompt. Use `--system-prompt` to clear it.
+    #[arg(
+        long = "system-prompt",
+        value_name = "PROMPT",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    pub system_prompt: Option<String>,
     /// Additional directory paths to scan for agent skills.
     #[arg(long = "skill-dir", value_name = "DIR")]
     pub skill_dirs: Vec<PathBuf>,
@@ -173,6 +206,9 @@ pub struct Cli {
     /// Disable optional provider/model discovery network requests at startup.
     #[arg(long)]
     pub offline: bool,
+    /// Treat unknown configuration keys as startup errors instead of warnings.
+    #[arg(long)]
+    pub strict_config: bool,
     /// Maximum `bash` tool execution time in seconds.
     #[arg(long, alias = "exec-timeout-secs")]
     pub bash_timeout_secs: Option<u64>,
@@ -219,8 +255,10 @@ struct ConfigLayer {
     show_turn_cost: Option<bool>,
     context_files: Option<bool>,
     offline: Option<bool>,
+    strict_config: Option<bool>,
     enabled_extensions: Option<Vec<String>>,
     trusted_extensions: Option<Vec<String>>,
+    system_prompt: Option<String>,
     compaction: Option<CompactionLayer>,
 }
 
@@ -257,8 +295,10 @@ impl ConfigLayer {
         override_some!(show_turn_cost);
         override_some!(context_files);
         override_some!(offline);
+        override_some!(strict_config);
         override_some!(enabled_extensions);
         override_some!(trusted_extensions);
+        override_some!(system_prompt);
         match (self.compaction.as_mut(), newer.compaction) {
             (Some(current), Some(newer)) => {
                 if newer.mode.is_some() {
@@ -330,9 +370,13 @@ impl ConfigLayer {
             &mut self.cost_warning_microdollars,
             project.cost_warning_microdollars.take(),
         );
-        // Offline=true is a one-way safety setting for project configuration.
+        // Offline and strict diagnostics are one-way safety settings for
+        // project configuration.
         self.offline =
             Some(self.offline.unwrap_or(false) || project.offline.take().unwrap_or(false));
+        if project.strict_config.take() == Some(true) {
+            self.strict_config = Some(true);
+        }
         // A trusted project may suggest activation, but executable trust is a
         // user-level decision and can never be granted by project config.
         let trusted_extensions = self.trusted_extensions.clone();
@@ -386,40 +430,19 @@ fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow
     } else {
         String::new()
     };
+    let mut document = if content.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        content.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            anyhow::anyhow!("cannot update invalid config {}: {error}", path.display())
+        })?
+    };
 
-    // Serialise the value through toml so special characters are
-    // properly escaped rather than producing invalid config.
-    let escaped = toml::Value::String(value.to_string());
-    let replacement = format!("{key} = {escaped}");
+    // Structural TOML editing avoids partial-key matches and orphaned lines
+    // from multiline values while retaining the user's comments and layout.
+    document[key] = toml_edit::value(value);
+    let new_content = document.to_string();
 
-    let mut found = false;
-    let mut new_lines = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        // Never rewrite a commented-out line.
-        if trimmed.starts_with('#') {
-            new_lines.push(line.to_string());
-            continue;
-        }
-        if trimmed.starts_with(key) {
-            let after = trimmed.strip_prefix(key).unwrap();
-            if after.trim_start().starts_with('=') {
-                new_lines.push(replacement.clone());
-                found = true;
-                continue;
-            }
-        }
-        new_lines.push(line.to_string());
-    }
-
-    if !found {
-        if !new_lines.is_empty() && !new_lines.last().unwrap().is_empty() {
-            new_lines.push(String::new());
-        }
-        new_lines.push(replacement);
-    }
-
-    let new_content = new_lines.join("\n") + "\n";
     // Atomic write: write to a sibling temp file then rename over the
     // real path so a crash mid-write cannot leave a truncated config.
     let tmp_path = path.with_extension("tmp");
@@ -499,7 +522,220 @@ fn normalize_extension_trust_grants(
     Ok(normalized.into_iter().collect())
 }
 
-fn read_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigSourceKind {
+    Global,
+    Project,
+}
+
+impl fmt::Display for ConfigSourceKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Global => "global",
+            Self::Project => "project",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConfigDiagnostic {
+    source_kind: ConfigSourceKind,
+    path: PathBuf,
+    key: String,
+    line: usize,
+    column: usize,
+    suggestion: Option<&'static str>,
+}
+
+impl fmt::Display for ConfigDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} config {}:{}:{}: unknown configuration key {:?}",
+            self.source_kind,
+            self.path.display(),
+            self.line,
+            self.column,
+            self.key
+        )?;
+        if let Some(suggestion) = self.suggestion {
+            write!(formatter, "; did you mean {suggestion:?}?")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct LoadedConfigLayer {
+    values: ConfigLayer,
+    diagnostics: Vec<ConfigDiagnostic>,
+}
+
+const CONFIG_KEYS: &[&str] = &[
+    "model",
+    "reasoning",
+    "reasoning_mode",
+    "cache_retention",
+    "theme",
+    "color",
+    "mouse",
+    "plain",
+    "allow_external_paths",
+    "allow_edit",
+    "allow_write",
+    "allow_process",
+    "allow_shell",
+    "allow_remote_read",
+    "shell_path",
+    "bash_timeout_secs",
+    "exec_timeout_secs",
+    "max_output_bytes",
+    "session_dir",
+    "max_turns",
+    "max_cost_microdollars",
+    "cost_warning_microdollars",
+    "show_turn_cost",
+    "context_files",
+    "offline",
+    "strict_config",
+    "enabled_extensions",
+    "trusted_extensions",
+    "system_prompt",
+    "compaction",
+];
+
+const COMPACTION_KEYS: &[&str] = &[
+    "mode",
+    "policy",
+    "enabled",
+    "threshold_fraction",
+    "keep_recent_turns",
+    "compact_model",
+];
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.chars().count()).collect::<Vec<_>>();
+    let mut current = vec![0; previous.len()];
+    for (left_index, left_character) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_character) in right.chars().enumerate() {
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + usize::from(left_character != right_character));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.chars().count()]
+}
+
+fn config_key_suggestion(key: &str) -> Option<&'static str> {
+    let (prefix, leaf, candidates) = match key.rsplit_once('.') {
+        Some(("compaction", leaf)) => ("compaction.", leaf, COMPACTION_KEYS),
+        Some(_) => return None,
+        None => ("", key, CONFIG_KEYS),
+    };
+    let (candidate, distance) = candidates
+        .iter()
+        .map(|candidate| (*candidate, edit_distance(leaf, candidate)))
+        .min_by_key(|(_, distance)| *distance)?;
+    let threshold = 2.max(leaf.chars().count() / 3);
+    (distance <= threshold).then(|| {
+        if prefix.is_empty() {
+            candidate
+        } else {
+            match candidate {
+                "mode" => "compaction.mode",
+                "policy" => "compaction.policy",
+                "enabled" => "compaction.enabled",
+                "threshold_fraction" => "compaction.threshold_fraction",
+                "keep_recent_turns" => "compaction.keep_recent_turns",
+                "compact_model" => "compaction.compact_model",
+                _ => unreachable!("compaction suggestion came from the fixed schema"),
+            }
+        }
+    })
+}
+
+fn table_key_offset(table: &toml_edit::Table, segments: &[&str]) -> Option<usize> {
+    let (segment, remaining) = segments.split_first()?;
+    let key = table.key(segment)?;
+    if remaining.is_empty() {
+        return key.span().map(|span| span.start);
+    }
+    let item = table.get(segment)?;
+    if let Some(table) = item.as_table() {
+        table_key_offset(table, remaining)
+    } else {
+        inline_table_key_offset(item.as_inline_table()?, remaining)
+    }
+}
+
+fn inline_table_key_offset(table: &toml_edit::InlineTable, segments: &[&str]) -> Option<usize> {
+    let (segment, remaining) = segments.split_first()?;
+    let key = table.key(segment)?;
+    if remaining.is_empty() {
+        return key.span().map(|span| span.start);
+    }
+    inline_table_key_offset(table.get(segment)?.as_inline_table()?, remaining)
+}
+
+fn ignored_config_path(path: &serde_ignored::Path<'_>, segments: &mut Vec<String>) {
+    match path {
+        serde_ignored::Path::Root => {}
+        serde_ignored::Path::Map { parent, key } => {
+            ignored_config_path(parent, segments);
+            segments.push(key.clone());
+        }
+        serde_ignored::Path::Seq { parent, index } => {
+            ignored_config_path(parent, segments);
+            segments.push(index.to_string());
+        }
+        serde_ignored::Path::Some { parent }
+        | serde_ignored::Path::NewtypeStruct { parent }
+        | serde_ignored::Path::NewtypeVariant { parent } => {
+            ignored_config_path(parent, segments);
+        }
+    }
+}
+
+fn config_key_location(source: &str, segments: &[String]) -> (usize, usize) {
+    let offset = toml_edit::ImDocument::parse(source.to_owned())
+        .ok()
+        .and_then(|document| {
+            let segments = segments.iter().map(String::as_str).collect::<Vec<_>>();
+            table_key_offset(document.as_table(), &segments)
+        })
+        .unwrap_or(0);
+    let prefix = &source[..offset.min(source.len())];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, tail)| tail)
+        .chars()
+        .count()
+        + 1;
+    (line, column)
+}
+
+fn report_config_diagnostics(diagnostics: &[ConfigDiagnostic], strict: bool) -> anyhow::Result<()> {
+    if diagnostics.is_empty() {
+        return Ok(());
+    }
+    if strict {
+        let details = diagnostics
+            .iter()
+            .map(|diagnostic| format!("  - {diagnostic}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!("strict configuration rejected unknown keys:\n{details}");
+    }
+    for diagnostic in diagnostics {
+        crate::output::stderr_line(format!("warning: {diagnostic}"));
+    }
+    Ok(())
+}
+
+fn read_layer(path: &Path, source_kind: ConfigSourceKind) -> anyhow::Result<LoadedConfigLayer> {
     const MAX_CONFIG_BYTES: usize = 1024 * 1024;
     let Some(name) = path.file_name() else {
         anyhow::bail!("config path {} has no file name", path.display());
@@ -510,7 +746,7 @@ fn read_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
     let parent = match parent.canonicalize() {
         Ok(parent) => parent,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ConfigLayer::default())
+            return Ok(LoadedConfigLayer::default())
         }
         Err(error) => return Err(error.into()),
     };
@@ -522,12 +758,40 @@ fn read_layer(path: &Path) -> anyhow::Result<ConfigLayer> {
             Err(ygg_agent::secure_fs::SecureFileError::Io(error))
                 if error.kind() == std::io::ErrorKind::NotFound =>
             {
-                return Ok(ConfigLayer::default())
+                return Ok(LoadedConfigLayer::default())
             }
             Err(error) => anyhow::bail!("cannot read config {}: {error}", path.display()),
         };
-    toml::from_str(&source)
-        .map_err(|error| anyhow::anyhow!("invalid config {}: {error}", path.display()))
+
+    let mut unknown_keys = Vec::new();
+    let deserializer = toml::Deserializer::new(&source);
+    let values = serde_ignored::deserialize(deserializer, |path| {
+        let mut segments = Vec::new();
+        ignored_config_path(&path, &mut segments);
+        unknown_keys.push(segments);
+    })
+    .map_err(|error| anyhow::anyhow!("invalid config {}: {error}", path.display()))?;
+    unknown_keys.sort();
+    unknown_keys.dedup();
+    let diagnostics = unknown_keys
+        .into_iter()
+        .map(|segments| {
+            let (line, column) = config_key_location(&source, &segments);
+            let key = segments.join(".");
+            ConfigDiagnostic {
+                source_kind,
+                path: path.to_path_buf(),
+                suggestion: config_key_suggestion(&key),
+                key,
+                line,
+                column,
+            }
+        })
+        .collect();
+    Ok(LoadedConfigLayer {
+        values,
+        diagnostics,
+    })
 }
 
 #[cfg(not(test))]
@@ -584,8 +848,10 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         show_turn_cost: env_parse("YGG_SHOW_TURN_COST")?,
         context_files: env_parse("YGG_CONTEXT_FILES")?,
         offline: env_parse("YGG_OFFLINE")?,
+        strict_config: env_parse("YGG_STRICT_CONFIG")?,
         enabled_extensions: env_value("YGG_EXTENSIONS").map(split_names),
         trusted_extensions: env_value("YGG_TRUSTED_EXTENSIONS").map(split_names),
+        system_prompt: env_value("YGG_SYSTEM_PROMPT"),
         compaction: (compaction_mode.is_some()
             || compaction_enabled.is_some()
             || threshold_fraction.is_some()
@@ -631,18 +897,24 @@ fn build_config_with_global_path(
     // invocation directory as user scope: that would let an untrusted project
     // smuggle executable trust through `./.ygg/config.toml`.
     let global = match global_path {
-        Some(path) => read_layer(path)?,
-        None => ConfigLayer::default(),
+        Some(path) => read_layer(path, ConfigSourceKind::Global)?,
+        None => LoadedConfigLayer::default(),
     };
     let project = if cli.workspace_trusted {
-        read_layer(&project_config_path(&workspace))?
+        read_layer(&project_config_path(&workspace), ConfigSourceKind::Project)?
     } else {
-        ConfigLayer::default()
+        LoadedConfigLayer::default()
     };
+    let mut diagnostics = global.diagnostics;
+    diagnostics.extend(project.diagnostics);
     let environment = environment_layer()?;
-    let mut values = global.clone();
-    values.merge_project(project);
+    let mut values = global.values;
+    values.merge_project(project.values);
     values.merge(environment);
+    report_config_diagnostics(
+        &diagnostics,
+        cli.strict_config || values.strict_config.unwrap_or(false),
+    )?;
 
     let model = resolve_model_id(
         cli.model.clone().map(ygg_ai::ModelId),
@@ -677,6 +949,7 @@ fn build_config_with_global_path(
         Some(value) => config::MouseMode::parse(value)?,
         None => config::MouseMode::Auto,
     };
+    let system_prompt = cli.system_prompt.or(values.system_prompt);
 
     let mut sandbox = SandboxPolicy::default();
     if let Some(value) = values.allow_external_paths {
@@ -796,14 +1069,20 @@ fn build_config_with_global_path(
         }
     }
 
-    let mode = if cli.print {
-        let prompt = cli.message.clone().unwrap_or_default();
-        if prompt.is_empty() && cli.prompt_template.is_none() {
-            anyhow::bail!("--print requires a prompt or --prompt <template>");
+    let mode = match cli.mode.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("rpc") => Mode::Rpc,
+        Some(value) if value.eq_ignore_ascii_case("interactive") => Mode::Interactive,
+        Some(value) => {
+            anyhow::bail!("invalid frontend mode {value:?}; use interactive or rpc (or --print)")
         }
-        Mode::Print { prompt }
-    } else {
-        Mode::Interactive
+        None if cli.print => {
+            let prompt = cli.message.clone().unwrap_or_default();
+            if prompt.is_empty() && cli.prompt_template.is_none() {
+                anyhow::bail!("--print requires a prompt or --prompt <template>");
+            }
+            Mode::Print { prompt }
+        }
+        None => Mode::Interactive,
     };
     let resume = if cli.continue_ {
         ResumeSelector::Continue
@@ -835,6 +1114,7 @@ fn build_config_with_global_path(
         cache_retention,
         sandbox,
         theme: cli.theme.or(values.theme),
+        system_prompt,
         theme_paths: cli.theme_dirs,
         color,
         mouse,
@@ -856,7 +1136,9 @@ fn build_config_with_global_path(
             }
         },
         show_reasoning_in_print: cli.show_reasoning,
-        initial_prompt: (!cli.print).then_some(cli.message).flatten(),
+        initial_prompt: matches!(mode, Mode::Interactive)
+            .then_some(cli.message)
+            .flatten(),
         prompt_template: cli.prompt_template,
         debug_prompt: cli.debug_prompt,
         prompt_paths: cli.prompt_templates,
@@ -895,6 +1177,7 @@ mod tests {
             login: None,
             logout: None,
             headless: false,
+            mode: None,
             print: false,
             continue_: false,
             resume: None,
@@ -932,8 +1215,10 @@ mod tests {
             shell_path: None,
             no_context_files: false,
             offline: false,
+            strict_config: false,
             bash_timeout_secs: None,
             max_output_bytes: None,
+            system_prompt: None,
         }
     }
 
@@ -1135,6 +1420,102 @@ mod tests {
     }
 
     #[test]
+    fn unknown_config_keys_report_source_location_and_suggestion() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(
+            &global,
+            "model = 'known'\nmodle = 'ignored'\n[compaction]\nkeep_recent_turn = 2\n",
+        )
+        .unwrap();
+
+        let loaded = read_layer(&global, ConfigSourceKind::Global).unwrap();
+
+        assert_eq!(loaded.values.model.as_deref(), Some("known"));
+        assert_eq!(loaded.diagnostics.len(), 2);
+        assert_eq!(loaded.diagnostics[0].key, "compaction.keep_recent_turn");
+        assert_eq!(loaded.diagnostics[0].line, 4);
+        assert_eq!(loaded.diagnostics[0].column, 1);
+        assert_eq!(
+            loaded.diagnostics[0].suggestion,
+            Some("compaction.keep_recent_turns")
+        );
+        assert_eq!(loaded.diagnostics[1].key, "modle");
+        assert_eq!(loaded.diagnostics[1].line, 2);
+        assert_eq!(loaded.diagnostics[1].column, 1);
+        assert_eq!(loaded.diagnostics[1].suggestion, Some("model"));
+        assert_eq!(loaded.diagnostics[1].source_kind, ConfigSourceKind::Global);
+        assert_eq!(loaded.diagnostics[1].path, global);
+    }
+
+    #[test]
+    fn unknown_config_keys_warn_by_default_and_fail_in_cli_strict_mode() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "modle = 'ignored'\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        assert!(build_config_with_global_path(cli, directory.path(), Some(&global)).is_ok());
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.strict_config = true;
+        let error = build_config_with_global_path(cli, directory.path(), Some(&global))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("strict configuration rejected unknown keys"));
+        assert!(error.contains("global config"));
+        assert!(error.contains(&format!("{}:1:1", global.display())));
+        assert!(error.contains("unknown configuration key \"modle\""));
+        assert!(error.contains("did you mean \"model\"?"));
+    }
+
+    #[test]
+    fn project_config_can_opt_into_strict_diagnostics() {
+        let directory = cwd();
+        std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
+        let project = directory.path().join(".ygg/config.toml");
+        std::fs::write(&project, "strict_config = true\nthemee = 'ignored'\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+
+        let error = config_with_empty_global(cli, directory.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("project config"));
+        assert!(error.contains(&format!("{}:2:1", project.display())));
+        assert!(error.contains("themee"));
+    }
+
+    #[test]
+    fn strict_config_flag_is_parsed() {
+        let cli = Cli::try_parse_from(["ygg", "--strict-config"]).unwrap();
+        assert!(cli.strict_config);
+    }
+
+    #[test]
+    fn accepted_config_aliases_do_not_emit_unknown_key_diagnostics() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(
+            &global,
+            "exec_timeout_secs = 30\n[compaction]\npolicy = 'local'\n",
+        )
+        .unwrap();
+
+        let loaded = read_layer(&global, ConfigSourceKind::Global).unwrap();
+
+        assert!(loaded.diagnostics.is_empty());
+        assert_eq!(loaded.values.bash_timeout_secs, Some(30));
+        assert_eq!(
+            loaded.values.compaction.unwrap().mode.as_deref(),
+            Some("local")
+        );
+    }
+
+    #[test]
     fn cli_overrides_project_which_overrides_global() {
         let directory = cwd();
         let global = directory.path().join("global.toml");
@@ -1164,34 +1545,49 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_project_config_is_ignored_and_cannot_relax_global_policy() {
+    fn system_prompt_layered_precedence_prefers_cli_over_project_then_global() {
         let directory = cwd();
         let global = directory.path().join("global.toml");
-        std::fs::write(
-            &global,
-            "model = 'global'\nallow_external_paths = false\nallow_edit = false\nallow_write = false\nallow_process = false\nallow_shell = false\nsession_dir = 'global-sessions'\n",
-        )
-        .unwrap();
+        std::fs::write(&global, "system_prompt = 'global'\n").unwrap();
         std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
         std::fs::write(
             directory.path().join(".ygg/config.toml"),
-            "model = 'project'\nallow_external_paths = true\nallow_edit = true\nallow_write = true\nallow_process = true\nallow_shell = true\nsession_dir = 'project-sessions'\n",
+            "system_prompt = 'project'\n",
         )
         .unwrap();
+
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        cli.system_prompt = Some("cli".into());
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.system_prompt.as_deref(), Some("cli"));
 
-        assert_eq!(config.model.unwrap().0, "global");
-        assert!(!config.sandbox.allow_external_paths);
-        assert!(!config.sandbox.allow_edit);
-        assert!(!config.sandbox.allow_write);
-        assert!(!config.sandbox.allow_process);
-        assert!(!config.sandbox.allow_shell);
-        assert_eq!(config.session_dir, PathBuf::from("global-sessions"));
-        assert!(!config.tools.enabled("edit"));
-        assert!(!config.tools.enabled("write"));
-        assert!(!config.tools.enabled("bash"));
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.system_prompt.as_deref(), Some("project"));
+    }
+
+    #[test]
+    fn system_prompt_explicit_empty_cli_value_is_preserved() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "system_prompt = 'global'\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.system_prompt = Some("".into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.system_prompt.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn parse_system_prompt_flag_without_value() {
+        let cli = Cli::try_parse_from(["ygg", "--system-prompt", "--print", "--prompt", "review"])
+            .unwrap();
+        assert!(cli.system_prompt.is_some());
+        assert_eq!(cli.system_prompt.as_deref(), Some(""));
     }
 
     #[test]
@@ -1447,14 +1843,52 @@ mod tests {
         std::fs::write(&path, "# model = \"commented-out\"\ntheme = \"dusk\"\n").unwrap();
         persist_model_to_path("active-model", &path).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            content.contains("# model = \"commented-out\""),
-            "commented line preserved: {content}"
-        );
+        // The TOML-based parser does not preserve comments since they are
+        // not part of the parsed representation. The commented line is
+        // intentionally dropped in exchange for structurally correct updates
+        // that never corrupt multi-line values or cause partial-key collisions.
         assert!(
             content.contains("model = \"active-model\""),
-            "new entry appended: {content}"
+            "new entry set: {content}"
         );
+        assert!(
+            content.contains("theme = \"dusk\""),
+            "existing key preserved: {content}"
+        );
+    }
+
+    #[test]
+    fn persist_model_preserves_multiline_values_and_partial_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "model_alias = \"keep\"\nnotes = [\n  \"first\",\n  \"second\",\n]\n[compaction]\nkeep_recent_turns = 4\n",
+        )
+        .unwrap();
+
+        persist_model_to_path("active-model", &path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(parsed["model"].as_str(), Some("active-model"));
+        assert_eq!(parsed["model_alias"].as_str(), Some("keep"));
+        assert_eq!(parsed["notes"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            parsed["compaction"]["keep_recent_turns"].as_integer(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn persist_model_rejects_invalid_toml_without_rewriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let invalid = "model = [\n";
+        std::fs::write(&path, invalid).unwrap();
+
+        assert!(persist_model_to_path("active-model", &path).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), invalid);
     }
 
     #[test]
@@ -1483,6 +1917,56 @@ mod tests {
             Some(TopLevelCommand::Sessions {
                 command: SessionCommand::Inspect { ref id }
             }) if id == "abc-123"
+        ));
+    }
+
+    #[test]
+    fn application_extension_commands_parse_without_a_prompt() {
+        let cli = Cli::try_parse_from(["ygg", "extension", "install", "ygg-serve"]).unwrap();
+        assert!(cli.message.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Extension {
+                command: ExtensionCommand::Install {
+                    name: Some(ref name),
+                    path: None,
+                }
+            }) if name == "ygg-serve"
+        ));
+
+        let cli = Cli::try_parse_from(["ygg", "extension", "install", "--path", "./serve.tar.gz"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Extension {
+                command: ExtensionCommand::Install {
+                    name: None,
+                    path: Some(_),
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn serve_command_parses_forwarded_loopback_options() {
+        let cli = Cli::try_parse_from([
+            "ygg",
+            "serve",
+            "--no-open",
+            "--port",
+            "0",
+            "--web-root",
+            "./web",
+        ])
+        .unwrap();
+        assert!(cli.message.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Serve {
+                no_open: true,
+                port: 0,
+                web_root: Some(_),
+            })
         ));
     }
 

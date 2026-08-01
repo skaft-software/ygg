@@ -2135,6 +2135,7 @@ mod tests {
             cache_retention: ygg_ai::CacheRetention::Short,
             sandbox: SandboxPolicy::default(),
             theme: None,
+            system_prompt: None,
             theme_paths: vec![],
             color: crate::config::ColorMode::Auto,
             mouse: crate::config::MouseMode::Auto,

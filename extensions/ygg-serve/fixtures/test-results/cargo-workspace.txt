@@ -1,0 +1,20 @@
+Running unittests src/lib.rs (target/debug/deps/alpha_core-a1b2c3d4e5f60718)
+
+running 1 test
+test alpha_works ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Running tests/http.rs (target/debug/deps/http-0011223344556677)
+
+running 1 test
+test request_works ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Running unittests src/lib.rs (target/debug/deps/beta_core-8899aabbccddeeff)
+
+running 1 test
+test beta_works ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

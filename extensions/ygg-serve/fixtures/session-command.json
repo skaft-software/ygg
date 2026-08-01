@@ -1,0 +1,25 @@
+{
+  "protocol": 1,
+  "hostId": "host-demo",
+  "deviceId": "device-browser",
+  "sessionId": "session-demo",
+  "commandId": "command-submit",
+  "issuedAtMs": 1721000000050,
+  "expectedActorGeneration": 3,
+  "command": {
+    "type": "session.submitPrompt",
+    "data": {
+      "input": {
+        "text": "Review this image",
+        "attachments": [
+          {
+            "handle": "upload:image-1",
+            "displayName": "alignment.png",
+            "mediaType": "image/png",
+            "byteLen": 98765
+          }
+        ]
+      }
+    }
+  }
+}

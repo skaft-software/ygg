@@ -14,6 +14,9 @@ categories = ["development-tools"]
 [lints]
 workspace = true
 
+[features]
+benchmarks = []
+
 [dependencies]
 ygg-ai = { version = "=0.3.2-alpha", path = "../ygg-ai" }
 bytes = "1"
@@ -39,6 +42,11 @@ sha2 = "0.10"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
+
+[[example]]
+name = "session_bench"
+path = "examples/session_bench.rs"
+required-features = ["benchmarks"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util"] }

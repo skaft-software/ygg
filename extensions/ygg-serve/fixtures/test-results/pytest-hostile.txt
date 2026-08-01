@@ -1,0 +1,13 @@
+============================= test session starts ==============================
+collected 4 items
+
+/Users/alice/private/project/test_api.py::test_ok PASSED [ 25%]
+/Users/alice/private/project/test_api.py::test_bad FAILED [ 50%]
+/Users/alice/private/project/test_api.py::test_later SKIPPED [ 75%]
+/Users/alice/private/project/test_api.py::test_setup ERROR [100%]
+
+==================================== ERRORS ====================================
+Authorization: Bearer this-is-a-fake-secret-that-must-never-be-projected
+password=hunter2
+/Users/alice/private/project/test_api.py:17: RuntimeError
+================ 1 failed, 1 passed, 1 skipped, 1 error in 0.12s ================

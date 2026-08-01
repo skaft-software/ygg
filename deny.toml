@@ -15,7 +15,14 @@ yanked = "deny"
 # attacker-supplied bytes reach bincode. Removal plan: upgrade when syntect
 # migrates its default-syntax dump off bincode 1, or replace `default-syntaxes`
 # with a Ygg-built trusted SyntaxSet if upstream does not migrate.
-ignore = ["RUSTSEC-2025-0141"]
+ignore = [
+  # Indirectly pulled by lopdf 0.42.0 for PDF font parsing. This is an
+  # unmaintained warning, not a known vulnerability; no newer lopdf release
+  # removes the dependency yet. Reassess on every lopdf upgrade or when
+  # lopdf adopts an actively maintained replacement.
+  "RUSTSEC-2026-0192",
+  "RUSTSEC-2025-0141",
+]
 
 [licenses]
 confidence-threshold = 0.8

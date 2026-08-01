@@ -1,0 +1,19 @@
+{
+  "protocol": 1,
+  "hostId": "host-demo",
+  "deviceId": "device-browser",
+  "commandId": "command-create",
+  "issuedAtMs": 1721000000060,
+  "command": {
+    "type": "host.createSession",
+    "data": {
+      "projectId": "project-ygg",
+      "authority": "fullAccess",
+      "model": {
+        "provider": "openai",
+        "model": "gpt-5.6",
+        "reasoning": "high"
+      }
+    }
+  }
+}

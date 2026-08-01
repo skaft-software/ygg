@@ -11,7 +11,8 @@ The adapter records its pins in [`config.py`](config.py):
 
 | Input | Pin |
 | --- | --- |
-| Ygg source | `https://github.com/skaft-software/ygg.git` at `06cc784ef52a60b173f6d04bd90d8d30954e7501` (`0.3.2-alpha`) |
+| Ygg source | `https://github.com/skaft-software/ygg.git` at `a2351bacd61311705c5480a714af65de1c6aaed6` (`0.3.2-alpha`) |
+| Ygg binary | `x86_64-unknown-linux-musl`, SHA-256 `d1afd17c9b415dd2fb7b315e5ede2e17dc904fb752ee2645074a6f5dd40a3957` |
 | Harbor source | `https://github.com/harbor-framework/harbor.git` at `e76f7e32f5644fb9f648cd23151aac5c67492ea0` |
 | Dataset | `terminal-bench/terminal-bench-2@2.0` |
 | Model | `openai/gpt-5.4` |
@@ -48,16 +49,19 @@ runtime dependencies too.
 
 ## Build and verify the Ygg binary
 
-Build from a clean checkout at the Ygg pin. A native build is sufficient on a
-Linux host:
+Build from a clean checkout at the Ygg pin. The release executable is built
+for `x86_64-unknown-linux-musl` so it runs in Alpine and other minimal Linux
+images:
 
 ```bash
 git clone https://github.com/skaft-software/ygg.git /tmp/ygg-pinned
-git -C /tmp/ygg-pinned checkout 06cc784ef52a60b173f6d04bd90d8d30954e7501
+git -C /tmp/ygg-pinned checkout a2351bacd61311705c5480a714af65de1c6aaed6
 rustup toolchain install 1.86.0
 cd /tmp/ygg-pinned
-cargo +1.86.0 build --locked --release -p ygg-coding-agent --bin ygg
-install -m 0755 target/release/ygg /tmp/ygg-0.3.2-alpha
+rustup target add --toolchain 1.86.0 x86_64-unknown-linux-musl
+cargo +1.86.0 build --locked --release --target x86_64-unknown-linux-musl \
+  -p ygg-coding-agent --bin ygg
+install -m 0755 target/x86_64-unknown-linux-musl/release/ygg /tmp/ygg-0.3.2-alpha
 export YGG_BINARY=/tmp/ygg-0.3.2-alpha
 export YGG_SHA256=$(sha256sum "$YGG_BINARY" | awk '{print $1}')
 "$YGG_BINARY" --version
@@ -69,8 +73,8 @@ and use that extracted file as `YGG_BINARY`:
 
 ```bash
 cd /tmp/ygg-pinned
-docker build -f deploy/Dockerfile.ygg -t ygg:0.3.2-alpha .
-container=$(docker create ygg:0.3.2-alpha)
+docker build --platform linux/amd64 -f deploy/Dockerfile.ygg -t ygg:0.3.2-alpha .
+container=$(docker create --platform linux/amd64 ygg:0.3.2-alpha)
 docker cp "${container}:/usr/local/bin/ygg" /tmp/ygg-0.3.2-alpha
 docker rm "$container"
 export YGG_BINARY=/tmp/ygg-0.3.2-alpha

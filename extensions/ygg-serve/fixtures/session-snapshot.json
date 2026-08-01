@@ -1,0 +1,63 @@
+{
+  "sessionId": "session-demo",
+  "actorGeneration": 3,
+  "cursor": {
+    "actorGeneration": 3,
+    "sequence": 42
+  },
+  "durableHead": "entry-42",
+  "branches": {
+    "head": "entry-42",
+    "entries": [
+      {
+        "entryId": "entry-42",
+        "kind": "assistantMessage",
+        "checkoutable": true,
+        "label": "Ready."
+      }
+    ],
+    "truncated": false
+  },
+  "liveState": "idle",
+  "model": {
+    "provider": "openai",
+    "model": "gpt-5.6",
+    "reasoning": "high"
+  },
+  "authority": "fullAccess",
+  "context": {
+    "usage": {
+      "inputTokens": 120,
+      "outputTokens": 45,
+      "contextTokens": 165,
+      "contextLimit": 128000
+    },
+    "compactions": 1,
+    "status": {
+      "current": {
+        "categories": [
+          {
+            "category": "other",
+            "tokens": 165
+          }
+        ],
+        "totalTokens": 165
+      },
+      "updatedAtMs": 1721000000042
+    }
+  },
+  "items": [
+    {
+      "id": "item-committed",
+      "turnId": "turn-1",
+      "lifecycle": "committed",
+      "durableEntryId": "entry-42",
+      "payload": {
+        "type": "assistantMessage",
+        "data": {
+          "text": "Ready."
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,199 @@
+{
+  "protocol": 1,
+  "host": {
+    "id": "host-demo",
+    "name": "Achu's Mac"
+  },
+  "capabilities": {
+    "concurrentSessions": true,
+    "opaqueResources": true,
+    "attachments": true,
+    "attachmentPolicy": {
+      "acceptedMediaTypes": [
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp"
+      ],
+      "maxCount": 8,
+      "maxFileBytes": 5242880,
+      "maxTotalBytes": 20971520
+    },
+    "previews": true,
+    "connectedDevices": false,
+    "sessionMetadata": true,
+    "sessionBranches": true,
+    "conversationBranching": true,
+    "sessionTrash": true,
+    "sessionExport": true,
+    "lanClients": false,
+    "terminal": false,
+    "childAgents": false
+  },
+  "catalogCursor": 7,
+  "models": [
+    {
+      "id": "gpt-5.6",
+      "name": "GPT-5.6",
+      "provider": "openai",
+      "local": false,
+      "available": true,
+      "reasoning": ["low", "medium", "high"],
+      "defaultReasoning": "high",
+      "inputPricing": {
+        "baseMicrodollarsPerMillionTokens": 2500000,
+        "tiers": [
+          {
+            "minInputTokens": 200000,
+            "microdollarsPerMillionTokens": 5000000
+          }
+        ]
+      },
+      "inputModalities": ["text", "image"]
+    }
+  ],
+  "authorityProfiles": ["readOnly", "workspace", "fullAccess"],
+  "authorityCeiling": "fullAccess",
+  "themes": [
+    {
+      "id": "tidepool",
+      "theme": {
+        "name": "Tidepool",
+        "source": "bundled",
+        "revision": 3,
+        "scheme": "dark",
+        "density": "airy",
+        "motion": "full",
+        "typography": {
+          "bodyFamily": "system-sans",
+          "monoFamily": "system-mono",
+          "bodySize": 17,
+          "displayRatioMilli": 1235
+        },
+        "colors": {
+          "accent": {
+            "kind": "rgb",
+            "red": 22,
+            "green": 143,
+            "blue": 145
+          },
+          "canvas": {
+            "kind": "default"
+          }
+        },
+        "roles": {
+          "surface.user": {
+            "foreground": "accent",
+            "background": "canvas",
+            "bold": false,
+            "dim": false,
+            "italic": false,
+            "underline": false,
+            "strikethrough": false
+          }
+        }
+      }
+    }
+  ],
+  "selectedThemeId": "tidepool",
+  "projects": [
+    {
+      "id": "project-ygg",
+      "name": "ygg",
+      "trusted": true,
+      "archived": false,
+      "available": true,
+      "isDefault": true,
+      "sessionCount": 1,
+      "liveSessionCount": 1
+    }
+  ],
+  "sessions": [
+    {
+      "id": "session-demo",
+      "projectId": "project-ygg",
+      "title": "New session",
+      "createdAtMs": 1721000000000,
+      "modifiedAtMs": 1721000000042,
+      "pinned": false,
+      "archived": false,
+      "lifecycle": "active",
+      "provisional": false,
+      "liveState": "idle",
+      "attention": "none",
+      "pullRequest": {
+        "state": "ready"
+      },
+      "owner": "hosted",
+      "model": {
+        "provider": "openai",
+        "model": "gpt-5.6",
+        "reasoning": "high"
+      }
+    }
+  ],
+  "selectedSessionId": "session-demo",
+  "selectedSession": {
+    "sessionId": "session-demo",
+    "actorGeneration": 3,
+    "cursor": {
+      "actorGeneration": 3,
+      "sequence": 42
+    },
+    "durableHead": "entry-42",
+    "branches": {
+      "head": "entry-42",
+      "entries": [
+        {
+          "entryId": "entry-42",
+          "kind": "assistantMessage",
+          "checkoutable": true,
+          "label": "Ready."
+        }
+      ],
+      "truncated": false
+    },
+    "liveState": "idle",
+    "model": {
+      "provider": "openai",
+      "model": "gpt-5.6",
+      "reasoning": "high"
+    },
+    "authority": "fullAccess",
+    "context": {
+      "usage": {
+        "inputTokens": 120,
+        "outputTokens": 45,
+        "contextTokens": 165,
+        "contextLimit": 128000
+      },
+      "compactions": 1,
+      "status": {
+        "current": {
+          "categories": [
+            {
+              "category": "other",
+              "tokens": 165
+            }
+          ],
+          "totalTokens": 165
+        },
+        "updatedAtMs": 1721000000042
+      }
+    },
+    "items": [
+      {
+        "id": "item-committed",
+        "turnId": "turn-1",
+        "lifecycle": "committed",
+        "durableEntryId": "entry-42",
+        "payload": {
+          "type": "assistantMessage",
+          "data": {
+            "text": "Ready."
+          }
+        }
+      }
+    ]
+  }
+}

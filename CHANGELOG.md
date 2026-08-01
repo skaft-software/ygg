@@ -2,7 +2,49 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## 0.3.2-alpha — 2026-07-26 (experimental)
+## 0.3.2-alpha — 2026-08-01 (experimental)
+
+### Added
+
+- Added target-specific prebuilt Ygg binaries and a version-pinned installer for
+  GNU/Linux x86-64, macOS x86-64, and macOS Apple silicon; compiling with Cargo
+  remains an explicit `--from-source` option.
+- Added the minimal first-party application-extension workflow: `ygg extension
+  install`, `list`, `update`, and `remove` download or accept a local package,
+  verify its checksums and exact Ygg compatibility, and install it atomically.
+- Added external `ygg serve` dispatch to the separately installed, loopback-only
+  Ygg Serve runtime. The ordinary Ygg binary does not include the Serve backend
+  or web application.
+- Added source-located diagnostics for unknown global and trusted-project config
+  keys, typo suggestions, and strict rejection through `--strict-config`,
+  `strict_config`, or `YGG_STRICT_CONFIG`.
+- Added `SessionRunOutcome` persistence, root-head checkpoints, durable run
+  terminal state, and independent display metadata for steering and follow-up
+  inputs.
+
+### Ygg Serve (experimental, feature-gated)
+
+- Added the loopback-only Ygg Serve backend under `extensions/ygg-serve/`, with
+  bounded host/session contracts, deterministic snapshots and replay,
+  authenticated HTTP/WebSocket transport, session supervision, evidence and
+  attachment storage, document and test-result ingestion, repository context,
+  project files, terminals, transcript search, runtime status, and prompt
+  context.
+- Added the React 19 and TypeScript web client under `apps/web/`, with responsive
+  session navigation, transcript and activity views, composer controls,
+  attachments, completion review, branching, project files, terminal access,
+  usage and context views, settings, search, local themes and fonts, and
+  Playwright acceptance coverage.
+- Added the feature-gated adapter in
+  `crates/ygg-coding-agent/src/extensions/serve.rs`, boundary enforcement,
+  deterministic embedded assets, installed-runtime smoke coverage, and
+  target-specific release packaging for GNU/Linux x86-64 and both supported
+  macOS architectures.
+
+### Documentation
+
+- Added architecture, current-state, lifecycle safety, LAN pairing, native
+  delivery, P0/P1 delivery, and web acceptance documentation for Ygg Serve.
 
 ### Changed
 
@@ -18,6 +60,9 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Fixed
 
+- Replaced line-based configuration updates with structural, comment-preserving
+  TOML editing so multiline values, similarly prefixed keys, and table sections
+  cannot be corrupted when Ygg persists model or reasoning selections.
 - Rebuilt cached transcript rows whenever the requested width changes, even when
   no content block is dirty, preventing wide rows from leaking into a narrow
   render.

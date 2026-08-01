@@ -32,7 +32,7 @@ use crate::providers::{
     ModelDiscovery, ModelFilter, ProviderPreset, StaticModelPreset, BUILTIN_PROVIDERS,
     MINIMAX_MODELS, OPENCODE_MODELS,
 };
-use crate::resources::{validate_skill_requirements, FileSystemSkillRegistry, SkillToolsExtension};
+use crate::resources::{format_skills_for_prompt, FileSystemSkillRegistry};
 use crate::session_store::SessionStore;
 use crate::tui::pickers::{model_picker, session_picker};
 use crate::tui::view::InteractiveShell;
@@ -3676,46 +3676,7 @@ fn validate_explicit_tool_policy(
     }
 }
 
-fn validate_active_skill_policy(
-    session: &Session,
-    extensions: &ExtensionHost,
-) -> anyhow::Result<()> {
-    let Some(head) = session.head() else {
-        return Ok(());
-    };
-    let active = session
-        .resolve_active_skills(&head)
-        .context("failed to resolve active skills for the selected session")?;
-    if active.active_skills.is_empty() {
-        return Ok(());
-    }
-
-    let mut registered = extensions
-        .tool_definitions()
-        .into_iter()
-        .map(|definition| definition.name)
-        .collect::<Vec<_>>();
-    registered.sort();
-    registered.dedup();
-    let available = if registered.is_empty() {
-        "(none)".to_owned()
-    } else {
-        registered.join(", ")
-    };
-
-    for skill in active.active_skills {
-        if let Err(error) = validate_skill_requirements(&skill.descriptor, &registered) {
-            anyhow::bail!(
-                "active skill {:?} cannot resume under the final tool policy: {error}; available tools: {available}. Re-enable its required tools, sandbox capabilities, or executable extensions before resuming this session",
-                skill.descriptor.id,
-            );
-        }
-    }
-    Ok(())
-}
-
 fn configured_extensions(
-    skills: Arc<dyn SkillRegistry>,
     config: &Config,
     session: &Session,
     model: &Model,
@@ -3724,9 +3685,6 @@ fn configured_extensions(
 ) -> (ExtensionHost, ExecutableExtensions) {
     let mut extensions = ExtensionHost::new();
     extensions.load(&CoreTools);
-    if !skills.descriptors().is_empty() {
-        extensions.load(&SkillToolsExtension::new(skills));
-    }
     let executable_extensions = ExecutableExtensions::discover_and_start(
         config,
         session,
@@ -3778,26 +3736,22 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     config.reasoning = reasoning.clone();
     config.reasoning_mode = reasoning_mode;
 
-    let skills: Arc<dyn SkillRegistry> = Arc::new(FileSystemSkillRegistry::new(
+    let skills: Arc<dyn SkillRegistry> = Arc::new(FileSystemSkillRegistry::new_with_invocation(
         config.workspace.clone(),
+        config.invocation_cwd.clone(),
         config.skill_paths.clone(),
         config.workspace_trusted,
     )?);
+    let mut system = system;
+    system.push_str(&format_skills_for_prompt(&skills.descriptors()));
     let prompts = Arc::new(PromptRegistry::discover(
         &config.workspace,
         &config.prompt_paths,
         config.workspace_trusted,
     ));
-    let (extensions, executable_extensions) = configured_extensions(
-        skills.clone(),
-        &config,
-        &session,
-        &model,
-        &reasoning,
-        &sessions,
-    );
+    let (extensions, executable_extensions) =
+        configured_extensions(&config, &session, &model, &reasoning, &sessions);
     validate_explicit_tool_policy(&config, &extensions, &model)?;
-    validate_active_skill_policy(&session, &extensions)?;
     let system_tokens = estimate_text_tokens(&system);
     let tool_schema_tokens = tool_schema_reserve(&extensions.tool_definitions());
     let mut agent = Agent::new(AgentConfig {
@@ -3860,9 +3814,9 @@ pub fn rebuild_app(
         reasoning,
         reasoning_mode,
         system,
-        system_tokens,
+        system_tokens: _,
         tool_schema_tokens: _,
-        skills: _,
+        skills: old_skills,
         prompts: _,
         mut executable_extensions,
     } = app;
@@ -3874,6 +3828,11 @@ pub fn rebuild_app(
         .transpose()
         .with_context(|| "configured compaction model could not be resolved")?;
     let current_path = agent.session().path().to_owned();
+    let old_skill_metadata = format_skills_for_prompt(&old_skills.descriptors());
+    let mut system = system;
+    if !old_skill_metadata.is_empty() && system.ends_with(&old_skill_metadata) {
+        system.truncate(system.len() - old_skill_metadata.len());
+    }
 
     let (persisted, mut prepared_session) = match selection.as_ref() {
         Some(SessionSelection::OpenExisting(path)) => {
@@ -3937,26 +3896,22 @@ pub fn rebuild_app(
     config.model = Some(model.spec.id.clone());
     config.reasoning = reasoning.clone();
     config.reasoning_mode = reasoning_mode;
-    let skills: Arc<dyn SkillRegistry> = Arc::new(FileSystemSkillRegistry::new(
+    let skills: Arc<dyn SkillRegistry> = Arc::new(FileSystemSkillRegistry::new_with_invocation(
         config.workspace.clone(),
+        config.invocation_cwd.clone(),
         config.skill_paths.clone(),
         config.workspace_trusted,
     )?);
+    system.push_str(&format_skills_for_prompt(&skills.descriptors()));
+    let system_tokens = estimate_text_tokens(&system);
     let prompts = Arc::new(PromptRegistry::discover(
         &config.workspace,
         &config.prompt_paths,
         config.workspace_trusted,
     ));
-    let (extensions, executable_extensions) = configured_extensions(
-        skills.clone(),
-        &config,
-        &session,
-        &model,
-        &reasoning,
-        &sessions,
-    );
+    let (extensions, executable_extensions) =
+        configured_extensions(&config, &session, &model, &reasoning, &sessions);
     validate_explicit_tool_policy(&config, &extensions, &model)?;
-    validate_active_skill_policy(&session, &extensions)?;
     let tool_schema_tokens = tool_schema_reserve(&extensions.tool_definitions());
     let mut agent = Agent::new(AgentConfig {
         client: client.clone(),
