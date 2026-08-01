@@ -1,13 +1,12 @@
 #!/bin/sh
 set -eu
 
-# Forward-enforcement checkpoint for this long-lived, stacked branch. Earlier
-# history includes unrelated core/TUI merges, so admitting every path changed
-# since the old c6ec60f base would turn this gate into a blanket core allowlist.
-# This checkpoint freezes that historical debt; the explicit paths below are
-# the reviewed integration seams added after it. A caller may pass an older
-# ancestor to audit a wider range without weakening the default gate.
-default_base_ref=eebe7389097cdcf27cc22b26da75b57a06e4e8e8
+# Forward-enforcement checkpoint after the shipped Serve source, canonical release
+# tooling, and then-current main were reconciled. Their independent histories
+# include unrelated core/TUI work, so auditing from the earlier stacked-branch
+# checkpoint would turn this gate into a blanket core allowlist. A caller may
+# still pass an older ancestor to audit a wider range explicitly.
+default_base_ref=63f73d655c4fe27faeae4579f379726b093ef827
 base_ref=${1:-$default_base_ref}
 
 if ! git rev-parse --verify "${base_ref}^{commit}" >/dev/null 2>&1; then
