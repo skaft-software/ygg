@@ -1,0 +1,313 @@
+name: Ygg binary release
+
+on:
+  push:
+    tags:
+      - "v*-alpha*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing canonical Ygg prerelease tag to package
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_OFFLINE: "false"
+
+jobs:
+  resolve:
+    name: Resolve canonical release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      source_commit: ${{ steps.release.outputs.source_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: release
+        name: Validate release tag and source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_RELEASE_TAG" ]]; then
+            tag="$INPUT_RELEASE_TAG"
+          elif [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            echo "release_tag is required when this workflow is not running for a tag" >&2
+            exit 1
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-alpha[0-9A-Za-z.-]*$ ]]; then
+            echo "invalid canonical alpha release tag: $tag" >&2
+            exit 1
+          fi
+
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          source_commit=$(git rev-parse "$tag^{commit}")
+          version=${tag#v}
+          cargo_version=$(git show "$source_commit:Cargo.toml" \
+            | awk -F '"' '/^version = / { print $2; exit }')
+          if [[ "$cargo_version" != "$version" ]]; then
+            echo "Cargo version $cargo_version does not match release tag $tag" >&2
+            exit 1
+          fi
+
+          if ! prerelease=$(gh release view "$tag" --json isPrerelease --jq '.isPrerelease'); then
+            echo "canonical release $tag does not exist" >&2
+            exit 1
+          fi
+          if [[ "$prerelease" != true ]]; then
+            echo "canonical release $tag is not marked as a prerelease" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-tools
+      - name: Check out immutable release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.source_commit }}
+          path: source
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ygg-binary-release-${{ matrix.target }}
+          workspaces: source -> target
+      - name: Build optimized Ygg binary
+        working-directory: source
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p ygg-coding-agent --bin ygg
+      - name: Verify standalone binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="source/target/${{ matrix.target }}/release/ygg"
+          test -x "$binary"
+          test "$("$binary" --version)" = "ygg ${{ needs.resolve.outputs.version }}"
+          test_home="$RUNNER_TEMP/ygg-binary-smoke-home"
+          mkdir -p "$test_home"
+          HOME="$test_home" "$binary" --help >/dev/null
+          HOME="$test_home" "$binary" extension --help >/dev/null
+      - name: Package target-specific archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          release-tools/scripts/package-ygg-release.sh \
+            "${{ matrix.target }}" \
+            "$RUNNER_TEMP/ygg-release" \
+            "${{ needs.resolve.outputs.tag }}" \
+            source
+          archive="$RUNNER_TEMP/ygg-release/ygg-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz"
+          test -f "$archive"
+          tar -tzf "$archive"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ygg-core-${{ matrix.target }}
+          path: ${{ runner.temp }}/ygg-release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Sign and attach Ygg binaries
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ needs.resolve.outputs.tag }}
+      version: ${{ needs.resolve.outputs.version }}
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ygg-core-*
+          path: release-assets
+          merge-multiple: true
+      - name: Add version-pinned binary installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp scripts/install.sh release-assets/install-ygg.sh
+          chmod 0755 release-assets/install-ygg.sh
+          release-assets/install-ygg.sh --help | grep -F "Install Ygg ${{ needs.resolve.outputs.version }}."
+          test "$(find release-assets -maxdepth 1 -name 'ygg-*.tar.gz' | wc -l | tr -d ' ')" = 3
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.8.1
+      - name: Create checksums and keyless signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum ./*.tar.gz ./install-ygg.sh | sort -k2 > YGG_SHA256SUMS
+          for artifact in ./*.tar.gz ./install-ygg.sh; do
+            cosign sign-blob \
+              --yes \
+              --bundle "${artifact}.sigstore.json" \
+              "$artifact"
+          done
+          cosign sign-blob \
+            --yes \
+            --bundle YGG_SHA256SUMS.sigstore.json \
+            YGG_SHA256SUMS
+          cat YGG_SHA256SUMS
+      - name: Verify checksums and signatures
+        shell: bash
+        env:
+          COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          COSIGN_IDENTITY: ^https://github.com/${{ github.repository }}/.github/workflows/release-ygg.yml@.*$
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum --check YGG_SHA256SUMS
+          for artifact in ./*.tar.gz ./install-ygg.sh; do
+            cosign verify-blob \
+              --bundle "${artifact}.sigstore.json" \
+              --certificate-identity-regexp "$COSIGN_IDENTITY" \
+              --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+              "$artifact"
+          done
+          cosign verify-blob \
+            --bundle YGG_SHA256SUMS.sigstore.json \
+            --certificate-identity-regexp "$COSIGN_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+            YGG_SHA256SUMS
+      - name: Attach assets to canonical prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          if [[ "$(git rev-parse "$RELEASE_TAG^{commit}")" != "$SOURCE_COMMIT" ]]; then
+            echo "canonical tag moved while release artifacts were building" >&2
+            exit 1
+          fi
+          prerelease=$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease')
+          if [[ "$prerelease" != true ]]; then
+            echo "canonical release $RELEASE_TAG is not marked as a prerelease" >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+
+  verify-published:
+    name: Verify binary install on ${{ matrix.target }}
+    needs: [resolve, publish]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - name: Download and run published installer without Cargo
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/install-ygg.sh"
+          installer_url="https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/install-ygg.sh"
+          for attempt in 1 2 3 4 5; do
+            if curl \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --tlsv1.2 \
+              --location \
+              --fail \
+              --silent \
+              --show-error \
+              --output "$installer" \
+              "$installer_url"; then
+              break
+            fi
+            if [[ "$attempt" == 5 ]]; then
+              echo "published installer is not readable" >&2
+              exit 1
+            fi
+            sleep $((attempt * 2))
+          done
+
+          test_home="$RUNNER_TEMP/ygg-binary-install-home"
+          install_directory="$test_home/bin"
+          fake_tools="$RUNNER_TEMP/no-cargo"
+          mkdir -p "$test_home" "$fake_tools"
+          cat > "$fake_tools/cargo" <<'EOF'
+          #!/bin/sh
+          echo "binary installer unexpectedly invoked Cargo" >&2
+          exit 99
+          EOF
+          chmod 0755 "$fake_tools/cargo"
+
+          installed=false
+          for attempt in 1 2 3 4 5; do
+            rm -f "$install_directory/ygg"
+            if HOME="$test_home" \
+              YGG_INSTALL_DIR="$install_directory" \
+              YGG_NO_MODIFY_PATH=1 \
+              PATH="$fake_tools:$PATH" \
+              sh "$installer"; then
+              installed=true
+              break
+            fi
+            echo "published binary assets are not readable yet (attempt $attempt)" >&2
+            sleep $((attempt * 2))
+          done
+          if [[ "$installed" != true ]]; then
+            echo "could not install Ygg from published binary assets" >&2
+            exit 1
+          fi
+
+          binary="$install_directory/ygg"
+          test -x "$binary"
+          test "$(HOME="$test_home" "$binary" --version)" = "ygg $VERSION"
+          HOME="$test_home" "$binary" --help >/dev/null
+          HOME="$test_home" "$binary" extension install ygg-serve
+          HOME="$test_home" "$binary" extension list | grep -F "ygg-serve"
+          HOME="$test_home" "$binary" extension remove ygg-serve
+          test ! -e "$test_home/.ygg/extensions/ygg-serve"

@@ -6,6 +6,9 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Added
 
+- Added target-specific prebuilt Ygg binaries and a version-pinned installer for
+  GNU/Linux x86-64, macOS x86-64, and macOS Apple silicon; compiling with Cargo
+  remains an explicit `--from-source` option.
 - Added the minimal first-party application-extension workflow: `ygg extension
   install`, `list`, `update`, and `remove` download or accept a local package,
   verify its checksums and exact Ygg compatibility, and install it atomically.
