@@ -191,16 +191,11 @@ impl Component for StreamingMarkdownWidget {
         let inner = width.saturating_sub(padding_x.saturating_mul(2));
         let prefix = " ".repeat(usize::from(padding_x));
         let mut lines = vec![String::new(); usize::from(self.options.padding_y)];
-        let rendered = self
-            .cache
-            .borrow_mut()
-            .render(&self.stream, &self.renderer, inner);
-        lines.extend(
-            rendered
-                .lines
-                .into_iter()
-                .map(|line| format!("{prefix}{}", line.styled)),
-        );
+        let rendered =
+            self.cache
+                .borrow_mut()
+                .render_lines(&self.stream, &self.renderer, inner, true);
+        lines.extend(rendered.into_iter().map(|line| format!("{prefix}{line}")));
         lines.extend(vec![String::new(); usize::from(self.options.padding_y)]);
         lines
     }

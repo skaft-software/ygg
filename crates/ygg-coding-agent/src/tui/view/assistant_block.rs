@@ -260,6 +260,7 @@ impl AssistantBlock {
         // Blocks are rendered at the caller's exact content width. Every
         // transcript block shares the same outer baseline; semantic styling
         // supplies hierarchy without changing horizontal geometry.
+        let use_plain = theme.capabilities().color == crate::tui::terminal::ColorDepth::None;
         if looks_like_diff(&self.text) {
             return renderer
                 .render_diff(
@@ -272,37 +273,23 @@ impl AssistantBlock {
                 )
                 .lines
                 .into_iter()
-                .map(|line| {
-                    if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
-                        line.plain
-                    } else {
-                        line.styled
-                    }
-                })
+                .map(|line| if use_plain { line.plain } else { line.styled })
                 .collect();
         }
-        let rendered =
-            if self.finished && background.is_some_and(|background| background != Color::Default) {
-                renderer.render_on_background(
+        if self.finished && background.is_some_and(|background| background != Color::Default) {
+            return renderer
+                .render_on_background(
                     &parse_markdown(self.markdown.raw_text()),
                     width,
                     background.expect("checked above"),
                 )
-            } else {
-                self.layout
-                    .borrow_mut()
-                    .render(&self.markdown, renderer, width)
-            };
-        rendered
-            .lines
-            .into_iter()
-            .map(|line| {
-                if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
-                    line.plain
-                } else {
-                    line.styled
-                }
-            })
-            .collect()
+                .lines
+                .into_iter()
+                .map(|line| if use_plain { line.plain } else { line.styled })
+                .collect();
+        }
+        self.layout
+            .borrow_mut()
+            .render_lines(&self.markdown, renderer, width, !use_plain)
     }
 }

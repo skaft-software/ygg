@@ -1,13 +1,87 @@
 //! Dependency-free smoke benchmark. Run with:
 //! `cargo run --release --example render_bench --features benchmarks`
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use sexy_tui_rs::{
     parse_markdown, ColorDepth, RenderOptions, RichRenderer, StreamingMarkdown,
     StreamingRenderCache, TerminalCapabilities, Theme,
 };
+
+struct CountingAllocator;
+
+static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+        unsafe { System.realloc(pointer, layout, size) }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AllocationStats {
+    allocations: u64,
+    bytes: u64,
+}
+
+fn reset_allocations() {
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+}
+
+fn allocation_stats() -> AllocationStats {
+    AllocationStats {
+        allocations: ALLOCATIONS.load(Ordering::Relaxed),
+        bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+fn run_stream(
+    source: &str,
+    renderer: &RichRenderer,
+    lines_only: bool,
+) -> (Duration, AllocationStats, sexy_tui_rs::StreamingStats) {
+    let mut stream = StreamingMarkdown::new();
+    let mut cache = StreamingRenderCache::default();
+    reset_allocations();
+    let start = Instant::now();
+    for chunk in source.as_bytes().chunks(7) {
+        stream.push_bytes(chunk);
+        if lines_only {
+            black_box(cache.render_lines(&stream, renderer, 80, true));
+        } else {
+            black_box(cache.render(&stream, renderer, 80));
+        }
+    }
+    stream.finish();
+    if lines_only {
+        black_box(cache.render_lines(&stream, renderer, 80, true));
+    } else {
+        black_box(cache.render(&stream, renderer, 80));
+    }
+    let elapsed = start.elapsed();
+    let stats = allocation_stats();
+    (elapsed, stats, stream.stats())
+}
 
 fn fixture(repetitions: usize) -> String {
     let section = r#"## Recovery step
@@ -52,17 +126,14 @@ fn main() {
     let render_elapsed = render_start.elapsed();
 
     let stream_source = fixture(100);
-    let stream_start = Instant::now();
-    let mut stream = StreamingMarkdown::new();
-    let mut cache = StreamingRenderCache::default();
-    for chunk in stream_source.as_bytes().chunks(7) {
-        stream.push_bytes(chunk);
-        black_box(cache.render(&stream, &renderer, 80));
-    }
-    stream.finish();
-    black_box(cache.render(&stream, &renderer, 80));
-    let stream_elapsed = stream_start.elapsed();
-    let stats = stream.stats();
+    // Run both APIs against the same tokenization workload. The legacy path
+    // remains here as a regression baseline for the lines-only hot path.
+    let (legacy_stream_elapsed, legacy_allocations, stats) =
+        run_stream(&stream_source, &renderer, false);
+    let (stream_elapsed, stream_allocations, selected_stats) =
+        run_stream(&stream_source, &renderer, true);
+
+    assert_eq!(stats, selected_stats);
 
     // Exercise syntax-cache misses and hits when that feature is enabled.
     let syntax_capabilities = TerminalCapabilities::interactive(ColorDepth::TrueColor, true);
@@ -82,7 +153,14 @@ fn main() {
     );
     println!("static parse: {parse_elapsed:?}");
     println!("50 static renders: {render_elapsed:?}");
-    println!("7-byte streaming + live layout: {stream_elapsed:?}");
+    println!(
+        "7-byte streaming + legacy layout: {legacy_stream_elapsed:?} ({} allocs, {} bytes requested)",
+        legacy_allocations.allocations, legacy_allocations.bytes
+    );
+    println!(
+        "7-byte streaming + lines-only layout: {stream_elapsed:?} ({} allocs, {} bytes requested)",
+        stream_allocations.allocations, stream_allocations.bytes
+    );
     println!(
         "stream parse passes={}, reparsed={} bytes; syntax hits={}, misses={}, cache={} bytes",
         stats.parse_passes, stats.reparsed_bytes, syntax.hits, syntax.misses, syntax.bytes
