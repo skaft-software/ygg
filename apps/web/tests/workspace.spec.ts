@@ -614,7 +614,7 @@ test("shows typed work and a conditional activity rail", async ({ page }) => {
     .toBe("composer-ring-chase");
   await expect(page.getByRole("button", { name: "Stop ygg" })).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Queue follow-up" }),
+    page.getByRole("button", { name: "Steer active run" }),
   ).toHaveCount(0);
   await ensureActivityOpen(page);
   await expect(
@@ -823,7 +823,7 @@ test("does not pull a scrolled-away performance transcript to the latest item", 
       }
     }
     const submit = document.querySelector<HTMLButtonElement>(
-      'button[aria-label="Queue follow-up"]',
+      'button[aria-label="Steer active run"]',
     );
     if (!submit)
       throw new Error("Performance fixture submit button is missing.");

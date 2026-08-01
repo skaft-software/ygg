@@ -3124,7 +3124,7 @@ function Composer({
     if (restoredDraft?.delivery === "steer" && bootstrap.capabilities.steer) {
       return "steer";
     }
-    return bootstrap.capabilities.followUp ? "followUp" : "steer";
+    return bootstrap.capabilities.steer ? "steer" : "followUp";
   });
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<SubmissionFailure | null>(
@@ -3501,7 +3501,7 @@ function Composer({
   useEffect(() => {
     if (!isWorking) {
       setActiveDelivery(
-        bootstrap.capabilities.followUp ? "followUp" : "steer",
+        bootstrap.capabilities.steer ? "steer" : "followUp",
       );
     } else if (
       activeDelivery === "followUp" &&

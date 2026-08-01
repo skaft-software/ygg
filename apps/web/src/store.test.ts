@@ -744,6 +744,36 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("defaults active-run submissions to steering", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    transport.emit({
+      type: "session.updated",
+      sessionId: "session-fresh",
+      sequence: 2,
+      patch: {
+        status: "working",
+        activeRunId: "run-live",
+      },
+    });
+    await nextFrame();
+    await store.submit(
+      "Steer by default",
+      [],
+      undefined,
+      "command-steer-default",
+    );
+
+    expect(transport.commands.at(-1)).toMatchObject({
+      id: "command-steer-default",
+      type: "session.steer",
+      sessionId: "session-fresh",
+    });
+    store.dispose();
+  });
+
   it("preserves classified retry metadata when a submission is rejected", async () => {
     const transport = new TestTransport();
     transport.commandHandler = async (command) => ({
