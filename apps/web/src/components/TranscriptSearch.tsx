@@ -6,6 +6,7 @@ import type {
   TranscriptSearchRequest,
   TranscriptSearchResult,
 } from "../protocol";
+import { displaySessionTitle } from "../session-title";
 
 interface TranscriptSearchProps {
   open: boolean;
@@ -391,7 +392,10 @@ export function TranscriptSearch({
                 aria-label="Conversation search results"
               >
                 {result.hits.map((hit) => {
-                  const title = hit.sessionTitle || "Untitled session";
+                  const rawTitle = hit.sessionTitle || "Untitled task";
+                  const title = displaySessionTitle(rawTitle);
+                  const titleMatchRanges =
+                    title === hit.sessionTitle ? hit.titleMatchRanges : [];
                   const timestamp = timestampMetadata(hit.timestampMs);
                   return (
                     <div
@@ -414,7 +418,7 @@ export function TranscriptSearch({
                           <strong>
                             <HighlightedText
                               text={title}
-                              ranges={hit.titleMatchRanges}
+                              ranges={titleMatchRanges}
                             />
                           </strong>
                           <small>

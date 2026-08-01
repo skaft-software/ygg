@@ -28,6 +28,7 @@ The immediate release blockers are:
 | Real local Ygg agent sessions | Yes |
 | Streaming, tools, approvals, stop, steer, follow-up | Yes |
 | Multiple independent sessions | Yes |
+| Exception-driven command center | Aggregate needs-you, working, review, and complete state; prioritized task queue; task/project search; focused-task handoff |
 | Reconnect, replay, resume, and branch checkout | Yes |
 | Attachments and prompt documents | PNG/JPEG/GIF/WebP images plus bounded text, Markdown, and PDF context; no audio |
 | Sources, diffs, and outputs | Real but limited to specific built-in tools |
@@ -50,18 +51,22 @@ The settled product is not "Ygg Workbench" as a separate mode. It is simply
 graphical `ygg`:
 
 - `ygg serve` runs Ygg headlessly.
-- There is one normal interaction mode: a repository-oriented coding
-  workbench.
-- Opening the root creates a fresh provisional session.
-- An explicit session route restores an existing session.
-- Previous, pinned, and running sessions appear in the sidebar.
-- Different sessions are independent agent sessions and may run concurrently.
+- There is one repository-oriented task lifecycle with two complementary views:
+  an exception-driven command center for supervision and a focused transcript
+  for execution.
+- Opening the root creates a fresh provisional task. `/overview` opens the
+  command center, and an explicit session route restores a focused task.
+- Previous, pinned, and running tasks appear in the sidebar.
+- Different tasks are independent agent sessions and may run concurrently.
 - There is no Chat, Code, Work, or Cowork mode selector.
 - There is no synchronized TUI, terminal mirror, or terminal-window mode.
 - A phone is eventually a companion/controller for the host, not a mobile
   agent runtime.
-- The transcript is primary. Sources, actions, outputs, previews, and progress
-  appear only when structured events justify them.
+- The command center derives aggregate state, ordering, search text, and row
+  previews from the existing session catalog. It does not create a second
+  orchestration protocol or synthetic agent narrative.
+- The transcript is primary within focused work. Sources, actions, outputs,
+  previews, and progress appear only when structured events justify them.
 - There is no account, login, hosted control plane, or outbound product
   telemetry. Local context, lifecycle, and usage accounting remain part of the
   workbench state.
@@ -99,6 +104,11 @@ composer. No proprietary vendor code, bundle, or asset was copied into Ygg; the
 interface remains original React and CSS built on Ygg's existing protocol and
 renderers.
 
+The command center does not restore the rejected switchboard. It is a compact
+projection of the same task catalog used by the sidebar: aggregate exception
+counts, a stable priority queue, and search. It introduces no evidence shelf,
+runtime-centric mode, generated cards, or alternate execution path.
+
 ## Settled visual and interaction language
 
 The UI iterations converged on these rules:
@@ -108,17 +118,22 @@ The UI iterations converged on these rules:
 - Use one opaque, neutral-dark workbench appearance. Do not use glass,
   translucency, or model-driven application colors. Rainbow color is reserved
   for the reasoning-effort control.
-- The desktop shell is a real three-pane workbench: a 296px project/session
-  sidebar, a broad center pane, and an optional 400px evidence pane. Distinct
+- The focused desktop shell is a real three-pane workbench: a 296px project/task
+  sidebar, a broad center pane, and an optional 400px evidence pane. The command
+  center uses the same sidebar with one broad supervisory surface. Distinct
   shaded surfaces separate panes without one-pixel divider lines.
-- Label navigation as Sessions, retain project grouping, and keep each active
-  session row to its title plus an optional PR mark. The PR mark appears only
-  for structured `in_progress`, `ready`, or `merged` evidence; repository state,
-  model metadata, and generic run status are not synthesized into the row.
+- Label navigation as Tasks, retain project grouping, and keep each sidebar row
+  to its title plus an optional PR mark. The PR mark appears only for structured
+  `in_progress`, `ready`, or `merged` evidence; repository state, model metadata,
+  and generic run status are not synthesized into the row.
+- Keep the command center exception-driven: semantic status totals lead to one
+  compact, aligned queue rather than a kanban board or a wall of agent cards.
+  Failed, disconnected, attention-required, and review-ready work sorts ahead of
+  healthy running or completed work.
 - Status color is semantic: green means working or successful, amber means
   attention, and red means failure. Provider and model colors do not determine
   shell state.
-- Keep the fresh session quiet: “New workspace task,” “What should we work on?”,
+- Keep the fresh task quiet: “New workspace task,” “What should we work on?”,
   and a short instruction replace the animated TUI/model splash.
 - Compose the transcript like an engineering record, not a chat product. User
   turns and expanded tool calls use restrained tonal surfaces without thin card
@@ -145,9 +160,9 @@ The UI iterations converged on these rules:
   combines those particles with the animated rainbow and is the only rainbow
   state. Reduced motion freezes that rainbow and removes all particles. Changing
   models never changes the shell appearance.
-- Do not duplicate Working or Activity indicators. The optional right pane is
-  limited to review, command history, progress, artifacts, and context backed
-  by structured events.
+- Do not duplicate Working or Activity indicators inside focused-task chrome.
+  The optional right pane is limited to review, command history, progress,
+  artifacts, and context backed by structured events.
 - A dominant inspector opens source, output, image, and diff content without
   changing transport or transcript behavior.
 - Mobile displays one primary surface at a time. Navigation, Activity, and the
@@ -236,7 +251,9 @@ See [Configuration diagnostics](../../design/config-diagnostics.md).
 - No CORS or remote assets.
 - Bounded HTTP, WebSocket, replay, resource, and attachment payloads.
 - Fresh-session root behavior.
-- Explicit session restoration.
+- Explicit session restoration and a durable `/overview` command-center route.
+- Exception-prioritized active-task aggregation and task/project search using
+  existing session summaries.
 - Concurrent independent graphical sessions.
 - Exactly one mutable `App` owner per session.
 - A durable, owner-private project registry with opaque IDs, root-identity
@@ -352,8 +369,10 @@ comprehensively.
 
 ### Frontend
 
-- Project-grouped Sessions sidebar with title-only rows and evidence-gated PR
-  marks, plus client-side title/preview search.
+- Project-grouped Tasks sidebar with title-only rows and evidence-gated PR
+  marks, plus task-title/preview and transcript search.
+- Exception-driven command center with aggregate status, search, priority triage,
+  focused-task handoff, and a durable `/overview` route.
 - One opaque neutral workbench visual system with semantic status colors and
   borderless tonal pane separation.
 - Transcript with Markdown, GitHub-Flavored Markdown, concise collapsed work
@@ -372,7 +391,7 @@ comprehensively.
   `max`, and static, particle-free reduced motion.
 - Settings, review, command history, progress, artifacts, repository context,
   and authoritative context/compaction inspection.
-- Project trust/default/archive management and active/archive/trash session
+- Project trust/default/archive management and active/archive/trash task
   navigation with guarded permanent deletion.
 - A retained, bounded PTY terminal panel when the host advertises process
   execution authority.

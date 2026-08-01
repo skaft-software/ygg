@@ -176,10 +176,23 @@ test("runs the authenticated production host lifecycle end to end", async ({
     });
 
     let sessionId = "";
-    await test.step("creates a real host session", async () => {
+    await test.step("reuses the provisional task before creating a real host task", async () => {
       const initialSessionId = sessionIdFromUrl(page.url());
       await page
-        .getByRole("button", { name: "New session", exact: true })
+        .getByRole("button", { name: "New task", exact: true })
+        .click();
+      expect(sessionIdFromUrl(page.url())).toBe(initialSessionId);
+
+      const seedRequest = await completePrompt(
+        page,
+        host,
+        "E2E_SEED",
+        "E2E_ASSISTANT_E2E_SEED",
+      );
+      expectDeterministicRequest(seedRequest);
+
+      await page
+        .getByRole("button", { name: "New task", exact: true })
         .click();
       await expect
         .poll(() => sessionIdFromUrl(page.url()))
@@ -198,7 +211,7 @@ test("runs the authenticated production host lifecycle end to end", async ({
       expectDeterministicRequest(request);
       await expect(
         page.getByRole("button", {
-          name: `Open session ${STREAM_PROMPT}, Working`,
+          name: `Open task ${STREAM_PROMPT}, Working`,
         }),
       ).toBeVisible();
       await expect(page.getByText(STREAM_PARTIAL, { exact: true })).toBeVisible();
@@ -208,7 +221,7 @@ test("runs the authenticated production host lifecycle end to end", async ({
       await expectDone(page, STREAM_REPLY);
       await expect(
         page.getByRole("button", {
-          name: `Open session ${STREAM_PROMPT}, Done`,
+          name: `Open task ${STREAM_PROMPT}, Done`,
         }),
       ).toBeVisible();
       const snapshot = await sessionSnapshot(page, origin, sessionId);
@@ -304,8 +317,8 @@ test("runs the authenticated production host lifecycle end to end", async ({
         await route.continue();
       });
 
-      await page.getByRole("button", { name: "Session actions" }).click();
-      await page.getByRole("menuitem", { name: "Session history" }).click();
+      await page.getByRole("button", { name: "Task actions" }).click();
+      await page.getByRole("menuitem", { name: "Task history" }).click();
       const branchARow = page
         .locator(".branch-history-row")
         .filter({ hasText: BRANCH_A_REPLY });
@@ -397,7 +410,7 @@ test("runs the authenticated production host lifecycle end to end", async ({
       expect(exportedText).not.toContain(EXPORT_CANARY);
       expect(exportedText).toContain("[REDACTED]");
 
-      await page.getByRole("button", { name: "Session actions" }).click();
+      await page.getByRole("button", { name: "Task actions" }).click();
       const downloadPromise = page.waitForEvent("download");
       await page
         .getByRole("menuitem", { name: "Download safe export" })

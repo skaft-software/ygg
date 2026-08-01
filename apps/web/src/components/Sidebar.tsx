@@ -8,6 +8,7 @@ import {
   GitPullRequest,
   GitPullRequestDraft,
   Laptop,
+  LayoutDashboard,
   LoaderCircle,
   Menu,
   MessageSquarePlus,
@@ -25,6 +26,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { taskNeedsAttention } from "../fleet-status";
 import type {
   ProjectSummary,
   SearchMatchRange,
@@ -33,6 +35,7 @@ import type {
   TranscriptSearchRequest,
   TranscriptSearchResult,
 } from "../protocol";
+import { displaySessionTitle } from "../session-title";
 
 interface SidebarProps {
   open: boolean;
@@ -40,12 +43,20 @@ interface SidebarProps {
   sessions: SessionSummary[];
   projects?: ProjectSummary[];
   selectedSessionId: string | null;
-  surface: "session" | "projects" | "files" | "usage" | "settings" | "devices";
+  surface:
+    | "fleet"
+    | "session"
+    | "projects"
+    | "files"
+    | "usage"
+    | "settings"
+    | "devices";
   devicesAvailable: boolean;
   filesAvailable?: boolean;
   onRestoreFocus: () => void;
   onClose: () => void;
   onNewSession: () => void;
+  onOpenFleet: () => void;
   onSelectSession: (sessionId: string) => void;
   onRestoreSession: (sessionId: string) => void;
   sessionTrashAvailable?: boolean;
@@ -175,7 +186,7 @@ function SessionSearchHit({
     <button
       className="session-search-hit"
       type="button"
-      aria-label={`Open ${searchKindLabels[hit.kind]} result from ${hit.sessionTitle}`}
+      aria-label={`Open ${searchKindLabels[hit.kind]} result from ${displaySessionTitle(hit.sessionTitle)}`}
       onClick={() => onActivate?.(hit.sessionId, hit.itemId)}
     >
       <span>
@@ -218,6 +229,7 @@ function SessionRow({
   onSelect: () => void;
   titleContent?: ReactNode;
 }) {
+  const displayTitle = displaySessionTitle(session.title);
   const pullRequestLabel = session.pullRequest
     ? `, ${pullRequestLabels[session.pullRequest.state]}`
     : "";
@@ -226,11 +238,13 @@ function SessionRow({
       className={`session-row ${selected ? "is-selected" : ""}`}
       onClick={onSelect}
       aria-current={selected ? "page" : undefined}
-      aria-label={`Open session ${session.title}, ${sessionStatusLabel[session.status]}${pullRequestLabel}`}
+      aria-label={`Open task ${displayTitle}, ${sessionStatusLabel[session.status]}${pullRequestLabel}`}
       data-status={session.status}
     >
       <span className="session-row-title">
-        {titleContent ?? session.title}
+        {titleContent && displayTitle === session.title
+          ? titleContent
+          : displayTitle}
       </span>
       {session.status === "working" || session.status === "disconnected" ? (
         <span className="session-row-meta">
@@ -339,7 +353,7 @@ function WorkspaceSection({
 function errorMessage(error: unknown): string {
   return error instanceof Error && error.message
     ? error.message
-    : "The host could not complete this session change.";
+    : "The host could not complete this task change.";
 }
 
 function purgeLabel(purgeAfterMs: number): string {
@@ -361,6 +375,7 @@ function SidebarView({
   onRestoreFocus,
   onClose,
   onNewSession,
+  onOpenFleet,
   onSelectSession,
   onRestoreSession,
   sessionTrashAvailable = false,
@@ -483,7 +498,7 @@ function SidebarView({
         })
         .catch(() => {
           if (sequence !== searchSequenceRef.current) return;
-          setSearchError("Session search could not be completed. Try again.");
+          setSearchError("Task search could not be completed. Try again.");
         })
         .finally(() => {
           if (sequence === searchSequenceRef.current) setSearchLoading(false);
@@ -508,6 +523,9 @@ function SidebarView({
   const matchesSessionMetadata = (session: SessionSummary) =>
     !normalizedQuery ||
     session.title.toLocaleLowerCase().includes(normalizedQuery) ||
+    displaySessionTitle(session.title)
+      .toLocaleLowerCase()
+      .includes(normalizedQuery) ||
     session.preview.toLocaleLowerCase().includes(normalizedQuery);
   const visibleSessions = sessions.filter(
     (session) => session.lifecycle === view && matchesSessionMetadata(session),
@@ -552,6 +570,13 @@ function SidebarView({
       (left, right) => Number(right.pinned) - Number(left.pinned),
     );
   }
+  const activeCount = sessions.filter(
+    (session) => session.lifecycle === "active",
+  ).length;
+  const attentionCount = sessions.filter(
+    (session) =>
+      session.lifecycle === "active" && taskNeedsAttention(session),
+  ).length;
   const archiveCount = sessions.filter(
     (session) => session.lifecycle === "archived",
   ).length;
@@ -629,6 +654,7 @@ function SidebarView({
 
   const renderSessionControls = (session: SessionSummary) => {
     if (view === "active" && !onSetSessionLifecycle) return null;
+    const displayTitle = displaySessionTitle(session.title);
     const pending = pendingSessionId === session.id;
     const retention = session.retention;
     const expectedPhrase = `permanently delete ${session.id}`;
@@ -646,8 +672,8 @@ function SidebarView({
               type="button"
               className="session-row-archive"
               onClick={() => void setLifecycle(session, "archived")}
-              aria-label={`Archive session ${session.title}`}
-              title="Archive session"
+              aria-label={`Archive task ${displayTitle}`}
+              title="Archive task"
               disabled={pending}
             >
               <Archive aria-hidden="true" />
@@ -657,8 +683,8 @@ function SidebarView({
               type="button"
               className="session-row-restore"
               onClick={() => void setLifecycle(session, "active")}
-              aria-label={`Restore session ${session.title}`}
-              title="Restore session"
+              aria-label={`Restore task ${displayTitle}`}
+              title="Restore task"
               disabled={pending}
             >
               <ArchiveRestore aria-hidden="true" />
@@ -671,7 +697,7 @@ function SidebarView({
               type="button"
               className="session-row-trash"
               onClick={() => void setLifecycle(session, "trash")}
-              aria-label={`Move session ${session.title} to trash`}
+              aria-label={`Move task ${displayTitle} to trash`}
               title="Move to trash"
               disabled={pending}
             >
@@ -685,7 +711,7 @@ function SidebarView({
               type="button"
               className="session-row-trash"
               onClick={() => beginPermanentDelete(session)}
-              aria-label={`Permanently delete session ${session.title}`}
+              aria-label={`Permanently delete task ${displayTitle}`}
               title="Permanently delete"
               aria-expanded={confirmingDelete}
               disabled={pending}
@@ -706,7 +732,7 @@ function SidebarView({
           <div
             className="session-delete-confirmation"
             role="group"
-            aria-label={`Permanent deletion confirmation for ${session.title}`}
+            aria-label={`Permanent deletion confirmation for ${displayTitle}`}
           >
             <p>
               This cannot be undone. Type{" "}
@@ -714,13 +740,13 @@ function SidebarView({
             </p>
             <label>
               <span className="sr-only">
-                Confirmation phrase for {session.title}
+                Confirmation phrase for {displayTitle}
               </span>
               <input
                 type="text"
                 value={deletePhrase}
                 onChange={(event) => setDeletePhrase(event.target.value)}
-                aria-label={`Confirmation phrase for ${session.title}`}
+                aria-label={`Confirmation phrase for ${displayTitle}`}
                 autoComplete="off"
                 spellCheck={false}
               />
@@ -790,11 +816,27 @@ function SidebarView({
             <span className="primary-action-glyph" aria-hidden="true">
               <MessageSquarePlus />
             </span>
-            <span>New session</span>
+            <span>New task</span>
+          </button>
+          <button
+            className={`sidebar-command-center ${surface === "fleet" ? "is-selected" : ""}`}
+            type="button"
+            aria-current={surface === "fleet" ? "page" : undefined}
+            onClick={onOpenFleet}
+          >
+            <LayoutDashboard aria-hidden="true" />
+            <span>Command center</span>
+            {attentionCount > 0 ? (
+              <em
+                aria-label={`${attentionCount} ${attentionCount === 1 ? "task needs" : "tasks need"} you`}
+              >
+                {attentionCount}
+              </em>
+            ) : null}
           </button>
           <label className="sidebar-search">
             <Search aria-hidden="true" />
-            <span className="sr-only">Search sessions</span>
+            <span className="sr-only">Search tasks and transcripts</span>
             <input
               type="search"
               value={query}
@@ -804,14 +846,14 @@ function SidebarView({
                   ? "Search archive"
                   : view === "trash"
                     ? "Search trash"
-                    : "Search sessions"
+                    : "Search tasks"
               }
             />
           </label>
           <div
             className="sidebar-lifecycle-tabs"
             role="tablist"
-            aria-label="Session groups"
+            aria-label="Task groups"
           >
             <button
               type="button"
@@ -823,6 +865,7 @@ function SidebarView({
             >
               <MessageSquarePlus aria-hidden="true" />
               <span>Active</span>
+              {activeCount > 0 ? <em>{activeCount}</em> : null}
             </button>
             <button
               type="button"
@@ -857,12 +900,12 @@ function SidebarView({
           className="sidebar-scroll"
           id="sidebar-session-list"
           role="tabpanel"
-          aria-label={`${view === "archived" ? "Archive" : view === "trash" ? "Trash" : "Active"} sessions`}
+          aria-label={`${view === "archived" ? "Archived" : view === "trash" ? "Trash" : "Active"} tasks`}
         >
           {searchMode &&
           (searchLoading || (!searchResult && !searchError)) ? (
             <div className="sidebar-search-state" role="status">
-              Searching sessions…
+              Searching tasks…
             </div>
           ) : searchMode && searchError ? (
             <div className="sidebar-search-state is-error" role="alert">
@@ -877,12 +920,12 @@ function SidebarView({
               )}
               <strong>
                 {normalizedQuery
-                  ? "No sessions match your query"
+                  ? "No tasks match your query"
                   : view === "archived"
                     ? "Archive is empty"
                     : view === "trash"
                       ? "Trash is empty"
-                      : "Start a conversation to see it here"}
+                      : "Start a task to see it here"}
               </strong>
               {view === "active" && !normalizedQuery ? (
                 <button
@@ -891,7 +934,7 @@ function SidebarView({
                   onClick={onNewSession}
                 >
                   <MessageSquarePlus aria-hidden="true" />
-                  New session
+                  New task
                 </button>
               ) : null}
             </div>
@@ -902,8 +945,8 @@ function SidebarView({
                   {searchMode
                     ? "Search results"
                     : view === "active"
-                      ? "Sessions"
-                      : "Session history"}
+                      ? "Tasks"
+                      : "Task history"}
                 </span>
                 <button type="button" onClick={onOpenProjects}>
                   Manage
@@ -958,10 +1001,11 @@ function SidebarView({
           {devicesAvailable ? (
             <button
               className={`sidebar-destination ${surface === "devices" ? "is-selected" : ""}`}
+              aria-label="Connected devices"
               onClick={onOpenDevices}
             >
               <Laptop aria-hidden="true" />
-              <strong>Connected devices</strong>
+              <strong>Devices</strong>
             </button>
           ) : null}
           <button

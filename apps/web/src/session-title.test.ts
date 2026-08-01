@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   deriveSessionTitle,
+  displaySessionTitle,
   isUntitledSession,
 } from "./session-title";
 
@@ -9,6 +10,8 @@ describe("session titles", () => {
     expect(isUntitledSession("New session")).toBe(true);
     expect(isUntitledSession("Session")).toBe(true);
     expect(isUntitledSession("Refine onboarding")).toBe(false);
+    expect(displaySessionTitle("New session")).toBe("New task");
+    expect(displaySessionTitle("Refine onboarding")).toBe("Refine onboarding");
   });
 
   it("derives a compact title from the first prompt", () => {

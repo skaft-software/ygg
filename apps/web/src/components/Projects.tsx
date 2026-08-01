@@ -116,8 +116,8 @@ export function ProjectsView({
           </h1>
           <p>
             Project trust allows ygg to load that folder&apos;s instructions,
-            skills, and extensions and to start coding-agent sessions there.
-            Agent authority is configured separately for each session.
+            skills, and extensions and to start coding-agent tasks there. Agent
+            authority is configured separately for each task.
           </p>
         </div>
       </header>
@@ -217,7 +217,7 @@ export function ProjectsView({
               <div className="project-facts">
                 <span>
                   <strong>{project.sessionCount}</strong>
-                  sessions
+                  {project.sessionCount === 1 ? "task" : "tasks"}
                 </span>
                 <span>
                   {project.trusted ? (

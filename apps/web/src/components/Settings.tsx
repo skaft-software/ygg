@@ -157,8 +157,8 @@ export function SettingsView({
         <div className="settings-section-heading">
           <SlidersHorizontal aria-hidden="true" />
           <div>
-            <h2 id="defaults-title">Session defaults</h2>
-            <p>New sessions begin ready for local work.</p>
+            <h2 id="defaults-title">Task defaults</h2>
+            <p>New tasks begin ready for local work.</p>
           </div>
         </div>
         <div className="settings-rows">
@@ -188,8 +188,8 @@ export function SettingsView({
           <div>
             <h2 id="notifications-title">Background attention</h2>
             <p>
-              Opt in to device notifications when a background session
-              finishes, fails, or needs your input.
+              Opt in to device notifications when a background task finishes,
+              fails, or needs your input.
             </p>
           </div>
         </div>
@@ -227,7 +227,7 @@ export function SettingsView({
                   ? "Notifications are unavailable in this browser."
                   : notificationPermission === "denied"
                     ? "Blocked by browser settings."
-                    : "Session titles only; no prompt or tool content is included."}
+                    : "Task titles only; no prompt or tool content is included."}
               </small>
             </span>
             {notificationsEnabled ? (

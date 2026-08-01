@@ -87,7 +87,7 @@ export function ConversationBranchDialog({
     action.kind === "edit"
       ? "Edit this turn"
       : action.kind === "fork"
-        ? "Fork into a new session"
+        ? "Fork into a new task"
         : action.withModel
           ? "Retry with another model"
           : "Retry this response";

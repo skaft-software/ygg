@@ -394,7 +394,7 @@ function ResourceContent({
             response.status === 401
               ? "Reconnect to ygg to inspect this resource."
               : response.status === 404
-                ? "This resource is not part of the selected session."
+                ? "This resource is not part of the selected task."
                 : response.status === 410
                   ? "This resource is no longer available."
                   : "This resource could not be loaded.";

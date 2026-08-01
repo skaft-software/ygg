@@ -8,6 +8,10 @@ export function isUntitledSession(title: string): boolean {
   return UNTITLED_SESSION_NAMES.has(title.trim().toLowerCase());
 }
 
+export function displaySessionTitle(title: string): string {
+  return isUntitledSession(title) ? "New task" : title;
+}
+
 export function deriveSessionTitle(
   prompt: string,
   attachmentName?: string,
