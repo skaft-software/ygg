@@ -1,6 +1,6 @@
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { Compartment, EditorState } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { EditorView, lineNumbers } from "@codemirror/view";
 import { tags } from "@lezer/highlight";
 import { useEffect, useRef, useState } from "react";
 import { languageForPath } from "./fileLanguage";
@@ -78,6 +78,7 @@ export interface FileCodeEditorProps {
   path: string;
   value: string;
   readOnly: boolean;
+  showLineNumbers?: boolean;
   onChange: (value: string) => void;
 }
 
@@ -85,6 +86,7 @@ export function FileCodeEditor({
   path,
   value,
   readOnly,
+  showLineNumbers = false,
   onChange,
 }: FileCodeEditorProps) {
   const highlightRef = useRef<HTMLDivElement>(null);
@@ -102,6 +104,7 @@ export function FileCodeEditor({
         doc: initialValue,
         extensions: [
           languageCompartment.of([]),
+          ...(showLineNumbers ? [lineNumbers()] : []),
           EditorState.readOnly.of(true),
           EditorView.editable.of(false),
           EditorState.tabSize.of(2),
@@ -135,7 +138,7 @@ export function FileCodeEditor({
       viewRef.current = null;
       view.destroy();
     };
-  }, [initialValue, languageCompartment, path]);
+  }, [initialValue, languageCompartment, path, showLineNumbers]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -147,7 +150,7 @@ export function FileCodeEditor({
 
   return (
     <div
-      className="files-code-editor"
+      className={`files-code-editor ${showLineNumbers ? "is-numbered" : ""}`}
       data-language-error={languageLoadError || undefined}
     >
       <div

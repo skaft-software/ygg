@@ -13,7 +13,7 @@ const APP_CSS: &[u8] = include_bytes!("../web/assets/app.css");
 const APP_JS: &[u8] = include_bytes!("../web/assets/app.js");
 const FILES_PANEL_JS: &[u8] = include_bytes!("../web/assets/chunk-FilesPanel.js");
 const FILE_LANGUAGES_JS: &[u8] = include_bytes!("../web/assets/chunk-file-languages.js");
-const JSX_RUNTIME_JS: &[u8] = include_bytes!("../web/assets/chunk-jsx-runtime.js");
+const JSX_RUNTIME_JS: &[u8] = include_bytes!("../web/assets/chunk-rolldown-runtime.js");
 const MARKDOWN_JS: &[u8] = include_bytes!("../web/assets/chunk-MarkdownMessage.js");
 const SHA256_SUMS: &str = include_str!("../web/SHA256SUMS");
 const BUNDLE_SHA256: &str = include_str!("../web/bundle.sha256");
@@ -22,7 +22,7 @@ const PAYLOAD_PATHS: [&str; 7] = [
     "assets/app.js",
     "assets/chunk-FilesPanel.js",
     "assets/chunk-file-languages.js",
-    "assets/chunk-jsx-runtime.js",
+    "assets/chunk-rolldown-runtime.js",
     "assets/chunk-MarkdownMessage.js",
     "index.html",
 ];
@@ -89,7 +89,7 @@ impl WebBundle {
         let app_js = read_asset(&root, "assets/app.js")?;
         let files_panel_js = read_asset(&root, "assets/chunk-FilesPanel.js")?;
         let file_languages_js = read_asset(&root, "assets/chunk-file-languages.js")?;
-        let jsx_runtime_js = read_asset(&root, "assets/chunk-jsx-runtime.js")?;
+        let jsx_runtime_js = read_asset(&root, "assets/chunk-rolldown-runtime.js")?;
         let markdown_js = read_asset(&root, "assets/chunk-MarkdownMessage.js")?;
         let sums = canonical_sums(
             &index_html,
@@ -171,7 +171,7 @@ impl WebBundle {
             "assets/chunk-file-languages.js" => {
                 (&self.file_languages_js, "text/javascript; charset=utf-8")
             }
-            "assets/chunk-jsx-runtime.js" => {
+            "assets/chunk-rolldown-runtime.js" => {
                 (&self.jsx_runtime_js, "text/javascript; charset=utf-8")
             }
             "assets/chunk-MarkdownMessage.js" => {
@@ -346,7 +346,11 @@ mod tests {
             FILE_LANGUAGES_JS,
         )
         .unwrap();
-        fs::write(root.join("assets/chunk-jsx-runtime.js"), JSX_RUNTIME_JS).unwrap();
+        fs::write(
+            root.join("assets/chunk-rolldown-runtime.js"),
+            JSX_RUNTIME_JS,
+        )
+        .unwrap();
         fs::write(root.join("assets/chunk-MarkdownMessage.js"), MARKDOWN_JS).unwrap();
     }
 
@@ -384,7 +388,7 @@ mod tests {
         );
         assert_eq!(
             bundle
-                .asset("assets/chunk-jsx-runtime.js")
+                .asset("assets/chunk-rolldown-runtime.js")
                 .unwrap()
                 .bytes
                 .as_ref(),

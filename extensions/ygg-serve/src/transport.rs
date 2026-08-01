@@ -3174,7 +3174,7 @@ mod tests {
             "assets/chunk-file-languages.js"
         )));
         assert!(safe_relative_path(FilePath::new(
-            "assets/chunk-jsx-runtime.js"
+            "assets/chunk-rolldown-runtime.js"
         )));
         assert!(safe_relative_path(FilePath::new(
             "assets/chunk-MarkdownMessage.js"
@@ -3200,7 +3200,7 @@ mod tests {
         );
         assert_eq!(
             bundle
-                .asset("assets/chunk-jsx-runtime.js")
+                .asset("assets/chunk-rolldown-runtime.js")
                 .unwrap()
                 .media_type,
             "text/javascript; charset=utf-8"
@@ -3954,7 +3954,7 @@ mod tests {
         );
         let jsx_runtime = request(
             address,
-            get_request(address, "/assets/chunk-jsx-runtime.js"),
+            get_request(address, "/assets/chunk-rolldown-runtime.js"),
         )
         .await;
         assert!(jsx_runtime.starts_with("HTTP/1.1 200"));
@@ -3964,7 +3964,7 @@ mod tests {
         );
         assert_eq!(
             jsx_runtime.split_once("\r\n\r\n").unwrap().1.as_bytes(),
-            include_bytes!("../web/assets/chunk-jsx-runtime.js")
+            include_bytes!("../web/assets/chunk-rolldown-runtime.js")
         );
         let markdown = request(
             address,
