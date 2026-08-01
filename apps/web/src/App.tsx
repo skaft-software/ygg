@@ -1088,7 +1088,7 @@ export default function App() {
       message={selectionError.message}
       onRetry={() => {
         void store
-          .selectSession(selectionError.sessionId)
+          .selectSession(selectionError.sessionId, selectionError.routeMode)
           .catch(() => undefined);
       }}
     />

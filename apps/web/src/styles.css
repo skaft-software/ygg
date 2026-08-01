@@ -8078,6 +8078,10 @@ kbd {
       max(12px, env(safe-area-inset-right));
   }
 
+  .session-selection-error {
+    top: calc(100px + env(safe-area-inset-top));
+  }
+
   .connection-banner small {
     display: none;
   }

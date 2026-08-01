@@ -49,7 +49,11 @@ export interface YggState {
   connecting: boolean;
   connection: TransportConnectionState;
   error: string | null;
-  selectionError: { sessionId: string; message: string } | null;
+  selectionError: {
+    sessionId: string;
+    message: string;
+    routeMode: SessionRouteMode;
+  } | null;
   bootstrap: HostBootstrap | null;
   projectCatalog: ProjectCatalog | null;
   selectedSessionId: string | null;
@@ -864,6 +868,7 @@ export class YggStore {
         ...this.state,
         selectionError: {
           sessionId,
+          routeMode,
           message:
             error instanceof Error
               ? error.message

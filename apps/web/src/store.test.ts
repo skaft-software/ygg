@@ -425,6 +425,7 @@ describe("YggStore", () => {
       selectionError: {
         sessionId: "session-done",
         message: "Session failed with 500",
+        routeMode: "push",
       },
     });
     expect(store.selectedSession?.sessionId).toBe("session-fresh");
@@ -433,6 +434,29 @@ describe("YggStore", () => {
       clone(fixtureSessions[sessionId]);
     await store.selectSession("session-done");
     expect(store.getSnapshot().selectionError).toBeNull();
+
+    transport.sessionLoader = async (sessionId) => {
+      if (sessionId === "session-live") {
+        throw new Error("Session failed with 503");
+      }
+      return clone(fixtureSessions[sessionId]);
+    };
+    await expect(store.selectSession("session-live", "none")).rejects.toThrow(
+      "Session failed with 503",
+    );
+    expect(store.getSnapshot().selectionError).toMatchObject({
+      sessionId: "session-live",
+      routeMode: "none",
+    });
+
+    transport.sessionLoader = async (sessionId) =>
+      clone(fixtureSessions[sessionId]);
+    await store.selectSession(
+      "session-live",
+      store.getSnapshot().selectionError!.routeMode,
+    );
+    expect(store.getSnapshot().selectionError).toBeNull();
+    expect(store.getSnapshot().selectedSessionId).toBe("session-live");
     store.dispose();
   });
 
