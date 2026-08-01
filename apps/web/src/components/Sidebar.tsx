@@ -8,6 +8,7 @@ import {
   GitPullRequest,
   GitPullRequestDraft,
   Laptop,
+  LoaderCircle,
   Menu,
   MessageSquarePlus,
   PanelLeftClose,
@@ -231,8 +232,34 @@ function SessionRow({
       <span className="session-row-title">
         {titleContent ?? session.title}
       </span>
-      {session.pullRequest ? (
-        <PullRequestMark state={session.pullRequest.state} />
+      {session.status === "working" || session.status === "disconnected" ? (
+        <span className="session-row-meta">
+          <span
+            className="session-loader"
+            aria-label={sessionStatusLabel[session.status]}
+          >
+            <LoaderCircle className="spin" aria-hidden="true" />
+          </span>
+          {session.pullRequest ? (
+            <PullRequestMark state={session.pullRequest.state} />
+          ) : null}
+        </span>
+      ) : session.attentionCount > 0 || session.unread || session.pullRequest ? (
+        <span className="session-row-meta">
+          {session.attentionCount > 0 || session.unread ? (
+            <span
+              className="session-unread"
+              aria-label={
+                session.attentionCount > 0
+                  ? "Needs attention"
+                  : "Unread activity"
+              }
+            />
+          ) : null}
+          {session.pullRequest ? (
+            <PullRequestMark state={session.pullRequest.state} />
+          ) : null}
+        </span>
       ) : null}
     </button>
   );
