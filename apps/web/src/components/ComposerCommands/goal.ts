@@ -46,7 +46,7 @@ export function goalStatusLabel(goal: GoalState): string {
 }
 
 export function goalStatusMessage(goal: GoalState | null): string {
-  if (!goal) return "No goal is configured for this session.";
+  if (!goal) return "No goal is configured for this task.";
   const remaining =
     goal.turnBudget === null
       ? ""

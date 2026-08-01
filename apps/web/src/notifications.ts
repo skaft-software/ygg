@@ -1,4 +1,5 @@
 import type { SessionSummary } from "./protocol";
+import { displaySessionTitle } from "./session-title";
 
 const NOTIFICATION_VERSION = 1;
 const MAX_REMEMBERED_TRANSITIONS = 256;
@@ -62,21 +63,22 @@ function notificationCopy(summary: SessionSummary): {
   body: string;
 } | null {
   if (!summary.unread && summary.attentionCount === 0) return null;
+  const taskTitle = displaySessionTitle(summary.title);
   switch (summary.status) {
     case "needs_attention":
       return {
         title: "ygg needs your attention",
-        body: `${summary.title} is waiting for approval or input.`,
+        body: `${taskTitle} is waiting for approval or input.`,
       };
     case "failed":
       return {
         title: "ygg task failed",
-        body: `${summary.title} needs review.`,
+        body: `${taskTitle} needs review.`,
       };
     case "done":
       return {
         title: "ygg finished",
-        body: `${summary.title} is ready to review.`,
+        body: `${taskTitle} is ready to review.`,
       };
     default:
       return null;

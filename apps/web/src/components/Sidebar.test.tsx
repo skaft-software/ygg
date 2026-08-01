@@ -77,6 +77,7 @@ function sidebarProps(
     onRestoreFocus: vi.fn(),
     onClose: vi.fn(),
     onNewSession: vi.fn(),
+    onOpenFleet: vi.fn(),
     onSelectSession: vi.fn(),
     onRestoreSession: vi.fn(),
     onSetSessionLifecycle: vi.fn(),
@@ -127,7 +128,7 @@ describe("sidebar session lifecycle", () => {
       />,
     );
 
-    const input = screen.getByRole("searchbox", { name: "Search sessions" });
+    const input = screen.getByRole("searchbox", { name: "Search tasks and transcripts" });
     fireEvent.change(input, { target: { value: "migrate" } });
     await waitFor(() => {
       expect(search).toHaveBeenCalledWith({
@@ -138,12 +139,12 @@ describe("sidebar session lifecycle", () => {
     });
     expect(
       screen.getByRole("button", {
-        name: "Open session Deployment notes, Ready",
+        name: "Open task Deployment notes, Ready",
       }),
     ).toBeVisible();
     expect(
       screen.queryByRole("button", {
-        name: "Open session Unrelated session, Ready",
+        name: "Open task Unrelated session, Ready",
       }),
     ).toBeNull();
 
@@ -155,17 +156,17 @@ describe("sidebar session lifecycle", () => {
         limit: 100,
       });
     });
-    expect(screen.getByText("No sessions match your query")).toBeVisible();
+    expect(screen.getByText("No tasks match your query")).toBeVisible();
 
     fireEvent.change(input, { target: { value: "" } });
     expect(
       screen.getByRole("button", {
-        name: "Open session Deployment notes, Ready",
+        name: "Open task Deployment notes, Ready",
       }),
     ).toBeVisible();
     expect(
       screen.getByRole("button", {
-        name: "Open session Unrelated session, Ready",
+        name: "Open task Unrelated session, Ready",
       }),
     ).toBeVisible();
   });
@@ -206,7 +207,7 @@ describe("sidebar session lifecycle", () => {
     );
 
     fireEvent.change(
-      screen.getByRole("searchbox", { name: "Search sessions" }),
+      screen.getByRole("searchbox", { name: "Search tasks and transcripts" }),
       { target: { value: "needle" } },
     );
     const result = await screen.findByRole("button", {
@@ -244,11 +245,11 @@ describe("sidebar session lifecycle", () => {
     );
 
     fireEvent.change(
-      screen.getByRole("searchbox", { name: "Search sessions" }),
+      screen.getByRole("searchbox", { name: "Search tasks and transcripts" }),
       { target: { value: "archived needle" } },
     );
     await waitFor(() => expect(search).toHaveBeenCalled());
-    expect(screen.getByText("No sessions match your query")).toBeVisible();
+    expect(screen.getByText("No tasks match your query")).toBeVisible();
   });
 
   it("reports search failures instead of leaving the loading state", async () => {
@@ -264,15 +265,15 @@ describe("sidebar session lifecycle", () => {
     );
 
     fireEvent.change(
-      screen.getByRole("searchbox", { name: "Search sessions" }),
+      screen.getByRole("searchbox", { name: "Search tasks and transcripts" }),
       { target: { value: "offline" } },
     );
     await waitFor(() => {
       expect(
-        screen.getByText("Session search could not be completed. Try again."),
+        screen.getByText("Task search could not be completed. Try again."),
       ).toBeVisible();
     });
-    expect(screen.queryByText("Searching sessions…")).toBeNull();
+    expect(screen.queryByText("Searching tasks…")).toBeNull();
   });
 
   it("guides empty and filtered session lists", () => {
@@ -284,18 +285,18 @@ describe("sidebar session lifecycle", () => {
     );
 
     const emptyState = screen
-      .getByText("Start a conversation to see it here")
+      .getByText("Start a task to see it here")
       .parentElement;
     expect(emptyState).not.toBeNull();
     fireEvent.click(
-      within(emptyState!).getByRole("button", { name: "New session" }),
+      within(emptyState!).getByRole("button", { name: "New task" }),
     );
     expect(onNewSession).toHaveBeenCalledOnce();
 
-    fireEvent.change(screen.getByRole("searchbox", { name: "Search sessions" }), {
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search tasks and transcripts" }), {
       target: { value: "missing" },
     });
-    expect(screen.getByText("No sessions match your query")).toBeVisible();
+    expect(screen.getByText("No tasks match your query")).toBeVisible();
     expect(screen.queryByText("No matching sessions")).toBeNull();
   });
 
@@ -324,7 +325,7 @@ describe("sidebar session lifecycle", () => {
     );
 
     const noEvidence = screen.getByRole("button", {
-      name: "Open session No PR evidence, Ready",
+      name: "Open task No PR evidence, Ready",
     });
     expect(noEvidence).toHaveTextContent("No PR evidence");
     expect(noEvidence.querySelector("svg")).toBeNull();
@@ -347,7 +348,7 @@ describe("sidebar session lifecycle", () => {
     );
 
     const archive = screen.getByRole("button", {
-      name: "Archive session Active investigation",
+      name: "Archive task Active investigation",
     });
     expect(archive).toHaveClass("session-row-archive");
     expect(archive.querySelector("svg")).not.toBeNull();
@@ -356,10 +357,33 @@ describe("sidebar session lifecycle", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: /Archive/ }));
     const restore = screen.getByRole("button", {
-      name: "Restore session Archived investigation",
+      name: "Restore task Archived investigation",
     });
     expect(restore).toHaveClass("session-row-restore");
     expect(container.querySelector(".session-row-archive")).toBeNull();
+  });
+
+  it("opens the command center and announces work needing attention", () => {
+    const openFleet = vi.fn();
+    render(
+      <Sidebar
+        {...sidebarProps({
+          surface: "fleet",
+          sessions: [
+            activeSession({ status: "failed", attentionCount: 1 }),
+            archivedSession(),
+          ],
+          onOpenFleet: openFleet,
+        })}
+      />,
+    );
+
+    const commandCenter = screen.getByRole("button", {
+      name: "Command center 1 task needs you",
+    });
+    expect(commandCenter).toHaveAttribute("aria-current", "page");
+    fireEvent.click(commandCenter);
+    expect(openFleet).toHaveBeenCalledOnce();
   });
 
   it("opens usage from the persistent destination", () => {
@@ -391,7 +415,7 @@ describe("sidebar session lifecycle", () => {
     );
 
     expect(
-      screen.getByRole("tab", { name: "Active" }),
+      screen.getByRole("tab", { name: /Active/ }),
     ).toHaveAttribute("aria-selected", "true");
     expect(screen.getByText("Active investigation")).toBeVisible();
     expect(screen.queryByText("Archived investigation")).toBeNull();
@@ -402,7 +426,7 @@ describe("sidebar session lifecycle", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: "Restore session Archived investigation",
+        name: "Restore task Archived investigation",
       }),
     );
     expect(setLifecycle).toHaveBeenCalledWith("session-archived", "active");
@@ -426,7 +450,7 @@ describe("sidebar session lifecycle", () => {
     fireEvent.click(screen.getByRole("tab", { name: /Archive/ }));
     fireEvent.click(
       screen.getByRole("button", {
-        name: "Restore session Archived investigation",
+        name: "Restore task Archived investigation",
       }),
     );
     expect(restore).toHaveBeenCalledWith("session-archived");
@@ -444,7 +468,7 @@ describe("sidebar session lifecycle", () => {
     fireEvent.click(screen.getByRole("tab", { name: /Archive/ }));
     fireEvent.click(
       screen.getByRole("button", {
-        name: "Move session Archived investigation to trash",
+        name: "Move task Archived investigation to trash",
       }),
     );
     expect(setLifecycle).toHaveBeenCalledWith("session-archived", "trash");
@@ -474,7 +498,7 @@ describe("sidebar session lifecycle", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: "Restore session Deleted investigation",
+        name: "Restore task Deleted investigation",
       }),
     );
     expect(setLifecycle).toHaveBeenCalledWith("session-trashed", "active");
@@ -510,7 +534,7 @@ describe("sidebar session lifecycle", () => {
     fireEvent.click(screen.getByRole("tab", { name: /Trash/ }));
     fireEvent.click(
       screen.getByRole("button", {
-        name: "Permanently delete session Deleted investigation",
+        name: "Permanently delete task Deleted investigation",
       }),
     );
 

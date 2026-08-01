@@ -609,7 +609,10 @@ export class YggStore {
         goal,
         sessions: { [installedSelected.sessionId]: installedSelected },
       });
-      if (this.isCurrentInitialization(generation)) {
+      if (
+        this.isCurrentInitialization(generation) &&
+        window.location.pathname !== "/overview"
+      ) {
         writeSessionRoute(installedSelected.sessionId, "replace");
       }
     } catch (error) {
@@ -628,7 +631,7 @@ export class YggStore {
 
   ingestDocument(file: File): Promise<DocumentReference> {
     const session = this.selectedSession;
-    if (!session) return Promise.reject(new Error("No session is selected."));
+    if (!session) return Promise.reject(new Error("No task is selected."));
     return this.transport.ingestDocument(session.sessionId, file);
   }
 
@@ -644,7 +647,7 @@ export class YggStore {
 
   getCommandDiscovery(): Promise<CommandDiscovery> {
     const session = this.selectedSession;
-    if (!session) return Promise.reject(new Error("No session is selected."));
+    if (!session) return Promise.reject(new Error("No task is selected."));
     return this.transport.getCommandDiscovery(session.sessionId);
   }
 
@@ -653,7 +656,7 @@ export class YggStore {
     idempotencyKey: string = commandId(),
   ): Promise<void> {
     const session = this.selectedSession;
-    if (!session) throw new Error("No session is selected.");
+    if (!session) throw new Error("No task is selected.");
     const ack = await this.sendCommand({
       id: idempotencyKey,
       type: "session.invokeSlashCommand",
@@ -695,7 +698,7 @@ export class YggStore {
     mutation: GoalMutation,
   ): Promise<GoalState | null> {
     const session = this.selectedSession;
-    if (!session) throw new Error("No session is selected.");
+    if (!session) throw new Error("No task is selected.");
     const goal = await this.transport.updateGoal(session.sessionId, mutation);
     if (this.state.selectedSessionId === session.sessionId) {
       this.publish({ ...this.state, goal });
@@ -1119,14 +1122,14 @@ export class YggStore {
       !["idle", "done", "failed", "stopped"].includes(session.status)
     ) {
       throw new Error(
-        "A session branch can only be checked out after current work finishes.",
+        "A task branch can only be checked out after current work finishes.",
       );
     }
     const target = session.branches.entries.find(
       (entry) => entry.entryId === entryId && entry.checkoutable,
     );
     if (!target) {
-      throw new Error("That session checkpoint is not available for checkout.");
+      throw new Error("That task checkpoint is not available for checkout.");
     }
     const ack = await this.sendCommand({
       id: commandId(),
@@ -1208,7 +1211,7 @@ export class YggStore {
           "The ygg host rejected this conversation fork.",
         );
       }
-      throw new Error("The ygg host did not identify the forked session.");
+      throw new Error("The ygg host did not identify the forked task.");
     }
     await this.installCreatedSession(ack.createdSessionId, bootstrap);
   }
@@ -1226,7 +1229,7 @@ export class YggStore {
     if (!ack.accepted) {
       throw rejectedCommandError(
         ack,
-        "The ygg host rejected this session lifecycle change.",
+        "The ygg host rejected this task lifecycle change.",
       );
     }
     await this.initialize();

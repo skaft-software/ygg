@@ -12,15 +12,21 @@ LAN contracts are stable.
 ## Product contract
 
 - Opening the graphical app at its root creates and selects a fresh provisional
-  session.
-- Opening an explicit session route restores that session.
-- Existing, pinned, and concurrently running sessions remain available in the
+  task in the focused work surface.
+- Opening an explicit task route restores that task. Opening `/overview`
+  restores the command center without replacing the selected task.
+- Existing, pinned, and concurrently running tasks remain available in the
   sidebar.
-- Each active session has one authoritative owner and runs independently.
-- The transcript is the primary surface. Progress, sources, outputs, diffs,
-  approvals, and previews appear only when real structured events create them.
-- The interface has no Chat, Code, Work, Cowork, fleet, runtime, or dashboard
-  mode.
+- Each active task has one authoritative session owner and runs independently.
+- The command center is a deterministic aggregate of host-owned task state. It
+  surfaces exception counts, prioritizes tasks that need intervention or review,
+  and supports task/project search without inventing summaries or runtime state.
+- The transcript remains the primary surface for a focused task. Progress,
+  sources, outputs, diffs, approvals, and previews appear only when real
+  structured events create them.
+- The interface has no Chat, Code, Work, or Cowork mode selector. The command
+  center and focused task are two views of the same task lifecycle, not separate
+  agent modes.
 - `ygg serve` is headless. It neither hosts nor synchronizes a TUI.
 
 The graphical interaction grammar deliberately feels familiar to users of
@@ -62,7 +68,9 @@ See:
 The first complete vertical slice must use real sessions, not production
 fixtures. It includes:
 
-- a fresh-session launch flow and durable session sidebar;
+- a fresh-task launch flow and durable task sidebar;
+- an exception-prioritized command center with aggregate status, task/project
+  search, and direct return to focused work;
 - two independently running sessions;
 - streaming assistant, reasoning, tool, approval, and run-outcome items;
 - stop, steer, and queued follow-up;

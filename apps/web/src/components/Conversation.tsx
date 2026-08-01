@@ -189,7 +189,7 @@ function classifySubmissionFailure(error: unknown): SubmissionFailure {
     ) {
       return {
         kind: "session",
-        title: "Session state changed",
+        title: "Task state changed",
         message,
         retryable: error.retryable,
       };
@@ -251,7 +251,7 @@ function classifySubmissionFailure(error: unknown): SubmissionFailure {
   ) {
     return {
       kind: "session",
-      title: "Session state changed",
+      title: "Task state changed",
       message,
       retryable: true,
     };
@@ -1269,7 +1269,7 @@ function AssistantMessage({
                 type="button"
                 onClick={onFork}
                 aria-label="Fork conversation here"
-                title="Fork into a new session"
+                title="Fork into a new task"
               >
                 <GitFork aria-hidden="true" />
               </button>
@@ -1481,7 +1481,7 @@ const TranscriptItemView = memo(function TranscriptItemView({
                 type="button"
                 onClick={() => onForkConversation(item)}
                 aria-label="Fork conversation here"
-                title="Fork into a new session"
+                title="Fork into a new task"
               >
                 <GitFork aria-hidden="true" />
               </button>
@@ -1570,7 +1570,7 @@ const TranscriptItemView = memo(function TranscriptItemView({
                 {item.resolved === "denied"
                   ? "Denied"
                   : item.resolved === "allowed_session"
-                    ? "Allowed for this session"
+                    ? "Allowed for this task"
                     : "Allowed once"}
               </div>
             ) : (
@@ -3358,7 +3358,7 @@ function Composer({
     if (onExportSession && bootstrap.capabilities.sessionExport) {
       direct.set("export", {
         title: "/export",
-        description: "download this session with secret redaction",
+        description: "download this task with secret redaction",
         icon: <Download />,
         disabled: isWorking,
         action: { type: "direct", name: "export" },
@@ -3644,7 +3644,7 @@ function Composer({
       if (isWorking && !handlesStatus) {
         setSubmitError({
           kind: "session",
-          title: "Session is still working",
+          title: "Task is still working",
           message: "Slash commands are available after current work finishes.",
           retryable: true,
         });
@@ -3725,7 +3725,7 @@ function Composer({
         setSubmitError({
           kind: "rejected",
           title: "Goal commands are unavailable",
-          message: "This session does not support the /goal extension.",
+          message: "This task does not support the /goal extension.",
           retryable: false,
         });
         return;

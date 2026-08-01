@@ -77,7 +77,7 @@ describe("App transcript search workflow", () => {
     render(<App />);
 
     const query = await screen.findByRole("searchbox", {
-      name: "Search sessions",
+      name: "Search tasks and transcripts",
     });
     await user.type(query, "release candidate");
 

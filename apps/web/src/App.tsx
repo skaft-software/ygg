@@ -29,6 +29,7 @@ import {
 } from "react";
 import { ActivityRail } from "./components/ActivityRail";
 import { Conversation } from "./components/Conversation";
+import { FleetOverview } from "./components/FleetOverview";
 import { GoalBadge } from "./components/GoalBadge";
 import { DevicesView } from "./components/Devices";
 import {
@@ -66,6 +67,7 @@ import {
   YggStore,
   useYggStore,
 } from "./store";
+import { displaySessionTitle, isUntitledSession } from "./session-title";
 import {
   goalCommandHelp,
   goalStatusMessage,
@@ -85,6 +87,7 @@ const FilesPanel = lazy(() =>
 );
 
 type Surface =
+  | "fleet"
   | "session"
   | "projects"
   | "files"
@@ -110,6 +113,12 @@ const terminalPaneStorageKey = "ygg.ui.terminal-width";
 const terminalPaneOpenStorageKey = "ygg.ui.terminal.open";
 const notificationPreferenceKey = (hostId: string) =>
   `ygg.notifications.enabled.${encodeURIComponent(hostId)}`;
+
+function writeFleetRoute() {
+  const route = `/overview${window.location.search}`;
+  window.history.pushState(null, "", route);
+}
+
 const MemoizedInspector = memo(
   Inspector,
   (previous, next) =>
@@ -211,7 +220,7 @@ function ConnectionBanner({
           ? "Connection interrupted. Reconnecting to ygg…"
           : "Connecting to local ygg…"}
       </span>
-      <small>Your current session remains visible while ygg reconnects.</small>
+      <small>Your current task remains visible while ygg reconnects.</small>
     </div>
   );
 }
@@ -310,7 +319,8 @@ export function SessionHeader({
 }: HeaderProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
-  const [draftTitle, setDraftTitle] = useState(sessionTitle);
+  const displayTitle = displaySessionTitle(sessionTitle);
+  const [draftTitle, setDraftTitle] = useState(displayTitle);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
   const renameFinishedRef = useRef(false);
 
@@ -329,7 +339,10 @@ export function SessionHeader({
   const finishRename = (commit: boolean, restoreFocus: boolean) => {
     if (renameFinishedRef.current) return;
     renameFinishedRef.current = true;
-    if (commit && draftTitle.trim()) onRename(draftTitle);
+    const nextTitle = draftTitle.trim();
+    if (commit && nextTitle && nextTitle !== displayTitle.trim()) {
+      onRename(draftTitle);
+    }
     setRenaming(false);
     setMenuOpen(false);
     if (restoreFocus) {
@@ -372,10 +385,10 @@ export function SessionHeader({
                   finishRename(false, true);
                 }
               }}
-              aria-label="Session title"
+              aria-label="Task title"
             />
           ) : (
-            <strong>{sessionTitle}</strong>
+            <strong>{displayTitle}</strong>
           )}
         </div>
       </div>
@@ -418,7 +431,7 @@ export function SessionHeader({
               className="icon-button"
               onClick={() => setMenuOpen((open) => !open)}
               aria-expanded={menuOpen}
-              aria-label="Session actions"
+              aria-label="Task actions"
             >
               <MoreHorizontal aria-hidden="true" />
             </button>
@@ -440,7 +453,7 @@ export function SessionHeader({
                       }}
                     >
                       <GitBranch aria-hidden="true" />
-                      Session history
+                      Task history
                     </button>
                   ) : null}
                   {sessionExportAvailable ? (
@@ -459,7 +472,7 @@ export function SessionHeader({
                       <button
                         role="menuitem"
                         onClick={() => {
-                          setDraftTitle(sessionTitle);
+                          setDraftTitle(displayTitle);
                           renameFinishedRef.current = false;
                           setRenaming(true);
                           setMenuOpen(false);
@@ -563,7 +576,7 @@ function BranchHistorySheet({
               <GitBranch />
             </span>
             <div>
-              <h2 id="branch-sheet-title">Session history</h2>
+              <h2 id="branch-sheet-title">Task history</h2>
               <p>Choose where the conversation should continue.</p>
             </div>
           </div>
@@ -681,8 +694,10 @@ export default function App() {
     () => window.matchMedia("(min-width: 900px)").matches,
   );
   const [activityOpen, setActivityOpen] = useState(false);
-  const [terminalOpen, setTerminalOpen] = useState(() =>
-    storedBoolean(terminalPaneOpenStorageKey),
+  const [terminalOpen, setTerminalOpen] = useState(
+    () =>
+      window.location.pathname !== "/overview" &&
+      storedBoolean(terminalPaneOpenStorageKey),
   );
   const [branchHistoryOpen, setBranchHistoryOpen] = useState(false);
   const [inspector, setInspector] = useState<InspectorSelection | null>(null);
@@ -696,7 +711,9 @@ export default function App() {
   const [terminalPaneWidth, setTerminalPaneWidth] = useState(() =>
     storedPaneWidth(terminalPaneStorageKey, 460),
   );
-  const [surface, setSurface] = useState<Surface>("session");
+  const [surface, setSurface] = useState<Surface>(() =>
+    window.location.pathname === "/overview" ? "fleet" : "session",
+  );
   const notificationManagerRef =
     useRef<AttentionNotificationManager | null>(null);
   const [notificationState, setNotificationState] = useState<{
@@ -824,7 +841,21 @@ export default function App() {
   useEffect(() => {
     const onPopState = () => {
       const sessionId = sessionIdFromPathname(window.location.pathname);
-      if (sessionId) void store.selectSession(sessionId, "none");
+      if (sessionId) {
+        setSurface("session");
+        void store.selectSession(sessionId, "none");
+        return;
+      }
+      if (window.location.pathname === "/overview") {
+        setSurface("fleet");
+        setInspector(null);
+        setActivityOpen(false);
+        setBranchHistoryOpen(false);
+        setTerminalOpen(false);
+        persistBoolean(terminalPaneOpenStorageKey, false);
+        return;
+      }
+      if (window.location.pathname === "/") setSurface("session");
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
@@ -846,7 +877,8 @@ export default function App() {
     persistBoolean(terminalPaneOpenStorageKey, false);
   }, []);
 
-  const visibleTerminalOpen = terminalAvailable && terminalOpen;
+  const visibleTerminalOpen =
+    surface === "session" && terminalAvailable && terminalOpen;
 
   const activityAvailable = Boolean(
     session &&
@@ -855,11 +887,13 @@ export default function App() {
         (state.bootstrap?.capabilities.resources &&
           (session.outputs.length || session.sources.length))),
   );
-  const visibleActivityOpen = activityOpen && activityAvailable;
+  const visibleActivityOpen =
+    surface === "session" && activityOpen && activityAvailable;
   const modalWorkspaceOpen =
-    branchHistoryOpen ||
-    (!wideLayout && (visibleActivityOpen || Boolean(inspector))) ||
-    (!terminalSplitLayout && visibleTerminalOpen);
+    surface === "session" &&
+    (branchHistoryOpen ||
+      (!wideLayout && (visibleActivityOpen || Boolean(inspector))) ||
+      (!terminalSplitLayout && visibleTerminalOpen));
 
   useEffect(() => {
     const media = window.matchMedia("(max-width: 760px)");
@@ -1070,12 +1104,33 @@ export default function App() {
     setActivityOpen(false);
     setInspector(null);
   }, [closeTerminal, terminalAvailable, terminalOpen]);
+  const openFleet = useCallback(() => {
+    closeTerminal();
+    setInspector(null);
+    setActivityOpen(false);
+    setBranchHistoryOpen(false);
+    setSurface("fleet");
+    if (window.location.pathname !== "/overview") writeFleetRoute();
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      setSidebarOpen(false);
+    }
+  }, [closeTerminal]);
   const startNewSession = useCallback(() => {
     setSurface("session");
     setInspector(null);
     setActivityOpen(false);
+    if (
+      session &&
+      selectedSummary?.lifecycle === "active" &&
+      session.items.length === 0 &&
+      session.status === "idle" &&
+      isUntitledSession(session.title)
+    ) {
+      void store.selectSession(session.sessionId);
+      return;
+    }
     void store.createSession();
-  }, []);
+  }, [selectedSummary?.lifecycle, session]);
   const selectSession = useCallback(
     (sessionId: string) => {
       setSurface("session");
@@ -1379,7 +1434,7 @@ const getCommandDiscovery = useCallback(
     [],
   );
   const exportSession = useCallback(() => {
-    if (!session) throw new Error("No session is selected.");
+    if (!session) throw new Error("No task is selected.");
     const link = document.createElement("a");
     link.href = `/api/v1/sessions/${encodeURIComponent(session.sessionId)}/export`;
     link.download = "";
@@ -1479,7 +1534,7 @@ const getCommandDiscovery = useCallback(
         />
       );
     }
-    return <ErrorState message="No session was selected." />;
+    return <ErrorState message="No task was selected." />;
   }
 
   return (
@@ -1496,6 +1551,7 @@ const getCommandDiscovery = useCallback(
         onRestoreFocus={restoreSidebarFocus}
         onClose={closeSidebar}
         onNewSession={startNewSession}
+        onOpenFleet={openFleet}
         onSelectSession={selectSession}
         onRestoreSession={(sessionId) => {
           void restoreSession(sessionId);
@@ -1616,8 +1672,10 @@ const getCommandDiscovery = useCallback(
         >
           <UtilityTopbar
             title={
-              surface === "settings"
-                ? "Settings"
+              surface === "fleet"
+                ? "Command center"
+                : surface === "settings"
+                  ? "Settings"
                 : surface === "projects"
                   ? "Projects"
                   : surface === "files"
@@ -1632,7 +1690,15 @@ const getCommandDiscovery = useCallback(
           />
           <ConnectionBanner connection={state.connection} />
           <FixtureModeLabel />
-          {surface === "files" ? (
+          {surface === "fleet" ? (
+            <FleetOverview
+              sessions={state.bootstrap.sessions}
+              projects={state.bootstrap.projects}
+              selectedSessionId={state.selectedSessionId}
+              onNewTask={startNewSession}
+              onSelectTask={selectSession}
+            />
+          ) : surface === "files" ? (
             <Suspense
               fallback={
                 <main className="files-panel files-empty" aria-busy="true">
@@ -1729,7 +1795,7 @@ const getCommandDiscovery = useCallback(
               className="pane-resize-handle"
               role="separator"
               aria-label={
-                inspector ? "Resize inspector" : "Resize session activity"
+                inspector ? "Resize inspector" : "Resize task activity"
               }
               aria-orientation="vertical"
               aria-valuemin={inspector ? 520 : 280}

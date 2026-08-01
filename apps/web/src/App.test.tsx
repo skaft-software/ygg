@@ -14,15 +14,18 @@ function renderHeader(
   sessionExportAvailable: boolean,
   terminalAvailable = false,
   terminalOpen = false,
+  sessionTitle = "Safe session",
 ) {
   const onToggleTerminal = vi.fn();
+  const onRename = vi.fn();
   return {
+    onRename,
     onToggleTerminal,
     ...render(
       <SessionHeader
         sidebarOpen
         sessionId="session-safe"
-        sessionTitle="Safe session"
+        sessionTitle={sessionTitle}
         projectName="Local project"
         status="idle"
         activityAvailable={false}
@@ -40,7 +43,7 @@ function renderHeader(
         onOpenSidebar={vi.fn()}
         onToggleActivity={vi.fn()}
         onToggleTerminal={onToggleTerminal}
-        onRename={vi.fn()}
+        onRename={onRename}
         onPin={vi.fn()}
         onArchive={vi.fn()}
         onOpenBranchHistory={vi.fn()}
@@ -67,18 +70,40 @@ describe("session header safe export", () => {
     expect(available.onToggleTerminal).toHaveBeenCalledOnce();
   });
 
+  it("keeps a provisional session title internal until the user renames the task", async () => {
+    const user = userEvent.setup();
+    const header = renderHeader(false, false, false, "New session");
+
+    expect(screen.getByText("New task", { exact: true })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Task actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Rename" }));
+    expect(screen.getByRole("textbox", { name: "Task title" })).toHaveValue(
+      "New task",
+    );
+    await user.keyboard("{Enter}");
+    expect(header.onRename).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Task actions" }));
+    await user.click(screen.getByRole("menuitem", { name: "Rename" }));
+    const title = screen.getByRole("textbox", { name: "Task title" });
+    await user.clear(title);
+    await user.type(title, "Release prep");
+    await user.keyboard("{Enter}");
+    expect(header.onRename).toHaveBeenCalledWith("Release prep");
+  });
+
   it("exposes a direct same-origin download only when the host advertises it", async () => {
     expect(fixtureBootstrap.capabilities.sessionExport).toBe(false);
     const user = userEvent.setup();
     const unavailable = renderHeader(false);
-    await user.click(screen.getByRole("button", { name: "Session actions" }));
+    await user.click(screen.getByRole("button", { name: "Task actions" }));
     expect(
       screen.queryByRole("menuitem", { name: "Download safe export" }),
     ).toBeNull();
     unavailable.unmount();
 
     renderHeader(true);
-    await user.click(screen.getByRole("button", { name: "Session actions" }));
+    await user.click(screen.getByRole("button", { name: "Task actions" }));
     const download = screen.getByRole("menuitem", {
       name: "Download safe export",
     });

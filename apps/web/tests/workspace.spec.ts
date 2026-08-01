@@ -14,7 +14,7 @@ async function ensureSidebar(page: Page) {
     await opener.click();
   }
   const newSession = page.getByRole("button", {
-    name: "New session",
+    name: "New task",
     exact: true,
   });
   await expect(newSession).toBeVisible();
@@ -86,6 +86,76 @@ test("labels simulated fixture mode", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("uses the command center to triage exceptions and restore focus", async ({
+  page,
+}, testInfo) => {
+  await page.clock.setFixedTime(new Date("2026-07-26T17:00:00Z"));
+  await ensureSidebar(page);
+  await page.getByRole("button", { name: /Command center/ }).click();
+
+  await expect(page).toHaveURL(/\/overview\?transport=fixture$/);
+  await expect(
+    page.getByRole("heading", { name: "All agents. One clear queue." }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Show needs you tasks, 1" }),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("list", { name: "Priority queue" })
+      .getByRole("button")
+      .first(),
+  ).toHaveAccessibleName(
+    "Open task Prepare signed macOS build, Needs you, ygg",
+  );
+  await expectNoViewportOverflow(page);
+  if (testInfo.project.name === "desktop") {
+    await page.evaluate(() => document.fonts.ready);
+    await expect(page.locator(".app-shell")).toHaveScreenshot(
+      "command-center-settled.png",
+      {
+        animations: "disabled",
+        maxDiffPixelRatio: 0.001,
+      },
+    );
+  }
+
+  await page
+    .getByRole("button", { name: "Show needs you tasks, 1" })
+    .click();
+  await page.getByRole("button", { name: "Open next" }).click();
+  await expect(page).toHaveURL(
+    /\/session\/session-attention\?transport=fixture$/,
+  );
+  await expect(
+    page
+      .getByRole("banner")
+      .getByText("Prepare signed macOS build", { exact: true }),
+  ).toBeVisible();
+
+  await page.goBack();
+  await expect(page).toHaveURL(/\/overview\?transport=fixture$/);
+  await expect(
+    page.getByRole("heading", { name: "All agents. One clear queue." }),
+  ).toBeVisible();
+
+  await page.goForward();
+  await expect(page).toHaveURL(
+    /\/session\/session-attention\?transport=fixture$/,
+  );
+  await expect(page.getByLabel("Message ygg")).toBeVisible();
+
+  await page.evaluate(() =>
+    window.localStorage.setItem("ygg.ui.terminal.open", "true"),
+  );
+  await page.goto("/overview?transport=fixture");
+  await expect(
+    page.getByRole("heading", { name: "All agents. One clear queue." }),
+  ).toBeVisible();
+  await expect(page.getByRole("region", { name: "Terminal" })).toHaveCount(0);
+  await expectNoViewportOverflow(page);
+});
+
 test("browses and saves a trusted project file", async ({ page }) => {
   await ensureSidebar(page);
   await page.getByRole("button", { name: "Files", exact: true }).click();
@@ -106,15 +176,15 @@ test("opens in a fresh, quiet session with the standard composer", async ({
   page,
 }) => {
   await expect(
-    page.getByRole("button", { name: "New session", exact: true }),
+    page.getByRole("button", { name: "New task", exact: true }),
   ).toBeVisible();
   await expect(page.locator(".brand-row .ygg-glyph")).toHaveCount(0);
   await expect(page.locator(".local-identity")).toHaveCount(0);
   await expect(page.getByText("Connected to local ygg")).toHaveCount(0);
   await expect(
     page
-      .getByRole("tabpanel", { name: "Active sessions" })
-      .getByText("Sessions", { exact: true }),
+      .getByRole("tabpanel", { name: "Active tasks" })
+      .getByText("Tasks", { exact: true }),
   ).toBeVisible();
   await expect(
     page.getByRole("region", { name: "ygg", exact: true }),
@@ -177,10 +247,10 @@ test("shows pull-request marks only for structured PR evidence", async ({
   await ensureSidebar(page);
 
   const noEvidence = page.getByRole("button", {
-    name: "Open session New session, Ready",
+    name: "Open task New task, Ready",
   });
   await expect(noEvidence.locator(".session-pull-request")).toHaveCount(0);
-  await expect(noEvidence).toHaveText("New session");
+  await expect(noEvidence).toHaveText("New task");
 
   const inProgress = page.getByRole("button", {
     name: /Refine onboarding preview, Working, Pull request in progress/,
@@ -988,7 +1058,7 @@ test("resizes the desktop activity pane and remembers its width", async ({
   await ensureActivityOpen(page);
 
   const separator = page.getByRole("separator", {
-    name: "Resize session activity",
+    name: "Resize task activity",
   });
   await expect(separator).toHaveAttribute("aria-valuenow", "400");
   await separator.press("ArrowLeft");
@@ -998,7 +1068,7 @@ test("resizes the desktop activity pane and remembers its width", async ({
   await selectSession(page, "Refine onboarding preview");
   await ensureActivityOpen(page);
   await expect(
-    page.getByRole("separator", { name: "Resize session activity" }),
+    page.getByRole("separator", { name: "Resize task activity" }),
   ).toHaveAttribute("aria-valuenow", "416");
 });
 
@@ -1044,7 +1114,7 @@ test("closes the session actions menu with Escape and restores its trigger", asy
   page,
 }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
-  const trigger = page.getByRole("button", { name: "Session actions" });
+  const trigger = page.getByRole("button", { name: "Task actions" });
   await trigger.focus();
   await trigger.press("Enter");
   await expect(page.getByRole("menu")).toBeVisible();
@@ -1313,7 +1383,7 @@ test("opens and dismisses the mobile sidebar with Escape", async ({
   await trigger.focus();
   await trigger.press("Enter");
   await expect(
-    page.getByRole("button", { name: "New session", exact: true }),
+    page.getByRole("button", { name: "New task", exact: true }),
   ).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(trigger).toBeVisible();

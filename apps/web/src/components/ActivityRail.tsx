@@ -124,7 +124,7 @@ function ActivityRailView({
     <aside
       ref={railRef}
       className={`activity-rail ${open ? "is-open" : ""}`}
-      aria-label="Session activity"
+      aria-label="Task activity"
       aria-hidden={!open}
       aria-modal={modal && open ? true : undefined}
       role={modal ? "dialog" : undefined}

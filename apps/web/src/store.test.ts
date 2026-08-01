@@ -313,6 +313,24 @@ afterEach(() => {
 });
 
 describe("YggStore", () => {
+  it("preserves a direct command-center route during initialization", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    const previousRoute = `${window.location.pathname}${window.location.search}`;
+    window.history.replaceState(null, "", "/overview?transport=fixture");
+
+    try {
+      await store.initialize();
+
+      expect(window.location.pathname).toBe("/overview");
+      expect(window.location.search).toBe("?transport=fixture");
+      expect(store.getSnapshot().selectedSessionId).toBe("session-fresh");
+    } finally {
+      store.dispose();
+      window.history.replaceState(null, "", previousRoute);
+    }
+  });
+
   it("renders session-free trust onboarding before opening a project", async () => {
     const transport = new TestTransport();
     transport.projectCatalog.projects = transport.projectCatalog.projects.map(
