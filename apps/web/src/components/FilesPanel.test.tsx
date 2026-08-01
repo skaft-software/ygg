@@ -29,6 +29,7 @@ function renderFilesPanel(
         { kind: "untracked" },
       ] },
       { name: "README.md", kind: "file", size: 24, gitStatus: [{ kind: "modified" }] },
+      { name: "main.ts", kind: "file", size: 24 },
     ],
     truncated: false,
     gitStatusTruncated: false,
@@ -56,8 +57,19 @@ const answer = 42;
     truncated: false,
     sha256: version,
   };
+  const codeRead: ProjectFileRead = {
+    path: "main.ts",
+    content: "export const answer = 42;\n",
+    startLine: 1,
+    endLine: 1,
+    lineCount: 1,
+    truncated: false,
+    sha256: version,
+  };
   const getTree = vi.fn(async () => tree);
-  const readFile = vi.fn(async () => read);
+  const readFile = vi.fn(async (_projectId: string, path: string) =>
+    path === codeRead.path ? codeRead : read,
+  );
   const searchFiles = vi.fn(async () => ({
     hits: [],
     truncated: false,
@@ -174,6 +186,16 @@ describe("FilesPanel", () => {
     expect(getTree).toHaveBeenCalledWith(project.id, "");
     expect(readFile).toHaveBeenCalledWith(project.id, "README.md");
     expect(screen.queryByText("Unsaved")).toBeNull();
+  });
+
+  it("shows line numbers for code files", async () => {
+    renderFilesPanel();
+
+    fireEvent.click(await screen.findByRole("button", { name: /main\.ts/ }));
+    expect(
+      await screen.findByRole("textbox", { name: "Contents of main.ts" }),
+    ).toBeTruthy();
+    expect(document.querySelector(".files-code-editor.is-numbered")).toBeTruthy();
   });
 
   it("shows accessible Git status indicators for tree entries", async () => {
