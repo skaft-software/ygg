@@ -61,7 +61,7 @@ The installer builds the pinned release tag and adds Cargo's binary directory to
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://raw.githubusercontent.com/skaft-software/ygg/v0.3.1-alpha/scripts/install.sh | sh
+  https://raw.githubusercontent.com/skaft-software/ygg/v0.3.2-alpha/scripts/install.sh | sh
 ```
 
 Restart the shell, then verify the installation:
@@ -78,7 +78,7 @@ To install without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.3.1-alpha \
+  --tag v0.3.2-alpha \
   --bin ygg \
   ygg-coding-agent
 ```
@@ -97,17 +97,38 @@ cd ygg
 cargo install --locked --path crates/ygg-coding-agent --bin ygg
 ```
 
+### Graphical Serve extension
+
+The optional first-party Serve package provides a loopback-only web interface.
+It is version-matched to Ygg and installed separately from the terminal binary:
+
+```sh
+ygg extension install ygg-serve
+ygg serve
+```
+
+For a headless launch on an operating-system-selected port:
+
+```sh
+ygg serve --no-open --port 0
+```
+
+Use `ygg extension list`, `update ygg-serve`, or `remove ygg-serve` to manage
+the package. A downloaded release archive can be installed with
+`ygg extension install --path ./ygg-serve-0.3.2-alpha-TARGET.tar.gz`.
+Removing the package leaves sessions and other Serve data intact.
+
 ### Container
 
 The included image builds ygg from the locked workspace, runs as an unprivileged
 user, and expects an explicit workspace mount:
 
 ```sh
-docker build -f deploy/Dockerfile.ygg -t ygg:0.3.1-alpha .
+docker build -f deploy/Dockerfile.ygg -t ygg:0.3.2-alpha .
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.3.1-alpha --model claude-sonnet-4-6
+  ygg:0.3.2-alpha --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs.
