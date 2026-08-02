@@ -2910,7 +2910,7 @@ export function projectSessionSnapshot(
 
 export interface HostBootstrapProjection {
   bootstrap: HostBootstrap;
-  selectedSession: SessionSnapshot;
+  selectedSession: SessionSnapshot | null;
 }
 
 function projectProjectSummary(value: unknown, path: string): ProjectSummary {
@@ -3557,30 +3557,42 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
     (session, index) =>
       projectSummary(session, `hostBootstrap.sessions[${index}]`, models),
   );
-  const selectedSessionId = string(
-    wire.selectedSessionId,
-    "hostBootstrap.selectedSessionId",
-  );
-  const selectedSummary = sessions.find(
-    (session) => session.id === selectedSessionId,
-  );
-  if (!selectedSummary) {
+  let selectedSessionId: string | null = null;
+  let selectedSession: SessionSnapshot | null = null;
+  const hasSelectedSessionId = wire.selectedSessionId !== null;
+  const hasSelectedSession = wire.selectedSession !== null;
+  if (hasSelectedSessionId !== hasSelectedSession) {
     throw new WireContractError(
-      "hostBootstrap.selectedSessionId",
-      "must identify a catalog session",
+      "hostBootstrap.selectedSession",
+      "must be present exactly when selectedSessionId is present",
     );
   }
-  const selectedSession = projectSessionSnapshot(wire.selectedSession, {
-    summary: selectedSummary,
-    projectIdFallback: projects[0]?.id,
-    timestampMs: Date.parse(selectedSummary.updatedAt),
-    models,
-  });
-  if (selectedSession.sessionId !== selectedSessionId) {
-    throw new WireContractError(
-      "hostBootstrap.selectedSession.sessionId",
-      "must match selectedSessionId",
+  if (hasSelectedSessionId) {
+    selectedSessionId = string(
+      wire.selectedSessionId,
+      "hostBootstrap.selectedSessionId",
     );
+    const selectedSummary = sessions.find(
+      (session) => session.id === selectedSessionId,
+    );
+    if (!selectedSummary) {
+      throw new WireContractError(
+        "hostBootstrap.selectedSessionId",
+        "must identify a catalog session",
+      );
+    }
+    selectedSession = projectSessionSnapshot(wire.selectedSession, {
+      summary: selectedSummary,
+      projectIdFallback: projects[0]?.id,
+      timestampMs: Date.parse(selectedSummary.updatedAt),
+      models,
+    });
+    if (selectedSession.sessionId !== selectedSessionId) {
+      throw new WireContractError(
+        "hostBootstrap.selectedSession.sessionId",
+        "must match selectedSessionId",
+      );
+    }
   }
   const authorityProfiles = array(
     wire.authorityProfiles,

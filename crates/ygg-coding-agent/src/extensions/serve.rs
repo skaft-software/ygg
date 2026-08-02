@@ -2892,10 +2892,7 @@ impl SlashInvocationOutcome {
     }
 }
 
-fn self_help_prompt(topic: Option<&str>, documentation_only: bool) -> String {
-    if documentation_only {
-        return "Explain where Ygg's canonical documentation lives and how to use it. If this workspace is a Ygg source checkout, inspect its README.md, docs/, examples/, and relevant Rust crates with the available tools before answering. Include practical next steps for understanding or extending Ygg.".to_owned();
-    }
+fn self_help_prompt(topic: Option<&str>) -> String {
     let subject = topic
         .map(|topic| format!("the Ygg command or topic `{topic}`"))
         .unwrap_or_else(|| "Ygg's commands and workflow".to_owned());
@@ -2919,18 +2916,7 @@ async fn invoke_idle_slash_command(
             Some(app),
             Ok(SlashInvocationOutcome::Start(RunPromptInput::New(
                 PromptInput {
-                    text: self_help_prompt(topic.as_deref(), false),
-                    attachments: Vec::new(),
-                    document_ids: Vec::new(),
-                    project_file_ids: Vec::new(),
-                },
-            ))),
-        ),
-        commands::Command::Docs => (
-            Some(app),
-            Ok(SlashInvocationOutcome::Start(RunPromptInput::New(
-                PromptInput {
-                    text: self_help_prompt(None, true),
+                    text: self_help_prompt(topic.as_deref()),
                     attachments: Vec::new(),
                     document_ids: Vec::new(),
                     project_file_ids: Vec::new(),
@@ -2962,28 +2948,6 @@ async fn invoke_idle_slash_command(
                 return (Some(app), Err(ServiceError::InvalidBoundary));
             }
             apply_slash_reconfiguration(app, Reconfig::Model(ModelId(model)), plan, projection)
-        }
-        commands::Command::CycleModel => {
-            let models = plan
-                .available_models
-                .iter()
-                .filter(|summary| summary.available)
-                .collect::<Vec<_>>();
-            let Some(current) = models
-                .iter()
-                .position(|summary| summary.id == plan.launch.model.0)
-            else {
-                return (Some(app), Err(ServiceError::InvalidBoundary));
-            };
-            let Some(next) = models.get((current + 1) % models.len()) else {
-                return (Some(app), Err(ServiceError::InvalidBoundary));
-            };
-            apply_slash_reconfiguration(
-                app,
-                Reconfig::Model(ModelId(next.id.clone())),
-                plan,
-                projection,
-            )
         }
         commands::Command::Thinking(Some(reasoning)) => {
             let level = match config::ThinkingLevel::parse(&reasoning) {
@@ -12810,8 +12774,8 @@ mod tests {
             selected_theme_id: theme_id,
             projects: Vec::new(),
             sessions: vec![seed.summary],
-            selected_session_id: session_id,
-            selected_session: seed.snapshot,
+            selected_session_id: Some(session_id),
+            selected_session: Some(seed.snapshot),
         };
         bootstrap.validate().unwrap();
     }

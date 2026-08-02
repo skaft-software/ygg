@@ -75,6 +75,14 @@ Each client keeps private presentation state such as:
 Commands that affect shared execution carry stable command IDs. Repeating the
 same command returns the original acknowledgement and never executes twice.
 
+## Bootstrap modes
+
+`GET /api/v1/bootstrap` creates and selects a provisional session by default.
+`selectedSessionId` restores an explicit session. `inventoryOnly=true` returns
+catalog state without creating, opening, or selecting a session; its
+`selectedSessionId` and `selectedSession` fields are both `null`. The inventory
+and explicit-selection query modes are mutually exclusive.
+
 ## Item lifecycle
 
 The protocol distinguishes provisional streaming state from durable committed

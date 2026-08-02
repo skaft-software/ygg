@@ -13,8 +13,9 @@ LAN contracts are stable.
 
 - Opening the graphical app at its root creates and selects a fresh provisional
   task in the focused work surface.
-- Opening an explicit task route restores that task. Opening `/overview`
-  restores the command center without replacing the selected task.
+- Opening an explicit task route restores that task. Opening `/overview` loads
+  the command center from session inventory without creating or opening a task;
+  an already selected task remains selected in client state.
 - Existing, pinned, and concurrently running tasks remain available in the
   sidebar.
 - Each active task has one authoritative session owner and runs independently.

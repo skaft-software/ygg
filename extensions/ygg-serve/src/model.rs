@@ -1405,10 +1405,10 @@ pub struct HostBootstrap {
     pub projects: Vec<ProjectSummary>,
     /// Bounded session summaries.
     pub sessions: Vec<SessionSummary>,
-    /// Freshly selected session.
-    pub selected_session_id: SessionId,
-    /// Complete selected-session snapshot.
-    pub selected_session: SessionSnapshot,
+    /// Freshly selected session, absent for inventory-only bootstrap.
+    pub selected_session_id: Option<SessionId>,
+    /// Complete selected-session snapshot, absent for inventory-only bootstrap.
+    pub selected_session: Option<SessionSnapshot>,
 }
 
 fn validate_media_type(field: &'static str, value: &str) -> Result<(), ValidationError> {
@@ -2564,35 +2564,47 @@ impl ProtocolValidation for HostBootstrap {
                 ));
             }
         }
-        if self.selected_session_id != self.selected_session.session_id {
-            return Err(ValidationError::new(
-                "bootstrap.selected_session_id",
-                "must match the selected session snapshot",
-            ));
-        }
-        if !session_ids.contains(&self.selected_session_id) {
-            return Err(ValidationError::new(
-                "bootstrap.sessions",
-                "must include the selected session summary",
-            ));
-        }
-        self.selected_session.validate()?;
-        if authority_rank(self.selected_session.authority) > authority_rank(self.authority_ceiling)
-        {
-            return Err(ValidationError::new(
-                "bootstrap.selected_session.authority",
-                "exceeds the host authority ceiling",
-            ));
-        }
-        let selected_model = (
-            self.selected_session.model.provider.clone(),
-            self.selected_session.model.model.clone(),
-        );
-        if !model_keys.contains(&selected_model) {
-            return Err(ValidationError::new(
-                "bootstrap.selected_session.model",
-                "must identify an advertised provider/model",
-            ));
+        match (&self.selected_session_id, &self.selected_session) {
+            (None, None) => {}
+            (Some(selected_session_id), Some(selected_session)) => {
+                if selected_session_id != &selected_session.session_id {
+                    return Err(ValidationError::new(
+                        "bootstrap.selected_session_id",
+                        "must match the selected session snapshot",
+                    ));
+                }
+                if !session_ids.contains(selected_session_id) {
+                    return Err(ValidationError::new(
+                        "bootstrap.sessions",
+                        "must include the selected session summary",
+                    ));
+                }
+                selected_session.validate()?;
+                if authority_rank(selected_session.authority)
+                    > authority_rank(self.authority_ceiling)
+                {
+                    return Err(ValidationError::new(
+                        "bootstrap.selected_session.authority",
+                        "exceeds the host authority ceiling",
+                    ));
+                }
+                let selected_model = (
+                    selected_session.model.provider.clone(),
+                    selected_session.model.model.clone(),
+                );
+                if !model_keys.contains(&selected_model) {
+                    return Err(ValidationError::new(
+                        "bootstrap.selected_session.model",
+                        "must identify an advertised provider/model",
+                    ));
+                }
+            }
+            _ => {
+                return Err(ValidationError::new(
+                    "bootstrap.selected_session",
+                    "must be present exactly when selected_session_id is present",
+                ));
+            }
         }
         validate_serialized_size("bootstrap", self, MAX_BOOTSTRAP_BYTES)
     }

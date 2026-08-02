@@ -41,6 +41,11 @@ class TestTransport implements YggTransport {
   readonly commands: ClientCommand[] = [];
   readonly listeners = new Set<(event: HostEvent) => void>();
   connectCount = 0;
+  readonly connectCalls: Array<{
+    selectedSessionId: string | undefined;
+    inventoryOnly: boolean;
+  }> = [];
+  readonly sessionLoads: string[] = [];
   projectCatalog: ProjectCatalog = {
     host: {
       id: fixtureBootstrap.host.id,
@@ -135,15 +140,23 @@ class TestTransport implements YggTransport {
     return { days: [], currentStreak: 0, longestStreak: 0 };
   }
 
-  async connect(): Promise<HostBootstrap> {
+  async connect(
+    selectedSessionId?: string,
+    inventoryOnly = false,
+  ): Promise<HostBootstrap> {
     this.connectCount += 1;
-    return clone(fixtureBootstrap);
+    this.connectCalls.push({ selectedSessionId, inventoryOnly });
+    const bootstrap = clone(fixtureBootstrap);
+    if (selectedSessionId) bootstrap.selectedSessionId = selectedSessionId;
+    if (inventoryOnly) bootstrap.selectedSessionId = null;
+    return bootstrap;
   }
 
   getSession(
     sessionId: string,
     signal?: AbortSignal,
   ): Promise<SessionSnapshot> {
+    this.sessionLoads.push(sessionId);
     return this.sessionLoader(sessionId, signal);
   }
 
@@ -298,6 +311,7 @@ async function nextFrame() {
 }
 
 beforeEach(() => {
+  window.history.replaceState(null, "", "/");
   vi.stubGlobal(
     "requestAnimationFrame",
     (callback: FrameRequestCallback) =>
@@ -313,7 +327,7 @@ afterEach(() => {
 });
 
 describe("YggStore", () => {
-  it("preserves a direct command-center route during initialization", async () => {
+  it("initializes the command center without selecting a task", async () => {
     const transport = new TestTransport();
     const store = new YggStore(transport);
     const previousRoute = `${window.location.pathname}${window.location.search}`;
@@ -324,7 +338,17 @@ describe("YggStore", () => {
 
       expect(window.location.pathname).toBe("/overview");
       expect(window.location.search).toBe("?transport=fixture");
-      expect(store.getSnapshot().selectedSessionId).toBe("session-fresh");
+      expect(transport.connectCalls).toEqual([
+        { selectedSessionId: undefined, inventoryOnly: true },
+      ]);
+      expect(transport.sessionLoads).toEqual([]);
+      expect(store.getSnapshot()).toMatchObject({
+        ready: true,
+        connecting: false,
+        selectedSessionId: null,
+        sessions: {},
+      });
+      expect(store.getSnapshot().bootstrap?.sessions.length).toBeGreaterThan(0);
     } finally {
       store.dispose();
       window.history.replaceState(null, "", previousRoute);
@@ -500,6 +524,39 @@ describe("YggStore", () => {
     expect(delayedSignal?.aborted).toBe(true);
     expect(store.getSnapshot().selectedSessionId).toBe("session-done");
     store.dispose();
+  });
+
+  it("does not let a pending selection replace command-center navigation", async () => {
+    const transport = new TestTransport();
+    const delayed = deferred<SessionSnapshot>();
+    let delayedSignal: AbortSignal | undefined;
+    transport.sessionLoader = async (sessionId, signal) => {
+      if (sessionId === "session-live") {
+        delayedSignal = signal;
+        return delayed.promise;
+      }
+      return clone(fixtureSessions[sessionId]);
+    };
+    const store = new YggStore(transport);
+    const previousRoute = `${window.location.pathname}${window.location.search}`;
+
+    try {
+      await store.initialize();
+      const pendingSelection = store.selectSession("session-live");
+      await vi.waitFor(() => expect(delayedSignal).toBeDefined());
+
+      store.cancelSessionSelection();
+      window.history.pushState(null, "", "/overview");
+      delayed.resolve(clone(fixtureSessions["session-live"]));
+      await pendingSelection;
+
+      expect(delayedSignal?.aborted).toBe(true);
+      expect(window.location.pathname).toBe("/overview");
+      expect(store.getSnapshot().selectedSessionId).toBe("session-fresh");
+    } finally {
+      store.dispose();
+      window.history.replaceState(null, "", previousRoute);
+    }
   });
 
   it("does not let an older initialization overwrite a newer one", async () => {

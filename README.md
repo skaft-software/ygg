@@ -460,12 +460,10 @@ Type `/` in the composer to open live command discovery.
 | `/tree` | Show the complete conversation branch tree. |
 | `/checkout <id>` | Move the durable head to another entry and branch from it. |
 | `/model [id]` | Open the model picker or select a model. |
-| `/cycle-model` | Select the next available model. |
 | `/thinking [level]` | Inspect or change model-supported reasoning. |
 | `/compact` | Compact at the next safe boundary. |
 | `/theme [name\|list\|reload]` | Select, inspect, or reload themes. |
 | `/verbose [on\|off]` | Expand or collapse retained reasoning and bounded tool-output projections. |
-| `/tool [call-id]` | Report that raw tool protocol evidence remains internal. |
 | `/reload` | Reload instructions, themes, prompts, skills, and enabled extensions. |
 | `/login [provider]` | Sign in to a subscription provider. |
 | `/logout [provider]` | Remove its stored credential. |
@@ -473,7 +471,6 @@ Type `/` in the composer to open live command discovery.
 | `/cost` | Show turn and session usage/cost accounting. |
 | `/cache` | Show prompt-cache diagnostics reported by the provider. |
 | `/name [name]` | Show or rename the current session. |
-| `/sessions` | List sessions for the current workspace. |
 | `/export [path]` | Export the current session with redaction. |
 | `/prompt [name] [arguments]` | List or expand named prompt templates. |
 | `/skills ...` | List, search, inspect, load, unload, or reload skills. |
@@ -594,8 +591,8 @@ When Ygg runs from its source checkout, its system prompt points the model to
 absolute paths for `README.md`, `docs/`, `examples/`, `crates/`, and the
 `ygg-coding-agent` crate and tells it to consult them when answering Ygg
 questions or making Ygg changes. In the interactive frontend, `/help [command]`
-shows local command help and `/docs` shows those documentation locations. From
-any other workspace, the commands point to the published documentation instead.
+shows local command help together with those documentation locations. From any
+other workspace, `/help` points to the published documentation instead.
 
 ## Architecture
 

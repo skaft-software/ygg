@@ -55,7 +55,8 @@ graphical `ygg`:
   an exception-driven command center for supervision and a focused transcript
   for execution.
 - Opening the root creates a fresh provisional task. `/overview` opens the
-  command center, and an explicit session route restores a focused task.
+  command center from session inventory without creating or opening a task, and
+  an explicit session route restores a focused task.
 - Previous, pinned, and running tasks appear in the sidebar.
 - Different tasks are independent agent sessions and may run concurrently.
 - There is no Chat, Code, Work, or Cowork mode selector.
@@ -251,7 +252,8 @@ See [Configuration diagnostics](../../design/config-diagnostics.md).
 - No CORS or remote assets.
 - Bounded HTTP, WebSocket, replay, resource, and attachment payloads.
 - Fresh-session root behavior.
-- Explicit session restoration and a durable `/overview` command-center route.
+- Explicit session restoration and a durable, inventory-only `/overview`
+  command-center route.
 - Exception-prioritized active-task aggregation and task/project search using
   existing session summaries.
 - Concurrent independent graphical sessions.

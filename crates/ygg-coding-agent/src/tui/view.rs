@@ -14,10 +14,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-#[cfg(test)]
-use sexy_tui_rs::strip_terminal_sequences;
 use sexy_tui_rs::{
-    parse_markdown, visible_width, wrap_text_with_ansi, RichRenderer, CURSOR_MARKER, TUI,
+    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, RichRenderer,
+    CURSOR_MARKER, TUI,
 };
 use ygg_agent::{AgentEvent, EntryValue, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ModalitySet, Model, ModelId, ToolCallId, Usage};
@@ -1031,9 +1030,16 @@ fn prompt_cursor(_theme: &YggTheme) -> &'static str {
 pub(crate) fn fit_line(line: &str, width: u16) -> String {
     let width = usize::from(width);
     if visible_width(line) <= width {
-        line.to_owned()
+        return line.to_owned();
+    }
+    let truncated = sexy_tui_rs::truncate_to_width(line, width, Some(""));
+    if line.contains('\x1b') {
+        truncated
     } else {
-        sexy_tui_rs::truncate_to_width(line, width, Some(""))
+        // The generic ANSI-aware truncator closes style state even when its
+        // input was plain. Do not introduce an orphan reset into no-color
+        // transcript output.
+        strip_terminal_sequences(&truncated)
     }
 }
 

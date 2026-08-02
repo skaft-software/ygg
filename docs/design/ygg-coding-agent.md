@@ -154,22 +154,18 @@ Commands run immediately when safe or queue to the next idle boundary when they
 need Agent/session ownership.
 
 - `/model [id]` — pick or select a model.
-- `/cycle-model` — move through available models deterministically.
 - `/thinking [level]` — select a capability-gated reasoning level.
 - `/theme [name]` — change the current theme.
-- `/tool [call-id]` — expand/collapse one tool panel; no ID means latest.
 - `/verbose [on|off]` — expand/collapse every tool panel.
 - `/compact` — force a compaction attempt.
 - `/reload` — reload AGENTS instructions, themes, prompts, and skills.
 - `/new`, `/resume [id]` — switch persistent sessions.
 - `/tree`, `/checkout <entry-id>` — inspect durable entries and fork from one.
-- `/name [name]`, `/sessions`, `/export [path]` — name, find, and safely export
-  the current session.
+- `/name [name]`, `/export [path]` — name and safely export the current session.
 - `/prompt [name] [arguments]` — inspect or expand prompt templates.
 - `/skills search|load|reload|off ...` — inspect and explicitly activate skills.
 - `/extensions [reload]` — inspect or reload trusted executable extensions.
 - `/help [command]` — show local command help and Ygg self-documentation.
-- `/docs` — show the Ygg documentation locations, when available.
 - `/status`, `/quit` — product status and lifecycle controls.
 
 Checkout appends a durable head record. The subsequent consuming rebuild

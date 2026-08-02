@@ -11,9 +11,9 @@ use crate::{
     ActorConfig, ActorError, ActorView, AuthorityProfile, CatalogCursor, CommandAdmission,
     CommandId, CreateSessionRequest, DeviceId, ErrorCode, HostBootstrap, HostCommand,
     HostCommandAck, HostCommandEnvelope, HostService, HostStreamEvent, ModelSelection,
-    ProjectCatalog, ProjectId, ProtocolValidation, ReplayResponse, SanitizedError, ServiceError,
-    SessionActor, SessionActorHandle, SessionCommandEnvelope, SessionCursor, SessionDriver,
-    SessionId, PROTOCOL_VERSION,
+    ProjectCatalog, ProjectId, ProjectSummary, ProtocolValidation, ReplayResponse, SanitizedError,
+    ServiceError, SessionActor, SessionActorHandle, SessionCommandEnvelope, SessionCursor,
+    SessionDriver, SessionId, SessionSnapshot, SessionSummary, PROTOCOL_VERSION,
 };
 
 const HOST_COMMAND_CACHE_CAPACITY: usize = 2_048;
@@ -260,6 +260,35 @@ impl<H: HostService> SessionSupervisor<H> {
         .map_err(|_| SupervisorError::Service(ServiceError::Unavailable))?
     }
 
+    /// Builds a catalog bootstrap without creating, opening, or selecting a session.
+    pub async fn inventory_bootstrap(&self) -> Result<HostBootstrap, SupervisorError> {
+        let projects = self.project_catalog().await?.projects;
+        let mut summaries = self
+            .host
+            .list_sessions()
+            .await?
+            .into_iter()
+            .map(|summary| (summary.id.clone(), summary))
+            .collect::<BTreeMap<_, _>>();
+        let active = {
+            let state = self.state.lock().await;
+            state
+                .actors
+                .values()
+                .filter(|handle| !handle.is_closed())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for handle in active {
+            let view = handle.view();
+            if !handle.is_closed() {
+                summaries.insert(view.summary.id.clone(), view.summary);
+            }
+        }
+        let sessions = bounded_bootstrap_sessions(summaries, None);
+        self.build_bootstrap(projects, sessions, None, None)
+    }
+
     /// Builds a fresh catalog/bootstrap around an already hosted session.
     pub async fn bootstrap(
         &self,
@@ -307,29 +336,7 @@ impl<H: HostService> SessionSupervisor<H> {
         for view in active_views {
             summaries.insert(view.summary.id.clone(), view.summary);
         }
-        let mut sessions = summaries.into_values().collect::<Vec<_>>();
-        sessions.sort_by(|left, right| {
-            left.archived
-                .cmp(&right.archived)
-                .then_with(|| right.pinned.cmp(&left.pinned))
-                .then_with(|| {
-                    session_activity_rank(right.live_state)
-                        .cmp(&session_activity_rank(left.live_state))
-                })
-                .then_with(|| right.modified_at_ms.cmp(&left.modified_at_ms))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        if sessions.len() > MAX_BOOTSTRAP_SESSION_SUMMARIES {
-            if let Some(selected_index) = sessions
-                .iter()
-                .position(|summary| &summary.id == selected_session_id)
-            {
-                if selected_index >= MAX_BOOTSTRAP_SESSION_SUMMARIES {
-                    sessions.swap(selected_index, MAX_BOOTSTRAP_SESSION_SUMMARIES - 1);
-                }
-            }
-            sessions.truncate(MAX_BOOTSTRAP_SESSION_SUMMARIES);
-        }
+        let sessions = bounded_bootstrap_sessions(summaries, Some(selected_session_id));
 
         // This is the bootstrap's ownership linearization point. A close
         // observed here makes the caller retry through the quarantine-aware
@@ -337,6 +344,21 @@ impl<H: HostService> SessionSupervisor<H> {
         if selected.is_closed() {
             return Err(ServiceError::Unavailable.into());
         }
+        self.build_bootstrap(
+            projects,
+            sessions,
+            Some(selected_session_id.clone()),
+            Some(selected_view.snapshot),
+        )
+    }
+
+    fn build_bootstrap(
+        &self,
+        projects: Vec<ProjectSummary>,
+        sessions: Vec<SessionSummary>,
+        selected_session_id: Option<SessionId>,
+        selected_session: Option<SessionSnapshot>,
+    ) -> Result<HostBootstrap, SupervisorError> {
         let bootstrap = HostBootstrap {
             protocol: PROTOCOL_VERSION,
             host: self.host.descriptor(),
@@ -349,8 +371,8 @@ impl<H: HostService> SessionSupervisor<H> {
             selected_theme_id: self.host.selected_theme_id(),
             projects,
             sessions,
-            selected_session_id: selected_session_id.clone(),
-            selected_session: selected_view.snapshot,
+            selected_session_id,
+            selected_session,
         };
         bootstrap
             .validate()
@@ -1426,6 +1448,37 @@ fn authority_rank(authority: AuthorityProfile) -> u8 {
     }
 }
 
+fn bounded_bootstrap_sessions(
+    summaries: BTreeMap<SessionId, SessionSummary>,
+    selected_session_id: Option<&SessionId>,
+) -> Vec<SessionSummary> {
+    let mut sessions = summaries.into_values().collect::<Vec<_>>();
+    sessions.sort_by(|left, right| {
+        left.archived
+            .cmp(&right.archived)
+            .then_with(|| right.pinned.cmp(&left.pinned))
+            .then_with(|| {
+                session_activity_rank(right.live_state).cmp(&session_activity_rank(left.live_state))
+            })
+            .then_with(|| right.modified_at_ms.cmp(&left.modified_at_ms))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if sessions.len() > MAX_BOOTSTRAP_SESSION_SUMMARIES {
+        if let Some(selected_session_id) = selected_session_id {
+            if let Some(selected_index) = sessions
+                .iter()
+                .position(|summary| &summary.id == selected_session_id)
+            {
+                if selected_index >= MAX_BOOTSTRAP_SESSION_SUMMARIES {
+                    sessions.swap(selected_index, MAX_BOOTSTRAP_SESSION_SUMMARIES - 1);
+                }
+            }
+        }
+        sessions.truncate(MAX_BOOTSTRAP_SESSION_SUMMARIES);
+    }
+    sessions
+}
+
 fn session_activity_rank(state: crate::SessionLiveState) -> u8 {
     use crate::SessionLiveState;
 
@@ -2241,7 +2294,7 @@ mod tests {
         let supervisor = SessionSupervisor::new(host.clone(), SupervisorConfig::default());
         let first = supervisor.launch(None).await.unwrap();
         let second = supervisor.create_fresh_session(None).await.unwrap();
-        let first_id = first.selected_session_id;
+        let first_id = first.selected_session_id.unwrap();
         let second_id = second.session_id().clone();
 
         supervisor
@@ -2277,7 +2330,7 @@ mod tests {
         let host = Arc::new(MockHost::new());
         let supervisor = SessionSupervisor::new(host.clone(), SupervisorConfig::default());
         let bootstrap = supervisor.launch(None).await.unwrap();
-        let session_id = bootstrap.selected_session_id;
+        let session_id = bootstrap.selected_session_id.unwrap();
         let envelope = command(session_id.clone(), "command-once", "do it");
 
         let first = supervisor.command(envelope.clone(), 20).await.unwrap();
@@ -2515,8 +2568,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(host.opens.load(Ordering::Relaxed), 1);
-        assert_eq!(bootstrap.selected_session.actor_generation, 2);
-        assert_eq!(bootstrap.selected_session.cursor, SessionCursor::zero(2));
+        assert_eq!(
+            bootstrap
+                .selected_session
+                .as_ref()
+                .unwrap()
+                .actor_generation,
+            2
+        );
+        assert_eq!(
+            bootstrap.selected_session.as_ref().unwrap().cursor,
+            SessionCursor::zero(2)
+        );
         assert_eq!(
             bootstrap
                 .sessions
@@ -2759,14 +2822,15 @@ mod tests {
         let supervisor = SessionSupervisor::new(host, SupervisorConfig::default());
         let bootstrap = supervisor.launch(None).await.unwrap();
         assert_eq!(
-            bootstrap.selected_session.authority,
+            bootstrap.selected_session.as_ref().unwrap().authority,
             AuthorityProfile::FullAccess
         );
         assert!(!bootstrap.capabilities.lan_clients);
+        let selected_session_id = bootstrap.selected_session_id.as_ref().unwrap();
         let summary = bootstrap
             .sessions
             .iter()
-            .find(|summary| summary.id == bootstrap.selected_session_id)
+            .find(|summary| &summary.id == selected_session_id)
             .unwrap();
         assert!(summary.provisional);
     }

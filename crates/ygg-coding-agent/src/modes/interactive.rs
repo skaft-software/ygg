@@ -121,7 +121,6 @@ pub enum PendingIdleAction {
     Login(Option<String>),
     Logout(Option<String>),
     ChangeModel(ModelId),
-    CycleModel,
     ChangeThinking(ReasoningConfig),
     ChangeThinkingLevel(ThinkingLevel),
     CycleThinking,
@@ -360,7 +359,6 @@ fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> a
         Command::Logout(provider) => PendingIdleAction::Logout(provider),
         Command::Model(Some(id)) => PendingIdleAction::ChangeModel(ModelId(id)),
         Command::Model(None) => PendingIdleAction::PickModel,
-        Command::CycleModel => PendingIdleAction::CycleModel,
         Command::Thinking(Some(level)) => match ThinkingLevel::parse(&level)? {
             ThinkingLevel::Off => PendingIdleAction::ChangeThinking(ReasoningConfig::Off),
             level => PendingIdleAction::ChangeThinkingLevel(level),
@@ -775,9 +773,6 @@ fn handle_active_command(
         }
         Command::Update => shell.notice("update checks are available at the next idle boundary"),
         Command::Theme(_) => shell.notice("theme commands are available at the next idle boundary"),
-        Command::Tool(_id) => {
-            shell.notice("tool details follow transcript verbosity; use Ctrl+O or /verbose")
-        }
         Command::Verbose(value) => {
             let enabled = value.unwrap_or(!shell.verbose_tools());
             shell.set_verbose_tools(enabled);
@@ -789,10 +784,8 @@ fn handle_active_command(
         Command::Extensions(_) => {
             shell.notice("extension inspection and reload are available at the next idle boundary")
         }
-        Command::Help(_) | Command::Docs => {
-            shell.notice("help and documentation are available at the next idle boundary")
-        }
-        Command::Name(_) | Command::Sessions | Command::Export(_) => {
+        Command::Help(_) => shell.notice("help is available at the next idle boundary"),
+        Command::Name(_) | Command::Export(_) => {
             shell.notice("session management commands are available at the next idle boundary")
         }
         Command::Quit => *quit_requested = true,
@@ -1546,10 +1539,6 @@ async fn reload_resources(
     Ok(app)
 }
 
-fn next_model_id(app: &App) -> anyhow::Result<ModelId> {
-    next_model_id_in_catalog(&app.catalog, &app.model.spec.id)
-}
-
 fn next_thinking_level(app: &App) -> anyhow::Result<ThinkingLevel> {
     let levels = supported_levels(&app.model);
     let current = level_from_reasoning(&app.reasoning, &app.model)?;
@@ -1588,25 +1577,6 @@ async fn thinking_configuration_picker(
         return Ok(None);
     };
     Ok(Some((mode, level)))
-}
-
-fn next_model_id_in_catalog(
-    catalog: &ygg_ai::ModelCatalog,
-    current_model: &ModelId,
-) -> anyhow::Result<ModelId> {
-    let mut models = catalog
-        .models()
-        .map(|model| model.id.clone())
-        .collect::<Vec<_>>();
-    models.sort_by(|left, right| left.0.cmp(&right.0));
-    let current = models
-        .iter()
-        .position(|model| model == current_model)
-        .ok_or_else(|| anyhow::anyhow!("active model is not present in the catalog"))?;
-    models
-        .get((current + 1) % models.len())
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no models are available"))
 }
 
 fn session_tree_text(session: &Session) -> String {
@@ -1727,11 +1697,6 @@ async fn apply_pending_actions(
             PendingIdleAction::ChangeModel(id) => {
                 app = transition(app, shell, input, Reconfig::Model(id)).await?;
                 shell.notice("queued model change applied");
-            }
-            PendingIdleAction::CycleModel => {
-                let id = next_model_id(&app)?;
-                app = transition(app, shell, input, Reconfig::Model(id)).await?;
-                shell.notice("queued model cycle applied");
             }
             PendingIdleAction::ChangeThinking(reasoning) => {
                 if let Err(e) = crate::cli::persist_reasoning(&reasoning_label(&reasoning)) {
@@ -2068,11 +2033,6 @@ async fn run_idle_command(
         Command::Help(topic) => {
             shell.show_overlay_text(commands::help_text(&app.config.workspace, topic.as_deref()));
         }
-        Command::Docs => {
-            shell.show_overlay_text(crate::resources::self_documentation_help(
-                &app.config.workspace,
-            ));
-        }
         Command::Status => {
             shell.show_status_text_with_telemetry(commands::status_text(&app, None));
         }
@@ -2122,30 +2082,6 @@ async fn run_idle_command(
                     ));
                 }
             }
-        }
-        Command::Sessions => {
-            let store = app.sessions.clone();
-            let sessions =
-                run_blocking_lifecycle(shell, input, "discovering sessions…", move || {
-                    Ok(store.list())
-                })
-                .await?;
-            let text = if sessions.is_empty() {
-                "No sessions in this workspace.".to_owned()
-            } else {
-                let mut lines = vec!["Sessions".to_owned()];
-                lines.extend(sessions.into_iter().map(|session| {
-                    let name = session.name.as_deref().unwrap_or(&session.title);
-                    let tags = if session.tags.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" · {}", session.tags.join(", "))
-                    };
-                    format!("- {} · {name}{tags}", session.id)
-                }));
-                lines.join("\n")
-            };
-            shell.show_overlay_text(text);
         }
         Command::Export(output) => {
             let id = app
@@ -2246,14 +2182,6 @@ async fn run_idle_command(
                 commands::model_selection_text(&app.model)
             ));
         }
-        Command::CycleModel => {
-            let id = next_model_id(&app)?;
-            app = transition(app, shell, input, Reconfig::Model(id)).await?;
-            shell.notice(format!(
-                "model changed · {}",
-                commands::model_selection_text(&app.model)
-            ));
-        }
         Command::Thinking(Some(level)) => {
             let level = ThinkingLevel::parse(&level)?;
             let reasoning = thinking_to_reasoning(level, &app.model)?;
@@ -2315,9 +2243,6 @@ async fn run_idle_command(
                 shell.error(error.to_string());
             }
         },
-        Command::Tool(_id) => {
-            shell.notice("tool details follow transcript verbosity; use Ctrl+O or /verbose")
-        }
         Command::Verbose(value) => {
             let enabled = value.unwrap_or(!shell.verbose_tools());
             shell.set_verbose_tools(enabled);
@@ -3274,23 +3199,6 @@ mod tests {
             update_rx.try_recv().is_ok(),
             "pipe reads must wake live rendering"
         );
-    }
-
-    #[test]
-    fn model_cycle_is_sorted_and_wraps() {
-        let catalog = ygg_ai::ModelCatalog::builtin().unwrap();
-        let mut ids = catalog
-            .models()
-            .map(|model| model.id.clone())
-            .collect::<Vec<_>>();
-        ids.sort_by(|left, right| left.0.cmp(&right.0));
-        assert!(ids.len() > 1);
-        for (index, current) in ids.iter().enumerate() {
-            assert_eq!(
-                next_model_id_in_catalog(&catalog, current).unwrap(),
-                ids[(index + 1) % ids.len()]
-            );
-        }
     }
 
     #[test]

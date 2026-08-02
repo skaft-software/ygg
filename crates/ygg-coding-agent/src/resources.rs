@@ -102,7 +102,7 @@ fn self_documentation_prompt(workspace: &Path) -> Option<String> {
     ))
 }
 
-/// Render the self-documentation locations used by `/docs` and `/help`.
+/// Render the self-documentation locations appended to `/help`.
 pub fn self_documentation_help(workspace: &Path) -> String {
     let Some([readme, docs, examples, crates, coding_agent]) = ygg_documentation_paths(workspace)
     else {

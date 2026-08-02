@@ -781,7 +781,9 @@ fn slash_command_menu_lists_commands_and_tab_completes_a_unique_prefix() {
     assert!(!popup.contains("Session"));
     assert!(!popup.contains("opens picker"));
     assert!(popup.contains("/help"));
-    assert!(popup.contains("/docs"));
+    for removed in ["/tool", "/docs", "/sessions", "/cycle-model"] {
+        assert!(!popup.contains(removed), "{removed} remained in {popup}");
+    }
     assert!(popup.contains("› /new"));
 
     shell.slash_menu(SlashMenuAction::Last);

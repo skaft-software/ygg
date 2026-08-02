@@ -67,7 +67,10 @@ export interface YggTransport {
   getUsageStats(period: UsagePeriod): Promise<UsageStats>;
   getUsageLifetime(): Promise<LifetimeUsage>;
   getUsageActivity(): Promise<UsageActivity>;
-  connect(selectedSessionId?: string): Promise<HostBootstrap>;
+  connect(
+    selectedSessionId?: string,
+    inventoryOnly?: boolean,
+  ): Promise<HostBootstrap>;
   getSession(sessionId: string, signal?: AbortSignal): Promise<SessionSnapshot>;
   getCommandDiscovery(sessionId: string): Promise<CommandDiscovery>;
   getGoal(sessionId: string, signal?: AbortSignal): Promise<GoalState | null>;
@@ -631,14 +634,23 @@ export class FixtureTransport implements YggTransport {
     };
   }
 
-  async connect(selectedSessionId?: string): Promise<HostBootstrap> {
+  async connect(
+    selectedSessionId?: string,
+    inventoryOnly = false,
+  ): Promise<HostBootstrap> {
+    if (selectedSessionId && inventoryOnly) {
+      throw new Error("Inventory bootstrap cannot select a fixture session");
+    }
+    const bootstrap = clone(this.bootstrap);
     if (selectedSessionId) {
       if (!this.sessions[selectedSessionId]) {
         throw new Error(`Unknown fixture session ${selectedSessionId}`);
       }
-      this.bootstrap.selectedSessionId = selectedSessionId;
+      bootstrap.selectedSessionId = selectedSessionId;
+    } else if (inventoryOnly) {
+      bootstrap.selectedSessionId = null;
     }
-    return clone(this.bootstrap);
+    return bootstrap;
   }
 
   async getSession(
@@ -2119,7 +2131,13 @@ export class HttpTransport implements YggTransport {
     return projectUsageActivity(await response.json());
   }
 
-  async connect(selectedSessionId?: string): Promise<HostBootstrap> {
+  async connect(
+    selectedSessionId?: string,
+    inventoryOnly = false,
+  ): Promise<HostBootstrap> {
+    if (selectedSessionId && inventoryOnly) {
+      throw new Error("Inventory bootstrap cannot select a session");
+    }
     this.closedByClient = false;
     const generation = ++this.connectGeneration;
     const request: RequestInit = {
@@ -2131,7 +2149,9 @@ export class HttpTransport implements YggTransport {
           `/api/v1/bootstrap?selectedSessionId=${encodeURIComponent(selectedSessionId)}`,
           request,
         )
-      : await fetch("/api/v1/bootstrap", request);
+      : inventoryOnly
+        ? await fetch("/api/v1/bootstrap?inventoryOnly=true", request)
+        : await fetch("/api/v1/bootstrap", request);
     if (!response.ok) {
       throw new Error(`Bootstrap failed with ${response.status}`);
     }
@@ -2149,7 +2169,9 @@ export class HttpTransport implements YggTransport {
       bootstrap.sessions.map((summary) => [summary.id, summary]),
     );
     this.selectedSessionCache = selectedSession;
-    this.rememberSnapshot(selectedSession);
+    if (selectedSession) {
+      this.rememberSnapshot(selectedSession);
+    }
     this.openSocket();
     return bootstrap;
   }
@@ -2838,14 +2860,16 @@ export class HttpTransport implements YggTransport {
   ): Promise<void> {
     const anchor =
       this.catalogAnchorSessionId ?? this.cursorBySession.keys().next().value;
-    if (!anchor) return;
-    const response = await fetch(
-      `/api/v1/bootstrap?selectedSessionId=${encodeURIComponent(anchor)}`,
-      {
-        headers: { Accept: "application/json" },
-        credentials: "same-origin",
-      },
-    );
+    const request: RequestInit = {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+    };
+    const response = anchor
+      ? await fetch(
+          `/api/v1/bootstrap?selectedSessionId=${encodeURIComponent(anchor)}`,
+          request,
+        )
+      : await fetch("/api/v1/bootstrap?inventoryOnly=true", request);
     if (!this.isCurrentSocket(socket, generation)) return;
     if (!response.ok) {
       throw new Error(`Catalog refresh failed with ${response.status}`);

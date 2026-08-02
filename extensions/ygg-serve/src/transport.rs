@@ -98,9 +98,9 @@ pub struct LoopbackServer {
 impl LoopbackServer {
     /// Starts a loopback server without allocating a session.
     ///
-    /// Each root-client bootstrap creates its own provisional session. A
-    /// bootstrap carrying an explicit session id restores that session
-    /// instead.
+    /// Each default root-client bootstrap creates its own provisional session.
+    /// A bootstrap carrying an explicit session id restores that session, while
+    /// an inventory-only bootstrap creates and selects no session.
     pub async fn start<H: HostService>(
         supervisor: Arc<SessionSupervisor<H>>,
         config: LoopbackConfig,
@@ -332,6 +332,8 @@ struct ErrorResponse {
 struct BootstrapQuery {
     #[serde(default)]
     selected_session_id: Option<String>,
+    #[serde(default)]
+    inventory_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -1319,22 +1321,30 @@ async fn bootstrap<H: HostService>(
     if !state.rate_limiter.admit() {
         return rate_limited();
     }
-    let selected = match query {
-        Ok(Query(query)) => match query.selected_session_id {
-            Some(raw) => match SessionId::new(raw) {
-                Ok(id) => Some(id),
-                Err(_) => return invalid_request(),
-            },
-            None => None,
-        },
+    let Query(query) = match query {
+        Ok(query) => query,
         Err(_) => return invalid_request(),
     };
-    let result = match selected {
-        Some(session_id) => match state.supervisor.open_session(&session_id).await {
-            Ok(_) => state.supervisor.bootstrap(&session_id).await,
-            Err(error) => Err(error),
+    if query.inventory_only && query.selected_session_id.is_some() {
+        return invalid_request();
+    }
+    let selected = match query.selected_session_id {
+        Some(raw) => match SessionId::new(raw) {
+            Ok(id) => Some(id),
+            Err(_) => return invalid_request(),
         },
-        None => state.supervisor.launch(None).await,
+        None => None,
+    };
+    let result = if query.inventory_only {
+        state.supervisor.inventory_bootstrap().await
+    } else {
+        match selected {
+            Some(session_id) => match state.supervisor.open_session(&session_id).await {
+                Ok(_) => state.supervisor.bootstrap(&session_id).await,
+                Err(error) => Err(error),
+            },
+            None => state.supervisor.launch(None).await,
+        }
     };
     match result {
         Ok(bootstrap) => Json(bootstrap).into_response(),
@@ -3441,6 +3451,39 @@ mod tests {
         );
         assert_eq!(response_json(&project_catalog)["importSupported"], false);
         assert_eq!(host.creates.load(Ordering::Relaxed), 0);
+
+        let inventory = request(
+            address,
+            authenticated_get_request(address, "/api/v1/bootstrap?inventoryOnly=true", cookie),
+        )
+        .await;
+        assert!(inventory.starts_with("HTTP/1.1 200"));
+        let inventory = response_json(&inventory);
+        assert!(inventory["selectedSessionId"].is_null());
+        assert!(inventory["selectedSession"].is_null());
+        assert!(inventory["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|summary| summary["id"] == existing.as_str()));
+        assert_eq!(host.creates.load(Ordering::Relaxed), 0);
+        assert_eq!(host.opens.load(Ordering::Relaxed), 0);
+
+        let conflicting_inventory = request(
+            address,
+            authenticated_get_request(
+                address,
+                &format!(
+                    "/api/v1/bootstrap?inventoryOnly=true&selectedSessionId={}",
+                    existing.as_str()
+                ),
+                cookie,
+            ),
+        )
+        .await;
+        assert!(conflicting_inventory.starts_with("HTTP/1.1 400"));
+        assert_eq!(host.creates.load(Ordering::Relaxed), 0);
+        assert_eq!(host.opens.load(Ordering::Relaxed), 0);
 
         let first = request(
             address,

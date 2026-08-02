@@ -32,10 +32,9 @@ head, so abandoned forks remain visible without looking like active context.
 `/checkout <entry-id>` creates a new branch by moving the durable head without
 deleting ancestry.
 
-Interactive shortcuts operate on the current session:
+Interactive commands operate on the current session:
 
 - `/name [name]` shows or changes its readable name.
-- `/sessions` opens the local session list.
 - `/export [path]` writes a redacted portable export.
 
 `delete` is recoverable: it moves the JSONL and metadata into `.trash/` rather

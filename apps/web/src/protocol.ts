@@ -368,7 +368,7 @@ export interface HostBootstrap {
     connection: "local" | "lan";
   };
   catalogRevision: number;
-  selectedSessionId: string;
+  selectedSessionId: string | null;
   projects: ProjectSummary[];
   sessions: SessionSummary[];
   models: ModelSummary[];

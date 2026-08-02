@@ -7,6 +7,9 @@ inspection evidence.
 
 - Production uses real coding-agent sessions and contains no fixture import.
 - Opening the root application creates one fresh provisional session.
+- Opening `/overview` requests session inventory without creating or opening a
+  session, and reconnect refreshes that inventory without requiring a selected
+  session.
 - Reloading or reconnecting an explicit session route reopens that session
   without creating another.
 - Two sessions can execute concurrently without crossing events, approvals,

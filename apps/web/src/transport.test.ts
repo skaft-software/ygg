@@ -609,6 +609,29 @@ describe("HTTP Ygg transport", () => {
     transport.close();
   });
 
+  it("requests an inventory-only bootstrap without selecting a session", async () => {
+    const inventoryBootstrap = {
+      ...hostBootstrapGolden,
+      selectedSessionId: null,
+      selectedSession: null,
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse(inventoryBootstrap));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+
+    await expect(transport.connect(undefined, true)).resolves.toMatchObject({
+      selectedSessionId: null,
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/bootstrap?inventoryOnly=true",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    transport.close();
+  });
+
   it("preserves the exact command envelope across a network retry", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
@@ -1013,6 +1036,48 @@ describe("HTTP Ygg transport", () => {
     );
     expect(fetchMock.mock.calls[2]?.[0]).toBe(
       "/api/v1/bootstrap?selectedSessionId=session-demo",
+    );
+    transport.close();
+  });
+
+  it("refreshes a session-free inventory after missing catalog changes", async () => {
+    const initial = {
+      ...hostBootstrapGolden,
+      selectedSessionId: null,
+      selectedSession: null,
+    };
+    const refreshed = structuredClone(initial);
+    refreshed.catalogCursor = 9;
+    const remoteSummary = structuredClone(hostBootstrapGolden.sessions[0]);
+    remoteSummary.id = "session-created-remotely";
+    remoteSummary.title = "Created while disconnected";
+    refreshed.sessions.unshift(remoteSummary);
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(initial))
+      .mockResolvedValueOnce(jsonResponse(refreshed));
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+    const received: unknown[] = [];
+    transport.subscribe((event) => received.push(event));
+    await transport.connect(undefined, true);
+
+    FakeWebSocket.instances[0]?.emit("open", new Event("open"));
+
+    await vi.waitFor(() =>
+      expect(received).toContainEqual(
+        expect.objectContaining({
+          type: "catalog.summary",
+          catalogRevision: 9,
+          summary: expect.objectContaining({
+            id: "session-created-remotely",
+            title: "Created while disconnected",
+          }),
+        }),
+      ),
+    );
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "/api/v1/bootstrap?inventoryOnly=true",
     );
     transport.close();
   });

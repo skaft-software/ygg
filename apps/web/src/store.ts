@@ -577,13 +577,32 @@ export class YggStore {
             project.available &&
             !project.archived,
         );
+      const inventoryOnly =
+        routedSessionId === null && window.location.pathname === "/overview";
       const bootstrap = await this.transport.connect(
         routedProjectRunnable ? routedSessionId ?? undefined : undefined,
+        inventoryOnly,
       );
       if (!this.isCurrentInitialization(generation)) return;
+      if (bootstrap.selectedSessionId === null) {
+        this.publish({
+          ready: true,
+          connecting: false,
+          connection: this.state.connection,
+          error: null,
+          selectionError: null,
+          bootstrap,
+          projectCatalog,
+          selectedSessionId: null,
+          goal: null,
+          sessions: {},
+        });
+        return;
+      }
+      const selectedSessionId = bootstrap.selectedSessionId;
       const [selected, goal] = await Promise.all([
-        this.transport.getSession(bootstrap.selectedSessionId),
-        this.transport.getGoal(bootstrap.selectedSessionId),
+        this.transport.getSession(selectedSessionId),
+        this.transport.getGoal(selectedSessionId),
       ]);
       if (!this.isCurrentInitialization(generation)) return;
       const selectedSummaryTitle = bootstrap.sessions.find(
@@ -783,6 +802,15 @@ export class YggStore {
 
   resourceContentUrl(sessionId: string, handle: string): string {
     return this.transport.resourceContentUrl(sessionId, handle);
+  }
+
+  cancelSessionSelection(): void {
+    this.selectionGeneration += 1;
+    this.selectionAbort?.abort();
+    this.selectionAbort = null;
+    if (this.state.selectionError) {
+      this.publish({ ...this.state, selectionError: null });
+    }
   }
 
   async selectSession(

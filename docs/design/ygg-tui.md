@@ -107,9 +107,8 @@ collapsible UI tail from bytes already discarded by the tool capture.
 
 Ctrl+O toggles the global disclosure mode for retained reasoning, compaction,
 search output, Bash/local-shell output, and edit/write diffs. `/verbose [on|off]`
-controls the same mode; `/tool [call-id]` remains accepted for command
-compatibility and reports that evidence is internal. Expansion cannot recover
-capture bytes that the tool already discarded.
+controls the same mode. Expansion cannot recover capture bytes that the tool
+already discarded.
 
 Final structured tool results remain provider-visible and persisted when the
 agent protocol requires them to continue a tool turn. This is operational
@@ -127,9 +126,9 @@ durable head and hydrates the selected branch. `/reload` recomposes AGENTS
 instructions, reloads theme files, rescans skills, and rebuilds the Agent only
 at an idle boundary.
 
-Model selection is available through a picker, direct `/model <id>`, and
-`/cycle-model`. Thinking choices include only the active model's advertised
-`min_effort..=max_effort` range.
+Model selection is available through a picker or direct `/model <id>`. Thinking
+choices include only the active model's advertised `min_effort..=max_effort`
+range.
 
 ## Active-run controls
 

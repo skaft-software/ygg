@@ -868,6 +868,7 @@ export default function App() {
         return;
       }
       if (window.location.pathname === "/overview") {
+        store.cancelSessionSelection();
         setSurface("fleet");
         setInspector(null);
         setActivityOpen(false);
@@ -1137,6 +1138,7 @@ export default function App() {
     setInspector(null);
   }, [closeTerminal, terminalAvailable, terminalOpen]);
   const openFleet = useCallback(() => {
+    store.cancelSessionSelection();
     closeTerminal();
     setInspector(null);
     setActivityOpen(false);
@@ -1148,7 +1150,6 @@ export default function App() {
     }
   }, [closeTerminal]);
   const startNewSession = useCallback(() => {
-    setSurface("session");
     setInspector(null);
     setActivityOpen(false);
     if (
@@ -1158,24 +1159,39 @@ export default function App() {
       session.status === "idle" &&
       isUntitledSession(session.title)
     ) {
+      setSurface("session");
       void store.selectSession(session.sessionId);
       return;
     }
-    void store.createSession();
+    if (session) setSurface("session");
+    void store.createSession().then(() => {
+      if (store.selectedSession) setSurface("session");
+    });
   }, [selectedSummary?.lifecycle, session]);
   const selectSession = useCallback(
     (sessionId: string) => {
-      setSurface("session");
+      const revealAfterSelection = !session;
+      if (!revealAfterSelection) setSurface("session");
       setInspector(null);
       if (sessionId !== state.selectedSessionId) {
         setActivityOpen(false);
       }
-      void store.selectSession(sessionId).catch(() => undefined);
+      void store
+        .selectSession(sessionId)
+        .then(() => {
+          if (
+            revealAfterSelection &&
+            store.getSnapshot().selectedSessionId === sessionId
+          ) {
+            setSurface("session");
+          }
+        })
+        .catch(() => undefined);
       if (window.matchMedia("(max-width: 760px)").matches) {
         setSidebarOpen(false);
       }
     },
-    [state.selectedSessionId],
+    [session, state.selectedSessionId],
   );
   const searchTranscripts = useCallback(
     (request: TranscriptSearchRequest): Promise<TranscriptSearchResult> =>
@@ -1552,7 +1568,7 @@ const getCommandDiscovery = useCallback(
       />
     );
   }
-  if (!state.bootstrap || !session) {
+  if (!state.bootstrap) {
     if (state.projectCatalog) {
       return (
         <ProjectsView
@@ -1568,6 +1584,7 @@ const getCommandDiscovery = useCallback(
     }
     return <ErrorState message="No task was selected." />;
   }
+  if (!session && surface === "session") return <LoadingState />;
 
   return (
     <div className={appClass} style={appStyle}>
@@ -1601,7 +1618,7 @@ const getCommandDiscovery = useCallback(
         onActivateSearchResult={activateSearchResult}
       />
 
-      {surface === "session" ? (
+      {surface === "session" && session ? (
         <div
           className="session-column"
           inert={
@@ -1743,7 +1760,7 @@ const getCommandDiscovery = useCallback(
             >
               <FilesPanel
                 projects={state.bootstrap.projects}
-                preferredProjectId={session.projectId}
+                preferredProjectId={session?.projectId}
                 writeAvailable={state.bootstrap.capabilities.projectFileWrite}
                 getTree={getProjectFileTree}
                 readFile={readProjectFileContent}

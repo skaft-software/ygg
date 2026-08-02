@@ -178,7 +178,7 @@ All TUI contributions contain plain text and optional semantic style roles.
 Raw terminal escape sequences are not part of the extension API.
 Tool-renderer segments are accepted and retained as internal extension
 provenance, but are never rendered in the TUI or exposed through Ctrl+O,
-`/tool`, `/verbose`, transcript selection, or copy. The original tool result
+`/verbose`, transcript selection, or copy. The original tool result
 remains immutable evidence for the agent's required protocol result,
 session persistence, and export redaction policy; it is not a presentation
 surface. Extension header, status, footer, notification, and confirmation

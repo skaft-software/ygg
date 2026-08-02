@@ -245,8 +245,8 @@ fn bootstrap() -> HostBootstrap {
             owner: ActorOwnerState::Hosted,
             model: model_selection(),
         }],
-        selected_session_id: SessionId::new("session-demo").unwrap(),
-        selected_session: snapshot(),
+        selected_session_id: Some(SessionId::new("session-demo").unwrap()),
+        selected_session: Some(snapshot()),
     }
 }
 

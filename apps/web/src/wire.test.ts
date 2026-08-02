@@ -81,6 +81,9 @@ describe("authoritative Rust wire contract", () => {
   it("projects the complete host bootstrap and embedded selected session", () => {
     const { bootstrap, selectedSession } =
       projectHostBootstrap(hostBootstrapGolden);
+    if (!selectedSession) {
+      throw new Error("golden bootstrap must select a session");
+    }
 
     expect(bootstrap.host).toEqual({
       id: "host-demo",
@@ -142,6 +145,26 @@ describe("authoritative Rust wire contract", () => {
       ],
       truncated: false,
     });
+  });
+
+  it("projects inventory-only bootstraps without a selected session", () => {
+    const inventory = {
+      ...hostBootstrapGolden,
+      selectedSessionId: null,
+      selectedSession: null,
+    };
+
+    const { bootstrap, selectedSession } = projectHostBootstrap(inventory);
+    expect(bootstrap.selectedSessionId).toBeNull();
+    expect(selectedSession).toBeNull();
+    expect(bootstrap.sessions).toHaveLength(hostBootstrapGolden.sessions.length);
+
+    expect(() =>
+      projectHostBootstrap({
+        ...inventory,
+        selectedSessionId: hostBootstrapGolden.selectedSessionId,
+      }),
+    ).toThrow(WireContractError);
   });
 
   it("projects root-confined project filesystem DTOs", () => {
@@ -1925,6 +1948,9 @@ describe("authoritative Rust wire contract", () => {
     golden.selectedSession.model.reasoning = "budget=8192";
 
     const { bootstrap, selectedSession } = projectHostBootstrap(golden);
+    if (!selectedSession) {
+      throw new Error("provider bootstrap must select a session");
+    }
     expect(bootstrap.models[0]?.reasoning).toEqual([
       "off",
       "on",

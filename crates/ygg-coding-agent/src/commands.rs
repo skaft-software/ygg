@@ -20,11 +20,8 @@ pub enum Command {
     Login(Option<String>),
     Logout(Option<String>),
     Model(Option<String>),
-    CycleModel,
     Thinking(Option<String>),
     Theme(Option<String>),
-    /// Toggle details for one tool call, or the latest call when omitted.
-    Tool(Option<String>),
     Verbose(Option<bool>),
     Compact,
     AutoCompact(Option<AutoCompactSetting>),
@@ -36,12 +33,10 @@ pub enum Command {
     Status,
     Context,
     Help(Option<String>),
-    Docs,
     Cost,
     Cache,
     Update,
     Name(Option<String>),
-    Sessions,
     Export(Option<String>),
     Quit,
     /// List or invoke named prompt templates. The optional string preserves
@@ -123,12 +118,6 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
     ),
     slash!("model", "/model [id]", "select or change the model", true),
     slash!(
-        "cycle-model",
-        "/cycle-model",
-        "switch to the next available model",
-        false
-    ),
-    slash!(
         "thinking",
         "/thinking [level]",
         "set reasoning effort",
@@ -151,12 +140,6 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
         "verbose",
         "/verbose [on|off]",
         "show or hide raw tool details",
-        true
-    ),
-    slash!(
-        "tool",
-        "/tool [call-id]",
-        "toggle details for one tool call",
         true
     ),
     slash!(
@@ -185,12 +168,10 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
         "show commands and Ygg self-documentation",
         true
     ),
-    slash!("docs", "/docs", "show Ygg documentation locations", false),
     slash!("cost", "/cost", "show turn and session cost", false),
     slash!("cache", "/cache", "show prompt-cache diagnostics", false),
     slash!("update", "/update", "check for a newer Ygg release", false),
     slash!("name", "/name [name]", "show or rename this session", true),
-    slash!("sessions", "/sessions", "list local sessions", false),
     slash!(
         "export",
         "/export [path]",
@@ -365,14 +346,6 @@ pub fn parse(input: &str) -> Command {
         };
     }
 
-    if full_name == "docs" {
-        return if parts.next().is_none() {
-            Command::Docs
-        } else {
-            Command::Unknown(input.to_owned())
-        };
-    }
-
     let argument = parts.next().map(str::to_owned);
     if parts.next().is_some() {
         return Command::Unknown(input.to_owned());
@@ -382,10 +355,8 @@ pub fn parse(input: &str) -> Command {
         "login" => Command::Login(argument),
         "logout" => Command::Logout(argument),
         "model" => Command::Model(argument),
-        "cycle-model" if argument.is_none() => Command::CycleModel,
         "thinking" => Command::Thinking(argument),
         "theme" => Command::Theme(argument),
-        "tool" => Command::Tool(argument),
         "verbose" => match argument.as_deref() {
             None => Command::Verbose(None),
             Some("on" | "true" | "yes") => Command::Verbose(Some(true)),
@@ -431,7 +402,6 @@ pub fn parse(input: &str) -> Command {
         "cost" if argument.is_none() => Command::Cost,
         "cache" if argument.is_none() => Command::Cache,
         "update" if argument.is_none() => Command::Update,
-        "sessions" if argument.is_none() => Command::Sessions,
         "quit" if argument.is_none() => Command::Quit,
         _ => Command::Unknown(input.to_owned()),
     }
@@ -900,7 +870,6 @@ mod tests {
             parse("/model gpt-4o-mini"),
             Command::Model(Some("gpt-4o-mini".into()))
         );
-        assert_eq!(parse("/cycle-model"), Command::CycleModel);
         assert_eq!(parse("/thinking"), Command::Thinking(None));
         assert_eq!(parse("/theme dusk"), Command::Theme(Some("dusk".into())));
         assert_eq!(parse("/verbose on"), Command::Verbose(Some(true)));
@@ -930,7 +899,6 @@ mod tests {
         assert_eq!(parse("/context"), Command::Context);
         assert_eq!(parse("/help"), Command::Help(None));
         assert_eq!(parse("/help status"), Command::Help(Some("status".into())));
-        assert_eq!(parse("/docs"), Command::Docs);
         assert_eq!(parse("/cost"), Command::Cost);
         assert_eq!(parse("/cache"), Command::Cache);
         assert_eq!(parse("/update"), Command::Update);
@@ -982,9 +950,11 @@ mod tests {
     }
 
     #[test]
-    fn popup_registry_includes_self_help_without_a_duplicate_session_entry() {
+    fn popup_registry_includes_self_help_without_removed_commands() {
         assert!(SLASH_COMMANDS.iter().any(|command| command.name == "help"));
-        assert!(SLASH_COMMANDS.iter().any(|command| command.name == "docs"));
+        for removed in ["cycle-model", "docs", "sessions", "tool"] {
+            assert!(SLASH_COMMANDS.iter().all(|command| command.name != removed));
+        }
         assert!(SLASH_COMMANDS
             .iter()
             .all(|command| command.name != "Session"));
@@ -1027,6 +997,9 @@ mod tests {
         assert!(matches!(parse("/checkout"), Command::Unknown(_)));
         assert!(matches!(parse("/auto-compact 0%"), Command::Unknown(_)));
         assert!(matches!(parse("/auto-compact 101%"), Command::Unknown(_)));
+        for removed in ["/cycle-model", "/docs", "/sessions", "/tool"] {
+            assert!(matches!(parse(removed), Command::Unknown(_)));
+        }
     }
 
     fn app_for_status() -> (tempfile::TempDir, App) {
