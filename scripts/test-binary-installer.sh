@@ -7,7 +7,7 @@ work_directory=$(mktemp -d "${TMPDIR:-/tmp}/ygg-installer-test.XXXXXX")
 trap 'rm -rf "$work_directory"' EXIT
 assets="$work_directory/assets"
 fake_bin="$work_directory/fake-bin"
-package="ygg-0.3.2-alpha-aarch64-apple-darwin"
+package="ygg-0.3.3-alpha-aarch64-apple-darwin"
 archive_name="$package.tar.gz"
 mkdir -p "$assets" "$fake_bin"
 
@@ -26,7 +26,7 @@ make_assets() {
     cat > "$staging/$package/ygg" <<'EOF'
 #!/bin/sh
 case "${1:-}" in
-    --version) printf '%s\n' 'ygg 0.3.2-alpha' ;;
+    --version) printf '%s\n' 'ygg 0.3.3-alpha' ;;
     --help) printf '%s\n' 'fake Ygg help' ;;
     *) exit 0 ;;
 esac
@@ -115,7 +115,7 @@ make_assets
 positive_home="$work_directory/positive-home"
 run_installer "$positive_home" > "$work_directory/positive.out"
 test -x "$positive_home/bin/ygg"
-test "$("$positive_home/bin/ygg" --version)" = 'ygg 0.3.2-alpha'
+test "$("$positive_home/bin/ygg" --version)" = 'ygg 0.3.3-alpha'
 
 after_redirect="$work_directory/untrusted-home"
 if run_installer "$after_redirect" \

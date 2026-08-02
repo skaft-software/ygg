@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# Build with: docker build -f deploy/Dockerfile.ygg -t ygg:0.3.2-alpha .
+# Build with: docker build -f deploy/Dockerfile.ygg -t ygg:0.3.3-alpha .
 FROM rust:1.86-bookworm AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends musl-tools \

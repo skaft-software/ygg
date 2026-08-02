@@ -649,7 +649,7 @@ evidence.
 
 1. Rebase or compare the forward-gated delta against the intended merge target
    and review any surviving pre-`eebe738` core changes explicitly.
-2. Run the experimental release workflow against a clean `v0.3.2-alpha` (or
+2. Run the experimental release workflow against a clean `v0.3.3-alpha` (or
    later alpha) tag and retain the checksum/signature verification output.
 3. Run `ygg serve` against a user's real provider and exercise:
    - fresh-session creation;

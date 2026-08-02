@@ -35,7 +35,7 @@ The **first** host request, sent immediately after the child process starts.
   "method": "initialize",
   "params": {
     "api_version": "0.1",
-    "ygg_version": "0.3.2-alpha",
+    "ygg_version": "0.3.3-alpha",
     "extension": {
       "name": "hello-world",
       "version": "0.1.0",

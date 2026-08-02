@@ -2,6 +2,37 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## 0.3.3-alpha — 2026-08-02 (experimental)
+
+### Added
+
+- Added an exception-driven Fleet command center that aggregates active and
+  attention-needed sessions, supports task and project search, and returns
+  directly to focused work.
+- Added live session activity indicators in the Serve sidebar and line numbers
+  in the graphical source-file viewer.
+- Added checkout-aware self-documentation guidance to `/help` and the system
+  prompt when Ygg is run from its own source tree.
+
+### Changed
+
+- Made graphical prompts submitted during an active run steer by default instead
+  of becoming queued follow-ups.
+- Removed the redundant interactive `/tool`, `/docs`, `/sessions`, and
+  `/cycle-model` commands. The top-level `ygg sessions` command remains
+  available.
+- Rounded compact TUI footer costs to three significant figures.
+
+### Fixed
+
+- Made `/overview` bootstrap from session inventory without creating or opening
+  a provisional task, including anchorless reconnect refresh and cancellation of
+  stale session-selection navigation.
+- Kept the focused session surface and route mode stable when session selection
+  or creation fails or is retried.
+- Prevented no-color line truncation from appending an ANSI reset sequence to
+  otherwise plain terminal output.
+
 ## 0.3.2-alpha — 2026-08-01 (experimental)
 
 ### Added

@@ -2,7 +2,7 @@
 set -eu
 
 repository="skaft-software/ygg"
-version="0.3.2-alpha"
+version="0.3.3-alpha"
 tag="v$version"
 release_base="https://github.com/$repository/releases/download/$tag"
 checksum_asset="YGG_SHA256SUMS"

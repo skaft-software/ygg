@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.3.2-alpha"><img alt="Release: 0.3.2-alpha" src="https://img.shields.io/badge/release-0.3.2--alpha-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.3.3-alpha"><img alt="Release: 0.3.3-alpha" src="https://img.shields.io/badge/release-0.3.3--alpha-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -54,7 +54,7 @@ Local endpoints are a primary path rather than a compatibility mode. Ygg keeps p
 ## Install
 
 ygg currently supports macOS and Linux and requires
-[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.3.2-alpha`
+[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.3.3-alpha`
 binaries are available for GNU/Linux x86-64, macOS x86-64, and macOS Apple
 silicon. Linux musl is not supported by this alpha.
 
@@ -66,7 +66,7 @@ architecture, verifies the matching release archive, and installs `ygg` under
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.3.2-alpha/install-ygg.sh | sh
+  https://github.com/skaft-software/ygg/releases/download/v0.3.3-alpha/install-ygg.sh | sh
 ```
 
 No Rust toolchain is needed for the default installation. Restart the shell,
@@ -82,7 +82,7 @@ To compile the pinned tag instead, install
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.3.2-alpha/install-ygg.sh \
+  https://github.com/skaft-software/ygg/releases/download/v0.3.3-alpha/install-ygg.sh \
   | sh -s -- --from-source
 ```
 
@@ -93,7 +93,7 @@ To install from source without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.3.2-alpha \
+  --tag v0.3.3-alpha \
   --bin ygg \
   ygg-coding-agent
 ```
@@ -130,7 +130,7 @@ ygg serve --no-open --port 0
 
 Use `ygg extension list`, `update ygg-serve`, or `remove ygg-serve` to manage
 the package. A downloaded release archive can be installed with
-`ygg extension install --path ./ygg-serve-0.3.2-alpha-TARGET.tar.gz`.
+`ygg extension install --path ./ygg-serve-0.3.3-alpha-TARGET.tar.gz`.
 Removing the package leaves sessions and other Serve data intact.
 
 ### Container
@@ -139,11 +139,11 @@ The included image builds ygg from the locked workspace, runs as an unprivileged
 user, and expects an explicit workspace mount:
 
 ```sh
-docker build -f deploy/Dockerfile.ygg -t ygg:0.3.2-alpha .
+docker build -f deploy/Dockerfile.ygg -t ygg:0.3.3-alpha .
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.3.2-alpha --model claude-sonnet-4-6
+  ygg:0.3.3-alpha --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs.
@@ -686,7 +686,7 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.3.1-alpha.md) | Current installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.3.3-alpha.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |

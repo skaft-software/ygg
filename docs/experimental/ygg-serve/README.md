@@ -85,7 +85,7 @@ Fixtures remain a development and test input only.
 
 ## Build, install, and release gates
 
-With canonical Ygg `v0.3.2-alpha` installed, install the matching first-party
+With canonical Ygg `v0.3.3-alpha` installed, install the matching first-party
 package and launch it with:
 
 ```console
@@ -100,10 +100,10 @@ preserves Serve sessions and other user data. A downloaded release archive can
 be installed without network access to GitHub:
 
 ```console
-ygg extension install --path ygg-serve-0.3.2-alpha-TARGET.tar.gz
+ygg extension install --path ygg-serve-0.3.3-alpha-TARGET.tar.gz
 ```
 
-The package requires exactly `=0.3.2-alpha` and supports GNU/Linux x86_64
+The package requires exactly `=0.3.3-alpha` and supports GNU/Linux x86_64
 (`x86_64-unknown-linux-gnu`) plus macOS x86_64/arm64. Linux musl targets are not
 supported in this alpha. For development, run the embedded feature build
 directly:
@@ -129,10 +129,10 @@ pairing plan.
 The release workflow at `.github/workflows/release-serve.yml` builds optimized
 runtimes for the three supported targets, verifies both direct and
 package-dispatched launch, and emits archives named
-`ygg-serve-0.3.2-alpha-TARGET.tar.gz`. It writes SHA-256 checksums, signs the
+`ygg-serve-0.3.3-alpha-TARGET.tar.gz`. It writes SHA-256 checksums, signs the
 archives and checksum manifest with keyless Sigstore bundles, and attaches them
 to the existing canonical Ygg prerelease. Serve source tags use the form
-`ygg-serve-v0.3.2-alpha`; they do not replace the canonical Ygg tag.
+`ygg-serve-v0.3.3-alpha`; they do not replace the canonical Ygg tag.
 
 ## Explicit exclusions
 
