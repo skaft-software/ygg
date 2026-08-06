@@ -487,7 +487,8 @@ Useful keys:
 | `Ctrl+D` | Close ygg from any interactive input surface, settling active work and child-process cleanup first. |
 | `Ctrl+O` | Expand or collapse reasoning, tool evidence, or shell output. |
 | `PageUp` / `PageDown` | Navigate transcript history. |
-| `@` | Complete workspace file mentions. |
+| `Tab` | Complete trailing `./`, `../`, `~/`, and absolute path tokens. Directories remain open for continued completion, and spaces are backslash-escaped. |
+| `@` | Fuzzy-complete gitignore-aware workspace file mentions; path-prefixed mentions also use filesystem completion. |
 
 ## Configuration
 

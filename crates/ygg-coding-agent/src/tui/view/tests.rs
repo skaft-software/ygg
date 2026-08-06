@@ -905,8 +905,68 @@ fn mention_completion_inserts_path_reference_for_text_files() {
         .iter()
         .any(|line| line.contains("project files · tab completes")));
     assert!(rendered.iter().any(|line| line.contains("src/main.rs")));
-    shell.complete_mention();
+    shell.complete_path();
     assert_eq!(shell.pending(), "see @src/main.rs ");
+}
+
+#[test]
+fn literal_path_completion_descends_through_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), b"x").unwrap();
+
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_workspace(dir.path().to_path_buf());
+    for character in "inspect ./sr".chars() {
+        shell.apply_edit(EditAction::Char(character));
+    }
+
+    let rendered = render_shell(&shell.state.borrow(), 120);
+    assert!(rendered
+        .iter()
+        .any(|line| line.contains("paths · tab completes")));
+    assert!(rendered.iter().any(|line| line.contains("./src/")));
+
+    shell.complete_path();
+    assert_eq!(shell.pending(), "inspect ./src/");
+    shell.complete_path();
+    assert_eq!(shell.pending(), "inspect ./src/main.rs ");
+}
+
+#[test]
+fn literal_path_completion_escapes_spaces_and_stays_active() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("My Folder")).unwrap();
+    std::fs::write(dir.path().join("My Folder/draft note.md"), b"text").unwrap();
+
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_workspace(dir.path().to_path_buf());
+    for character in "inspect ./My".chars() {
+        shell.apply_edit(EditAction::Char(character));
+    }
+
+    shell.complete_path();
+    assert_eq!(shell.pending(), r"inspect ./My\ Folder/");
+    shell.complete_path();
+    assert_eq!(shell.pending(), r"inspect ./My\ Folder/draft\ note.md ");
+}
+
+#[test]
+fn mention_path_completion_keeps_directories_active() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/lib.rs"), b"x").unwrap();
+
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_workspace(dir.path().to_path_buf());
+    for character in "@./sr".chars() {
+        shell.apply_edit(EditAction::Char(character));
+    }
+
+    shell.complete_path();
+    assert_eq!(shell.pending(), "@./src/");
+    shell.complete_path();
+    assert_eq!(shell.pending(), "@./src/lib.rs ");
 }
 
 #[test]
@@ -920,7 +980,7 @@ fn mention_completion_attaches_media_files() {
     for character in "@shot".chars() {
         shell.apply_edit(EditAction::Char(character));
     }
-    shell.complete_mention();
+    shell.complete_path();
     assert_eq!(shell.pending(), "[Image #1]");
     let composed = shell.drain_composed();
     assert!(composed
@@ -985,7 +1045,7 @@ fn unsupported_media_mention_falls_back_to_a_path_and_notice() {
     for character in "@shot".chars() {
         shell.apply_edit(EditAction::Char(character));
     }
-    shell.complete_mention();
+    shell.complete_path();
 
     assert_eq!(shell.pending(), "@shot.png ");
     assert!(shell

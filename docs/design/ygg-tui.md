@@ -64,11 +64,14 @@ actions such as submit, panel confirmation, close, abort, and reasoning/summary 
 require a fresh key press.
 
 The composer supports multiline editing, bracketed paste, large-paste chips,
-media attachments, dropped paths, and gitignore-aware `@` completion. Media is
-capability-gated at attachment time and remains ordered with text when submitted.
-PDFs are not decoded or sent as multimodal payloads: a dropped PDF receives a
-composer chip, but submission resolves that chip to the file path as text so the
-model can inspect it with file tools.
+media attachments, dropped paths, gitignore-aware `@` completion, and Tab
+completion for relative, parent, home-relative, and absolute path tokens.
+Directory completions retain their trailing separator so completion can continue
+one level at a time, and whitespace in completed names is backslash-escaped.
+Media is capability-gated at attachment time and remains ordered with text when
+submitted. PDFs are not decoded or sent as multimodal
+payloads: a dropped PDF receives a composer chip, but submission resolves that
+chip to the file path as text so the model can inspect it with file tools.
 
 The compiled default composer leaves the terminal canvas unfilled and keeps a
 restrained perimeter at rest; live work animates a model-colored shimmer around

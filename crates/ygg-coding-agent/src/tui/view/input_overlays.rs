@@ -179,41 +179,54 @@ pub(super) fn render_slash_suggestions(
     lines
 }
 
-fn render_mention_suggestions(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
+fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
     if max_rows == 0 || state.editor_cursor != state.editor.len() {
         return Vec::new();
     }
-    let Some(query) = composer::active_mention(&state.editor) else {
-        return Vec::new();
-    };
 
-    // When the query looks like a path (contains / or starts with .),
-    // do a live filesystem listing instead of searching the pre-built index.
-    let looks_like_path = query.contains('/') || query.starts_with('.') || query.contains('\\');
-    let matches: Vec<String> = if looks_like_path {
+    let (heading_label, matches) = if let Some(query) = composer::active_mention(&state.editor) {
+        if composer::is_path_query(query) {
+            let Some(root) = &state.workspace else {
+                return Vec::new();
+            };
+            let matches = composer::path_matches(root, query, 5)
+                .into_iter()
+                .map(|suggestion| suggestion.completion)
+                .collect();
+            ("paths", matches)
+        } else {
+            let Some(files) = state.file_index.as_ref() else {
+                return Vec::new();
+            };
+            let matches = composer::mention_matches(files, query, 5)
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            ("project files", matches)
+        }
+    } else if let Some(query) = composer::active_path(&state.editor) {
         let Some(root) = &state.workspace else {
             return Vec::new();
         };
-        composer::live_path_matches(root, query, 5)
-    } else {
-        let Some(files) = state.file_index.as_ref() else {
-            return Vec::new();
-        };
-        composer::mention_matches(files, query, 5)
+        let matches = composer::path_matches(root, query, 5)
             .into_iter()
-            .map(str::to_owned)
-            .collect()
+            .map(|suggestion| suggestion.completion)
+            .collect();
+        ("paths", matches)
+    } else {
+        return Vec::new();
     };
+    let matches: Vec<String> = matches;
     if matches.is_empty() {
         return Vec::new();
     }
 
     let heading = if state.theme.unicode() {
-        "  project files · tab completes"
+        format!("  {heading_label} · tab completes")
     } else {
-        "  project files - tab completes"
+        format!("  {heading_label} - tab completes")
     };
-    let mut lines = vec![state.theme.fg("model_accent", heading)];
+    let mut lines = vec![state.theme.fg("model_accent", &heading)];
     let item_rows = max_rows.saturating_sub(1).min(5);
     let available_width = usize::from(width).saturating_sub(2);
     for (index, path) in matches.into_iter().take(item_rows).enumerate() {
@@ -236,7 +249,7 @@ pub(super) fn render_input_suggestions(
 ) -> Vec<String> {
     let slash = render_slash_suggestions(state, width, max_rows);
     if slash.is_empty() {
-        render_mention_suggestions(state, width, max_rows)
+        render_path_suggestions(state, width, max_rows)
     } else {
         slash
     }

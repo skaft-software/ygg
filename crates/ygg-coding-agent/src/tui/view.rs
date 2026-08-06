@@ -1878,7 +1878,8 @@ impl InteractiveShell {
             state.slash_popup_dismissed = false;
         }
         if state.editor_cursor == state.editor.len()
-            && composer::active_mention(&state.editor).is_some()
+            && composer::active_mention(&state.editor)
+                .is_some_and(|query| !composer::is_path_query(query))
             && state.file_index.is_none()
         {
             if let Some(root) = state.workspace.clone() {
@@ -2014,68 +2015,88 @@ impl InteractiveShell {
         state.slash_scroll = 0;
     }
 
-    /// Complete the trailing `@token`: media files attach, others insert a
-    /// plain `@relative/path` reference.
-    pub fn complete_mention(&mut self) {
+    /// Complete the trailing path token. `@` mentions retain their attachment
+    /// behavior; literal paths are inserted as text. Directory completions omit
+    /// the trailing space so another Tab can descend into them.
+    pub fn complete_path(&mut self) {
         let mut state = self.state.borrow_mut();
         if state.editor_cursor != state.editor.len() {
             return;
         }
-        let Some(query) = composer::active_mention(&state.editor).map(str::to_owned) else {
-            return;
-        };
         let Some(root) = state.workspace.clone() else {
             return;
         };
 
-        // When the query looks like a path (contains a separator or starts
-        // with `.` / `..`), do a live filesystem listing so `@../../` and
-        // `@src/` completions work.
-        let looks_like_path = query.contains('/') || query.starts_with('.') || query.contains('\\');
-        let top: Option<String> = if looks_like_path {
-            let matches = composer::live_path_matches(&root, &query, 1);
-            matches.into_iter().next()
-        } else {
-            if state.file_index.is_none() {
-                state.file_index = Some(composer::workspace_files(&root, 10_000));
+        if let Some(query) = composer::active_mention(&state.editor).map(str::to_owned) {
+            let suggestion = if composer::is_path_query(&query) {
+                composer::path_matches(&root, &query, 1).into_iter().next()
+            } else {
+                if state.file_index.is_none() {
+                    state.file_index = Some(composer::workspace_files(&root, 10_000));
+                }
+                let top = {
+                    let files = state.file_index.as_ref().expect("file index just built");
+                    composer::mention_matches(files, &query, 1)
+                        .first()
+                        .copied()
+                        .map(str::to_owned)
+                };
+                top.map(|completion| composer::PathSuggestion {
+                    path: root.join(&completion),
+                    completion,
+                    is_dir: false,
+                })
+            };
+            let Some(suggestion) = suggestion else {
+                return;
+            };
+            let token_start = state.editor.len() - (query.len() + 1);
+
+            if suggestion.is_dir {
+                state
+                    .editor
+                    .replace_range(token_start.., &format!("@{}", suggestion.completion));
+            } else if composer::media_kind_for_path(&suggestion.path).is_some() {
+                let modalities = state.input_modalities;
+                match state.ledger.attach_media(&suggestion.path, modalities) {
+                    Ok(chip) => state.editor.replace_range(token_start.., &chip),
+                    Err(error) => {
+                        state.push_block(TranscriptBlock::Notice(error.to_string()));
+                        state
+                            .editor
+                            .replace_range(token_start.., &format!("@{} ", suggestion.completion));
+                    }
+                }
+            } else if composer::file_kind_for_path(&suggestion.path).is_some() {
+                match state.ledger.attach_file_reference(&suggestion.path) {
+                    Ok(chip) => state.editor.replace_range(token_start.., &chip),
+                    Err(error) => {
+                        state.push_block(TranscriptBlock::Notice(error.to_string()));
+                        state
+                            .editor
+                            .replace_range(token_start.., &format!("@{} ", suggestion.completion));
+                    }
+                }
+            } else {
+                state
+                    .editor
+                    .replace_range(token_start.., &format!("@{} ", suggestion.completion));
             }
-            let files = state.file_index.as_ref().expect("file index just built");
-            composer::mention_matches(files, &query, 1)
-                .first()
-                .copied()
-                .map(str::to_owned)
-        };
-        let Some(top) = top else {
+            state.editor_cursor = state.editor.len();
+            return;
+        }
+
+        let Some(query) = composer::active_path(&state.editor).map(str::to_owned) else {
             return;
         };
-        let token_start = state.editor.len() - (query.len() + 1);
-        let absolute = root.join(&top);
-        if composer::media_kind_for_path(&absolute).is_some() {
-            let modalities = state.input_modalities;
-            match state.ledger.attach_media(&absolute, modalities) {
-                Ok(chip) => state.editor.replace_range(token_start.., &chip),
-                Err(error) => {
-                    state.push_block(TranscriptBlock::Notice(error.to_string()));
-                    state
-                        .editor
-                        .replace_range(token_start.., &format!("@{top} "));
-                }
-            }
-        } else if composer::file_kind_for_path(&absolute).is_some() {
-            match state.ledger.attach_file_reference(&absolute) {
-                Ok(chip) => state.editor.replace_range(token_start.., &chip),
-                Err(error) => {
-                    state.push_block(TranscriptBlock::Notice(error.to_string()));
-                    state
-                        .editor
-                        .replace_range(token_start.., &format!("@{top} "));
-                }
-            }
-        } else {
-            state
-                .editor
-                .replace_range(token_start.., &format!("@{top} "));
-        }
+        let Some(suggestion) = composer::path_matches(&root, &query, 1).into_iter().next() else {
+            return;
+        };
+        let token_start = state.editor.len() - query.len();
+        let suffix = if suggestion.is_dir { "" } else { " " };
+        state
+            .editor
+            .replace_range(token_start.., &format!("{}{suffix}", suggestion.completion));
         state.editor_cursor = state.editor.len();
     }
 
