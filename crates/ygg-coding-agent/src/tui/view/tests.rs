@@ -7281,10 +7281,11 @@ fn panel_border_layout_degrades_to_unframed_narrow_picker() {
     assert!(narrow.iter().all(|line| !line.chars().all(|ch| ch == '─')));
 }
 
-const BUNDLED_THEME_NAMES: [&str; 10] = [
+const BUNDLED_THEME_NAMES: [&str; 11] = [
     "bone-machine",
     "circuit-garden",
     "field-notes",
+    "kawaii-pink",
     "oxide-console",
     "paper-ledger",
     "signal-noir",
@@ -7423,7 +7424,7 @@ fn ansi_background_is_open_at_end(line: &str) -> bool {
 }
 
 #[test]
-fn bundled_theme_pack_has_ten_color_independent_wide_and_narrow_identities() {
+fn bundled_theme_pack_has_eleven_color_independent_wide_and_narrow_identities() {
     use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
     use crate::tui::theme::TerminalBackground;
 
@@ -7513,7 +7514,7 @@ fn bundled_theme_pack_has_ten_color_independent_wide_and_narrow_identities() {
             eprintln!("\n===== {name} / narrow =====\n{narrow_frame}");
         }
     }
-    assert_eq!(wide.len(), 10);
-    assert_eq!(ascii.len(), 10);
-    assert_eq!(narrow.len(), 10);
+    assert_eq!(wide.len(), 11);
+    assert_eq!(ascii.len(), 11);
+    assert_eq!(narrow.len(), 11);
 }
