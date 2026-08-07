@@ -86,6 +86,42 @@ test("labels simulated fixture mode", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("collapses sidebar projects without hiding their neighbors", async ({
+  page,
+}) => {
+  await ensureSidebar(page);
+  const yggToggle = page.getByRole("button", {
+    name: "Collapse project ygg, 4 tasks",
+  });
+  const notesToggle = page.getByRole("button", {
+    name: "Collapse project Research notes, 1 task",
+  });
+  const yggTask = page.getByRole("button", {
+    name: /Open task Review release readiness/,
+  });
+  const notesTask = page.getByRole("button", {
+    name: /Open task Summarize provider notes/,
+  });
+
+  await yggToggle.click();
+  await expect(
+    page.getByRole("button", { name: "Expand project ygg, 4 tasks" }),
+  ).toHaveAttribute("aria-expanded", "false");
+  await expect(yggTask).toBeHidden();
+  await expect(notesToggle).toHaveAttribute("aria-expanded", "true");
+  await expect(notesTask).toBeVisible();
+
+  await page
+    .getByRole("searchbox", { name: "Search tasks and transcripts" })
+    .fill("release readiness");
+  await expect(
+    page.getByRole("button", {
+      name: "Collapse project ygg, 1 task",
+    }),
+  ).toHaveAttribute("aria-expanded", "true");
+  await expect(yggTask).toBeVisible();
+});
+
 test("uses the command center to triage exceptions and restore focus", async ({
   page,
 }, testInfo) => {
@@ -189,7 +225,9 @@ test("opens in a fresh, quiet session with the standard composer", async ({
   await expect(
     page.getByRole("region", { name: "ygg", exact: true }),
   ).toBeVisible();
-  await expect(page.getByLabel("Research notes")).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Research notes", exact: true }),
+  ).toBeVisible();
   await expect(page.getByLabel("Message ygg")).toBeVisible();
   await expect
     .poll(() =>
@@ -686,6 +724,15 @@ test("shows typed work and a conditional activity rail", async ({ page }) => {
   await expect(
     page.getByRole("button", { name: "Steer active run" }),
   ).toHaveCount(0);
+  await expect(page.locator(".composer-actions .submit-button")).toHaveCount(1);
+  await page.getByLabel("Message ygg").fill("Focus on the keyboard flow");
+  await expect(page.getByRole("button", { name: "Stop ygg" })).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Steer active run" }),
+  ).toBeVisible();
+  await expect(page.locator(".composer-actions .submit-button")).toHaveCount(1);
+  await page.getByLabel("Message ygg").fill("");
+  await expect(page.getByRole("button", { name: "Stop ygg" })).toBeVisible();
   await ensureActivityOpen(page);
   await expect(
     page.getByText("Verifying keyboard and touch behavior"),
@@ -1305,6 +1352,32 @@ test("uses one fixed workbench appearance", async ({ page }) => {
     0,
   );
   await expect(page.locator(".theme-options")).toHaveCount(0);
+  await expect(
+    page.getByRole("heading", { name: "Task defaults" }),
+  ).toHaveCount(0);
+  const fontPairing = page.getByLabel("Font pairing");
+  const uiSize = page.getByLabel("UI size");
+  await expect(fontPairing).toBeVisible();
+  await expect(uiSize).toBeVisible();
+  await fontPairing.selectOption("system-mono");
+  await uiSize.selectOption("15");
+  await expect
+    .poll(() =>
+      page.evaluate(() => ({
+        font: localStorage.getItem("ygg.ui.font"),
+        size: localStorage.getItem("ygg.ui.size"),
+        bodySize: getComputedStyle(document.documentElement)
+          .getPropertyValue("--font-body")
+          .trim(),
+      })),
+    )
+    .toEqual({ font: "system-mono", size: "15", bodySize: "15px" });
+  await expectNoViewportOverflow(page);
+  await expect(
+    page.getByRole("heading", { name: "Background attention" }),
+  ).toBeVisible();
+  await expect(page.getByRole("switch")).toBeDisabled();
+  await expect(page.getByText("Blocked by browser settings.")).toBeVisible();
   await expect(page.locator("html")).not.toHaveAttribute("data-theme");
 });
 

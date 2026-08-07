@@ -491,6 +491,26 @@ describe("conversation composer", () => {
     ).toBeVisible();
   });
 
+  it("omits a meaningless zero-value context cost estimate", () => {
+    render(
+      <Conversation
+        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+      />,
+    );
+
+    const context = document.querySelector(".composer-context-cost");
+    expect(context).not.toHaveTextContent("$0.00");
+    expect(context).not.toHaveAccessibleName(/Estimated next-turn input cost/);
+  });
+
   it("projects live context sources and compaction lifecycle in the composer", () => {
     const session = structuredClone(fixtureSessions["session-live"]!);
     const totals = {
@@ -677,6 +697,58 @@ describe("conversation composer", () => {
     expect(screen.getByText("notes.md")).toBeVisible();
   });
 
+  it("steers with an attachment-only draft instead of replacing send with stop", async () => {
+    const user = userEvent.setup();
+    const session = structuredClone(fixtureSessions["session-live"]!);
+    const bootstrap = structuredClone(fixtureBootstrap);
+    const attachment = {
+      id: "attachment-draft",
+      handle: "attachment-handle",
+      name: "notes.md",
+      mediaType: "text/markdown",
+      size: 128,
+    };
+    new SessionDraftStore(window.localStorage).save(
+      bootstrap.host.id,
+      session.sessionId,
+      {
+        text: "",
+        delivery: "steer",
+        attachments: [attachment],
+        updatedAt: new Date().toISOString(),
+      },
+    );
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    const { container } = render(
+      <Conversation
+        session={session}
+        bootstrap={bootstrap}
+        onSubmit={onSubmit}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Stop ygg" })).toBeNull();
+    expect(
+      container.querySelectorAll(".composer-actions .submit-button"),
+    ).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Steer active run" }));
+    expect(onSubmit).toHaveBeenCalledWith(
+      "",
+      [attachment],
+      "steer",
+      expect.any(String),
+      [],
+      [],
+    );
+  });
+
   it("keeps the draft and surfaces a rejected send", async () => {
     const user = userEvent.setup();
     const onSubmit = vi
@@ -772,15 +844,16 @@ describe("conversation composer", () => {
     expect(onInvokeSlashCommand.mock.calls[1]?.[1]).not.toBe(firstKey);
   });
 
-  it("steers by default and keeps Follow up in a themed secondary menu", async () => {
+  it("uses one action to stop, steer, and queue follow-ups", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);
-    render(
+    const onInterrupt = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(
       <Conversation
         session={structuredClone(fixtureSessions["session-live"]!)}
         bootstrap={structuredClone(fixtureBootstrap)}
         onSubmit={onSubmit}
-        onInterrupt={noOp}
+        onInterrupt={onInterrupt}
         onConfigure={noOp}
         onResolveApproval={noOp}
         onResolveUserInput={noOp}
@@ -789,7 +862,17 @@ describe("conversation composer", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: "Stop ygg" })).toBeVisible();
+    const stop = screen.getByRole("button", { name: "Stop ygg" });
+    expect(stop).toBeVisible();
+    expect(
+      container.querySelectorAll(".composer-actions .submit-button"),
+    ).toHaveLength(1);
+    expect(
+      screen.queryByRole("button", { name: "Steer active run" }),
+    ).toBeNull();
+    await user.click(stop);
+    expect(onInterrupt).toHaveBeenCalledOnce();
+
     const delivery = screen.getByRole("button", {
       name: "While ygg is working: Steer now",
     });
@@ -797,6 +880,10 @@ describe("conversation composer", () => {
       screen.queryByRole("combobox", { name: "Active run delivery" }),
     ).toBeNull();
     await user.type(screen.getByLabelText("Message ygg"), "Steer this");
+    expect(screen.queryByRole("button", { name: "Stop ygg" })).toBeNull();
+    expect(
+      container.querySelectorAll(".composer-actions .submit-button"),
+    ).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: "Steer active run" }));
 
     expect(onSubmit).toHaveBeenCalledWith(
@@ -808,13 +895,34 @@ describe("conversation composer", () => {
       [],
     );
 
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Stop ygg" })).toBeVisible(),
+    );
     await user.click(delivery);
     expect(
       screen.getByRole("menu", { name: "While ygg is working" }),
     ).toBeVisible();
-    expect(
-      screen.getByRole("menuitemradio", { name: /Follow up/ }),
-    ).toBeVisible();
+    const followUp = screen.getByRole("menuitemradio", { name: /Follow up/ });
+    expect(followUp).toBeVisible();
+    await user.click(followUp);
+    await waitFor(() =>
+      expect(delivery).toHaveAccessibleName(
+        "While ygg is working: Follow up",
+      ),
+    );
+
+    await user.type(screen.getByLabelText("Message ygg"), "Then summarize");
+    await user.click(screen.getByRole("button", { name: "Queue follow-up" }));
+    expect(onSubmit).toHaveBeenLastCalledWith(
+      "Then summarize",
+      [],
+      "followUp",
+      expect.any(String),
+      [],
+      [],
+    );
+
+    await user.click(delivery);
     await user.keyboard("{Escape}");
     expect(
       screen.queryByRole("menu", { name: "While ygg is working" }),

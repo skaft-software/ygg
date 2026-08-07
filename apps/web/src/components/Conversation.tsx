@@ -2950,6 +2950,7 @@ function estimatedContextInputCost(
   contextTokens: number,
   model: ModelSummary | undefined,
 ): string | undefined {
+  if (contextTokens <= 0) return undefined;
   const pricing = model?.inputPricing;
   if (!pricing) return undefined;
 
@@ -3490,6 +3491,11 @@ function Composer({
   const uploadedAttachments = attachments.flatMap((attachment) =>
     attachment.reference ? [attachment.reference] : [],
   );
+  const hasComposerContent =
+    Boolean(prompt.trim()) ||
+    attachments.length > 0 ||
+    documents.length > 0 ||
+    projectFiles.length > 0;
   const canSubmit =
     (Boolean(prompt.trim()) ||
       uploadedAttachments.length > 0 ||
@@ -3497,6 +3503,7 @@ function Composer({
       projectFiles.length > 0) &&
     !attachmentsPending &&
     !attachmentsFailed;
+  const submitActionIsStop = isWorking && !hasComposerContent;
 
   useEffect(() => {
     if (!isWorking) {
@@ -4428,32 +4435,32 @@ function Composer({
                 </>
               ) : null}
             </span>
-            {isWorking ? (
-              <button
-                className="submit-button stop-button"
-                onClick={() => void onInterrupt()}
-                aria-label="Stop ygg"
-              >
-                <span className="stop-glyph" aria-hidden="true" />
-              </button>
-            ) : null}
-            {!isWorking || canSubmit ? (
-              <button
-                className="submit-button"
-                onClick={() => void submit()}
-                disabled={submitting || !canSubmit}
-                aria-disabled={submitting || !canSubmit}
-                aria-label={
-                  isWorking
+            <button
+              type="button"
+              className={`submit-button ${submitActionIsStop ? "stop-button" : ""}`}
+              onClick={() =>
+                void (submitActionIsStop ? onInterrupt() : submit())
+              }
+              disabled={!submitActionIsStop && (submitting || !canSubmit)}
+              aria-disabled={
+                !submitActionIsStop && (submitting || !canSubmit)
+              }
+              aria-label={
+                submitActionIsStop
+                  ? "Stop ygg"
+                  : isWorking
                     ? activeDelivery === "steer"
                       ? "Steer active run"
                       : "Queue follow-up"
                     : "Send message"
-                }
-              >
+              }
+            >
+              {submitActionIsStop ? (
+                <span className="stop-glyph" aria-hidden="true" />
+              ) : (
                 <ArrowUp aria-hidden="true" />
-              </button>
-            ) : null}
+              )}
+            </button>
           </div>
         </div>
         {commandFeedback ? (
