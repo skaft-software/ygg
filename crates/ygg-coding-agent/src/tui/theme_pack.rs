@@ -20,6 +20,10 @@ pub(crate) const THEMES: &[BundledTheme] = &[
         source: include_str!("../../themes/field-notes.toml"),
     },
     BundledTheme {
+        id: "kawaii-pink",
+        source: include_str!("../../themes/kawaii-pink.toml"),
+    },
+    BundledTheme {
         id: "oxide-console",
         source: include_str!("../../themes/oxide-console.toml"),
     },
@@ -61,12 +65,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pack_has_ten_unique_stable_ids() {
+    fn pack_has_eleven_unique_stable_ids() {
         let mut ids = THEMES.iter().map(|theme| theme.id).collect::<Vec<_>>();
-        assert_eq!(ids.len(), 10);
+        assert_eq!(ids.len(), 11);
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 10);
-        assert!(find("TIDEPOOL").is_some());
+        assert_eq!(ids.len(), 11);
+        assert!(find("KAWAII-PINK").is_some());
     }
 }

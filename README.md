@@ -48,7 +48,7 @@ Local endpoints are a primary path rather than a compatibility mode. Ygg keeps p
 | **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share typed request, message, tool, usage, and streaming models. |
 | **Durable by construction** | Sessions are append-only, parent-linked, branchable, locked, synced, repairable, and inspectable without ygg running. |
 | **Authority is explicit** | Workspace trust, tool allowlists, mutation controls, command controls, bounded I/O, and extension trust are visible user decisions. |
-| **The terminal handles presentation** | Native scrollback and selection by default, opt-in semantic scrolling, semantic rendering, ten bundled themes, narrow layouts, and plain-output fallbacks share one terminal model. |
+| **The terminal handles presentation** | Native scrollback and selection by default, opt-in semantic scrolling, semantic rendering, eleven bundled themes, narrow layouts, and plain-output fallbacks share one terminal model. |
 | **Customization is local data** | Prompts, skills, themes, instructions, and extensions are ordinary files with deterministic precedence and reloadable snapshots. |
 
 ## Install
@@ -410,7 +410,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
 - Prompt colors tied to model labs in the default theme; named themes retain their own authored palettes.
 - Exact theme replacement: switching back to default does not retain attributes from the previous theme.
-- Ten bundled themes: `bone-machine`, `circuit-garden`, `field-notes`, `oxide-console`, `paper-ledger`, `signal-noir`, `synthwave-relay`, `tidepool`, `violet-hour`, and `zen-mono`.
+- Eleven bundled themes: `bone-machine`, `circuit-garden`, `field-notes`, `kawaii-pink`, `oxide-console`, `paper-ledger`, `signal-noir`, `synthwave-relay`, `tidepool`, `violet-hour`, and `zen-mono`.
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
@@ -427,7 +427,7 @@ and sent to the provider only when required to continue the tool protocol; live
 progress is neither persisted nor sent to the model.
 
 ```sh
-ygg --theme violet-hour
+ygg --theme kawaii-pink
 ygg --color auto
 ygg --mouse app
 ```

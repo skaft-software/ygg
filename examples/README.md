@@ -12,7 +12,7 @@ extension into a project.
   TOML form.
 - [`skills/`](skills/) — explicit, inspectable skills with bounded text
   resources.
-- [Bundled theme pack](../crates/ygg-coding-agent/themes/) — ten complete TOML
+- [Bundled theme pack](../crates/ygg-coding-agent/themes/) — eleven complete TOML
   themes that can also be copied and edited as project themes.
 - [`extensions/hello-world/`](extensions/hello-world/) — a minimal executable
   JSON-RPC extension.
