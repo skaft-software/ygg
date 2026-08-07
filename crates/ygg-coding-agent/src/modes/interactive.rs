@@ -266,8 +266,8 @@ where
                         shell.complete_slash_command();
                         shell.render();
                     }
-                    InputAction::CompleteMention => {
-                        shell.complete_mention();
+                    InputAction::CompletePath => {
+                        shell.complete_path();
                         shell.render();
                     }
                     InputAction::Edit(action) => {
@@ -993,8 +993,8 @@ where
                         shell.slash_menu(action);
                         shell.render();
                     }
-                    InputAction::CompleteMention => {
-                        shell.complete_mention();
+                    InputAction::CompletePath => {
+                        shell.complete_path();
                         shell.render();
                     }
                     InputAction::Abort => {

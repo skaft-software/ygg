@@ -55,6 +55,23 @@ pub fn media_kind_for_path(path: &Path) -> Option<MediaKind> {
     }
 }
 
+fn unescape_path_token(text: &str) -> String {
+    let mut unescaped = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\'
+            && characters
+                .peek()
+                .is_some_and(|next| *next == '\\' || next.is_whitespace())
+        {
+            unescaped.push(characters.next().expect("peeked escaped character"));
+        } else {
+            unescaped.push(character);
+        }
+    }
+    unescaped
+}
+
 /// Interpret a paste payload as a dropped/pasted file path, if it is one.
 ///
 /// Terminals deliver drag-drops as the path text, variously shell-escaped
@@ -70,7 +87,7 @@ pub fn parse_dropped_path(text: &str) -> Option<PathBuf> {
         .and_then(|s| s.strip_suffix('\''))
         .or_else(|| trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
         .unwrap_or(trimmed);
-    let unescaped = unquoted.replace("\\ ", " ");
+    let unescaped = unescape_path_token(unquoted);
     let expanded = if let Some(rest) = unescaped.strip_prefix("file://") {
         let path = if rest == "localhost" {
             String::new()
@@ -269,13 +286,49 @@ pub fn workspace_files(root: &Path, cap: usize) -> Vec<String> {
     files
 }
 
+fn active_token(text: &str) -> Option<&str> {
+    let mut token_start = 0;
+    let mut escaped = false;
+    for (index, character) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+        } else if character.is_whitespace() {
+            token_start = index + character.len_utf8();
+        }
+    }
+    (token_start < text.len()).then(|| &text[token_start..])
+}
+
 /// The mention query when the text ends in an `@`-prefixed token.
 pub fn active_mention(text: &str) -> Option<&str> {
-    if text.starts_with('/') || text.chars().last().is_some_and(char::is_whitespace) {
+    active_token(text)?.strip_prefix('@')
+}
+
+/// Whether a mention query should be completed by walking one filesystem
+/// directory instead of fuzzy-matching the workspace file index.
+pub fn is_path_query(query: &str) -> bool {
+    query.starts_with(['.', '~', '/']) || query.contains('/')
+}
+
+/// A trailing literal path token eligible for Tab completion.
+///
+/// Bare words are deliberately excluded so Tab remains inert while writing
+/// prose. A leading slash is treated as a path only when it is distinguishable
+/// from a slash command; command arguments can always contain path tokens.
+pub fn active_path(text: &str) -> Option<&str> {
+    let token = active_token(text)?;
+    if token.starts_with('@') || token.contains("://") || !is_path_query(token) {
         return None;
     }
-    let token = text.split_whitespace().next_back()?;
-    token.strip_prefix('@')
+    let token_is_entire_input = text.trim_start() == token;
+    if token.starts_with('/') && token_is_entire_input && !looks_like_absolute_path(token) {
+        return None;
+    }
+    Some(token)
 }
 
 /// Case-insensitive substring match on relative paths; earlier and shorter
@@ -573,71 +626,121 @@ pub fn compose(display_text: String, ledger: &mut AttachmentLedger) -> ComposedI
     }
 }
 
-/// Live filesystem listing for path-like mention queries. Returns up to
-/// `limit` workspace-relative paths matching `query`. Supports `../../`
-/// traversal, directory browsing, and extension filtering.
-pub fn live_path_matches(root: &std::path::PathBuf, query: &str, limit: usize) -> Vec<String> {
-    use std::path::Path;
-
-    let mut results: Vec<String> = Vec::new();
-    let expanded = if query.starts_with('~') {
-        if let Some(home) = dirs::home_dir() {
-            query.replacen('~', &home.display().to_string(), 1)
-        } else {
-            query.to_string()
+fn escape_path_token(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character == '\\' || character.is_whitespace() {
+            escaped.push('\\');
         }
-    } else {
-        query.to_string()
-    };
-
-    let abs = if expanded.starts_with('/') {
-        Path::new(&expanded).to_path_buf()
-    } else {
-        root.join(&expanded)
-    };
-
-    let (search_dir, prefix) = if expanded.ends_with('/') {
-        (abs.clone(), String::new())
-    } else {
-        match abs.parent() {
-            Some(parent) if parent.starts_with(root) || expanded.starts_with('/') => (
-                parent.to_path_buf(),
-                abs.file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-            ),
-            _ => (abs.clone(), String::new()),
-        }
-    };
-
-    if let Ok(entries) = std::fs::read_dir(&search_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if name.starts_with('.') && !prefix.starts_with('.') {
-                continue;
-            }
-            if !prefix.is_empty() && !name.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                continue;
-            }
-            let Ok(rel) = path.strip_prefix(root) else {
-                continue;
-            };
-            let rel_str = rel.display().to_string();
-            if path.is_dir() {
-                results.push(format!("{rel_str}/"));
-            } else {
-                results.push(rel_str);
-            }
-            if results.len() >= limit {
-                break;
-            }
-        }
+        escaped.push(character);
     }
-    results
+    escaped
+}
+
+/// One filesystem path offered to the composer for Tab completion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathSuggestion {
+    /// Text that replaces the active query, preserving `./`, `../`, `~/`, or
+    /// absolute syntax from the user's input.
+    pub completion: String,
+    /// Resolved path used for attachment classification and reads.
+    pub path: PathBuf,
+    /// Directories remain active after completion so another Tab can descend.
+    pub is_dir: bool,
+}
+
+/// List entries matching a path-shaped query.
+///
+/// Only the query's immediate directory is read. Relative, parent, home, and
+/// absolute prefixes are preserved in the returned completion text; whitespace
+/// is backslash-escaped, and hidden entries appear only after the user starts a
+/// basename with `.`.
+pub fn path_matches(root: &Path, query: &str, limit: usize) -> Vec<PathSuggestion> {
+    const MAX_SCANNED_ENTRIES: usize = 10_000;
+
+    if limit == 0 {
+        return Vec::new();
+    }
+    let query = unescape_path_token(query);
+
+    // These directory aliases do not appear in read_dir(), but completing them
+    // first makes `.` / `..` / `~` behave like an ordinary shell prompt.
+    let directory_alias = match query.as_str() {
+        "." => Some(("./", root.to_path_buf())),
+        ".." => Some(("../", root.join(".."))),
+        "~" => dirs::home_dir().map(|home| ("~/", home)),
+        _ => None,
+    };
+    if let Some((completion, path)) = directory_alias {
+        return if path.is_dir() {
+            vec![PathSuggestion {
+                completion: completion.to_owned(),
+                path,
+                is_dir: true,
+            }]
+        } else {
+            Vec::new()
+        };
+    }
+
+    // `~other-user` expansion is intentionally unsupported: dirs::home_dir()
+    // resolves only the current user's home, so guessing would produce a path
+    // that looks valid but points somewhere else.
+    if query.starts_with('~') && !query.starts_with("~/") {
+        return Vec::new();
+    }
+
+    let basename_start = query.rfind('/').map_or(0, |index| index + 1);
+    let directory_prefix = &query[..basename_start];
+    let basename_prefix = &query[basename_start..];
+    let search_dir = if let Some(home_relative) = directory_prefix.strip_prefix("~/") {
+        let Some(home) = dirs::home_dir() else {
+            return Vec::new();
+        };
+        home.join(home_relative)
+    } else if Path::new(directory_prefix).is_absolute() {
+        PathBuf::from(directory_prefix)
+    } else {
+        root.join(directory_prefix)
+    };
+
+    let Ok(entries) = fs::read_dir(search_dir) else {
+        return Vec::new();
+    };
+    let folded_prefix = basename_prefix.to_lowercase();
+    let mut suggestions = Vec::new();
+    for entry in entries.flatten().take(MAX_SCANNED_ENTRIES) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.chars().any(char::is_control)
+            || (name.starts_with('.') && !basename_prefix.starts_with('.'))
+        {
+            continue;
+        }
+        if !name.to_lowercase().starts_with(&folded_prefix) {
+            continue;
+        }
+
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        if !is_dir && !path.is_file() {
+            continue;
+        }
+        let completion = format!("{directory_prefix}{name}{}", if is_dir { "/" } else { "" });
+        suggestions.push(PathSuggestion {
+            completion: escape_path_token(&completion),
+            path,
+            is_dir,
+        });
+    }
+
+    suggestions.sort_by(|left, right| {
+        left.completion
+            .to_lowercase()
+            .cmp(&right.completion.to_lowercase())
+            .then_with(|| left.completion.cmp(&right.completion))
+    });
+    suggestions.truncate(limit);
+    suggestions
 }
 
 #[cfg(test)]
@@ -784,9 +887,93 @@ mod tests {
     fn active_mention_is_the_trailing_at_token() {
         assert_eq!(active_mention("look at @sr"), Some("sr"));
         assert_eq!(active_mention("@"), Some(""));
+        assert_eq!(active_mention("/prompt review @src"), Some("src"));
+        assert_eq!(active_mention(r"inspect @./My\ Fo"), Some(r"./My\ Fo"));
         assert_eq!(active_mention("email a@b.com"), None);
         assert_eq!(active_mention("no mention"), None);
         assert_eq!(active_mention("ends with space @x "), None);
+    }
+
+    #[test]
+    fn active_literal_paths_do_not_capture_prose_urls_or_slash_commands() {
+        assert_eq!(active_path("inspect ./sr"), Some("./sr"));
+        assert_eq!(active_path("../notes"), Some("../notes"));
+        assert_eq!(active_path("/tmp/new-file"), Some("/tmp/new-file"));
+        assert_eq!(active_path("/export ./session.md"), Some("./session.md"));
+        assert_eq!(active_path(r"inspect ./My\ Fo"), Some(r"./My\ Fo"));
+        assert_eq!(active_path("plain"), None);
+        assert_eq!(active_path("https://example.com/file"), None);
+        assert_eq!(active_path("@./src"), None);
+        assert_eq!(active_path("/model"), None);
+    }
+
+    #[test]
+    fn path_matches_preserve_prefixes_and_keep_directories_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::create_dir_all(workspace.join("My Folder")).unwrap();
+        fs::write(workspace.join("src/main.rs"), b"x").unwrap();
+        fs::write(workspace.join("My Folder/draft note.md"), b"x").unwrap();
+        fs::write(dir.path().join("sibling.md"), b"x").unwrap();
+
+        let relative = path_matches(&workspace, "./sr", 5);
+        assert_eq!(relative.len(), 1);
+        assert_eq!(relative[0].completion, "./src/");
+        assert!(relative[0].is_dir);
+
+        let child = path_matches(&workspace, "./src/ma", 5);
+        assert_eq!(child.len(), 1);
+        assert_eq!(child[0].completion, "./src/main.rs");
+        assert!(!child[0].is_dir);
+
+        let parent = path_matches(&workspace, "../sib", 5);
+        assert_eq!(parent.len(), 1);
+        assert_eq!(parent[0].completion, "../sibling.md");
+        assert_eq!(
+            parent[0].path.canonicalize().unwrap(),
+            dir.path().join("sibling.md").canonicalize().unwrap()
+        );
+
+        let spaced_directory = path_matches(&workspace, "./My", 5);
+        assert_eq!(spaced_directory[0].completion, r"./My\ Folder/");
+        let spaced_file = path_matches(&workspace, r"./My\ Folder/dra", 5);
+        assert_eq!(spaced_file[0].completion, r"./My\ Folder/draft\ note.md");
+        assert_eq!(
+            spaced_file[0].path,
+            workspace.join("My Folder/draft note.md")
+        );
+    }
+
+    #[test]
+    fn path_matches_support_absolute_paths_sort_and_hide_dotfiles_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("beta.txt"), b"x").unwrap();
+        fs::write(dir.path().join("Alpha.txt"), b"x").unwrap();
+        fs::write(dir.path().join(".secret"), b"x").unwrap();
+
+        let query = format!("{}/", dir.path().display());
+        let matches = path_matches(dir.path(), &query, 10);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|suggestion| suggestion.completion.as_str())
+                .collect::<Vec<_>>(),
+            vec![format!("{query}Alpha.txt"), format!("{query}beta.txt")]
+        );
+
+        let hidden = path_matches(dir.path(), &format!("{query}.s"), 10);
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].completion, format!("{query}.secret"));
+        assert!(path_matches(dir.path(), &query, 0).is_empty());
+    }
+
+    #[test]
+    fn path_directory_aliases_complete_before_they_are_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(path_matches(dir.path(), ".", 1)[0].completion, "./");
+        assert_eq!(path_matches(dir.path(), "..", 1)[0].completion, "../");
+        assert_eq!(path_matches(dir.path(), "~", 1)[0].completion, "~/");
     }
 
     #[test]

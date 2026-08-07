@@ -16,7 +16,7 @@ pub enum InputAction {
     Command(String),
     CompleteSlashCommand,
     SlashMenu(SlashMenuAction),
-    CompleteMention,
+    CompletePath,
     ShowCompactionSummary,
     /// Toggle verbose transcript mode for all expandable blocks (ctrl+o).
     ExpandFocusedTool,
@@ -195,11 +195,11 @@ pub fn translate_with_popup(
                 return InputAction::Edit(EditAction::Newline);
             }
 
-            let slash_menu = slash_popup_open
-                && editor_text.starts_with('/')
+            let slash_command = editor_text.starts_with('/')
                 && !editor_text.chars().any(char::is_whitespace)
                 && (editor_text == "/"
                     || !crate::tui::composer::looks_like_absolute_path(editor_text));
+            let slash_menu = slash_popup_open && slash_command;
             if slash_menu && key.modifiers.is_empty() {
                 let action = match key.code {
                     KeyCode::Up => Some(SlashMenuAction::Previous),
@@ -250,18 +250,15 @@ pub fn translate_with_popup(
             {
                 return InputAction::Command(editor_text.to_owned());
             }
-            if key.code == KeyCode::Tab
-                && key.modifiers.is_empty()
-                && editor_text.starts_with('/')
-                && !crate::tui::composer::looks_like_absolute_path(editor_text)
-            {
+            if key.code == KeyCode::Tab && key.modifiers.is_empty() && slash_command {
                 return InputAction::CompleteSlashCommand;
             }
             if key.code == KeyCode::Tab
                 && key.modifiers.is_empty()
-                && crate::tui::composer::active_mention(editor_text).is_some()
+                && (crate::tui::composer::active_mention(editor_text).is_some()
+                    || crate::tui::composer::active_path(editor_text).is_some())
             {
-                return InputAction::CompleteMention;
+                return InputAction::CompletePath;
             }
 
             if key.code == KeyCode::BackTab
@@ -527,7 +524,7 @@ mod tests {
                 false,
                 "/Users/example/project/new-file.txt"
             ),
-            InputAction::Ignore
+            InputAction::CompletePath
         );
     }
 
@@ -544,14 +541,30 @@ mod tests {
     }
 
     #[test]
-    fn tab_on_trailing_at_token_requests_mention_completion() {
+    fn tab_requests_mention_and_literal_path_completion() {
         assert_eq!(
             translate(
                 Some(key(KeyCode::Tab, KeyModifiers::NONE)),
                 false,
                 "see @sr"
             ),
-            InputAction::CompleteMention
+            InputAction::CompletePath
+        );
+        assert_eq!(
+            translate(
+                Some(key(KeyCode::Tab, KeyModifiers::NONE)),
+                false,
+                "inspect ./src/ma"
+            ),
+            InputAction::CompletePath
+        );
+        assert_eq!(
+            translate(
+                Some(key(KeyCode::Tab, KeyModifiers::NONE)),
+                false,
+                "/export ../session"
+            ),
+            InputAction::CompletePath
         );
         assert_eq!(
             translate(Some(key(KeyCode::Tab, KeyModifiers::NONE)), false, "plain"),
