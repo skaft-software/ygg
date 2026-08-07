@@ -972,6 +972,18 @@ impl SessionStore {
         candidates
     }
 
+    /// Lists safe regular JSONL filename stems without parsing transcript content.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn session_file_ids(&self) -> Vec<String> {
+        self.candidates()
+            .into_iter()
+            .filter_map(|candidate| {
+                let id = candidate.path.file_stem()?.to_str()?.to_owned();
+                session_id_is_valid(&id).then_some(id)
+            })
+            .collect()
+    }
+
     fn summarize(&self, candidate: SessionCandidate) -> Option<SessionMeta> {
         let fallback_title = match summarize_session(&candidate.path) {
             Ok(Some(title)) => title,
@@ -2146,12 +2158,16 @@ mod tests {
         }
         assert!(store.path_by_id("directory").is_err());
         assert!(store.session_file_exists("directory").is_err());
+        let mut session_file_ids = store.session_file_ids();
+        session_file_ids.sort();
+        assert_eq!(session_file_ids, vec!["one", "unrelated"]);
 
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&one_path, store.dir().join("linked.jsonl")).unwrap();
             assert!(store.path_by_id("linked").is_err());
             assert!(store.session_file_exists("linked").is_err());
+            assert!(!store.session_file_ids().iter().any(|id| id == "linked"));
             assert!(!store.list().iter().any(|session| {
                 session.path.file_stem().and_then(|stem| stem.to_str()) == Some("linked")
             }));
