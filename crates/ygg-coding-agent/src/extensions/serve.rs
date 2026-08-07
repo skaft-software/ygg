@@ -292,27 +292,14 @@ impl YggHost {
         let (themes, selected_theme_id) = graphical_themes(&config)?;
         let state_dir = secure_serve_state_dir(&config.session_dir)?;
         let mut projects = ProjectRegistry::open(state_dir.join("projects"))?;
-        let existing_session_ids = boot
-            .sessions
-            .list()
-            .into_iter()
-            .map(|meta| meta.id)
-            .collect::<Vec<_>>();
         let launch_project = match projects.find_by_root(&config.workspace)? {
-            Some(project) => {
-                projects
-                    .bind_sessions(&project.id, existing_session_ids.iter().map(String::as_str))?;
-                project
-            }
-            None => projects.import_with_sessions(
-                &config.workspace,
-                Some(workspace_name),
-                existing_session_ids.iter().map(String::as_str),
-            )?,
+            Some(project) => project,
+            None => projects.import(&config.workspace, Some(workspace_name))?,
         };
         if config.workspace_trusted && launch_project.state == RegistryProjectState::Untrusted {
             projects.grant_trust(&launch_project.id)?;
         }
+        reconcile_session_bindings(&config, &mut projects, Some(&launch_project.id))?;
         if projects.default_project().is_none()
             && launch_project.state != RegistryProjectState::Archived
         {
@@ -508,15 +495,13 @@ impl YggHost {
     }
 
     fn default_selection(&self) -> Result<ModelSelection, ServiceError> {
-        if let Some(model_id) = &self.config.model {
-            let summary = self
-                .models
-                .iter()
-                .find(|summary| summary.id == model_id.0)
-                .ok_or(ServiceError::InvalidSeed)?;
-            return Ok(selection_from_summary(summary));
-        }
-        let summary = self.models.first().ok_or(ServiceError::InvalidSeed)?;
+        let summary = self
+            .config
+            .model
+            .as_ref()
+            .and_then(|model_id| self.models.iter().find(|summary| summary.id == model_id.0))
+            .or_else(|| self.models.first())
+            .ok_or(ServiceError::InvalidSeed)?;
         Ok(selection_from_summary(summary))
     }
 
@@ -567,7 +552,11 @@ impl YggHost {
         session_id: &SessionId,
     ) -> Result<ProjectContext, ServiceError> {
         let project_id = {
-            let projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
+            let mut projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
+            if projects.project_for_session(session_id.as_str()).is_none() {
+                reconcile_session_bindings(&self.config, &mut projects, None)
+                    .map_err(project_registry_service_error)?;
+            }
             projects
                 .project_for_session(session_id.as_str())
                 .ok_or(ServiceError::NotFound)?
@@ -691,8 +680,9 @@ impl YggHost {
             .path_by_id(session_id.as_str())
             .map_err(|_| ServiceError::NotFound)?;
         let session = Session::open_read_only(&path).map_err(|_| ServiceError::InvalidSeed)?;
-        let selection = selection_from_session(&session, &self.catalog, &self.config)
-            .or_else(|_| self.default_selection())?;
+        let selection =
+            advertised_selection_from_session(&session, &self.catalog, &self.config, &self.models)
+                .map_or_else(|| self.default_selection(), Ok)?;
         let generation = next_actor_generation();
         let seed = seed_from_session(
             &session,
@@ -742,6 +732,65 @@ impl YggHost {
         let known_entries = session.entries().len();
         Ok(YggSessionDriver::spawn(seed, plan, known_entries))
     }
+}
+
+fn reconcile_session_bindings(
+    config: &Config,
+    projects: &mut ProjectRegistry,
+    include_untrusted: Option<&RegistryProjectId>,
+) -> Result<(), ProjectRegistryError> {
+    let eligible = projects
+        .list()
+        .into_iter()
+        .filter_map(|project| {
+            let explicitly_included = include_untrusted == Some(&project.id);
+            (project.state == RegistryProjectState::Trusted || explicitly_included)
+                .then_some((project.id, explicitly_included))
+        })
+        .collect::<Vec<_>>();
+    let mut candidates = BTreeMap::<String, RegistryProjectId>::new();
+    let mut ambiguous = BTreeSet::new();
+
+    for (project_id, explicitly_included) in &eligible {
+        let root = if *explicitly_included {
+            projects.resolve_root(project_id)
+        } else {
+            projects.resolve_trusted_root(project_id)
+        };
+        let Ok(root) = root else {
+            continue;
+        };
+        let sessions = SessionStore::new(&config.session_dir, root.as_path());
+        for session_id in sessions.session_file_ids() {
+            if projects.project_for_session(&session_id).is_some()
+                || SessionId::new(session_id.clone()).is_err()
+                || ambiguous.contains(&session_id)
+            {
+                continue;
+            }
+            match candidates.get(&session_id) {
+                Some(existing) if existing != project_id => {
+                    candidates.remove(&session_id);
+                    ambiguous.insert(session_id);
+                }
+                Some(_) => {}
+                None => {
+                    candidates.insert(session_id, project_id.clone());
+                }
+            }
+        }
+    }
+
+    for (project_id, _) in eligible {
+        let session_ids = candidates
+            .iter()
+            .filter_map(|(session_id, candidate)| {
+                (candidate == &project_id).then_some(session_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        projects.bind_sessions(&project_id, session_ids)?;
+    }
+    Ok(())
 }
 
 fn backfill_usage_store(
@@ -1588,8 +1637,11 @@ impl HostService for YggHost {
 
     async fn list_projects(&self) -> Result<Vec<ProjectSummary>, ServiceError> {
         let projects = Arc::clone(&self.projects);
+        let config = self.config.clone();
         tokio::task::spawn_blocking(move || {
-            let projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            let mut projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            reconcile_session_bindings(&config, &mut projects, None)
+                .map_err(project_registry_service_error)?;
             projects
                 .list()
                 .into_iter()
@@ -1678,6 +1730,7 @@ impl HostService for YggHost {
         let project_id = registry_project_id(project_id)?;
         let launch_project_id = self.launch_project_id.clone();
         let launch_workspace = self.config.workspace.clone();
+        let config = self.config.clone();
         tokio::task::spawn_blocking(move || {
             let mut projects = projects.lock().map_err(|_| ServiceError::Internal)?;
             let project = if trusted {
@@ -1694,6 +1747,10 @@ impl HostService for YggHost {
                 projects.revoke_trust(&project_id)
             }
             .map_err(project_registry_service_error)?;
+            if trusted {
+                reconcile_session_bindings(&config, &mut projects, None)
+                    .map_err(project_registry_service_error)?;
+            }
             public_project_summary(&projects, project)
         })
         .await
@@ -1742,9 +1799,14 @@ impl HostService for YggHost {
         let selection = Session::open_read_only(&meta.path)
             .ok()
             .and_then(|session| {
-                selection_from_session(&session, &self.catalog, &context.config).ok()
+                advertised_selection_from_session(
+                    &session,
+                    &self.catalog,
+                    &context.config,
+                    &self.models,
+                )
             })
-            .unwrap_or(self.default_selection()?);
+            .map_or_else(|| self.default_selection(), Ok)?;
         summary_from_meta(&meta, Some(context.project_id), selection)
     }
 
@@ -1827,9 +1889,12 @@ impl HostService for YggHost {
         let fallback = self.default_selection()?;
         let projects = Arc::clone(&self.projects);
         let catalog = self.catalog.clone();
+        let models = self.models.clone();
         let base_config = self.config.clone();
         tokio::task::spawn_blocking(move || {
-            let projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            let mut projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+            reconcile_session_bindings(&base_config, &mut projects, None)
+                .map_err(project_registry_service_error)?;
             let mut summaries = Vec::new();
             for project in projects.list() {
                 if summaries.len() >= 2_000 || project.state == RegistryProjectState::Archived {
@@ -1856,7 +1921,12 @@ impl HostService for YggHost {
                     let selection = Session::open_read_only(&meta.path)
                         .ok()
                         .and_then(|session| {
-                            selection_from_session(&session, &catalog, &project_config).ok()
+                            advertised_selection_from_session(
+                                &session,
+                                &catalog,
+                                &project_config,
+                                &models,
+                            )
                         })
                         .unwrap_or_else(|| fallback.clone());
                     if let Ok(summary) =
@@ -8284,6 +8354,21 @@ fn selection_from_session(
     Ok(selection_for_model(&model, &reasoning, config))
 }
 
+fn advertised_selection_from_session(
+    session: &Session,
+    catalog: &ModelCatalog,
+    config: &Config,
+    models: &[ModelSummary],
+) -> Option<ModelSelection> {
+    selection_from_session(session, catalog, config)
+        .ok()
+        .filter(|selection| {
+            models
+                .iter()
+                .any(|model| model.provider == selection.provider && model.id == selection.model)
+        })
+}
+
 fn current_selection(plan: &WorkerPlan) -> ModelSelection {
     let summary = plan
         .available_models
@@ -8959,6 +9044,164 @@ mod tests {
         config.session_dir = directory.join("sessions");
         config.workspace_trusted = trusted;
         config
+    }
+
+    const REMOVED_MODEL_ID: &str = "removed-provider/retired-model";
+
+    fn configure_removed_model(config: &mut Config) {
+        config.model = Some(ModelId(REMOVED_MODEL_ID.into()));
+        config.model_explicit = true;
+    }
+
+    #[tokio::test]
+    async fn inventory_bootstrap_falls_back_when_the_configured_model_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        configure_removed_model(&mut config);
+        let host = YggHost::new(config).unwrap();
+        let supervisor = SessionSupervisor::new(Arc::new(host), SupervisorConfig::default());
+
+        let bootstrap = supervisor.inventory_bootstrap().await.unwrap();
+        assert!(!bootstrap.models.is_empty());
+        bootstrap.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_session_in_another_registered_project_is_reconciled_and_resumable() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_dir = directory.path().join("sessions");
+        let first_workspace = directory.path().join("first-workspace");
+        let launch_workspace = directory.path().join("launch-workspace");
+        std::fs::create_dir_all(&first_workspace).unwrap();
+        std::fs::create_dir_all(&launch_workspace).unwrap();
+        let first_workspace = first_workspace.canonicalize().unwrap();
+        let launch_workspace = launch_workspace.canonicalize().unwrap();
+
+        let mut first_config = serve_test_config(&first_workspace);
+        first_config.session_dir = session_dir.clone();
+        let first_host = YggHost::new(first_config).unwrap();
+        let first_project_id = first_host.launch_project_id.clone();
+        let terminal_selection = first_host.default_selection().unwrap();
+        drop(first_host);
+
+        let sessions = SessionStore::new(&session_dir, &first_workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let session_id = SessionId::new("terminal-created-session").unwrap();
+        let mut session =
+            Session::create(sessions.dir().join("terminal-created-session.jsonl")).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("created in the terminal".into())],
+            })))
+            .unwrap();
+        session
+            .append(EntryValue::Config {
+                model: Some(terminal_selection.model.clone()),
+                reasoning: Some(terminal_selection.reasoning.clone()),
+                reasoning_mode: Some("standard".into()),
+            })
+            .unwrap();
+        drop(session);
+
+        let mut launch_config = serve_test_config(&launch_workspace);
+        launch_config.session_dir = session_dir;
+        let host = YggHost::new(launch_config).unwrap();
+
+        assert_eq!(
+            host.projects
+                .lock()
+                .unwrap()
+                .project_for_session(session_id.as_str()),
+            Some(registry_project_id(&first_project_id).unwrap())
+        );
+        let summary = host
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == session_id)
+            .unwrap();
+        assert_eq!(summary.project_id, Some(first_project_id));
+        assert_eq!(summary.model, terminal_selection);
+
+        let mut driver = host.open_session(&session_id).await.unwrap();
+        assert_eq!(driver.seed().summary.model, terminal_selection);
+        driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn serve_created_session_resumes_when_its_historical_model_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        config.workspace = config.workspace.canonicalize().unwrap();
+        config.invocation_cwd = config.workspace.clone();
+        let host = YggHost::new(config.clone()).unwrap();
+        let project_id = host.launch_project_id.clone();
+        let mut driver = host
+            .create_session(CreateSessionRequest {
+                project_id: Some(project_id.clone()),
+                provisional: true,
+                authority: AuthorityProfile::FullAccess,
+                model: None,
+            })
+            .await
+            .unwrap();
+        let created_seed = driver.seed();
+        let session_id = created_seed.summary.id;
+        let historical_selection = created_seed.summary.model;
+        driver.command_discovery().await.unwrap();
+        driver.shutdown().await;
+
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        let path = sessions.path_by_id(session_id.as_str()).unwrap();
+        let mut session = Session::open(path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("created in Serve".into())],
+            })))
+            .unwrap();
+        session
+            .append(EntryValue::Config {
+                model: Some(historical_selection.model.clone()),
+                reasoning: Some(historical_selection.reasoning.clone()),
+                reasoning_mode: Some("standard".into()),
+            })
+            .unwrap();
+        drop(session);
+        drop(host);
+
+        let mut reopened = YggHost::new(config).unwrap();
+        assert!(reopened
+            .catalog
+            .resolve(&ModelId(historical_selection.model.clone()))
+            .is_ok());
+        let advertised_model_count = reopened.models.len();
+        reopened.models.retain(|model| {
+            model.provider != historical_selection.provider
+                || model.id != historical_selection.model
+        });
+        assert!(!reopened.models.is_empty());
+        assert!(reopened.models.len() < advertised_model_count);
+        let summary = reopened
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == session_id)
+            .unwrap();
+        assert_eq!(summary.project_id, Some(project_id));
+        assert_ne!(summary.model, historical_selection);
+        assert!(reopened.models.iter().any(|model| {
+            model.provider == summary.model.provider && model.id == summary.model.model
+        }));
+
+        let mut resumed = reopened.open_session(&session_id).await.unwrap();
+        let resumed_selection = resumed.seed().summary.model;
+        assert_ne!(resumed_selection, historical_selection);
+        assert!(reopened.models.iter().any(|model| {
+            model.provider == resumed_selection.provider && model.id == resumed_selection.model
+        }));
+        resumed.shutdown().await;
     }
 
     #[test]
