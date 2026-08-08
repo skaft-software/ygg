@@ -943,6 +943,13 @@ export type SessionEvent =
       >;
     }
   | {
+      type: "session.pullRequestChanged";
+      sessionId: string;
+      actorGeneration?: number;
+      sequence: number;
+      pullRequest: NonNullable<SessionSummary["pullRequest"]> | null;
+    }
+  | {
       /** Complete replayable replacement emitted by context.updated. */
       type: "context.updated";
       sessionId: string;

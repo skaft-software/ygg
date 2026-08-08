@@ -38,6 +38,22 @@ describe("fleet command center", () => {
       screen.getByRole("button", { name: "Show complete tasks, 1" }),
     ).toBeVisible();
 
+    const pullRequestMetrics = screen.getByRole("region", {
+      name: "Pull request status overview",
+    });
+    expect(pullRequestMetrics.querySelector(".is-created dd")).toHaveTextContent(
+      "3",
+    );
+    expect(
+      pullRequestMetrics.querySelector(".is-created small"),
+    ).toHaveTextContent("1 in progress");
+    expect(pullRequestMetrics.querySelector(".is-ready dd")).toHaveTextContent(
+      "1",
+    );
+    expect(pullRequestMetrics.querySelector(".is-merged dd")).toHaveTextContent(
+      "1",
+    );
+
     const rows = screen.getAllByRole("button", { name: /^Open task/ });
     expect(rows[0]).toHaveAccessibleName(
       "Open task Prepare signed macOS build, Needs you, ygg",

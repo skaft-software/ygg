@@ -631,6 +631,91 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("keeps catalog PR evidence authoritative while session events advance replay", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+    const summary = () =>
+      store
+        .getSnapshot()
+        .bootstrap?.sessions.find((candidate) => candidate.id === "session-fresh");
+
+    transport.emit({
+      type: "session.pullRequestChanged",
+      sessionId: "session-fresh",
+      sequence: 2,
+      pullRequest: { state: "ready" },
+    });
+    await nextFrame();
+    expect(summary()?.pullRequest).toBeUndefined();
+    expect(store.selectedSession?.sequence).toBe(2);
+
+    transport.emit({
+      type: "catalog.summary",
+      catalogRevision: fixtureBootstrap.catalogRevision + 1,
+      summary: { ...summary()!, pullRequest: { state: "ready" } },
+    });
+    await nextFrame();
+    expect(summary()?.pullRequest).toEqual({ state: "ready" });
+
+    transport.emit({
+      type: "catalog.summary",
+      catalogRevision: fixtureBootstrap.catalogRevision + 2,
+      summary: { ...summary()!, pullRequest: { state: "merged" } },
+    });
+    await nextFrame();
+    expect(summary()?.pullRequest).toEqual({ state: "merged" });
+
+    // This event is valid for the loaded session cursor but was delayed behind
+    // the newer authoritative catalog projection.
+    transport.emit({
+      type: "session.pullRequestChanged",
+      sessionId: "session-fresh",
+      sequence: 3,
+      pullRequest: { state: "in_progress" },
+    });
+    await nextFrame();
+    expect(summary()?.pullRequest).toEqual({ state: "merged" });
+    expect(store.selectedSession?.sequence).toBe(3);
+    store.dispose();
+  });
+
+  it("keeps catalog PR evidence authoritative for unloaded sessions", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+    const background = clone(
+      fixtureBootstrap.sessions.find(
+        (summary) => summary.id === "session-live",
+      )!,
+    );
+
+    transport.emit({
+      type: "catalog.summary",
+      catalogRevision: fixtureBootstrap.catalogRevision + 1,
+      summary: { ...background, pullRequest: { state: "merged" } },
+    });
+    await nextFrame();
+    expect(store.getSnapshot().sessions[background.id]).toBeUndefined();
+
+    transport.emit({
+      type: "session.pullRequestChanged",
+      sessionId: background.id,
+      actorGeneration: 1,
+      sequence: 1,
+      pullRequest: { state: "in_progress" },
+    });
+    await nextFrame();
+
+    expect(
+      store
+        .getSnapshot()
+        .bootstrap?.sessions.find((summary) => summary.id === background.id)
+        ?.pullRequest,
+    ).toEqual({ state: "merged" });
+    store.dispose();
+  });
+
   it("does not regress a host-derived title to an untitled snapshot or catalog summary", async () => {
     const transport = new TestTransport();
     const title = "Keep the new-session title stable";

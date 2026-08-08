@@ -2,6 +2,7 @@ import {
   Archive,
   ArchiveRestore,
   BarChart3,
+  ChevronRight,
   Folder,
   Files,
   GitMerge,
@@ -23,6 +24,7 @@ import {
   Fragment,
   memo,
   useEffect,
+  useId,
   useRef,
   useState,
 } from "react";
@@ -239,6 +241,7 @@ function SessionRow({
       onClick={onSelect}
       aria-current={selected ? "page" : undefined}
       aria-label={`Open task ${displayTitle}, ${sessionStatusLabel[session.status]}${pullRequestLabel}`}
+      title={displayTitle}
       data-status={session.status}
     >
       <span className="session-row-title">
@@ -283,6 +286,8 @@ function WorkspaceSection({
   project,
   sessions,
   selectedSessionId,
+  collapsed,
+  onToggle,
   onSelectSession,
   renderControls,
   searchHitsBySession,
@@ -291,22 +296,39 @@ function WorkspaceSection({
   project?: ProjectSummary;
   sessions: SessionSummary[];
   selectedSessionId: string | null;
+  collapsed: boolean;
+  onToggle: () => void;
   onSelectSession: (sessionId: string) => void;
   renderControls?: (session: SessionSummary) => ReactNode;
   searchHitsBySession?: ReadonlyMap<string, TranscriptSearchHit[]>;
   onActivateSearchResult?: (sessionId: string, itemId: string) => void;
 }) {
+  const sessionListId = useId();
   if (sessions.length === 0) return null;
   const title = project?.name ?? "Unassigned project";
+  const taskCountLabel = `${sessions.length} ${sessions.length === 1 ? "task" : "tasks"}`;
   return (
     <section className="workspace-section" aria-label={title}>
       <header className="workspace-section-heading">
-        <span className="workspace-name">
-          <Folder aria-hidden="true" />
-          <strong>{title}</strong>
-        </span>
+        <button
+          className="workspace-toggle"
+          type="button"
+          aria-expanded={!collapsed}
+          aria-controls={sessionListId}
+          aria-label={`${collapsed ? "Expand" : "Collapse"} project ${title}, ${taskCountLabel}`}
+          title={`${collapsed ? "Expand" : "Collapse"} ${title}`}
+          onClick={onToggle}
+        >
+          <ChevronRight className="workspace-chevron" aria-hidden="true" />
+          <span className="workspace-name">
+            <strong>{title}</strong>
+          </span>
+          <span className="workspace-task-count" aria-hidden="true">
+            {sessions.length}
+          </span>
+        </button>
       </header>
-      <div className="session-list">
+      <div className="session-list" id={sessionListId} hidden={collapsed}>
         {sessions.map((session) => {
           const controls = renderControls?.(session);
           const searchHits = searchHitsBySession?.get(session.id);
@@ -452,6 +474,23 @@ function SidebarView({
     };
   }, [blocked, onRestoreFocus, open]);
   const [query, setQuery] = useState("");
+  const selectedWorkspaceId = selectedSessionId
+    ? (sessions.find((session) => session.id === selectedSessionId)?.projectId ??
+      null)
+    : null;
+  const [workspaceCollapse, setWorkspaceCollapse] = useState<{
+    selectedSessionId: string | null;
+    selectedWorkspaceId: string | null;
+    searchQuery: string;
+    ids: Set<string>;
+    idsBeforeSearch: Set<string> | null;
+  }>(() => ({
+    selectedSessionId,
+    selectedWorkspaceId,
+    searchQuery: "",
+    ids: new Set(),
+    idsBeforeSearch: null,
+  }));
   const [selectedView, setSelectedView] =
     useState<SessionSummary["lifecycle"]>("active");
   const [pendingSessionId, setPendingSessionId] = useState<string | null>(null);
@@ -558,18 +597,86 @@ function SidebarView({
     ...projects
       .filter((project) => workspaceSessions.has(project.id))
       .map((project) => ({
+        workspaceId: project.id,
         project,
         sessions: workspaceSessions.get(project.id)!,
       })),
     ...Array.from(workspaceSessions.entries())
       .filter(([projectId]) => !projectsById.has(projectId))
-      .map(([, workspace]) => ({ project: undefined, sessions: workspace })),
+      .map(([projectId, workspace]) => ({
+        workspaceId: projectId,
+        project: undefined,
+        sessions: workspace,
+      })),
   ];
   for (const workspace of workspaces) {
     workspace.sessions.sort(
       (left, right) => Number(right.pinned) - Number(left.pinned),
     );
   }
+  const selectionChanged =
+    workspaceCollapse.selectedSessionId !== selectedSessionId ||
+    workspaceCollapse.selectedWorkspaceId !== selectedWorkspaceId;
+  const searchChanged = workspaceCollapse.searchQuery !== searchQuery;
+  let workspaceCollapseView = workspaceCollapse;
+  // Synchronize prop-driven reveals in the same commit so a selected or moved
+  // task never renders inside a project that is still collapsed.
+  if (selectionChanged || searchChanged) {
+    let ids = new Set(workspaceCollapse.ids);
+    let idsBeforeSearch = workspaceCollapse.idsBeforeSearch
+      ? new Set(workspaceCollapse.idsBeforeSearch)
+      : null;
+    if (searchChanged) {
+      // Search expansion is temporary; clearing the query restores each
+      // project's independent disclosure choice.
+      if (!workspaceCollapse.searchQuery && searchQuery) {
+        idsBeforeSearch = new Set(ids);
+        ids.clear();
+      } else if (workspaceCollapse.searchQuery && !searchQuery) {
+        ids = idsBeforeSearch ?? new Set();
+        idsBeforeSearch = null;
+      } else if (searchQuery) {
+        ids.clear();
+      }
+    }
+    if (selectionChanged && selectedWorkspaceId) {
+      ids.delete(selectedWorkspaceId);
+      idsBeforeSearch?.delete(selectedWorkspaceId);
+    }
+    workspaceCollapseView = {
+      selectedSessionId,
+      selectedWorkspaceId,
+      searchQuery,
+      ids,
+      idsBeforeSearch,
+    };
+    setWorkspaceCollapse(workspaceCollapseView);
+  }
+  const collapsedWorkspaceIds = workspaceCollapseView.ids;
+
+  const revealWorkspace = (workspaceId: string) => {
+    const ids = new Set(collapsedWorkspaceIds);
+    const idsBeforeSearch = workspaceCollapseView.idsBeforeSearch
+      ? new Set(workspaceCollapseView.idsBeforeSearch)
+      : null;
+    const collapsedChanged = ids.delete(workspaceId);
+    const savedChanged = idsBeforeSearch?.delete(workspaceId) ?? false;
+    if (collapsedChanged || savedChanged) {
+      setWorkspaceCollapse({
+        ...workspaceCollapseView,
+        ids,
+        idsBeforeSearch,
+      });
+    }
+  };
+
+  const toggleWorkspace = (workspaceId: string) => {
+    const ids = new Set(collapsedWorkspaceIds);
+    if (ids.has(workspaceId)) ids.delete(workspaceId);
+    else ids.add(workspaceId);
+    setWorkspaceCollapse({ ...workspaceCollapseView, ids });
+  };
+
   const activeCount = sessions.filter(
     (session) => session.lifecycle === "active",
   ).length;
@@ -948,21 +1055,30 @@ function SidebarView({
                       ? "Tasks"
                       : "Task history"}
                 </span>
-                <button type="button" onClick={onOpenProjects}>
-                  Manage
-                </button>
               </div>
               {workspaces.map((workspace) => (
                 <WorkspaceSection
-                  key={workspace.project?.id ?? workspace.sessions[0]!.projectId}
+                  key={workspace.workspaceId}
                   project={workspace.project}
                   sessions={workspace.sessions}
                   selectedSessionId={selectedSessionId}
-                  onSelectSession={onSelectSession}
+                  collapsed={collapsedWorkspaceIds.has(workspace.workspaceId)}
+                  onToggle={() => toggleWorkspace(workspace.workspaceId)}
+                  onSelectSession={(sessionId) => {
+                    revealWorkspace(workspace.workspaceId);
+                    onSelectSession(sessionId);
+                  }}
                   searchHitsBySession={
                     searchMode ? searchHitsBySession : undefined
                   }
-                  onActivateSearchResult={onActivateSearchResult}
+                  onActivateSearchResult={
+                    onActivateSearchResult
+                      ? (sessionId, itemId) => {
+                          revealWorkspace(workspace.workspaceId);
+                          onActivateSearchResult(sessionId, itemId);
+                        }
+                      : undefined
+                  }
                   renderControls={
                     !searchMode ? renderSessionControls : undefined
                   }

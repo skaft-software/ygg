@@ -155,6 +155,21 @@ export function FleetOverview({
     ],
     [activeSessions],
   );
+  const pullRequestMetrics = useMemo(() => {
+    const pullRequests = activeSessions.flatMap((session) =>
+      session.pullRequest ? [session.pullRequest] : [],
+    );
+    return {
+      created: pullRequests.length,
+      inProgress: pullRequests.filter(
+        (pullRequest) => pullRequest.state === "in_progress",
+      ).length,
+      ready: pullRequests.filter((pullRequest) => pullRequest.state === "ready")
+        .length,
+      merged: pullRequests.filter((pullRequest) => pullRequest.state === "merged")
+        .length,
+    };
+  }, [activeSessions]);
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const visibleSessions = useMemo(
     () =>
@@ -234,6 +249,33 @@ export function FleetOverview({
               </button>
             );
           })}
+        </section>
+
+        <section
+          className="fleet-pull-request-summary"
+          aria-label="Pull request status overview"
+        >
+          <div className="fleet-pull-request-heading">
+            <GitPullRequest aria-hidden="true" />
+            <strong>Pull requests</strong>
+          </div>
+          <dl>
+            <div className="is-created">
+              <dt>Created</dt>
+              <dd>{pullRequestMetrics.created}</dd>
+              <small>{pullRequestMetrics.inProgress} in progress</small>
+            </div>
+            <div className="is-ready">
+              <dt>Review ready</dt>
+              <dd>{pullRequestMetrics.ready}</dd>
+              <small>Open for review</small>
+            </div>
+            <div className="is-merged">
+              <dt>Merged</dt>
+              <dd>{pullRequestMetrics.merged}</dd>
+              <small>Completed PRs</small>
+            </div>
+          </dl>
         </section>
 
         <section className="fleet-queue" aria-labelledby="fleet-queue-title">

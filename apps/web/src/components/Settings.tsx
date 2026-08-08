@@ -1,11 +1,4 @@
-import {
-  Bell,
-  BellOff,
-  FolderClock,
-  ShieldCheck,
-  SlidersHorizontal,
-  Type,
-} from "lucide-react";
+import { Bell, BellOff, Type } from "lucide-react";
 import { useEffect, useState } from "react";
 
 interface SettingsViewProps {
@@ -153,32 +146,6 @@ export function SettingsView({
         </div>
       </section>
 
-      <section className="settings-section" aria-labelledby="defaults-title">
-        <div className="settings-section-heading">
-          <SlidersHorizontal aria-hidden="true" />
-          <div>
-            <h2 id="defaults-title">Task defaults</h2>
-            <p>New tasks begin ready for local work.</p>
-          </div>
-        </div>
-        <div className="settings-rows">
-          <div className="settings-static-row">
-            <span>
-              <strong>Default authority</strong>
-              <small>Full access</small>
-            </span>
-            <ShieldCheck aria-hidden="true" />
-          </div>
-          <div className="settings-static-row">
-            <span>
-              <strong>Default project</strong>
-              <small>Use the last active folder</small>
-            </span>
-            <FolderClock aria-hidden="true" />
-          </div>
-        </div>
-      </section>
-
       <section
         className="settings-section"
         aria-labelledby="notifications-title"
@@ -199,7 +166,11 @@ export function SettingsView({
             className="settings-toggle-row"
             role="switch"
             aria-checked={notificationsEnabled}
-            disabled={!notificationsSupported || notificationPending}
+            disabled={
+              !notificationsSupported ||
+              notificationPermission === "denied" ||
+              notificationPending
+            }
             onClick={() => {
               setNotificationPending(true);
               setNotificationMessage(null);

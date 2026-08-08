@@ -92,6 +92,17 @@ describe("reduceSessionEvent", () => {
     });
   });
 
+  it("advances the snapshot cursor for summary-only pull-request events", () => {
+    const next = reduceSessionEvent(base, {
+      type: "session.pullRequestChanged",
+      sessionId: "session-1",
+      sequence: 5,
+      pullRequest: { state: "ready" },
+    });
+
+    expect(next).toEqual({ ...base, sequence: 5 });
+  });
+
   it("coalesces adjacent streaming deltas without changing sequence semantics", () => {
     const started = reduceSessionEvent(base, {
       type: "item.started",

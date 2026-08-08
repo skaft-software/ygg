@@ -1077,6 +1077,39 @@ describe("authoritative Rust wire contract", () => {
     });
   });
 
+  it("projects pull-request evidence changes and explicit removal", () => {
+    const changed = clone(eventEnvelopeGolden) as unknown as {
+      cursor: { sequence: number };
+      event: unknown;
+    };
+    changed.cursor.sequence = 44;
+    changed.event = {
+      type: "session.pullRequestChanged",
+      data: { pullRequest: { state: "inProgress" } },
+    };
+
+    expect(projectEventEnvelope(changed)).toEqual({
+      type: "session.pullRequestChanged",
+      sessionId: "session-demo",
+      actorGeneration: 3,
+      sequence: 44,
+      pullRequest: { state: "in_progress" },
+    });
+
+    changed.cursor.sequence = 45;
+    changed.event = {
+      type: "session.pullRequestChanged",
+      data: { pullRequest: null },
+    };
+    expect(projectEventEnvelope(changed)).toEqual({
+      type: "session.pullRequestChanged",
+      sessionId: "session-demo",
+      actorGeneration: 3,
+      sequence: 45,
+      pullRequest: null,
+    });
+  });
+
   it("preserves active-run identity while a session needs attention", () => {
     const waiting = clone(eventEnvelopeGolden) as unknown as {
       cursor: { sequence: number };

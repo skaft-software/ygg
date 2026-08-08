@@ -28,7 +28,7 @@ The immediate release blockers are:
 | Real local Ygg agent sessions | Yes |
 | Streaming, tools, approvals, stop, steer, follow-up | Yes |
 | Multiple independent sessions | Yes |
-| Exception-driven command center | Aggregate needs-you, working, review, and complete state; prioritized task queue; task/project search; focused-task handoff |
+| Exception-driven command center | Aggregate needs-you, working, review, complete, and evidence-backed pull-request state; prioritized task queue; task/project search; focused-task handoff |
 | Reconnect, replay, resume, and branch checkout | Yes |
 | Attachments and prompt documents | PNG/JPEG/GIF/WebP images plus bounded text, Markdown, and PDF context; no audio |
 | Sources, diffs, and outputs | Real but limited to specific built-in tools |
@@ -444,8 +444,10 @@ transport from becoming reachable as production behavior.
 - Context and compaction lifecycle is now projected live and replayed within a
   host run, but the operational tracker is intentionally not conversation
   persistence.
-- Structured PR state is optional in `SessionSummary` and covered by fixtures,
-  but production has no PR evidence producer yet and therefore omits it.
+- Structured PR state is produced from bounded `gh` JSON after admitted runs,
+  persisted in a Serve-owned sidecar, refreshed for hosted and inventory-only
+  sessions, and projected through live session/catalog events. Temporary lookup
+  failures retain prior valid evidence; authoritative closure removes it.
 - Structured plans exist in DTOs and fixtures, but the real adapter does not
   produce them.
 
@@ -624,7 +626,7 @@ another chat-product skin:
 - Headers, user turns, action groups, composer, Activity, and Inspector use
   neutral opaque shades instead of warm tint or structural divider lines.
 - Model color does not drive navigation state or composer chrome. Session rows
-  contain only their title and an evidence-gated gray, green, or purple PR mark.
+  contain only their title and an evidence-gated green or purple PR mark.
 - Completed work reduces to a concise action-and-duration summary, prior live
   work stays collapsed, and the current live item remains visible. Commands,
   reasoning, metadata, output, and completion review are disclosed on demand.

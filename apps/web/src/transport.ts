@@ -1180,6 +1180,11 @@ export class FixtureTransport implements YggTransport {
           ...event.patch,
           sequence: event.sequence,
         };
+      } else if (event.type === "session.pullRequestChanged") {
+        this.sessions[event.sessionId] = {
+          ...current,
+          sequence: event.sequence,
+        };
       } else if (event.type === "item.started") {
         this.sessions[event.sessionId] = {
           ...current,
@@ -1267,6 +1272,19 @@ export class FixtureTransport implements YggTransport {
           outputs: mergeById(current.outputs, event.outputs),
           previews: mergeById(current.previews, event.previews),
         };
+      }
+    }
+
+    if (event.type === "session.pullRequestChanged") {
+      const summary = this.bootstrap.sessions.find(
+        (candidate) => candidate.id === event.sessionId,
+      );
+      if (summary) {
+        if (event.pullRequest === null) {
+          delete summary.pullRequest;
+        } else {
+          summary.pullRequest = clone(event.pullRequest);
+        }
       }
     }
 
@@ -2690,8 +2708,9 @@ export class HttpTransport implements YggTransport {
             .splice(0)
             .sort((left, right) => left.hostSequence - right.hostSequence);
           for (const projection of buffered) {
-            this.rememberEvent(projection.event);
-            this.dispatch(projection.event);
+            if (this.rememberEvent(projection.event)) {
+              this.dispatch(projection.event);
+            }
           }
         },
         () => {
@@ -2709,8 +2728,7 @@ export class HttpTransport implements YggTransport {
         );
         if (replaying) {
           bufferedEvents.push(projection);
-        } else {
-          this.rememberEvent(projection.event);
+        } else if (this.rememberEvent(projection.event)) {
           this.dispatch(projection.event);
         }
       } catch {
@@ -2810,15 +2828,13 @@ export class HttpTransport implements YggTransport {
     });
   }
 
-  private rememberEvent(event: HostEvent): void {
+  private rememberEvent(event: HostEvent): boolean {
     if (event.type === "catalog.summary") {
-      this.catalogRevision = Math.max(
-        this.catalogRevision,
-        event.catalogRevision,
-      );
+      if (event.catalogRevision <= this.catalogRevision) return false;
+      this.catalogRevision = event.catalogRevision;
       this.summaries.set(event.summary.id, event.summary);
       this.modelIdBySession[event.summary.id] = event.summary.modelId;
-      return;
+      return true;
     }
     const generation = event.actorGeneration;
     if (generation !== undefined) {
@@ -2852,6 +2868,7 @@ export class HttpTransport implements YggTransport {
     } else if (event.type === "session.updated" && event.patch.modelId) {
       this.modelIdBySession[event.sessionId] = event.patch.modelId;
     }
+    return true;
   }
 
   private async refreshCatalog(
@@ -2940,8 +2957,7 @@ export class HttpTransport implements YggTransport {
           return;
         }
         for (const event of replay.events) {
-          this.rememberEvent(event);
-          this.dispatch(event);
+          if (this.rememberEvent(event)) this.dispatch(event);
         }
         if (
           replay.events.length === 0 &&
