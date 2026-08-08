@@ -896,8 +896,9 @@ describe("conversation composer", () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Stop ygg" })).toBeVisible(),
+      expect(screen.getByLabelText("Message ygg")).toHaveValue(""),
     );
+    expect(screen.getByRole("button", { name: "Stop ygg" })).toBeVisible();
     await user.click(delivery);
     expect(
       screen.getByRole("menu", { name: "While ygg is working" }),
