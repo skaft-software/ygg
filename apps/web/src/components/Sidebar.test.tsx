@@ -395,6 +395,59 @@ describe("sidebar session lifecycle", () => {
     ).not.toBeVisible();
   });
 
+  it("keeps a reselected task revealed after search", () => {
+    const onSelectSession = vi.fn();
+    const sessions = [
+      activeSession({
+        id: "session-ygg",
+        projectId: "project-ygg",
+        title: "Ygg task",
+      }),
+      activeSession({
+        id: "session-notes",
+        projectId: "project-notes",
+        title: "Provider notes",
+      }),
+    ];
+    render(
+      <Sidebar
+        {...sidebarProps({
+          sessions,
+          selectedSessionId: "session-notes",
+          onSelectSession,
+        })}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Collapse project Research notes, 1 task",
+      }),
+    );
+
+    const searchbox = screen.getByRole("searchbox", {
+      name: "Search tasks and transcripts",
+    });
+    fireEvent.change(searchbox, { target: { value: "provider" } });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Open task Provider notes, Ready",
+      }),
+    );
+    expect(onSelectSession).toHaveBeenCalledWith("session-notes");
+
+    fireEvent.change(searchbox, { target: { value: "" } });
+    expect(
+      screen.getByRole("button", {
+        name: "Collapse project Research notes, 1 task",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", {
+        name: "Open task Provider notes, Ready",
+      }),
+    ).toBeVisible();
+  });
+
   it("shows content hits and activates their transcript item", async () => {
     const search = vi.fn().mockResolvedValue({
       hits: [

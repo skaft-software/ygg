@@ -654,6 +654,22 @@ function SidebarView({
   }
   const collapsedWorkspaceIds = workspaceCollapseView.ids;
 
+  const revealWorkspace = (workspaceId: string) => {
+    const ids = new Set(collapsedWorkspaceIds);
+    const idsBeforeSearch = workspaceCollapseView.idsBeforeSearch
+      ? new Set(workspaceCollapseView.idsBeforeSearch)
+      : null;
+    const collapsedChanged = ids.delete(workspaceId);
+    const savedChanged = idsBeforeSearch?.delete(workspaceId) ?? false;
+    if (collapsedChanged || savedChanged) {
+      setWorkspaceCollapse({
+        ...workspaceCollapseView,
+        ids,
+        idsBeforeSearch,
+      });
+    }
+  };
+
   const toggleWorkspace = (workspaceId: string) => {
     const ids = new Set(collapsedWorkspaceIds);
     if (ids.has(workspaceId)) ids.delete(workspaceId);
@@ -1048,11 +1064,21 @@ function SidebarView({
                   selectedSessionId={selectedSessionId}
                   collapsed={collapsedWorkspaceIds.has(workspace.workspaceId)}
                   onToggle={() => toggleWorkspace(workspace.workspaceId)}
-                  onSelectSession={onSelectSession}
+                  onSelectSession={(sessionId) => {
+                    revealWorkspace(workspace.workspaceId);
+                    onSelectSession(sessionId);
+                  }}
                   searchHitsBySession={
                     searchMode ? searchHitsBySession : undefined
                   }
-                  onActivateSearchResult={onActivateSearchResult}
+                  onActivateSearchResult={
+                    onActivateSearchResult
+                      ? (sessionId, itemId) => {
+                          revealWorkspace(workspace.workspaceId);
+                          onActivateSearchResult(sessionId, itemId);
+                        }
+                      : undefined
+                  }
                   renderControls={
                     !searchMode ? renderSessionControls : undefined
                   }

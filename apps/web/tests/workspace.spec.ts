@@ -296,7 +296,7 @@ test("shows pull-request marks only for structured PR evidence", async ({
   await expect(inProgress).toHaveText("Refine onboarding preview");
   await expect(inProgress.locator(".session-pull-request")).toHaveCSS(
     "color",
-    "rgb(139, 143, 152)",
+    "rgb(82, 199, 123)",
   );
 
   const ready = page.getByRole("button", {
@@ -1466,10 +1466,11 @@ test("opens and dismisses the mobile sidebar with Escape", async ({
 test("does not make outbound requests or overflow the viewport", async ({
   page,
 }) => {
+  const allowedOrigin = new URL(page.url()).origin;
   const external: string[] = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
-    if (url.origin !== "http://127.0.0.1:4178") external.push(request.url());
+    if (url.origin !== allowedOrigin) external.push(request.url());
   });
   await page.reload();
   await selectSession(page, "Review release readiness");

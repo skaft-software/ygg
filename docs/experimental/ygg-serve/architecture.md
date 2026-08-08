@@ -81,7 +81,10 @@ same command returns the original acknowledgement and never executes twice.
 `selectedSessionId` restores an explicit session. `inventoryOnly=true` returns
 catalog state without creating, opening, or selecting a session; its
 `selectedSessionId` and `selectedSession` fields are both `null`. The inventory
-and explicit-selection query modes are mutually exclusive.
+and explicit-selection query modes are mutually exclusive. Bootstrap catalog
+cursors are anchored before asynchronous project/session listing, so a catalog
+change racing the snapshot always retains a newer replayable revision instead of
+being hidden behind stale list data.
 
 ## Item lifecycle
 
@@ -98,6 +101,37 @@ entries:
 The client reducer must be deterministic and idempotent. Tool state, sources,
 outputs, and changed files are derived from typed evidence, never from assistant
 prose or command-shaped text.
+
+## Pull-request projection
+
+The coding-agent adapter discovers a session-associated pull request only from
+structured `gh pr view --json number,url,state,isDraft` output. First-time
+association remains disabled until the session admits user work; a bounded,
+independent host refresher then keeps both hosted and inventory-only sessions
+current without delaying agent commands. CLI execution is non-interactive and
+shell-free, with null stdin, bounded output and concurrency, a four-second
+timeout, and strict HTTPS pull-request URL validation. Hosted refreshers wait
+fairly for detached query permits, while inventory work uses only immediately
+available capacity so a large inactive catalog cannot starve live sessions.
+Inventory evidence is attempted oldest-first in bounded rounds, so a temporarily
+unavailable record cannot indefinitely pin every later session behind it.
+
+The private `pull-requests-v1.json` sidecar stores the session ID, validated URL,
+number, state, and refresh time. It is size/count bounded, opened without following
+symlinks, and replaced atomically. Invalid or ambiguous persisted evidence fails
+host startup. Evidence persistence and inactive transcript projection run on the
+blocking pool rather than the agent runtime path; command-side projection
+replacements read the actor's in-memory PR summary instead of contending with
+that persistence lock. Temporary GitHub or CLI failure preserves the last valid
+state; authoritative closure removes open evidence, while merged evidence is
+terminal. Permanent deletion fences the session before removing evidence, so an
+already-finishing discovery cannot recreate the sidecar record.
+`session.pullRequestChanged` advances the actor's catalog projection and replay
+sequence, never the durable conversation transcript. Bootstrap overlays retain
+the host catalog's durable PR projection when an active actor view is waiting on
+a backpressured evidence event. The web store replaces sidebar/command-center PR
+evidence only from the catalog stream, so a delayed session envelope cannot
+regress a newer hosted or inventory projection.
 
 ## Local transport
 

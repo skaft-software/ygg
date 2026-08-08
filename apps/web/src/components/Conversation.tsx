@@ -3491,11 +3491,6 @@ function Composer({
   const uploadedAttachments = attachments.flatMap((attachment) =>
     attachment.reference ? [attachment.reference] : [],
   );
-  const hasComposerContent =
-    Boolean(prompt.trim()) ||
-    attachments.length > 0 ||
-    documents.length > 0 ||
-    projectFiles.length > 0;
   const canSubmit =
     (Boolean(prompt.trim()) ||
       uploadedAttachments.length > 0 ||
@@ -3503,7 +3498,7 @@ function Composer({
       projectFiles.length > 0) &&
     !attachmentsPending &&
     !attachmentsFailed;
-  const submitActionIsStop = isWorking && !hasComposerContent;
+  const submitActionIsStop = isWorking && (!canSubmit || submitting);
 
   useEffect(() => {
     if (!isWorking) {

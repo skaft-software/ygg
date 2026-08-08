@@ -8603,7 +8603,7 @@ body {
   height: 17px;
   display: grid;
   place-items: center;
-  color: #8b8f98;
+  color: var(--success);
 }
 
 .session-pull-request > svg {
@@ -8791,7 +8791,87 @@ body {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
+  margin-bottom: 8px;
+}
+
+.fleet-pull-request-summary {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.7fr) minmax(0, 3fr);
+  align-items: stretch;
+  gap: 12px;
+  min-height: 62px;
   margin-bottom: 28px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  color: var(--text-soft);
+  background: #1b1c1f;
+}
+
+.fleet-pull-request-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 4px;
+}
+
+.fleet-pull-request-heading > svg {
+  width: 16px;
+  height: 16px;
+  color: var(--success);
+}
+
+.fleet-pull-request-heading > strong {
+  color: var(--text);
+  font-size: var(--font-meta);
+  font-weight: 620;
+}
+
+.fleet-pull-request-summary dl {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+}
+
+.fleet-pull-request-summary dl > div {
+  --pull-request-color: var(--success);
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  align-content: center;
+  gap: 0 8px;
+  padding: 2px 12px;
+  border-left: 1px solid var(--line);
+}
+
+.fleet-pull-request-summary dl > div.is-merged {
+  --pull-request-color: #a78bfa;
+}
+
+.fleet-pull-request-summary dt {
+  overflow-wrap: anywhere;
+  color: var(--text-soft);
+  font-size: var(--font-meta);
+  font-weight: 560;
+  line-height: 18px;
+}
+
+.fleet-pull-request-summary dd {
+  grid-row: 1 / 3;
+  margin: 0;
+  color: var(--pull-request-color);
+  font-size: var(--font-body);
+  font-weight: 680;
+  line-height: 34px;
+}
+
+.fleet-pull-request-summary small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .fleet-metric {
@@ -9292,7 +9372,36 @@ body {
 
   .fleet-metrics {
     gap: 6px;
+    margin-bottom: 8px;
+  }
+
+  .fleet-pull-request-summary {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
     margin-bottom: 18px;
+    padding: 8px;
+  }
+
+  .fleet-pull-request-heading {
+    min-height: 30px;
+    padding: 0 6px 5px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .fleet-pull-request-summary dl > div {
+    padding: 2px 6px;
+    border-left: 0;
+  }
+
+  .fleet-pull-request-summary dl > div + div {
+    border-left: 1px solid var(--line);
+  }
+
+  .fleet-pull-request-summary small {
+    overflow: visible;
+    line-height: 15px;
+    text-overflow: clip;
+    white-space: normal;
   }
 
   .fleet-metric {

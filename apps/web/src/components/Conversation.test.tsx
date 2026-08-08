@@ -2148,8 +2148,9 @@ describe("conversation composer", () => {
     );
   });
 
-  it("retains a failed image upload with retry and remove controls", async () => {
+  it("keeps interruption available while a failed image remains retryable", async () => {
     const user = userEvent.setup();
+    const onInterrupt = vi.fn().mockResolvedValue(undefined);
     const onIngestAttachment = vi
       .fn()
       .mockRejectedValueOnce(new Error("Upload failed"))
@@ -2162,10 +2163,10 @@ describe("conversation composer", () => {
       });
     const { container } = render(
       <Conversation
-        session={structuredClone(fixtureSessions["session-fresh"]!)}
+        session={structuredClone(fixtureSessions["session-live"]!)}
         bootstrap={structuredClone(fixtureBootstrap)}
         onSubmit={noOp}
-        onInterrupt={noOp}
+        onInterrupt={onInterrupt}
         onConfigure={noOp}
         onResolveApproval={noOp}
         onResolveUserInput={noOp}
@@ -2188,6 +2189,12 @@ describe("conversation composer", () => {
       name: "Retry photo.png",
     });
     expect(screen.getByText("Upload failed")).toBeVisible();
+    expect(
+      container.querySelectorAll(".composer-actions .submit-button"),
+    ).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "Stop ygg" }));
+    expect(onInterrupt).toHaveBeenCalledOnce();
+
     await user.click(retry);
     expect(await screen.findByText("Ready")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Remove photo.png" }));

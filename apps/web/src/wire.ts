@@ -3885,6 +3885,22 @@ export function projectEventEnvelope(
         patch: title === undefined ? {} : { title },
       };
     }
+    case "session.pullRequestChanged": {
+      const data = object(event.data, "event.event.data", ["pullRequest"]);
+      return {
+        type: "session.pullRequestChanged",
+        sessionId,
+        actorGeneration,
+        sequence,
+        pullRequest:
+          data.pullRequest === null
+            ? null
+            : projectPullRequest(
+                data.pullRequest,
+                "event.event.data.pullRequest",
+              ),
+      };
+    }
     case "session.durableHeadChanged": {
       const data = object(event.data, "event.event.data", [
         "durableEntryId",

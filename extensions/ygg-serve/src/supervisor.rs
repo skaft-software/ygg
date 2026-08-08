@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, RwLock};
 
 use crate::{
     ActorConfig, ActorError, ActorView, AuthorityProfile, CatalogCursor, CommandAdmission,
@@ -205,13 +205,6 @@ impl<H: HostService> SessionSupervisor<H> {
                 }) {
                     return Err(ServiceError::Unauthorized.into());
                 }
-                if state
-                    .actors
-                    .get(session_id)
-                    .is_some_and(|handle| handle.is_closed() && handle.is_quiesced())
-                {
-                    state.actors.remove(session_id);
-                }
                 if let Some(existing) = state.actors.get(session_id) {
                     if existing.is_closed() {
                         Begin::Quarantined(existing.clone())
@@ -240,6 +233,7 @@ impl<H: HostService> SessionSupervisor<H> {
                     tokio::time::timeout(self.config.quarantine_wait_timeout, handle.quiesced())
                         .await
                         .map_err(|_| SupervisorError::Service(ServiceError::Unavailable))?;
+                    self.wait_for_actor_registry_release(&handle).await;
                 }
                 Begin::Lead => break,
             }
@@ -262,6 +256,11 @@ impl<H: HostService> SessionSupervisor<H> {
 
     /// Builds a catalog bootstrap without creating, opening, or selecting a session.
     pub async fn inventory_bootstrap(&self) -> Result<HostBootstrap, SupervisorError> {
+        // Anchor the replay cursor before crossing asynchronous catalog
+        // boundaries. Any change racing the snapshot then has a strictly newer
+        // revision and remains replayable instead of being hidden behind a
+        // cursor captured after stale list data.
+        let catalog_cursor = self.catalog_cursor();
         let projects = self.project_catalog().await?.projects;
         let mut summaries = self
             .host
@@ -282,11 +281,11 @@ impl<H: HostService> SessionSupervisor<H> {
         for handle in active {
             let view = handle.view();
             if !handle.is_closed() {
-                summaries.insert(view.summary.id.clone(), view.summary);
+                insert_active_summary(&mut summaries, view.summary);
             }
         }
         let sessions = bounded_bootstrap_sessions(summaries, None);
-        self.build_bootstrap(projects, sessions, None, None)
+        self.build_bootstrap(catalog_cursor, projects, sessions, None, None)
     }
 
     /// Builds a fresh catalog/bootstrap around an already hosted session.
@@ -294,6 +293,7 @@ impl<H: HostService> SessionSupervisor<H> {
         &self,
         selected_session_id: &SessionId,
     ) -> Result<HostBootstrap, SupervisorError> {
+        let catalog_cursor = self.catalog_cursor();
         let projects = self.project_catalog().await?.projects;
         let mut summaries = self
             .host
@@ -334,7 +334,7 @@ impl<H: HostService> SessionSupervisor<H> {
             })
             .collect::<Vec<_>>();
         for view in active_views {
-            summaries.insert(view.summary.id.clone(), view.summary);
+            insert_active_summary(&mut summaries, view.summary);
         }
         let sessions = bounded_bootstrap_sessions(summaries, Some(selected_session_id));
 
@@ -345,6 +345,7 @@ impl<H: HostService> SessionSupervisor<H> {
             return Err(ServiceError::Unavailable.into());
         }
         self.build_bootstrap(
+            catalog_cursor,
             projects,
             sessions,
             Some(selected_session_id.clone()),
@@ -354,6 +355,7 @@ impl<H: HostService> SessionSupervisor<H> {
 
     fn build_bootstrap(
         &self,
+        catalog_cursor: CatalogCursor,
         projects: Vec<ProjectSummary>,
         sessions: Vec<SessionSummary>,
         selected_session_id: Option<SessionId>,
@@ -363,7 +365,7 @@ impl<H: HostService> SessionSupervisor<H> {
             protocol: PROTOCOL_VERSION,
             host: self.host.descriptor(),
             capabilities: self.host.capabilities(),
-            catalog_cursor: self.catalog_cursor(),
+            catalog_cursor,
             models: self.host.model_catalog(),
             authority_profiles: self.host.authority_profiles(),
             authority_ceiling: self.host.authority_ceiling(),
@@ -771,6 +773,51 @@ impl<H: HostService> SessionSupervisor<H> {
         self.host.usage_activity().await
     }
 
+    /// Returns the sessions that currently have a live graphical owner.
+    ///
+    /// Host integrations use this snapshot to avoid duplicating background work
+    /// already owned by a session driver. The result is advisory; ownership is
+    /// rechecked before an integration-only catalog refresh is published.
+    pub async fn hosted_session_ids(&self) -> BTreeSet<SessionId> {
+        self.state
+            .lock()
+            .await
+            .actors
+            .iter()
+            .filter_map(|(session_id, handle)| (!handle.is_closed()).then_some(session_id.clone()))
+            .collect()
+    }
+
+    /// Publishes a host-owned summary refresh without creating a session actor.
+    ///
+    /// Returns `false` when a session/project lifecycle fence, an in-flight
+    /// open, or a live/retiring actor requires the caller to retry. A live actor
+    /// remains authoritative and consumes the refresh through its own driver.
+    pub async fn publish_inactive_catalog_summary(
+        &self,
+        summary: SessionSummary,
+    ) -> Result<bool, ServiceError> {
+        summary.validate().map_err(|_| ServiceError::InvalidSeed)?;
+        let state = self.state.lock().await;
+        if state.blocked_sessions.contains(&summary.id)
+            || state.session_openings.contains_key(&summary.id)
+            || summary
+                .project_id
+                .as_ref()
+                .is_some_and(|project_id| state.blocked_projects.contains(project_id))
+        {
+            return Ok(false);
+        }
+        if state.actors.contains_key(&summary.id) {
+            return Ok(false);
+        }
+        // Publish while ownership is fenced by the registry lock. Otherwise an
+        // actor could install and publish a newer view between this check and
+        // the catalog send, only to be overwritten by this inactive summary.
+        self.publish_catalog(summary);
+        Ok(true)
+    }
+
     /// Subscribes to the ordered live stream across all hosted sessions.
     ///
     /// A lagged subscriber must recover each affected session through replay
@@ -843,11 +890,15 @@ impl<H: HostService> SessionSupervisor<H> {
         if handle.session_id() != &session_id {
             return Err(SupervisorError::IdentityMismatch);
         }
-        let summary = handle.view().summary;
-        self.observe_actor(&handle);
+        let events = handle.subscribe_events();
+        let mut views = handle.subscribe();
+        let summary = views.borrow_and_update().summary.clone();
         state.actors.insert(session_id, handle.clone());
-        drop(state);
+        // Publish the receiver's baseline before its observer can forward a
+        // newer actor view; this prevents both gaps and baseline regression.
         self.publish_catalog(summary);
+        self.observe_actor(&handle, views, events);
+        drop(state);
         Ok(handle)
     }
 
@@ -877,13 +928,6 @@ impl<H: HostService> SessionSupervisor<H> {
         {
             return Err(SupervisorError::Service(ServiceError::Unauthorized));
         }
-        if state
-            .actors
-            .get(session_id)
-            .is_some_and(|handle| handle.is_closed() && handle.is_quiesced())
-        {
-            state.actors.remove(session_id);
-        }
         if let Some(existing) = state.actors.get(session_id) {
             if existing.is_closed() {
                 return Err(SupervisorError::Service(ServiceError::Unavailable));
@@ -897,11 +941,14 @@ impl<H: HostService> SessionSupervisor<H> {
         if handle.session_id() != session_id {
             return Err(SupervisorError::IdentityMismatch);
         }
-        let summary = handle.view().summary;
-        self.observe_actor(&handle);
+        let events = handle.subscribe_events();
+        let mut views = handle.subscribe();
+        let summary = views.borrow_and_update().summary.clone();
         state.actors.insert(session_id.clone(), handle.clone());
-        drop(state);
+        // Keep the subscribed baseline ahead of all observed replacements.
         self.publish_catalog(summary);
+        self.observe_actor(&handle, views, events);
+        drop(state);
         Ok(handle)
     }
 
@@ -1147,7 +1194,26 @@ impl<H: HostService> SessionSupervisor<H> {
     }
 
     fn advance_project_catalog(&self) -> CatalogCursor {
+        let Ok(_order) = self.host_event_order.lock() else {
+            return self.catalog_cursor();
+        };
         advance_catalog(&self.catalog_cursor).unwrap_or_else(|| self.catalog_cursor())
+    }
+
+    async fn wait_for_actor_registry_release(&self, actor: &SessionActorHandle) {
+        loop {
+            let retained = self
+                .state
+                .lock()
+                .await
+                .actors
+                .get(actor.session_id())
+                .is_some_and(|current| current.same_actor(actor));
+            if !retained {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     async fn block_and_retire_project(&self, project_id: &ProjectId) {
@@ -1167,15 +1233,7 @@ impl<H: HostService> SessionSupervisor<H> {
         for actor in actors {
             actor.closed().await;
             actor.quiesced().await;
-            let session_id = actor.session_id().clone();
-            let mut state = self.state.lock().await;
-            if state
-                .actors
-                .get(&session_id)
-                .is_some_and(|current| current.same_actor(&actor))
-            {
-                state.actors.remove(&session_id);
-            }
+            self.wait_for_actor_registry_release(&actor).await;
         }
     }
 
@@ -1251,14 +1309,7 @@ impl<H: HostService> SessionSupervisor<H> {
             actor.retire().await;
             actor.closed().await;
             actor.quiesced().await;
-            let mut state = self.state.lock().await;
-            if state
-                .actors
-                .get(session_id)
-                .is_some_and(|current| current.same_actor(&actor))
-            {
-                state.actors.remove(session_id);
-            }
+            self.wait_for_actor_registry_release(&actor).await;
         }
     }
 
@@ -1306,22 +1357,29 @@ impl<H: HostService> SessionSupervisor<H> {
         )?)
     }
 
-    fn observe_actor(&self, handle: &SessionActorHandle) {
-        let mut views = handle.subscribe();
+    fn observe_actor(
+        &self,
+        handle: &SessionActorHandle,
+        mut views: watch::Receiver<Arc<ActorView>>,
+        mut events: broadcast::Receiver<crate::EventEnvelope>,
+    ) {
         let cursor = Arc::clone(&self.catalog_cursor);
         let sender = self.host_events.clone();
         let order = Arc::clone(&self.host_event_order);
-        tokio::spawn(async move {
+        let catalog_observer = tokio::spawn(async move {
             while views.changed().await.is_ok() {
                 let summary = views.borrow_and_update().summary.clone();
-                let Some(catalog_cursor) = advance_catalog(&cursor) else {
+                if !send_ordered_catalog_event(&sender, &order, &cursor, summary) {
                     break;
-                };
-                let Some(streamed) = ordered_catalog_event(&order, catalog_cursor, summary) else {
-                    break;
-                };
-                let _ = sender.send(streamed);
+                }
             }
+        });
+
+        let event_owner = handle.clone();
+        let sender = self.host_events.clone();
+        let order = Arc::clone(&self.host_event_order);
+        let event_observer = tokio::spawn(async move {
+            forward_actor_events_until_quiesced(&mut events, &sender, &order, &event_owner).await;
         });
 
         let observed = handle.clone();
@@ -1330,6 +1388,11 @@ impl<H: HostService> SessionSupervisor<H> {
         tokio::spawn(async move {
             observed.closed().await;
             observed.quiesced().await;
+            // Keep ownership fenced until the actor's final view and session
+            // events have been forwarded; an inactive refresh must never
+            // overtake either observer and then be regressed by delayed work.
+            let _ = catalog_observer.await;
+            let _ = event_observer.await;
             let mut state = state.lock().await;
             let remove = state.actors.get(&session_id).is_some_and(|current| {
                 current.same_actor(&observed) && current.is_closed() && current.is_quiesced()
@@ -1338,22 +1401,15 @@ impl<H: HostService> SessionSupervisor<H> {
                 state.actors.remove(&session_id);
             }
         });
-
-        let mut events = handle.subscribe_events();
-        let sender = self.host_events.clone();
-        let order = Arc::clone(&self.host_event_order);
-        tokio::spawn(async move { forward_actor_events(&mut events, &sender, &order).await });
     }
 
     fn publish_catalog(&self, summary: crate::SessionSummary) {
-        let Some(catalog_cursor) = advance_catalog(&self.catalog_cursor) else {
-            return;
-        };
-        let Some(streamed) = ordered_catalog_event(&self.host_event_order, catalog_cursor, summary)
-        else {
-            return;
-        };
-        let _ = self.host_events.send(streamed);
+        send_ordered_catalog_event(
+            &self.host_events,
+            &self.host_event_order,
+            &self.catalog_cursor,
+            summary,
+        );
     }
 }
 
@@ -1367,17 +1423,44 @@ fn advance_catalog(cursor: &AtomicU64) -> Option<CatalogCursor> {
         .map(CatalogCursor)
 }
 
-fn ordered_catalog_event(
+fn send_ordered_catalog_event(
+    sender: &broadcast::Sender<HostStreamEvent>,
     order: &std::sync::Mutex<u64>,
-    catalog_cursor: CatalogCursor,
+    cursor: &AtomicU64,
     summary: crate::SessionSummary,
-) -> Option<HostStreamEvent> {
-    let mut sequence = order.lock().ok()?;
-    let next = sequence.checked_add(1)?;
+) -> bool {
+    let Ok(mut sequence) = order.lock() else {
+        return false;
+    };
+    let Some(next) = sequence.checked_add(1) else {
+        return false;
+    };
+    let Some(catalog_cursor) = advance_catalog(cursor) else {
+        return false;
+    };
     *sequence = next;
-    Some(HostStreamEvent::catalog(next, catalog_cursor, summary))
+    // Assign both revisions and broadcast while the order lock is held. A
+    // concurrent producer therefore cannot enqueue host sequence or catalog
+    // revision N + 1 before N.
+    let _ = sender.send(HostStreamEvent::catalog(next, catalog_cursor, summary));
+    true
 }
 
+fn send_ordered_actor_event(
+    sender: &broadcast::Sender<HostStreamEvent>,
+    order: &std::sync::Mutex<u64>,
+    event: crate::EventEnvelope,
+) -> bool {
+    let mut sequence = order.lock().expect("host event order poisoned");
+    let Some(next) = sequence.checked_add(1) else {
+        return false;
+    };
+    *sequence = next;
+    let _ = sender.send(HostStreamEvent::new(next, event));
+    true
+}
+
+#[cfg(test)]
 async fn forward_actor_events(
     events: &mut broadcast::Receiver<crate::EventEnvelope>,
     sender: &broadcast::Sender<HostStreamEvent>,
@@ -1386,21 +1469,55 @@ async fn forward_actor_events(
     loop {
         match events.recv().await {
             Ok(event) => {
-                let streamed = {
-                    let mut sequence = order.lock().expect("host event order poisoned");
-                    let Some(next) = sequence.checked_add(1) else {
-                        break;
-                    };
-                    *sequence = next;
-                    HostStreamEvent::new(next, event)
-                };
-                let _ = sender.send(streamed);
+                if !send_ordered_actor_event(sender, order, event) {
+                    break;
+                }
             }
             // Do not synthesize continuity. The next retained event keeps its
             // original per-session cursor, exposing the gap so clients can
             // recover with replay or a snapshot.
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn forward_actor_events_until_quiesced(
+    events: &mut broadcast::Receiver<crate::EventEnvelope>,
+    sender: &broadcast::Sender<HostStreamEvent>,
+    order: &std::sync::Mutex<u64>,
+    owner: &SessionActorHandle,
+) {
+    loop {
+        tokio::select! {
+            _ = owner.quiesced() => {
+                // Quiescence is signaled only after the actor has emitted its
+                // final event, so the receiver can now be drained without
+                // waiting for handle-owned broadcast senders to be dropped.
+                loop {
+                    match events.try_recv() {
+                        Ok(event) => {
+                            if !send_ordered_actor_event(sender, order, event) {
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                        Err(
+                            broadcast::error::TryRecvError::Empty
+                            | broadcast::error::TryRecvError::Closed,
+                        ) => return,
+                    }
+                }
+            }
+            result = events.recv() => match result {
+                Ok(event) => {
+                    if !send_ordered_actor_event(sender, order, event) {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            }
         }
     }
 }
@@ -1446,6 +1563,19 @@ fn authority_rank(authority: AuthorityProfile) -> u8 {
         AuthorityProfile::Workspace => 1,
         AuthorityProfile::FullAccess => 2,
     }
+}
+
+fn insert_active_summary(
+    summaries: &mut BTreeMap<SessionId, SessionSummary>,
+    mut active: SessionSummary,
+) {
+    if let Some(catalog) = summaries.get(&active.id) {
+        // The host catalog owns durable external evidence. Persistence can
+        // advance before a backpressured actor event updates its live view, so
+        // only overlay actor-owned live fields onto that PR projection.
+        active.pull_request.clone_from(&catalog.pull_request);
+    }
+    summaries.insert(active.id.clone(), active);
 }
 
 fn bounded_bootstrap_sessions(
@@ -2149,6 +2279,230 @@ mod tests {
         assert_eq!(catalog.summary.id, *handle.session_id());
         assert!(catalog.summary.provisional);
         streamed.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_catalog_producers_preserve_revision_delivery_order() {
+        const PRODUCERS: usize = 32;
+
+        let host = Arc::new(MockHost::new());
+        let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+        let mut events = supervisor.subscribe_events();
+        let handle = supervisor.create_fresh_session(None).await.unwrap();
+        let initial = events.recv().await.unwrap();
+        let initial_catalog = initial.catalog.expect("initial catalog change");
+        let barrier = Arc::new(std::sync::Barrier::new(PRODUCERS + 1));
+        let mut producers = Vec::with_capacity(PRODUCERS);
+
+        for index in 0..PRODUCERS {
+            let supervisor = Arc::clone(&supervisor);
+            let barrier = Arc::clone(&barrier);
+            let mut summary = handle.view().summary;
+            summary.title = format!("Concurrent summary {index}");
+            producers.push(std::thread::spawn(move || {
+                barrier.wait();
+                supervisor.publish_catalog(summary);
+            }));
+        }
+        barrier.wait();
+        for producer in producers {
+            producer.join().unwrap();
+        }
+
+        let mut previous_host_sequence = initial.host_sequence;
+        let mut previous_catalog_cursor = initial_catalog.catalog_cursor.0;
+        for _ in 0..PRODUCERS {
+            let streamed = events.try_recv().unwrap();
+            let catalog = streamed.catalog.expect("ordered catalog change");
+            assert_eq!(streamed.host_sequence, previous_host_sequence + 1);
+            assert_eq!(catalog.catalog_cursor.0, previous_catalog_cursor + 1);
+            previous_host_sequence = streamed.host_sequence;
+            previous_catalog_cursor = catalog.catalog_cursor.0;
+        }
+        assert_eq!(previous_catalog_cursor, supervisor.catalog_cursor().0,);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cursor_precedes_catalog_changes_that_race_listings() {
+        let (host, projects_entered, projects_release, sessions_entered, sessions_release) =
+            MockHost::with_gated_catalog();
+        let seed = host.make_seed(&CreateSessionRequest {
+            project_id: None,
+            provisional: false,
+            authority: AuthorityProfile::FullAccess,
+            model: None,
+        });
+        let session_id = seed.summary.id.clone();
+        host.seeds
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), seed.clone());
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::new(host),
+            SupervisorConfig::default(),
+        ));
+        let bootstrap_cursor = supervisor.catalog_cursor();
+        let mut events = supervisor.subscribe_events();
+        let bootstrap = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move { supervisor.inventory_bootstrap().await })
+        };
+
+        projects_entered.wait().await;
+        projects_release.wait().await;
+        sessions_entered.wait().await;
+        let mut refreshed = seed.summary;
+        refreshed.pull_request = Some(crate::PullRequestSummary {
+            state: crate::PullRequestState::Ready,
+        });
+        supervisor.publish_catalog(refreshed.clone());
+        let streamed = events.recv().await.unwrap();
+        sessions_release.wait().await;
+
+        let bootstrap = bootstrap.await.unwrap().unwrap();
+        assert_eq!(bootstrap.catalog_cursor, bootstrap_cursor);
+        assert!(
+            bootstrap
+                .sessions
+                .iter()
+                .find(|summary| summary.id == session_id)
+                .unwrap()
+                .pull_request
+                .is_none(),
+            "the gated host listing intentionally returned its earlier projection"
+        );
+        let catalog = streamed.catalog.expect("racing catalog change");
+        assert!(catalog.catalog_cursor > bootstrap.catalog_cursor);
+        assert_eq!(catalog.summary, refreshed);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_keeps_durable_pull_request_when_the_actor_view_lags() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = SessionSupervisor::new(Arc::clone(&host), SupervisorConfig::default());
+        let handle = supervisor.create_fresh_session(None).await.unwrap();
+        let session_id = handle.session_id().clone();
+        host.seeds
+            .lock()
+            .unwrap()
+            .get_mut(&session_id)
+            .unwrap()
+            .summary
+            .pull_request = Some(crate::PullRequestSummary {
+            state: crate::PullRequestState::Merged,
+        });
+
+        let inventory = supervisor.inventory_bootstrap().await.unwrap();
+        assert_eq!(
+            inventory
+                .sessions
+                .iter()
+                .find(|summary| summary.id == session_id)
+                .and_then(|summary| summary.pull_request.as_ref())
+                .map(|pull_request| pull_request.state),
+            Some(crate::PullRequestState::Merged)
+        );
+
+        let selected = supervisor.bootstrap(&session_id).await.unwrap();
+        assert_eq!(
+            selected
+                .sessions
+                .iter()
+                .find(|summary| summary.id == session_id)
+                .and_then(|summary| summary.pull_request.as_ref())
+                .map(|pull_request| pull_request.state),
+            Some(crate::PullRequestState::Merged)
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_catalog_publication_waits_for_the_live_owner_to_retire() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = SessionSupervisor::new(host, SupervisorConfig::default());
+        let mut events = supervisor.subscribe_events();
+        let handle = supervisor.create_fresh_session(None).await.unwrap();
+        events.recv().await.unwrap();
+        let session_id = handle.session_id().clone();
+        let mut inactive = handle.view().summary;
+        inactive.owner = ActorOwnerState::Inactive;
+        inactive.pull_request = Some(crate::PullRequestSummary {
+            state: crate::PullRequestState::Ready,
+        });
+
+        assert!(supervisor.hosted_session_ids().await.contains(&session_id));
+        assert!(!supervisor
+            .publish_inactive_catalog_summary(inactive.clone())
+            .await
+            .unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err()
+        );
+
+        let admission = supervisor
+            .command(
+                metadata_command(
+                    session_id.clone(),
+                    "retiring-rename",
+                    SessionCommand::Rename {
+                        title: "Retiring session".into(),
+                    },
+                ),
+                20,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            admission.ack.disposition,
+            AckDisposition::Accepted { .. }
+        ));
+        inactive = handle.view().summary;
+        inactive.owner = ActorOwnerState::Inactive;
+        inactive.pull_request = Some(crate::PullRequestSummary {
+            state: crate::PullRequestState::Ready,
+        });
+
+        handle.retire().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if supervisor
+                    .publish_inactive_catalog_summary(inactive.clone())
+                    .await
+                    .unwrap()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("inactive publication must resume after actor retirement");
+
+        let mut previous_host_sequence = 0;
+        let mut published = false;
+        for _ in 0..8 {
+            let streamed = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("retiring actor events must drain before inactive publication")
+                .unwrap();
+            assert!(streamed.host_sequence > previous_host_sequence);
+            previous_host_sequence = streamed.host_sequence;
+            if streamed
+                .catalog
+                .is_some_and(|catalog| catalog.summary == inactive)
+            {
+                published = true;
+                break;
+            }
+        }
+        assert!(published);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err(),
+            "no stale actor event may overtake the inactive catalog summary"
+        );
     }
 
     #[tokio::test]

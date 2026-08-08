@@ -143,6 +143,12 @@ function updateSummary(
           : 0,
     };
   }
+  if (event.type === "session.pullRequestChanged") {
+    // Session events advance the replay cursor, but catalog summaries own PR
+    // evidence. Keeping that ownership split prevents a delayed actor event
+    // from regressing a newer host/inventory catalog projection.
+    return summary;
+  }
   if (event.type === "session.updated") {
     const status = event.patch.status ?? summary.status;
     return {
@@ -375,10 +381,17 @@ export class YggStore {
         if (title !== updated.title) updated = { ...updated, title };
       }
 
+      // An unloaded session has no actor-generation/sequence cursor with which
+      // to reject replayed PR events; its catalog summary stays authoritative.
+      const summaryEventAccepted = current
+        ? updated !== current
+        : event.type === "session.snapshot"
+          ? updated !== undefined
+          : event.type !== "session.pullRequestChanged";
       const bootstrap = next.bootstrap;
       let summaryChanged = false;
       const summaries = bootstrap?.sessions.map((summary) => {
-        if (summary.id !== event.sessionId) return summary;
+        if (summary.id !== event.sessionId || !summaryEventAccepted) return summary;
         const candidate = updateSummary(
           summary,
           event,
