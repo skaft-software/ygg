@@ -17,6 +17,9 @@ inspection evidence.
 - Two observers of one session converge without duplicate execution.
 - Reopening a session hydrates its durable items without duplicated prefixes or
   tool output.
+- Pull-request discovery and refresh use bounded structured GitHub CLI output;
+  persisted evidence updates inventory-only command-center sessions as well as
+  hosted sessions without parsing transcript text.
 
 ## Interaction
 
@@ -55,6 +58,8 @@ inspection evidence.
   authoritative snapshot.
 - Host, origin, request, frame, replay, and attachment bounds are enforced.
 - Public errors are sanitized.
+- Invalid, oversized, aliased, or symlinked persisted pull-request evidence fails
+  closed; temporary GitHub unavailability never erases the last valid state.
 - Generated HTML cannot access the main app or host bridge.
 - Production performs no analytics, remote-font, CDN, or hosted-control-plane
   request.

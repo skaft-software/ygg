@@ -1082,6 +1082,71 @@ describe("HTTP Ygg transport", () => {
     transport.close();
   });
 
+  it("keeps refreshed catalog context ahead of stale buffered events", async () => {
+    const initial = {
+      ...structuredClone(hostBootstrapGolden),
+      selectedSessionId: null,
+      selectedSession: null,
+    };
+    const refreshed = structuredClone(initial);
+    refreshed.catalogCursor = 9;
+    refreshed.sessions[0]!.title = "Authoritative catalog title";
+    const catalogRefresh = deferred<Response>();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(initial))
+      .mockImplementationOnce(() => catalogRefresh.promise)
+      .mockResolvedValueOnce(
+        jsonResponse(structuredClone(hostBootstrapGolden.selectedSession)),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+    const received: unknown[] = [];
+    transport.subscribe((event) => received.push(event));
+    await transport.connect(undefined, true);
+
+    const staleSummary = structuredClone(hostBootstrapGolden.sessions[0]);
+    staleSummary.title = "Stale buffered title";
+    FakeWebSocket.instances[0]?.emit("open", new Event("open"));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    FakeWebSocket.instances[0]?.emit(
+      "message",
+      new MessageEvent("message", {
+        data: JSON.stringify({
+          protocol: 1,
+          hostSequence: 10,
+          catalog: {
+            catalogCursor: 9,
+            summary: staleSummary,
+          },
+        }),
+      }),
+    );
+    catalogRefresh.resolve(jsonResponse(refreshed));
+
+    await vi.waitFor(() =>
+      expect(received).toContainEqual(
+        expect.objectContaining({
+          type: "catalog.summary",
+          catalogRevision: 9,
+          summary: expect.objectContaining({
+            title: "Authoritative catalog title",
+          }),
+        }),
+      ),
+    );
+    expect(received).not.toContainEqual(
+      expect.objectContaining({
+        type: "catalog.summary",
+        summary: expect.objectContaining({ title: "Stale buffered title" }),
+      }),
+    );
+    await expect(transport.getSession("session-demo")).resolves.toMatchObject({
+      title: "Authoritative catalog title",
+    });
+    transport.close();
+  });
+
   it("retains new-session summary context before loading its snapshot", async () => {
     const createdSnapshot = structuredClone(
       hostBootstrapGolden.selectedSession,

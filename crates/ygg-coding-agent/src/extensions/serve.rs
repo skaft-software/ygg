@@ -5,13 +5,17 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
+use futures_util::StreamExt as _;
 use sexy_tui_rs::{Color as TuiColor, TextStyle as TuiTextStyle};
 use sha2::{Digest as _, Sha256};
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, oneshot};
 use ygg_agent::{
     AgentEvent, CompactionReason, ContextBreakdown as AgentContextBreakdown,
@@ -41,20 +45,21 @@ use ygg_serve_backend::{
     ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProjectFileRead,
     ProjectFileSearchResult, ProjectFileSystem, ProjectFileSystemError, ProjectFileTree,
     ProjectFileWrite, ProjectId, ProjectRegistry, ProjectRegistryError, ProjectSummary,
-    PromptInput, ProtocolValidation, RegistryProjectId, RegistryProjectState,
-    RepositoryContextError, RepositoryContextSnapshot, RequestAnswer, RequestId, RequestKind,
-    RequestState, RunId, RuntimeId, SearchDocument, SearchDocumentKind, SearchError, SemanticRole,
-    ServiceError, SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph,
-    SessionCatalogState, SessionCommand, SessionCursor, SessionDriver, SessionId, SessionItem,
-    SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot, SessionSummary,
-    SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId, SourceKind, SourceRef,
-    StoredAttachment, StoredResource, StructuredTestResults, SupervisorConfig, TestCommandOutcome,
-    TestCommandStatus, TestFramework, TestOutputInput, ThemeColor, ThemeDensity, ThemeDto, ThemeId,
-    ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent,
-    ToolActivity, ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
-    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
-    TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
-    UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
+    PromptInput, ProtocolValidation, PullRequestState, PullRequestSummary, RegistryProjectId,
+    RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer,
+    RequestId, RequestKind, RequestState, RunId, RuntimeId, SearchDocument, SearchDocumentKind,
+    SearchError, SemanticRole, ServiceError, SessionBranchEntry, SessionBranchEntryKind,
+    SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor, SessionDriver,
+    SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot,
+    SessionSummary, SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId,
+    SourceKind, SourceRef, StoredAttachment, StoredResource, StructuredTestResults,
+    SupervisorConfig, TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput,
+    ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle,
+    ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity, ToolActivityStatus,
+    ToolKind, ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest,
+    TranscriptSearchResult, TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary,
+    TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId, UsageActivity,
+    UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
     MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES,
     PROTOCOL_VERSION,
 };
@@ -98,9 +103,12 @@ pub async fn run(
             });
     let host = Arc::new(YggHost::new(config)?);
     let goal_store_root = host.serve_state_dir.join("goals");
-    let supervisor = Arc::new(SessionSupervisor::new(host, SupervisorConfig::default()));
+    let supervisor = Arc::new(SessionSupervisor::new(
+        Arc::clone(&host),
+        SupervisorConfig::default(),
+    ));
     let server = LoopbackServer::start(
-        supervisor,
+        Arc::clone(&supervisor),
         LoopbackConfig {
             port,
             web_root: web_root.clone(),
@@ -109,6 +117,7 @@ pub async fn run(
         },
     )
     .await?;
+    let pull_request_refresh = tokio::spawn(run_pull_request_catalog_refresh(host, supervisor));
     let clean_url = server.url();
     if let Some(root) = web_root {
         crate::output::stdout_line(format!("Web app: {}", root.display()));
@@ -128,7 +137,10 @@ pub async fn run(
         }
         crate::output::stdout_line(format!("ygg graphical host: {clean_url}"));
     }
-    tokio::signal::ctrl_c().await?;
+    let interrupted = tokio::signal::ctrl_c().await;
+    pull_request_refresh.abort();
+    let _ = pull_request_refresh.await;
+    interrupted?;
     server.shutdown().await?;
     Ok(())
 }
@@ -213,6 +225,7 @@ struct YggHost {
     search_index: Arc<Mutex<TranscriptSearchIndex>>,
     resources: Option<ygg_serve_backend::ResourceStore>,
     usage: Arc<Mutex<InferenceRequestStore>>,
+    pull_requests: Arc<Mutex<PullRequestStore>>,
     serve_state_dir: PathBuf,
     session_deletion_lock: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
@@ -230,6 +243,387 @@ struct ProjectContext {
 const SESSION_DELETION_VERSION: u16 = 1;
 const SESSION_DELETION_DIRECTORY: &str = "session-deletions-v1";
 const MAX_SESSION_DELETION_RECORD_BYTES: u64 = 4 * 1024;
+const PULL_REQUEST_STORE_VERSION: u16 = 1;
+const PULL_REQUEST_STORE_FILE: &str = "pull-requests-v1.json";
+const MAX_PULL_REQUEST_STORE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PULL_REQUEST_RECORDS: usize = 2_000;
+const MAX_GITHUB_CLI_OUTPUT_BYTES: u64 = 16 * 1024;
+const MAX_CONCURRENT_GITHUB_QUERIES: usize = 4;
+const GITHUB_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const PULL_REQUEST_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+static GITHUB_QUERY_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_GITHUB_QUERIES);
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PullRequestIdentity {
+    host: String,
+    port: u16,
+    owner: String,
+    repository: String,
+    number: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredPullRequest {
+    session_id: String,
+    url: String,
+    number: u64,
+    state: PullRequestState,
+    refreshed_at_ms: u64,
+}
+
+impl StoredPullRequest {
+    fn summary(&self) -> PullRequestSummary {
+        PullRequestSummary { state: self.state }
+    }
+
+    fn validate(&self) -> bool {
+        SessionId::new(self.session_id.clone()).is_ok()
+            && self.number > 0
+            && self.refreshed_at_ms > 0
+            && pull_request_url_is_valid(&self.url, self.number)
+    }
+}
+
+fn pull_request_identity(value: &str, number: u64) -> Option<PullRequestIdentity> {
+    if value.len() > 2_048 || number == 0 {
+        return None;
+    }
+    let url = url::Url::parse(value).ok()?;
+    let path_segments = url.path_segments()?.collect::<Vec<_>>();
+    let host = url.host_str()?;
+    let path_matches = path_segments.len() == 4
+        && path_segments.iter().all(|segment| !segment.is_empty())
+        && path_segments[..2]
+            .iter()
+            .all(|segment| !segment.contains('%'))
+        && path_segments[2] == "pull"
+        && path_segments[3] == number.to_string();
+    if url.scheme() != "https"
+        || url.cannot_be_a_base()
+        || host.is_empty()
+        || host.ends_with('.')
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !path_matches
+    {
+        return None;
+    }
+    Some(PullRequestIdentity {
+        host: host.to_ascii_lowercase(),
+        port: url.port_or_known_default()?,
+        owner: path_segments[0].to_ascii_lowercase(),
+        repository: path_segments[1].to_ascii_lowercase(),
+        number,
+    })
+}
+
+fn pull_request_url_is_valid(value: &str, number: u64) -> bool {
+    pull_request_identity(value, number).is_some()
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredPullRequestCatalog {
+    version: u16,
+    #[serde(deserialize_with = "deserialize_unique_pull_request_records")]
+    records: BTreeMap<String, StoredPullRequest>,
+}
+
+fn deserialize_unique_pull_request_records<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, StoredPullRequest>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueRecordsVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for UniqueRecordsVisitor {
+        type Value = BTreeMap<String, StoredPullRequest>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a pull-request record map with unique session IDs")
+        }
+
+        fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut records = BTreeMap::new();
+            while let Some((session_id, pull_request)) = entries.next_entry()? {
+                if records.insert(session_id, pull_request).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate pull-request session ID",
+                    ));
+                }
+            }
+            Ok(records)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueRecordsVisitor)
+}
+
+struct PullRequestStore {
+    path: PathBuf,
+    records: BTreeMap<String, StoredPullRequest>,
+    catalog_changes: BTreeSet<String>,
+    deleted_sessions: BTreeSet<String>,
+}
+
+impl PullRequestStore {
+    fn empty(serve_state_dir: &Path) -> Self {
+        Self {
+            path: serve_state_dir.join(PULL_REQUEST_STORE_FILE),
+            records: BTreeMap::new(),
+            catalog_changes: BTreeSet::new(),
+            deleted_sessions: BTreeSet::new(),
+        }
+    }
+
+    fn open(serve_state_dir: &Path) -> anyhow::Result<Self> {
+        let path = serve_state_dir.join(PULL_REQUEST_STORE_FILE);
+        let metadata = match path.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::empty(serve_state_dir));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_PULL_REQUEST_STORE_BYTES
+        {
+            anyhow::bail!("pull-request evidence store is unsafe");
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options.open(&path)?;
+        let opened_metadata = file.metadata()?;
+        if !opened_metadata.is_file() || opened_metadata.len() > MAX_PULL_REQUEST_STORE_BYTES {
+            anyhow::bail!("pull-request evidence store changed during validation");
+        }
+        let mut bytes = Vec::with_capacity(opened_metadata.len() as usize);
+        file.take(MAX_PULL_REQUEST_STORE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_PULL_REQUEST_STORE_BYTES {
+            anyhow::bail!("pull-request evidence store is too large");
+        }
+        let catalog = serde_json::from_slice::<StoredPullRequestCatalog>(&bytes)?;
+        let mut identities = BTreeSet::new();
+        if catalog.version != PULL_REQUEST_STORE_VERSION
+            || catalog.records.len() > MAX_PULL_REQUEST_RECORDS
+            || catalog.records.iter().any(|(session_id, record)| {
+                session_id != &record.session_id
+                    || !record.validate()
+                    || match pull_request_identity(&record.url, record.number) {
+                        Some(identity) => !identities.insert(identity),
+                        None => true,
+                    }
+            })
+        {
+            anyhow::bail!("pull-request evidence store is invalid");
+        }
+        Ok(Self {
+            path,
+            records: catalog.records,
+            catalog_changes: BTreeSet::new(),
+            deleted_sessions: BTreeSet::new(),
+        })
+    }
+
+    fn get(&self, session_id: &SessionId) -> Option<StoredPullRequest> {
+        self.records.get(session_id.as_str()).cloned()
+    }
+
+    fn summary(&self, session_id: &SessionId) -> Option<PullRequestSummary> {
+        self.records
+            .get(session_id.as_str())
+            .map(StoredPullRequest::summary)
+    }
+
+    fn summaries(&self) -> BTreeMap<String, PullRequestSummary> {
+        self.records
+            .iter()
+            .map(|(session_id, pull_request)| (session_id.clone(), pull_request.summary()))
+            .collect()
+    }
+
+    fn refreshable(&self) -> Vec<StoredPullRequest> {
+        let mut pull_requests = self
+            .records
+            .values()
+            .filter(|pull_request| pull_request.state != PullRequestState::Merged)
+            .cloned()
+            .collect::<Vec<_>>();
+        // Oldest evidence goes first so a permit race cannot repeatedly favor
+        // the same session-ID prefix while the trailing inventory stays stale.
+        pull_requests.sort_by(|left, right| {
+            left.refreshed_at_ms
+                .cmp(&right.refreshed_at_ms)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        pull_requests
+    }
+
+    fn take_catalog_changes(&mut self) -> BTreeSet<SessionId> {
+        std::mem::take(&mut self.catalog_changes)
+            .into_iter()
+            .map(|session_id| SessionId::new(session_id).expect("stored pull-request session ID"))
+            .collect()
+    }
+
+    fn replace(
+        &mut self,
+        session_id: &SessionId,
+        pull_request: Option<StoredPullRequest>,
+    ) -> anyhow::Result<()> {
+        self.transaction(|store| store.replace_unpersisted(session_id, pull_request))
+    }
+
+    fn delete_session(&mut self, session_id: &SessionId) -> anyhow::Result<()> {
+        // A hosted refresh may already be finishing on the blocking pool when
+        // actor retirement begins. Fence the identity before removal so that a
+        // late first-discovery result cannot recreate evidence after permanent
+        // session deletion.
+        self.deleted_sessions.insert(session_id.as_str().to_owned());
+        if self.records.contains_key(session_id.as_str()) {
+            self.replace(session_id, None)?;
+        }
+        Ok(())
+    }
+
+    fn replace_unpersisted(
+        &mut self,
+        session_id: &SessionId,
+        pull_request: Option<StoredPullRequest>,
+    ) -> anyhow::Result<()> {
+        let previous_summary = self.summary(session_id);
+        if let Some(pull_request) = pull_request.as_ref() {
+            if self.deleted_sessions.contains(session_id.as_str()) {
+                anyhow::bail!("pull-request session was permanently deleted");
+            }
+            if self.records.len() >= MAX_PULL_REQUEST_RECORDS
+                && !self.records.contains_key(session_id.as_str())
+            {
+                anyhow::bail!("pull-request evidence store is full");
+            }
+            if pull_request.session_id != session_id.as_str() || !pull_request.validate() {
+                anyhow::bail!("pull-request evidence is invalid");
+            }
+            let identity = pull_request_identity(&pull_request.url, pull_request.number)
+                .ok_or_else(|| anyhow::anyhow!("pull-request evidence is invalid"))?;
+            if self.records.iter().any(|(other_session_id, other)| {
+                other_session_id != session_id.as_str()
+                    && pull_request_identity(&other.url, other.number).as_ref() == Some(&identity)
+            }) {
+                anyhow::bail!("pull-request evidence is already associated with another session");
+            }
+        }
+        match pull_request {
+            Some(pull_request) => self
+                .records
+                .insert(session_id.as_str().to_owned(), pull_request),
+            None => self.records.remove(session_id.as_str()),
+        };
+        if self.summary(session_id) != previous_summary {
+            self.catalog_changes.insert(session_id.as_str().to_owned());
+        }
+        Ok(())
+    }
+
+    fn transaction<T>(
+        &mut self,
+        update: impl FnOnce(&mut Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let previous_records = self.records.clone();
+        let previous_catalog_changes = self.catalog_changes.clone();
+        let outcome = match update(self) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.records = previous_records;
+                self.catalog_changes = previous_catalog_changes;
+                return Err(error);
+            }
+        };
+        if self.records == previous_records {
+            self.catalog_changes = previous_catalog_changes;
+        } else if let Err(error) = self.persist() {
+            self.records = previous_records;
+            self.catalog_changes = previous_catalog_changes;
+            return Err(error);
+        }
+        Ok(outcome)
+    }
+
+    fn persist(&self) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec(&StoredPullRequestCatalog {
+            version: PULL_REQUEST_STORE_VERSION,
+            records: self.records.clone(),
+        })?;
+        if bytes.len() as u64 > MAX_PULL_REQUEST_STORE_BYTES {
+            anyhow::bail!("pull-request evidence store is too large");
+        }
+        let directory = self
+            .path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("pull-request evidence store has no parent"))?;
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)?;
+        let temporary = directory.join(format!(".pull-requests-{}", stable_hash(&random)));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&temporary)?;
+        let result = (|| -> anyhow::Result<()> {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temporary, &self.path)?;
+            std::fs::File::open(directory)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GitHubPullRequest {
+    number: u64,
+    url: String,
+    state: String,
+    is_draft: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PullRequestObservation {
+    Trackable {
+        number: u64,
+        url: String,
+        state: PullRequestState,
+    },
+    Closed {
+        number: u64,
+        url: String,
+    },
+    Unavailable,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -337,6 +731,8 @@ impl YggHost {
         };
         let mut usage = InferenceRequestStore::open(&state_dir)?;
         backfill_usage_store(&config, &projects, &mut usage)?;
+        let pull_requests = PullRequestStore::open(&state_dir)
+            .context("failed to open stored pull-request evidence")?;
         let host = Self {
             config,
             catalog: boot.catalog,
@@ -353,6 +749,7 @@ impl YggHost {
             search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources,
             usage: Arc::new(Mutex::new(usage)),
+            pull_requests: Arc::new(Mutex::new(pull_requests)),
             serve_state_dir: state_dir,
             session_deletion_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
@@ -391,6 +788,12 @@ impl YggHost {
         match self.search_index.lock() {
             Ok(mut search_index) => {
                 complete &= search_index.remove_session(session_id.as_str()).is_ok();
+            }
+            Err(_) => complete = false,
+        }
+        match self.pull_requests.lock() {
+            Ok(mut pull_requests) => {
+                complete &= pull_requests.delete_session(session_id).is_ok();
             }
             Err(_) => complete = false,
         }
@@ -492,6 +895,36 @@ impl YggHost {
                 ));
             }
         }
+    }
+
+    fn cached_pull_request(&self, session_id: &SessionId) -> Option<PullRequestSummary> {
+        self.pull_requests
+            .lock()
+            .ok()
+            .and_then(|pull_requests| pull_requests.summary(session_id))
+    }
+
+    fn stored_session_summary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionSummary, ServiceError> {
+        let context = self.storage_context_for_session(session_id)?;
+        let meta =
+            session_meta_for_id(&context.sessions, session_id).ok_or(ServiceError::NotFound)?;
+        let selection = Session::open_read_only(&meta.path)
+            .ok()
+            .and_then(|session| {
+                advertised_selection_from_session(
+                    &session,
+                    &self.catalog,
+                    &context.config,
+                    &self.models,
+                )
+            })
+            .map_or_else(|| self.default_selection(), Ok)?;
+        let mut summary = summary_from_meta(&meta, Some(context.project_id), selection)?;
+        summary.pull_request = self.cached_pull_request(session_id);
+        Ok(summary)
     }
 
     fn default_selection(&self) -> Result<ModelSelection, ServiceError> {
@@ -657,6 +1090,10 @@ impl YggHost {
             search_index: Arc::clone(&self.search_index),
             resources: self.resources.clone(),
             usage: Arc::clone(&self.usage),
+            pull_requests: Arc::clone(&self.pull_requests),
+            pull_request_projection: Arc::new(Mutex::new(None)),
+            pull_request_discovery_enabled: Arc::new(AtomicBool::new(false)),
+            pull_request_refresh_requested: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             checkout_hooks: CheckoutTestHooks::default(),
         };
@@ -684,7 +1121,7 @@ impl YggHost {
             advertised_selection_from_session(&session, &self.catalog, &self.config, &self.models)
                 .map_or_else(|| self.default_selection(), Ok)?;
         let generation = next_actor_generation();
-        let seed = seed_from_session(
+        let mut seed = seed_from_session(
             &session,
             session_id.clone(),
             SessionSeedOptions {
@@ -698,6 +1135,11 @@ impl YggHost {
                 resource_store: self.resources.as_ref(),
             },
         )?;
+        seed.summary.pull_request = self.cached_pull_request(session_id);
+        let pull_request_discovery_enabled = session
+            .entries()
+            .iter()
+            .any(|entry| matches!(&entry.value, EntryValue::Message(Message::User(_))));
         let reasoning =
             config::parse_reasoning(&selection.reasoning).map_err(|_| ServiceError::InvalidSeed)?;
         let plan = WorkerPlan {
@@ -721,6 +1163,12 @@ impl YggHost {
             search_index: Arc::clone(&self.search_index),
             resources: self.resources.clone(),
             usage: Arc::clone(&self.usage),
+            pull_requests: Arc::clone(&self.pull_requests),
+            pull_request_projection: Arc::new(Mutex::new(seed.summary.pull_request.clone())),
+            pull_request_discovery_enabled: Arc::new(AtomicBool::new(
+                pull_request_discovery_enabled,
+            )),
+            pull_request_refresh_requested: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             checkout_hooks: self
                 .checkout_hooks
@@ -1794,20 +2242,7 @@ impl HostService for YggHost {
             .sessions
             .set_lifecycle(session_id.as_str(), storage_lifecycle, changed_at_ms)
             .map_err(|_| ServiceError::Internal)?;
-        let meta =
-            session_meta_for_id(&context.sessions, session_id).ok_or(ServiceError::NotFound)?;
-        let selection = Session::open_read_only(&meta.path)
-            .ok()
-            .and_then(|session| {
-                advertised_selection_from_session(
-                    &session,
-                    &self.catalog,
-                    &context.config,
-                    &self.models,
-                )
-            })
-            .map_or_else(|| self.default_selection(), Ok)?;
-        summary_from_meta(&meta, Some(context.project_id), selection)
+        self.stored_session_summary(session_id)
     }
 
     async fn delete_session_permanently(
@@ -1888,6 +2323,7 @@ impl HostService for YggHost {
     async fn list_sessions(&self) -> Result<Vec<SessionSummary>, ServiceError> {
         let fallback = self.default_selection()?;
         let projects = Arc::clone(&self.projects);
+        let pull_requests = Arc::clone(&self.pull_requests);
         let catalog = self.catalog.clone();
         let models = self.models.clone();
         let base_config = self.config.clone();
@@ -1935,6 +2371,17 @@ impl HostService for YggHost {
                         summaries.push(summary);
                     }
                 }
+            }
+            drop(projects);
+            // Snapshot evidence only after the blocking inventory scan, without
+            // holding its mutex across transcript I/O or waiting on the async
+            // runtime when a persistence transaction is finishing.
+            let pull_requests = pull_requests
+                .lock()
+                .map_err(|_| ServiceError::Internal)?
+                .summaries();
+            for summary in &mut summaries {
+                summary.pull_request = pull_requests.get(summary.id.as_str()).cloned();
             }
             Ok(summaries)
         })
@@ -2080,8 +2527,508 @@ struct WorkerPlan {
     search_index: Arc<Mutex<TranscriptSearchIndex>>,
     resources: Option<ygg_serve_backend::ResourceStore>,
     usage: Arc<Mutex<InferenceRequestStore>>,
+    pull_requests: Arc<Mutex<PullRequestStore>>,
+    pull_request_projection: Arc<Mutex<Option<PullRequestSummary>>>,
+    pull_request_discovery_enabled: Arc<AtomicBool>,
+    pull_request_refresh_requested: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     checkout_hooks: CheckoutTestHooks,
+}
+
+#[derive(Clone)]
+struct PullRequestRefreshPlan {
+    workspace: PathBuf,
+    session_id: SessionId,
+    pull_requests: Arc<Mutex<PullRequestStore>>,
+    projection: Arc<Mutex<Option<PullRequestSummary>>>,
+    discovery_enabled: Arc<AtomicBool>,
+    refresh_requested: Arc<tokio::sync::Notify>,
+}
+
+impl From<&WorkerPlan> for PullRequestRefreshPlan {
+    fn from(plan: &WorkerPlan) -> Self {
+        Self {
+            workspace: plan.config.workspace.clone(),
+            session_id: plan.session_id.clone(),
+            pull_requests: Arc::clone(&plan.pull_requests),
+            projection: Arc::clone(&plan.pull_request_projection),
+            discovery_enabled: Arc::clone(&plan.pull_request_discovery_enabled),
+            refresh_requested: Arc::clone(&plan.pull_request_refresh_requested),
+        }
+    }
+}
+
+fn project_github_pull_request(bytes: &[u8]) -> PullRequestObservation {
+    let Ok(pull_request) = serde_json::from_slice::<GitHubPullRequest>(bytes) else {
+        return PullRequestObservation::Unavailable;
+    };
+    if pull_request.number == 0
+        || !pull_request_url_is_valid(&pull_request.url, pull_request.number)
+    {
+        return PullRequestObservation::Unavailable;
+    }
+    let state = match pull_request.state.as_str() {
+        "OPEN" if pull_request.is_draft => PullRequestState::InProgress,
+        "OPEN" => PullRequestState::Ready,
+        "MERGED" => PullRequestState::Merged,
+        "CLOSED" => {
+            return PullRequestObservation::Closed {
+                number: pull_request.number,
+                url: pull_request.url,
+            };
+        }
+        _ => return PullRequestObservation::Unavailable,
+    };
+    PullRequestObservation::Trackable {
+        number: pull_request.number,
+        url: pull_request.url,
+        state,
+    }
+}
+
+async fn query_github_pull_request(
+    workspace: &Path,
+    selector: Option<&str>,
+    executable: &Path,
+) -> PullRequestObservation {
+    query_github_pull_request_with_timeout(workspace, selector, executable, GITHUB_CLI_TIMEOUT)
+        .await
+}
+
+async fn query_hosted_github_pull_request(
+    workspace: &Path,
+    selector: Option<&str>,
+    executable: &Path,
+) -> PullRequestObservation {
+    query_github_pull_request_with_timeout_and_queued_permit(
+        workspace,
+        selector,
+        executable,
+        GITHUB_CLI_TIMEOUT,
+        &GITHUB_QUERY_PERMITS,
+    )
+    .await
+}
+
+async fn query_github_pull_request_with_timeout(
+    workspace: &Path,
+    selector: Option<&str>,
+    executable: &Path,
+    timeout: std::time::Duration,
+) -> PullRequestObservation {
+    query_github_pull_request_with_timeout_and_permits(
+        workspace,
+        selector,
+        executable,
+        timeout,
+        &GITHUB_QUERY_PERMITS,
+    )
+    .await
+}
+
+async fn query_github_pull_request_with_timeout_and_permits(
+    workspace: &Path,
+    selector: Option<&str>,
+    executable: &Path,
+    timeout: std::time::Duration,
+    permits: &tokio::sync::Semaphore,
+) -> PullRequestObservation {
+    let Ok(_permit) = permits.try_acquire() else {
+        return PullRequestObservation::Unavailable;
+    };
+    execute_github_pull_request_query(workspace, selector, executable, timeout).await
+}
+
+async fn query_github_pull_request_with_timeout_and_queued_permit(
+    workspace: &Path,
+    selector: Option<&str>,
+    executable: &Path,
+    timeout: std::time::Duration,
+    permits: &tokio::sync::Semaphore,
+) -> PullRequestObservation {
+    let Ok(_permit) = permits.acquire().await else {
+        return PullRequestObservation::Unavailable;
+    };
+    execute_github_pull_request_query(workspace, selector, executable, timeout).await
+}
+
+async fn execute_github_pull_request_query(
+    workspace: &Path,
+    selector: Option<&str>,
+    executable: &Path,
+    timeout: std::time::Duration,
+) -> PullRequestObservation {
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .args(["pr", "view"])
+        .current_dir(workspace)
+        .env_remove("GH_REPO")
+        .env_remove("GH_FORCE_TTY")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if let Some(selector) = selector {
+        command.arg(selector);
+    }
+    command.args(["--json", "number,url,state,isDraft"]);
+    let Ok(mut child) = command.spawn() else {
+        return PullRequestObservation::Unavailable;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        return PullRequestObservation::Unavailable;
+    };
+    let result = tokio::time::timeout(timeout, async {
+        let mut bytes = Vec::new();
+        let mut bounded = stdout.take(MAX_GITHUB_CLI_OUTPUT_BYTES + 1);
+        bounded.read_to_end(&mut bytes).await?;
+        drop(bounded);
+        if bytes.len() as u64 > MAX_GITHUB_CLI_OUTPUT_BYTES {
+            let _ = child.kill().await;
+        }
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, bytes))
+    })
+    .await;
+    let Ok(Ok((status, bytes))) = result else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return PullRequestObservation::Unavailable;
+    };
+    if !status.success() || bytes.len() as u64 > MAX_GITHUB_CLI_OUTPUT_BYTES {
+        return PullRequestObservation::Unavailable;
+    }
+    project_github_pull_request(&bytes)
+}
+
+fn apply_pull_request_observation(
+    store: &mut PullRequestStore,
+    session_id: &SessionId,
+    observation: PullRequestObservation,
+    refreshed_at_ms: u64,
+) -> anyhow::Result<Option<Option<PullRequestSummary>>> {
+    store.transaction(|store| {
+        apply_pull_request_observation_unpersisted(store, session_id, observation, refreshed_at_ms)
+    })
+}
+
+fn apply_pull_request_observation_unpersisted(
+    store: &mut PullRequestStore,
+    session_id: &SessionId,
+    observation: PullRequestObservation,
+    refreshed_at_ms: u64,
+) -> anyhow::Result<Option<Option<PullRequestSummary>>> {
+    let previous = store.get(session_id);
+    if previous
+        .as_ref()
+        .is_some_and(|pull_request| pull_request.state == PullRequestState::Merged)
+    {
+        return Ok(None);
+    }
+    if let Some(previous) = &previous {
+        match &observation {
+            PullRequestObservation::Trackable { number, url, .. }
+            | PullRequestObservation::Closed { number, url }
+                if pull_request_identity(&previous.url, previous.number)
+                    != pull_request_identity(url, *number) =>
+            {
+                return Ok(None);
+            }
+            _ => {}
+        }
+    }
+    let (next, summary) = match observation {
+        PullRequestObservation::Trackable { number, url, state } => {
+            let stored = StoredPullRequest {
+                session_id: session_id.as_str().to_owned(),
+                url,
+                number,
+                state,
+                refreshed_at_ms,
+            };
+            let summary = Some(stored.summary());
+            (Some(stored), summary)
+        }
+        PullRequestObservation::Closed { .. } if previous.is_some() => (None, None),
+        PullRequestObservation::Closed { .. } | PullRequestObservation::Unavailable => {
+            return Ok(None);
+        }
+    };
+    let previous_summary = previous.as_ref().map(StoredPullRequest::summary);
+    store.replace_unpersisted(session_id, next)?;
+    Ok((previous_summary != summary).then_some(summary))
+}
+
+async fn publish_pull_request_projection(
+    plan: &PullRequestRefreshPlan,
+    events: &mpsc::Sender<TimestampedEvent>,
+    summary: Option<PullRequestSummary>,
+) -> Result<(), ServiceError> {
+    {
+        let mut projection = plan.projection.lock().map_err(|_| ServiceError::Internal)?;
+        if projection.as_ref() == summary.as_ref() {
+            return Ok(());
+        }
+        // Replacement commands read this projection independently of event
+        // delivery. Advance it first so an event already observed by the actor
+        // can never be overwritten by a replacement built from stale evidence.
+        *projection = summary.clone();
+    }
+    events
+        .send(event(EventPayload::SessionPullRequestChanged {
+            pull_request: summary,
+        }))
+        .await
+        .map_err(|_| ServiceError::Unavailable)
+}
+
+async fn refresh_pull_request_projection(
+    plan: &PullRequestRefreshPlan,
+    events: &mpsc::Sender<TimestampedEvent>,
+    executable: &Path,
+) -> Result<(), ServiceError> {
+    let pull_requests = Arc::clone(&plan.pull_requests);
+    let session_id = plan.session_id.clone();
+    let previous = tokio::task::spawn_blocking(move || {
+        pull_requests
+            .lock()
+            .map_err(|_| ServiceError::Internal)
+            .map(|pull_requests| pull_requests.get(&session_id))
+    })
+    .await
+    .map_err(|_| ServiceError::Internal)??;
+    publish_pull_request_projection(
+        plan,
+        events,
+        previous.as_ref().map(StoredPullRequest::summary),
+    )
+    .await?;
+    if previous
+        .as_ref()
+        .is_some_and(|pull_request| pull_request.state == PullRequestState::Merged)
+        || (previous.is_none() && !plan.discovery_enabled.load(Ordering::Acquire))
+    {
+        return Ok(());
+    }
+    let observation = query_hosted_github_pull_request(
+        &plan.workspace,
+        previous
+            .as_ref()
+            .map(|pull_request| pull_request.url.as_str()),
+        executable,
+    )
+    .await;
+    let pull_requests = Arc::clone(&plan.pull_requests);
+    let session_id = plan.session_id.clone();
+    let current = tokio::task::spawn_blocking(move || {
+        let mut pull_requests = pull_requests.lock().map_err(|_| ServiceError::Internal)?;
+        if pull_requests.get(&session_id) == previous {
+            apply_pull_request_observation(&mut pull_requests, &session_id, observation, now_ms())
+                .map_err(|_| ServiceError::Internal)?;
+        }
+        Ok::<_, ServiceError>(pull_requests.summary(&session_id))
+    })
+    .await
+    .map_err(|_| ServiceError::Internal)??;
+    publish_pull_request_projection(plan, events, current).await
+}
+
+async fn run_hosted_pull_request_refresh(
+    plan: PullRequestRefreshPlan,
+    events: mpsc::Sender<TimestampedEvent>,
+) {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + PULL_REQUEST_REFRESH_INTERVAL,
+        PULL_REQUEST_REFRESH_INTERVAL,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = events.closed() => return,
+            _ = interval.tick() => {}
+            () = plan.refresh_requested.notified() => {}
+        }
+        let _ = refresh_pull_request_projection(&plan, &events, Path::new("gh")).await;
+    }
+}
+
+#[cfg(test)]
+async fn refresh_pull_request_projection_with_executable(
+    plan: &WorkerPlan,
+    events: &mpsc::Sender<TimestampedEvent>,
+    executable: &Path,
+) -> Result<(), ServiceError> {
+    refresh_pull_request_projection(&PullRequestRefreshPlan::from(plan), events, executable).await
+}
+
+fn select_inactive_pull_request_batch(
+    refreshable: Vec<StoredPullRequest>,
+    hosted: &BTreeSet<SessionId>,
+    attempted: &mut BTreeSet<String>,
+    capacity: usize,
+) -> Vec<StoredPullRequest> {
+    let inactive = refreshable
+        .into_iter()
+        .filter(|pull_request| {
+            !hosted
+                .iter()
+                .any(|session_id| session_id.as_str() == pull_request.session_id)
+        })
+        .collect::<Vec<_>>();
+    let inactive_ids = inactive
+        .iter()
+        .map(|pull_request| pull_request.session_id.as_str())
+        .collect::<BTreeSet<_>>();
+    attempted.retain(|session_id| inactive_ids.contains(session_id.as_str()));
+    if capacity == 0 || inactive.is_empty() {
+        return Vec::new();
+    }
+    if inactive
+        .iter()
+        .all(|pull_request| attempted.contains(&pull_request.session_id))
+    {
+        attempted.clear();
+    }
+    let batch = inactive
+        .into_iter()
+        .filter(|pull_request| !attempted.contains(&pull_request.session_id))
+        .take(capacity)
+        .collect::<Vec<_>>();
+    attempted.extend(
+        batch
+            .iter()
+            .map(|pull_request| pull_request.session_id.clone()),
+    );
+    batch
+}
+
+async fn refresh_inactive_pull_requests_once(
+    host: &Arc<YggHost>,
+    supervisor: &Arc<SessionSupervisor<YggHost>>,
+    pending_catalog: &mut BTreeSet<SessionId>,
+    attempted: &mut BTreeSet<String>,
+    executable: &Path,
+) {
+    let hosted = supervisor.hosted_session_ids().await;
+    let pull_requests = Arc::clone(&host.pull_requests);
+    let refreshable = match tokio::task::spawn_blocking(move || {
+        pull_requests
+            .lock()
+            .map_err(|_| ())
+            .map(|pull_requests| pull_requests.refreshable())
+    })
+    .await
+    {
+        Ok(Ok(refreshable)) => refreshable,
+        Ok(Err(())) | Err(_) => return,
+    };
+    let workspace = host.config.workspace.clone();
+    let executable = executable.to_owned();
+    // Match the one-shot batch width to permits available at its start. Keep a
+    // round of attempted identities so temporary failures do not pin every
+    // later inventory record behind the same oldest evidence.
+    let query_concurrency = GITHUB_QUERY_PERMITS
+        .available_permits()
+        .min(MAX_CONCURRENT_GITHUB_QUERIES);
+    let refreshable =
+        select_inactive_pull_request_batch(refreshable, &hosted, attempted, query_concurrency);
+    let observations = if query_concurrency == 0 {
+        Vec::new()
+    } else {
+        futures_util::stream::iter(refreshable.into_iter().map(|stored| {
+            let workspace = workspace.clone();
+            let executable = executable.clone();
+            async move {
+                let observation =
+                    query_github_pull_request(&workspace, Some(stored.url.as_str()), &executable)
+                        .await;
+                (stored, observation)
+            }
+        }))
+        .buffer_unordered(query_concurrency)
+        .collect::<Vec<_>>()
+        .await
+    };
+
+    let refreshed_at_ms = now_ms();
+    let pull_requests = Arc::clone(&host.pull_requests);
+    let catalog_changes = tokio::task::spawn_blocking(move || {
+        let Ok(mut pull_requests) = pull_requests.lock() else {
+            return BTreeSet::new();
+        };
+        let _ = pull_requests.transaction(|pull_requests| {
+            for (expected, observation) in observations {
+                let session_id = SessionId::new(expected.session_id.clone())
+                    .expect("stored pull-request session ID");
+                if pull_requests.get(&session_id).as_ref() != Some(&expected) {
+                    continue;
+                }
+                apply_pull_request_observation_unpersisted(
+                    pull_requests,
+                    &session_id,
+                    observation,
+                    refreshed_at_ms,
+                )?;
+            }
+            Ok(())
+        });
+        pull_requests.take_catalog_changes()
+    })
+    .await
+    .unwrap_or_default();
+    // A hosted refresh can persist evidence just as its actor retires, after
+    // the actor has stopped consuming driver events. Reconcile every durable
+    // state change through the inactive ownership fence so such handoffs cannot
+    // strand a stale catalog projection, including terminal merges or closure.
+    pending_catalog.extend(catalog_changes);
+
+    for session_id in pending_catalog.iter().cloned().collect::<Vec<_>>() {
+        let summary_host = Arc::clone(host);
+        let summary_session_id = session_id.clone();
+        let summary = match tokio::task::spawn_blocking(move || {
+            summary_host.stored_session_summary(&summary_session_id)
+        })
+        .await
+        {
+            Ok(Ok(summary)) => summary,
+            Ok(Err(ServiceError::NotFound)) => {
+                pending_catalog.remove(&session_id);
+                continue;
+            }
+            Ok(Err(_)) | Err(_) => continue,
+        };
+        if let Ok(true) = supervisor.publish_inactive_catalog_summary(summary).await {
+            pending_catalog.remove(&session_id);
+        }
+    }
+}
+
+async fn run_pull_request_catalog_refresh(
+    host: Arc<YggHost>,
+    supervisor: Arc<SessionSupervisor<YggHost>>,
+) {
+    let mut pending_catalog = BTreeSet::new();
+    let mut attempted = BTreeSet::new();
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + PULL_REQUEST_REFRESH_INTERVAL,
+        PULL_REQUEST_REFRESH_INTERVAL,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        refresh_inactive_pull_requests_once(
+            &host,
+            &supervisor,
+            &mut pending_catalog,
+            &mut attempted,
+            Path::new("gh"),
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -2340,6 +3287,10 @@ async fn run_worker(
 ) {
     let mut app: Option<App> = None;
     let mut projection = ProjectionState::new(known_entries);
+    let pull_request_refresh = tokio::spawn(run_hosted_pull_request_refresh(
+        PullRequestRefreshPlan::from(&plan),
+        events.clone(),
+    ));
     while let Some(message) = commands.recv().await {
         let message = match message {
             WorkerMessage::Command(message) => message,
@@ -2626,7 +3577,7 @@ async fn run_worker(
                         }
                     };
                 let model = selection_for_model(&rebuilt.model, &rebuilt.reasoning, &plan.config);
-                let replacement = seed_from_session(
+                let mut replacement = seed_from_session(
                     rebuilt.agent.session(),
                     plan.session_id.clone(),
                     SessionSeedOptions {
@@ -2640,8 +3591,14 @@ async fn run_worker(
                         resource_store: plan.resources.as_ref(),
                     },
                 );
-                #[cfg(test)]
-                let mut replacement = replacement;
+                if let (Ok(seed), Ok(pull_request)) =
+                    (replacement.as_mut(), plan.pull_request_projection.lock())
+                {
+                    // Projection replacement runs on the serialized command
+                    // worker. Read its in-memory actor projection rather than
+                    // contending with blocking-pool evidence persistence.
+                    seed.summary.pull_request = pull_request.clone();
+                }
                 #[cfg(test)]
                 {
                     if plan.checkout_hooks.fail_seed_after_checkout {
@@ -2948,6 +3905,8 @@ async fn run_worker(
             }
         }
     }
+    pull_request_refresh.abort();
+    let _ = pull_request_refresh.await;
     shutdown_worker_app(&mut app).await;
 }
 
@@ -4338,6 +5297,9 @@ async fn start_and_drive_run(
     {
         control.abort();
     }
+    plan.pull_request_discovery_enabled
+        .store(true, Ordering::Release);
+    plan.pull_request_refresh_requested.notify_one();
 
     let mut response_text = String::new();
     let mut completed = false;
@@ -9204,6 +10166,1010 @@ mod tests {
         resumed.shutdown().await;
     }
 
+    fn stored_pull_request(
+        session_id: &SessionId,
+        number: u64,
+        state: PullRequestState,
+    ) -> StoredPullRequest {
+        StoredPullRequest {
+            session_id: session_id.as_str().to_owned(),
+            url: format!("https://github.com/skaft-software/ygg/pull/{number}"),
+            number,
+            state,
+            refreshed_at_ms: 1_750_000_000_000,
+        }
+    }
+
+    fn pull_request_worker_plan(directory: &Path, session_name: &str) -> WorkerPlan {
+        let workspace = directory.join("workspace");
+        let session_dir = directory.join("sessions");
+        let state_dir = directory.join("state");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut config = serve_test_config(&workspace);
+        config.workspace = workspace.clone();
+        config.invocation_cwd = workspace.clone();
+        config.session_dir = session_dir.clone();
+        let session_id = SessionId::new(session_name).unwrap();
+        WorkerPlan {
+            config,
+            sessions: SessionStore::new(&session_dir, &workspace),
+            launch: LaunchSelection {
+                model: ModelId("test-model".into()),
+                session: SessionSelection::CreateNew(
+                    session_dir.join(format!("{session_name}.jsonl")),
+                ),
+                reasoning: ReasoningConfig::Off,
+                reasoning_mode: ygg_ai::ReasoningMode::Standard,
+            },
+            authority: AuthorityProfile::FullAccess,
+            available_models: Vec::new(),
+            actor_generation: 1,
+            session_id,
+            project_id: None,
+            attachments: None,
+            documents: None,
+            projects: Arc::new(Mutex::new(
+                ProjectRegistry::open(state_dir.join("projects")).unwrap(),
+            )),
+            trusted_files: Arc::new(Mutex::new(HashMap::new())),
+            search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
+            resources: None,
+            usage: Arc::new(Mutex::new(InferenceRequestStore::open(&state_dir).unwrap())),
+            pull_requests: Arc::new(Mutex::new(PullRequestStore::open(&state_dir).unwrap())),
+            pull_request_projection: Arc::new(Mutex::new(None)),
+            pull_request_discovery_enabled: Arc::new(AtomicBool::new(false)),
+            pull_request_refresh_requested: Arc::new(tokio::sync::Notify::new()),
+            checkout_hooks: CheckoutTestHooks::default(),
+        }
+    }
+
+    #[test]
+    fn inactive_pull_request_batches_are_bounded_and_rotate_after_failures() {
+        let session_ids = (1..=6)
+            .map(|number| SessionId::new(format!("pull-request-inactive-{number}")).unwrap())
+            .collect::<Vec<_>>();
+        let refreshable = session_ids
+            .iter()
+            .enumerate()
+            .map(|(index, session_id)| {
+                let mut pull_request =
+                    stored_pull_request(session_id, (index + 1) as u64, PullRequestState::Ready);
+                pull_request.refreshed_at_ms += index as u64;
+                pull_request
+            })
+            .collect::<Vec<_>>();
+        let hosted = BTreeSet::from([session_ids[1].clone()]);
+        let mut attempted = BTreeSet::new();
+        let numbers = |batch: Vec<StoredPullRequest>| {
+            batch
+                .into_iter()
+                .map(|pull_request| pull_request.number)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            numbers(select_inactive_pull_request_batch(
+                refreshable.clone(),
+                &hosted,
+                &mut attempted,
+                2,
+            )),
+            vec![1, 3]
+        );
+        assert_eq!(
+            numbers(select_inactive_pull_request_batch(
+                refreshable.clone(),
+                &hosted,
+                &mut attempted,
+                2,
+            )),
+            vec![4, 5]
+        );
+        assert_eq!(
+            numbers(select_inactive_pull_request_batch(
+                refreshable.clone(),
+                &hosted,
+                &mut attempted,
+                2,
+            )),
+            vec![6]
+        );
+        assert_eq!(
+            numbers(select_inactive_pull_request_batch(
+                refreshable,
+                &hosted,
+                &mut attempted,
+                2,
+            )),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn github_pull_request_projection_is_structured_and_conservative() {
+        for (state, is_draft, expected) in [
+            (
+                "OPEN",
+                true,
+                PullRequestObservation::Trackable {
+                    number: 124,
+                    url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                    state: PullRequestState::InProgress,
+                },
+            ),
+            (
+                "OPEN",
+                false,
+                PullRequestObservation::Trackable {
+                    number: 124,
+                    url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                    state: PullRequestState::Ready,
+                },
+            ),
+            (
+                "MERGED",
+                false,
+                PullRequestObservation::Trackable {
+                    number: 124,
+                    url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                    state: PullRequestState::Merged,
+                },
+            ),
+            (
+                "CLOSED",
+                false,
+                PullRequestObservation::Closed {
+                    number: 124,
+                    url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                },
+            ),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "number": 124,
+                "url": "https://github.com/skaft-software/ygg/pull/124",
+                "state": state,
+                "isDraft": is_draft,
+            }))
+            .unwrap();
+            assert_eq!(project_github_pull_request(&bytes), expected);
+        }
+
+        for invalid in [
+            serde_json::json!({
+                "number": 124,
+                "url": "https://github.com/skaft-software/ygg/pull/125",
+                "state": "OPEN",
+                "isDraft": false,
+            }),
+            serde_json::json!({
+                "number": 124,
+                "url": "file:///tmp/pull/124",
+                "state": "OPEN",
+                "isDraft": false,
+            }),
+            serde_json::json!({
+                "number": 124,
+                "url": "http://github.com/skaft-software/ygg/pull/124",
+                "state": "OPEN",
+                "isDraft": false,
+            }),
+            serde_json::json!({
+                "number": 124,
+                "url": "https://user:secret@github.com/skaft-software/ygg/pull/124",
+                "state": "OPEN",
+                "isDraft": false,
+            }),
+            serde_json::json!({
+                "number": 124,
+                "url": "https://github.com/prefix/skaft-software/ygg/pull/124?view=1",
+                "state": "OPEN",
+                "isDraft": false,
+            }),
+            serde_json::json!({
+                "number": 124,
+                "url": "https://github.com/skaft-software/%79gg/pull/124",
+                "state": "OPEN",
+                "isDraft": false,
+            }),
+            serde_json::json!({
+                "number": 124,
+                "url": "https://github.com/skaft-software/ygg/pull/0124",
+                "state": "OPEN",
+                "isDraft": false,
+            }),
+            serde_json::json!({
+                "number": 124,
+                "url": "https://github.com/skaft-software/ygg/pull/124",
+                "state": "UNKNOWN",
+                "isDraft": false,
+            }),
+        ] {
+            assert_eq!(
+                project_github_pull_request(&serde_json::to_vec(&invalid).unwrap()),
+                PullRequestObservation::Unavailable
+            );
+        }
+        assert_eq!(
+            project_github_pull_request(b"not json"),
+            PullRequestObservation::Unavailable
+        );
+    }
+
+    #[test]
+    fn pull_request_store_persists_evidence_and_rejects_cross_session_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = SessionId::new("pull-request-first").unwrap();
+        let second = SessionId::new("pull-request-second").unwrap();
+        let mut store = PullRequestStore::open(directory.path()).unwrap();
+        store
+            .replace(
+                &first,
+                Some(stored_pull_request(&first, 124, PullRequestState::Ready)),
+            )
+            .unwrap();
+        assert_eq!(
+            store.summary(&first),
+            Some(PullRequestSummary {
+                state: PullRequestState::Ready,
+            })
+        );
+        let mut aliased = stored_pull_request(&second, 124, PullRequestState::Merged);
+        aliased.url = "https://GITHUB.com/SKAFT-SOFTWARE/YGG/pull/124".into();
+        assert!(store.replace(&second, Some(aliased)).is_err());
+        let mut port_aliased = stored_pull_request(&second, 124, PullRequestState::Merged);
+        port_aliased.url = "https://github.com:443/skaft-software/ygg/pull/124".into();
+        assert!(store.replace(&second, Some(port_aliased)).is_err());
+        drop(store);
+
+        let mut reopened = PullRequestStore::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened.summary(&first),
+            Some(PullRequestSummary {
+                state: PullRequestState::Ready,
+            })
+        );
+        assert_eq!(reopened.summary(&second), None);
+        reopened.replace(&first, None).unwrap();
+        assert_eq!(
+            PullRequestStore::open(directory.path())
+                .unwrap()
+                .summary(&first),
+            None
+        );
+    }
+
+    #[test]
+    fn permanently_deleted_sessions_reject_late_pull_request_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new("pull-request-deleted-race").unwrap();
+        let mut store = PullRequestStore::open(directory.path()).unwrap();
+
+        store.delete_session(&session_id).unwrap();
+        assert!(apply_pull_request_observation(
+            &mut store,
+            &session_id,
+            PullRequestObservation::Trackable {
+                number: 124,
+                url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                state: PullRequestState::Ready,
+            },
+            20,
+        )
+        .is_err());
+        assert_eq!(store.summary(&session_id), None);
+        assert!(store.take_catalog_changes().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_request_store_fails_closed_on_unsafe_or_ambiguous_evidence() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let symlink_directory = directory.path().join("symlink");
+        std::fs::create_dir(&symlink_directory).unwrap();
+        let target = symlink_directory.join("target.json");
+        std::fs::write(&target, b"{}").unwrap();
+        symlink(&target, symlink_directory.join(PULL_REQUEST_STORE_FILE)).unwrap();
+        assert!(PullRequestStore::open(&symlink_directory).is_err());
+
+        let oversized_directory = directory.path().join("oversized");
+        std::fs::create_dir(&oversized_directory).unwrap();
+        let oversized =
+            std::fs::File::create(oversized_directory.join(PULL_REQUEST_STORE_FILE)).unwrap();
+        oversized.set_len(MAX_PULL_REQUEST_STORE_BYTES + 1).unwrap();
+        assert!(PullRequestStore::open(&oversized_directory).is_err());
+
+        let duplicate_directory = directory.path().join("duplicate");
+        std::fs::create_dir(&duplicate_directory).unwrap();
+        let first = SessionId::new("pull-request-duplicate-first").unwrap();
+        let second = SessionId::new("pull-request-duplicate-second").unwrap();
+        let first_record = stored_pull_request(&first, 124, PullRequestState::Ready);
+        let mut second_record = first_record.clone();
+        second_record.session_id = second.as_str().to_owned();
+        second_record.url = "https://GITHUB.com/SKAFT-SOFTWARE/YGG/pull/124".into();
+        let duplicate_catalog = StoredPullRequestCatalog {
+            version: PULL_REQUEST_STORE_VERSION,
+            records: BTreeMap::from([
+                (first.as_str().to_owned(), first_record),
+                (second.as_str().to_owned(), second_record),
+            ]),
+        };
+        std::fs::write(
+            duplicate_directory.join(PULL_REQUEST_STORE_FILE),
+            serde_json::to_vec(&duplicate_catalog).unwrap(),
+        )
+        .unwrap();
+        assert!(PullRequestStore::open(&duplicate_directory).is_err());
+
+        let duplicate_key_directory = directory.path().join("duplicate-key");
+        std::fs::create_dir(&duplicate_key_directory).unwrap();
+        let session_id = SessionId::new("pull-request-duplicate-key").unwrap();
+        let record = serde_json::to_string(&stored_pull_request(
+            &session_id,
+            125,
+            PullRequestState::Ready,
+        ))
+        .unwrap();
+        std::fs::write(
+            duplicate_key_directory.join(PULL_REQUEST_STORE_FILE),
+            format!(
+                r#"{{"version":1,"records":{{"{session_id}":{record},"{session_id}":{record}}}}}"#,
+                session_id = session_id.as_str(),
+            ),
+        )
+        .unwrap();
+        assert!(PullRequestStore::open(&duplicate_key_directory).is_err());
+    }
+
+    #[test]
+    fn pull_request_store_transactions_roll_back_records_and_catalog_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new("pull-request-transaction").unwrap();
+        let mut store = PullRequestStore::open(directory.path()).unwrap();
+        store
+            .replace(
+                &session_id,
+                Some(stored_pull_request(
+                    &session_id,
+                    124,
+                    PullRequestState::Ready,
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            store.take_catalog_changes(),
+            BTreeSet::from([session_id.clone()])
+        );
+
+        let update_error: anyhow::Result<()> = store.transaction(|store| {
+            store.replace_unpersisted(
+                &session_id,
+                Some(stored_pull_request(
+                    &session_id,
+                    124,
+                    PullRequestState::Merged,
+                )),
+            )?;
+            anyhow::bail!("injected update failure")
+        });
+        assert!(update_error.is_err());
+        assert_eq!(
+            store.summary(&session_id),
+            Some(PullRequestSummary {
+                state: PullRequestState::Ready,
+            })
+        );
+        assert!(store.take_catalog_changes().is_empty());
+
+        let persisted_path = store.path.clone();
+        store.path = directory.path().join("unreplaceable-directory");
+        std::fs::create_dir(&store.path).unwrap();
+        assert!(apply_pull_request_observation(
+            &mut store,
+            &session_id,
+            PullRequestObservation::Trackable {
+                number: 124,
+                url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                state: PullRequestState::Merged,
+            },
+            20,
+        )
+        .is_err());
+        assert_eq!(
+            store.summary(&session_id),
+            Some(PullRequestSummary {
+                state: PullRequestState::Ready,
+            })
+        );
+        assert!(store.take_catalog_changes().is_empty());
+        store.path = persisted_path;
+        assert_eq!(
+            PullRequestStore::open(directory.path())
+                .unwrap()
+                .summary(&session_id),
+            Some(PullRequestSummary {
+                state: PullRequestState::Ready,
+            })
+        );
+    }
+
+    #[test]
+    fn pull_request_observations_retain_unavailable_evidence_and_emit_state_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = SessionId::new("pull-request-observation").unwrap();
+        let mut store = PullRequestStore::open(directory.path()).unwrap();
+        let ready = PullRequestObservation::Trackable {
+            number: 124,
+            url: "https://github.com/skaft-software/ygg/pull/124".into(),
+            state: PullRequestState::Ready,
+        };
+        assert_eq!(
+            apply_pull_request_observation(&mut store, &session_id, ready.clone(), 10).unwrap(),
+            Some(Some(PullRequestSummary {
+                state: PullRequestState::Ready,
+            }))
+        );
+        assert_eq!(
+            apply_pull_request_observation(
+                &mut store,
+                &session_id,
+                PullRequestObservation::Unavailable,
+                20,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(store.get(&session_id).unwrap().refreshed_at_ms, 10);
+        assert_eq!(
+            apply_pull_request_observation(&mut store, &session_id, ready, 30).unwrap(),
+            None
+        );
+        assert_eq!(store.get(&session_id).unwrap().refreshed_at_ms, 30);
+        assert_eq!(
+            apply_pull_request_observation(
+                &mut store,
+                &session_id,
+                PullRequestObservation::Trackable {
+                    number: 125,
+                    url: "https://github.com/skaft-software/ygg/pull/125".into(),
+                    state: PullRequestState::Ready,
+                },
+                35,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(store.get(&session_id).unwrap().number, 124);
+        assert_eq!(
+            apply_pull_request_observation(
+                &mut store,
+                &session_id,
+                PullRequestObservation::Closed {
+                    number: 125,
+                    url: "https://github.com/skaft-software/ygg/pull/125".into(),
+                },
+                36,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(store.get(&session_id).unwrap().number, 124);
+        assert_eq!(
+            apply_pull_request_observation(
+                &mut store,
+                &session_id,
+                PullRequestObservation::Closed {
+                    number: 124,
+                    url: "https://GITHUB.com:443/SKAFT-SOFTWARE/YGG/pull/124".into(),
+                },
+                37,
+            )
+            .unwrap(),
+            Some(None)
+        );
+        assert_eq!(store.get(&session_id), None);
+        apply_pull_request_observation(
+            &mut store,
+            &session_id,
+            PullRequestObservation::Trackable {
+                number: 124,
+                url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                state: PullRequestState::Ready,
+            },
+            37,
+        )
+        .unwrap();
+
+        assert_eq!(
+            apply_pull_request_observation(
+                &mut store,
+                &session_id,
+                PullRequestObservation::Trackable {
+                    number: 124,
+                    url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                    state: PullRequestState::Merged,
+                },
+                40,
+            )
+            .unwrap(),
+            Some(Some(PullRequestSummary {
+                state: PullRequestState::Merged,
+            }))
+        );
+        assert_eq!(
+            apply_pull_request_observation(
+                &mut store,
+                &session_id,
+                PullRequestObservation::Closed {
+                    number: 124,
+                    url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                },
+                50,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.summary(&session_id),
+            Some(PullRequestSummary {
+                state: PullRequestState::Merged,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_request_projection_leads_event_delivery_for_replacements() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = pull_request_worker_plan(directory.path(), "pull-request-event-order");
+        let refresh_plan = PullRequestRefreshPlan::from(&plan);
+        let projection = Arc::clone(&refresh_plan.projection);
+        let (events, mut received) = mpsc::channel(1);
+        events
+            .send(event(EventPayload::SessionPullRequestChanged {
+                pull_request: None,
+            }))
+            .await
+            .unwrap();
+
+        let publisher = tokio::spawn(async move {
+            publish_pull_request_projection(
+                &refresh_plan,
+                &events,
+                Some(PullRequestSummary {
+                    state: PullRequestState::Ready,
+                }),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            loop {
+                if *projection.lock().unwrap()
+                    == Some(PullRequestSummary {
+                        state: PullRequestState::Ready,
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("projection should advance while event delivery is backpressured");
+        assert!(!publisher.is_finished());
+
+        let _ = received.recv().await.unwrap();
+        publisher.await.unwrap().unwrap();
+        assert!(matches!(
+            received.recv().await.unwrap().payload,
+            EventPayload::SessionPullRequestChanged {
+                pull_request: Some(PullRequestSummary {
+                    state: PullRequestState::Ready,
+                })
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosted_pull_request_refresh_retries_and_streams_authoritative_transitions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh-hosted-fixture");
+        std::fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s' '{\"number\":124,\"url\":\"https://github.com/skaft-software/ygg/pull/124\",\"state\":\"OPEN\",\"isDraft\":true}'\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let hosted_directory = directory.path().join("hosted");
+        let plan = pull_request_worker_plan(&hosted_directory, "hosted-pull-request-refresh");
+        let session_id = plan.session_id.clone();
+        let (events, mut received) = mpsc::channel(8);
+
+        refresh_pull_request_projection_with_executable(&plan, &events, &executable)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.pull_requests.lock().unwrap().summary(&session_id),
+            None
+        );
+        assert!(received.try_recv().is_err());
+
+        plan.pull_request_discovery_enabled
+            .store(true, Ordering::Release);
+        refresh_pull_request_projection_with_executable(&plan, &events, &executable)
+            .await
+            .unwrap();
+        assert!(matches!(
+            received.recv().await.unwrap().payload,
+            EventPayload::SessionPullRequestChanged {
+                pull_request: Some(PullRequestSummary {
+                    state: PullRequestState::InProgress
+                })
+            }
+        ));
+
+        std::fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s' '{\"number\":124,\"url\":\"https://github.com/skaft-software/ygg/pull/124\",\"state\":\"OPEN\",\"isDraft\":false}'\n",
+            ),
+        )
+        .unwrap();
+        refresh_pull_request_projection_with_executable(&plan, &events, &executable)
+            .await
+            .unwrap();
+        assert!(matches!(
+            received.recv().await.unwrap().payload,
+            EventPayload::SessionPullRequestChanged {
+                pull_request: Some(PullRequestSummary {
+                    state: PullRequestState::Ready
+                })
+            }
+        ));
+
+        std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+        refresh_pull_request_projection_with_executable(&plan, &events, &executable)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.pull_requests.lock().unwrap().summary(&session_id),
+            Some(PullRequestSummary {
+                state: PullRequestState::Ready,
+            })
+        );
+        assert!(received.try_recv().is_err());
+
+        std::fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s' '{\"number\":124,\"url\":\"https://github.com/skaft-software/ygg/pull/124\",\"state\":\"MERGED\",\"isDraft\":false}'\n",
+            ),
+        )
+        .unwrap();
+        refresh_pull_request_projection_with_executable(&plan, &events, &executable)
+            .await
+            .unwrap();
+        assert!(matches!(
+            received.recv().await.unwrap().payload,
+            EventPayload::SessionPullRequestChanged {
+                pull_request: Some(PullRequestSummary {
+                    state: PullRequestState::Merged
+                })
+            }
+        ));
+
+        std::fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s' '{\"number\":124,\"url\":\"https://github.com/skaft-software/ygg/pull/124\",\"state\":\"CLOSED\",\"isDraft\":false}'\n",
+            ),
+        )
+        .unwrap();
+        refresh_pull_request_projection_with_executable(&plan, &events, &executable)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.pull_requests.lock().unwrap().summary(&session_id),
+            Some(PullRequestSummary {
+                state: PullRequestState::Merged,
+            })
+        );
+        assert!(received.try_recv().is_err());
+        drop(plan);
+        assert_eq!(
+            PullRequestStore::open(&hosted_directory.join("state"))
+                .unwrap()
+                .summary(&session_id),
+            Some(PullRequestSummary {
+                state: PullRequestState::Merged,
+            })
+        );
+
+        let closed_directory = directory.path().join("closed");
+        let plan = pull_request_worker_plan(&closed_directory, "closed-pull-request-refresh");
+        plan.pull_request_discovery_enabled
+            .store(true, Ordering::Release);
+        let session_id = plan.session_id.clone();
+        let (events, mut received) = mpsc::channel(4);
+        std::fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s' '{\"number\":125,\"url\":\"https://github.com/skaft-software/ygg/pull/125\",\"state\":\"OPEN\",\"isDraft\":false}'\n",
+            ),
+        )
+        .unwrap();
+        refresh_pull_request_projection_with_executable(&plan, &events, &executable)
+            .await
+            .unwrap();
+        let _ = received.recv().await.unwrap();
+        std::fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s' '{\"number\":125,\"url\":\"https://github.com/skaft-software/ygg/pull/125\",\"state\":\"CLOSED\",\"isDraft\":false}'\n",
+            ),
+        )
+        .unwrap();
+        refresh_pull_request_projection_with_executable(&plan, &events, &executable)
+            .await
+            .unwrap();
+        assert!(matches!(
+            received.recv().await.unwrap().payload,
+            EventPayload::SessionPullRequestChanged { pull_request: None }
+        ));
+        assert_eq!(
+            plan.pull_requests.lock().unwrap().summary(&session_id),
+            None
+        );
+        drop(plan);
+        assert_eq!(
+            PullRequestStore::open(&closed_directory.join("state"))
+                .unwrap()
+                .summary(&session_id),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn github_cli_query_accepts_only_successful_bounded_json() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh-fixture");
+        std::fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s' '{\"number\":124,\"url\":\"https://github.com/skaft-software/ygg/pull/124\",\"state\":\"OPEN\",\"isDraft\":false}'\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            query_github_pull_request(
+                directory.path(),
+                Some("https://github.com/skaft-software/ygg/pull/124"),
+                &executable,
+            )
+            .await,
+            PullRequestObservation::Trackable {
+                number: 124,
+                url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                state: PullRequestState::Ready,
+            }
+        );
+
+        let queued_permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let queued_query = {
+            let workspace = directory.path().to_owned();
+            let executable = executable.clone();
+            let permits = Arc::clone(&queued_permits);
+            tokio::spawn(async move {
+                query_github_pull_request_with_timeout_and_queued_permit(
+                    &workspace,
+                    None,
+                    &executable,
+                    std::time::Duration::from_secs(1),
+                    &permits,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!queued_query.is_finished());
+        queued_permits.add_permits(1);
+        assert_eq!(
+            queued_query.await.unwrap(),
+            PullRequestObservation::Trackable {
+                number: 124,
+                url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                state: PullRequestState::Ready,
+            }
+        );
+
+        std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+        assert_eq!(
+            query_github_pull_request(directory.path(), None, &executable).await,
+            PullRequestObservation::Unavailable
+        );
+
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 20000 ]; do printf x; i=$((i + 1)); done\n",
+        )
+        .unwrap();
+        assert_eq!(
+            query_github_pull_request(directory.path(), None, &executable).await,
+            PullRequestObservation::Unavailable
+        );
+
+        std::fs::write(&executable, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            query_github_pull_request_with_timeout(
+                directory.path(),
+                None,
+                &executable,
+                std::time::Duration::from_millis(30),
+            )
+            .await,
+            PullRequestObservation::Unavailable
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let saturated = tokio::sync::Semaphore::new(0);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            query_github_pull_request_with_timeout_and_permits(
+                directory.path(),
+                None,
+                &executable,
+                std::time::Duration::from_secs(1),
+                &saturated,
+            )
+            .await,
+            PullRequestObservation::Unavailable
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inactive_pull_request_refresh_updates_the_persisted_catalog_stream() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (host, session_id, _, _, _) =
+            worker_checkout_fixture(directory.path(), "inactive-pull-request-refresh");
+        host.pull_requests
+            .lock()
+            .unwrap()
+            .replace(
+                &session_id,
+                Some(stored_pull_request(
+                    &session_id,
+                    124,
+                    PullRequestState::Ready,
+                )),
+            )
+            .unwrap();
+        let host = Arc::new(host);
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig::default(),
+        ));
+        let mut events = supervisor.subscribe_events();
+        let executable = directory.path().join("gh-refresh-fixture");
+        std::fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s' '{\"number\":124,\"url\":\"https://github.com/skaft-software/ygg/pull/124\",\"state\":\"MERGED\",\"isDraft\":false}'\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let mut pending = BTreeSet::new();
+        let mut attempted = BTreeSet::new();
+        refresh_inactive_pull_requests_once(
+            &host,
+            &supervisor,
+            &mut pending,
+            &mut attempted,
+            &executable,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert_eq!(
+            host.pull_requests.lock().unwrap().summary(&session_id),
+            Some(PullRequestSummary {
+                state: PullRequestState::Merged,
+            })
+        );
+        let streamed = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let catalog = streamed.catalog.expect("catalog refresh");
+        assert_eq!(catalog.summary.id, session_id);
+        assert_eq!(
+            catalog.summary.pull_request,
+            Some(PullRequestSummary {
+                state: PullRequestState::Merged,
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inactive_catalog_reconciles_a_terminal_hosted_store_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, session_id, _, _, _) =
+            worker_checkout_fixture(directory.path(), "terminal-pull-request-handoff");
+        host.pull_requests
+            .lock()
+            .unwrap()
+            .replace(
+                &session_id,
+                Some(stored_pull_request(
+                    &session_id,
+                    124,
+                    PullRequestState::Merged,
+                )),
+            )
+            .unwrap();
+        let host = Arc::new(host);
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig::default(),
+        ));
+        let mut events = supervisor.subscribe_events();
+
+        let mut pending = BTreeSet::new();
+        let mut attempted = BTreeSet::new();
+        refresh_inactive_pull_requests_once(
+            &host,
+            &supervisor,
+            &mut pending,
+            &mut attempted,
+            Path::new("unused-gh"),
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        let streamed = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            streamed
+                .catalog
+                .expect("catalog handoff")
+                .summary
+                .pull_request,
+            Some(PullRequestSummary {
+                state: PullRequestState::Merged,
+            })
+        );
+    }
+
     #[test]
     fn terminal_capability_tracks_process_execution_permission() {
         let directory = tempfile::tempdir().unwrap();
@@ -9378,6 +11344,18 @@ mod tests {
         host.goals
             .set(&session_id, "Remove the session goal", None)
             .unwrap();
+        host.pull_requests
+            .lock()
+            .unwrap()
+            .replace(
+                &session_id,
+                Some(stored_pull_request(
+                    &session_id,
+                    124,
+                    PullRequestState::Ready,
+                )),
+            )
+            .unwrap();
 
         host.delete_session_permanently(
             &session_id,
@@ -9433,6 +11411,10 @@ mod tests {
             .run_record(&session_id, &run_entry)
             .is_err());
         assert_eq!(host.goals.get(&session_id).unwrap(), None);
+        assert_eq!(
+            host.pull_requests.lock().unwrap().summary(&session_id),
+            None
+        );
         assert_eq!(host.usage.lock().unwrap().lifetime().request_count, 1);
         assert!(load_pending_session_deletions(&host.serve_state_dir)
             .unwrap()
@@ -9441,6 +11423,10 @@ mod tests {
         drop(host);
         let reopened = YggHost::new(config).unwrap();
         assert_eq!(reopened.usage.lock().unwrap().lifetime().request_count, 1);
+        assert_eq!(
+            reopened.pull_requests.lock().unwrap().summary(&session_id),
+            None
+        );
         assert!(reopened
             .documents
             .as_ref()
@@ -10969,6 +12955,12 @@ mod tests {
             usage: Arc::new(Mutex::new(
                 InferenceRequestStore::open(directory.path()).unwrap(),
             )),
+            pull_requests: Arc::new(Mutex::new(
+                PullRequestStore::open(&directory.path().join("selection-pull-requests")).unwrap(),
+            )),
+            pull_request_projection: Arc::new(Mutex::new(None)),
+            pull_request_discovery_enabled: Arc::new(AtomicBool::new(false)),
+            pull_request_refresh_requested: Arc::new(tokio::sync::Notify::new()),
             checkout_hooks: CheckoutTestHooks::default(),
         };
         let mut projection = ProjectionState::new(0);
@@ -11161,6 +13153,80 @@ mod tests {
                 ItemPayload::AssistantMessage { text } if text == "answer"
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn checkout_does_not_wait_for_pull_request_store_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, session_id, _old_head, target, _path) =
+            worker_checkout_fixture(directory.path(), "worker-pr-projection");
+        host.pull_requests
+            .lock()
+            .unwrap()
+            .replace(
+                &session_id,
+                Some(stored_pull_request(
+                    &session_id,
+                    124,
+                    PullRequestState::Ready,
+                )),
+            )
+            .unwrap();
+        let host = Arc::new(host);
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig::default(),
+        ));
+        let handle = supervisor.open_session(&session_id).await.unwrap();
+        assert_eq!(
+            handle.view().summary.pull_request,
+            Some(PullRequestSummary {
+                state: PullRequestState::Ready,
+            })
+        );
+
+        let store_locked = Arc::new(std::sync::Barrier::new(2));
+        let release_store = Arc::new(std::sync::Barrier::new(2));
+        let pull_requests = Arc::clone(&host.pull_requests);
+        let holder = {
+            let store_locked = Arc::clone(&store_locked);
+            let release_store = Arc::clone(&release_store);
+            std::thread::spawn(move || {
+                let _store = pull_requests.lock().unwrap();
+                store_locked.wait();
+                release_store.wait();
+            })
+        };
+        store_locked.wait();
+
+        let envelope = checkout_envelope(
+            &host,
+            &session_id,
+            handle.view().snapshot.actor_generation,
+            "command-worker-pr-projection",
+            target,
+        );
+        let command = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move { supervisor.command(envelope, 10).await })
+        };
+        let admission = tokio::time::timeout(std::time::Duration::from_secs(2), command).await;
+        release_store.wait();
+        holder.join().unwrap();
+        let admission = admission
+            .expect("checkout must not contend with pull-request persistence")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            admission.ack.disposition,
+            AckDisposition::Accepted { .. }
+        ));
+        assert_eq!(
+            handle.view().summary.pull_request,
+            Some(PullRequestSummary {
+                state: PullRequestState::Ready,
+            })
+        );
     }
 
     #[tokio::test]
@@ -11467,6 +13533,12 @@ mod tests {
             usage: Arc::new(Mutex::new(
                 InferenceRequestStore::open(directory.path()).unwrap(),
             )),
+            pull_requests: Arc::new(Mutex::new(
+                PullRequestStore::open(&directory.path().join("metadata-pull-requests")).unwrap(),
+            )),
+            pull_request_projection: Arc::new(Mutex::new(None)),
+            pull_request_discovery_enabled: Arc::new(AtomicBool::new(false)),
+            pull_request_refresh_requested: Arc::new(tokio::sync::Notify::new()),
             checkout_hooks: CheckoutTestHooks::default(),
         };
 

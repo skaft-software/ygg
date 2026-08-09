@@ -171,6 +171,283 @@ describe("sidebar session lifecycle", () => {
     ).toBeVisible();
   });
 
+  it("collapses projects independently", () => {
+    const sessions = [
+      activeSession({
+        id: "session-ygg",
+        projectId: "project-ygg",
+        title: "Ygg task",
+      }),
+      activeSession({
+        id: "session-notes",
+        projectId: "project-notes",
+        title: "Notes task",
+      }),
+    ];
+    render(
+      <Sidebar
+        {...sidebarProps({ sessions, selectedSessionId: null })}
+      />,
+    );
+
+    const yggToggle = screen.getByRole("button", {
+      name: "Collapse project ygg, 1 task",
+    });
+    const notesToggle = screen.getByRole("button", {
+      name: "Collapse project Research notes, 1 task",
+    });
+    const yggTask = screen.getByRole("button", {
+      name: "Open task Ygg task, Ready",
+    });
+    const notesTask = screen.getByRole("button", {
+      name: "Open task Notes task, Ready",
+    });
+
+    fireEvent.click(yggToggle);
+    expect(yggToggle).toHaveAttribute("aria-expanded", "false");
+    expect(yggTask).not.toBeVisible();
+    expect(notesToggle).toHaveAttribute("aria-expanded", "true");
+    expect(notesTask).toBeVisible();
+
+    fireEvent.click(notesToggle);
+    expect(notesTask).not.toBeVisible();
+    fireEvent.click(yggToggle);
+    expect(yggTask).toBeVisible();
+    expect(notesTask).not.toBeVisible();
+  });
+
+  it("reveals a project whenever one of its tasks is selected", () => {
+    const sessions = [
+      activeSession({
+        id: "session-ygg",
+        projectId: "project-ygg",
+        title: "Ygg task",
+      }),
+      activeSession({
+        id: "session-notes",
+        projectId: "project-notes",
+        title: "Notes task",
+      }),
+    ];
+    const { rerender } = render(
+      <Sidebar
+        {...sidebarProps({ sessions, selectedSessionId: null })}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Collapse project Research notes, 1 task",
+      }),
+    );
+
+    rerender(
+      <Sidebar
+        {...sidebarProps({
+          sessions,
+          selectedSessionId: "session-notes",
+        })}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", {
+        name: "Collapse project Research notes, 1 task",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", { name: "Open task Notes task, Ready" }),
+    ).toBeVisible();
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Collapse project Research notes, 1 task",
+      }),
+    );
+    rerender(
+      <Sidebar
+        {...sidebarProps({
+          sessions,
+          selectedSessionId: "session-ygg",
+        })}
+      />,
+    );
+    rerender(
+      <Sidebar
+        {...sidebarProps({
+          sessions,
+          selectedSessionId: "session-notes",
+        })}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", {
+        name: "Collapse project Research notes, 1 task",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", { name: "Open task Notes task, Ready" }),
+    ).toBeVisible();
+  });
+
+  it("reveals a selected task when it moves between projects", () => {
+    const sessions = [
+      activeSession({
+        id: "session-ygg",
+        projectId: "project-ygg",
+        title: "Ygg task",
+      }),
+      activeSession({
+        id: "session-notes",
+        projectId: "project-notes",
+        title: "Notes task",
+      }),
+    ];
+    const { rerender } = render(
+      <Sidebar
+        {...sidebarProps({
+          sessions,
+          selectedSessionId: "session-notes",
+        })}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Collapse project ygg, 1 task",
+      }),
+    );
+
+    const movedSessions = sessions.map((session) =>
+      session.id === "session-notes"
+        ? { ...session, projectId: "project-ygg" }
+        : session,
+    );
+    rerender(
+      <Sidebar
+        {...sidebarProps({
+          sessions: movedSessions,
+          selectedSessionId: "session-notes",
+        })}
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", {
+        name: "Collapse project ygg, 2 tasks",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", { name: "Open task Notes task, Ready" }),
+    ).toBeVisible();
+  });
+
+  it("expands matching projects while searching and restores collapse state", () => {
+    const sessions = [
+      activeSession({
+        id: "session-ygg",
+        projectId: "project-ygg",
+        title: "Ygg task",
+      }),
+      activeSession({
+        id: "session-notes",
+        projectId: "project-notes",
+        title: "Provider notes",
+      }),
+    ];
+    render(
+      <Sidebar
+        {...sidebarProps({ sessions, selectedSessionId: null })}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Collapse project Research notes, 1 task",
+      }),
+    );
+
+    const searchbox = screen.getByRole("searchbox", {
+      name: "Search tasks and transcripts",
+    });
+    fireEvent.change(searchbox, { target: { value: "provider" } });
+
+    expect(
+      screen.getByRole("button", {
+        name: "Collapse project Research notes, 1 task",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", {
+        name: "Open task Provider notes, Ready",
+      }),
+    ).toBeVisible();
+
+    fireEvent.change(searchbox, { target: { value: "" } });
+    expect(
+      screen.getByRole("button", {
+        name: "Expand project Research notes, 1 task",
+      }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.getByRole("button", {
+        name: "Open task Provider notes, Ready",
+        hidden: true,
+      }),
+    ).not.toBeVisible();
+  });
+
+  it("keeps a reselected task revealed after search", () => {
+    const onSelectSession = vi.fn();
+    const sessions = [
+      activeSession({
+        id: "session-ygg",
+        projectId: "project-ygg",
+        title: "Ygg task",
+      }),
+      activeSession({
+        id: "session-notes",
+        projectId: "project-notes",
+        title: "Provider notes",
+      }),
+    ];
+    render(
+      <Sidebar
+        {...sidebarProps({
+          sessions,
+          selectedSessionId: "session-notes",
+          onSelectSession,
+        })}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Collapse project Research notes, 1 task",
+      }),
+    );
+
+    const searchbox = screen.getByRole("searchbox", {
+      name: "Search tasks and transcripts",
+    });
+    fireEvent.change(searchbox, { target: { value: "provider" } });
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Open task Provider notes, Ready",
+      }),
+    );
+    expect(onSelectSession).toHaveBeenCalledWith("session-notes");
+
+    fireEvent.change(searchbox, { target: { value: "" } });
+    expect(
+      screen.getByRole("button", {
+        name: "Collapse project Research notes, 1 task",
+      }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(
+      screen.getByRole("button", {
+        name: "Open task Provider notes, Ready",
+      }),
+    ).toBeVisible();
+  });
+
   it("shows content hits and activates their transcript item", async () => {
     const search = vi.fn().mockResolvedValue({
       hits: [
