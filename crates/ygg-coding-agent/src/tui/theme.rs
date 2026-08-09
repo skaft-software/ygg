@@ -2228,8 +2228,8 @@ mod tests {
     }
 
     #[test]
-    fn ten_bundled_themes_load_for_every_terminal_profile() {
-        assert_eq!(theme_pack::THEMES.len(), 10);
+    fn eleven_bundled_themes_load_for_every_terminal_profile() {
+        assert_eq!(theme_pack::THEMES.len(), 11);
         let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
         let black = Rgb {
             red: 0,
@@ -2298,6 +2298,37 @@ mod tests {
     }
 
     #[test]
+    fn kawaii_pink_preserves_default_layout_and_adapts_its_surfaces() {
+        let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
+        let dark =
+            load_bundled_theme_for("kawaii-pink", capabilities, TerminalBackground::Dark).unwrap();
+        let light =
+            load_bundled_theme_for("kawaii-pink", capabilities, TerminalBackground::Light).unwrap();
+        let unknown =
+            load_bundled_theme_for("kawaii-pink", capabilities, TerminalBackground::Unknown)
+                .unwrap();
+
+        assert_eq!(dark.layout(), &ThemeLayout::default());
+        assert_eq!(light.layout(), &ThemeLayout::default());
+        for theme in [&dark, &light, &unknown] {
+            let accent = required_rgb_token(theme, "accent");
+            assert!(
+                accent.red > accent.green && accent.blue > accent.green,
+                "pink accent lost its hue: {accent:?}"
+            );
+        }
+        for token in ["kawaii_blush_bg", "kawaii_lilac_bg", "kawaii_note_bg"] {
+            assert!(relative_luminance(required_rgb_token(&dark, token)) < 0.05);
+            assert!(relative_luminance(required_rgb_token(&light, token)) > 0.90);
+            assert_eq!(
+                unknown.resolve::<String>(token).as_deref(),
+                Some("default"),
+                "unknown terminals should keep {token} on their default canvas"
+            );
+        }
+    }
+
+    #[test]
     fn bundled_themes_have_distinct_design_signatures() {
         let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
         let themes = theme_pack::THEMES
@@ -2322,14 +2353,14 @@ mod tests {
                 )
             })
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(signatures.len(), 10);
+        assert_eq!(signatures.len(), 11);
         assert_eq!(
             themes
                 .iter()
                 .map(|theme| theme.glyph("wordmark"))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            10
+            11
         );
         assert!(
             themes
@@ -2355,7 +2386,7 @@ mod tests {
                 .len(),
             3
         );
-        assert_eq!(bundled_theme_summaries().len(), 10);
+        assert_eq!(bundled_theme_summaries().len(), 11);
     }
 
     #[test]

@@ -11,7 +11,7 @@ Theme files are discovered in these locations:
 3. Explicit theme directories, in command-line order
 
 Later locations win when names collide. The resource inspector reports each
-override and ignores project themes in untrusted workspaces. The ten themes
+override and ignores project themes in untrusted workspaces. The eleven themes
 shipped in the binary are the lowest-precedence fallback, so any of them can be
 replaced locally by a file with the same name.
 
@@ -28,6 +28,7 @@ painting over the user's terminal background:
 - `bone-machine` — dense brutalist slabs, heavy tabs, and mechanical state cuts
 - `circuit-garden` — airy rounded seed/canopy cards with vine-like rails
 - `field-notes` — ASCII notebook margins explicitly marked `Q`, `OBS`, and `CMD`
+- `kawaii-pink` — default-like focus dressed in adaptive candy pink, blush ribbons, hearts, and sparkles
 - `oxide-console` — industrial instrument panels, buses, alarms, and registers
 - `paper-ledger` — measured 84-column rules, label columns, and margin notes
 - `signal-noir` — sparse prose interrupted by red signal and trace bands
@@ -245,7 +246,7 @@ output readable even when the active theme predates the extension.
 
 `extension.header` and `extension.status` are the conventional roles for
 persistent extension chrome. Tool-renderer segments can request any other
-namespaced role; all ten bundled themes demonstrate both conventional chrome
+namespaced role; all eleven bundled themes demonstrate both conventional chrome
 roles and a distinct extension-specific role. Extension chrome is explicit:
 an enabled contribution remains visible even when a theme hides the matching
 built-in identity or telemetry surface.
