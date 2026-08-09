@@ -696,6 +696,9 @@ fn reduce_summary(summary: &mut SessionSummary, snapshot: &SessionSnapshot, even
             summary.retention = None;
         }
     }
+    if let EventPayload::SessionPullRequestChanged { pull_request } = &event.event {
+        summary.pull_request = pull_request.clone();
+    }
     summary.live_state = snapshot.live_state;
     summary.model = snapshot.model.clone();
     summary.modified_at_ms = summary.modified_at_ms.max(event.timestamp_ms);
@@ -729,7 +732,8 @@ fn reduce_snapshot(snapshot: &mut SessionSnapshot, event: &EventPayload) -> Resu
             snapshot.model = model.clone();
             snapshot.authority = *authority;
         }
-        EventPayload::SessionMetadataChanged { .. } => {}
+        EventPayload::SessionMetadataChanged { .. }
+        | EventPayload::SessionPullRequestChanged { .. } => {}
         EventPayload::SessionDurableHeadChanged { durable_entry_id } => {
             if durable_entry_id.as_ref().is_some_and(|head| {
                 !snapshot
@@ -1464,6 +1468,46 @@ mod tests {
         assert_eq!(view.snapshot.durable_head, original_snapshot.durable_head);
         assert_eq!(view.snapshot.items, original_snapshot.items);
         assert_eq!(view.snapshot.cursor.sequence, 1);
+    }
+
+    #[test]
+    fn pull_request_event_updates_only_the_catalog_projection() {
+        let mut core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            seed(),
+            ActorConfig::default(),
+        )
+        .unwrap();
+        let original_snapshot = core.snapshot();
+
+        core.publish(TimestampedEvent::new(
+            7,
+            EventPayload::SessionPullRequestChanged {
+                pull_request: Some(crate::PullRequestSummary {
+                    state: crate::PullRequestState::Ready,
+                }),
+            },
+        ))
+        .unwrap();
+
+        let view = core.view();
+        assert_eq!(
+            view.summary.pull_request,
+            Some(crate::PullRequestSummary {
+                state: crate::PullRequestState::Ready,
+            })
+        );
+        assert_eq!(view.summary.modified_at_ms, 7);
+        assert_eq!(view.snapshot.items, original_snapshot.items);
+        assert_eq!(view.snapshot.cursor.sequence, 1);
+
+        core.publish(TimestampedEvent::new(
+            8,
+            EventPayload::SessionPullRequestChanged { pull_request: None },
+        ))
+        .unwrap();
+        assert_eq!(core.view().summary.pull_request, None);
+        assert_eq!(core.snapshot().cursor.sequence, 2);
     }
 
     #[test]

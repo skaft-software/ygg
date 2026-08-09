@@ -124,7 +124,15 @@ a one-use opaque folder candidate; the browser must never submit a host path.
       that never accept arbitrary paths or URL schemes from the client.
 - [ ] Project Git and pull-request status with explicit source and refresh state.
 
-The unchecked review rows remain real limitations. Durable evidence is complete
+Production now discovers a session's current pull request from bounded structured
+`gh pr view` output after admitted runs, persists that association privately,
+refreshes both hosted and inventory-only sessions, and projects draft, review-ready,
+and merged state into the catalog. Temporary GitHub unavailability retains the
+last valid evidence, authoritative closure removes it, and merge is terminal. The
+broader row remains unchecked because project-level source/refresh presentation
+and generalized review integration are still absent.
+
+The other unchecked review rows remain real limitations. Durable evidence is complete
 for successful built-in `read`, `read_skill_resource`, `edit`, and `write`
 operations, but arbitrary Bash/extension mutations, comprehensive binary and
 large-file review, full command logs, preview ownership, host-open actions, and

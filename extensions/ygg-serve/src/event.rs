@@ -8,9 +8,9 @@ use crate::bounds::{
 };
 use crate::{
     ArtifactRef, AuthorityProfile, CatalogCursor, ContextUsage, DurableEntryId, ItemId,
-    ItemLifecycle, ModelSelection, PendingRequest, RunId, SessionBranchEntry, SessionCursor,
-    SessionId, SessionItem, SessionLiveState, SessionSnapshot, SessionSummary, SourceRef,
-    ToolActivity, UsageSnapshot, PROTOCOL_VERSION,
+    ItemLifecycle, ModelSelection, PendingRequest, PullRequestSummary, RunId, SessionBranchEntry,
+    SessionCursor, SessionId, SessionItem, SessionLiveState, SessionSnapshot, SessionSummary,
+    SourceRef, ToolActivity, UsageSnapshot, PROTOCOL_VERSION,
 };
 
 const MAX_BRANCH_DELTA_ENTRIES: usize = 128;
@@ -77,6 +77,12 @@ pub enum EventPayload {
         /// Replacement archived state when changed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         archived: Option<bool>,
+    },
+    /// Host-integrated pull-request evidence changed.
+    #[serde(rename = "session.pullRequestChanged")]
+    SessionPullRequestChanged {
+        /// Replacement evidence, or none when the associated PR is no longer trackable.
+        pull_request: Option<PullRequestSummary>,
     },
     /// The authoritative append-only head changed, including invisible config
     /// or provider sidecar entries.
@@ -364,6 +370,7 @@ impl ProtocolValidation for EventPayload {
                     validate_public_text("event.session_metadata.title", title, 512, false)?;
                 }
             }
+            Self::SessionPullRequestChanged { .. } => {}
             Self::SessionDurableHeadChanged { .. } => {}
             Self::SessionBranchEntriesAppended { entries } => {
                 if entries.is_empty() || entries.len() > MAX_BRANCH_DELTA_ENTRIES {
@@ -517,6 +524,31 @@ mod tests {
     use crate::{SessionBranchEntry, SessionBranchEntryKind};
 
     use super::*;
+
+    #[test]
+    fn pull_request_changes_preserve_evidence_and_explicit_removal_on_the_wire() {
+        let tracked = EventPayload::SessionPullRequestChanged {
+            pull_request: Some(PullRequestSummary {
+                state: crate::PullRequestState::Ready,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&tracked).unwrap(),
+            serde_json::json!({
+                "type": "session.pullRequestChanged",
+                "data": { "pullRequest": { "state": "ready" } }
+            })
+        );
+
+        let removed = EventPayload::SessionPullRequestChanged { pull_request: None };
+        assert_eq!(
+            serde_json::to_value(&removed).unwrap(),
+            serde_json::json!({
+                "type": "session.pullRequestChanged",
+                "data": { "pullRequest": null }
+            })
+        );
+    }
 
     #[test]
     fn branch_delta_is_bounded_to_128_entries() {
