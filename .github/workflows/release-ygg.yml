@@ -32,6 +32,7 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
       source_commit: ${{ steps.release.outputs.source_commit }}
+      workflow_commit: ${{ steps.release.outputs.workflow_commit }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -75,9 +76,36 @@ jobs:
           source_commit=$(git rev-parse "$tag^{commit}")
           workflow_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
           if [[ "$workflow_commit" != "$source_commit" ]]; then
-            echo "workflow ref $workflow_commit does not match canonical release source $source_commit" >&2
-            echo "dispatch this workflow from $tag, or push the binary tag at that exact commit" >&2
-            exit 1
+            if [[ "$GITHUB_EVENT_NAME" != push \
+              || "$GITHUB_REF_TYPE" != tag \
+              || "$GITHUB_REF_NAME" != "ygg-binaries-$tag" ]]; then
+              echo "workflow ref $workflow_commit does not match canonical release source $source_commit" >&2
+              echo "tooling-only repairs must use the dedicated ygg-binaries-$tag tag" >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$source_commit" "$workflow_commit"; then
+              echo "release tooling commit $workflow_commit does not descend from $source_commit" >&2
+              exit 1
+            fi
+            unexpected_paths=$(git diff --name-only "$source_commit" "$workflow_commit" \
+              | grep -Ev '^\.github/workflows/release-(ygg|serve)\.yml$' || true)
+            if [[ -n "$unexpected_paths" ]]; then
+              echo "tooling-only repair changes non-release-workflow paths:" >&2
+              printf '%s\n' "$unexpected_paths" >&2
+              exit 1
+            fi
+            if git diff --quiet "$source_commit" "$workflow_commit" -- .github/workflows/release-ygg.yml; then
+              echo "tooling-only repair does not change the Ygg release workflow" >&2
+              exit 1
+            fi
+            echo "using release tooling $workflow_commit to package immutable source $source_commit"
+            {
+              echo "## Release tooling repair"
+              echo
+              echo "- Immutable source: \`$source_commit\`"
+              echo "- Release tooling: \`$workflow_commit\`"
+              echo "- Trigger: \`$GITHUB_REF_NAME\`"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
           version=${tag#v}
           cargo_version=$(git show "$source_commit:Cargo.toml" \
@@ -148,9 +176,12 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "source_commit=$source_commit"
+            echo "workflow_commit=$workflow_commit"
+          } >> "$GITHUB_OUTPUT"
 
   security:
     name: Audit release dependencies
@@ -284,29 +315,48 @@ jobs:
         shell: bash
         env:
           SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
         run: |
           set -euo pipefail
-          python3 - "$SOURCE_COMMIT" scripts/install.sh release-assets/install-ygg.sh <<'PY'
+          python3 - "$SOURCE_COMMIT" "$WORKFLOW_COMMIT" scripts/install.sh release-assets/install-ygg.sh <<'PY'
           import pathlib
           import re
           import sys
 
-          source_commit, source_path, destination_path = sys.argv[1:4]
-          if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
-              raise SystemExit("release source commit is malformed")
+          source_commit, workflow_commit, source_path, destination_path = sys.argv[1:5]
+          for name, commit in (
+              ("release source", source_commit),
+              ("release workflow", workflow_commit),
+          ):
+              if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+                  raise SystemExit(f"{name} commit is malformed")
           source = pathlib.Path(source_path).read_text(encoding="utf-8")
           placeholder = 'release_source_commit="__YGG_RELEASE_SOURCE_COMMIT__"'
           if source.count(placeholder) != 1:
               raise SystemExit("installer source-commit placeholder is missing or ambiguous")
           generated = source.replace(
               placeholder,
-              f'release_source_commit="{source_commit}"',
+              (
+                  f'release_source_commit="{source_commit}"\n'
+                  f'release_workflow_commit="{workflow_commit}"'
+              ),
+          )
+          signature_commit_argument = '        "$release_source_commit" \\\n'
+          if generated.count(signature_commit_argument) != 1:
+              raise SystemExit("installer signature-commit argument is missing or ambiguous")
+          generated = generated.replace(
+              signature_commit_argument,
+              '        "$release_workflow_commit" \\\n',
           )
           pathlib.Path(destination_path).write_text(generated, encoding="utf-8")
           PY
           chmod 0755 release-assets/install-ygg.sh
-          ! grep -F '__YGG_RELEASE_SOURCE_COMMIT__' release-assets/install-ygg.sh
+          if grep -F '__YGG_RELEASE_SOURCE_COMMIT__' release-assets/install-ygg.sh; then
+            echo "generated installer still contains its source-commit placeholder" >&2
+            exit 1
+          fi
           grep -F "release_source_commit=\"$SOURCE_COMMIT\"" release-assets/install-ygg.sh
+          grep -F "release_workflow_commit=\"$WORKFLOW_COMMIT\"" release-assets/install-ygg.sh
           release-assets/install-ygg.sh --help | grep -F "Install Ygg ${{ needs.resolve.outputs.version }}."
           test "$(find release-assets -maxdepth 1 -name 'ygg-*.tar.gz' | wc -l | tr -d ' ')" = 3
       - name: Install cosign
@@ -335,7 +385,7 @@ jobs:
         env:
           COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
           COSIGN_IDENTITY: https://github.com/${{ github.workflow_ref }}
-          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
           WORKFLOW_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -346,7 +396,7 @@ jobs:
             --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER"
             --certificate-github-workflow-name "Ygg binary release"
             --certificate-github-workflow-repository "$WORKFLOW_REPOSITORY"
-            --certificate-github-workflow-sha "$SOURCE_COMMIT"
+            --certificate-github-workflow-sha "$WORKFLOW_COMMIT"
           )
           for artifact in ./*.tar.gz ./install-ygg.sh; do
             cosign verify-blob \
@@ -364,13 +414,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_TAG: ${{ github.ref_name }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
         run: |
           set -euo pipefail
-          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-          if [[ "$(git rev-parse "$RELEASE_TAG^{commit}")" != "$SOURCE_COMMIT" ]]; then
-            echo "canonical tag moved while release artifacts were building" >&2
-            exit 1
-          fi
+          verify_release_refs() {
+            phase=$1
+            git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            if [[ "$(git rev-parse "$RELEASE_TAG^{commit}")" != "$SOURCE_COMMIT" ]]; then
+              echo "canonical tag moved while release artifacts were $phase" >&2
+              exit 1
+            fi
+            git fetch --force origin "refs/tags/$WORKFLOW_TAG:refs/tags/$WORKFLOW_TAG"
+            if [[ "$(git rev-parse "$WORKFLOW_TAG^{commit}")" != "$WORKFLOW_COMMIT" ]]; then
+              echo "release workflow tag moved while release artifacts were $phase" >&2
+              exit 1
+            fi
+          }
+          verify_release_refs building
           if ! release_state=$(gh release view "$RELEASE_TAG" \
             --json tagName,isDraft,isPrerelease \
             --jq '[.tagName, .isDraft, .isPrerelease] | @tsv'); then
@@ -391,11 +452,7 @@ jobs:
             fi
           done
           gh release upload "$RELEASE_TAG" release-assets/*
-          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-          if [[ "$(git rev-parse "$RELEASE_TAG^{commit}")" != "$SOURCE_COMMIT" ]]; then
-            echo "canonical tag moved while release artifacts were publishing" >&2
-            exit 1
-          fi
+          verify_release_refs publishing
 
   verify-published:
     name: Verify binary install on ${{ matrix.target }}
