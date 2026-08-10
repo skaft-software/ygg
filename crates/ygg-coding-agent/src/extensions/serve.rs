@@ -70,7 +70,9 @@ use crate::commands;
 use crate::compaction::attempt_compaction;
 use crate::config::{self, Config};
 use crate::resources::{compose_instructions, validate_skill_requirements};
-use crate::session_store::{SessionMeta, SessionStorageLifecycle, SessionStore};
+use crate::session_store::{
+    SessionCatalogEntry, SessionMeta, SessionStorageLifecycle, SessionStore, SessionUsageRecord,
+};
 
 const DRIVER_MAILBOX_CAPACITY: usize = 64;
 const DRIVER_EVENT_CAPACITY: usize = 512;
@@ -909,19 +911,18 @@ impl YggHost {
         session_id: &SessionId,
     ) -> Result<SessionSummary, ServiceError> {
         let context = self.storage_context_for_session(session_id)?;
-        let meta =
-            session_meta_for_id(&context.sessions, session_id).ok_or(ServiceError::NotFound)?;
-        let selection = Session::open_read_only(&meta.path)
-            .ok()
-            .and_then(|session| {
-                advertised_selection_from_session(
-                    &session,
-                    &self.catalog,
-                    &context.config,
-                    &self.models,
-                )
-            })
-            .map_or_else(|| self.default_selection(), Ok)?;
+        let catalog = context
+            .sessions
+            .catalog_by_id(session_id.as_str())
+            .map_err(|_| ServiceError::InvalidSeed)?;
+        let meta = catalog.meta.as_ref().ok_or(ServiceError::NotFound)?;
+        let selection = advertised_selection_from_catalog_entry(
+            &catalog,
+            &self.catalog,
+            &context.config,
+            &self.models,
+        )
+        .map_or_else(|| self.default_selection(), Ok)?;
         let mut summary = summary_from_meta(&meta, Some(context.project_id), selection)?;
         summary.pull_request = self.cached_pull_request(session_id);
         Ok(summary)
@@ -1078,6 +1079,7 @@ impl YggHost {
                 reasoning,
                 reasoning_mode: self.config.reasoning_mode,
             },
+            prepared_session: Mutex::new(None),
             authority: request.authority,
             available_models: self.models.clone(),
             actor_generation: generation,
@@ -1107,16 +1109,25 @@ impl YggHost {
         #[cfg(test)]
         self.open_count.fetch_add(1, Ordering::Relaxed);
         let context = self.project_context_for_session(session_id)?;
-        if session_meta_for_id(&context.sessions, session_id)
-            .is_some_and(|meta| meta.trashed_at_ms.is_some())
-        {
+        let metadata = context
+            .sessions
+            .load_metadata(session_id.as_str())
+            .map_err(|_| ServiceError::InvalidSeed)?;
+        if metadata.trashed_at_ms.is_some() {
             return Err(ServiceError::InvalidBoundary);
         }
         let path = context
             .sessions
             .path_by_id(session_id.as_str())
             .map_err(|_| ServiceError::NotFound)?;
-        let session = Session::open_read_only(&path).map_err(|_| ServiceError::InvalidSeed)?;
+        let file = ygg_agent::secure_fs::open_regular_file_for_append(&path)
+            .map_err(|_| ServiceError::InvalidSeed)?;
+        let session =
+            Session::open_with_file(path.clone(), file).map_err(|_| ServiceError::InvalidSeed)?;
+        let meta = context
+            .sessions
+            .meta_for_open_session(session_id.as_str(), &session)
+            .map_err(|_| ServiceError::InvalidSeed)?;
         let selection =
             advertised_selection_from_session(&session, &self.catalog, &self.config, &self.models)
                 .map_or_else(|| self.default_selection(), Ok)?;
@@ -1130,7 +1141,7 @@ impl YggHost {
                 model: selection.clone(),
                 authority: AuthorityProfile::FullAccess,
                 generation,
-                meta: session_meta_for_id(&context.sessions, session_id),
+                meta: meta.clone(),
                 attachment_store: self.attachments.as_ref(),
                 resource_store: self.resources.as_ref(),
             },
@@ -1142,6 +1153,7 @@ impl YggHost {
             .any(|entry| matches!(&entry.value, EntryValue::Message(Message::User(_))));
         let reasoning =
             config::parse_reasoning(&selection.reasoning).map_err(|_| ServiceError::InvalidSeed)?;
+        let known_entries = session.entries().len();
         let plan = WorkerPlan {
             config: context.config,
             sessions: context.sessions,
@@ -1151,6 +1163,7 @@ impl YggHost {
                 reasoning,
                 reasoning_mode: self.config.reasoning_mode,
             },
+            prepared_session: Mutex::new(Some(session)),
             authority: AuthorityProfile::FullAccess,
             available_models: self.models.clone(),
             actor_generation: generation,
@@ -1177,7 +1190,6 @@ impl YggHost {
                 .pop_front()
                 .unwrap_or_default(),
         };
-        let known_entries = session.entries().len();
         Ok(YggSessionDriver::spawn(seed, plan, known_entries))
     }
 }
@@ -1251,18 +1263,14 @@ fn backfill_usage_store(
             continue;
         };
         let sessions = SessionStore::new(&config.session_dir, root.as_path());
-        let bound = projects
-            .sessions_for_project(&project.id)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        for meta in sessions.list() {
-            if !bound.contains(&meta.id) {
-                continue;
-            }
-            let Ok(session) = Session::open_read_only(&meta.path) else {
+        for session_id in projects.sessions_for_project(&project.id) {
+            let Ok(inspection) = sessions.inspect_by_id(&session_id) else {
                 continue;
             };
-            usage.record_all(project_session_usage(&meta.id, &session)?)?;
+            usage.record_all(project_catalog_usage(
+                &session_id,
+                &inspection.usage_records,
+            )?)?;
         }
     }
     Ok(())
@@ -1300,6 +1308,34 @@ fn project_session_usage(
                 cache_write_1h_tokens: record.usage.cache_write_1h_tokens,
                 reasoning_tokens: record.usage.reasoning_tokens,
                 total_tokens: record.usage.total_tokens,
+            })
+        })
+        .collect()
+}
+
+fn project_catalog_usage(
+    session_id: &str,
+    records: &[SessionUsageRecord],
+) -> Result<Vec<InferenceRequest>, UsageStoreError> {
+    records
+        .iter()
+        .enumerate()
+        .map(|(ordinal, record)| {
+            let request_ordinal =
+                u64::try_from(ordinal).map_err(|_| UsageStoreError::InvalidRecord)?;
+            Ok(InferenceRequest {
+                session_id: session_id.to_owned(),
+                request_ordinal,
+                provider: record.endpoint.as_deref().unwrap_or("unknown").to_owned(),
+                model: record.model.as_deref().unwrap_or("unknown").to_owned(),
+                timestamp_ms: record.completed_at_unix_ms.unwrap_or_default(),
+                prompt_tokens: record.input_tokens,
+                completion_tokens: record.output_tokens,
+                cache_read_tokens: record.cache_read_tokens,
+                cache_write_tokens: record.cache_write_tokens,
+                cache_write_1h_tokens: record.cache_write_1h_tokens,
+                reasoning_tokens: record.reasoning_tokens,
+                total_tokens: record.total_tokens,
             })
         })
         .collect()
@@ -1938,24 +1974,27 @@ impl HostService for YggHost {
                     continue;
                 };
                 let sessions = SessionStore::new(&base_config.session_dir, root.as_path());
-                let bound = projects
-                    .sessions_for_project(&project.id)
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
+                let bound = projects.sessions_for_project(&project.id);
                 let public_project_id =
                     ProjectId::new(project.id.as_str()).map_err(|_| ServiceError::Internal)?;
                 let mut project_config = base_config.clone();
                 project_config.workspace = root.as_path().to_owned();
                 project_config.invocation_cwd = root.as_path().to_owned();
                 project_config.workspace_trusted = true;
-                for meta in sessions.list() {
-                    if !bound.contains(&meta.id) {
-                        continue;
-                    }
-                    let Ok(session_id) = SessionId::new(meta.id.clone()) else {
+                for session_id_text in
+                    sessions.session_ids_newest_first(bound.iter().map(String::as_str))
+                {
+                    let Ok(session_id) = SessionId::new(session_id_text.clone()) else {
                         continue;
                     };
-                    let Ok(session) = Session::open_read_only(&meta.path) else {
+                    let Ok(path) = sessions.path_by_id(&session_id_text) else {
+                        continue;
+                    };
+                    let Ok(session) = Session::open_read_only(&path) else {
+                        continue;
+                    };
+                    let Ok(Some(meta)) = sessions.meta_for_open_session(&session_id_text, &session)
+                    else {
                         continue;
                     };
                     let selection = selection_from_session(&session, &catalog, &project_config)
@@ -2340,31 +2379,32 @@ impl HostService for YggHost {
                     continue;
                 };
                 let sessions = SessionStore::new(&base_config.session_dir, root.as_path());
-                let bound = projects
-                    .sessions_for_project(&project.id)
-                    .into_iter()
-                    .collect::<BTreeSet<_>>();
+                let bound = projects.sessions_for_project(&project.id);
                 let public_project_id =
                     ProjectId::new(project.id.as_str()).map_err(|_| ServiceError::Internal)?;
                 let mut project_config = base_config.clone();
                 project_config.workspace = root.as_path().to_owned();
                 project_config.invocation_cwd = root.as_path().to_owned();
                 project_config.workspace_trusted = project.state == RegistryProjectState::Trusted;
-                for meta in sessions.list() {
-                    if summaries.len() >= 2_000 || !bound.contains(&meta.id) {
-                        continue;
+                for session_id in
+                    sessions.session_ids_newest_first(bound.iter().map(String::as_str))
+                {
+                    if summaries.len() >= 2_000 {
+                        break;
                     }
-                    let selection = Session::open_read_only(&meta.path)
-                        .ok()
-                        .and_then(|session| {
-                            advertised_selection_from_session(
-                                &session,
-                                &catalog,
-                                &project_config,
-                                &models,
-                            )
-                        })
-                        .unwrap_or_else(|| fallback.clone());
+                    let Ok(catalog_entry) = sessions.catalog_by_id(&session_id) else {
+                        continue;
+                    };
+                    let Some(meta) = catalog_entry.meta.as_ref() else {
+                        continue;
+                    };
+                    let selection = advertised_selection_from_catalog_entry(
+                        &catalog_entry,
+                        &catalog,
+                        &project_config,
+                        &models,
+                    )
+                    .unwrap_or_else(|| fallback.clone());
                     if let Ok(summary) =
                         summary_from_meta(&meta, Some(public_project_id.clone()), selection)
                     {
@@ -2515,6 +2555,7 @@ struct WorkerPlan {
     config: Config,
     sessions: SessionStore,
     launch: LaunchSelection,
+    prepared_session: Mutex<Option<Session>>,
     authority: AuthorityProfile,
     available_models: Vec<ModelSummary>,
     actor_generation: u64,
@@ -3297,7 +3338,7 @@ async fn run_worker(
             WorkerMessage::CommandDiscovery { response } => {
                 let result = match app.as_ref() {
                     Some(app) => build_command_discovery(app),
-                    None => match build_worker_app(&plan) {
+                    None => match build_worker_app(&mut plan) {
                         Ok(owned_app) => {
                             let discovery = build_command_discovery(&owned_app);
                             app = Some(owned_app);
@@ -3314,7 +3355,7 @@ async fn run_worker(
             SessionCommand::SubmitPrompt { input } => {
                 let mut owned_app = match app.take() {
                     Some(app) => app,
-                    None => match build_worker_app(&plan) {
+                    None => match build_worker_app(&mut plan) {
                         Ok(app) => app,
                         Err(_) => {
                             let _ = message.response.send(Err(ServiceError::Internal));
@@ -3358,7 +3399,7 @@ async fn run_worker(
             } => {
                 let owned_app = match app.take() {
                     Some(app) => app,
-                    None => match build_worker_app(&plan) {
+                    None => match build_worker_app(&mut plan) {
                         Ok(app) => app,
                         Err(_) => {
                             let _ = message.response.send(Err(ServiceError::Internal));
@@ -3423,7 +3464,7 @@ async fn run_worker(
             } => {
                 let owned_app = match app.take() {
                     Some(app) => app,
-                    None => match build_worker_app(&plan) {
+                    None => match build_worker_app(&mut plan) {
                         Ok(app) => app,
                         Err(_) => {
                             let _ = message.response.send(Err(ServiceError::Internal));
@@ -3504,7 +3545,7 @@ async fn run_worker(
             SessionCommand::ForkConversation { entry_id } => {
                 let owned_app = match app.take() {
                     Some(app) => app,
-                    None => match build_worker_app(&plan) {
+                    None => match build_worker_app(&mut plan) {
                         Ok(app) => app,
                         Err(_) => {
                             let _ = message.response.send(Err(ServiceError::Internal));
@@ -3529,7 +3570,7 @@ async fn run_worker(
             SessionCommand::Checkout { entry_id } => {
                 let mut owned_app = match app.take() {
                     Some(app) => app,
-                    None => match build_worker_app(&plan) {
+                    None => match build_worker_app(&mut plan) {
                         Ok(app) => app,
                         Err(_) => {
                             let _ = message.response.send(Err(ServiceError::Internal));
@@ -3560,7 +3601,7 @@ async fn run_worker(
                         Ok(rebuilt) => rebuilt,
                         Err(_) => {
                             match checkout_rejection_after_rollback(
-                                restore_checkout_owner(&path, previous_head, &plan),
+                                restore_checkout_owner(&path, previous_head, &mut plan),
                                 ServiceError::Internal,
                             ) {
                                 Ok((restored, rejection)) => {
@@ -3586,7 +3627,14 @@ async fn run_worker(
                         model,
                         authority: plan.authority,
                         generation: plan.actor_generation,
-                        meta: session_meta_for_id(&plan.sessions, &plan.session_id),
+                        meta: plan
+                            .sessions
+                            .meta_for_open_session(
+                                plan.session_id.as_str(),
+                                rebuilt.agent.session(),
+                            )
+                            .ok()
+                            .flatten(),
                         attachment_store: plan.attachments.as_ref(),
                         resource_store: plan.resources.as_ref(),
                     },
@@ -3633,7 +3681,7 @@ async fn run_worker(
                                     rebuilt,
                                     &path,
                                     previous_head,
-                                    &plan,
+                                    &mut plan,
                                 ) {
                                     Ok(restored) => {
                                         app = Some(restored);
@@ -3652,7 +3700,7 @@ async fn run_worker(
                                     rebuilt,
                                     &path,
                                     previous_head,
-                                    &plan,
+                                    &mut plan,
                                 )
                                 .ok();
                                 if app.is_none() {
@@ -3663,7 +3711,7 @@ async fn run_worker(
                     }
                     Err(error) => {
                         match checkout_rejection_after_rollback(
-                            rollback_checkout_candidate(rebuilt, &path, previous_head, &plan),
+                            rollback_checkout_candidate(rebuilt, &path, previous_head, &mut plan),
                             error,
                         ) {
                             Ok((restored, rejection)) => {
@@ -3682,7 +3730,7 @@ async fn run_worker(
             SessionCommand::InvokeSlashCommand { invocation } => {
                 let owned_app = match app.take() {
                     Some(app) => app,
-                    None => match build_worker_app(&plan) {
+                    None => match build_worker_app(&mut plan) {
                         Ok(app) => app,
                         Err(_) => {
                             let _ = message.response.send(Err(ServiceError::Internal));
@@ -3775,7 +3823,7 @@ async fn run_worker(
                             outcome
                         }
                         Err(_) => {
-                            app = build_worker_app(&plan).ok();
+                            app = build_worker_app(&mut plan).ok();
                             Err(ServiceError::Internal)
                         }
                     }
@@ -3854,7 +3902,7 @@ async fn run_worker(
                             outcome
                         }
                         Err(_) => {
-                            app = build_worker_app(&plan).ok();
+                            app = build_worker_app(&mut plan).ok();
                             Err(ServiceError::Internal)
                         }
                     }
@@ -4693,7 +4741,7 @@ fn rollback_checkout_candidate(
     mut candidate: App,
     path: &Path,
     previous_head: EntryId,
-    plan: &WorkerPlan,
+    plan: &mut WorkerPlan,
 ) -> Result<App, ServiceError> {
     candidate.executable_extensions.shutdown_blocking();
     drop(candidate);
@@ -4703,7 +4751,7 @@ fn rollback_checkout_candidate(
 fn restore_checkout_owner(
     path: &Path,
     previous_head: EntryId,
-    plan: &WorkerPlan,
+    plan: &mut WorkerPlan,
 ) -> Result<App, ServiceError> {
     #[cfg(test)]
     if plan.checkout_hooks.fail_rollback {
@@ -4751,7 +4799,7 @@ async fn shutdown_worker_app(app: &mut Option<App>) {
     }
 }
 
-fn build_worker_app(plan: &WorkerPlan) -> anyhow::Result<App> {
+fn build_worker_app(plan: &mut WorkerPlan) -> anyhow::Result<App> {
     let mut config = plan.config.clone();
     config.resume = match &plan.launch.session {
         SessionSelection::CreateNew(_) => crate::config::ResumeSelector::New,
@@ -4761,8 +4809,16 @@ fn build_worker_app(plan: &WorkerPlan) -> anyhow::Result<App> {
                 .map(str::to_owned),
         ),
     };
-    let boot = crate::app::bootstrap::bootstrap(config)?;
+    let mut boot = crate::app::bootstrap::bootstrap(config)?;
     let system = compose_instructions(&boot.config)?;
+    if let Some(session) = plan
+        .prepared_session
+        .get_mut()
+        .map_err(|_| anyhow::anyhow!("prepared session lock poisoned"))?
+        .take()
+    {
+        boot.set_prepared_session(session);
+    }
     build_app(boot, plan.launch.clone(), system)
 }
 
@@ -5221,7 +5277,8 @@ async fn start_and_drive_run(
     }
     input_parts.extend(media.into_iter().map(InputPart::Media));
     let title_before_prompt =
-        session_meta_for_id(&plan.sessions, &plan.session_id).map(|metadata| metadata.title);
+        session_meta_for_open_session(&plan.sessions, &plan.session_id, app.agent.session())
+            .map(|metadata| metadata.title);
     let run_model = app.model.clone();
     let mut run = match app.agent.prompt(UserInput::from(input_parts)).await {
         Ok(run) => run,
@@ -5257,11 +5314,21 @@ async fn start_and_drive_run(
         .commit_prompt_context(pending_context_count);
     let control = run.control();
     let mut immediate = Vec::with_capacity(3);
-    if let Some(title) = changed_session_title(
-        &plan.sessions,
-        &plan.session_id,
-        title_before_prompt.as_deref(),
-    ) {
+    let title_after_prompt = title_before_prompt.clone().or_else(|| {
+        plan.sessions
+            .load_metadata(plan.session_id.as_str())
+            .ok()
+            .and_then(|metadata| metadata.name)
+            .or_else(|| {
+                let title = crate::session_store::trim_title(&display_text);
+                (!title.trim().is_empty()).then_some(title)
+            })
+    });
+    if let Some(title) = title_after_prompt.filter(|title| {
+        title != "(empty session)"
+            && !title.trim().is_empty()
+            && title_before_prompt.as_deref() != Some(title.as_str())
+    }) {
         immediate.push(event(EventPayload::SessionMetadataChanged {
             title: Some(title),
             pinned: None,
@@ -5516,7 +5583,8 @@ async fn start_and_drive_run(
         plan.attachments.as_ref(),
         &plan.session_id,
     )?;
-    let search_title = session_meta_for_id(&plan.sessions, &plan.session_id)
+    let search_title =
+        session_meta_for_open_session(&plan.sessions, &plan.session_id, app.agent.session())
         .map(|meta| meta.name.unwrap_or(meta.title))
         .unwrap_or_else(|| "Session".to_owned());
     if let Ok(mut search_index) = plan.search_index.lock() {
@@ -9310,6 +9378,28 @@ fn selection_from_session(
         }
         cursor = entry.parent.as_ref();
     }
+    selection_from_persisted_config(model, reasoning, catalog, config)
+}
+
+fn selection_from_catalog_entry(
+    entry: &SessionCatalogEntry,
+    catalog: &ModelCatalog,
+    config: &Config,
+) -> Result<ModelSelection, ServiceError> {
+    selection_from_persisted_config(
+        entry.configured_model.clone(),
+        entry.configured_reasoning.clone(),
+        catalog,
+        config,
+    )
+}
+
+fn selection_from_persisted_config(
+    model: Option<String>,
+    reasoning: Option<String>,
+    catalog: &ModelCatalog,
+    config: &Config,
+) -> Result<ModelSelection, ServiceError> {
     let model_id = model
         .map(ModelId)
         .or_else(|| config.model.clone())
@@ -9333,6 +9423,21 @@ fn advertised_selection_from_session(
     models: &[ModelSummary],
 ) -> Option<ModelSelection> {
     selection_from_session(session, catalog, config)
+        .ok()
+        .filter(|selection| {
+            models
+                .iter()
+                .any(|model| model.provider == selection.provider && model.id == selection.model)
+        })
+}
+
+fn advertised_selection_from_catalog_entry(
+    entry: &SessionCatalogEntry,
+    catalog: &ModelCatalog,
+    config: &Config,
+    models: &[ModelSummary],
+) -> Option<ModelSelection> {
+    selection_from_catalog_entry(entry, catalog, config)
         .ok()
         .filter(|selection| {
             models
@@ -9559,13 +9664,23 @@ fn graphical_role_style(
     }
 }
 
+#[cfg(test)]
 fn session_meta_for_id(store: &SessionStore, session_id: &SessionId) -> Option<SessionMeta> {
-    store
-        .list()
-        .into_iter()
-        .find(|meta| meta.id == session_id.as_str())
+    store.get_by_id(session_id.as_str()).ok().flatten()
 }
 
+fn session_meta_for_open_session(
+    store: &SessionStore,
+    session_id: &SessionId,
+    session: &Session,
+) -> Option<SessionMeta> {
+    store
+        .meta_for_open_session(session_id.as_str(), session)
+        .ok()
+        .flatten()
+}
+
+#[cfg(test)]
 fn changed_session_title(
     store: &SessionStore,
     session_id: &SessionId,
@@ -10131,6 +10246,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn targeted_resume_rejects_trashed_transcripts() {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, session_id, _, _, _) =
+            worker_checkout_fixture(directory.path(), "targeted-trashed");
+        let context = host.project_context(Some(&host.launch_project_id)).unwrap();
+        context
+            .sessions
+            .set_lifecycle(
+                session_id.as_str(),
+                SessionStorageLifecycle::Trash,
+                1_000,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            host.open_session(&session_id).await,
+            Err(ServiceError::InvalidBoundary)
+        ));
+    }
+
+    #[tokio::test]
+    async fn targeted_resume_rejects_unsafe_metadata_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, session_id, _, _, _) =
+            worker_checkout_fixture(directory.path(), "targeted-unsafe-metadata");
+        let context = host.project_context(Some(&host.launch_project_id)).unwrap();
+        std::fs::write(context.sessions.dir().join(".metadata"), b"not a directory").unwrap();
+
+        assert!(matches!(
+            host.stored_session_summary(&session_id),
+            Err(ServiceError::InvalidSeed)
+        ));
+        assert!(matches!(
+            host.open_session(&session_id).await,
+            Err(ServiceError::InvalidSeed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn targeted_resume_and_catalog_reject_corrupt_transcripts() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (host, session_id, _, _, path) =
+            worker_checkout_fixture(directory.path(), "targeted-corrupt");
+        let mut transcript = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        transcript.write_all(b"{\n").unwrap();
+        drop(transcript);
+
+        assert!(matches!(
+            host.stored_session_summary(&session_id),
+            Err(ServiceError::InvalidSeed)
+        ));
+        assert!(matches!(
+            host.open_session(&session_id).await,
+            Err(ServiceError::InvalidSeed)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn targeted_resume_and_catalog_reject_symlinked_transcripts() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (host, session_id, _, _, path) =
+            worker_checkout_fixture(directory.path(), "targeted-symlink");
+        let outside = directory.path().join("outside.jsonl");
+        std::fs::rename(&path, &outside).unwrap();
+        symlink(&outside, &path).unwrap();
+
+        assert!(matches!(
+            host.stored_session_summary(&session_id),
+            Err(ServiceError::InvalidSeed)
+        ));
+        assert!(matches!(
+            host.open_session(&session_id).await,
+            Err(ServiceError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn catalog_selection_matches_full_replay_on_the_active_branch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = serve_test_config(directory.path());
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        config.workspace = workspace.clone();
+        config.invocation_cwd = workspace;
+        config.model = Some(ModelId("gpt-4o-mini".into()));
+        config.model_explicit = true;
+        let host = YggHost::new(config).unwrap();
+        let active = host.default_selection().unwrap();
+        let inactive = host
+            .models
+            .iter()
+            .find(|summary| summary.id != active.model)
+            .map(selection_from_summary)
+            .expect("Serve test catalog must expose a second model");
+        let session_id = SessionId::new("catalog-active-branch").unwrap();
+        let context = host.project_context(Some(&host.launch_project_id)).unwrap();
+        std::fs::create_dir_all(context.sessions.dir()).unwrap();
+        host.projects
+            .lock()
+            .unwrap()
+            .bind_session(
+                session_id.as_str(),
+                &registry_project_id(&host.launch_project_id).unwrap(),
+            )
+            .unwrap();
+        let path = context.sessions.dir().join("catalog-active-branch.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        let root = session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("root prompt".into())],
+            })))
+            .unwrap();
+        let active_config = session
+            .append(EntryValue::Config {
+                model: Some(active.model.clone()),
+                reasoning: Some(active.reasoning.clone()),
+                reasoning_mode: Some("standard".into()),
+            })
+            .unwrap();
+        session.checkout(root).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("inactive prompt".into())],
+            })))
+            .unwrap();
+        session
+            .append(EntryValue::Config {
+                model: Some(inactive.model),
+                reasoning: Some(inactive.reasoning),
+                reasoning_mode: Some("standard".into()),
+            })
+            .unwrap();
+        session.checkout(active_config).unwrap();
+        drop(session);
+
+        let replayed = Session::open_read_only(&path).unwrap();
+        let catalog_entry = context.sessions.catalog_by_id(session_id.as_str()).unwrap();
+        let full = selection_from_session(&replayed, &host.catalog, &context.config).unwrap();
+        let catalog = selection_from_catalog_entry(&catalog_entry, &host.catalog, &context.config)
+            .unwrap();
+        assert_eq!(catalog, full);
+        assert_eq!(catalog, active);
+
+        let listed = host
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == session_id)
+            .unwrap();
+        assert_eq!(listed.model, active);
+    }
+
+    #[tokio::test]
     async fn serve_created_session_resumes_when_its_historical_model_is_unavailable() {
         let directory = tempfile::tempdir().unwrap();
         let mut config = project_test_config(directory.path(), true);
@@ -10242,6 +10519,7 @@ mod tests {
                 reasoning: ReasoningConfig::Off,
                 reasoning_mode: ygg_ai::ReasoningMode::Standard,
             },
+            prepared_session: Mutex::new(None),
             authority: AuthorityProfile::FullAccess,
             available_models: Vec::new(),
             actor_generation: 1,
@@ -10262,6 +10540,75 @@ mod tests {
             pull_request_refresh_requested: Arc::new(tokio::sync::Notify::new()),
             checkout_hooks: CheckoutTestHooks::default(),
         }
+    }
+
+    #[test]
+    fn prepared_session_descriptor_is_consumed_once_and_checkout_rebuild_reopens_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = pull_request_worker_plan(directory.path(), "prepared-descriptor");
+        let SessionSelection::CreateNew(path) = plan.launch.session.clone() else {
+            panic!("test worker plan must create a session");
+        };
+        plan.launch.model = ModelId("gpt-4o-mini".into());
+        let mut original = Session::create(&path).unwrap();
+        original
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("authorized transcript".into())],
+            })))
+            .unwrap();
+        drop(original);
+
+        let file = ygg_agent::secure_fs::open_regular_file_for_append(&path).unwrap();
+        let prepared = Session::open_with_file(path.clone(), file).unwrap();
+        plan.launch.session = SessionSelection::OpenExisting(path.clone());
+        *plan.prepared_session.get_mut().unwrap() = Some(prepared);
+
+        // Simulate a pathname replacement after descriptor-bound authorization.
+        // The initial worker must keep the authorized descriptor. A checkout
+        // rebuild deliberately reopens the current pathname through the normal
+        // descriptor-bound path instead of retaining an unsafe broad cache.
+        let displaced = path.with_extension("displaced");
+        std::fs::rename(&path, &displaced).unwrap();
+        let mut replacement = Session::create(&path).unwrap();
+        replacement
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("replacement transcript".into())],
+            })))
+            .unwrap();
+        drop(replacement);
+
+        let app = build_worker_app(&mut plan).unwrap();
+        assert!(app.agent.session().entries().iter().any(|entry| {
+            matches!(
+                &entry.value,
+                EntryValue::Message(Message::User(UserMessage { content }))
+                    if matches!(content.as_slice(), [UserPart::Text(text)] if text == "authorized transcript")
+            )
+        }));
+        assert!(plan.prepared_session.get_mut().unwrap().is_none());
+
+        let rebuilt = rebuild_app(
+            app,
+            None,
+            None,
+            None,
+            Some(SessionSelection::OpenExisting(path)),
+        )
+        .unwrap();
+        assert!(rebuilt.agent.session().entries().iter().any(|entry| {
+            matches!(
+                &entry.value,
+                EntryValue::Message(Message::User(UserMessage { content }))
+                    if matches!(content.as_slice(), [UserPart::Text(text)] if text == "replacement transcript")
+            )
+        }));
+        assert!(rebuilt.agent.session().entries().iter().all(|entry| {
+            !matches!(
+                &entry.value,
+                EntryValue::Message(Message::User(UserMessage { content }))
+                    if matches!(content.as_slice(), [UserPart::Text(text)] if text == "authorized transcript")
+            )
+        }));
     }
 
     #[test]
@@ -12978,6 +13325,7 @@ mod tests {
                 reasoning: ReasoningConfig::Effort(ygg_ai::ReasoningEffort::High),
                 reasoning_mode: ygg_ai::ReasoningMode::Standard,
             },
+            prepared_session: Mutex::new(None),
             authority: AuthorityProfile::FullAccess,
             available_models: Vec::new(),
             actor_generation: 1,
@@ -13556,6 +13904,7 @@ mod tests {
                 reasoning: ReasoningConfig::Off,
                 reasoning_mode: ygg_ai::ReasoningMode::Standard,
             },
+            prepared_session: Mutex::new(None),
             authority: AuthorityProfile::FullAccess,
             available_models: Vec::new(),
             actor_generation: 1,

@@ -51,6 +51,43 @@ pub struct SessionMeta {
     pub modified: SystemTime,
 }
 
+/// Compact active-branch state derived without constructing a full `Session`.
+///
+/// This is intentionally limited to data needed for catalog inventory and
+/// lifetime usage recovery. Opening a session for mutation still performs the
+/// authoritative descriptor-bound `Session` replay.
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub(crate) struct SessionCatalogEntry {
+    pub meta: Option<SessionMeta>,
+    pub configured_model: Option<String>,
+    pub configured_reasoning: Option<String>,
+}
+
+/// One compact usage projection retained by the lightweight catalog replay.
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub(crate) struct SessionUsageRecord {
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub completed_at_unix_ms: Option<u64>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// Result of one bounded, graph-validating transcript scan.
+#[cfg_attr(not(feature = "serve"), allow(dead_code))]
+#[derive(Clone, Debug)]
+pub(crate) struct SessionCatalogInspection {
+    pub catalog: SessionCatalogEntry,
+    pub usage_records: Vec<SessionUsageRecord>,
+}
+
 /// Small user-owned metadata kept next to, but separate from, append-only
 /// session records. Sidecars let older Ygg binaries continue to open JSONL
 /// sessions while catalog metadata remains easy to export and recover.
@@ -106,6 +143,8 @@ struct SummaryEntry {
     position: u32,
     assistant_model: Option<ModelId>,
     assistant_protocol: Option<Protocol>,
+    configured_model: Option<String>,
+    configured_reasoning: Option<String>,
 }
 
 fn summary_ancestry_intervals(entries: &HashMap<EntryId, SummaryEntry>) -> (Vec<u32>, Vec<u32>) {
@@ -205,6 +244,12 @@ enum SummaryUserPart {
 #[derive(Deserialize)]
 struct SummaryUserMessage {
     content: Vec<SummaryUserPart>,
+}
+
+#[derive(Deserialize)]
+struct SummaryEntryMetadata {
+    #[serde(default)]
+    display_text: Option<TitleText>,
 }
 
 #[derive(Deserialize)]
@@ -492,11 +537,25 @@ enum SummaryEntryValue {
         _model: ModelId,
         output: SummaryResponsesOutput,
     },
-    Config {},
+    Config {
+        model: Option<String>,
+        reasoning: Option<String>,
+    },
     PromptTemplateSelected {},
     SkillActivated {},
     SkillResourceRead {},
     SkillDeactivated {},
+}
+
+#[derive(Deserialize)]
+struct SummaryUsage {
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    cache_write_1h_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+    total_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -516,6 +575,13 @@ enum SummaryUsageKind {
 #[derive(Deserialize)]
 struct SummaryUsageRecord {
     kind: SummaryUsageKind,
+    usage: SummaryUsage,
+    #[serde(default)]
+    endpoint: Option<EndpointId>,
+    #[serde(default)]
+    model: Option<ModelId>,
+    #[serde(default)]
+    completed_at_unix_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -524,6 +590,8 @@ enum SummaryRecord {
     Entry {
         id: EntryId,
         parent: Option<EntryId>,
+        #[serde(default)]
+        metadata: Option<SummaryEntryMetadata>,
         value: SummaryEntryValue,
     },
     Head {
@@ -539,8 +607,8 @@ enum SummaryRecord {
     },
 }
 
-/// Derive a compact title from the oldest user text on the active branch.
-pub fn active_branch_title(session: &Session) -> String {
+/// Derive the oldest user title on the active branch, if one exists.
+fn active_branch_catalog_title(session: &Session) -> Option<String> {
     let mut oldest: Option<&str> = None;
     let mut cursor = session.head_ref();
     while let Some(id) = cursor {
@@ -564,10 +632,15 @@ pub fn active_branch_title(session: &Session) -> String {
         }
         cursor = entry.parent.as_ref();
     }
-    oldest.map_or_else(|| "(empty session)".to_owned(), trim_title)
+    oldest.map(trim_title)
 }
 
-fn trim_title(title: &str) -> String {
+/// Derive a compact title from the oldest user text on the active branch.
+pub fn active_branch_title(session: &Session) -> String {
+    active_branch_catalog_title(session).unwrap_or_else(|| "(empty session)".to_owned())
+}
+
+pub(crate) fn trim_title(title: &str) -> String {
     const LIMIT: usize = 60;
     let mut normalized = String::with_capacity(LIMIT + 3);
     let mut length = 0usize;
@@ -714,18 +787,39 @@ fn summary_text_with_torn_tail(bytes: &[u8]) -> anyhow::Result<&str> {
     }
 }
 
-/// Replay only the graph metadata needed by the session picker. Large model,
-/// tool, media, skill, and compaction bodies are consumed by serde without
-/// being retained. This deliberately mirrors Session::open_read_only's graph
-/// checks and torn-final-record handling so the fast path cannot bless a file
-/// that normal resume would reject.
-fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
+/// Result of a bounded transcript scan before filesystem catalog metadata is applied.
+#[derive(Debug)]
+struct TranscriptSummary {
+    title: Option<String>,
+    configured_model: Option<String>,
+    configured_reasoning: Option<String>,
+    usage_records: Vec<SessionUsageRecord>,
+}
+
+/// Replay only the graph metadata needed by the session picker and serve
+/// catalog. Large model, tool, media, skill, and compaction bodies are
+/// consumed by serde without being retained. This deliberately mirrors
+/// Session::open_read_only's graph checks and torn-final-record handling so the
+/// fast path cannot bless a file that normal resume would reject.
+fn summarize_session(path: &Path) -> anyhow::Result<TranscriptSummary> {
+    summarize_session_with_usage(path, true)
+}
+
+fn summarize_catalog_session(path: &Path) -> anyhow::Result<TranscriptSummary> {
+    summarize_session_with_usage(path, false)
+}
+
+fn summarize_session_with_usage(
+    path: &Path,
+    retain_usage_records: bool,
+) -> anyhow::Result<TranscriptSummary> {
     let path = absolute_read_path(path)?;
     let bytes = ygg_agent::secure_fs::read_regular_file_bounded(&path, MAX_SESSION_FILE_BYTES)?;
     let content = summary_text_with_torn_tail(&bytes)?;
     let mut entries = HashMap::<EntryId, SummaryEntry>::new();
     let mut head = None;
     let mut checkpoints = Vec::<(EntryId, EntryId, usize)>::new();
+    let mut usage_records = Vec::<SessionUsageRecord>::new();
     let mut segments = content.split_inclusive('\n').peekable();
     let mut line_no = 0usize;
 
@@ -746,7 +840,12 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
         };
 
         match record {
-            SummaryRecord::Entry { id, parent, value } => {
+            SummaryRecord::Entry {
+                id,
+                parent,
+                metadata,
+                value,
+            } => {
                 if entries.contains_key(&id) {
                     return Err(corrupt_summary(
                         line_no,
@@ -762,83 +861,97 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                     }
                 }
 
-                let (kind, title, assistant_route) = match value {
-                    SummaryEntryValue::Message(SummaryMessage::User(message)) => {
-                        let title = message.content.into_iter().find_map(|part| match part {
-                            SummaryUserPart::Text(TitleText(title)) => Some(title),
-                            SummaryUserPart::Media(_) | SummaryUserPart::ToolResult(_) => None,
-                        });
-                        (SummaryEntryKind::User, title, None)
-                    }
-                    SummaryEntryValue::Message(SummaryMessage::Assistant(message)) => (
-                        SummaryEntryKind::Assistant,
-                        None,
-                        Some((message.model, message.protocol)),
-                    ),
-                    SummaryEntryValue::Compaction { first_kept } => {
-                        if !entries.contains_key(&first_kept) {
-                            return Err(corrupt_summary(
-                                line_no,
-                                format!(
-                                    "compaction {:?} references unknown first_kept {:?}",
-                                    id.0, first_kept.0
-                                ),
-                            ));
+                let (kind, title, assistant_route, configured_model, configured_reasoning) =
+                    match value {
+                        SummaryEntryValue::Message(SummaryMessage::User(message)) => {
+                            let title = message.content.into_iter().find_map(|part| match part {
+                                SummaryUserPart::Text(TitleText(title)) => Some(title),
+                                SummaryUserPart::Media(_) | SummaryUserPart::ToolResult(_) => None,
+                            });
+                            (
+                                SummaryEntryKind::User,
+                                metadata
+                                    .and_then(|metadata| metadata.display_text)
+                                    .map(|text| text.0)
+                                    .or(title),
+                                None,
+                                None,
+                                None,
+                            )
                         }
-                        (SummaryEntryKind::Other, None, None)
-                    }
-                    SummaryEntryValue::ResponsesTurn {
-                        assistant,
-                        model,
-                        output,
-                        ..
-                    } => {
-                        let valid_assistant = entries.get(&assistant).is_some_and(|candidate| {
-                            candidate.kind == SummaryEntryKind::Assistant
-                                && candidate.assistant_protocol == Some(Protocol::OpenAiResponses)
-                                && candidate.assistant_model.as_ref() == Some(&model)
-                        });
-                        if !valid_assistant
-                            || parent.as_ref() != Some(&assistant)
-                            || output.is_empty()
-                        {
-                            return Err(corrupt_summary(
-                                line_no,
-                                format!(
-                                    "Responses turn {:?} is not a direct sidecar of assistant {:?}",
-                                    id.0, assistant.0
-                                ),
-                            ));
+                        SummaryEntryValue::Message(SummaryMessage::Assistant(message)) => (
+                            SummaryEntryKind::Assistant,
+                            None,
+                            Some((message.model, message.protocol)),
+                            None,
+                            None,
+                        ),
+                        SummaryEntryValue::Compaction { first_kept } => {
+                            if !entries.contains_key(&first_kept) {
+                                return Err(corrupt_summary(
+                                    line_no,
+                                    format!(
+                                        "compaction {:?} references unknown first_kept {:?}",
+                                        id.0, first_kept.0
+                                    ),
+                                ));
+                            }
+                            (SummaryEntryKind::Other, None, None, None, None)
                         }
-                        (SummaryEntryKind::Other, None, None)
-                    }
-                    SummaryEntryValue::ResponsesCompaction {
-                        covered_through,
-                        output,
-                        ..
-                    } => {
-                        if !entries.contains_key(&covered_through)
-                            || parent.as_ref() != Some(&covered_through)
-                            || !output.has_valid_compaction()
-                        {
-                            return Err(corrupt_summary(
-                                line_no,
-                                format!(
-                                    "Responses compaction {:?} is not a direct checkpoint of {:?}",
-                                    id.0, covered_through.0
-                                ),
-                            ));
+                        SummaryEntryValue::ResponsesTurn {
+                            assistant,
+                            model,
+                            output,
+                            ..
+                        } => {
+                            let valid_assistant = entries.get(&assistant).is_some_and(|candidate| {
+                                candidate.kind == SummaryEntryKind::Assistant
+                                    && candidate.assistant_protocol == Some(Protocol::OpenAiResponses)
+                                    && candidate.assistant_model.as_ref() == Some(&model)
+                            });
+                            if !valid_assistant
+                                || parent.as_ref() != Some(&assistant)
+                                || output.is_empty()
+                            {
+                                return Err(corrupt_summary(
+                                    line_no,
+                                    format!(
+                                        "Responses turn {:?} is not a direct sidecar of assistant {:?}",
+                                        id.0, assistant.0
+                                    ),
+                                ));
+                            }
+                            (SummaryEntryKind::Other, None, None, None, None)
                         }
-                        (SummaryEntryKind::Other, None, None)
-                    }
-                    SummaryEntryValue::Config {}
-                    | SummaryEntryValue::PromptTemplateSelected {}
-                    | SummaryEntryValue::SkillActivated {}
-                    | SummaryEntryValue::SkillResourceRead {}
-                    | SummaryEntryValue::SkillDeactivated {} => {
-                        (SummaryEntryKind::Other, None, None)
-                    }
-                };
+                        SummaryEntryValue::ResponsesCompaction {
+                            covered_through,
+                            output,
+                            ..
+                        } => {
+                            if !entries.contains_key(&covered_through)
+                                || parent.as_ref() != Some(&covered_through)
+                                || !output.has_valid_compaction()
+                            {
+                                return Err(corrupt_summary(
+                                    line_no,
+                                    format!(
+                                        "Responses compaction {:?} is not a direct checkpoint of {:?}",
+                                        id.0, covered_through.0
+                                    ),
+                                ));
+                            }
+                            (SummaryEntryKind::Other, None, None, None, None)
+                        }
+                        SummaryEntryValue::Config { model, reasoning } => {
+                            (SummaryEntryKind::Other, None, None, model, reasoning)
+                        }
+                        SummaryEntryValue::PromptTemplateSelected {}
+                        | SummaryEntryValue::SkillActivated {}
+                        | SummaryEntryValue::SkillResourceRead {}
+                        | SummaryEntryValue::SkillDeactivated {} => {
+                            (SummaryEntryKind::Other, None, None, None, None)
+                        }
+                    };
                 let (assistant_model, assistant_protocol) = assistant_route
                     .map_or((None, None), |(model, protocol)| {
                         (Some(model), Some(protocol))
@@ -853,6 +966,8 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                         position,
                         assistant_model,
                         assistant_protocol,
+                        configured_model,
+                        configured_reasoning,
                     },
                 );
             }
@@ -884,9 +999,9 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                 checkpoints.push((prompt, checkpoint_head, line_no));
             }
             SummaryRecord::Usage { record } => {
-                if let SummaryUsageKind::AssistantTurn { assistant } = record.kind {
+                if let SummaryUsageKind::AssistantTurn { assistant } = &record.kind {
                     let valid_assistant = entries
-                        .get(&assistant)
+                        .get(assistant)
                         .is_some_and(|entry| entry.kind == SummaryEntryKind::Assistant);
                     if !valid_assistant {
                         return Err(corrupt_summary(
@@ -894,6 +1009,20 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                             "usage record references an unknown or non-assistant entry",
                         ));
                     }
+                }
+                if retain_usage_records {
+                    usage_records.push(SessionUsageRecord {
+                        endpoint: record.endpoint.map(|endpoint| endpoint.0),
+                        model: record.model.map(|model| model.0),
+                        completed_at_unix_ms: record.completed_at_unix_ms,
+                        input_tokens: record.usage.input_tokens,
+                        output_tokens: record.usage.output_tokens,
+                        cache_read_tokens: record.usage.cache_read_tokens,
+                        cache_write_tokens: record.usage.cache_write_tokens,
+                        cache_write_1h_tokens: record.usage.cache_write_1h_tokens,
+                        reasoning_tokens: record.usage.reasoning_tokens,
+                        total_tokens: record.usage.total_tokens,
+                    });
                 }
             }
         }
@@ -916,6 +1045,8 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
     }
 
     let mut oldest_title = None;
+    let mut configured_model = None;
+    let mut configured_reasoning = None;
     let mut cursor = head.as_ref();
     while let Some(id) = cursor {
         let Some(entry) = entries.get(id) else {
@@ -926,9 +1057,20 @@ fn summarize_session(path: &Path) -> anyhow::Result<Option<String>> {
                 oldest_title = Some(title.clone());
             }
         }
+        if configured_model.is_none() {
+            configured_model = entry.configured_model.clone();
+        }
+        if configured_reasoning.is_none() {
+            configured_reasoning = entry.configured_reasoning.clone();
+        }
         cursor = entry.parent.as_ref();
     }
-    Ok(oldest_title)
+    Ok(TranscriptSummary {
+        title: oldest_title,
+        configured_model,
+        configured_reasoning,
+        usage_records,
+    })
 }
 
 impl SessionStore {
@@ -984,18 +1126,46 @@ impl SessionStore {
             .collect()
     }
 
-    fn summarize(&self, candidate: SessionCandidate) -> Option<SessionMeta> {
-        let fallback_title = match summarize_session(&candidate.path) {
-            Ok(Some(title)) => title,
-            Ok(None) => return None,
-            Err(_) => "(unreadable session)".to_owned(),
-        };
-        let id = candidate
-            .path
-            .file_stem()
-            .and_then(|value| value.to_str())?
-            .to_owned();
-        let metadata = self.load_metadata(&id).unwrap_or_default();
+    /// Sort named, already-authorized session IDs by transcript mtime without
+    /// enumerating or parsing other workspace sessions.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn session_ids_newest_first<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<String> {
+        let mut candidates = ids
+            .into_iter()
+            .filter_map(|id| {
+                self.candidate_by_id(id)
+                    .ok()
+                    .map(|candidate| (id.to_owned(), candidate.modified))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+        candidates.into_iter().map(|(id, _)| id).collect()
+    }
+
+    fn candidate_by_id(&self, id: &str) -> anyhow::Result<SessionCandidate> {
+        let path = self.path_by_id(id)?;
+        let metadata = path.symlink_metadata().map_err(|error| {
+            anyhow::anyhow!("session {id:?} could not be inspected after lookup: {error}")
+        })?;
+        if !metadata.file_type().is_file() {
+            anyhow::bail!("session {id:?} is not a regular file");
+        }
+        Ok(SessionCandidate {
+            path,
+            modified: metadata.modified()?,
+        })
+    }
+
+    fn meta_from_parts(
+        &self,
+        candidate: SessionCandidate,
+        id: String,
+        fallback_title: String,
+        metadata: SessionUserMetadata,
+    ) -> SessionMeta {
         let title = metadata
             .name
             .clone()
@@ -1009,7 +1179,7 @@ impl SessionStore {
             .map_or(candidate.modified, |metadata_modified| {
                 std::cmp::max(candidate.modified, metadata_modified)
             });
-        Some(SessionMeta {
+        SessionMeta {
             id,
             path: candidate.path,
             title,
@@ -1022,7 +1192,117 @@ impl SessionStore {
             forked_from_session_id: metadata.forked_from_session_id,
             forked_from_entry_id: metadata.forked_from_entry_id,
             modified,
+        }
+    }
+
+    fn inspect_candidate(
+        &self,
+        candidate: SessionCandidate,
+        retain_usage_records: bool,
+    ) -> anyhow::Result<SessionCatalogInspection> {
+        let id = candidate
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .filter(|id| session_id_is_valid(id))
+            .ok_or_else(|| anyhow::anyhow!("session has an invalid filename"))?
+            .to_owned();
+        let transcript = if retain_usage_records {
+            summarize_session(&candidate.path)?
+        } else {
+            summarize_catalog_session(&candidate.path)?
+        };
+        let metadata = transcript
+            .title
+            .is_some()
+            .then(|| self.load_metadata(&id))
+            .transpose()?
+            .unwrap_or_default();
+        let meta = transcript
+            .title
+            .map(|title| self.meta_from_parts(candidate, id, title, metadata));
+        Ok(SessionCatalogInspection {
+            catalog: SessionCatalogEntry {
+                meta,
+                configured_model: transcript.configured_model,
+                configured_reasoning: transcript.configured_reasoning,
+            },
+            usage_records: transcript.usage_records,
         })
+    }
+
+    /// Inspect one named transcript without enumerating or parsing unrelated
+    /// sessions. The bounded scan validates its graph and torn tail before
+    /// returning catalog and usage projections.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn inspect_by_id(&self, id: &str) -> anyhow::Result<SessionCatalogInspection> {
+        self.inspect_candidate(self.candidate_by_id(id)?, true)
+    }
+
+    /// Load catalog metadata for one named transcript without scanning the
+    /// workspace catalog.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn catalog_by_id(&self, id: &str) -> anyhow::Result<SessionCatalogEntry> {
+        Ok(self
+            .inspect_candidate(self.candidate_by_id(id)?, false)?
+            .catalog)
+    }
+
+    /// Build catalog metadata from the already authorized, fully replayed
+    /// session rather than reopening its pathname.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn meta_for_open_session(
+        &self,
+        id: &str,
+        session: &Session,
+    ) -> anyhow::Result<Option<SessionMeta>> {
+        let candidate = self.candidate_by_id(id)?;
+        if absolute_read_path(session.path())? != absolute_read_path(&candidate.path)? {
+            anyhow::bail!("opened session does not match requested session id {id:?}");
+        }
+        let Some(title) = active_branch_catalog_title(session) else {
+            return Ok(None);
+        };
+        Ok(Some(self.meta_from_parts(
+            candidate,
+            id.to_owned(),
+            title,
+            self.load_metadata(id)?,
+        )))
+    }
+
+    /// Load one session's validated catalog metadata without scanning unrelated
+    /// transcripts.
+    #[cfg(test)]
+    pub(crate) fn get_by_id(&self, id: &str) -> anyhow::Result<Option<SessionMeta>> {
+        Ok(self.catalog_by_id(id)?.meta)
+    }
+
+    fn summarize(&self, candidate: SessionCandidate) -> Option<SessionMeta> {
+        let id = candidate
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())?
+            .to_owned();
+        let transcript = match summarize_catalog_session(&candidate.path) {
+            Ok(transcript) => transcript,
+            Err(_) => {
+                let metadata = self.load_metadata(&id).unwrap_or_default();
+                return Some(self.meta_from_parts(
+                    candidate,
+                    id,
+                    "(unreadable session)".to_owned(),
+                    metadata,
+                ));
+            }
+        };
+        let title = transcript.title?;
+        Some(self.meta_from_parts(
+            candidate,
+            id.clone(),
+            title,
+            self.load_metadata(&id).unwrap_or_default(),
+        ))
     }
 
     /// List sessions newest-first by filesystem modification time.
@@ -1084,6 +1364,20 @@ impl SessionStore {
     /// Read optional user-owned session catalog metadata.
     pub fn load_metadata(&self, id: &str) -> anyhow::Result<SessionUserMetadata> {
         let path = self.metadata_path(id)?;
+        let metadata_dir = self.metadata_dir();
+        match metadata_dir.symlink_metadata() {
+            Ok(metadata)
+                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => anyhow::bail!(
+                "session metadata directory is not a real directory: {}",
+                metadata_dir.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SessionUserMetadata::default());
+            }
+            Err(error) => return Err(error.into()),
+        }
+
         let bytes = match crate::auth::read_bounded_private(&path, MAX_SESSION_METADATA_BYTES) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(SessionUserMetadata::default()),
@@ -2027,7 +2321,7 @@ mod tests {
         drop(session);
 
         assert_eq!(
-            summarize_session(&path).unwrap().as_deref(),
+            summarize_session(&path).unwrap().title.as_deref(),
             Some("usage title")
         );
     }
@@ -2065,11 +2359,19 @@ mod tests {
         let path = store.dir().join("large.jsonl");
         let mut session = Session::create(&path).unwrap();
         session
-            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
-                content: vec![UserPart::Text(
-                    "  title   with whitespace that the picker normalizes  ".into(),
-                )],
-            })))
+            .append_with_metadata(
+                EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                    content: vec![UserPart::Text(
+                        "model-only prompt text that must not title the session".into(),
+                    )],
+                })),
+                Some(ygg_agent::EntryMetadata {
+                    display_text: Some(
+                        "  title   with whitespace that the picker normalizes  ".into(),
+                    ),
+                    ..ygg_agent::EntryMetadata::default()
+                }),
+            )
             .unwrap();
         session
             .append(EntryValue::Message(Message::Assistant(AssistantMessage {
@@ -2127,6 +2429,125 @@ mod tests {
         assert!(listed
             .iter()
             .all(|session| session.title == "scale fixture"));
+    }
+
+    #[test]
+    fn catalog_inspection_defaults_when_metadata_directory_is_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("unannotated.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("unannotated title".into())],
+            })))
+            .unwrap();
+        drop(session);
+
+        assert!(!store.metadata_dir().exists());
+        assert_eq!(store.load_metadata("unannotated").unwrap(), SessionUserMetadata::default());
+        assert_eq!(
+            store
+                .inspect_by_id("unannotated")
+                .unwrap()
+                .catalog
+                .meta
+                .unwrap()
+                .title,
+            "unannotated title"
+        );
+        assert_eq!(
+            store
+                .catalog_by_id("unannotated")
+                .unwrap()
+                .meta
+                .unwrap()
+                .title,
+            "unannotated title"
+        );
+    }
+
+    #[test]
+    fn targeted_catalog_inspection_validates_only_the_requested_session() {
+        use ygg_ai::{AssistantMessage, AssistantPart, Protocol, Usage, UserMessage};
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let target = store.dir().join("target.jsonl");
+        let mut session = Session::create(&target).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("target title".into())],
+            })))
+            .unwrap();
+        let assistant = session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::Text("done".into())],
+                model: ModelId("target-model".into()),
+                protocol: Protocol::OpenAiChat,
+            })))
+            .unwrap();
+        session
+            .record_assistant_usage(
+                assistant,
+                EndpointId("target-endpoint".into()),
+                ModelId("target-model".into()),
+                Usage {
+                    input_tokens: 11,
+                    cache_read_tokens: 2,
+                    cache_write_tokens: 3,
+                    cache_write_1h_tokens: 4,
+                    output_tokens: 5,
+                    reasoning_tokens: 6,
+                    total_tokens: 31,
+                },
+                None,
+            )
+            .unwrap();
+        session
+            .append(EntryValue::Config {
+                model: Some("target-config".into()),
+                reasoning: Some("high".into()),
+                reasoning_mode: None,
+            })
+            .unwrap();
+        drop(session);
+        store
+            .set_lifecycle("target", SessionStorageLifecycle::Trash, 1_000)
+            .unwrap();
+
+        // A corrupt sibling must not affect a targeted operation.
+        let corrupt = store.dir().join("corrupt.jsonl");
+        drop(Session::create(&corrupt).unwrap());
+        std::fs::write(&corrupt, b"{not valid json}\n").unwrap();
+
+        let inspection = store.inspect_by_id("target").unwrap();
+        let meta = inspection.catalog.meta.as_ref().unwrap();
+        assert_eq!(meta.title, "target title");
+        assert_eq!(meta.trashed_at_ms, Some(1_000));
+        assert_eq!(
+            inspection.catalog.configured_model.as_deref(),
+            Some("target-config")
+        );
+        assert_eq!(
+            inspection.catalog.configured_reasoning.as_deref(),
+            Some("high")
+        );
+        assert_eq!(inspection.usage_records.len(), 1);
+        assert_eq!(
+            inspection.usage_records[0].endpoint.as_deref(),
+            Some("target-endpoint")
+        );
+        assert_eq!(inspection.usage_records[0].total_tokens, 31);
+
+        let catalog = store.catalog_by_id("target").unwrap();
+        assert_eq!(catalog.meta.unwrap().title, "target title");
+        assert!(store.catalog_by_id("corrupt").is_err());
+        assert!(store.get_by_id("corrupt").is_err());
     }
 
     #[test]
