@@ -361,7 +361,7 @@ pub struct Run<'a> {
     context: Arc<ContextTracker>,
 }
 
-impl<'a> Run<'a> {
+impl Run<'_> {
     /// Returns a clonable handle for sending control messages while the run's
     /// event stream is being consumed.
     pub fn control(&self) -> RunControl {

@@ -1,5 +1,6 @@
 //! Retained component tree with line-differential terminal rendering.
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::rc::Rc;
 
 use crate::scrollback::reset_and_replay;
@@ -1774,12 +1775,10 @@ fn ensure_line_width(line: &str, width: u16) -> String {
         return String::new();
     }
     let visible = visible_width(line);
-    if visible < width {
-        format!("{}{}", line, " ".repeat(width - visible))
-    } else if visible > width {
-        crate::utils::truncate_to_width(line, width, Some(""))
-    } else {
-        line.to_owned()
+    match visible.cmp(&width) {
+        Ordering::Less => format!("{}{}", line, " ".repeat(width - visible)),
+        Ordering::Greater => crate::utils::truncate_to_width(line, width, Some("")),
+        Ordering::Equal => line.to_owned(),
     }
 }
 

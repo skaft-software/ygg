@@ -62,10 +62,14 @@ impl sexy_tui_rs::Terminal for EmulatedTerminal {
     }
 
     fn move_by(&mut self, lines: i16) {
-        if lines < 0 {
-            self.push(format!("\x1b[{}A", lines.unsigned_abs()).as_bytes());
-        } else if lines > 0 {
-            self.push(format!("\x1b[{}B", lines.unsigned_abs()).as_bytes());
+        match lines.cmp(&0) {
+            std::cmp::Ordering::Less => {
+                self.push(format!("\x1b[{}A", lines.unsigned_abs()).as_bytes());
+            }
+            std::cmp::Ordering::Greater => {
+                self.push(format!("\x1b[{}B", lines.unsigned_abs()).as_bytes());
+            }
+            std::cmp::Ordering::Equal => {}
         }
     }
 

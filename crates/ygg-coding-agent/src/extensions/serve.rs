@@ -4523,10 +4523,10 @@ fn stored_prompt_context_for_entry(
         return (Vec::new(), Vec::new());
     };
     for entry in session.entries().iter().rev() {
-        if !entry
+        if entry
             .metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.run_outcome.is_some())
+            .is_none_or(|metadata| metadata.run_outcome.is_none())
         {
             continue;
         }
@@ -8967,10 +8967,10 @@ fn seed_from_session(
     let mut reviews_by_outcome = HashMap::<String, CompletionReview>::new();
     if let Some(resources) = resource_store {
         for entry in &chain {
-            if !entry
+            if entry
                 .metadata
                 .as_ref()
-                .is_some_and(|metadata| metadata.run_outcome.is_some())
+                .is_none_or(|metadata| metadata.run_outcome.is_none())
             {
                 continue;
             }

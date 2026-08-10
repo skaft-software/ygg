@@ -711,12 +711,10 @@ impl<W: Write> sexy_tui_rs::Terminal for YggTerminal<W> {
     }
 
     fn move_by(&mut self, lines: i16) {
-        let result = if lines > 0 {
-            queue!(self.pending, cursor::MoveDown(lines as u16))
-        } else if lines < 0 {
-            queue!(self.pending, cursor::MoveUp((-lines) as u16))
-        } else {
-            Ok(())
+        let result = match lines.cmp(&0) {
+            std::cmp::Ordering::Greater => queue!(self.pending, cursor::MoveDown(lines as u16)),
+            std::cmp::Ordering::Less => queue!(self.pending, cursor::MoveUp((-lines) as u16)),
+            std::cmp::Ordering::Equal => Ok(()),
         };
         let _ = result;
         self.flush_if_outside_frame();

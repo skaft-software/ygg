@@ -19,6 +19,10 @@ pub(crate) const MAX_RESPONSE_EVENTS: usize = 100_000;
 pub(crate) const MAX_RESPONSE_PARTS: usize = 1_024;
 
 /// Unified events emitted by the client generation stream.
+///
+/// The final response stays inline to avoid a heap allocation and a public API
+/// change at the one terminal event emitted per generation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
     /// Stream started. Always first.
