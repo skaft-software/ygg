@@ -540,18 +540,19 @@ pinned `apps/web/.node-version` runtime, Node `v22.13.0`.
 | Web unit tests | Full Vitest suite passed |
 | Fixture Playwright matrix | Every applicable test passed for desktop, tablet landscape, tablet portrait, mobile, and mobile-small |
 | Production-host Playwright | 1/1 passed against the real Rust host and a disposable local OpenAI-compatible provider; authentication/model selection, streaming, tool replay, `429`/`408` retries, explicit compaction, restart/resume, cancellation, and secret-safe failure projection are covered |
-| `ygg-agent` tests | 200 passed |
-| Coding-agent tests with `serve` | 671 passed |
+| `ygg-agent` tests | 216 library and 64 agent-run integration tests passed |
+| Coding-agent tests | 753 passed with `serve`; 671 passed with default features |
 | Full Rust workspace tests | All targets/all features and documentation tests passed |
 | No-default-feature workspace check | Pass |
-| Independent `extensions/ygg-serve` tests | 108 library tests and every integration suite passed |
+| Independent `extensions/ygg-serve` tests | 115 library tests and every integration suite passed |
 | Strict workspace and independent-extension Clippy | Pass |
 | Rust 1.86 workspace and independent-extension checks | Pass |
 | Rust formatting and `git diff --check` | Pass |
 | Package-boundary script | Pass |
-| Publishable core workspace package assembly | `cargo package --workspace --exclude ygg-coding-agent` passed with `--allow-dirty`; the clean-tree form is blocked only by the intentionally uncommitted worktree |
-| Installed `ygg-coding-agent --features serve` smoke | Pass; installed `ygg 0.3.2-alpha` served the synchronized embedded bundle |
+| Publishable core workspace package assembly | `cargo package --workspace --exclude ygg-coding-agent --locked --no-verify` passed from the clean `v0.4.0` candidate tree |
+| Installed `ygg-coding-agent --features serve` smoke | Pass; installed `ygg 0.4.0` served the synchronized embedded bundle |
 | Optimized feature-enabled build and bundle smoke | Pass locally with the release binary; no signed tag artifact published |
+| Reproducible Serve archive and package dispatch | Two optimized Apple-silicon archives were byte-identical; local install, list, package-dispatched launch, embedded-bundle verification, removal, and data preservation passed |
 | Optimized signed serve release | Workflow defined; not yet run against a release tag |
 
 `lopdf` is pinned to `0.42.0`; the independent serve manifest and lockfile are
@@ -562,7 +563,7 @@ direct nesting levels and verifies Ygg's iterative preflight rejects the input a
 its 64-level bound before `lopdf` parsing.
 
 The fixture matrix was split by configured Playwright project after the combined
-155-test invocation exceeded the command runner's 120-second limit; no test
+165-test invocation exceeded the command runner's 120-second limit; no test
 failure caused that timeout. Every project then passed independently under the
 pinned Node runtime.
 
@@ -571,13 +572,13 @@ adapter, and real provider request path with a disposable local
 OpenAI-compatible provider. It now covers the configured-provider conformance
 scenarios listed above without inheriting external credentials. Credentialed
 checks remain a separate stable-release gate; their supported routes, required
-environment variables, handling rules, and current `v0.3.3` results are recorded
+environment variables, handling rules, and current `v0.4.0` results are recorded
 in [configured-provider acceptance](provider-acceptance.md).
 
 The synchronized embedded bundle has SHA-256:
 
 ```text
-35321c707b58a5146428a7d0e805ac4b9f38e61b078bc9d3b12a2260b0bc35d7
+bc411e451925a63ec17926db70d5a9cf1717d3168cee6deeff3751d2420cc59a
 ```
 
 ## Repository checkpoint
@@ -655,7 +656,7 @@ evidence.
 
 1. Rebase or compare the forward-gated delta against the intended merge target
    and review any surviving pre-`eebe738` core changes explicitly.
-2. Run the experimental release workflow against a clean `v0.3.3` (or
+2. Run the experimental release workflow against a clean `v0.4.0` (or
    later stable) tag and retain the checksum/signature verification output.
 3. Run `ygg serve` against a user's real provider and exercise:
    - fresh-session creation;

@@ -264,7 +264,7 @@ The SDK-backed examples remain small and copyable:
 Application packages are separate from the executable-extension protocol above.
 They distribute a complete first-party application runtime rather than JSON-RPC
 tools or hooks, use `package.toml` instead of `extension.toml`, and are never
-loaded during ordinary agent startup. The `0.3.3` package manager supports
+loaded during ordinary agent startup. The `0.4.0` package manager supports
 only the official `ygg-serve` package and local copies of that release archive.
 It is intentionally not a general package registry.
 
@@ -290,12 +290,15 @@ and loopback/process/workspace capabilities. Official installs download the
 matching release archive and `SHA256SUMS` over HTTPS. Local archives use:
 
 ```console
-ygg extension install --path ./ygg-serve-0.3.3-TARGET.tar.gz
+ygg extension install --path ./ygg-serve-0.4.0-TARGET.tar.gz
 ```
 
 Installation validates the bounded archive and embedded executable checksum,
 rejects links and unexpected paths, and publishes the package with an atomic
 same-filesystem rename. `ygg serve` revalidates compatibility and the executable
-checksum before replacing the launcher process with the installed runtime.
-Removal deletes only package files; sessions, project metadata, and other user
-data remain outside the package directory.
+checksum before replacing the launcher process with the installed runtime. As a
+first-party replacement Ygg process, that runtime inherits the launcher's
+configuration and provider environment; the sanitized child environment used
+for model-controlled tools and executable extensions does not apply. Removal
+deletes only package files; sessions, project metadata, and other user data
+remain outside the package directory.

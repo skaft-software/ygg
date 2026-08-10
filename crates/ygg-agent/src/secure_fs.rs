@@ -499,8 +499,7 @@ mod imp {
                 };
                 if rustix::fs::FileType::from_raw_mode(actual.st_mode)
                     != rustix::fs::FileType::Directory
-                    || (actual.st_dev as u64, actual.st_ino as u64)
-                        != (created.device, created.inode)
+                    || (actual.st_dev as u64, actual.st_ino) != (created.device, created.inode)
                 {
                     continue;
                 }

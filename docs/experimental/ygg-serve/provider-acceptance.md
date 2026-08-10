@@ -122,11 +122,11 @@ A stable tag is blocked while any required row is `NOT RUN` or `FAIL`.
 
 | Candidate | Gate | Provider/model | UTC date | Result | Reviewer |
 | --- | --- | --- | --- | --- | --- |
-| Uncommitted `v0.3.3` worktree | Deterministic Serve configured-provider matrix | `custom/e2e/e2e-model` | 2026-08-07 | PASS | Local release review |
-| `v0.3.3` release SHA | OpenAI Responses live representative | To be recorded | — | NOT RUN — no credential available | — |
-| `v0.3.3` release SHA | Anthropic Messages live representative | To be recorded | — | NOT RUN — no credential available | — |
-| `v0.3.3` release SHA | OpenAI Chat live representative | To be recorded | — | NOT RUN — no credential available | — |
-| `v0.3.3` release SHA | Native audio production route | To be recorded | — | NOT RUN — no accepted route or credential available | — |
+| Uncommitted `v0.4.0` worktree | Deterministic Serve configured-provider matrix | `custom/e2e/e2e-model` | 2026-08-10 | PASS | Local release review |
+| `v0.4.0` release SHA | OpenAI Responses live representative | To be recorded | — | NOT RUN — no credential available | — |
+| `v0.4.0` release SHA | Anthropic Messages live representative | To be recorded | — | NOT RUN — no credential available | — |
+| `v0.4.0` release SHA | OpenAI Chat live representative | To be recorded | — | NOT RUN — no credential available | — |
+| `v0.4.0` release SHA | Native audio production route | To be recorded | — | NOT RUN — no accepted route or credential available | — |
 
 Replace the pending rows with the protected run's sanitized metadata before
 creating the stable GitHub release. A local dirty-worktree pass is useful

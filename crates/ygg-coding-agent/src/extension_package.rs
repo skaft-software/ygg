@@ -150,10 +150,11 @@ pub fn run_serve(no_open: bool, port: u16, web_root: Option<PathBuf>) -> anyhow:
         stage_validated_entrypoint(&entrypoint, &manifest.entrypoint.sha256)?;
 
     let mut command = Command::new(&staged_entrypoint);
-    command
-        .env_clear()
-        .envs(ygg_agent::extension_process::sanitized_subprocess_environment())
-        .args(&manifest.entrypoint.args);
+    // This exact-version, first-party runtime replaces the launcher process. It
+    // must receive the same user-controlled configuration and provider
+    // credentials as a directly launched Ygg binary; the sanitized environment
+    // is reserved for model-controlled tool and executable-extension children.
+    command.args(&manifest.entrypoint.args);
     if no_open {
         command.arg("--no-open");
     }
@@ -1113,7 +1114,7 @@ mod tests {
     #[test]
     fn official_downloads_only_trust_github_https_hosts() {
         for accepted in [
-            "https://github.com/skaft-software/ygg/releases/download/v0.3.3/SHA256SUMS",
+            "https://github.com/skaft-software/ygg/releases/download/v0.4.0/SHA256SUMS",
             "https://release-assets.githubusercontent.com/github-production-release-asset/file?token=signed",
         ] {
             assert!(is_trusted_release_url(

@@ -16,7 +16,7 @@ if [[ -z "$target" || -z "$version" || -z "$source_directory" ]]; then
     exit 2
 fi
 if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    printf 'version must be a canonical release tag such as v0.3.3: %s\n' "$version" >&2
+    printf 'version must be a canonical release tag such as v0.4.0: %s\n' "$version" >&2
     exit 2
 fi
 case "$target" in

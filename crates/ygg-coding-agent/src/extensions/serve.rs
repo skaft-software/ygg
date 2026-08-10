@@ -923,7 +923,7 @@ impl YggHost {
             &self.models,
         )
         .map_or_else(|| self.default_selection(), Ok)?;
-        let mut summary = summary_from_meta(&meta, Some(context.project_id), selection)?;
+        let mut summary = summary_from_meta(meta, Some(context.project_id), selection)?;
         summary.pull_request = self.cached_pull_request(session_id);
         Ok(summary)
     }
@@ -2406,7 +2406,7 @@ impl HostService for YggHost {
                     )
                     .unwrap_or_else(|| fallback.clone());
                     if let Ok(summary) =
-                        summary_from_meta(&meta, Some(public_project_id.clone()), selection)
+                        summary_from_meta(meta, Some(public_project_id.clone()), selection)
                     {
                         summaries.push(summary);
                     }
@@ -5585,8 +5585,8 @@ async fn start_and_drive_run(
     )?;
     let search_title =
         session_meta_for_open_session(&plan.sessions, &plan.session_id, app.agent.session())
-        .map(|meta| meta.name.unwrap_or(meta.title))
-        .unwrap_or_else(|| "Session".to_owned());
+            .map(|meta| meta.name.unwrap_or(meta.title))
+            .unwrap_or_else(|| "Session".to_owned());
     if let Ok(mut search_index) = plan.search_index.lock() {
         for item in &committed {
             if let Some(document) =
@@ -10253,11 +10253,7 @@ mod tests {
         let context = host.project_context(Some(&host.launch_project_id)).unwrap();
         context
             .sessions
-            .set_lifecycle(
-                session_id.as_str(),
-                SessionStorageLifecycle::Trash,
-                1_000,
-            )
+            .set_lifecycle(session_id.as_str(), SessionStorageLifecycle::Trash, 1_000)
             .unwrap();
 
         assert!(matches!(
@@ -10392,8 +10388,8 @@ mod tests {
         let replayed = Session::open_read_only(&path).unwrap();
         let catalog_entry = context.sessions.catalog_by_id(session_id.as_str()).unwrap();
         let full = selection_from_session(&replayed, &host.catalog, &context.config).unwrap();
-        let catalog = selection_from_catalog_entry(&catalog_entry, &host.catalog, &context.config)
-            .unwrap();
+        let catalog =
+            selection_from_catalog_entry(&catalog_entry, &host.catalog, &context.config).unwrap();
         assert_eq!(catalog, full);
         assert_eq!(catalog, active);
 

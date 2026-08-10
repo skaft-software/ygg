@@ -476,15 +476,18 @@ fn temporary_files(directory: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn wait_for_temporary_file(directory: &Path) -> PathBuf {
+fn wait_for_temporary_file(directory: &Path, expected_content: &str) -> PathBuf {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Some(path) = temporary_files(directory).into_iter().next() {
+        if let Some(path) = temporary_files(directory)
+            .into_iter()
+            .find(|path| fs::read_to_string(path).is_ok_and(|content| content == expected_content))
+        {
             return path;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for atomic write temporary file in {}",
+            "timed out waiting for populated atomic write temporary file in {}",
             directory.display()
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -592,7 +595,7 @@ fn atomic_write_does_not_publish_content_before_the_final_rename() {
                 false,
             )
         });
-        let temporary = wait_for_temporary_file(&fixture.root);
+        let temporary = wait_for_temporary_file(&fixture.root, "after\n");
         assert_eq!(
             fs::read_to_string(fixture.root.join("visibility-target.txt")).unwrap(),
             "before\n"
@@ -636,7 +639,7 @@ fn destination_replacement_race_conflicts_without_overwriting_the_replacement() 
                 false,
             )
         });
-        wait_for_temporary_file(&fixture.root);
+        wait_for_temporary_file(&fixture.root, "writer\n");
         fs::rename(
             fixture.root.join("destination-race.txt"),
             fixture.root.join("destination-race-original.txt"),
@@ -693,7 +696,7 @@ fn parent_symlink_swap_race_cannot_move_a_write_outside_the_project() {
                 false,
             )
         });
-        wait_for_temporary_file(&fixture.root.join("nested"));
+        wait_for_temporary_file(&fixture.root.join("nested"), "writer\n");
         fs::rename(fixture.root.join("nested"), &moved_parent).unwrap();
         symlink(&outside, fixture.root.join("nested")).unwrap();
         writer.join().unwrap()

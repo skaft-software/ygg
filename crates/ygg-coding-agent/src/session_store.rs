@@ -904,11 +904,13 @@ fn summarize_session_with_usage(
                             output,
                             ..
                         } => {
-                            let valid_assistant = entries.get(&assistant).is_some_and(|candidate| {
-                                candidate.kind == SummaryEntryKind::Assistant
-                                    && candidate.assistant_protocol == Some(Protocol::OpenAiResponses)
-                                    && candidate.assistant_model.as_ref() == Some(&model)
-                            });
+                            let valid_assistant =
+                                entries.get(&assistant).is_some_and(|candidate| {
+                                    candidate.kind == SummaryEntryKind::Assistant
+                                        && candidate.assistant_protocol
+                                            == Some(Protocol::OpenAiResponses)
+                                        && candidate.assistant_model.as_ref() == Some(&model)
+                                });
                             if !valid_assistant
                                 || parent.as_ref() != Some(&assistant)
                                 || output.is_empty()
@@ -1366,8 +1368,8 @@ impl SessionStore {
         let path = self.metadata_path(id)?;
         let metadata_dir = self.metadata_dir();
         match metadata_dir.symlink_metadata() {
-            Ok(metadata)
-                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            }
             Ok(_) => anyhow::bail!(
                 "session metadata directory is not a real directory: {}",
                 metadata_dir.display()
@@ -2447,7 +2449,10 @@ mod tests {
         drop(session);
 
         assert!(!store.metadata_dir().exists());
-        assert_eq!(store.load_metadata("unannotated").unwrap(), SessionUserMetadata::default());
+        assert_eq!(
+            store.load_metadata("unannotated").unwrap(),
+            SessionUserMetadata::default()
+        );
         assert_eq!(
             store
                 .inspect_by_id("unannotated")

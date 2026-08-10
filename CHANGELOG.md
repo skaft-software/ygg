@@ -2,7 +2,7 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## 0.3.3 — 2026-08-07
+## 0.4.0 — 2026-08-10
 
 ### Added
 
@@ -41,6 +41,14 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Enforced dependency review, high-severity npm audit, plus `cargo audit` and
   `cargo deny` for both lockfiles on pull-request and release paths.
 
+### Performance and reliability
+
+- Replaced broad Serve session inventory replays with bounded, targeted catalog
+  scans and carried an authorized resume session into the worker by descriptor.
+  On the isolated 891-transcript fixture, startup improved from 43.01 seconds to
+  19.41 seconds; direct resume of the large-session fixture completed in 2.39
+  seconds.
+
 ### Fixed
 
 - Made `/overview` bootstrap from session inventory without creating or opening
@@ -48,8 +56,14 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   stale session-selection navigation.
 - Kept the focused session surface and route mode stable when session selection
   or creation fails or is retried.
+- Hardened Serve catalog and resume selection against corrupt or symlinked
+  transcripts, trashed sessions, unsafe sidecar metadata, inactive-branch
+  configuration, and pathname replacement after resume authorization.
 - Prevented no-color line truncation from appending an ANSI reset sequence to
   otherwise plain terminal output.
+- Preserved launcher configuration, model selection, and provider credential
+  environment variables when `ygg serve` dispatches to the exact-version
+  first-party package runtime.
 
 ## 0.3.2-alpha — 2026-08-01 (experimental)
 
