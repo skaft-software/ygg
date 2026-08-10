@@ -571,9 +571,10 @@ The production-host Playwright test uses the real Rust host, real session
 adapter, and real provider request path with a disposable local
 OpenAI-compatible provider. It now covers the configured-provider conformance
 scenarios listed above without inheriting external credentials. Credentialed
-checks remain a separate stable-release gate; their supported routes, required
-environment variables, handling rules, and current `v0.4.0` results are recorded
-in [configured-provider acceptance](provider-acceptance.md).
+checks remain separately protected but are temporarily optional for stable
+releases; their supported routes, required environment variables, handling
+rules, and current `v0.4.0` waiver are recorded in
+[configured-provider acceptance](provider-acceptance.md).
 
 The synchronized embedded bundle has SHA-256:
 

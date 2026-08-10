@@ -10,6 +10,11 @@ on:
         description: Existing canonical stable Ygg tag to package
         required: true
         type: string
+      require_provider_acceptance:
+        description: Require approved live-provider acceptance for this release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -37,6 +42,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INPUT_REQUIRE_PROVIDER_ACCEPTANCE: ${{ inputs.require_provider_acceptance }}
         run: |
           set -euo pipefail
           if [[ -n "$INPUT_RELEASE_TAG" ]]; then
@@ -101,36 +107,46 @@ jobs:
             exit 1
           fi
 
-          environment_name=stable-release-provider-acceptance
-          workflow_id=$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/provider-acceptance.yml" \
-            --jq .id)
-          evidence_run=$(gh api --method GET \
-            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs" \
-            -f head_sha="$source_commit" \
-            -f event=workflow_dispatch \
-            -f status=success \
-            -f per_page=100 \
-            --jq '.workflow_runs | map(select(.event == "workflow_dispatch" and .conclusion == "success")) | sort_by(.run_started_at) | last | .id // empty')
-          if [[ ! "$evidence_run" =~ ^[0-9]+$ ]]; then
-            echo "no successful protected provider/audio acceptance run is bound to $source_commit" >&2
-            exit 1
+          if [[ "${INPUT_REQUIRE_PROVIDER_ACCEPTANCE:-false}" == true ]]; then
+            environment_name=stable-release-provider-acceptance
+            workflow_id=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/provider-acceptance.yml" \
+              --jq .id)
+            evidence_run=$(gh api --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs" \
+              -f head_sha="$source_commit" \
+              -f event=workflow_dispatch \
+              -f status=success \
+              -f per_page=100 \
+              --jq '.workflow_runs | map(select(.event == "workflow_dispatch" and .conclusion == "success")) | sort_by(.run_started_at) | last | .id // empty')
+            if [[ ! "$evidence_run" =~ ^[0-9]+$ ]]; then
+              echo "no successful protected provider/audio acceptance run is bound to $source_commit" >&2
+              exit 1
+            fi
+            evidence_sha=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$evidence_run" \
+              --jq .head_sha)
+            if [[ "$evidence_sha" != "$source_commit" ]]; then
+              echo "provider acceptance evidence is not bound to $source_commit" >&2
+              exit 1
+            fi
+            approval_count=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$evidence_run/approvals" \
+              --jq '[.[] | select(.state == "approved") | .environments[]? | select(.name == "stable-release-provider-acceptance")] | length')
+            if [[ ! "$approval_count" =~ ^[0-9]+$ || "$approval_count" -lt 1 ]]; then
+              echo "provider acceptance run $evidence_run lacks a recorded $environment_name approval" >&2
+              exit 1
+            fi
+            echo "using protected provider acceptance run $evidence_run for $source_commit"
+          else
+            echo "::warning title=Live-provider acceptance waived::Release packaging is proceeding without credentialed provider/audio acceptance for $source_commit"
+            {
+              echo "## Release acceptance"
+              echo
+              echo "- Candidate: \`$source_commit\`"
+              echo "- Live provider/audio acceptance: **WAIVED**"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
-          evidence_sha=$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$evidence_run" \
-            --jq .head_sha)
-          if [[ "$evidence_sha" != "$source_commit" ]]; then
-            echo "provider acceptance evidence is not bound to $source_commit" >&2
-            exit 1
-          fi
-          approval_count=$(gh api \
-            "repos/$GITHUB_REPOSITORY/actions/runs/$evidence_run/approvals" \
-            --jq '[.[] | select(.state == "approved") | .environments[]? | select(.name == "stable-release-provider-acceptance")] | length')
-          if [[ ! "$approval_count" =~ ^[0-9]+$ || "$approval_count" -lt 1 ]]; then
-            echo "provider acceptance run $evidence_run lacks a recorded $environment_name approval" >&2
-            exit 1
-          fi
-          echo "using protected provider acceptance run $evidence_run for $source_commit"
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"

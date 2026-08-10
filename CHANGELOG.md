@@ -22,8 +22,8 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   binary/source installers, containers, and release smoke tests.
 - Added credential-free configured-provider acceptance for Serve covering
   authentication/model selection, streaming, tool replay, retries, explicit
-  compaction, restart/resume, cancellation, and secret-safe failures, plus a
-  separately gated live-provider release record.
+  compaction, restart/resume, cancellation, and secret-safe failures, plus an
+  optional protected live-provider acceptance workflow.
 - Added a deeply nested PDF regression proving Ygg's bounded iterative preflight
   rejects hostile nesting before parser entry.
 

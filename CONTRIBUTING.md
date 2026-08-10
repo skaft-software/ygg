@@ -81,11 +81,12 @@ Protocol changes should include exact wire fixtures and malformed-stream
 coverage. Session changes should cover restart and torn-tail behavior.
 
 The live multimodal test is intentionally ignored unless an explicitly
-configured compatible endpoint is available. Stable Serve releases must also
-pass the disposable configured-provider matrix in ordinary CI and record the
-separately approved credentialed checks described in
+configured compatible endpoint is available. Stable Serve releases must pass the
+disposable configured-provider matrix in ordinary CI. Maintainers may also run
+the separately approved credentialed checks described in
 [configured-provider acceptance](docs/experimental/ygg-serve/provider-acceptance.md)
-against the immutable release SHA.
+against the immutable release SHA; that live check is temporarily optional and
+the release workflow records an explicit waiver when it is not selected.
 
 ## Commits and pull requests
 

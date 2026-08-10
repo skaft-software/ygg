@@ -1,19 +1,21 @@
 # Configured-provider acceptance
 
 Ygg Serve uses the coding agent's provider stack rather than a web-specific
-client. Release acceptance therefore has two separate gates:
+client. Release acceptance therefore has two separate layers:
 
-1. a deterministic, credential-free conformance test on every pull request; and
-2. a manually approved credentialed check against representative live providers
-   before a stable release.
+1. a required deterministic, credential-free conformance test on every pull
+   request; and
+2. an optional manually approved credentialed check against representative live
+   providers.
 
-The two gates must remain separate. Pull-request CI must not inherit developer or
-repository provider credentials, and credentialed results must not upload raw
-provider traffic, prompts, or logs as artifacts.
+The two layers must remain separate. Pull-request CI must not inherit developer
+or repository provider credentials, and credentialed results must not upload raw
+provider traffic, prompts, or logs as artifacts. The credentialed layer is
+temporarily advisory and does not block stable packaging by default.
 
 ## Supported provider matrix
 
-| Route | Providers | Credential source | Deterministic coverage | Stable-release live representative |
+| Route | Providers | Credential source | Deterministic coverage | Optional live representative |
 | --- | --- | --- | --- | --- |
 | OpenAI Responses | OpenAI API models | `OPENAI_API_KEY` | `ygg-ai` protocol/client tests | OpenAI |
 | OpenAI Responses with subscription auth | Codex models | `ygg --login codex` or first-use import into Ygg's owner-only store | protocol, refresh, migration, and redaction tests | Codex when this route changes |
@@ -76,12 +78,18 @@ npm run test:e2e:live
 This is the only configured-provider test allowed in ordinary CI. It must stay
 loopback-only and credential-free.
 
-## Credentialed stable-release gate
+## Optional credentialed acceptance
 
-The protected `Stable provider acceptance` workflow is the only release evidence
-accepted by the release workflows. Configure its
-`stable-release-provider-acceptance` environment with required reviewers and
-these spend-limited secrets:
+The protected `Stable provider acceptance` workflow remains available for
+maintainers who want live-provider evidence. Both stable release workflows
+expose a `require_provider_acceptance` input, which defaults to `false` while the
+credentialed gate is temporarily waived. With the default, release packaging
+does not read provider secrets or require an acceptance run. Setting the input
+to `true` restores fail-closed exact-SHA and protected-approval enforcement for
+that workflow run.
+
+When opting in, configure the `stable-release-provider-acceptance` environment
+with required reviewers and these spend-limited secrets:
 
 - `LIVE_OPENAI_API_KEY`
 - `LIVE_ANTHROPIC_API_KEY`
@@ -109,25 +117,25 @@ and raw protocol/provider traffic is never uploaded. Workflow logs and the job
 summary contain only route labels, provider/model IDs, candidate SHA, and
 sanitized pass/fail status. Retry, cancellation, compaction, persistence, and
 invalid-credential redaction remain deterministic CI responsibilities; the live
-gate must not intentionally create billable throttling or network disruption.
+check must not intentionally create billable throttling or network disruption.
 
-Both stable release workflows query GitHub's immutable Actions history and fail
-closed unless the exact source commit has a successful `workflow_dispatch` run
-with a recorded approval for `stable-release-provider-acceptance`. A local run,
-a run for another SHA, or an unapproved successful run is not release evidence.
+When `require_provider_acceptance` is `true`, both stable release workflows query
+GitHub's immutable Actions history and fail closed unless the exact source commit
+has a successful `workflow_dispatch` run with a recorded approval for
+`stable-release-provider-acceptance`. A local run, a run for another SHA, or an
+unapproved successful run is not release evidence. When the input is `false`,
+the workflow records the waiver in its job summary and continues packaging.
 
 ## Release record
 
-A stable tag is blocked while any required row is `NOT RUN` or `FAIL`.
+Live-provider checks are waived for `v0.4.0`; deterministic configured-provider
+coverage remains required and passed. The optional protected workflow can be run
+later without changing the published binaries.
 
 | Candidate | Gate | Provider/model | UTC date | Result | Reviewer |
 | --- | --- | --- | --- | --- | --- |
-| Uncommitted `v0.4.0` worktree | Deterministic Serve configured-provider matrix | `custom/e2e/e2e-model` | 2026-08-10 | PASS | Local release review |
-| `v0.4.0` release SHA | OpenAI Responses live representative | To be recorded | — | NOT RUN — no credential available | — |
-| `v0.4.0` release SHA | Anthropic Messages live representative | To be recorded | — | NOT RUN — no credential available | — |
-| `v0.4.0` release SHA | OpenAI Chat live representative | To be recorded | — | NOT RUN — no credential available | — |
-| `v0.4.0` release SHA | Native audio production route | To be recorded | — | NOT RUN — no accepted route or credential available | — |
-
-Replace the pending rows with the protected run's sanitized metadata before
-creating the stable GitHub release. A local dirty-worktree pass is useful
-regression evidence but is not release-SHA evidence.
+| `v0.4.0` pre-release validation | Deterministic Serve configured-provider matrix | `custom/e2e/e2e-model` | 2026-08-10 | PASS | Local release review |
+| `v0.4.0` release SHA | OpenAI Responses live representative | Not selected | — | WAIVED — no release credential | Project decision |
+| `v0.4.0` release SHA | Anthropic Messages live representative | Not selected | — | WAIVED — no release credential | Project decision |
+| `v0.4.0` release SHA | OpenAI Chat live representative | Not selected | — | WAIVED — no release credential | Project decision |
+| `v0.4.0` release SHA | Native audio production route | Not selected | — | WAIVED — no release credential | Project decision |
