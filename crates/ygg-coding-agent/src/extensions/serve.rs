@@ -5222,6 +5222,7 @@ async fn start_and_drive_run(
     input_parts.extend(media.into_iter().map(InputPart::Media));
     let title_before_prompt =
         session_meta_for_id(&plan.sessions, &plan.session_id).map(|metadata| metadata.title);
+    let run_model = app.model.clone();
     let mut run = match app.agent.prompt(UserInput::from(input_parts)).await {
         Ok(run) => run,
         Err(_) => {
@@ -5315,6 +5316,7 @@ async fn start_and_drive_run(
                     agent_event,
                     &run_id,
                     plan,
+                    &run_model,
                     projection,
                     &mut context_projection,
                     events,
@@ -6712,10 +6714,12 @@ fn attribute_delivered_prompt_context(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn project_agent_event(
     agent_event: AgentEvent,
     run_id: &RunId,
     plan: &WorkerPlan,
+    provider_model: &Model,
     projection: &mut ProjectionState,
     context_projection: &mut RunContextProjection,
     events: &mpsc::Sender<TimestampedEvent>,
@@ -6890,7 +6894,13 @@ async fn project_agent_event(
             let terminal = match reason {
                 FinishReason::Completed => TerminalProjection::completed(),
                 FinishReason::Aborted => TerminalProjection::stopped(),
-                FinishReason::Failed(_) => TerminalProjection::failed("The run failed."),
+                FinishReason::Failed(error) => {
+                    TerminalProjection::failed(ygg_agent::public_error_diagnostic(
+                        &error,
+                        &provider_model.endpoint.id.0,
+                        &provider_model.spec.id.0,
+                    ))
+                }
                 FinishReason::MaxTurns => {
                     TerminalProjection::failed("The maximum model-turn limit was reached.")
                 }
@@ -7631,7 +7641,7 @@ impl TerminalProjection {
         }
     }
 
-    fn failed(message: &str) -> Self {
+    fn failed(message: impl Into<String>) -> Self {
         Self {
             state: SessionLiveState::Failed,
             outcome: ygg_serve_backend::RunOutcome::Failed,
@@ -9946,13 +9956,42 @@ fn system_time_ms(time: SystemTime) -> u64 {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-    use ygg_agent::EntryMetadata;
-    use ygg_ai::{AssistantMessage, Protocol, UserMessage};
+    use ygg_agent::{AgentError, EntryMetadata};
+    use ygg_ai::{AiError, AssistantMessage, Protocol, TransportPhase, UserMessage};
     use ygg_serve_backend::{
         AckDisposition, ActorConfig, ActorError, CatalogCursor, CommandId, DeviceId, HostBootstrap,
         SessionActorCore, SessionCommandEnvelope, SessionSupervisor, SupervisorConfig,
         SupervisorError, PROTOCOL_VERSION,
     };
+
+    #[test]
+    fn provider_failure_diagnostics_are_phase_specific_and_omit_provider_bodies() {
+        let error = AgentError::Ai(AiError::Http(ygg_ai::HttpError {
+            status: http::StatusCode::BAD_REQUEST,
+            request_id: Some("request-secret".to_owned()),
+            retry_after: None,
+            provider_code: Some("provider-secret".to_owned()),
+            body_snippet: Some("credential-secret".to_owned()),
+            retryable: false,
+        }));
+        let message = ygg_agent::public_error_diagnostic(&error, "custom/e2e", "e2e-model");
+        assert_eq!(
+            message,
+            "provider=custom/e2e model=e2e-model phase=HTTP response"
+        );
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("400"));
+
+        let timeout = AgentError::Ai(AiError::Transport(ygg_ai::TransportError {
+            phase: TransportPhase::Body,
+            timeout: true,
+            message: "credential-secret".to_owned(),
+        }));
+        assert_eq!(
+            ygg_agent::public_error_diagnostic(&timeout, "custom/e2e", "e2e-model"),
+            "provider=custom/e2e model=e2e-model phase=response body timeout"
+        );
+    }
 
     fn serve_test_config(directory: &Path) -> Config {
         Config {

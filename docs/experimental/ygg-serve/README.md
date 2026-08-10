@@ -43,7 +43,7 @@ Substantial implementation belongs outside Ygg's four core packages:
 - `apps/web/` owns the shared React client.
 - Later thin native applications live under `apps/`.
 
-For this alpha, the release package is binary-modular: the feature-enabled
+For this release, the package is binary-modular: the feature-enabled
 runtime contains the smallest adapter needed to construct and control Ygg's
 private `App`, while the ordinary Ygg binary owns only package management and a
 small external `ygg serve` dispatcher. Source-level extraction behind a stable
@@ -63,6 +63,7 @@ See:
 - [LAN pairing](lan-pairing.md)
 - [Native delivery](native-delivery.md)
 - [Web acceptance](web-acceptance.md)
+- [Configured-provider acceptance](provider-acceptance.md)
 
 ## First web cut
 
@@ -85,7 +86,7 @@ Fixtures remain a development and test input only.
 
 ## Build, install, and release gates
 
-With canonical Ygg `v0.3.3-alpha` installed, install the matching first-party
+With canonical Ygg `v0.3.3` installed, install the matching first-party
 package and launch it with:
 
 ```console
@@ -100,12 +101,12 @@ preserves Serve sessions and other user data. A downloaded release archive can
 be installed without network access to GitHub:
 
 ```console
-ygg extension install --path ygg-serve-0.3.3-alpha-TARGET.tar.gz
+ygg extension install --path ygg-serve-0.3.3-TARGET.tar.gz
 ```
 
-The package requires exactly `=0.3.3-alpha` and supports GNU/Linux x86_64
+The package requires exactly `=0.3.3` and supports GNU/Linux x86_64
 (`x86_64-unknown-linux-gnu`) plus macOS x86_64/arm64. Linux musl targets are not
-supported in this alpha. For development, run the embedded feature build
+supported in this release. For development, run the embedded feature build
 directly:
 
 ```console
@@ -129,10 +130,10 @@ pairing plan.
 The release workflow at `.github/workflows/release-serve.yml` builds optimized
 runtimes for the three supported targets, verifies both direct and
 package-dispatched launch, and emits archives named
-`ygg-serve-0.3.3-alpha-TARGET.tar.gz`. It writes SHA-256 checksums, signs the
+`ygg-serve-0.3.3-TARGET.tar.gz`. It writes SHA-256 checksums, signs the
 archives and checksum manifest with keyless Sigstore bundles, and attaches them
-to the existing canonical Ygg prerelease. Serve source tags use the form
-`ygg-serve-v0.3.3-alpha`; they do not replace the canonical Ygg tag.
+to the existing canonical stable Ygg release. Serve source tags use the form
+`ygg-serve-v0.3.3`; they do not replace the canonical Ygg tag.
 
 ## Explicit exclusions
 

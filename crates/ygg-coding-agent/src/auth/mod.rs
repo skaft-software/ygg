@@ -14,18 +14,27 @@ pub(crate) fn read_bounded_regular(
     path: &std::path::Path,
     limit: usize,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let Some(name) = path.file_name() else {
-        anyhow::bail!("path {} has no file name", path.display());
+    read_optional(path, limit, false)
+}
+
+pub(crate) fn read_bounded_private(
+    path: &std::path::Path,
+    limit: usize,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    read_optional(path, limit, true)
+}
+
+fn read_optional(
+    path: &std::path::Path,
+    limit: usize,
+    private: bool,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let result = if private {
+        ygg_agent::secure_fs::read_private_file_bounded(path, limit)
+    } else {
+        ygg_agent::secure_fs::read_regular_file_bounded(path, limit)
     };
-    let Some(parent) = path.parent() else {
-        anyhow::bail!("path {} has no parent", path.display());
-    };
-    let parent = match parent.canonicalize() {
-        Ok(parent) => parent,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    match ygg_agent::secure_fs::read_regular_file_bounded(&parent.join(name), limit) {
+    match result {
         Ok(bytes) => Ok(Some(bytes)),
         Err(ygg_agent::secure_fs::SecureFileError::Io(error))
             if error.kind() == std::io::ErrorKind::NotFound =>
@@ -41,37 +50,9 @@ pub(crate) fn read_bounded_regular(
 pub(crate) fn write_private_atomic(
     path: &std::path::Path,
     bytes: &[u8],
-    temporary_prefix: &str,
+    _temporary_prefix: &str,
 ) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use std::io::Write;
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("path {} has no parent", path.display()))?;
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restricting {}", parent.display()))?;
-    }
-
-    let mut temporary = tempfile::Builder::new()
-        .prefix(temporary_prefix)
-        .tempfile_in(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        temporary
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    temporary.write_all(bytes)?;
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    const MAX_PRIVATE_ATOMIC_BYTES: usize = 256 * 1024 * 1024;
+    ygg_agent::secure_fs::write_private_atomic(path, bytes, MAX_PRIVATE_ATOMIC_BYTES)
+        .map_err(anyhow::Error::from)
 }

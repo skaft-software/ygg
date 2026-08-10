@@ -470,6 +470,8 @@ struct TrackedTool {
 pub struct RunPresentation {
     id: RunId,
     provider: String,
+    endpoint: String,
+    model: String,
     started_at: Instant,
     phase_started_at: Instant,
     phase: RunPhase,
@@ -487,6 +489,14 @@ impl RunPresentation {
 
     pub fn phase(&self) -> &RunPhase {
         &self.phase
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     pub fn is_active(&self) -> bool {
@@ -575,13 +585,47 @@ impl RunTracker {
         self.current = None;
     }
 
-    pub fn begin(&mut self, provider: impl Into<String>) -> Result<RunId, &'static str> {
-        self.begin_at(provider, Instant::now())
-    }
-
     pub fn begin_at(
         &mut self,
         provider: impl Into<String>,
+        now: Instant,
+    ) -> Result<RunId, &'static str> {
+        let provider = provider.into();
+        self.begin_route_at(provider.clone(), provider, "unknown", now)
+    }
+
+    pub fn begin_for_model(
+        &mut self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Result<RunId, &'static str> {
+        self.begin_for_model_at(provider, model, Instant::now())
+    }
+
+    pub fn begin_for_model_at(
+        &mut self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        now: Instant,
+    ) -> Result<RunId, &'static str> {
+        let provider = provider.into();
+        self.begin_route_at(provider.clone(), provider, model, now)
+    }
+
+    pub fn begin_route(
+        &mut self,
+        provider: impl Into<String>,
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Result<RunId, &'static str> {
+        self.begin_route_at(provider, endpoint, model, Instant::now())
+    }
+
+    fn begin_route_at(
+        &mut self,
+        provider: impl Into<String>,
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
         now: Instant,
     ) -> Result<RunId, &'static str> {
         if self.is_active() {
@@ -592,6 +636,8 @@ impl RunTracker {
         self.current = Some(RunPresentation {
             id,
             provider: provider.into(),
+            endpoint: endpoint.into(),
+            model: model.into(),
             started_at: now,
             phase_started_at: now,
             phase: RunPhase::Preparing {
@@ -805,7 +851,11 @@ impl RunTracker {
                     FinishReason::Aborted => RunOutcome::Interrupted { elapsed },
                     FinishReason::Failed(error) => RunOutcome::Failed {
                         elapsed,
-                        reason: error.to_string(),
+                        reason: ygg_agent::public_error_diagnostic(
+                            error,
+                            &run.endpoint,
+                            &run.model,
+                        ),
                     },
                     FinishReason::MaxTurns => RunOutcome::Failed {
                         elapsed,
@@ -1172,7 +1222,7 @@ mod tests {
         assert_eq!(format_token_rate_value(TokenRate(2_800)), "$0.0028");
     }
     use ygg_agent::{AgentError, EntryId, FinishReason, OutputChannel};
-    use ygg_ai::{AssistantMessage, ModelId, Protocol, ToolCall, ToolCallId, Usage};
+    use ygg_ai::{AiError, AssistantMessage, ModelId, Protocol, ToolCall, ToolCallId, Usage};
 
     fn text_event(channel: OutputChannel) -> AgentEvent {
         AgentEvent::OutputDelta {
@@ -1411,6 +1461,38 @@ mod tests {
             now,
         );
         assert!(matches!(update.outcome, Some(RunOutcome::Failed { .. })));
+    }
+
+    #[test]
+    fn provider_failure_outcome_uses_canonical_route_without_provider_details() {
+        let now = Instant::now();
+        let mut tracker = RunTracker::default();
+        let id = tracker
+            .begin_for_model_at("custom-endpoint", "test-model", now)
+            .unwrap();
+        let update = tracker.apply_event_at(
+            id,
+            &finished(FinishReason::Failed(AgentError::Ai(AiError::Http(
+                ygg_ai::HttpError {
+                    status: http::StatusCode::BAD_REQUEST,
+                    request_id: Some("secret-request-id".into()),
+                    retry_after: None,
+                    provider_code: Some("secret-provider-code".into()),
+                    body_snippet: Some("secret provider body and prompt".into()),
+                    retryable: false,
+                },
+            )))),
+            now,
+        );
+        let Some(RunOutcome::Failed { reason, .. }) = update.outcome else {
+            panic!("expected failed outcome");
+        };
+        assert_eq!(
+            reason,
+            "provider=custom-endpoint model=test-model phase=HTTP response"
+        );
+        assert!(!reason.contains("secret"));
+        assert!(!reason.contains("400"));
     }
 
     #[test]

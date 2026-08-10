@@ -22,8 +22,9 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 
-export const LIVE_MODEL_ID = "custom/e2e/e2e-model";
+export const LIVE_PROVIDER_ENDPOINT_ID = "custom-provider-3-e2e";
 export const LIVE_API_MODEL = "e2e-model";
+export const LIVE_MODEL_ID = `custom/e2e/${LIVE_API_MODEL}`;
 export const LIVE_PROVIDER_TOKEN = "e2e-fake-token";
 
 export const STREAM_PROMPT = "E2E_STREAM";
@@ -39,6 +40,17 @@ export const BRANCH_B_PROMPT = `E2E_BRANCH_B ${EXPORT_CANARY}`;
 export const BRANCH_B_REPLY = "E2E_BRANCH_B_ASSISTANT";
 export const RESUME_PROMPT = "E2E_RESUMED";
 export const RESUME_REPLY = "E2E_RESUMED_ASSISTANT";
+export const TOOL_PROMPT = "E2E_TOOL";
+export const TOOL_REPLY = "E2E_TOOL_ASSISTANT";
+export const TOOL_FILE_CONTENT = "provider conformance canary";
+export const RETRY_PROMPT = "E2E_RETRY";
+export const RETRY_REPLY = "E2E_RETRY_ASSISTANT";
+export const TIMEOUT_PROMPT = "E2E_TIMEOUT";
+export const TIMEOUT_REPLY = "E2E_TIMEOUT_ASSISTANT";
+export const ERROR_PROMPT = "E2E_PROVIDER_ERROR";
+export const ERROR_DIAGNOSTIC = "E2E_PROVIDER_FAILURE";
+export const COMPACTION_PROMPT = "E2E_COMPACTION_REQUEST";
+export const COMPACTION_REPLY = "## Goal\nPreserve deterministic E2E history.\n\n## Progress\nConfigured-provider compaction completed.";
 
 const launchLine =
   /^Open ygg once: (http:\/\/127\.0\.0\.1:(\d+)\/__ygg\/launch\/([0-9a-f]{64}))$/;
@@ -112,6 +124,12 @@ function latestUserPrompt(body: Record<string, unknown>): string {
   return "";
 }
 
+function isCompactionRequest(body: Record<string, unknown>): boolean {
+  return JSON.stringify(body.messages ?? []).includes(
+    "You are a context summarization assistant.",
+  );
+}
+
 function responseForPrompt(prompt: string): string {
   switch (prompt) {
     case STREAM_PROMPT:
@@ -124,6 +142,14 @@ function responseForPrompt(prompt: string): string {
       return BRANCH_B_REPLY;
     case RESUME_PROMPT:
       return RESUME_REPLY;
+    case TOOL_PROMPT:
+      return TOOL_REPLY;
+    case RETRY_PROMPT:
+      return RETRY_REPLY;
+    case TIMEOUT_PROMPT:
+      return TIMEOUT_REPLY;
+    case COMPACTION_PROMPT:
+      return COMPACTION_REPLY;
     default:
       return `E2E_ASSISTANT_${prompt.replaceAll(/\s+/g, "_").slice(0, 80)}`;
   }
@@ -166,6 +192,49 @@ function streamFinished(): string {
   })}\n\ndata: [DONE]\n\n`;
 }
 
+function streamToolCall(): string {
+  const started = {
+    id: "chat-ygg-e2e-tool",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: LIVE_API_MODEL,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          role: "assistant",
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_e2e_read",
+              type: "function",
+              function: {
+                name: "read",
+                arguments: JSON.stringify({ path: "provider-canary.txt" }),
+              },
+            },
+          ],
+        },
+        finish_reason: null,
+      },
+    ],
+  };
+  const finished = {
+    id: "chat-ygg-e2e-tool",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: LIVE_API_MODEL,
+    choices: [
+      {
+        index: 0,
+        delta: {},
+        finish_reason: "tool_calls",
+      },
+    ],
+  };
+  return `data: ${JSON.stringify(started)}\n\ndata: ${JSON.stringify(finished)}\n\ndata: [DONE]\n\n`;
+}
+
 export interface RecordedChatRequest {
   prompt: string;
   body: Record<string, unknown>;
@@ -175,6 +244,7 @@ export interface RecordedChatRequest {
 export class DeterministicChatProvider {
   private server: Server | null = null;
   private requestWaiters = new Map<string, Deferred<RecordedChatRequest>>();
+  private attemptWaiters = new Map<string, Deferred<RecordedChatRequest>>();
   private releaseGates = new Map<string, Deferred<void>>();
   private abortWaiters = new Map<string, Deferred<void>>();
   private abortedPrompts = new Set<string>();
@@ -223,6 +293,28 @@ export class DeterministicChatProvider {
       this.requestWaiters.set(prompt, waiter);
     }
     return withTimeout(waiter.promise, `provider request ${prompt}`, timeoutMs);
+  }
+
+  async waitForPromptAttempt(
+    prompt: string,
+    attempt: number,
+    timeoutMs = defaultWaitMs,
+  ): Promise<RecordedChatRequest> {
+    const existing = this.requests.filter((request) => request.prompt === prompt)[
+      attempt - 1
+    ];
+    if (existing) return existing;
+    const key = `${prompt}#${attempt}`;
+    let waiter = this.attemptWaiters.get(key);
+    if (!waiter) {
+      waiter = deferred<RecordedChatRequest>();
+      this.attemptWaiters.set(key, waiter);
+    }
+    return withTimeout(
+      waiter.promise,
+      `provider request ${prompt} attempt ${attempt}`,
+      timeoutMs,
+    );
   }
 
   release(prompt: string): void {
@@ -315,11 +407,15 @@ export class DeterministicChatProvider {
       return;
     }
 
-    const prompt = latestUserPrompt(body);
+    const compactionRequest = isCompactionRequest(body);
+    const prompt = compactionRequest ? COMPACTION_PROMPT : latestUserPrompt(body);
     const authorization = request.headers.authorization;
     const record = { prompt, body, authorization };
+    const attempt =
+      this.requests.filter((candidate) => candidate.prompt === prompt).length + 1;
     this.requests.push(record);
     this.requestWaiters.get(prompt)?.resolve(record);
+    this.attemptWaiters.get(`${prompt}#${attempt}`)?.resolve(record);
 
     if (authorization !== `Bearer ${LIVE_PROVIDER_TOKEN}`) {
       this.violations.push("Provider request used the wrong bearer token.");
@@ -330,11 +426,23 @@ export class DeterministicChatProvider {
     if (body.stream !== true) {
       this.violations.push("Provider request was not streaming.");
     }
-    if (
-      body.tools !== undefined &&
-      (!Array.isArray(body.tools) || body.tools.length !== 0)
-    ) {
-      this.violations.push("Provider request unexpectedly exposed tools.");
+    const tools = Array.isArray(body.tools) ? body.tools : [];
+    const exposesRead = tools.some((candidate) => {
+      if (!candidate || typeof candidate !== "object") return false;
+      const tool = candidate as Record<string, unknown>;
+      const fn = tool.function;
+      return (
+        fn !== null &&
+        typeof fn === "object" &&
+        (fn as Record<string, unknown>).name === "read"
+      );
+    });
+    if (compactionRequest ? tools.length !== 0 : !exposesRead) {
+      this.violations.push(
+        compactionRequest
+          ? "Compaction request unexpectedly exposed tools."
+          : "Provider request did not expose the read tool.",
+      );
     }
     if (!prompt) {
       this.violations.push("Provider request had no user prompt.");
@@ -342,6 +450,40 @@ export class DeterministicChatProvider {
     if (this.violations.length > 0) {
       response.writeHead(400, { "content-type": "application/json" });
       response.end('{"error":"invalid deterministic request"}');
+      return;
+    }
+
+    if (
+      attempt === 1 &&
+      (prompt === RETRY_PROMPT || prompt === TIMEOUT_PROMPT)
+    ) {
+      const timedOut = prompt === TIMEOUT_PROMPT;
+      response.writeHead(timedOut ? 408 : 429, {
+        "content-type": "application/json",
+        "retry-after": "0",
+      });
+      response.end(
+        JSON.stringify({
+          error: {
+            type: timedOut ? "request_timeout" : "rate_limit_error",
+            message: `temporary ${LIVE_PROVIDER_TOKEN} ${prompt}`,
+          },
+        }),
+      );
+      return;
+    }
+
+    if (prompt === ERROR_PROMPT) {
+      response.writeHead(400, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          error: {
+            type: "invalid_request_error",
+            code: "e2e_invalid_request",
+            message: `${ERROR_DIAGNOSTIC}: Bearer ${LIVE_PROVIDER_TOKEN}`,
+          },
+        }),
+      );
       return;
     }
 
@@ -363,6 +505,12 @@ export class DeterministicChatProvider {
       aborted.resolve();
     });
 
+    if (prompt === TOOL_PROMPT && attempt === 1) {
+      completed = true;
+      response.end(streamToolCall());
+      this.openResponses.delete(response);
+      return;
+    }
     if (prompt === STREAM_PROMPT) {
       response.write(streamChunk(STREAM_PARTIAL));
       let gate = this.releaseGates.get(prompt);
@@ -472,8 +620,7 @@ export class LiveHostHarness {
         "--reasoning",
         "off",
         "--max-turns",
-        "1",
-        "--no-tools",
+        "2",
         "--no-context-files",
         "--offline",
         "serve",
@@ -683,6 +830,16 @@ export class LiveHostHarness {
       await mkdir(directory, { recursive: true, mode: 0o700 });
       await chmod(directory, 0o700);
     }
+    await writeFile(
+      join(this.workspaceDir, "provider-canary.txt"),
+      `${TOOL_FILE_CONTENT}\n`,
+      { mode: 0o600 },
+    );
+    await writeFile(
+      join(this.homeDir, ".ygg", "config.toml"),
+      "[compaction]\nmode = \"local\"\nthreshold_fraction = 0.85\nkeep_recent_turns = 1\n",
+      { mode: 0o600 },
+    );
   }
 
   private async writeProviderRegistry(): Promise<void> {
@@ -707,7 +864,7 @@ export class LiveHostHarness {
               display_name: "E2E Model",
               context_window: 32_768,
               max_output_tokens: 1_024,
-              tools: false,
+              tools: true,
               parallel_tool_calls: false,
               vision: false,
               structured_output: false,

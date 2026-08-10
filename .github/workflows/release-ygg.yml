@@ -3,15 +3,16 @@ name: Ygg binary release
 on:
   push:
     tags:
-      - "ygg-binaries-v*-alpha*"
+      - "ygg-binaries-v*"
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing canonical Ygg prerelease tag to package
+        description: Existing canonical stable Ygg tag to package
         required: true
         type: string
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -21,13 +22,13 @@ env:
 jobs:
   resolve:
     name: Resolve canonical release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
       source_commit: ${{ steps.release.outputs.source_commit }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
       - id: release
@@ -50,13 +51,28 @@ jobs:
             echo "release_tag is required when this workflow is not running for a tag" >&2
             exit 1
           fi
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-alpha[0-9A-Za-z.-]*$ ]]; then
-            echo "invalid canonical alpha release tag: $tag" >&2
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid canonical stable release tag: $tag" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            if [[ "$GITHUB_REF_TYPE" != tag || "$GITHUB_REF_NAME" != "$tag" ]]; then
+              echo "manual releases must dispatch this workflow from the exact canonical tag $tag" >&2
+              exit 1
+            fi
+          elif [[ "$GITHUB_REF_TYPE" != tag || "$GITHUB_REF_NAME" != "ygg-binaries-$tag" ]]; then
+            echo "binary release pushes must use ygg-binaries-$tag" >&2
             exit 1
           fi
 
           git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
           source_commit=$(git rev-parse "$tag^{commit}")
+          workflow_commit=$(git rev-parse "$GITHUB_SHA^{commit}")
+          if [[ "$workflow_commit" != "$source_commit" ]]; then
+            echo "workflow ref $workflow_commit does not match canonical release source $source_commit" >&2
+            echo "dispatch this workflow from $tag, or push the binary tag at that exact commit" >&2
+            exit 1
+          fi
           version=${tag#v}
           cargo_version=$(git show "$source_commit:Cargo.toml" \
             | awk -F '"' '/^version = / { print $2; exit }')
@@ -65,22 +81,90 @@ jobs:
             exit 1
           fi
 
-          if ! prerelease=$(gh release view "$tag" --json isPrerelease --jq '.isPrerelease'); then
+          if ! release_state=$(gh release view "$tag" \
+            --json tagName,isDraft,isPrerelease \
+            --jq '[.tagName, .isDraft, .isPrerelease] | @tsv'); then
             echo "canonical release $tag does not exist" >&2
             exit 1
           fi
-          if [[ "$prerelease" != true ]]; then
-            echo "canonical release $tag is not marked as a prerelease" >&2
+          IFS=$'\t' read -r release_tag draft prerelease <<< "$release_state"
+          if [[ "$release_tag" != "$tag" ]]; then
+            echo "resolved release tag $release_tag does not match $tag" >&2
             exit 1
           fi
+          if [[ "$draft" != false ]]; then
+            echo "canonical release $tag is still a draft" >&2
+            exit 1
+          fi
+          if [[ "$prerelease" != false ]]; then
+            echo "canonical release $tag is marked as a prerelease" >&2
+            exit 1
+          fi
+
+          environment_name=stable-release-provider-acceptance
+          workflow_id=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/provider-acceptance.yml" \
+            --jq .id)
+          evidence_run=$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs" \
+            -f head_sha="$source_commit" \
+            -f event=workflow_dispatch \
+            -f status=success \
+            -f per_page=100 \
+            --jq '.workflow_runs | map(select(.event == "workflow_dispatch" and .conclusion == "success")) | sort_by(.run_started_at) | last | .id // empty')
+          if [[ ! "$evidence_run" =~ ^[0-9]+$ ]]; then
+            echo "no successful protected provider/audio acceptance run is bound to $source_commit" >&2
+            exit 1
+          fi
+          evidence_sha=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$evidence_run" \
+            --jq .head_sha)
+          if [[ "$evidence_sha" != "$source_commit" ]]; then
+            echo "provider acceptance evidence is not bound to $source_commit" >&2
+            exit 1
+          fi
+          approval_count=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$evidence_run/approvals" \
+            --jq '[.[] | select(.state == "approved") | .environments[]? | select(.name == "stable-release-provider-acceptance")] | length')
+          if [[ ! "$approval_count" =~ ^[0-9]+$ || "$approval_count" -lt 1 ]]; then
+            echo "provider acceptance run $evidence_run lacks a recorded $environment_name approval" >&2
+            exit 1
+          fi
+          echo "using protected provider acceptance run $evidence_run for $source_commit"
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
 
+  security:
+    name: Audit release dependencies
+    needs: resolve
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.resolve.outputs.source_commit }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: apps/web/.node-version
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.20.2
+      - run: cargo audit
+      - run: cargo audit --file extensions/ygg-serve/Cargo.lock
+      - run: cargo deny check
+      - run: cargo deny --manifest-path extensions/ygg-serve/Cargo.toml check
+      - run: npm ci
+        working-directory: apps/web
+      - run: npm audit --audit-level=high
+        working-directory: apps/web
+
   build:
     name: Build ${{ matrix.target }}
-    needs: resolve
+    needs: [resolve, security]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -93,50 +177,65 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
     steps:
-      - name: Check out release tooling
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          path: release-tools
-      - name: Check out immutable release source
-        uses: actions/checkout@v4
+      - name: Check out immutable release source and tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
           path: source
-      - uses: dtolnay/rust-toolchain@stable
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
         with:
           key: ygg-binary-release-${{ matrix.target }}
           workspaces: source -> target
-      - name: Build optimized Ygg binary
+      - name: Build optimized Ygg binaries
         working-directory: source
-        run: cargo build --release --locked --target "${{ matrix.target }}" -p ygg-coding-agent --bin ygg
-      - name: Verify standalone binary
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p ygg-coding-agent --bins
+      - name: Verify standalone binaries
         shell: bash
         run: |
           set -euo pipefail
           binary="source/target/${{ matrix.target }}/release/ygg"
+          host_binary="source/target/${{ matrix.target }}/release/ygg-host"
           test -x "$binary"
+          test -x "$host_binary"
           test "$("$binary" --version)" = "ygg ${{ needs.resolve.outputs.version }}"
           test_home="$RUNNER_TEMP/ygg-binary-smoke-home"
           mkdir -p "$test_home"
           HOME="$test_home" "$binary" --help >/dev/null
           HOME="$test_home" "$binary" extension --help >/dev/null
+          printf '%s\n' '{"protocol_version":1,"request_id":"release-smoke","command":"hello"}' \
+            | HOME="$test_home" "$host_binary" \
+            | grep -F '"type":"hello"' >/dev/null
       - name: Package target-specific archive
         shell: bash
         run: |
           set -euo pipefail
-          release-tools/scripts/package-ygg-release.sh \
+          source/scripts/package-ygg-release.sh \
             "${{ matrix.target }}" \
             "$RUNNER_TEMP/ygg-release" \
             "${{ needs.resolve.outputs.tag }}" \
             source
+          source/scripts/package-ygg-release.sh \
+            "${{ matrix.target }}" \
+            "$RUNNER_TEMP/ygg-release-reproducibility-check" \
+            "${{ needs.resolve.outputs.tag }}" \
+            source
           archive="$RUNNER_TEMP/ygg-release/ygg-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz"
+          repeated_archive="$RUNNER_TEMP/ygg-release-reproducibility-check/ygg-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz"
           test -f "$archive"
+          cmp "$archive" "$repeated_archive"
           tar -tzf "$archive"
-      - uses: actions/upload-artifact@v4
+          package="ygg-${{ needs.resolve.outputs.version }}-${{ matrix.target }}"
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          test -x "$RUNNER_TEMP/$package/ygg-host"
+          if tar -tzf "$archive" | grep -E '(^|/)(\.DS_Store|__pycache__|research|plans|reports|superpowers)(/|$)'; then
+            echo "release archive contains a local-only asset" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ygg-core-${{ matrix.target }}
           path: ${{ runner.temp }}/ygg-release/*.tar.gz
@@ -146,7 +245,7 @@ jobs:
   publish:
     name: Sign and attach Ygg binaries
     needs: [resolve, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       release_tag: ${{ needs.resolve.outputs.tag }}
       version: ${{ needs.resolve.outputs.version }}
@@ -155,26 +254,49 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - name: Check out release tooling
-        uses: actions/checkout@v4
+      - name: Check out immutable release source and tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.resolve.outputs.source_commit }}
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: ygg-core-*
           path: release-assets
           merge-multiple: true
-      - name: Add version-pinned binary installer
+      - name: Add source-bound binary installer
         shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
         run: |
           set -euo pipefail
-          cp scripts/install.sh release-assets/install-ygg.sh
+          python3 - "$SOURCE_COMMIT" scripts/install.sh release-assets/install-ygg.sh <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          source_commit, source_path, destination_path = sys.argv[1:4]
+          if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+              raise SystemExit("release source commit is malformed")
+          source = pathlib.Path(source_path).read_text(encoding="utf-8")
+          placeholder = 'release_source_commit="__YGG_RELEASE_SOURCE_COMMIT__"'
+          if source.count(placeholder) != 1:
+              raise SystemExit("installer source-commit placeholder is missing or ambiguous")
+          generated = source.replace(
+              placeholder,
+              f'release_source_commit="{source_commit}"',
+          )
+          pathlib.Path(destination_path).write_text(generated, encoding="utf-8")
+          PY
           chmod 0755 release-assets/install-ygg.sh
+          ! grep -F '__YGG_RELEASE_SOURCE_COMMIT__' release-assets/install-ygg.sh
+          grep -F "release_source_commit=\"$SOURCE_COMMIT\"" release-assets/install-ygg.sh
           release-assets/install-ygg.sh --help | grep -F "Install Ygg ${{ needs.resolve.outputs.version }}."
           test "$(find release-assets -maxdepth 1 -name 'ygg-*.tar.gz' | wc -l | tr -d ' ')" = 3
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.8.1
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a
+        with:
+          cosign-release: v3.1.3
       - name: Create checksums and keyless signatures
         shell: bash
         run: |
@@ -196,24 +318,31 @@ jobs:
         shell: bash
         env:
           COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
-          COSIGN_IDENTITY: ^https://github.com/${{ github.repository }}/.github/workflows/release-ygg.yml@.*$
+          COSIGN_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           cd release-assets
           sha256sum --check YGG_SHA256SUMS
+          verify=(
+            --certificate-identity "$COSIGN_IDENTITY"
+            --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER"
+            --certificate-github-workflow-name "Ygg binary release"
+            --certificate-github-workflow-repository "$WORKFLOW_REPOSITORY"
+            --certificate-github-workflow-sha "$SOURCE_COMMIT"
+          )
           for artifact in ./*.tar.gz ./install-ygg.sh; do
             cosign verify-blob \
               --bundle "${artifact}.sigstore.json" \
-              --certificate-identity-regexp "$COSIGN_IDENTITY" \
-              --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+              "${verify[@]}" \
               "$artifact"
           done
           cosign verify-blob \
             --bundle YGG_SHA256SUMS.sigstore.json \
-            --certificate-identity-regexp "$COSIGN_IDENTITY" \
-            --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+            "${verify[@]}" \
             YGG_SHA256SUMS
-      - name: Attach assets to canonical prerelease
+      - name: Attach assets to canonical release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -226,12 +355,31 @@ jobs:
             echo "canonical tag moved while release artifacts were building" >&2
             exit 1
           fi
-          prerelease=$(gh release view "$RELEASE_TAG" --json isPrerelease --jq '.isPrerelease')
-          if [[ "$prerelease" != true ]]; then
-            echo "canonical release $RELEASE_TAG is not marked as a prerelease" >&2
+          if ! release_state=$(gh release view "$RELEASE_TAG" \
+            --json tagName,isDraft,isPrerelease \
+            --jq '[.tagName, .isDraft, .isPrerelease] | @tsv'); then
+            echo "canonical release $RELEASE_TAG no longer exists" >&2
             exit 1
           fi
-          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          IFS=$'\t' read -r release_tag draft prerelease <<< "$release_state"
+          if [[ "$release_tag" != "$RELEASE_TAG" || "$draft" != false || "$prerelease" != false ]]; then
+            echo "canonical release $RELEASE_TAG is no longer a published stable release" >&2
+            exit 1
+          fi
+          existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+          for asset in release-assets/*; do
+            name=${asset##*/}
+            if grep -Fx "$name" <<< "$existing_assets" >/dev/null; then
+              echo "refusing to replace existing immutable release asset: $name" >&2
+              exit 1
+            fi
+          done
+          gh release upload "$RELEASE_TAG" release-assets/*
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          if [[ "$(git rev-parse "$RELEASE_TAG^{commit}")" != "$SOURCE_COMMIT" ]]; then
+            echo "canonical tag moved while release artifacts were publishing" >&2
+            exit 1
+          fi
 
   verify-published:
     name: Verify binary install on ${{ matrix.target }}
@@ -290,7 +438,7 @@ jobs:
 
           installed=false
           for attempt in 1 2 3 4 5; do
-            rm -f "$install_directory/ygg"
+            rm -f "$install_directory/ygg" "$install_directory/ygg-host"
             if HOME="$test_home" \
               YGG_INSTALL_DIR="$install_directory" \
               YGG_NO_MODIFY_PATH=1 \
@@ -308,9 +456,14 @@ jobs:
           fi
 
           binary="$install_directory/ygg"
+          host_binary="$install_directory/ygg-host"
           test -x "$binary"
+          test -x "$host_binary"
           test "$(HOME="$test_home" "$binary" --version)" = "ygg $VERSION"
           HOME="$test_home" "$binary" --help >/dev/null
+          printf '%s\n' '{"protocol_version":1,"request_id":"published-smoke","command":"hello"}' \
+            | HOME="$test_home" "$host_binary" \
+            | grep -F '"type":"hello"' >/dev/null
           HOME="$test_home" "$binary" extension install ygg-serve
           HOME="$test_home" "$binary" extension list | grep -F "ygg-serve"
           HOME="$test_home" "$binary" extension remove ygg-serve

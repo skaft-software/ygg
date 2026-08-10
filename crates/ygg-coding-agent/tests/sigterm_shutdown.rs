@@ -394,6 +394,48 @@ fn sigterm_stops_redirected_background_descendant_after_shell_leader_exits() {
 }
 
 #[test]
+fn sigterm_stops_detached_descendant_after_shell_leader_exits() {
+    let _guard = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let marker = directory.path().join("detached-descendant.pid");
+    let mut ygg = PtyYgg::spawn(directory.path());
+    ygg.write_input(
+        format!(
+            "!python3 -c 'import os,time; os.setsid(); open(\"{}\", \"w\").write(str(os.getpid())); time.sleep(30)' </dev/null >/dev/null 2>&1 &\r",
+            marker.display()
+        )
+        .as_bytes(),
+    );
+    ygg.wait_until(READY_DEADLINE, |_| pid_marker_ready(&marker));
+    let descendant = read_pid(&marker);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        process_exists(descendant),
+        "detached descendant exited before shutdown"
+    );
+
+    let (status, elapsed, _) = ygg.terminate();
+    assert_eq!(status.code(), Some(128 + libc::SIGTERM));
+    assert!(elapsed < EXIT_DEADLINE, "shutdown took {elapsed:?}");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while process_exists(descendant) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let survived = process_exists(descendant);
+    if survived {
+        unsafe {
+            let _ = libc::kill(descendant, libc::SIGKILL);
+        }
+    }
+    assert!(
+        !survived,
+        "detached shell descendant {descendant} survived Ygg shutdown"
+    );
+}
+
+#[test]
 fn sigterm_delivers_graceful_shutdown_to_executable_extension() {
     let _guard = PTY_TEST_LOCK
         .lock()

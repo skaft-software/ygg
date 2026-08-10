@@ -5,7 +5,7 @@ use std::io::{IsTerminal, Write};
 use ygg_agent::{AgentEvent, OutputChannel};
 
 use crate::app::bootstrap::{build_app, resolve_launch_print, Bootstrap};
-use crate::modes::{timestamp, RunEnded};
+use crate::modes::{run_ended, timestamp, RunEnded};
 use crate::resources::{compose_instructions, expand_skill_command};
 
 /// Convert an explicit terminal run result to process success or an actionable
@@ -25,16 +25,11 @@ pub fn classify_finish(finished: Option<RunEnded>) -> anyhow::Result<()> {
     }
 }
 
-fn terminal_outcome(event: &AgentEvent) -> Option<RunEnded> {
+fn terminal_outcome(event: &AgentEvent, endpoint: &str, model: &str) -> Option<RunEnded> {
     let AgentEvent::RunFinished { reason, .. } = event else {
         return None;
     };
-    Some(match reason {
-        ygg_agent::FinishReason::Completed => RunEnded::Completed,
-        ygg_agent::FinishReason::Aborted => RunEnded::Aborted,
-        ygg_agent::FinishReason::MaxTurns => RunEnded::MaxTurns,
-        ygg_agent::FinishReason::Failed(error) => RunEnded::Failed(error.to_string()),
-    })
+    Some(run_ended(reason, endpoint, model))
 }
 
 fn terminal_safe_output(text: &str, terminal: bool) -> std::borrow::Cow<'_, str> {
@@ -99,7 +94,14 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
     app.agent.set_prompt_display_text(Some(display_prompt));
     let mut run = match app.agent.prompt(composition.prompt).await {
         Ok(run) => run,
-        Err(error) => return Err(error.into()),
+        Err(error) => anyhow::bail!(
+            "{}",
+            ygg_agent::public_error_diagnostic(
+                &error,
+                &app.model.endpoint.id.0,
+                &app.model.spec.id.0,
+            )
+        ),
     };
     app.executable_extensions
         .commit_prompt_context(pending_context_count);
@@ -130,7 +132,9 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
         let Some(event) = event else {
             break;
         };
-        if let Some(outcome) = terminal_outcome(&event) {
+        if let Some(outcome) =
+            terminal_outcome(&event, &app.model.endpoint.id.0, &app.model.spec.id.0)
+        {
             finished = Some(outcome);
         }
         match event {
@@ -284,7 +288,7 @@ mod tests {
         ];
         let mut finished = None;
         for event in &events {
-            if let Some(outcome) = terminal_outcome(event) {
+            if let Some(outcome) = terminal_outcome(event, "test-provider", "test-model") {
                 finished = Some(outcome);
             }
         }

@@ -2,7 +2,7 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## 0.3.3-alpha — 2026-08-02 (experimental)
+## 0.3.3 — 2026-08-07
 
 ### Added
 
@@ -13,6 +13,19 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   in the graphical source-file viewer.
 - Added checkout-aware self-documentation guidance to `/help` and the system
   prompt when Ygg is run from its own source tree.
+- Added the `ygg_sdk` Rust library and `ygg-host` protocol-v1 NDJSON process
+  interface for native integrations, including bounded streaming, inline and
+  configured providers, typed media, seeded history, and durable sessions.
+- Added first-use, owner-only Codex credential migration from legacy Codex and
+  Hamr stores without modifying the source credentials.
+- Added both Ygg binaries to deterministic, Git-tracked release archives,
+  binary/source installers, containers, and release smoke tests.
+- Added credential-free configured-provider acceptance for Serve covering
+  authentication/model selection, streaming, tool replay, retries, explicit
+  compaction, restart/resume, cancellation, and secret-safe failures, plus a
+  separately gated live-provider release record.
+- Added a deeply nested PDF regression proving Ygg's bounded iterative preflight
+  rejects hostile nesting before parser entry.
 
 ### Changed
 
@@ -22,6 +35,11 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   `/cycle-model` commands. The top-level `ygg sessions` command remains
   available.
 - Rounded compact TUI footer costs to three significant figures.
+- Made headless native-host interactions fail closed: tool confirmations are
+  denied, typed input requests are cancelled, protocol frames are bounded, and
+  session/image/provider inputs are validated at their system boundaries.
+- Enforced dependency review, high-severity npm audit, plus `cargo audit` and
+  `cargo deny` for both lockfiles on pull-request and release paths.
 
 ### Fixed
 

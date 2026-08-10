@@ -1443,12 +1443,9 @@ async fn repeated_connect_failure_is_visible_and_bounded() {
         .iter()
         .all(|(_, _, error)| error.contains("Are you connected to the internet?")));
     assert!(retries[0].2.contains("provider=test model=scripted"));
-    assert!(retries[0].2.contains("Connect"));
-    assert!(
-        retries[0].2.contains("connection") || retries[0].2.contains("closed"),
-        "the sanitized transport cause chain was lost: {}",
-        retries[0].2
-    );
+    assert!(retries[0].2.contains("phase=connection"));
+    assert!(!retries[0].2.contains("Connect"));
+    assert!(!retries[0].2.contains("closed"));
     assert!(!retries[0].2.contains(&uri));
     assert!(!retries[0].2.contains("test-key"));
     assert_eq!(calls.load(Ordering::SeqCst), MAX_CONNECT_ATTEMPTS_FOR_TEST);

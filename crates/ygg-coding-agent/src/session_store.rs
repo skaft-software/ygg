@@ -1084,7 +1084,7 @@ impl SessionStore {
     /// Read optional user-owned session catalog metadata.
     pub fn load_metadata(&self, id: &str) -> anyhow::Result<SessionUserMetadata> {
         let path = self.metadata_path(id)?;
-        let bytes = match crate::auth::read_bounded_regular(&path, MAX_SESSION_METADATA_BYTES) {
+        let bytes = match crate::auth::read_bounded_private(&path, MAX_SESSION_METADATA_BYTES) {
             Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(SessionUserMetadata::default()),
             Err(error) => anyhow::bail!("cannot read session metadata {}: {error}", path.display()),

@@ -29,7 +29,7 @@ use crate::compaction::{
     attempt_compaction, context_window, estimate_next_request_tokens, CompactionOutcome,
 };
 use crate::config::{CompactionMode, ThinkingLevel};
-use crate::modes::RunEnded;
+use crate::modes::{run_ended, RunEnded};
 use crate::presentation::RunId;
 use crate::prompts::{render_and_record, RenderedPrompt};
 use crate::resources::{compose_instructions, expand_skill_command};
@@ -1271,8 +1271,10 @@ where
                     }
                     shell.render();
                     if let AgentEvent::RunFinished { reason, .. } = event {
-                        let ended = RunEnded::from(reason);
-                        return Ok(ended);
+                        let (endpoint, model) = shell
+                            .current_run_route()
+                            .unwrap_or_else(|| ("unknown".to_owned(), "unknown".to_owned()));
+                        return Ok(run_ended(&reason, &endpoint, &model));
                     }
                 }
                 None => {
@@ -2972,6 +2974,11 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         // attempt recomposes from `app.system` and overwrites
                         // this transient composed Agent system before append.
                         shell.restore_composed(retry_composed);
+                        let error = ygg_agent::public_error_diagnostic(
+                            &error,
+                            &app.model.endpoint.id.0,
+                            &app.model.spec.id.0,
+                        );
                         shell.error(format!("prompt was not saved: {error}"));
                         shell.render();
                         continue;

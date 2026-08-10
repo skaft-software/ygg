@@ -16,7 +16,7 @@ use ygg_ai::ToolCallId;
 use sexy_tui_rs::{sanitize_text, ControlPictures, SanitizeOptions};
 
 use crate::app::bootstrap::{build_app, resolve_launch_print, Bootstrap};
-use crate::modes::{timestamp, RunEnded};
+use crate::modes::{run_ended, timestamp, RunEnded};
 use crate::presentation::{
     format_duration, is_hidden_tool_detail, summarize_tool_with_workspace, tool_failure_reason,
     tool_result_is_failure, RunOutcome, RunPhase, RunTracker,
@@ -198,7 +198,7 @@ async fn run_prompt(
     };
     write_prompt(output, theme, &display_prompt)?;
     let run_id = tracker
-        .begin(&app.model.endpoint.id.0)
+        .begin_for_model(&app.model.endpoint.id.0, &app.model.spec.id.0)
         .expect("fresh tracker cannot have an active run");
 
     if let Some(limit) = app.config.max_cost_microdollars {
@@ -253,10 +253,15 @@ async fn run_prompt(
         Err(error) => {
             // Pending extension context remains uncommitted. A later TTY
             // prompt recomposes from `app.system` before touching the Agent.
-            let outcome = tracker.fail(run_id, error.to_string()).expect("active run");
+            let reason = ygg_agent::public_error_diagnostic(
+                &error,
+                &app.model.endpoint.id.0,
+                &app.model.spec.id.0,
+            );
+            let outcome = tracker.fail(run_id, reason.clone()).expect("active run");
             writeln!(output, "{}", style_log(theme, &outcome_text(&outcome)))?;
             output.flush()?;
-            return Ok(PromptExit::Finished(RunEnded::Failed(error.to_string())));
+            return Ok(PromptExit::Finished(RunEnded::Failed(reason)));
         }
     };
     app.executable_extensions
@@ -472,14 +477,11 @@ async fn run_prompt(
                     AgentEvent::SteeringDelivered { .. }
                     | AgentEvent::FollowUpDelivered { .. } => {}
                     AgentEvent::RunFinished { reason, .. } => {
-                        finished = Some(match reason {
-                            ygg_agent::FinishReason::Completed => RunEnded::Completed,
-                            ygg_agent::FinishReason::Aborted => RunEnded::Aborted,
-                            ygg_agent::FinishReason::MaxTurns => RunEnded::MaxTurns,
-                            ygg_agent::FinishReason::Failed(error) => {
-                                RunEnded::Failed(error.to_string())
-                            }
-                        });
+                        finished = Some(run_ended(
+                            reason,
+                            &app.model.endpoint.id.0,
+                            &app.model.spec.id.0,
+                        ));
                         if let Some(outcome) = update.outcome {
                             write_log(output, &mut response_open, theme, &outcome_text(&outcome))?;
                         }

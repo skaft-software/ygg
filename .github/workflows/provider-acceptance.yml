@@ -1,0 +1,106 @@
+name: Stable provider acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact candidate commit selected as this workflow's ref
+        required: true
+        type: string
+      openai_responses_model:
+        description: OpenAI Responses model ID
+        required: true
+        type: string
+      anthropic_model:
+        description: Anthropic Messages model ID
+        required: true
+        type: string
+      openai_chat_provider:
+        description: OpenAI Chat provider ID
+        required: true
+        type: string
+      openai_chat_model:
+        description: OpenAI Chat model ID
+        required: true
+        type: string
+      audio_provider:
+        description: Proven native-audio provider ID
+        required: true
+        type: string
+      audio_model:
+        description: Proven native-audio model ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stable-provider-acceptance-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: Live routes and native audio
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: stable-release-provider-acceptance
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind the protected run to the selected immutable commit
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_sha must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$SOURCE_SHA" ]]; then
+            echo "dispatch the workflow with its ref set to the exact source_sha" >&2
+            exit 1
+          fi
+          test "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_SHA"
+          git diff-index --quiet HEAD --
+      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+      - name: Build the candidate native host
+        run: cargo build --locked --release -p ygg-coding-agent --bin ygg-host
+      - name: Exercise credentialed routes without retaining provider traffic
+        env:
+          YGG_ACCEPTANCE_OPENAI_RESPONSES_MODEL: ${{ inputs.openai_responses_model }}
+          YGG_ACCEPTANCE_OPENAI_API_KEY: ${{ secrets.LIVE_OPENAI_API_KEY }}
+          YGG_ACCEPTANCE_ANTHROPIC_MODEL: ${{ inputs.anthropic_model }}
+          YGG_ACCEPTANCE_ANTHROPIC_API_KEY: ${{ secrets.LIVE_ANTHROPIC_API_KEY }}
+          YGG_ACCEPTANCE_OPENAI_CHAT_PROVIDER: ${{ inputs.openai_chat_provider }}
+          YGG_ACCEPTANCE_OPENAI_CHAT_MODEL: ${{ inputs.openai_chat_model }}
+          YGG_ACCEPTANCE_OPENAI_CHAT_BASE_URL: ${{ secrets.LIVE_OPENAI_CHAT_BASE_URL }}
+          YGG_ACCEPTANCE_OPENAI_CHAT_API_KEY: ${{ secrets.LIVE_OPENAI_CHAT_API_KEY }}
+          YGG_ACCEPTANCE_AUDIO_PROVIDER: ${{ inputs.audio_provider }}
+          YGG_ACCEPTANCE_AUDIO_MODEL: ${{ inputs.audio_model }}
+          YGG_ACCEPTANCE_AUDIO_BASE_URL: ${{ secrets.LIVE_AUDIO_BASE_URL }}
+          YGG_ACCEPTANCE_AUDIO_API_KEY: ${{ secrets.LIVE_AUDIO_API_KEY }}
+        run: scripts/provider-acceptance.py target/release/ygg-host
+      - name: Record immutable acceptance metadata
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          OPENAI_MODEL: ${{ inputs.openai_responses_model }}
+          ANTHROPIC_MODEL: ${{ inputs.anthropic_model }}
+          CHAT_PROVIDER: ${{ inputs.openai_chat_provider }}
+          CHAT_MODEL: ${{ inputs.openai_chat_model }}
+          AUDIO_PROVIDER: ${{ inputs.audio_provider }}
+          AUDIO_MODEL: ${{ inputs.audio_model }}
+        run: |
+          {
+            echo "## Stable provider acceptance"
+            echo
+            echo "- Candidate: \`$SOURCE_SHA\`"
+            echo "- OpenAI Responses: \`$OPENAI_MODEL\`"
+            echo "- Anthropic Messages: \`$ANTHROPIC_MODEL\`"
+            echo "- OpenAI Chat: \`$CHAT_PROVIDER:$CHAT_MODEL\`"
+            echo "- Native audio: \`$AUDIO_PROVIDER:$AUDIO_MODEL\`"
+            echo "- Result: PASS"
+          } >> "$GITHUB_STEP_SUMMARY"

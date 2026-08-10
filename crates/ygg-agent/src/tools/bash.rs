@@ -151,6 +151,8 @@ impl BashTool {
         };
 
         command
+            .env_clear()
+            .envs(crate::extension_process::sanitized_subprocess_environment())
             .current_dir(&workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

@@ -8,12 +8,43 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use ygg_ai::CacheCompatibility;
 
 const MAX_CREDENTIAL_BYTES: usize = 1024 * 1024;
 const MAX_MODEL_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const REGISTRY_VERSION: u8 = 1;
 const LEGACY_PROVIDER_ID: &str = "custom-openai";
+
+fn cache_modified_is_stale(modified: std::time::SystemTime, max_age: std::time::Duration) -> bool {
+    modified.elapsed().map_or(true, |age| age >= max_age)
+}
+
+fn cache_path_component(provider_id: &str) -> String {
+    // File-name sanitization is lossy (`a/b` and `a:b` would both become
+    // `a_b`). Bind every non-legacy cache name to the complete source ID.
+    let readable = provider_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect::<String>();
+    let readable = if readable.is_empty() {
+        "provider"
+    } else {
+        &readable
+    };
+    let digest = Sha256::digest(provider_id.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{readable}-{digest}")
+}
 
 /// Configuration for one custom OpenAI-compatible endpoint.
 #[derive(Clone, Serialize, Deserialize)]
@@ -275,18 +306,9 @@ impl CredentialStore {
         if provider_id == LEGACY_PROVIDER_ID {
             self.path.with_file_name(format!("{stem}-models.json"))
         } else {
-            let safe_id = provider_id
-                .chars()
-                .map(|character| {
-                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
-                        character
-                    } else {
-                        '_'
-                    }
-                })
-                .collect::<String>();
+            let component = cache_path_component(provider_id);
             self.path
-                .with_file_name(format!("{stem}-models-{safe_id}.json"))
+                .with_file_name(format!("{stem}-models-{component}.json"))
         }
     }
 
@@ -300,7 +322,7 @@ impl CredentialStore {
     /// `custom-openai` provider. It is never treated as a separate runtime
     /// abstraction.
     pub fn load_registry(&self) -> Result<Option<CustomRegistry>> {
-        let Some(bytes) = crate::auth::read_bounded_regular(&self.path, MAX_CREDENTIAL_BYTES)
+        let Some(bytes) = crate::auth::read_bounded_private(&self.path, MAX_CREDENTIAL_BYTES)
             .with_context(|| format!("reading {}", self.path.display()))?
         else {
             return Ok(None);
@@ -381,7 +403,7 @@ impl CredentialStore {
     /// credential so startup never rewrites or exposes the secret-bearing file.
     pub(crate) fn load_model_cache_for(&self, provider_id: &str) -> Result<Option<Vec<u8>>> {
         let path = self.model_cache_path_for(provider_id);
-        crate::auth::read_bounded_regular(&path, MAX_MODEL_CACHE_BYTES)
+        crate::auth::read_bounded_private(&path, MAX_MODEL_CACHE_BYTES)
             .with_context(|| format!("reading {}", path.display()))
     }
 
@@ -395,16 +417,6 @@ impl CredentialStore {
     /// the credential itself.
     pub(crate) fn save_model_cache_for(&self, provider_id: &str, bytes: &[u8]) -> Result<()> {
         let path = self.model_cache_path_for(provider_id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                    .with_context(|| format!("restricting {}", parent.display()))?;
-            }
-        }
         write_private(&path, bytes).with_context(|| format!("writing {}", path.display()))
     }
 
@@ -425,7 +437,7 @@ impl CredentialStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
             Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
         };
-        Ok(modified.elapsed().is_ok_and(|age| age >= max_age))
+        Ok(cache_modified_is_stale(modified, max_age))
     }
 
     /// Load prompt-cache compatibility controls for the sole configured
@@ -492,16 +504,6 @@ impl CredentialStore {
                 registry.version
             );
         }
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                    .with_context(|| format!("restricting {}", parent.display()))?;
-            }
-        }
         let bytes = serde_json::to_vec_pretty(registry)?;
         write_private(&self.path, &bytes)
             .with_context(|| format!("writing {}", self.path.display()))
@@ -549,35 +551,29 @@ fn remove_if_present(path: &Path) -> Result<()> {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "credential path has no parent",
-        )
-    })?;
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".custom-credential-")
-        .tempfile_in(parent)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        temporary
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::io::Write::write_all(&mut temporary, bytes)?;
-    std::io::Write::flush(&mut temporary)?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-
-    #[cfg(unix)]
-    std::fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    ygg_agent::secure_fs::write_private_atomic(path, bytes, MAX_MODEL_CACHE_BYTES)
+        .map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_private_fixture(path: &Path, bytes: impl AsRef<[u8]>) {
+        ygg_agent::secure_fs::write_private_atomic(path, bytes.as_ref(), 64 * 1024).unwrap();
+    }
+
+    #[test]
+    fn provider_cache_components_do_not_collide_and_future_entries_are_stale() {
+        assert_ne!(
+            cache_path_component("provider/a"),
+            cache_path_component("provider:a")
+        );
+        assert!(cache_modified_is_stale(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(1),
+        ));
+    }
 
     #[test]
     fn round_trips_and_is_owner_only() {
@@ -721,16 +717,14 @@ mod tests {
     fn legacy_file_normalizes_to_one_provider_and_preserves_legacy_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials/custom.json");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
+        write_private_fixture(
             &path,
             r#"{
                 "base_url": "http://localhost:1234/v1/",
                 "api_name": "legacy-model",
                 "cache": { "supports_long_retention": false }
             }"#,
-        )
-        .unwrap();
+        );
 
         let registry = CredentialStore::new(&path)
             .load_registry()
@@ -839,8 +833,7 @@ mod tests {
     fn custom_cache_compatibility_is_loaded_without_changing_legacy_shape() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials/custom.json");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
+        write_private_fixture(
             &path,
             r#"{
                 "base_url": "http://localhost:1234/v1/",
@@ -850,8 +843,7 @@ mod tests {
                     "supports_long_retention": false
                 }
             }"#,
-        )
-        .unwrap();
+        );
 
         let cache = CredentialStore::new(&path)
             .load_cache_compatibility()
@@ -888,15 +880,13 @@ mod tests {
     fn custom_startup_timeout_is_loaded_and_preserved_on_save() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials/custom.json");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
+        write_private_fixture(
             &path,
             r#"{
                 "base_url": "http://localhost:1234/v1/",
                 "startup_timeout_secs": 420
             }"#,
-        )
-        .unwrap();
+        );
 
         let store = CredentialStore::new(&path);
         assert_eq!(store.load_startup_timeout_secs().unwrap(), Some(420));

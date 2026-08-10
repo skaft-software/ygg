@@ -290,12 +290,34 @@ fn page_and_xref_object_limits_are_enforced_before_extraction() {
         ingest_document("objects.pdf", "application/pdf", Bytes::from(xref_bomb)),
         Err(DocumentIngestError::PdfObjectLimit)
     );
+}
 
-    let mut nested = Object::Integer(1);
-    for _ in 0..=MAX_PDF_NESTING_DEPTH {
-        nested = Object::Array(vec![nested]);
-    }
-    let nested = ordinary_pdf(&["hello"], false, Some(nested));
+#[test]
+fn deeply_nested_pdf_is_rejected_by_bounded_preflight() {
+    // Keep this far beyond ordinary parser recursion. Ygg's iterative syntax
+    // scan must reject it at the explicit nesting bound before lopdf parses it.
+    let depth = MAX_PDF_NESTING_DEPTH * 64;
+    let marker = vec![b'y'; depth * 2 - 1];
+    let mut nested = ordinary_pdf(
+        &["hello"],
+        false,
+        Some(Object::string_literal(marker.clone())),
+    );
+    let mut literal = Vec::with_capacity(marker.len() + 2);
+    literal.push(b'(');
+    literal.extend_from_slice(&marker);
+    literal.push(b')');
+    let offset = nested
+        .windows(literal.len())
+        .position(|candidate| candidate == literal)
+        .expect("literal nesting placeholder");
+    let mut replacement = Vec::with_capacity(literal.len());
+    replacement.extend(std::iter::repeat_n(b'[', depth));
+    replacement.push(b'1');
+    replacement.extend(std::iter::repeat_n(b']', depth));
+    assert_eq!(replacement.len(), literal.len());
+    nested[offset..offset + literal.len()].copy_from_slice(&replacement);
+
     assert_eq!(
         ingest_document("nested.pdf", "application/pdf", Bytes::from(nested)),
         Err(DocumentIngestError::PdfObjectLimit)

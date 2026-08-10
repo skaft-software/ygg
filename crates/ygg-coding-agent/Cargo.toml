@@ -19,17 +19,25 @@ serve = ["dep:getrandom", "dep:ygg-serve-backend", "tokio/net", "tokio/signal"]
 [lints]
 workspace = true
 
+[lib]
+name = "ygg_sdk"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ygg"
 path = "src/main.rs"
 
+[[bin]]
+name = "ygg-host"
+path = "src/bin/ygg-host.rs"
+
 [dependencies]
-ygg-ai = { version = "=0.3.3-alpha", path = "../ygg-ai" }
-ygg-agent = { version = "=0.3.3-alpha", path = "../ygg-agent" }
+ygg-ai = { version = "=0.3.3", path = "../ygg-ai" }
+ygg-agent = { version = "=0.3.3", path = "../ygg-agent" }
 # Vendored semantic rich-rendering integration. Keeping it in this workspace
 # makes fresh clones build the exact implementation reviewed with Ygg.
 sexy-tui-rs = { version = "=0.3.1", path = "../sexy-tui-rs" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "process", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "io-std", "process", "sync"] }
 crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
 futures-util = "0.3"
 tokio-stream = "0.1"

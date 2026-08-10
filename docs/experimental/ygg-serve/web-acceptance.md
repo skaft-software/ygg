@@ -57,9 +57,14 @@ inspection evidence.
 - Reconnect replays missing events; a replay gap replaces state from a complete
   authoritative snapshot.
 - Host, origin, request, frame, replay, and attachment bounds are enforced.
-- Public errors are sanitized.
+- Public errors are sanitized. Configured-provider failures identify the
+  provider/model and failure phase or bounded HTTP status without exposing
+  provider bodies, prompts, request IDs, error codes, or credentials.
 - Invalid, oversized, aliased, or symlinked persisted pull-request evidence fails
   closed; temporary GitHub unavailability never erases the last valid state.
+- PDF ingestion rejects deeply nested direct structures in an iterative bounded
+  preflight before invoking the parser; hostile-input regression coverage uses a
+  fixture far beyond the accepted nesting limit.
 - Generated HTML cannot access the main app or host bridge.
 - Production performs no analytics, remote-font, CDN, or hosted-control-plane
   request.
@@ -114,4 +119,8 @@ inspection evidence.
   and feature-gated coding-agent seam.
 - Generated server assets exactly match the tested frontend source.
 - Focused Rust and web tests pass before full workspace tests.
+- The configured-provider process test uses only a disposable loopback fixture
+  and an allowlisted child environment. Credentialed provider checks are
+  separately approved and recorded against the immutable stable-release SHA as
+  described in [configured-provider acceptance](provider-acceptance.md).
 - The main checkout remains untouched.

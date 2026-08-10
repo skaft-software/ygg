@@ -539,7 +539,7 @@ pinned `apps/web/.node-version` runtime, Node `v22.13.0`.
 | Web lint, typecheck, typography, production build, same-origin/CSP audit, and embedded-bundle check | Pass |
 | Web unit tests | Full Vitest suite passed |
 | Fixture Playwright matrix | Every applicable test passed for desktop, tablet landscape, tablet portrait, mobile, and mobile-small |
-| Production-host Playwright | 1/1 passed against the real Rust host and a deterministic local OpenAI-compatible provider |
+| Production-host Playwright | 1/1 passed against the real Rust host and a disposable local OpenAI-compatible provider; authentication/model selection, streaming, tool replay, `429`/`408` retries, explicit compaction, restart/resume, cancellation, and secret-safe failure projection are covered |
 | `ygg-agent` tests | 200 passed |
 | Coding-agent tests with `serve` | 671 passed |
 | Full Rust workspace tests | All targets/all features and documentation tests passed |
@@ -556,8 +556,10 @@ pinned `apps/web/.node-version` runtime, Node `v22.13.0`.
 
 `lopdf` is pinned to `0.42.0`; the independent serve manifest and lockfile are
 kept explicit so the PDF parser remains on the audited version. Serve retains
-its own strict PDF header, envelope, classic-xref, revision, size, and object
-limits around that parser.
+its own strict PDF header, envelope, classic-xref, revision, size, object, and
+nesting limits around that parser. A hostile-input regression constructs 4,096
+direct nesting levels and verifies Ygg's iterative preflight rejects the input at
+its 64-level bound before `lopdf` parsing.
 
 The fixture matrix was split by configured Playwright project after the combined
 155-test invocation exceeded the command runner's 120-second limit; no test
@@ -565,10 +567,12 @@ failure caused that timeout. Every project then passed independently under the
 pinned Node runtime.
 
 The production-host Playwright test uses the real Rust host, real session
-adapter, and real provider request path with a deterministic local
-OpenAI-compatible provider. It proves the integration without requiring an
-external model. Final acceptance against a user's actual configured provider
-remains outstanding.
+adapter, and real provider request path with a disposable local
+OpenAI-compatible provider. It now covers the configured-provider conformance
+scenarios listed above without inheriting external credentials. Credentialed
+checks remain a separate stable-release gate; their supported routes, required
+environment variables, handling rules, and current `v0.3.3` results are recorded
+in [configured-provider acceptance](provider-acceptance.md).
 
 The synchronized embedded bundle has SHA-256:
 
@@ -651,8 +655,8 @@ evidence.
 
 1. Rebase or compare the forward-gated delta against the intended merge target
    and review any surviving pre-`eebe738` core changes explicitly.
-2. Run the experimental release workflow against a clean `v0.3.3-alpha` (or
-   later alpha) tag and retain the checksum/signature verification output.
+2. Run the experimental release workflow against a clean `v0.3.3` (or
+   later stable) tag and retain the checksum/signature verification output.
 3. Run `ygg serve` against a user's real provider and exercise:
    - fresh-session creation;
    - real prompt and streaming;

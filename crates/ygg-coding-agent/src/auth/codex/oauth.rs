@@ -3,6 +3,8 @@
 //! OpenAI device authorization, token exchange/refresh, and JWT claim
 //! validation. The flow mirrors Pi's TypeScript OpenAI Codex OAuth provider.
 
+use std::fmt;
+
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -91,11 +93,22 @@ impl ChatGptPlan {
     }
 }
 
-/// Non-secret routing and entitlement claims derived from a subscription JWT.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Routing and entitlement claims derived from a subscription JWT. Account
+/// identity is redacted from diagnostics.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SubscriptionClaims {
     pub account_id: String,
     pub plan: Option<ChatGptPlan>,
+}
+
+impl fmt::Debug for SubscriptionClaims {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubscriptionClaims")
+            .field("account_id", &"[REDACTED]")
+            .field("plan", &self.plan)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -438,10 +451,11 @@ mod tests {
         let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
         let token = format!("h.{encoded}.s");
         assert_eq!(validate_subscription_token(&token).unwrap(), "acct_123");
-        assert_eq!(
-            subscription_claims(&token).unwrap().plan,
-            Some(ChatGptPlan::Pro)
-        );
+        let claims = subscription_claims(&token).unwrap();
+        assert_eq!(claims.plan, Some(ChatGptPlan::Pro));
+        let debug = format!("{claims:?}");
+        assert!(!debug.contains("acct_123"), "{debug}");
+        assert!(debug.contains("[REDACTED]"), "{debug}");
         assert!(validate_subscription_token("not-a-jwt").is_err());
         assert!(validate_subscription_token(&format!("h.{encoded}")).is_err());
 

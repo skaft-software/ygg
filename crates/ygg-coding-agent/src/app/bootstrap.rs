@@ -10,6 +10,7 @@ use anyhow::Context;
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
 use sha2::{Digest as _, Sha256};
+use ygg_agent::secure_fs::{create_regular_file_for_append, open_regular_file_for_append};
 use ygg_agent::{
     Agent, AgentCompactionMode, AgentConfig, CoreTools, EntryValue, ExtensionHost, Session,
     SkillRegistry,
@@ -46,6 +47,16 @@ pub struct Bootstrap {
     /// Session opened while resolving resume provenance. Keeping it here
     /// avoids replaying the same JSONL file a second time in `build_app`.
     prepared_session: RefCell<Option<Session>>,
+}
+
+impl Bootstrap {
+    /// Supply an already-open session for the next launch.
+    ///
+    /// Hosts use this to keep authorization bound to a caller-opened file
+    /// descriptor instead of reopening the session by pathname in `build_app`.
+    pub(crate) fn set_prepared_session(&mut self, session: Session) {
+        *self.prepared_session.get_mut() = Some(session);
+    }
 }
 
 /// Selected persistent session operation.
@@ -264,6 +275,9 @@ fn custom_credential_fingerprint(api_key: &str, headers: &http::HeaderMap) -> St
 }
 
 fn provider_inventory_cache_path(provider_id: &str) -> PathBuf {
+    // Keep a short readable prefix for diagnostics, but include the complete
+    // digest of the original identifier. Replacing punctuation with `_` alone
+    // lets distinct provider IDs map to the same cache file.
     let safe_id = provider_id
         .chars()
         .map(|character| {
@@ -273,13 +287,20 @@ fn provider_inventory_cache_path(provider_id: &str) -> PathBuf {
                 '_'
             }
         })
+        .take(64)
         .collect::<String>();
+    let readable = if safe_id.is_empty() {
+        "provider"
+    } else {
+        safe_id.as_str()
+    };
+    let digest = fingerprint_bytes(provider_id.as_bytes());
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".ygg")
         .join("cache")
         .join("model-inventories")
-        .join(format!("{safe_id}.json"))
+        .join(format!("{readable}-{digest}.json"))
 }
 
 fn load_provider_inventory_cache(
@@ -288,7 +309,7 @@ fn load_provider_inventory_cache(
     inventory_url: &str,
     credential_fingerprint: &str,
 ) -> anyhow::Result<Option<CachedProviderInventory>> {
-    let Some(bytes) = crate::auth::read_bounded_regular(path, MAX_PROVIDER_INVENTORY_CACHE_BYTES)?
+    let Some(bytes) = crate::auth::read_bounded_private(path, MAX_PROVIDER_INVENTORY_CACHE_BYTES)?
     else {
         return Ok(None);
     };
@@ -324,12 +345,20 @@ fn save_provider_inventory_cache(
     crate::auth::write_private_atomic(path, &serde_json::to_vec(&cache)?, ".provider-models-")
 }
 
+fn cache_modified_is_stale(modified: std::time::SystemTime, refresh_interval: Duration) -> bool {
+    // A clock rollback or attacker-controlled future timestamp must never pin a
+    // cache entry indefinitely. Treat an unmeasurable age as stale.
+    modified
+        .elapsed()
+        .map_or(true, |age| age >= refresh_interval)
+}
+
 fn provider_inventory_cache_is_stale(path: &std::path::Path) -> bool {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.elapsed().ok())
-        .is_none_or(|age| age >= PROVIDER_INVENTORY_REFRESH_INTERVAL)
+        .map_or(true, |modified| {
+            cache_modified_is_stale(modified, PROVIDER_INVENTORY_REFRESH_INTERVAL)
+        })
 }
 
 fn fetch_provider_inventory(
@@ -770,10 +799,10 @@ fn get_models_json_blocking(
         .get(url)
         .headers(headers)
         .send()
-        .map_err(|error| anyhow::anyhow!("GET {url} failed: {error}"))?
+        .map_err(|_| anyhow::anyhow!("model discovery request failed"))?
         .error_for_status()
-        .map_err(|error| anyhow::anyhow!("GET {url} failed: {error}"))?;
-    bounded_discovery_json(response, &format!("models response from {url}"))
+        .map_err(|_| anyhow::anyhow!("model discovery request was rejected"))?;
+    bounded_discovery_json(response, "model discovery")
 }
 
 fn has_api_model(catalog: &ModelCatalog, endpoint: &str, api_name: &str) -> bool {
@@ -3482,7 +3511,11 @@ fn launch_configuration_parts(
     ReasoningMode,
 )> {
     let prepared = match session {
-        SessionSelection::OpenExisting(path) => Some(Session::open(path)?),
+        SessionSelection::OpenExisting(path) => {
+            let descriptor_path = descriptor_session_path(path)?;
+            let file = open_regular_file_for_append(&descriptor_path)?;
+            Some(Session::open_with_file(path, file)?)
+        }
         SessionSelection::CreateNew(_) => None,
     };
     let persisted = prepared
@@ -3627,13 +3660,28 @@ pub fn tool_schema_reserve(definitions: &[ToolDef]) -> u64 {
 }
 
 fn create_private_session_dir(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    ygg_agent::secure_fs::create_private_directory_all(path).map_err(std::io::Error::other)
+}
+
+fn descriptor_session_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session path must be absolute and identify a file",
+        ));
     }
-    Ok(())
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session path must not contain traversal components",
+        ));
+    }
+    Ok(path.to_owned())
 }
 
 fn validate_explicit_tool_policy(
@@ -3720,11 +3768,17 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
             if let Some(parent) = path.parent() {
                 create_private_session_dir(parent)?;
             }
-            Session::create(path)?
+            let descriptor_path = descriptor_session_path(&path)?;
+            let file = create_regular_file_for_append(&descriptor_path)?;
+            Session::create_with_file(path, file)?
         }
         SessionSelection::OpenExisting(path) => match prepared_session.take() {
             Some(session) if session.path() == path => session,
-            _ => Session::open(path)?,
+            _ => {
+                let descriptor_path = descriptor_session_path(&path)?;
+                let file = open_regular_file_for_append(&descriptor_path)?;
+                Session::open_with_file(path, file)?
+            }
         },
     };
 
@@ -3836,7 +3890,9 @@ pub fn rebuild_app(
 
     let (persisted, mut prepared_session) = match selection.as_ref() {
         Some(SessionSelection::OpenExisting(path)) => {
-            let session = Session::open(path)?;
+            let descriptor_path = descriptor_session_path(path)?;
+            let file = open_regular_file_for_append(&descriptor_path)?;
+            let session = Session::open_with_file(path, file)?;
             let persisted = persisted_session_config(&session)?;
             (persisted, Some(session))
         }
@@ -3883,13 +3939,23 @@ pub fn rebuild_app(
             if let Some(parent) = path.parent() {
                 create_private_session_dir(parent)?;
             }
-            Session::create(path)?
+            let descriptor_path = descriptor_session_path(&path)?;
+            let file = create_regular_file_for_append(&descriptor_path)?;
+            Session::create_with_file(path, file)?
         }
         Some(SessionSelection::OpenExisting(path)) => match prepared_session.take() {
             Some(session) if session.path() == path => session,
-            _ => Session::open(path)?,
+            _ => {
+                let descriptor_path = descriptor_session_path(&path)?;
+                let file = open_regular_file_for_append(&descriptor_path)?;
+                Session::open_with_file(path, file)?
+            }
         },
-        None => Session::open(current_path)?,
+        None => {
+            let descriptor_path = descriptor_session_path(&current_path)?;
+            let file = open_regular_file_for_append(&descriptor_path)?;
+            Session::open_with_file(current_path, file)?
+        }
     };
     append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
 

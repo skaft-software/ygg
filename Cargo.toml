@@ -9,7 +9,7 @@ members = [
 exclude = ["extensions/ygg-serve"]
 
 [workspace.package]
-version = "0.3.3-alpha"
+version = "0.3.3"
 edition = "2021"
 authors = ["Skaft Software"]
 repository = "https://github.com/skaft-software/ygg"

@@ -1,8 +1,6 @@
 //! Private, bounded storage for browser-ingested image attachments.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use ygg_agent::secure_fs::{self, SecureFileError};
 
 use crate::{sanitize_public_text, AttachmentPolicy, AttachmentRef, SessionId};
 
@@ -319,18 +318,20 @@ impl AttachmentStore {
         let reservation = self.reserve_quota(stored.byte_len, &handle)?;
 
         let blob_path = self.inner.blobs.join(format!("{handle}.blob"));
-        atomic_write(&self.inner.blobs, &blob_path, &bytes)?;
+        atomic_write(&blob_path, &bytes, MAX_ATTACHMENT_FILE_BYTES)?;
         let metadata_bytes = serde_json::to_vec(&stored).map_err(|_| AttachmentError::Storage)?;
         let metadata_path = self.inner.metadata.join(format!("{handle}.json"));
-        if let Err(error) = atomic_write(&self.inner.metadata, &metadata_path, &metadata_bytes) {
-            let _ = std::fs::remove_file(&blob_path);
+        if let Err(error) =
+            atomic_write(&metadata_path, &metadata_bytes, MAX_METADATA_BYTES as usize)
+        {
+            let _ = remove_file_if_exists(&blob_path);
             return Err(error);
         }
 
         let reference = stored.attachment_ref();
         if let Err(error) = reservation.commit(stored) {
-            let _ = std::fs::remove_file(&metadata_path);
-            let _ = std::fs::remove_file(&blob_path);
+            let _ = remove_file_if_exists(&metadata_path);
+            let _ = remove_file_if_exists(&blob_path);
             return Err(error);
         }
         Ok(reference)
@@ -540,15 +541,10 @@ impl AttachmentStore {
             remove_file_if_exists(&self.inner.metadata.join(format!("{handle}.json")))?;
             remove_file_if_exists(&self.inner.blobs.join(format!("{handle}.blob")))?;
         }
-        sync_directory(&self.inner.metadata)?;
-        sync_directory(&self.inner.blobs)?;
-
         for key in &removed_keys {
             let file_key = sha256_hex(format!("{}\0{}", key.session_id, key.durable_entry_id));
             remove_file_if_exists(&self.inner.associations.join(format!("{file_key}.json")))?;
         }
-        sync_directory(&self.inner.associations)?;
-
         for key in removed_keys {
             index.associations.remove(&key);
         }
@@ -604,9 +600,9 @@ impl AttachmentStore {
             sha256_hex(format!("{}\0{}", session_id.as_str(), durable_entry_id).as_bytes())
         );
         atomic_write(
-            &self.inner.associations,
             &self.inner.associations.join(file_name),
             &bytes,
+            MAX_ASSOCIATION_BYTES as usize,
         )?;
         let key = AssociationKey {
             session_id: session_id.as_str().to_owned(),
@@ -731,33 +727,7 @@ fn valid_handle(value: &str) -> bool {
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), AttachmentError> {
-    match path.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_dir() => {}
-        Ok(_) => return Err(AttachmentError::Storage),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-                builder.mode(0o700);
-            }
-            builder.create(path).map_err(|_| AttachmentError::Storage)?;
-        }
-        Err(_) => return Err(AttachmentError::Storage),
-    }
-    let metadata = path
-        .symlink_metadata()
-        .map_err(|_| AttachmentError::Storage)?;
-    if !metadata.file_type().is_dir() {
-        return Err(AttachmentError::Storage);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| AttachmentError::Storage)?;
-    }
-    Ok(())
+    secure_fs::create_private_directory_all(path).map_err(|_| AttachmentError::Storage)
 }
 
 fn cleanup_temporary_files(directory: &Path) -> Result<(), AttachmentError> {
@@ -765,11 +735,15 @@ fn cleanup_temporary_files(directory: &Path) -> Result<(), AttachmentError> {
     for entry in entries {
         let entry = entry.map_err(|_| AttachmentError::Storage)?;
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with(".tmp-") {
+        let name = name.to_string_lossy();
+        if name.starts_with(".tmp-")
+            || name.starts_with(".ygg-tmp-")
+            || name.starts_with(".ygg-delete-")
+        {
             remove_file_if_exists(&entry.path())?;
         }
     }
-    sync_directory(directory)
+    Ok(())
 }
 
 fn load_metadata(
@@ -797,10 +771,10 @@ fn load_metadata(
             continue;
         }
         let blob_path = blobs_dir.join(format!("{handle}.blob"));
-        let Ok(blob_metadata) = blob_path.symlink_metadata() else {
+        let Ok(blob) = read_regular_file(&blob_path, metadata.byte_len) else {
             continue;
         };
-        if !blob_metadata.file_type().is_file() || blob_metadata.len() != metadata.byte_len {
+        if blob.len() as u64 != metadata.byte_len {
             continue;
         }
         if index.metadata.len() >= MAX_STORED_ATTACHMENTS
@@ -882,7 +856,7 @@ fn cleanup_handle_files(
             remove_file_if_exists(&entry.path())?;
         }
     }
-    sync_directory(directory)
+    Ok(())
 }
 
 fn cleanup_unindexed_associations(
@@ -912,72 +886,28 @@ fn valid_stored_metadata(metadata: &StoredMetadata, expected_handle: &str) -> bo
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn remove_file_if_exists(path: &Path) -> Result<(), AttachmentError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(AttachmentError::Storage),
+fn attachment_error(error: SecureFileError) -> AttachmentError {
+    match error {
+        SecureFileError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            AttachmentError::NotFound
+        }
+        _ => AttachmentError::Storage,
     }
 }
 
-fn atomic_write(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<(), AttachmentError> {
-    let temp_path = directory.join(format!(".tmp-{}", random_hex(16)?));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options
-        .open(&temp_path)
-        .map_err(|_| AttachmentError::Storage)?;
-    if file.write_all(bytes).is_err() || file.sync_all().is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(AttachmentError::Storage);
-    }
-    drop(file);
-    if destination.exists() || std::fs::rename(&temp_path, destination).is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(AttachmentError::Storage);
-    }
-    sync_directory(directory)?;
-    Ok(())
+fn remove_file_if_exists(path: &Path) -> Result<(), AttachmentError> {
+    secure_fs::remove_regular_file_if_exists(path)
+        .map(|_| ())
+        .map_err(attachment_error)
+}
+
+fn atomic_write(destination: &Path, bytes: &[u8], limit: usize) -> Result<(), AttachmentError> {
+    secure_fs::write_private_atomic(destination, bytes, limit).map_err(attachment_error)
 }
 
 fn read_regular_file(path: &Path, expected_or_max_bytes: u64) -> Result<Vec<u8>, AttachmentError> {
-    let metadata = path.symlink_metadata().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            AttachmentError::NotFound
-        } else {
-            AttachmentError::Storage
-        }
-    })?;
-    if !metadata.file_type().is_file() || metadata.len() > expected_or_max_bytes {
-        return Err(AttachmentError::Storage);
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path).map_err(|_| AttachmentError::Storage)?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    std::io::Read::by_ref(&mut file)
-        .take(expected_or_max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| AttachmentError::Storage)?;
-    if bytes.len() as u64 > expected_or_max_bytes {
-        return Err(AttachmentError::Storage);
-    }
-    Ok(bytes)
-}
-
-fn sync_directory(path: &Path) -> Result<(), AttachmentError> {
-    let directory = File::open(path).map_err(|_| AttachmentError::Storage)?;
-    directory.sync_all().map_err(|_| AttachmentError::Storage)
+    let limit = usize::try_from(expected_or_max_bytes).map_err(|_| AttachmentError::Storage)?;
+    secure_fs::read_private_file_bounded(path, limit).map_err(attachment_error)
 }
 
 fn random_hex(byte_len: usize) -> Result<String, AttachmentError> {
@@ -1360,6 +1290,28 @@ mod tests {
         assert!(!orphan_blob.exists());
         assert!(!orphan_metadata.exists());
         assert!(!orphan_association.exists());
+    }
+
+    #[test]
+    fn startup_cleans_secure_filesystem_recovery_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AttachmentStore::open(directory.path()).unwrap();
+        let root = store.root().to_owned();
+        let leftovers = [
+            root.join("blobs").join(".tmp-legacy-write"),
+            root.join("metadata").join(".ygg-tmp-interrupted-write"),
+            root.join("associations")
+                .join(".ygg-delete-interrupted-cleanup"),
+        ];
+        for leftover in &leftovers {
+            std::fs::write(leftover, b"incomplete").unwrap();
+        }
+        drop(store);
+
+        AttachmentStore::open(directory.path()).unwrap();
+        for leftover in leftovers {
+            assert!(!leftover.exists(), "{} was not cleaned", leftover.display());
+        }
     }
 
     fn fake_metadata(handle: String) -> StoredMetadata {

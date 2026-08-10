@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -23,6 +23,7 @@ const MAX_CHECKSUM_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ENTRYPOINT_BYTES: u64 = 384 * 1024 * 1024;
+const MAX_EXPANDED_ARCHIVE_BYTES: u64 = MAX_ENTRYPOINT_BYTES + MAX_MANIFEST_BYTES;
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum ExtensionCommand {
@@ -145,10 +146,14 @@ pub fn run_serve(no_open: bool, port: u16, web_root: Option<PathBuf>) -> anyhow:
     })?;
     let package_dir = root.join(PACKAGE_ID);
     let entrypoint = package_dir.join(&manifest.entrypoint.path);
-    validate_entrypoint(&entrypoint, &manifest.entrypoint.sha256)?;
+    let (_entrypoint_snapshot, staged_entrypoint) =
+        stage_validated_entrypoint(&entrypoint, &manifest.entrypoint.sha256)?;
 
-    let mut command = Command::new(&entrypoint);
-    command.args(&manifest.entrypoint.args);
+    let mut command = Command::new(&staged_entrypoint);
+    command
+        .env_clear()
+        .envs(ygg_agent::extension_process::sanitized_subprocess_environment())
+        .args(&manifest.entrypoint.args);
     if no_open {
         command.arg("--no-open");
     }
@@ -189,7 +194,7 @@ fn validate_supported_name(name: &str) -> anyhow::Result<()> {
         Ok(())
     } else {
         anyhow::bail!(
-            "unsupported application extension {name:?}; this alpha supports only {PACKAGE_ID:?}"
+            "unsupported application extension {name:?}; this release supports only {PACKAGE_ID:?}"
         )
     }
 }
@@ -272,6 +277,14 @@ fn install_archive(
     archive_sha256: &str,
     replace: bool,
 ) -> anyhow::Result<PackageManifest> {
+    let mut archive_file = open_archive_snapshot(archive)?;
+    let bound_digest = sha256_open_file_bounded(&mut archive_file, MAX_ARCHIVE_BYTES)?;
+    if bound_digest != archive_sha256 {
+        anyhow::bail!(
+            "package archive changed before extraction: expected {archive_sha256}, found {bound_digest}"
+        );
+    }
+    archive_file.rewind()?;
     let _lock = acquire_lock(root)?;
     let destination = root.join(PACKAGE_ID);
     match fs::symlink_metadata(&destination) {
@@ -296,7 +309,7 @@ fn install_archive(
         .prefix(".ygg-serve-install-")
         .tempdir_in(root)
         .context("cannot create extension staging directory")?;
-    extract_archive(archive, staging.path())?;
+    extract_archive_reader(&mut archive_file, staging.path())?;
     let manifest = load_manifest(&staging.path().join(PACKAGE_MANIFEST))?;
     validate_manifest(&manifest)?;
     let entrypoint = staging.path().join(&manifest.entrypoint.path);
@@ -356,10 +369,37 @@ fn publish_staging(
     Ok(())
 }
 
-fn extract_archive(archive: &Path, destination: &Path) -> anyhow::Result<()> {
-    let file = File::open(archive)
-        .with_context(|| format!("cannot open package archive {}", archive.display()))?;
-    let decoder = GzDecoder::new(BufReader::new(file));
+fn open_archive_snapshot(path: &Path) -> anyhow::Result<File> {
+    let file = ygg_agent::secure_fs::open_regular_file_for_read(path)
+        .with_context(|| format!("cannot open package archive {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_ARCHIVE_BYTES {
+        anyhow::bail!(
+            "package archive {} exceeds the {MAX_ARCHIVE_BYTES}-byte limit",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+fn sha256_open_file_bounded(file: &mut File, maximum: u64) -> anyhow::Result<String> {
+    file.rewind()?;
+    let mut hasher = Sha256::new();
+    let copied = io::copy(&mut Read::by_ref(file).take(maximum + 1), &mut hasher)?;
+    if copied > maximum {
+        anyhow::bail!("package archive exceeds the {maximum}-byte limit");
+    }
+    Ok(digest_hex(&hasher.finalize()))
+}
+
+#[cfg(test)]
+fn extract_archive(path: &Path, destination: &Path) -> anyhow::Result<()> {
+    let mut file = open_archive_snapshot(path)?;
+    extract_archive_reader(&mut file, destination)
+}
+
+fn extract_archive_reader<R: Read>(reader: R, destination: &Path) -> anyhow::Result<()> {
+    let decoder = GzDecoder::new(BufReader::new(reader));
     let mut archive = tar::Archive::new(decoder);
     let bin = destination.join("bin");
     fs::create_dir(&bin).context("cannot create package bin directory")?;
@@ -368,6 +408,7 @@ fn extract_archive(archive: &Path, destination: &Path) -> anyhow::Result<()> {
     let mut found_bin = false;
     let mut found_manifest = false;
     let mut found_entrypoint = false;
+    let mut expanded_bytes = 0u64;
     for entry in archive.entries().context("cannot read package archive")? {
         let mut entry = entry.context("cannot read package archive entry")?;
         let path = entry
@@ -404,6 +445,7 @@ fn extract_archive(archive: &Path, destination: &Path) -> anyhow::Result<()> {
                     anyhow::bail!("package archive contains duplicate {PACKAGE_MANIFEST}");
                 }
                 require_regular_entry(&entry, &path)?;
+                account_expanded_entry(&entry, &mut expanded_bytes)?;
                 copy_archive_entry(
                     &mut entry,
                     &destination.join(PACKAGE_MANIFEST),
@@ -416,6 +458,7 @@ fn extract_archive(archive: &Path, destination: &Path) -> anyhow::Result<()> {
                     anyhow::bail!("package archive contains duplicate {ENTRYPOINT}");
                 }
                 require_regular_entry(&entry, &path)?;
+                account_expanded_entry(&entry, &mut expanded_bytes)?;
                 copy_archive_entry(
                     &mut entry,
                     &destination.join(ENTRYPOINT),
@@ -487,6 +530,20 @@ fn require_regular_entry<R: Read>(entry: &tar::Entry<'_, R>, path: &Path) -> any
             "package archive entry {} must be a regular file",
             path.display()
         );
+    }
+    Ok(())
+}
+
+fn account_expanded_entry<R: Read>(
+    entry: &tar::Entry<'_, R>,
+    expanded_bytes: &mut u64,
+) -> anyhow::Result<()> {
+    let size = entry.header().size()?;
+    *expanded_bytes = expanded_bytes
+        .checked_add(size)
+        .ok_or_else(|| anyhow::anyhow!("package archive expanded size overflow"))?;
+    if *expanded_bytes > MAX_EXPANDED_ARCHIVE_BYTES {
+        anyhow::bail!("package archive expands beyond the {MAX_EXPANDED_ARCHIVE_BYTES}-byte limit");
     }
     Ok(())
 }
@@ -578,7 +635,7 @@ fn validate_manifest(manifest: &PackageManifest) -> anyhow::Result<()> {
         .context("package requires_ygg is not a valid semantic version requirement")?;
     if manifest.requires_ygg != expected_requirement || !requirement.matches(&current) {
         anyhow::bail!(
-            "package requires Ygg {:?}; this alpha requires an exact {:?} package",
+            "package requires Ygg {:?}; this release requires an exact {:?} package",
             manifest.requires_ygg,
             expected_requirement
         );
@@ -604,6 +661,74 @@ fn validate_manifest(manifest: &PackageManifest) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn stage_validated_entrypoint(
+    path: &Path,
+    expected_sha256: &str,
+) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
+    let mut source = ygg_agent::secure_fs::open_regular_file_for_read(path)
+        .with_context(|| format!("cannot open package entrypoint {}", path.display()))?;
+    let metadata = source.metadata()?;
+    if metadata.len() > MAX_ENTRYPOINT_BYTES {
+        anyhow::bail!(
+            "package entrypoint {} exceeds the {MAX_ENTRYPOINT_BYTES}-byte limit",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            anyhow::bail!("package entrypoint is not executable: {}", path.display());
+        }
+    }
+
+    let temporary = tempfile::Builder::new()
+        .prefix("ygg-package-entrypoint-")
+        .tempdir()
+        .context("cannot create private package entrypoint snapshot")?;
+    let staged = temporary.path().join("ygg-serve-runtime");
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o700);
+    }
+    let mut destination = options.open(&staged)?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(read as u64)
+            .ok_or_else(|| anyhow::anyhow!("package entrypoint size overflow"))?;
+        if copied > MAX_ENTRYPOINT_BYTES {
+            anyhow::bail!("package entrypoint grew beyond its byte limit");
+        }
+        hasher.update(&buffer[..read]);
+        destination.write_all(&buffer[..read])?;
+    }
+    let actual = digest_hex(hasher.finalize().as_slice());
+    if actual != expected_sha256 {
+        anyhow::bail!(
+            "package entrypoint checksum mismatch: expected {expected_sha256}, found {actual}"
+        );
+    }
+    destination.flush()?;
+    destination.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        destination.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        destination.sync_all()?;
+    }
+    Ok((temporary, staged))
 }
 
 fn validate_entrypoint(path: &Path, expected_sha256: &str) -> anyhow::Result<()> {
@@ -988,7 +1113,7 @@ mod tests {
     #[test]
     fn official_downloads_only_trust_github_https_hosts() {
         for accepted in [
-            "https://github.com/skaft-software/ygg/releases/download/v0.3.3-alpha/SHA256SUMS",
+            "https://github.com/skaft-software/ygg/releases/download/v0.3.3/SHA256SUMS",
             "https://release-assets.githubusercontent.com/github-production-release-asset/file?token=signed",
         ] {
             assert!(is_trusted_release_url(

@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Ygg is pre-1.0 software. Security fixes are made on the latest `0.3.3-alpha` release; older snapshots are not supported.
+Ygg is pre-1.0 software. Security fixes are made on the latest `0.3.3` release; older snapshots are not supported.
 
 ## Boundary and defaults
 
@@ -18,10 +18,13 @@ Ygg nevertheless treats its own policy and persistence boundaries as security in
 - Arbitrary process execution and shell execution are treated as equivalent authority. `bash` requires both compatibility gates to be enabled.
 - Mutating or unknown tool calls left unresolved by a crash are never replayed automatically. They are paired with an indeterminate result for explicit reconciliation.
 - Session mutation uses advisory interprocess locking, stale-generation checks, private permissions, bounded parsing, and synced records. Session listing is byte-for-byte read-only.
+- The native `ygg-host` keeps stdout protocol-only and bounds inbound and outbound NDJSON frames. It confines resumed sessions to regular files in the selected session directory, validates inline-provider and image inputs, denies headless tool confirmations, and cancels typed input requests. Protocol v1 has no in-band abort, so consumers must launch each host in a dedicated process group and terminate that group to cancel it.
+- On first use, Ygg may copy bounded Codex credentials from owner-only legacy Codex or Hamr stores into its own owner-only store under a cross-process lock. It never modifies or deletes the legacy source and does not include credential values in migration diagnostics.
 - Serve project browsing and editing resolves opaque project IDs to a revalidated root identity, then uses descriptor-relative no-follow traversal. Atomic writes recheck target identity and sync both content and the owning directory.
 - Serve owns Git and PTY process groups through bounded graceful/forced cleanup, including descendants that retain output descriptors. This prevents ordinary timeout/shutdown leaks; it does not restrict what an enabled command may access.
 - Serve permanent deletion journals intent before removing the transcript, retries idempotent sidecar cleanup after interruption, retains payloads referenced by another session, and fails before commit when a required store is unavailable. Conversation-content-free append-only inference accounting remains host-level history.
 - Provider streams, discovery responses, context, configuration, credentials, sessions, tool arguments/results, and local file reads have hard aggregate limits.
+- Serve accepts only bounded, classic single-revision PDFs for partial text extraction. An iterative raw-syntax preflight rejects excessive direct nesting before the audited `lopdf 0.42.0` parser runs; parser version, object/page/decompression limits, and a deeply nested regression are release gates.
 - Run cancellation reaches provider streaming, retry waits, tools, and autonomous compaction. Once cancellation wins a request race, no summary or usage record from that request is committed.
 
 These controls reduce accidental authority and defend documented Ygg boundaries. They do not contain a command that the user has enabled. In particular, an enabled `bash` can read credentials, access the network, and start descendants with the user's authority.

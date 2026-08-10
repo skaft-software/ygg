@@ -676,22 +676,16 @@ fn write_codex_credential(path: &std::path::Path, localhost: bool, plan: &str) {
         "h.{}.s",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
     );
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(
-        path,
-        serde_json::to_vec(&serde_json::json!({
-            "tokens": {
-                "access_token": access,
-                "refresh_token": "refresh",
-                "account_id": "acct_test"
-            },
-            "expires_at": u64::MAX
-        }))
-        .unwrap(),
-    )
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "tokens": {
+            "access_token": access,
+            "refresh_token": "refresh",
+            "account_id": "acct_test"
+        },
+        "expires_at": u64::MAX
+    }))
     .unwrap();
+    ygg_agent::secure_fs::write_private_atomic(path, &bytes, 1024 * 1024).unwrap();
 }
 
 #[test]
@@ -1086,6 +1080,18 @@ fn provider_inventory_cache_is_private_and_scoped_to_provider_url_and_account() 
 }
 
 #[test]
+fn provider_inventory_cache_names_and_future_timestamps_are_collision_safe() {
+    assert_ne!(
+        provider_inventory_cache_path("provider/a"),
+        provider_inventory_cache_path("provider:a"),
+    );
+    assert!(cache_modified_is_stale(
+        std::time::SystemTime::now() + Duration::from_secs(60),
+        Duration::from_secs(1),
+    ));
+}
+
+#[test]
 fn negative_provider_cache_recovers_in_the_current_launch() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("cache/openrouter.json");
@@ -1202,7 +1208,7 @@ fn custom_registry_registers_labeled_providers_with_isolated_auth_and_models() {
     let apple = catalog
         .resolve(&ModelId("custom/apple-fm/shared-model".into()))
         .unwrap();
-    assert_eq!(apple.endpoint.id.0, "custom-apple-fm");
+    assert_eq!(apple.endpoint.id.0, "custom-provider-8-apple-fm");
     assert_eq!(
         catalog.endpoint_label(&apple.endpoint.id),
         Some("Apple Foundation Models")
@@ -1216,7 +1222,7 @@ fn custom_registry_registers_labeled_providers_with_isolated_auth_and_models() {
     let home = catalog
         .resolve(&ModelId("custom/home-server/shared-model".into()))
         .unwrap();
-    assert_eq!(home.endpoint.id.0, "custom-home-server");
+    assert_eq!(home.endpoint.id.0, "custom-provider-11-home-server");
     assert_eq!(
         catalog.endpoint_label(&home.endpoint.id),
         Some("Home Server")

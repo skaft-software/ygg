@@ -1,6 +1,6 @@
 //! Executable extensions discovered from disk and connected over JSON lines.
 //!
-//! Native [`Extension`](crate::Extension)s remain the lowest-overhead option for
+//! Native [`Extension`]s remain the lowest-overhead option for
 //! built-ins. This module adds a language-neutral product boundary: a trusted,
 //! explicitly enabled manifest launches one child process and exchanges typed
 //! JSON-RPC 2.0 requests, responses, and notifications over stdin/stdout.
@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -54,6 +54,37 @@ const MAX_CONFIRMATION_REQUEST_ID_BYTES: usize = 256;
 static HOST_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static HOST_SHUTDOWN_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
+/// Return the non-secret ambient environment permitted for model-controlled
+/// subprocesses. Provider credentials, application tokens, dynamic-loader
+/// controls, and arbitrary dotenv values are intentionally absent.
+pub fn sanitized_subprocess_environment() -> BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    const ALLOWED: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "YGG_PACKAGE_DIR",
+    ];
+    ALLOWED
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| ((*name).into(), value)))
+        .collect()
+}
+
 /// Marks the host as shutting down and cancels ordinary extension RPC work.
 ///
 /// The flag is level-triggered so calls which start after the signal cannot
@@ -62,7 +93,7 @@ pub fn begin_host_shutdown() {
     HOST_SHUTDOWN_REQUESTED.store(true, Ordering::Release);
     HOST_SHUTDOWN_NOTIFY.notify_waiters();
     #[cfg(unix)]
-    if let Some(reaper) = LazyLock::force(&DETACHED_EXEC_REAPER) {
+    if let Some(reaper) = LazyLock::force(&PROCESS_REAPER) {
         reaper.unpark();
     }
 }
@@ -83,6 +114,39 @@ enum RegisteredProcessKind {
     Extension,
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+const PROCESS_IDENTITY_TRACKING_AVAILABLE: bool = true;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+const PROCESS_IDENTITY_TRACKING_AVAILABLE: bool = false;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: i32,
+    start_time: u128,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct ProcessSnapshot {
+    identity: ProcessIdentity,
+    parent_pid: i32,
+    process_group_id: i32,
+}
+
 #[cfg(unix)]
 struct DetachedBashSupervision {
     deadline: Instant,
@@ -93,6 +157,9 @@ struct DetachedBashSupervision {
 struct RegisteredProcessGroup {
     kind: RegisteredProcessKind,
     registration_id: u64,
+    root: Option<ProcessIdentity>,
+    original_group_active: bool,
+    descendants: BTreeMap<i32, ProcessIdentity>,
     detached_bash: Option<DetachedBashSupervision>,
 }
 
@@ -102,17 +169,16 @@ static REGISTERED_PROCESS_GROUPS: LazyLock<StdMutex<BTreeMap<i32, RegisteredProc
 static NEXT_PROCESS_GROUP_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(unix)]
-const DETACHED_EXEC_REAPER_POLL: Duration = Duration::from_millis(25);
+const PROCESS_REAPER_POLL: Duration = Duration::from_millis(25);
 
-/// One process-wide reaper owns successful `bash` groups whose direct leader
-/// has exited while background descendants remain. A standard thread keeps the
-/// cleanup boundary alive during async-runtime teardown without spawning one
-/// task per command.
+/// One process-wide supervisor records PID/start-time identities for descendants
+/// and reaps successful `bash` groups with residual background work. A standard
+/// thread keeps the cleanup boundary alive during async-runtime teardown.
 #[cfg(unix)]
-static DETACHED_EXEC_REAPER: LazyLock<Option<std::thread::Thread>> = LazyLock::new(|| {
+static PROCESS_REAPER: LazyLock<Option<std::thread::Thread>> = LazyLock::new(|| {
     std::thread::Builder::new()
-        .name("ygg-bash-group-reaper".into())
-        .spawn(detached_bash_reaper_loop)
+        .name("ygg-process-reaper".into())
+        .spawn(process_reaper_loop)
         .ok()
         .map(|handle| handle.thread().clone())
 });
@@ -127,34 +193,50 @@ fn register_process_group(process_group_id: u64, kind: RegisteredProcessKind) ->
     let registration_id = NEXT_PROCESS_GROUP_REGISTRATION_ID.fetch_add(1, Ordering::Relaxed);
     #[cfg(unix)]
     if let Some(process_group_id) = valid_process_group_id(process_group_id) {
+        let root = process_identity(process_group_id);
         lock_std_mutex(&REGISTERED_PROCESS_GROUPS).insert(
             process_group_id,
             RegisteredProcessGroup {
                 kind,
                 registration_id,
+                root,
+                original_group_active: root.is_some(),
+                descendants: BTreeMap::new(),
                 detached_bash: None,
             },
         );
+        if let Some(reaper) = LazyLock::force(&PROCESS_REAPER) {
+            reaper.unpark();
+        }
     }
     #[cfg(not(unix))]
     let _ = (process_group_id, kind);
     registration_id
 }
 
+#[cfg(unix)]
+fn remove_registered_process_group(
+    process_group_id: i32,
+    registration_id: u64,
+) -> Option<RegisteredProcessGroup> {
+    let mut registered = lock_std_mutex(&REGISTERED_PROCESS_GROUPS);
+    if registered
+        .get(&process_group_id)
+        .is_some_and(|entry| entry.registration_id == registration_id)
+    {
+        registered.remove(&process_group_id)
+    } else {
+        None
+    }
+}
+
 fn unregister_process_group(process_group_id: u64, registration_id: u64) -> bool {
     #[cfg(unix)]
     if let Some(process_group_id) = valid_process_group_id(process_group_id) {
-        let mut registered = lock_std_mutex(&REGISTERED_PROCESS_GROUPS);
-        if registered
-            .get(&process_group_id)
-            .is_some_and(|entry| entry.registration_id == registration_id)
-        {
-            registered.remove(&process_group_id);
-            return true;
-        }
+        return remove_registered_process_group(process_group_id, registration_id).is_some();
     }
     #[cfg(not(unix))]
-    let _ = process_group_id;
+    let _ = (process_group_id, registration_id);
     false
 }
 
@@ -189,8 +271,7 @@ impl ProcessGroupGuard {
     /// Immediately force-terminates the owned process group.
     pub fn terminate_now(&self) {
         let process_group_id = self.process_group_id.swap(0, Ordering::AcqRel);
-        unregister_process_group(process_group_id, self.registration_id);
-        kill_process_group(process_group_id);
+        terminate_registered_process_group(process_group_id, self.registration_id, libc_sigkill());
     }
 
     /// Releases the group after its child and output pipes have fully settled.
@@ -211,7 +292,8 @@ impl ProcessGroupGuard {
                 self.disarm();
                 return;
             };
-            if !process_group_is_alive(process_group_id_i32) {
+            refresh_registered_descendants();
+            if !registered_process_is_alive(process_group_id_i32, self.registration_id) {
                 self.disarm();
                 return;
             }
@@ -227,7 +309,7 @@ impl ProcessGroupGuard {
                 self.terminate_now();
                 return;
             };
-            let Some(reaper) = LazyLock::force(&DETACHED_EXEC_REAPER) else {
+            let Some(reaper) = LazyLock::force(&PROCESS_REAPER) else {
                 self.terminate_now();
                 return;
             };
@@ -270,15 +352,294 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_process_snapshot(pid: i32) -> Option<ProcessSnapshot> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat.get(stat.rfind(") ")?.saturating_add(2)..)?;
+    let fields = fields.split_ascii_whitespace().collect::<Vec<_>>();
+    let parent_pid = fields.get(1)?.parse().ok()?;
+    let process_group_id = fields.get(2)?.parse().ok()?;
+    let start_time = fields.get(19)?.parse::<u128>().ok()?;
+    Some(ProcessSnapshot {
+        identity: ProcessIdentity { pid, start_time },
+        parent_pid,
+        process_group_id,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_snapshots() -> Vec<ProcessSnapshot> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(linux_process_snapshot)
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn apple_process_snapshot(pid: i32) -> Option<ProcessSnapshot> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let size_i32 = i32::try_from(size).ok()?;
+    // SAFETY: `info` points to exactly `size_i32` writable bytes and
+    // PROC_PIDTBSDINFO initializes the complete proc_bsdinfo on success.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size_i32,
+        )
+    };
+    if read != size_i32 {
+        return None;
+    }
+    // SAFETY: the exact-size success check above proves initialization.
+    let info = unsafe { info.assume_init() };
+    if i32::try_from(info.pbi_pid).ok()? != pid {
+        return None;
+    }
+    let parent_pid = i32::try_from(info.pbi_ppid).ok()?;
+    let process_group_id = i32::try_from(info.pbi_pgid).ok()?;
+    let start_time = u128::from(info.pbi_start_tvsec)
+        .saturating_mul(1_000_000)
+        .saturating_add(u128::from(info.pbi_start_tvusec));
+    Some(ProcessSnapshot {
+        identity: ProcessIdentity { pid, start_time },
+        parent_pid,
+        process_group_id,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn apple_related_pids(process_id: i32, children: bool) -> Vec<i32> {
+    // SAFETY: null/zero queries ask libproc only for the required PID count.
+    let count = unsafe {
+        if children {
+            libc::proc_listchildpids(process_id, std::ptr::null_mut(), 0)
+        } else {
+            libc::proc_listpgrppids(process_id, std::ptr::null_mut(), 0)
+        }
+    };
+    let Ok(count) = usize::try_from(count) else {
+        return Vec::new();
+    };
+    let capacity = count.saturating_add(16);
+    let mut pids = vec![0_i32; capacity];
+    let Ok(bytes) = i32::try_from(capacity.saturating_mul(std::mem::size_of::<i32>())) else {
+        return Vec::new();
+    };
+    // SAFETY: `pids` exposes `bytes` writable bytes and libproc returns no more
+    // PID entries than fit in the supplied buffer.
+    let listed = unsafe {
+        if children {
+            libc::proc_listchildpids(process_id, pids.as_mut_ptr().cast(), bytes)
+        } else {
+            libc::proc_listpgrppids(process_id, pids.as_mut_ptr().cast(), bytes)
+        }
+    };
+    let Ok(listed) = usize::try_from(listed) else {
+        return Vec::new();
+    };
+    pids.truncate(listed.min(pids.len()));
+    pids.retain(|pid| *pid > 0);
+    pids
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn process_snapshots() -> Vec<ProcessSnapshot> {
+    let (mut pending, active_groups) = {
+        let registered = lock_std_mutex(&REGISTERED_PROCESS_GROUPS);
+        let mut pending = BTreeSet::new();
+        let mut active_groups = Vec::new();
+        for (process_group_id, entry) in registered.iter() {
+            pending.extend(entry.root.into_iter().map(|identity| identity.pid));
+            pending.extend(entry.descendants.keys().copied());
+            if entry.original_group_active {
+                active_groups.push(*process_group_id);
+            }
+        }
+        (pending, active_groups)
+    };
+    for process_group_id in active_groups {
+        pending.extend(apple_related_pids(process_group_id, false));
+    }
+
+    let mut discovered = BTreeSet::new();
+    let mut snapshots = Vec::new();
+    while let Some(pid) = pending.pop_first() {
+        if !discovered.insert(pid) {
+            continue;
+        }
+        let Some(snapshot) = apple_process_snapshot(pid) else {
+            continue;
+        };
+        pending.extend(apple_related_pids(pid, true));
+        snapshots.push(snapshot);
+    }
+    snapshots
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn process_snapshots() -> Vec<ProcessSnapshot> {
+    Vec::new()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_snapshot(pid: i32) -> Option<ProcessSnapshot> {
+    linux_process_snapshot(pid)
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn process_snapshot(pid: i32) -> Option<ProcessSnapshot> {
+    apple_process_snapshot(pid)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn process_snapshot(pid: i32) -> Option<ProcessSnapshot> {
+    process_snapshots()
+        .into_iter()
+        .find(|snapshot| snapshot.identity.pid == pid)
+}
+
 #[cfg(unix)]
-fn registered_process_groups(kind: Option<RegisteredProcessKind>) -> Vec<i32> {
+fn process_identity(pid: i32) -> Option<ProcessIdentity> {
+    process_snapshot(pid).map(|snapshot| snapshot.identity)
+}
+
+#[cfg(unix)]
+fn process_identity_is_alive(identity: ProcessIdentity) -> bool {
+    process_identity(identity.pid) == Some(identity)
+}
+
+#[cfg(unix)]
+fn refresh_registered_descendants() {
+    let snapshots = process_snapshots();
+    if snapshots.is_empty() {
+        return;
+    }
+    let snapshots_by_pid = snapshots
+        .into_iter()
+        .map(|snapshot| (snapshot.identity.pid, snapshot))
+        .collect::<BTreeMap<_, _>>();
+    let mut registered = lock_std_mutex(&REGISTERED_PROCESS_GROUPS);
+    for (process_group_id, entry) in registered.iter_mut() {
+        entry.descendants.retain(|pid, identity| {
+            snapshots_by_pid
+                .get(pid)
+                .is_some_and(|snapshot| snapshot.identity == *identity)
+        });
+
+        let root_alive = entry.root.and_then(|identity| {
+            snapshots_by_pid
+                .get(&identity.pid)
+                .filter(|snapshot| snapshot.identity == identity)
+                .copied()
+        });
+        let mut owned = entry.descendants.clone();
+        if let Some(root) = root_alive {
+            owned.insert(root.identity.pid, root.identity);
+        }
+        let group_has_member = snapshots_by_pid
+            .values()
+            .any(|snapshot| snapshot.process_group_id == *process_group_id);
+        let group_is_bound = entry.original_group_active && group_has_member;
+
+        loop {
+            let mut changed = false;
+            for snapshot in snapshots_by_pid.values() {
+                if owned.contains_key(&snapshot.identity.pid) {
+                    continue;
+                }
+                let child_of_owned = owned.contains_key(&snapshot.parent_pid);
+                let original_group_member =
+                    group_is_bound && snapshot.process_group_id == *process_group_id;
+                if child_of_owned || original_group_member {
+                    owned.insert(snapshot.identity.pid, snapshot.identity);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if let Some(root) = entry.root {
+            owned.remove(&root.pid);
+        }
+        entry.original_group_active = group_is_bound;
+        entry.descendants = owned;
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct RegisteredProcessTargets {
+    process_group_id: i32,
+    root: Option<ProcessIdentity>,
+    descendants: Vec<ProcessIdentity>,
+}
+
+#[cfg(unix)]
+impl RegisteredProcessTargets {
+    fn identities(&self) -> impl Iterator<Item = ProcessIdentity> + '_ {
+        self.root
+            .into_iter()
+            .chain(self.descendants.iter().copied())
+    }
+}
+
+#[cfg(unix)]
+fn targets_from_registered(
+    process_group_id: i32,
+    registered: &RegisteredProcessGroup,
+) -> RegisteredProcessTargets {
+    RegisteredProcessTargets {
+        process_group_id,
+        root: registered.root,
+        descendants: registered.descendants.values().copied().collect(),
+    }
+}
+
+#[cfg(unix)]
+fn registered_process_keys(kind: Option<RegisteredProcessKind>) -> Vec<(i32, u64)> {
     lock_std_mutex(&REGISTERED_PROCESS_GROUPS)
         .iter()
         .filter_map(|(process_group_id, registered)| {
             kind.is_none_or(|kind| kind == registered.kind)
-                .then_some(*process_group_id)
+                .then_some((*process_group_id, registered.registration_id))
         })
         .collect()
+}
+
+#[cfg(unix)]
+fn registered_targets(
+    process_group_id: i32,
+    registration_id: u64,
+) -> Option<RegisteredProcessTargets> {
+    lock_std_mutex(&REGISTERED_PROCESS_GROUPS)
+        .get(&process_group_id)
+        .filter(|registered| registered.registration_id == registration_id)
+        .map(|registered| targets_from_registered(process_group_id, registered))
 }
 
 #[cfg(unix)]
@@ -299,24 +660,111 @@ fn detached_bash_process_groups() -> Vec<(i32, u64, Instant, CancellationToken)>
 }
 
 #[cfg(unix)]
-fn detached_bash_reaper_loop() {
+fn signal_identity(identity: ProcessIdentity, signal: i32) {
+    if process_identity(identity.pid) != Some(identity) {
+        return;
+    }
+    // SAFETY: the immediately preceding start-time check binds this PID to the
+    // process recorded while it was a descendant of Ygg's registered child.
+    unsafe {
+        let _ = libc::kill(identity.pid, signal);
+    }
+}
+
+#[cfg(unix)]
+fn signal_registered_targets(targets: &RegisteredProcessTargets, signal: i32) {
+    let group_is_bound = targets.identities().any(|identity| {
+        process_snapshot(identity.pid).is_some_and(|snapshot| {
+            snapshot.identity == identity && snapshot.process_group_id == targets.process_group_id
+        })
+    });
+    if group_is_bound
+        || (!PROCESS_IDENTITY_TRACKING_AVAILABLE
+            && process_group_is_alive(targets.process_group_id))
+    {
+        // SAFETY: supported platforms require a matching PID/start-time
+        // identity in the group, so its ID cannot name an unrelated group.
+        // Other Unix targets retain the legacy best-effort group cleanup.
+        unsafe {
+            let _ = libc::kill(-targets.process_group_id, signal);
+        }
+    }
+    for identity in targets.identities() {
+        signal_identity(identity, signal);
+    }
+}
+
+#[cfg(unix)]
+fn registered_process_is_alive(process_group_id: i32, registration_id: u64) -> bool {
+    let Some(targets) = registered_targets(process_group_id, registration_id) else {
+        return false;
+    };
+    let mut identities = targets.identities().peekable();
+    if identities.peek().is_none() {
+        return process_group_is_alive(process_group_id);
+    }
+    identities.any(process_identity_is_alive)
+}
+
+fn libc_sigkill() -> i32 {
+    #[cfg(unix)]
+    {
+        libc::SIGKILL
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn terminate_registered_process_group(process_group_id: u64, registration_id: u64, signal: i32) {
+    #[cfg(unix)]
+    {
+        refresh_registered_descendants();
+        let Some(process_group_id) = valid_process_group_id(process_group_id) else {
+            return;
+        };
+        if let Some(registered) = remove_registered_process_group(process_group_id, registration_id)
+        {
+            let targets = targets_from_registered(process_group_id, &registered);
+            signal_registered_targets(&targets, signal);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (registration_id, signal);
+        kill_process_group(process_group_id);
+    }
+}
+
+#[cfg(unix)]
+fn process_reaper_loop() {
     loop {
-        let supervised = detached_bash_process_groups();
-        if supervised.is_empty() {
+        refresh_registered_descendants();
+        let has_registered = !lock_std_mutex(&REGISTERED_PROCESS_GROUPS).is_empty();
+        if !has_registered {
             std::thread::park();
             continue;
         }
 
         let now = Instant::now();
         let host_shutdown = HOST_SHUTDOWN_REQUESTED.load(Ordering::Acquire);
-        let mut next_poll = DETACHED_EXEC_REAPER_POLL;
-        for (process_group_id, registration_id, deadline, cancellation) in supervised {
-            let alive = process_group_is_alive(process_group_id);
+        let mut next_poll = PROCESS_REAPER_POLL;
+        for (process_group_id, registration_id, deadline, cancellation) in
+            detached_bash_process_groups()
+        {
+            let alive = registered_process_is_alive(process_group_id, registration_id);
             let terminate = host_shutdown || cancellation.is_cancelled() || now >= deadline;
-            if !alive || terminate {
-                if unregister_process_group(process_group_id as u64, registration_id) && terminate {
-                    kill_process_group(process_group_id as u64);
-                }
+            if !alive {
+                unregister_process_group(process_group_id as u64, registration_id);
+                continue;
+            }
+            if terminate {
+                terminate_registered_process_group(
+                    process_group_id as u64,
+                    registration_id,
+                    libc::SIGKILL,
+                );
                 continue;
             }
             next_poll = next_poll.min(deadline.saturating_duration_since(now));
@@ -335,17 +783,6 @@ pub(crate) fn process_group_registered_for_test(process_group_id: i32) -> bool {
 }
 
 #[cfg(unix)]
-fn signal_process_groups(process_group_ids: &[i32], signal: i32) {
-    for process_group_id in process_group_ids {
-        // SAFETY: every ID is registered only after its child was spawned with
-        // `process_group(0)`, so a negative target cannot reach Ygg's caller.
-        unsafe {
-            let _ = libc::kill(-*process_group_id, signal);
-        }
-    }
-}
-
-#[cfg(unix)]
 fn process_group_is_alive(process_group_id: i32) -> bool {
     // Signal zero performs existence/permission checking without changing the
     // target. EPERM still means that the group exists.
@@ -353,31 +790,47 @@ fn process_group_is_alive(process_group_id: i32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Gracefully terminates registered shell/`bash` groups, then force-kills and
-/// waits for survivors, all within the supplied total timeout.
+#[cfg(unix)]
+fn signal_registered_processes(keys: &[(i32, u64)], signal: i32) {
+    refresh_registered_descendants();
+    for (process_group_id, registration_id) in keys {
+        if let Some(targets) = registered_targets(*process_group_id, *registration_id) {
+            signal_registered_targets(&targets, signal);
+        }
+    }
+}
+
+/// Gracefully terminates registered shell/`bash` process trees, then force-kills
+/// and waits for survivors, all within the supplied total timeout.
 pub async fn terminate_bash_process_groups(timeout: Duration) {
     #[cfg(unix)]
     {
-        let process_group_ids = registered_process_groups(Some(RegisteredProcessKind::Bash));
-        if process_group_ids.is_empty() {
+        let process_keys = registered_process_keys(Some(RegisteredProcessKind::Bash));
+        if process_keys.is_empty() {
             return;
         }
         let started = Instant::now();
         let graceful_deadline = started + timeout / 2;
         let final_deadline = started + timeout;
-        signal_process_groups(&process_group_ids, libc::SIGTERM);
+        signal_registered_processes(&process_keys, libc::SIGTERM);
 
-        let mut survivors = process_group_ids;
+        let mut survivors = process_keys;
         while Instant::now() < graceful_deadline {
-            survivors.retain(|process_group_id| process_group_is_alive(*process_group_id));
+            refresh_registered_descendants();
+            survivors.retain(|(process_group_id, registration_id)| {
+                registered_process_is_alive(*process_group_id, *registration_id)
+            });
             if survivors.is_empty() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        signal_process_groups(&survivors, libc::SIGKILL);
+        signal_registered_processes(&survivors, libc::SIGKILL);
         while Instant::now() < final_deadline {
-            survivors.retain(|process_group_id| process_group_is_alive(*process_group_id));
+            refresh_registered_descendants();
+            survivors.retain(|(process_group_id, registration_id)| {
+                registered_process_is_alive(*process_group_id, *registration_id)
+            });
             if survivors.is_empty() {
                 return;
             }
@@ -388,12 +841,15 @@ pub async fn terminate_bash_process_groups(timeout: Duration) {
     let _ = timeout;
 }
 
-/// Force-kills every registered shell, `bash`, and extension process group.
+/// Force-kills every registered shell, `bash`, and extension process tree.
 ///
 /// This is the last-resort watchdog path after coordinated cleanup times out.
 pub fn force_kill_registered_process_groups() {
     #[cfg(unix)]
-    signal_process_groups(&registered_process_groups(None), libc::SIGKILL);
+    {
+        let process_keys = registered_process_keys(None);
+        signal_registered_processes(&process_keys, libc::SIGKILL);
+    }
 }
 
 /// Parsed `extension.toml` metadata.
@@ -2438,8 +2894,14 @@ async fn spawn_connection(
                 extension: descriptor.manifest.name.clone(),
                 message: "manifest has no parent directory".into(),
             })?;
-    let command_path = resolve_entrypoint_command(extension_dir, &descriptor.manifest.entrypoint);
-    let mut command = Command::new(command_path);
+    let resolved_entrypoint =
+        resolve_entrypoint_command(extension_dir, &descriptor.manifest.entrypoint).map_err(
+            |error| ExtensionRuntimeError::Spawn {
+                extension: descriptor.manifest.name.clone(),
+                message: error.to_string(),
+            },
+        )?;
+    let mut command = Command::new(&resolved_entrypoint.command);
     command
         .args(&descriptor.manifest.entrypoint.args)
         .current_dir(&config.workspace)
@@ -2447,6 +2909,8 @@ async fn spawn_connection(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
+        .env_clear()
+        .envs(sanitized_subprocess_environment())
         .envs(&descriptor.manifest.entrypoint.env)
         .env("YGG_EXTENSION_API_VERSION", EXTENSION_API_VERSION)
         .env("YGG_EXTENSION_NAME", &descriptor.manifest.name)
@@ -2560,17 +3024,111 @@ async fn spawn_connection(
     Ok((connection, contributions))
 }
 
-fn resolve_entrypoint_command(directory: &Path, entrypoint: &ExtensionEntrypoint) -> PathBuf {
+const MAX_STAGED_ENTRYPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
+struct ResolvedEntrypoint {
+    command: PathBuf,
+    _staging: Option<tempfile::TempDir>,
+}
+
+fn stage_entrypoint(path: &Path) -> std::io::Result<Option<ResolvedEntrypoint>> {
+    let mut source = match crate::secure_fs::open_regular_file_for_read(path) {
+        Ok(source) => source,
+        Err(crate::secure_fs::SecureFileError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(std::io::Error::other(error)),
+    };
+    let metadata = source.metadata()?;
+    if metadata.len() > MAX_STAGED_ENTRYPOINT_BYTES {
+        return Err(std::io::Error::other(
+            "extension entrypoint exceeds the 64 MiB staging limit",
+        ));
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix("ygg-extension-entrypoint-")
+        .tempdir()?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("extension entrypoint has no file name"))?;
+    let staged = temporary.path().join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o700);
+    }
+    let mut destination = options.open(&staged)?;
+    let copied = std::io::copy(
+        &mut Read::by_ref(&mut source).take(MAX_STAGED_ENTRYPOINT_BYTES + 1),
+        &mut destination,
+    )?;
+    if copied > MAX_STAGED_ENTRYPOINT_BYTES {
+        return Err(std::io::Error::other(
+            "extension entrypoint grew beyond the 64 MiB staging limit",
+        ));
+    }
+    destination.flush()?;
+    destination.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let executable = metadata.permissions().mode() & 0o111 != 0;
+        destination.set_permissions(std::fs::Permissions::from_mode(if executable {
+            0o700
+        } else {
+            0o600
+        }))?;
+        destination.sync_all()?;
+    }
+    Ok(Some(ResolvedEntrypoint {
+        command: staged,
+        _staging: Some(temporary),
+    }))
+}
+
+fn resolve_entrypoint_command(
+    directory: &Path,
+    entrypoint: &ExtensionEntrypoint,
+) -> std::io::Result<ResolvedEntrypoint> {
     let configured = PathBuf::from(&entrypoint.command);
     if configured.is_absolute() {
-        return configured;
+        return stage_entrypoint(&configured)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "extension entrypoint is missing",
+            )
+        });
     }
+
     let local = directory.join(&configured);
-    if local.is_file() {
-        local
-    } else {
-        configured
+    if let Some(staged) = stage_entrypoint(&local)? {
+        return Ok(staged);
     }
+
+    if configured.components().count() == 1 {
+        if let Some(path) = std::env::var_os("PATH") {
+            for directory in std::env::split_paths(&path) {
+                let candidate = directory.join(&configured);
+                let resolved = match candidate.canonicalize() {
+                    Ok(resolved) => resolved,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                if let Some(staged) = stage_entrypoint(&resolved)? {
+                    return Ok(staged);
+                }
+            }
+        }
+    }
+
+    Ok(ResolvedEntrypoint {
+        command: configured,
+        _staging: None,
+    })
 }
 
 fn negotiate_contributions(
@@ -2926,20 +3484,6 @@ fn extension_process_group_id(child: &Child) -> u64 {
 #[cfg(not(unix))]
 fn extension_process_group_id(_child: &Child) -> u64 {
     0
-}
-
-#[cfg(unix)]
-fn kill_process_group(process_group_id: u64) {
-    if let Ok(process_group_id) = i32::try_from(process_group_id) {
-        if process_group_id > 0 {
-            // SAFETY: the child was placed into a fresh process group whose
-            // ID is its PID, so the negative kill target cannot name an
-            // unrelated process group while this connection owns the child.
-            unsafe {
-                let _ = libc::kill(-process_group_id, libc::SIGKILL);
-            }
-        }
-    }
 }
 
 #[cfg(not(unix))]
@@ -3568,6 +4112,31 @@ sleep 30
     }
 
     #[cfg(unix)]
+    #[test]
+    fn pid_start_time_prevents_signaling_a_different_process_identity() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn identity fixture");
+        let pid = i32::try_from(child.id()).expect("fixture pid");
+        let identity = process_identity(pid).expect("read fixture identity");
+        let stale_identity = ProcessIdentity {
+            start_time: identity.start_time.saturating_add(1),
+            ..identity
+        };
+
+        signal_identity(stale_identity, libc::SIGKILL);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            child.try_wait().expect("inspect fixture").is_none(),
+            "a stale PID identity signaled the replacement process"
+        );
+
+        signal_identity(identity, libc::SIGKILL);
+        child.wait().expect("reap fixture");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn graceful_shutdown_request_reaches_extension_before_exit() {
         let temp = TempDir::new().expect("tempdir");
@@ -3579,8 +4148,8 @@ IFS= read -r initialize
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"api_version":"0.1","tools":[],"commands":[]}}'
 IFS= read -r shutdown
 printf '%s\n' graceful > "$YGG_WORKSPACE/graceful.marker"
-sleep 30 &
-printf '%s\n' "$!" > "$YGG_WORKSPACE/graceful-descendant.pid"
+python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(30)' "$YGG_WORKSPACE/graceful-descendant.pid" &
+sleep 0.1
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
 "#,
         );

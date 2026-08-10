@@ -80,8 +80,8 @@ pub mod tool;
 pub mod tools;
 
 pub use agent::{
-    Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy, RequestContextEstimate,
-    Run, RunControl, RunOutput,
+    public_error_diagnostic, Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy,
+    RequestContextEstimate, Run, RunControl, RunOutput,
 };
 pub use cache::{
     analyze_session_cache, analyze_session_cache_stats, CacheMiss, CacheStats,

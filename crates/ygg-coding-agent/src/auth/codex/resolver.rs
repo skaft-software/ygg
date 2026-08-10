@@ -47,14 +47,15 @@ impl CodexResolver {
         // have persisted a fresh token.
         let _task_guard = self.refresh_lock.lock().await;
         let lock_store = self.store.clone();
-        let _process_guard = tokio::task::spawn_blocking(move || lock_store.lock_refresh())
+        let process_guard = tokio::task::spawn_blocking(move || lock_store.lock_refresh())
             .await
             .context("refresh-lock worker failed")??;
         let cred = self
             .store
-            .load()?
+            .load_while_refresh_locked(&process_guard)?
             .ok_or_else(|| anyhow!("credential removed during refresh"))?;
         if now_unix() + REFRESH_SKEW_SECS < cred.expires_at {
+            process_guard.finish()?;
             return Ok(cred);
         }
 
@@ -74,7 +75,8 @@ impl CodexResolver {
             expires_at: tokens.expires_at,
         };
         self.store
-            .save_while_refresh_locked(&refreshed, &_process_guard)?;
+            .save_while_refresh_locked(&refreshed, &process_guard)?;
+        process_guard.finish()?;
         Ok(refreshed)
     }
 

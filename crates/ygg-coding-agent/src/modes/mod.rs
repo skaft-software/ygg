@@ -7,7 +7,7 @@ pub mod rpc;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ygg_agent::FinishReason;
+use ygg_agent::{public_error_diagnostic, FinishReason};
 
 /// Terminal state of a started Agent run, shared by both frontends.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,13 +18,13 @@ pub enum RunEnded {
     Failed(String),
 }
 
-impl From<FinishReason> for RunEnded {
-    fn from(reason: FinishReason) -> Self {
-        match reason {
-            FinishReason::Completed => Self::Completed,
-            FinishReason::Aborted => Self::Aborted,
-            FinishReason::MaxTurns => Self::MaxTurns,
-            FinishReason::Failed(error) => Self::Failed(error.to_string()),
+pub fn run_ended(reason: &FinishReason, endpoint: &str, model: &str) -> RunEnded {
+    match reason {
+        FinishReason::Completed => RunEnded::Completed,
+        FinishReason::Aborted => RunEnded::Aborted,
+        FinishReason::MaxTurns => RunEnded::MaxTurns,
+        FinishReason::Failed(error) => {
+            RunEnded::Failed(public_error_diagnostic(error, endpoint, model))
         }
     }
 }

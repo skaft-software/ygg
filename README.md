@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.3.3-alpha"><img alt="Release: 0.3.3-alpha" src="https://img.shields.io/badge/release-0.3.3--alpha-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.3.3"><img alt="Release: 0.3.3" src="https://img.shields.io/badge/release-0.3.3-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -54,19 +54,19 @@ Local endpoints are a primary path rather than a compatibility mode. Ygg keeps p
 ## Install
 
 ygg currently supports macOS and Linux and requires
-[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.3.3-alpha`
+[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.3.3`
 binaries are available for GNU/Linux x86-64, macOS x86-64, and macOS Apple
-silicon. Linux musl is not supported by this alpha.
+silicon. Linux musl is not supported by this release.
 
 ### Installer
 
 The version-pinned installer detects the current operating system and
-architecture, verifies the matching release archive, and installs `ygg` under
-`~/.local/bin`:
+architecture, verifies the matching release archive, and installs `ygg` and
+`ygg-host` under `~/.local/bin`:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.3.3-alpha/install-ygg.sh | sh
+  https://github.com/skaft-software/ygg/releases/download/v0.3.3/install-ygg.sh | sh
 ```
 
 No Rust toolchain is needed for the default installation. Restart the shell,
@@ -82,7 +82,7 @@ To compile the pinned tag instead, install
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.3.3-alpha/install-ygg.sh \
+  https://github.com/skaft-software/ygg/releases/download/v0.3.3/install-ygg.sh \
   | sh -s -- --from-source
 ```
 
@@ -93,8 +93,8 @@ To install from source without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.3.3-alpha \
-  --bin ygg \
+  --tag v0.3.3 \
+  --bins \
   ygg-coding-agent
 ```
 
@@ -109,7 +109,7 @@ export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 ```sh
 git clone https://github.com/skaft-software/ygg.git
 cd ygg
-cargo install --locked --path crates/ygg-coding-agent --bin ygg
+cargo install --locked --path crates/ygg-coding-agent --bins
 ```
 
 ### Graphical Serve extension
@@ -130,23 +130,27 @@ ygg serve --no-open --port 0
 
 Use `ygg extension list`, `update ygg-serve`, or `remove ygg-serve` to manage
 the package. A downloaded release archive can be installed with
-`ygg extension install --path ./ygg-serve-0.3.3-alpha-TARGET.tar.gz`.
+`ygg extension install --path ./ygg-serve-0.3.3-TARGET.tar.gz`.
 Removing the package leaves sessions and other Serve data intact.
 
 ### Container
 
-The included image builds ygg from the locked workspace, runs as an unprivileged
-user, and expects an explicit workspace mount:
+The included linux/amd64 image builds Ygg from a clean, tracked Git snapshot,
+uses digest-pinned base images and Debian package snapshots, runs as an
+unprivileged user, and expects an explicit workspace mount. The build script
+refuses tracked changes and excludes all untracked workstation content:
 
 ```sh
-docker build -f deploy/Dockerfile.ygg -t ygg:0.3.3-alpha .
+scripts/build-ygg-image.sh ygg:0.3.3
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.3.3-alpha --model claude-sonnet-4-6
+  ygg:0.3.3 --model claude-sonnet-4-6
 ```
 
-Only pass credentials and mount paths the container actually needs.
+Only pass credentials and mount paths the container actually needs. The image
+keeps its read-only packaged documentation under `/usr/local/share/ygg`, exposed
+to Ygg through `YGG_PACKAGE_DIR`.
 
 ## Quick start
 
@@ -588,12 +592,18 @@ Start with [examples/README.md](examples/README.md), then read [docs/resources.m
 
 ### Self-documentation
 
-When Ygg runs from its source checkout, its system prompt points the model to
-absolute paths for `README.md`, `docs/`, `examples/`, `crates/`, and the
-`ygg-coding-agent` crate and tells it to consult them when answering Ygg
-questions or making Ygg changes. In the interactive frontend, `/help [command]`
-shows local command help together with those documentation locations. From any
-other workspace, `/help` points to the published documentation instead.
+Ygg releases ship `README.md`, `docs/`, `examples/`, and `sdk/` beside the
+binary's package assets. The default system prompt points the model to their
+absolute paths and tells it to read them when answering Ygg questions or making
+Ygg changes. The shell installer places those assets under the matching
+`share/ygg/` data directory; `YGG_PACKAGE_DIR` or `YGG_DATA_DIR` can override
+that asset root for other layouts.
+
+When Ygg runs from its source checkout, the system prompt instead points to
+that checkout's `README.md`, `docs/`, `examples/`, `sdk/`, `crates/`, and
+`ygg-coding-agent` crate so it can inspect and extend the implementation. From
+an installation without local package assets, `/help` points to the published
+documentation at https://skaft.org/ygg/docs.
 
 ## Architecture
 
@@ -687,10 +697,11 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.3.3-alpha.md) | Current installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.3.3.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |
+| [Native SDK host](docs/sdk.md) | Versioned NDJSON application protocol, sessions, providers, safety, and cancellation. |
 | [Themes](docs/themes.md) | Theme schema, roles, glyphs, responsive layout, and fallback behavior. |
 | [Sessions](docs/sessions.md) | Commands, JSONL schema, branching, export, redaction, and repair. |
 | [AI architecture](docs/design/ygg-ai.md) | Canonical inference model, validation, transport, and streaming. |

@@ -676,8 +676,35 @@ impl Session {
             options.mode(0o600);
         }
         let file = options.open(&path)?;
+        Self::create_with_file(path, file)
+    }
+
+    /// Create an empty session through a caller-supplied read/append file
+    /// descriptor that was opened with exclusive-create semantics.
+    ///
+    /// The descriptor must have been opened with exclusive-create semantics
+    /// and must still be empty. This lets a host securely create the file
+    /// relative to a validated parent directory before handing it here.
+    pub fn create_with_file(path: impl Into<PathBuf>, file: File) -> Result<Self, SessionError> {
+        if !file.metadata()?.file_type().is_file() {
+            return Err(SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session descriptor is not a regular file",
+            )));
+        }
+        if file.metadata()?.len() != 0 {
+            return Err(SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "new session descriptor is not empty",
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(Self {
-            path,
+            path: path.into(),
             file,
             persisted_len: 0,
             persisted_records: 0,
@@ -707,6 +734,22 @@ impl Session {
         Self::open_impl(path.into(), true)
     }
 
+    /// Open an existing session through a caller-supplied read/append file
+    /// descriptor.
+    ///
+    /// This lets a host bind path authorization and opening into one
+    /// descriptor-relative operation. The descriptor must refer to a regular
+    /// file and permit reads, locking, permission repair, and durable appends.
+    pub fn open_with_file(path: impl Into<PathBuf>, file: File) -> Result<Self, SessionError> {
+        Self::open_file_impl_with_limits(
+            path.into(),
+            file,
+            true,
+            MAX_SESSION_FILE_BYTES,
+            MAX_SESSION_RECORDS,
+        )
+    }
+
     /// Inspect an existing session without repairing, truncating, appending,
     /// or otherwise changing its bytes. The returned snapshot is intended for
     /// listing and reporting only; mutation methods fail because its file
@@ -730,15 +773,31 @@ impl Session {
         max_file_bytes: u64,
         max_records: usize,
     ) -> Result<Self, SessionError> {
-        // Replay and tail handling must observe one stable snapshot. Without
-        // this lock, a writer could append after the read but before the
-        // observed length is captured, pairing stale IDs with a newer length.
         let mut options = OpenOptions::new();
         options.read(true);
         if recover_tail {
             options.append(true);
         }
-        let mut file = options.open(&path)?;
+        let file = options.open(&path)?;
+        Self::open_file_impl_with_limits(path, file, recover_tail, max_file_bytes, max_records)
+    }
+
+    fn open_file_impl_with_limits(
+        path: PathBuf,
+        mut file: File,
+        recover_tail: bool,
+        max_file_bytes: u64,
+        max_records: usize,
+    ) -> Result<Self, SessionError> {
+        if !file.metadata()?.file_type().is_file() {
+            return Err(SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session descriptor is not a regular file",
+            )));
+        }
+        // Replay and tail handling must observe one stable snapshot. Without
+        // this lock, a writer could append after the read but before the
+        // observed length is captured, pairing stale IDs with a newer length.
         if recover_tail {
             file.lock_exclusive()?;
             #[cfg(unix)]
@@ -2523,6 +2582,41 @@ mod tests {
         assert_eq!(ctx.len(), 2);
         assert_eq!(text_of(&ctx[0]), "hello");
         assert_eq!(text_of(&ctx[1]), "hi there");
+    }
+
+    #[test]
+    fn caller_supplied_descriptor_is_not_reopened_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let moved = dir.path().join("authorized.jsonl");
+
+        let mut original = Session::create(&path).unwrap();
+        original.append(user("authorized")).unwrap();
+        drop(original);
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+
+        std::fs::rename(&path, &moved).unwrap();
+        let mut replacement = Session::create(&path).unwrap();
+        replacement.append(user("replacement")).unwrap();
+        drop(replacement);
+
+        let mut adopted = Session::open_with_file(&path, file).unwrap();
+        assert_eq!(text_of(&adopted.context().unwrap()[0]), "authorized");
+        adopted.append(assistant("bound descriptor")).unwrap();
+        drop(adopted);
+
+        let authorized = Session::open(&moved).unwrap();
+        assert_eq!(
+            text_of(&authorized.context().unwrap()[1]),
+            "bound descriptor"
+        );
+        let replacement = Session::open(&path).unwrap();
+        assert_eq!(replacement.context().unwrap().len(), 1);
+        assert_eq!(text_of(&replacement.context().unwrap()[0]), "replacement");
     }
 
     #[test]

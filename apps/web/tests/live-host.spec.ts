@@ -8,16 +8,27 @@ import {
   BRANCH_A_REPLY,
   BRANCH_B_PROMPT,
   BRANCH_B_REPLY,
+  COMPACTION_PROMPT,
+  ERROR_DIAGNOSTIC,
+  ERROR_PROMPT,
   EXPORT_CANARY,
   LIVE_API_MODEL,
   LIVE_MODEL_ID,
+  LIVE_PROVIDER_ENDPOINT_ID,
   LIVE_PROVIDER_TOKEN,
   LiveHostHarness,
   RESUME_PROMPT,
   RESUME_REPLY,
+  RETRY_PROMPT,
+  RETRY_REPLY,
   STREAM_PARTIAL,
   STREAM_PROMPT,
   STREAM_REPLY,
+  TIMEOUT_PROMPT,
+  TIMEOUT_REPLY,
+  TOOL_FILE_CONTENT,
+  TOOL_PROMPT,
+  TOOL_REPLY,
   type RecordedChatRequest,
 } from "./support/live-host";
 
@@ -86,7 +97,8 @@ function expectDeterministicRequest(request: RecordedChatRequest): void {
   expect(request.authorization).toBe(`Bearer ${LIVE_PROVIDER_TOKEN}`);
   expect(request.body.model).toBe(LIVE_API_MODEL);
   expect(request.body.stream).toBe(true);
-  expect(request.body.tools ?? []).toEqual([]);
+  expect(Array.isArray(request.body.tools)).toBe(true);
+  expect(JSON.stringify(request.body.tools)).toContain('"name":"read"');
 }
 
 async function sessionSnapshot(
@@ -228,6 +240,55 @@ test("runs the authenticated production host lifecycle end to end", async ({
       expect(snapshot.liveState).toBe("done");
       expect(JSON.stringify(snapshot.items)).toContain(STREAM_REPLY);
       expect(snapshot.durableHead).toBeTruthy();
+    });
+
+    await test.step("streams and executes a configured-provider tool call", async () => {
+      await sendPrompt(page, TOOL_PROMPT);
+      const toolCallRequest = await host.provider.waitForPromptAttempt(
+        TOOL_PROMPT,
+        1,
+      );
+      const toolResultRequest = await host.provider.waitForPromptAttempt(
+        TOOL_PROMPT,
+        2,
+      );
+      expectDeterministicRequest(toolCallRequest);
+      expectDeterministicRequest(toolResultRequest);
+      const replay = JSON.stringify(toolResultRequest.body);
+      expect(replay).toContain('"role":"tool"');
+      expect(replay).toContain(TOOL_FILE_CONTENT);
+      await expectDone(page, TOOL_REPLY);
+    });
+
+    await test.step("retries configured-provider throttling and timeout responses", async () => {
+      for (const [prompt, reply] of [
+        [RETRY_PROMPT, RETRY_REPLY],
+        [TIMEOUT_PROMPT, TIMEOUT_REPLY],
+      ] as const) {
+        await sendPrompt(page, prompt);
+        const first = await host.provider.waitForPromptAttempt(prompt, 1);
+        const second = await host.provider.waitForPromptAttempt(prompt, 2);
+        expectDeterministicRequest(first);
+        expectDeterministicRequest(second);
+        await expectDone(page, reply);
+      }
+      const visibleText = await page.locator("body").innerText();
+      expect(visibleText).not.toContain(LIVE_PROVIDER_TOKEN);
+    });
+
+    await test.step("compacts configured-provider history into a durable checkpoint", async () => {
+      await sendPrompt(page, "/compact");
+      const request = await host.provider.waitForPrompt(COMPACTION_PROMPT);
+      expect(request.authorization).toBe(`Bearer ${LIVE_PROVIDER_TOKEN}`);
+      expect(request.body.model).toBe(LIVE_API_MODEL);
+      expect(request.body.stream).toBe(true);
+      expect(request.body.tools ?? []).toEqual([]);
+      const summaryInput = JSON.stringify(request.body);
+      expect(summaryInput).toContain("context summarization assistant");
+      expect(summaryInput).toContain(STREAM_PROMPT);
+      await expect
+        .poll(() => host.sessionSourceText())
+        .toContain("Configured-provider compaction completed.");
     });
 
     await test.step("stops an in-flight provider stream", async () => {
@@ -476,6 +537,7 @@ test("runs the authenticated production host lifecycle end to end", async ({
       const resumedRequest = JSON.stringify(resumed.body);
       expect(resumedRequest).toContain(BRANCH_A_PROMPT);
       expect(resumedRequest).toContain(BRANCH_A_REPLY);
+      expect(resumedRequest).toContain("Configured-provider compaction completed.");
       expect(resumedRequest).not.toContain(BRANCH_B_PROMPT);
       expect(resumedRequest).not.toContain(BRANCH_B_REPLY);
       expect(resumedRequest).not.toContain(EXPORT_CANARY);
@@ -485,6 +547,25 @@ test("runs the authenticated production host lifecycle end to end", async ({
       expect(snapshot.branches.head).not.toBe(branchATarget);
       expect(JSON.stringify(snapshot.items)).toContain(RESUME_REPLY);
       expect(JSON.stringify(snapshot.items)).not.toContain(BRANCH_B_PROMPT);
+    });
+
+    await test.step("publishes bounded provider/phase diagnostics without credentials", async () => {
+      await sendPrompt(page, ERROR_PROMPT);
+      const request = await host.provider.waitForPrompt(ERROR_PROMPT);
+      expectDeterministicRequest(request);
+      const expected =
+        `provider=${LIVE_PROVIDER_ENDPOINT_ID} model=${LIVE_MODEL_ID} phase=HTTP response`;
+      await expect(page.locator(".header-status")).toHaveText("Failed");
+
+      const snapshot = await sessionSnapshot(page, origin, sessionId);
+      const publicSnapshot = JSON.stringify(snapshot);
+      expect(publicSnapshot).toContain(expected);
+      expect(publicSnapshot).not.toContain("status 400");
+      expect(publicSnapshot).not.toContain(ERROR_DIAGNOSTIC);
+      expect(publicSnapshot).not.toContain(LIVE_PROVIDER_TOKEN);
+      expect(await page.locator("body").innerText()).not.toContain(
+        LIVE_PROVIDER_TOKEN,
+      );
     });
 
     host.provider.assertHealthy();

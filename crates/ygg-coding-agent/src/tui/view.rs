@@ -1263,9 +1263,10 @@ impl InteractiveShell {
         state.run_price_display = Some(state.price_display);
         state.run_context_estimate = state.context_estimate;
         let provider_status = crate::presentation::provider_status_name(provider);
+        let model = state.model.clone();
         let id = state
             .run
-            .begin(&provider_status)
+            .begin_route(&provider_status, provider, model)
             .expect("a new prompt is accepted only after the previous run terminates");
         state.shimmer_started_at = Some(Instant::now());
         state.open_reasoning_status();
@@ -1274,6 +1275,14 @@ impl InteractiveShell {
 
     pub fn current_run_id(&self) -> Option<RunId> {
         self.state.borrow().run.current_id()
+    }
+
+    pub fn current_run_route(&self) -> Option<(String, String)> {
+        self.state
+            .borrow()
+            .run
+            .current()
+            .map(|run| (run.endpoint().to_owned(), run.model().to_owned()))
     }
 
     pub fn set_run_preparing(&mut self, id: RunId, summary: impl Into<String>) {

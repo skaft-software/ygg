@@ -54,12 +54,40 @@ fn prompt_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn absolute_path(path: PathBuf) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        std::env::current_dir()
+            .ok()
+            .map(|directory| directory.join(path))
+    }
+}
+
+fn documentation_paths(root: &Path) -> Option<[PathBuf; 4]> {
+    if !root.is_absolute()
+        || !root.join("README.md").is_file()
+        || !root.join("docs").is_dir()
+        || !root.join("examples").is_dir()
+        || !root.join("sdk").is_dir()
+    {
+        return None;
+    }
+    Some([
+        root.join("README.md"),
+        root.join("docs"),
+        root.join("examples"),
+        root.join("sdk"),
+    ])
+}
+
 fn ygg_source_checkout(workspace: &Path) -> bool {
     workspace.is_absolute()
         && workspace.join("README.md").is_file()
         && workspace.join("Cargo.toml").is_file()
         && workspace.join("docs").is_dir()
         && workspace.join("examples").is_dir()
+        && workspace.join("sdk").is_dir()
         && workspace.join("crates").is_dir()
         && workspace
             .join("crates")
@@ -81,41 +109,116 @@ fn ygg_documentation_paths(workspace: &Path) -> Option<[PathBuf; 5]> {
     ])
 }
 
+fn installed_documentation_paths_from(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Option<[PathBuf; 4]> {
+    candidates
+        .into_iter()
+        .find_map(|candidate| documentation_paths(&candidate))
+}
+
+/// Resolve the documentation shipped with a packaged Ygg binary.
+///
+/// This mirrors Pi's package-asset lookup: an override is useful for packaged
+/// installs, then assets beside the executable are preferred, followed by the
+/// conventional `share/ygg` directory used by the shell installer.
+fn installed_documentation_paths() -> Option<[PathBuf; 4]> {
+    let mut candidates = Vec::new();
+    if let Some(directory) = std::env::var_os("YGG_PACKAGE_DIR") {
+        if let Some(directory) = absolute_path(PathBuf::from(directory)) {
+            candidates.push(directory);
+        }
+    }
+    if let Some(directory) = std::env::var_os("YGG_DATA_DIR") {
+        if let Some(directory) = absolute_path(PathBuf::from(directory)) {
+            candidates.push(directory);
+        }
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable
+            .parent()
+            .and_then(|directory| absolute_path(directory.to_owned()))
+        {
+            candidates.push(directory.clone());
+            if let Some(prefix) = directory.parent() {
+                candidates.push(prefix.join("share/ygg"));
+            }
+        }
+    }
+    installed_documentation_paths_from(candidates)
+}
+
+fn documentation_prompt(
+    readme: &Path,
+    docs: &Path,
+    examples: &Path,
+    sdk: &Path,
+    source_paths: Option<(&Path, &Path)>,
+) -> String {
+    let mut prompt = format!(
+        r#"Ygg documentation (read only when the user asks about Ygg itself, its commands, architecture, customization, or extension API):
+- Main documentation: {}
+- Additional docs: {}
+- Examples: {}
+- Python SDK: {}
+- When reading Ygg docs or examples, resolve `docs/...` under Additional docs and `examples/...` under Examples, not the current working directory.
+- When asked about: extensions (`docs/extensions.md`, `examples/extensions/`), themes (`docs/themes.md`), skills, prompt templates, sessions, providers, or the Rust architecture.
+- When working on Ygg topics, read the docs and examples and follow `.md` cross-references before implementing.
+- Always read relevant Ygg `.md` files completely before relying on them."#,
+        prompt_path(readme),
+        prompt_path(docs),
+        prompt_path(examples),
+        prompt_path(sdk),
+    );
+    if let Some((crates, coding_agent)) = source_paths {
+        prompt.push_str(&format!(
+            "\n- Rust crates: {}\n- Coding-agent crate: {}\n- When asked to change Ygg, inspect the relevant Rust crate, tests, docs, or examples first, then make the requested change and run appropriate checks.",
+            prompt_path(crates),
+            prompt_path(coding_agent),
+        ));
+    }
+    prompt
+}
+
 fn self_documentation_prompt(workspace: &Path) -> Option<String> {
-    let [readme, docs, examples, crates, coding_agent] = ygg_documentation_paths(workspace)?;
-    Some(format!(
-        r#"Self-documentation:
-- This workspace is Ygg's source checkout, so Ygg can explain and extend itself here.
-- When asked about Ygg, its commands, architecture, customization, or extension API, consult the relevant documentation or source before answering. Do not rely on memory when the checkout can answer.
-- The following absolute paths are the canonical starting points; read files or inspect directories with the available tools as needed:
-  - README: {}
-  - Documentation: {}
-  - Examples: {}
-  - Rust crates: {}
-  - Coding-agent crate: {}
-- When asked to change Ygg, inspect the relevant Rust crate, tests, docs, or examples first, then make the requested change and run appropriate checks."#,
-        prompt_path(&readme),
-        prompt_path(&docs),
-        prompt_path(&examples),
-        prompt_path(&crates),
-        prompt_path(&coding_agent),
-    ))
+    if let Some([readme, docs, examples, crates, coding_agent]) = ygg_documentation_paths(workspace)
+    {
+        return Some(documentation_prompt(
+            &readme,
+            &docs,
+            &examples,
+            &workspace.join("sdk"),
+            Some((&crates, &coding_agent)),
+        ));
+    }
+    installed_documentation_paths().map(|[readme, docs, examples, sdk]| {
+        documentation_prompt(&readme, &docs, &examples, &sdk, None)
+    })
 }
 
 /// Render the self-documentation locations appended to `/help`.
 pub fn self_documentation_help(workspace: &Path) -> String {
-    let Some([readme, docs, examples, crates, coding_agent]) = ygg_documentation_paths(workspace)
-    else {
-        return "Ygg's source documentation is not present in this workspace. Run Ygg from its source checkout to let it inspect the local README, docs, examples, and Rust crates. The published documentation is available at https://skaft.org/ygg/docs.".to_owned();
-    };
-    format!(
-        "Ygg source documentation (read these with the available tools):\n  README: {}\n  Documentation: {}\n  Examples: {}\n  Rust crates: {}\n  Coding-agent crate: {}",
-        prompt_path(&readme),
-        prompt_path(&docs),
-        prompt_path(&examples),
-        prompt_path(&crates),
-        prompt_path(&coding_agent),
-    )
+    if let Some([readme, docs, examples, crates, coding_agent]) = ygg_documentation_paths(workspace)
+    {
+        return format!(
+            "Ygg source documentation (read these with the available tools):\n  README: {}\n  Documentation: {}\n  Examples: {}\n  Rust crates: {}\n  Coding-agent crate: {}",
+            prompt_path(&readme),
+            prompt_path(&docs),
+            prompt_path(&examples),
+            prompt_path(&crates),
+            prompt_path(&coding_agent),
+        );
+    }
+    if let Some([readme, docs, examples, sdk]) = installed_documentation_paths() {
+        return format!(
+            "Ygg packaged documentation (read these with the available tools):\n  README: {}\n  Documentation: {}\n  Examples: {}\n  Python SDK: {}",
+            prompt_path(&readme),
+            prompt_path(&docs),
+            prompt_path(&examples),
+            prompt_path(&sdk),
+        );
+    }
+    "Ygg's packaged documentation is not present in this installation. The published documentation is available at https://skaft.org/ygg/docs.".to_owned()
 }
 
 fn xml_attribute(value: &str) -> String {
@@ -1352,6 +1455,7 @@ Environment:
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("docs")).unwrap();
         std::fs::create_dir_all(root.path().join("examples")).unwrap();
+        std::fs::create_dir_all(root.path().join("sdk")).unwrap();
         std::fs::create_dir_all(root.path().join("crates/ygg-coding-agent")).unwrap();
         std::fs::create_dir_all(root.path().join("crates")).unwrap();
         std::fs::write(root.path().join("README.md"), "# Ygg").unwrap();
@@ -1368,6 +1472,7 @@ Environment:
             root.path().join("README.md"),
             root.path().join("docs"),
             root.path().join("examples"),
+            root.path().join("sdk"),
             root.path().join("crates"),
             root.path().join("crates/ygg-coding-agent"),
         ] {
@@ -1377,16 +1482,32 @@ Environment:
                 path.display()
             );
         }
-        assert!(prompt.contains("consult the relevant documentation or source"));
-        assert!(prompt.contains("Ygg can explain and extend itself"));
+        assert!(prompt.contains("Ygg documentation (read only when the user asks about Ygg itself"));
+        assert!(prompt.contains("When working on Ygg topics, read the docs and examples"));
     }
 
     #[test]
     fn self_documentation_help_explains_when_the_checkout_is_unavailable() {
         let root = tempfile::tempdir().unwrap();
         let help = self_documentation_help(root.path());
-        assert!(help.contains("not present in this workspace"));
+        assert!(help.contains("packaged documentation is not present"));
         assert!(help.contains("https://skaft.org/ygg/docs"));
+    }
+
+    #[test]
+    fn packaged_documentation_is_resolved_from_a_complete_asset_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs")).unwrap();
+        std::fs::create_dir_all(root.path().join("examples")).unwrap();
+        std::fs::create_dir_all(root.path().join("sdk")).unwrap();
+        std::fs::write(root.path().join("README.md"), "# Ygg").unwrap();
+
+        let [readme, docs, examples, sdk] =
+            installed_documentation_paths_from([root.path().to_owned()]).unwrap();
+        assert_eq!(readme, root.path().join("README.md"));
+        assert_eq!(docs, root.path().join("docs"));
+        assert_eq!(examples, root.path().join("examples"));
+        assert_eq!(sdk, root.path().join("sdk"));
     }
 
     #[test]

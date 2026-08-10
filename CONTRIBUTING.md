@@ -68,7 +68,10 @@ cargo test --workspace --all-targets --all-features --locked
 cargo test --workspace --doc --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo audit
+cargo audit --file extensions/ygg-serve/Cargo.lock
 cargo deny check
+cargo deny --manifest-path extensions/ygg-serve/Cargo.toml check
+(cd apps/web && npm ci && npm audit --audit-level=high)
 git diff --check
 ```
 
@@ -78,7 +81,11 @@ Protocol changes should include exact wire fixtures and malformed-stream
 coverage. Session changes should cover restart and torn-tail behavior.
 
 The live multimodal test is intentionally ignored unless an explicitly
-configured compatible endpoint is available.
+configured compatible endpoint is available. Stable Serve releases must also
+pass the disposable configured-provider matrix in ordinary CI and record the
+separately approved credentialed checks described in
+[configured-provider acceptance](docs/experimental/ygg-serve/provider-acceptance.md)
+against the immutable release SHA.
 
 ## Commits and pull requests
 

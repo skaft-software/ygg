@@ -62,7 +62,7 @@ pub enum AgentError {
     NetworkUnavailable {
         /// Number of replacement attempts made after the initial request.
         retries: usize,
-        /// Sanitized transport detail for diagnostics.
+        /// Bounded phase-only detail for diagnostics.
         detail: String,
     },
     /// Two tools were registered under the same name.
@@ -105,6 +105,62 @@ pub enum AgentError {
     /// A control message was sent after the run finished.
     #[error("the run has already finished")]
     RunEnded,
+}
+
+/// Format an agent failure for a public frontend.
+///
+/// Provider-originated failures retain only the configured endpoint/model route
+/// and execution phase. Provider payloads, status and error codes, request IDs,
+/// URLs, and transport details are intentionally omitted. Local agent failures
+/// retain their ordinary diagnostic.
+pub fn public_error_diagnostic(error: &AgentError, endpoint: &str, model: &str) -> String {
+    match provider_failure_phase(error) {
+        Some(phase) => provider_phase_diagnostic(endpoint, model, phase),
+        None => error.to_string(),
+    }
+}
+
+fn provider_failure_phase(error: &AgentError) -> Option<&'static str> {
+    match error {
+        AgentError::Ai(error) => Some(ai_error_phase(error)),
+        AgentError::NetworkUnavailable { .. } => Some("connection"),
+        AgentError::IncompleteResponse { .. } => Some("response completion"),
+        AgentError::Session(_)
+        | AgentError::DuplicateTool(_)
+        | AgentError::Workspace(_)
+        | AgentError::CostLimit { .. }
+        | AgentError::ContextExceeded { .. }
+        | AgentError::InvalidCompactionPolicy(_)
+        | AgentError::Cancelled
+        | AgentError::RunEnded => None,
+    }
+}
+
+fn ai_error_phase(error: &AiError) -> &'static str {
+    match error {
+        AiError::Config(_) | AiError::Validation(_) | AiError::Unsupported(_) => {
+            "request preparation"
+        }
+        AiError::Auth(_) => "authentication",
+        AiError::Http(_) => "HTTP response",
+        AiError::Transport(error) => match (error.phase, error.timeout) {
+            (ygg_ai::TransportPhase::Connect, false) => "connection",
+            (ygg_ai::TransportPhase::Connect, true) => "connection timeout",
+            (ygg_ai::TransportPhase::ResponseHeaders, false) => "response headers",
+            (ygg_ai::TransportPhase::ResponseHeaders, true) => "response headers timeout",
+            (ygg_ai::TransportPhase::Body, false) => "response body",
+            (ygg_ai::TransportPhase::Body, true) => "response body timeout",
+        },
+        AiError::Provider(_) => "response body (provider error)",
+        AiError::Decode(_) => "response decoding",
+        AiError::Pricing(_) => "usage accounting",
+        AiError::StreamProtocol(_) => "stream protocol",
+        AiError::Canceled => "request cancellation",
+    }
+}
+
+fn provider_phase_diagnostic(endpoint: &str, model: &str, phase: &str) -> String {
+    format!("provider={endpoint} model={model} phase={phase}")
 }
 
 /// How an agent decides that a natural no-tool response is complete.
@@ -1075,9 +1131,10 @@ fn retry_after(error: &AiError, attempt: usize) -> Duration {
 }
 
 fn provider_retry_diagnostic(model: &Model, error: &AiError) -> String {
-    let context = format!(
-        "provider={} model={}: {error}",
-        model.endpoint.id.0, model.spec.id.0
+    let context = provider_phase_diagnostic(
+        &model.endpoint.id.0,
+        &model.spec.id.0,
+        ai_error_phase(error),
     );
     if is_replayable_network_failure(error) {
         format!("Network connection lost. Are you connected to the internet? {context}")
@@ -1090,7 +1147,7 @@ fn provider_failure(error: AiError, retries: usize) -> AgentError {
     if is_replayable_network_failure(&error) {
         AgentError::NetworkUnavailable {
             retries,
-            detail: error.to_string(),
+            detail: ai_error_phase(&error).to_owned(),
         }
     } else {
         error.into()
@@ -2005,6 +2062,7 @@ impl<'a> CompactionContext<'a> {
         tools: &[ToolDef],
         reason: CompactionReason,
         operation: &Result<CompactionInfo, AgentError>,
+        provider_model: &Model,
     ) {
         let after = operation.as_ref().ok().and_then(|_| {
             observe_context_tracker(self.context, self.session, self.model, system, tools).ok()
@@ -2013,7 +2071,11 @@ impl<'a> CompactionContext<'a> {
             .compaction_finished(id, after, operation.is_ok());
         let event_result = match operation {
             Ok(info) => Ok(info.clone()),
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(public_error_diagnostic(
+                error,
+                &provider_model.endpoint.id.0,
+                &provider_model.spec.id.0,
+            )),
         };
         let _ = self.events.send(AgentEvent::CompactionFinished {
             reason,
@@ -2112,7 +2174,7 @@ impl<'a> CompactionContext<'a> {
         }
         .await;
 
-        self.finish_compaction(id, system, tools, reason, &operation);
+        self.finish_compaction(id, system, tools, reason, &operation, self.model);
         operation
     }
 
@@ -2161,7 +2223,7 @@ impl<'a> CompactionContext<'a> {
         }
         .await;
 
-        self.finish_compaction(id, system, tools, reason, &operation);
+        self.finish_compaction(id, system, tools, reason, &operation, self.compaction_model);
         operation
     }
 
@@ -2486,9 +2548,10 @@ impl Agent {
 
     /// Set the transcript text for the next submitted prompt. It is consumed
     /// exactly once by `prompt`; model-visible text remains in the durable
-    /// message payload for replay.
+    /// message payload for replay. An explicitly empty string is retained so
+    /// media-only turns do not expose synthetic model instructions as caller text.
     pub fn set_prompt_display_text(&mut self, text: Option<String>) {
-        self.prompt_display_text = text.filter(|text| !text.is_empty());
+        self.prompt_display_text = text;
     }
 
     fn prompt_entry_metadata(&mut self) -> EntryMetadata {
@@ -4235,6 +4298,57 @@ mod tests {
     }
 
     #[test]
+    fn provider_retry_diagnostics_omit_provider_details_and_secrets() {
+        let model = tool_media_model(Protocol::OpenAiChat, ygg_ai::ModalitySet::none());
+        let errors = [
+            AiError::Http(ygg_ai::HttpError {
+                status: http::StatusCode::TOO_MANY_REQUESTS,
+                request_id: Some("secret-request-id".into()),
+                retry_after: None,
+                provider_code: Some("secret-provider-code".into()),
+                body_snippet: Some("secret-provider-body with secret-api-key".into()),
+                retryable: true,
+            }),
+            AiError::Provider(ygg_ai::ProviderError {
+                code: Some("secret-stream-code".into()),
+                kind: Some("secret-stream-kind".into()),
+                message: "secret-stream-body with user prompt".into(),
+                request_id: Some("secret-stream-request-id".into()),
+            }),
+            AiError::Transport(ygg_ai::TransportError {
+                phase: ygg_ai::TransportPhase::Connect,
+                timeout: false,
+                message: "secret transport detail with secret-api-key".into(),
+            }),
+        ];
+
+        for error in &errors {
+            let diagnostic = provider_retry_diagnostic(&model, error);
+            assert!(diagnostic.contains("provider="), "{diagnostic}");
+            assert!(diagnostic.contains("model="), "{diagnostic}");
+            assert!(diagnostic.contains("phase="), "{diagnostic}");
+            for secret in [
+                "secret-request-id",
+                "secret-provider-code",
+                "secret-provider-body",
+                "secret-api-key",
+                "secret-stream-code",
+                "secret-stream-kind",
+                "secret-stream-body",
+                "secret-stream-request-id",
+                "user prompt",
+                "secret transport detail",
+                "429",
+            ] {
+                assert!(
+                    !diagnostic.contains(secret),
+                    "leaked {secret:?}: {diagnostic}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn provider_context_limit_variants_are_classified_as_overflow() {
         for message in [
             "model_context_window_exceeded",
@@ -4285,7 +4399,82 @@ mod tests {
 
         let failure = provider_failure(error, 5).to_string();
         assert!(failure.contains("Are you connected to the internet?"));
-        assert!(failure.contains("connection refused"));
+        assert!(failure.contains("connection"));
+        assert!(!failure.contains("connection refused"));
+    }
+
+    #[test]
+    fn public_provider_failures_are_route_and_phase_only() {
+        let errors = [
+            (
+                AgentError::Ai(AiError::Http(ygg_ai::HttpError {
+                    status: http::StatusCode::BAD_REQUEST,
+                    request_id: Some("secret-request-id".into()),
+                    retry_after: None,
+                    provider_code: Some("secret-provider-code".into()),
+                    body_snippet: Some("secret body https://user:password@example.test".into()),
+                    retryable: false,
+                })),
+                "HTTP response",
+            ),
+            (
+                AgentError::Ai(AiError::Provider(ygg_ai::ProviderError {
+                    code: Some("secret-stream-code".into()),
+                    kind: Some("secret-stream-kind".into()),
+                    message: "secret prompt and credential".into(),
+                    request_id: Some("secret-stream-request-id".into()),
+                })),
+                "response body (provider error)",
+            ),
+            (
+                AgentError::Ai(AiError::Transport(ygg_ai::TransportError {
+                    phase: ygg_ai::TransportPhase::Body,
+                    timeout: true,
+                    message: "secret transport detail".into(),
+                })),
+                "response body timeout",
+            ),
+            (
+                AgentError::IncompleteResponse {
+                    stop_reason: "secret stop code".into(),
+                },
+                "response completion",
+            ),
+            (
+                AgentError::NetworkUnavailable {
+                    retries: 5,
+                    detail: "secret network detail".into(),
+                },
+                "connection",
+            ),
+        ];
+
+        for (error, phase) in errors {
+            let diagnostic = public_error_diagnostic(&error, "openai", "gpt-test");
+            assert_eq!(
+                diagnostic,
+                format!("provider=openai model=gpt-test phase={phase}")
+            );
+            for secret in [
+                "400",
+                "secret",
+                "https://",
+                "example.test",
+                "password",
+                "credential",
+                "prompt",
+            ] {
+                assert!(
+                    !diagnostic.contains(secret),
+                    "leaked {secret:?}: {diagnostic}"
+                );
+            }
+        }
+
+        assert_eq!(
+            public_error_diagnostic(&AgentError::RunEnded, "openai", "gpt-test"),
+            "the run has already finished"
+        );
     }
 
     #[test]

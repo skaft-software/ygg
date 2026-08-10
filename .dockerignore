@@ -2,7 +2,6 @@
 .github
 target
 **/target
-docs
 fuzz
 scripts
 .DS_Store

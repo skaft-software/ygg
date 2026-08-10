@@ -17,9 +17,9 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use ygg_agent::{
-    AgentCompactionMode, AgentEvent, BashTool, CancellationToken, EntryValue, FinishReason,
-    InputPart, OutputChannel, QueueDeliveryMode, Run, RunControl, SandboxConfig, SkillRegistry,
-    Tool, ToolContext, ToolProgress, ToolProgressSink, UserInput,
+    AgentCompactionMode, AgentError, AgentEvent, BashTool, CancellationToken, EntryValue,
+    FinishReason, InputPart, OutputChannel, QueueDeliveryMode, Run, RunControl, SandboxConfig,
+    SkillRegistry, Tool, ToolContext, ToolProgress, ToolProgressSink, UserInput,
 };
 use ygg_ai::{
     AssistantMessage, AssistantPart, Cost, ImageSource, Media, Message, Modality, Model, ModelId,
@@ -1130,6 +1130,10 @@ async fn prepare_prompt(
     Ok((input, composition.pending_context_count, display_message))
 }
 
+fn rpc_error_diagnostic(model: &Model, error: &AgentError) -> String {
+    ygg_agent::public_error_diagnostic(error, &model.endpoint.id.0, &model.spec.id.0)
+}
+
 struct EventTranslator {
     endpoint: String,
     model: Model,
@@ -1623,7 +1627,10 @@ impl EventTranslator {
                         Some("error"),
                         Some("Maximum agent turns reached".to_owned()),
                     ),
-                    FinishReason::Failed(error) => (Some("error"), Some(error.to_string())),
+                    FinishReason::Failed(error) => (
+                        Some("error"),
+                        Some(rpc_error_diagnostic(&self.model, error)),
+                    ),
                 };
                 if let Some(stop_reason) = stop_reason {
                     self.finish_interrupted(output, stop_reason, owned_error.as_deref())?;
@@ -2486,7 +2493,11 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
         let mut run = match app.agent.prompt(prompt).await {
             Ok(run) => run,
             Err(error) => {
-                output.error(id.as_deref(), "prompt", error.to_string())?;
+                output.error(
+                    id.as_deref(),
+                    "prompt",
+                    rpc_error_diagnostic(&translator.model, &error),
+                )?;
                 continue;
             }
         };
@@ -2543,6 +2554,31 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_failure_diagnostic_omits_provider_payloads_and_codes() {
+        let model = ygg_ai::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let error = AgentError::Ai(ygg_ai::AiError::Http(ygg_ai::HttpError {
+            status: http::StatusCode::BAD_REQUEST,
+            request_id: Some("secret-request-id".into()),
+            retry_after: None,
+            provider_code: Some("secret-provider-code".into()),
+            body_snippet: Some("secret provider body with user prompt".into()),
+            retryable: false,
+        }));
+
+        let diagnostic = rpc_error_diagnostic(&model, &error);
+        assert_eq!(
+            diagnostic,
+            "provider=openai model=gpt-4o-mini phase=HTTP response"
+        );
+        assert!(!diagnostic.contains("secret"));
+        assert!(!diagnostic.contains("400"));
+        assert!(!diagnostic.contains("prompt"));
+    }
 
     #[test]
     fn lf_framing_keeps_unicode_line_separators_inside_json() {
