@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "ygg-binaries-v*"
+      - "ygg-installer-v*"
   workflow_dispatch:
     inputs:
       release_tag:
@@ -33,6 +34,8 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       source_commit: ${{ steps.release.outputs.source_commit }}
       workflow_commit: ${{ steps.release.outputs.workflow_commit }}
+      core_workflow_commit: ${{ steps.release.outputs.core_workflow_commit }}
+      mode: ${{ steps.release.outputs.mode }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -46,14 +49,24 @@ jobs:
           INPUT_REQUIRE_PROVIDER_ACCEPTANCE: ${{ inputs.require_provider_acceptance }}
         run: |
           set -euo pipefail
+          mode=binaries
           if [[ -n "$INPUT_RELEASE_TAG" ]]; then
             tag="$INPUT_RELEASE_TAG"
           elif [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            tag=${GITHUB_REF_NAME#ygg-binaries-}
-            if [[ "$tag" == "$GITHUB_REF_NAME" ]]; then
-              echo "binary source tags must start with ygg-binaries-" >&2
-              exit 1
-            fi
+            case "$GITHUB_REF_NAME" in
+              ygg-binaries-v*)
+                mode=binaries
+                tag=${GITHUB_REF_NAME#ygg-binaries-}
+                ;;
+              ygg-installer-v*)
+                mode=installer
+                tag=${GITHUB_REF_NAME#ygg-installer-}
+                ;;
+              *)
+                echo "release tooling tags must start with ygg-binaries- or ygg-installer-" >&2
+                exit 1
+                ;;
+            esac
           else
             echo "release_tag is required when this workflow is not running for a tag" >&2
             exit 1
@@ -67,9 +80,21 @@ jobs:
               echo "manual releases must dispatch this workflow from the exact canonical tag $tag" >&2
               exit 1
             fi
-          elif [[ "$GITHUB_REF_TYPE" != tag || "$GITHUB_REF_NAME" != "ygg-binaries-$tag" ]]; then
-            echo "binary release pushes must use ygg-binaries-$tag" >&2
-            exit 1
+          else
+            case "$mode" in
+              binaries) expected_workflow_tag="ygg-binaries-$tag" ;;
+              installer) expected_workflow_tag="ygg-installer-$tag" ;;
+              *)
+                echo "invalid release mode: $mode" >&2
+                exit 1
+                ;;
+            esac
+            if [[ "$GITHUB_EVENT_NAME" != push \
+              || "$GITHUB_REF_TYPE" != tag \
+              || "$GITHUB_REF_NAME" != "$expected_workflow_tag" ]]; then
+              echo "$mode release pushes must use $expected_workflow_tag" >&2
+              exit 1
+            fi
           fi
 
           git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
@@ -78,9 +103,9 @@ jobs:
           if [[ "$workflow_commit" != "$source_commit" ]]; then
             if [[ "$GITHUB_EVENT_NAME" != push \
               || "$GITHUB_REF_TYPE" != tag \
-              || "$GITHUB_REF_NAME" != "ygg-binaries-$tag" ]]; then
+              || "$GITHUB_REF_NAME" != "$expected_workflow_tag" ]]; then
               echo "workflow ref $workflow_commit does not match canonical release source $source_commit" >&2
-              echo "tooling-only repairs must use the dedicated ygg-binaries-$tag tag" >&2
+              echo "tooling-only repairs must use the dedicated $expected_workflow_tag tag" >&2
               exit 1
             fi
             if ! git merge-base --is-ancestor "$source_commit" "$workflow_commit"; then
@@ -98,14 +123,37 @@ jobs:
               echo "tooling-only repair does not change the Ygg release workflow" >&2
               exit 1
             fi
-            echo "using release tooling $workflow_commit to package immutable source $source_commit"
+            echo "using release tooling $workflow_commit with immutable source $source_commit"
             {
               echo "## Release tooling repair"
               echo
               echo "- Immutable source: \`$source_commit\`"
               echo "- Release tooling: \`$workflow_commit\`"
+              echo "- Mode: \`$mode\`"
               echo "- Trigger: \`$GITHUB_REF_NAME\`"
             } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          core_workflow_commit=$workflow_commit
+          if [[ "$mode" == installer ]]; then
+            core_workflow_tag="ygg-binaries-$tag"
+            git fetch --force origin "refs/tags/$core_workflow_tag:refs/tags/$core_workflow_tag"
+            core_workflow_commit=$(git rev-parse "$core_workflow_tag^{commit}")
+            if ! git merge-base --is-ancestor "$source_commit" "$core_workflow_commit"; then
+              echo "core release tooling $core_workflow_commit does not descend from $source_commit" >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$core_workflow_commit" "$workflow_commit"; then
+              echo "installer repair tooling $workflow_commit does not descend from core tooling $core_workflow_commit" >&2
+              exit 1
+            fi
+            core_unexpected_paths=$(git diff --name-only "$source_commit" "$core_workflow_commit" \
+              | grep -Ev '^\.github/workflows/release-(ygg|serve)\.yml$' || true)
+            if [[ -n "$core_unexpected_paths" ]]; then
+              echo "core release tooling changes non-release-workflow paths:" >&2
+              printf '%s\n' "$core_unexpected_paths" >&2
+              exit 1
+            fi
           fi
           version=${tag#v}
           cargo_version=$(git show "$source_commit:Cargo.toml" \
@@ -135,44 +183,53 @@ jobs:
             exit 1
           fi
 
-          if [[ "${INPUT_REQUIRE_PROVIDER_ACCEPTANCE:-false}" == true ]]; then
-            environment_name=stable-release-provider-acceptance
-            workflow_id=$(gh api \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/provider-acceptance.yml" \
-              --jq .id)
-            evidence_run=$(gh api --method GET \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs" \
-              -f head_sha="$source_commit" \
-              -f event=workflow_dispatch \
-              -f status=success \
-              -f per_page=100 \
-              --jq '.workflow_runs | map(select(.event == "workflow_dispatch" and .conclusion == "success")) | sort_by(.run_started_at) | last | .id // empty')
-            if [[ ! "$evidence_run" =~ ^[0-9]+$ ]]; then
-              echo "no successful protected provider/audio acceptance run is bound to $source_commit" >&2
-              exit 1
+          if [[ "$mode" == binaries ]]; then
+            if [[ "${INPUT_REQUIRE_PROVIDER_ACCEPTANCE:-false}" == true ]]; then
+              environment_name=stable-release-provider-acceptance
+              workflow_id=$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/provider-acceptance.yml" \
+                --jq .id)
+              evidence_run=$(gh api --method GET \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs" \
+                -f head_sha="$source_commit" \
+                -f event=workflow_dispatch \
+                -f status=success \
+                -f per_page=100 \
+                --jq '.workflow_runs | map(select(.event == "workflow_dispatch" and .conclusion == "success")) | sort_by(.run_started_at) | last | .id // empty')
+              if [[ ! "$evidence_run" =~ ^[0-9]+$ ]]; then
+                echo "no successful protected provider/audio acceptance run is bound to $source_commit" >&2
+                exit 1
+              fi
+              evidence_sha=$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$evidence_run" \
+                --jq .head_sha)
+              if [[ "$evidence_sha" != "$source_commit" ]]; then
+                echo "provider acceptance evidence is not bound to $source_commit" >&2
+                exit 1
+              fi
+              approval_count=$(gh api \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$evidence_run/approvals" \
+                --jq '[.[] | select(.state == "approved") | .environments[]? | select(.name == "stable-release-provider-acceptance")] | length')
+              if [[ ! "$approval_count" =~ ^[0-9]+$ || "$approval_count" -lt 1 ]]; then
+                echo "provider acceptance run $evidence_run lacks a recorded $environment_name approval" >&2
+                exit 1
+              fi
+              echo "using protected provider acceptance run $evidence_run for $source_commit"
+            else
+              echo "::warning title=Live-provider acceptance waived::Release packaging is proceeding without credentialed provider/audio acceptance for $source_commit"
+              {
+                echo "## Release acceptance"
+                echo
+                echo "- Candidate: \`$source_commit\`"
+                echo "- Live provider/audio acceptance: **WAIVED**"
+              } >> "$GITHUB_STEP_SUMMARY"
             fi
-            evidence_sha=$(gh api \
-              "repos/$GITHUB_REPOSITORY/actions/runs/$evidence_run" \
-              --jq .head_sha)
-            if [[ "$evidence_sha" != "$source_commit" ]]; then
-              echo "provider acceptance evidence is not bound to $source_commit" >&2
-              exit 1
-            fi
-            approval_count=$(gh api \
-              "repos/$GITHUB_REPOSITORY/actions/runs/$evidence_run/approvals" \
-              --jq '[.[] | select(.state == "approved") | .environments[]? | select(.name == "stable-release-provider-acceptance")] | length')
-            if [[ ! "$approval_count" =~ ^[0-9]+$ || "$approval_count" -lt 1 ]]; then
-              echo "provider acceptance run $evidence_run lacks a recorded $environment_name approval" >&2
-              exit 1
-            fi
-            echo "using protected provider acceptance run $evidence_run for $source_commit"
           else
-            echo "::warning title=Live-provider acceptance waived::Release packaging is proceeding without credentialed provider/audio acceptance for $source_commit"
             {
-              echo "## Release acceptance"
+              echo "## Installer portability repair"
               echo
-              echo "- Candidate: \`$source_commit\`"
-              echo "- Live provider/audio acceptance: **WAIVED**"
+              echo "- Existing signed binary assets remain immutable."
+              echo "- Core signing workflow: \`$core_workflow_commit\`"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -181,11 +238,14 @@ jobs:
             echo "version=$version"
             echo "source_commit=$source_commit"
             echo "workflow_commit=$workflow_commit"
+            echo "core_workflow_commit=$core_workflow_commit"
+            echo "mode=$mode"
           } >> "$GITHUB_OUTPUT"
 
   security:
     name: Audit release dependencies
     needs: resolve
+    if: needs.resolve.outputs.mode == 'binaries'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -212,6 +272,7 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     needs: [resolve, security]
+    if: needs.resolve.outputs.mode == 'binaries'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -292,6 +353,7 @@ jobs:
   publish:
     name: Sign and attach Ygg binaries
     needs: [resolve, build]
+    if: needs.resolve.outputs.mode == 'binaries'
     runs-on: ubuntu-24.04
     outputs:
       release_tag: ${{ needs.resolve.outputs.tag }}
@@ -457,6 +519,7 @@ jobs:
   verify-published:
     name: Verify binary install on ${{ matrix.target }}
     needs: [resolve, publish]
+    if: needs.resolve.outputs.mode == 'binaries'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -537,6 +600,302 @@ jobs:
           printf '%s\n' '{"protocol_version":1,"request_id":"published-smoke","command":"hello"}' \
             | HOME="$test_home" "$host_binary" \
             | grep -F '"type":"hello"' >/dev/null
+          HOME="$test_home" "$binary" extension install ygg-serve
+          HOME="$test_home" "$binary" extension list | grep -F "ygg-serve"
+          HOME="$test_home" "$binary" extension remove ygg-serve
+          test ! -e "$test_home/.ygg/extensions/ygg-serve"
+
+  publish-installer-repair:
+    name: Sign and attach portable Ygg installer
+    needs: resolve
+    if: needs.resolve.outputs.mode == 'installer'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out immutable release source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.resolve.outputs.source_commit }}
+          fetch-depth: 0
+      - name: Generate version-pinned portable installer
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          CORE_WORKFLOW_COMMIT: ${{ needs.resolve.outputs.core_workflow_commit }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          installer="release-assets/install-ygg-$RELEASE_TAG.sh"
+          python3 - \
+            "$SOURCE_COMMIT" \
+            "$CORE_WORKFLOW_COMMIT" \
+            scripts/install.sh \
+            "$installer" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          source_commit, core_workflow_commit, source_path, destination_path = sys.argv[1:5]
+          for name, commit in (
+              ("release source", source_commit),
+              ("core release workflow", core_workflow_commit),
+          ):
+              if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+                  raise SystemExit(f"{name} commit is malformed")
+
+          generated = pathlib.Path(source_path).read_text(encoding="utf-8")
+          placeholder = 'release_source_commit="__YGG_RELEASE_SOURCE_COMMIT__"'
+          if generated.count(placeholder) != 1:
+              raise SystemExit("installer source-commit placeholder is missing or ambiguous")
+          generated = generated.replace(
+              placeholder,
+              (
+                  f'release_source_commit="{source_commit}"\n'
+                  f'release_workflow_commit="{core_workflow_commit}"'
+              ),
+          )
+
+          signature_commit_argument = '        "$release_source_commit" \\\n'
+          if generated.count(signature_commit_argument) != 1:
+              raise SystemExit("installer signature-commit argument is missing or ambiguous")
+          generated = generated.replace(
+              signature_commit_argument,
+              '        "$release_workflow_commit" \\\n',
+          )
+
+          darwin_incompatible = '''    bundle_reference = f"/dev/fd/{bundle}"
+              if not os.path.exists(manifest_reference) or not os.path.exists(bundle_reference):
+                  raise RuntimeError("descriptor-relative verification is unavailable")'''
+          portable = '''    bundle_reference = bundle_path
+              if not os.path.exists(manifest_reference):
+                  raise RuntimeError("descriptor-relative verification is unavailable")'''
+          if generated.count(darwin_incompatible) != 1:
+              raise SystemExit("installer bundle-reference block is missing or ambiguous")
+          generated = generated.replace(darwin_incompatible, portable)
+
+          pathlib.Path(destination_path).write_text(generated, encoding="utf-8")
+          PY
+          chmod 0755 "$installer"
+          if grep -F '__YGG_RELEASE_SOURCE_COMMIT__' "$installer"; then
+            echo "generated installer still contains its source-commit placeholder" >&2
+            exit 1
+          fi
+          grep -F "release_source_commit=\"$SOURCE_COMMIT\"" "$installer"
+          grep -F "release_workflow_commit=\"$CORE_WORKFLOW_COMMIT\"" "$installer"
+          grep -F 'bundle_reference = bundle_path' "$installer"
+          if grep -F 'bundle_reference = f"/dev/fd/{bundle}"' "$installer"; then
+            echo "generated installer still passes the bundle through a shared Darwin descriptor" >&2
+            exit 1
+          fi
+          "$installer" --help | grep -F "Install Ygg ${{ needs.resolve.outputs.version }}."
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v3.1.3
+      - name: Verify existing core release provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          CORE_WORKFLOW_COMMIT: ${{ needs.resolve.outputs.core_workflow_commit }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir upstream-assets
+          gh release download "$RELEASE_TAG" \
+            --dir upstream-assets \
+            --pattern YGG_SHA256SUMS \
+            --pattern YGG_SHA256SUMS.sigstore.json
+          core_identity="https://github.com/$WORKFLOW_REPOSITORY/.github/workflows/release-ygg.yml@refs/tags/ygg-binaries-$RELEASE_TAG"
+          cosign verify-blob \
+            --bundle upstream-assets/YGG_SHA256SUMS.sigstore.json \
+            --certificate-identity "$core_identity" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-name "Ygg binary release" \
+            --certificate-github-workflow-repository "$WORKFLOW_REPOSITORY" \
+            --certificate-github-workflow-sha "$CORE_WORKFLOW_COMMIT" \
+            upstream-assets/YGG_SHA256SUMS
+          gh release view "$RELEASE_TAG" --json assets > upstream-assets/release.json
+          python3 - \
+            upstream-assets/YGG_SHA256SUMS \
+            upstream-assets/release.json \
+            "${{ needs.resolve.outputs.version }}" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          manifest_path, release_path, version = sys.argv[1:4]
+          expected = {
+              "install-ygg.sh",
+              f"ygg-{version}-aarch64-apple-darwin.tar.gz",
+              f"ygg-{version}-x86_64-apple-darwin.tar.gz",
+              f"ygg-{version}-x86_64-unknown-linux-gnu.tar.gz",
+          }
+          pattern = re.compile(r"^([0-9a-f]{64})  \./([A-Za-z0-9_.-]+)$")
+          entries = {}
+          for line in pathlib.Path(manifest_path).read_text(encoding="ascii").splitlines():
+              match = pattern.fullmatch(line)
+              if match is None or match.group(2) in entries:
+                  raise SystemExit("core checksum manifest is malformed")
+              entries[match.group(2)] = match.group(1)
+          if set(entries) != expected:
+              raise SystemExit("core checksum manifest has an unexpected asset set")
+
+          release = json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
+          assets = {asset["name"]: asset for asset in release["assets"]}
+          required = expected | {"YGG_SHA256SUMS", "YGG_SHA256SUMS.sigstore.json"}
+          missing = required - set(assets)
+          if missing:
+              raise SystemExit(f"core release assets are missing: {sorted(missing)}")
+          for name, digest in entries.items():
+              if assets[name].get("digest") != f"sha256:{digest}":
+                  raise SystemExit(f"GitHub digest does not match signed manifest for {name}")
+          PY
+      - name: Sign and verify portable installer
+        shell: bash
+        env:
+          COSIGN_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          installer="release-assets/install-ygg-$RELEASE_TAG.sh"
+          cosign sign-blob \
+            --yes \
+            --bundle "$installer.sigstore.json" \
+            "$installer"
+          cosign verify-blob \
+            --bundle "$installer.sigstore.json" \
+            --certificate-identity "$COSIGN_IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-name "Ygg binary release" \
+            --certificate-github-workflow-repository "$WORKFLOW_REPOSITORY" \
+            --certificate-github-workflow-sha "$WORKFLOW_COMMIT" \
+            "$installer"
+          sha256sum "$installer" "$installer.sigstore.json"
+      - name: Attach portable installer to canonical release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          CORE_WORKFLOW_TAG: ygg-binaries-${{ needs.resolve.outputs.tag }}
+          CORE_WORKFLOW_COMMIT: ${{ needs.resolve.outputs.core_workflow_commit }}
+          INSTALLER_WORKFLOW_TAG: ${{ github.ref_name }}
+          INSTALLER_WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+        run: |
+          set -euo pipefail
+          verify_release_refs() {
+            phase=$1
+            for ref_spec in \
+              "$RELEASE_TAG:$SOURCE_COMMIT" \
+              "$CORE_WORKFLOW_TAG:$CORE_WORKFLOW_COMMIT" \
+              "$INSTALLER_WORKFLOW_TAG:$INSTALLER_WORKFLOW_COMMIT"; do
+              tag_name=${ref_spec%%:*}
+              expected_commit=${ref_spec#*:}
+              git fetch --force origin "refs/tags/$tag_name:refs/tags/$tag_name"
+              if [[ "$(git rev-parse "$tag_name^{commit}")" != "$expected_commit" ]]; then
+                echo "release tag $tag_name moved while installer assets were $phase" >&2
+                exit 1
+              fi
+            done
+          }
+          verify_release_refs prepared
+          release_state=$(gh release view "$RELEASE_TAG" \
+            --json tagName,isDraft,isPrerelease \
+            --jq '[.tagName, .isDraft, .isPrerelease] | @tsv')
+          IFS=$'\t' read -r release_tag draft prerelease <<< "$release_state"
+          if [[ "$release_tag" != "$RELEASE_TAG" || "$draft" != false || "$prerelease" != false ]]; then
+            echo "canonical release $RELEASE_TAG is not a published stable release" >&2
+            exit 1
+          fi
+          existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+          for asset in release-assets/*; do
+            name=${asset##*/}
+            if grep -Fx "$name" <<< "$existing_assets" >/dev/null; then
+              echo "refusing to replace existing immutable release asset: $name" >&2
+              exit 1
+            fi
+          done
+          gh release upload "$RELEASE_TAG" release-assets/*
+          verify_release_refs published
+
+  verify-installer-repair:
+    name: Verify portable installer on ${{ matrix.target }}
+    needs: [resolve, publish-installer-repair]
+    if: needs.resolve.outputs.mode == 'installer'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - name: Download and run published portable installer without Cargo
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          installer="$RUNNER_TEMP/install-ygg-$RELEASE_TAG.sh"
+          installer_url="https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/install-ygg-$RELEASE_TAG.sh"
+          for attempt in 1 2 3 4 5; do
+            if curl \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --tlsv1.2 \
+              --location \
+              --fail \
+              --silent \
+              --show-error \
+              --output "$installer" \
+              "$installer_url"; then
+              break
+            fi
+            if [[ "$attempt" == 5 ]]; then
+              echo "published portable installer is not readable" >&2
+              exit 1
+            fi
+            sleep $((attempt * 2))
+          done
+
+          test_home="$RUNNER_TEMP/ygg-portable-install-home"
+          install_directory="$test_home/bin"
+          fake_tools="$RUNNER_TEMP/no-cargo"
+          mkdir -p "$test_home" "$fake_tools"
+          cat > "$fake_tools/cargo" <<'EOF'
+          #!/bin/sh
+          echo "binary installer unexpectedly invoked Cargo" >&2
+          exit 99
+          EOF
+          chmod 0755 "$fake_tools/cargo"
+
+          HOME="$test_home" \
+            YGG_INSTALL_DIR="$install_directory" \
+            YGG_NO_MODIFY_PATH=1 \
+            PATH="$fake_tools:$PATH" \
+            sh "$installer"
+
+          binary="$install_directory/ygg"
+          host_binary="$install_directory/ygg-host"
+          test -x "$binary"
+          test -x "$host_binary"
+          test "$(HOME="$test_home" "$binary" --version)" = "ygg $VERSION"
+          HOME="$test_home" "$binary" --help >/dev/null
+          printf '%s\n' '{"protocol_version":1,"request_id":"portable-installer-smoke","command":"hello"}' \
+            | HOME="$test_home" "$host_binary" \
+            | grep -F '"sdk_version":"0.4.0"' >/dev/null
           HOME="$test_home" "$binary" extension install ygg-serve
           HOME="$test_home" "$binary" extension list | grep -F "ygg-serve"
           HOME="$test_home" "$binary" extension remove ygg-serve
