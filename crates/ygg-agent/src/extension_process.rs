@@ -164,8 +164,19 @@ struct RegisteredProcessGroup {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+struct RegisteredProcessScanState {
+    registration_id: u64,
+    direct_bash_child_owned: bool,
+}
+
+#[cfg(unix)]
 static REGISTERED_PROCESS_GROUPS: LazyLock<StdMutex<BTreeMap<i32, RegisteredProcessGroup>>> =
     LazyLock::new(|| StdMutex::new(BTreeMap::new()));
+/// Keep process scan/application order monotonic. Otherwise an older scan can
+/// finish last and erase descendants recorded by a newer scan.
+#[cfg(unix)]
+static PROCESS_SNAPSHOT_REFRESH: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 static NEXT_PROCESS_GROUP_REGISTRATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(unix)]
@@ -292,8 +303,28 @@ impl ProcessGroupGuard {
                 self.disarm();
                 return;
             };
-            refresh_registered_descendants();
-            if !registered_process_is_alive(process_group_id_i32, self.registration_id) {
+            // A whole-process-table scan can race the shell's final exit and
+            // miss a background child that has already inherited its group.
+            // Retry the bounded handoff while the freshly created group still
+            // exists; stable PID/start-time identities remain mandatory.
+            let mut descendants_found = false;
+            for _ in 0..3 {
+                refresh_registered_descendants();
+                let handoff_is_bound = if PROCESS_IDENTITY_TRACKING_AVAILABLE {
+                    registered_process_has_live_identity(process_group_id_i32, self.registration_id)
+                } else {
+                    registered_process_is_alive(process_group_id_i32, self.registration_id)
+                };
+                if handoff_is_bound {
+                    descendants_found = true;
+                    break;
+                }
+                if !process_group_is_alive(process_group_id_i32) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            if !descendants_found {
                 self.disarm();
                 return;
             }
@@ -534,16 +565,78 @@ fn process_identity_is_alive(identity: ProcessIdentity) -> bool {
 
 #[cfg(unix)]
 fn refresh_registered_descendants() {
+    let _refresh_guard = lock_std_mutex(&PROCESS_SNAPSHOT_REFRESH);
+    // Process discovery runs without the registry lock. Record which
+    // registrations and directly-owned state the scan can describe so a group
+    // inserted, replaced, or handed off while the scan is in flight is never
+    // invalidated by stale observations.
+    let (registration_states_at_snapshot_start, known_identities) = {
+        let registered = lock_std_mutex(&REGISTERED_PROCESS_GROUPS);
+        let registration_states = registered
+            .iter()
+            .map(|(process_group_id, entry)| {
+                (
+                    *process_group_id,
+                    RegisteredProcessScanState {
+                        registration_id: entry.registration_id,
+                        direct_bash_child_owned: entry.kind == RegisteredProcessKind::Bash
+                            && entry.detached_bash.is_none(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let identities = registered
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .root
+                    .into_iter()
+                    .chain(entry.descendants.values().copied())
+            })
+            .collect::<Vec<_>>();
+        (registration_states, identities)
+    };
     let snapshots = process_snapshots();
     if snapshots.is_empty() {
         return;
     }
-    let snapshots_by_pid = snapshots
+    let mut snapshots_by_pid = snapshots
         .into_iter()
         .map(|snapshot| (snapshot.identity.pid, snapshot))
         .collect::<BTreeMap<_, _>>();
+    // Whole-system enumeration is not atomic and platform APIs may briefly
+    // omit a live process. Re-read every missing identity directly before
+    // treating it as dead and severing ownership of its descendants.
+    for identity in known_identities {
+        if snapshots_by_pid.contains_key(&identity.pid) {
+            continue;
+        }
+        let Some(snapshot) = process_snapshot(identity.pid) else {
+            continue;
+        };
+        snapshots_by_pid.insert(identity.pid, snapshot);
+    }
     let mut registered = lock_std_mutex(&REGISTERED_PROCESS_GROUPS);
+    apply_process_snapshots(
+        &mut registered,
+        &registration_states_at_snapshot_start,
+        &snapshots_by_pid,
+    );
+}
+
+#[cfg(unix)]
+fn apply_process_snapshots(
+    registered: &mut BTreeMap<i32, RegisteredProcessGroup>,
+    registration_states_at_snapshot_start: &BTreeMap<i32, RegisteredProcessScanState>,
+    snapshots_by_pid: &BTreeMap<i32, ProcessSnapshot>,
+) {
     for (process_group_id, entry) in registered.iter_mut() {
+        let Some(scan_state) = registration_states_at_snapshot_start.get(process_group_id) else {
+            continue;
+        };
+        if scan_state.registration_id != entry.registration_id {
+            continue;
+        }
         entry.descendants.retain(|pid, identity| {
             snapshots_by_pid
                 .get(pid)
@@ -563,7 +656,11 @@ fn refresh_registered_descendants() {
         let group_has_member = snapshots_by_pid
             .values()
             .any(|snapshot| snapshot.process_group_id == *process_group_id);
-        let group_is_bound = entry.original_group_active && group_has_member;
+        // A scan may straddle the direct child's exit and its descendant's
+        // creation. Keep the freshly owned group bound until Bash hands it to
+        // detached supervision; the handoff performs fresh scans below.
+        let group_is_bound =
+            entry.original_group_active && (group_has_member || scan_state.direct_bash_child_owned);
 
         loop {
             let mut changed = false;
@@ -692,6 +789,12 @@ fn signal_registered_targets(targets: &RegisteredProcessTargets, signal: i32) {
     for identity in targets.identities() {
         signal_identity(identity, signal);
     }
+}
+
+#[cfg(unix)]
+fn registered_process_has_live_identity(process_group_id: i32, registration_id: u64) -> bool {
+    registered_targets(process_group_id, registration_id)
+        .is_some_and(|targets| targets.identities().any(process_identity_is_alive))
 }
 
 #[cfg(unix)]
@@ -4109,6 +4212,154 @@ sleep 30
         let _ = request.await;
         assert!(lock_std_mutex(&connection.pending).is_empty());
         connection.terminate().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_scan_does_not_mutate_a_later_registration() {
+        let process_group_id = 42;
+        let root = ProcessIdentity {
+            pid: process_group_id,
+            start_time: 200,
+        };
+        let descendant = ProcessIdentity {
+            pid: 43,
+            start_time: 201,
+        };
+        let mut registered = BTreeMap::from([(
+            process_group_id,
+            RegisteredProcessGroup {
+                kind: RegisteredProcessKind::Bash,
+                registration_id: 8,
+                root: Some(root),
+                original_group_active: true,
+                descendants: BTreeMap::from([(descendant.pid, descendant)]),
+                detached_bash: None,
+            },
+        )]);
+        let registrations_at_snapshot_start = BTreeMap::from([(
+            process_group_id,
+            RegisteredProcessScanState {
+                registration_id: 7,
+                direct_bash_child_owned: true,
+            },
+        )]);
+        let unrelated = ProcessSnapshot {
+            identity: ProcessIdentity {
+                pid: 900,
+                start_time: 1,
+            },
+            parent_pid: 1,
+            process_group_id: 900,
+        };
+        let snapshots_by_pid = BTreeMap::from([(unrelated.identity.pid, unrelated)]);
+
+        apply_process_snapshots(
+            &mut registered,
+            &registrations_at_snapshot_start,
+            &snapshots_by_pid,
+        );
+
+        let entry = registered.get(&process_group_id).expect("registration");
+        assert!(entry.original_group_active);
+        assert_eq!(entry.root, Some(root));
+        assert_eq!(entry.descendants.get(&descendant.pid), Some(&descendant));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_scan_keeps_a_directly_owned_group_bound_during_handoff() {
+        let process_group_id = 42;
+        let root = ProcessIdentity {
+            pid: process_group_id,
+            start_time: 200,
+        };
+        let mut registered = BTreeMap::from([(
+            process_group_id,
+            RegisteredProcessGroup {
+                kind: RegisteredProcessKind::Bash,
+                registration_id: 8,
+                root: Some(root),
+                original_group_active: true,
+                descendants: BTreeMap::new(),
+                detached_bash: Some(DetachedBashSupervision {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    cancellation: CancellationToken::default(),
+                }),
+            },
+        )]);
+        let registrations_at_snapshot_start = BTreeMap::from([(
+            process_group_id,
+            RegisteredProcessScanState {
+                registration_id: 8,
+                direct_bash_child_owned: true,
+            },
+        )]);
+        let unrelated = ProcessSnapshot {
+            identity: ProcessIdentity {
+                pid: 900,
+                start_time: 1,
+            },
+            parent_pid: 1,
+            process_group_id: 900,
+        };
+        let snapshots_by_pid = BTreeMap::from([(unrelated.identity.pid, unrelated)]);
+
+        apply_process_snapshots(
+            &mut registered,
+            &registrations_at_snapshot_start,
+            &snapshots_by_pid,
+        );
+
+        let entry = registered.get(&process_group_id).expect("registration");
+        assert!(entry.original_group_active);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_scan_does_not_keep_an_extension_group_bound_without_a_member() {
+        let process_group_id = 42;
+        let root = ProcessIdentity {
+            pid: process_group_id,
+            start_time: 200,
+        };
+        let mut registered = BTreeMap::from([(
+            process_group_id,
+            RegisteredProcessGroup {
+                kind: RegisteredProcessKind::Extension,
+                registration_id: 8,
+                root: Some(root),
+                original_group_active: true,
+                descendants: BTreeMap::new(),
+                detached_bash: None,
+            },
+        )]);
+        let registrations_at_snapshot_start = BTreeMap::from([(
+            process_group_id,
+            RegisteredProcessScanState {
+                registration_id: 8,
+                direct_bash_child_owned: false,
+            },
+        )]);
+        let unrelated = ProcessSnapshot {
+            identity: ProcessIdentity {
+                pid: 900,
+                start_time: 1,
+            },
+            parent_pid: 1,
+            process_group_id: 900,
+        };
+        let snapshots_by_pid = BTreeMap::from([(unrelated.identity.pid, unrelated)]);
+
+        apply_process_snapshots(
+            &mut registered,
+            &registrations_at_snapshot_start,
+            &snapshots_by_pid,
+        );
+
+        let entry = registered.get(&process_group_id).expect("registration");
+        assert!(!entry.original_group_active);
+        assert!(entry.descendants.is_empty());
     }
 
     #[cfg(unix)]

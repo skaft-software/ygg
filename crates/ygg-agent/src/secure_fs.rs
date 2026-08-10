@@ -455,7 +455,7 @@ mod imp {
     struct CreatedDirectory {
         parent: OwnedFd,
         name: OsString,
-        device: u64,
+        device: rustix::fs::Dev,
         inode: u64,
     }
 
@@ -478,8 +478,8 @@ mod imp {
             self.entries.push(CreatedDirectory {
                 parent,
                 name: name.to_os_string(),
-                device: metadata.st_dev as u64,
-                inode: metadata.st_ino as u64,
+                device: metadata.st_dev,
+                inode: metadata.st_ino,
             });
             Ok(())
         }
@@ -499,7 +499,7 @@ mod imp {
                 };
                 if rustix::fs::FileType::from_raw_mode(actual.st_mode)
                     != rustix::fs::FileType::Directory
-                    || (actual.st_dev as u64, actual.st_ino) != (created.device, created.inode)
+                    || (actual.st_dev, actual.st_ino) != (created.device, created.inode)
                 {
                     continue;
                 }
@@ -531,26 +531,20 @@ mod imp {
         Ok(Some(directory))
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn open_root_component(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, Errno> {
+        open_directory(parent, name)
+    }
+
+    #[cfg(target_os = "macos")]
     fn open_root_component(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, Errno> {
         // Root components are no different from caller-controlled descendants,
         // except for macOS's system-owned `/var -> private/var` compatibility
         // alias. Never follow arbitrary first-component links.
         match open_directory(parent, name) {
             Ok(directory) => Ok(directory),
-            Err(error) => {
-                #[cfg(target_os = "macos")]
-                {
-                    if name == OsStr::new("var") {
-                        open_macos_var_alias(parent).or(Err(error))
-                    } else {
-                        Err(error)
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    Err(error)
-                }
-            }
+            Err(error) if name == OsStr::new("var") => open_macos_var_alias(parent).or(Err(error)),
+            Err(error) => Err(error),
         }
     }
 
