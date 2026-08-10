@@ -847,7 +847,7 @@ test("rehydrates a replayed background run while concurrent sessions remain live
   await expect(transcript).toHaveAttribute("data-session-sequence", "1001");
 });
 
-test("does not pull a scrolled-away performance transcript to the latest item", async ({
+test("@isolated-performance does not pull a scrolled-away performance transcript to the latest item", async ({
   page,
 }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop");
@@ -1067,8 +1067,11 @@ test("does not pull a scrolled-away performance transcript to the latest item", 
   expect(performanceProbe?.steadyFramesPerSecond).toBeGreaterThanOrEqual(50);
   expect(performanceProbe?.streamElapsedMs).toBeLessThan(1_000);
   expect(performanceProbe?.longTaskObservationSupported).toBe(true);
-  expect(performanceProbe?.longTaskCount).toBe(0);
-  expect(performanceProbe?.maximumLongTaskMs).toBeLessThanOrEqual(50);
+  const performanceDiagnostics = `performance probe: ${JSON.stringify(performanceProbe)}`;
+  expect(performanceProbe?.longTaskCount, performanceDiagnostics).toBe(0);
+  expect(performanceProbe?.maximumLongTaskMs, performanceDiagnostics).toBeLessThanOrEqual(
+    50,
+  );
   await expect(
     page.getByRole("button", { name: "Jump to latest" }),
   ).toBeVisible();

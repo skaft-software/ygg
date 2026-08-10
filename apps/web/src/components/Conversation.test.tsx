@@ -906,14 +906,20 @@ describe("conversation composer", () => {
     const followUp = screen.getByRole("menuitemradio", { name: /Follow up/ });
     expect(followUp).toBeVisible();
     await user.click(followUp);
-    await waitFor(() =>
+    await waitFor(() => {
       expect(delivery).toHaveAccessibleName(
         "While ygg is working: Follow up",
-      ),
-    );
+      );
+      expect(
+        screen.queryByRole("menu", { name: "While ygg is working" }),
+      ).toBeNull();
+      expect(delivery).toHaveFocus();
+    });
 
     await user.type(screen.getByLabelText("Message ygg"), "Then summarize");
-    await user.click(screen.getByRole("button", { name: "Queue follow-up" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Queue follow-up" }),
+    );
     expect(onSubmit).toHaveBeenLastCalledWith(
       "Then summarize",
       [],

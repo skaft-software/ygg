@@ -565,7 +565,9 @@ its 64-level bound before `lopdf` parsing.
 The fixture matrix was split by configured Playwright project after the combined
 165-test invocation exceeded the command runner's 120-second limit; no test
 failure caused that timeout. Every project then passed independently under the
-pinned Node runtime.
+pinned Node runtime. The strict post-stream 50 ms long-task benchmark also runs
+in a separate Playwright invocation to keep unrelated functional cases outside
+its application-pressure window.
 
 The production-host Playwright test uses the real Rust host, real session
 adapter, and real provider request path with a disposable local
