@@ -540,7 +540,7 @@ pinned `apps/web/.node-version` runtime, Node `v22.13.0`.
 | Web unit tests | Full Vitest suite passed |
 | Fixture Playwright matrix | Every applicable test passed for desktop, tablet landscape, tablet portrait, mobile, and mobile-small |
 | Production-host Playwright | 1/1 passed against the real Rust host and a disposable local OpenAI-compatible provider; authentication/model selection, streaming, tool replay, `429`/`408` retries, explicit compaction, restart/resume, cancellation, and secret-safe failure projection are covered |
-| `ygg-agent` tests | 216 library and 64 agent-run integration tests passed |
+| `ygg-agent` tests | 219 library and 64 agent-run integration tests passed |
 | Coding-agent tests | 753 passed with `serve`; 671 passed with default features |
 | Full Rust workspace tests | All targets/all features and documentation tests passed |
 | No-default-feature workspace check | Pass |
@@ -549,7 +549,7 @@ pinned `apps/web/.node-version` runtime, Node `v22.13.0`.
 | Rust 1.86 workspace and independent-extension checks | Pass |
 | Rust formatting and `git diff --check` | Pass |
 | Package-boundary script | Pass |
-| Publishable core workspace package assembly | `cargo package --workspace --exclude ygg-coding-agent --locked --no-verify` passed from the clean `v0.4.0` candidate tree |
+| Publishable core workspace package assembly | `cargo +1.90.0 package --workspace --exclude ygg-coding-agent --locked --no-verify` passed from the clean `v0.4.0` candidate tree; Cargo 1.90 is used only for interdependent package assembly, while compilation remains on the Rust 1.86 MSRV |
 | Installed `ygg-coding-agent --features serve` smoke | Pass; installed `ygg 0.4.0` served the synchronized embedded bundle |
 | Optimized feature-enabled build and bundle smoke | Pass locally with the release binary; no signed tag artifact published |
 | Reproducible Serve archive and package dispatch | Two optimized Apple-silicon archives were byte-identical; local install, list, package-dispatched launch, embedded-bundle verification, removal, and data preservation passed |

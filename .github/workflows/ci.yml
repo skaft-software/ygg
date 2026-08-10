@@ -57,11 +57,17 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --doc --locked
-      # The serve feature depends on the publish-excluded optional extension.
-      - run: cargo package --workspace --exclude ygg-coding-agent --locked --no-verify
       - run: cargo fmt --manifest-path extensions/ygg-serve/Cargo.toml -- --check
       - run: cargo clippy --manifest-path extensions/ygg-serve/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo test --manifest-path extensions/ygg-serve/Cargo.toml --locked
+      # Cargo 1.90 stabilized packaging interdependent workspace crates. Keep
+      # compilation and tests on the 1.86 MSRV above; use 1.90 only to assemble
+      # the publishable crates together. The serve feature depends on the
+      # publish-excluded optional extension.
+      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+        with:
+          toolchain: 1.90.0
+      - run: cargo package --workspace --exclude ygg-coding-agent --locked --no-verify
 
   test:
     strategy:
