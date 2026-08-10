@@ -4399,7 +4399,14 @@ IFS= read -r initialize
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"api_version":"0.1","tools":[],"commands":[]}}'
 IFS= read -r shutdown
 printf '%s\n' graceful > "$YGG_WORKSPACE/graceful.marker"
-python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(30)' "$YGG_WORKSPACE/graceful-descendant.pid" &
+descendant_marker="$YGG_WORKSPACE/graceful-descendant.pid"
+python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1], "w").write(str(os.getpid())); time.sleep(30)' "$descendant_marker" &
+attempts=0
+while [ ! -s "$descendant_marker" ]; do
+  attempts=$((attempts + 1))
+  [ "$attempts" -lt 100 ] || exit 24
+  sleep 0.01
+done
 sleep 0.1
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
 "#,
