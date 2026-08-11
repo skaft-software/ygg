@@ -3852,28 +3852,21 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
 /// Recreate the Agent at an idle boundary. Taking `App` by value guarantees the
 /// old Agent and its session file are dropped before a session is reopened.
 pub fn rebuild_app(
-    app: App,
+    mut app: App,
     new_model: Option<Model>,
     new_reasoning: Option<ReasoningConfig>,
     new_reasoning_mode: Option<ReasoningMode>,
     selection: Option<SessionSelection>,
 ) -> anyhow::Result<App> {
-    let App {
-        agent,
-        model,
-        client,
-        mut config,
-        catalog,
-        sessions,
-        reasoning,
-        reasoning_mode,
-        system,
-        system_tokens: _,
-        tool_schema_tokens: _,
-        skills: old_skills,
-        prompts: _,
-        mut executable_extensions,
-    } = app;
+    let mut config = app.config.clone();
+    let catalog = app.catalog.clone();
+    let sessions = app.sessions.clone();
+    let client = app.client.clone();
+    let model = app.model.clone();
+    let reasoning = app.reasoning.clone();
+    let reasoning_mode = app.reasoning_mode;
+    let mut system = app.system.clone();
+    let old_skills = Arc::clone(&app.skills);
     let compact_model = config
         .compaction
         .compact_model
@@ -3881,9 +3874,8 @@ pub fn rebuild_app(
         .map(|id| catalog.resolve(id))
         .transpose()
         .with_context(|| "configured compaction model could not be resolved")?;
-    let current_path = agent.session().path().to_owned();
+    let current_path = app.agent.session().path().to_owned();
     let old_skill_metadata = format_skills_for_prompt(&old_skills.descriptors());
-    let mut system = system;
     if !old_skill_metadata.is_empty() && system.ends_with(&old_skill_metadata) {
         system.truncate(system.len() - old_skill_metadata.len());
     }
@@ -3925,15 +3917,15 @@ pub fn rebuild_app(
     let candidate_session = match selection.as_ref() {
         Some(SessionSelection::OpenExisting(_)) => prepared_session.as_ref(),
         Some(SessionSelection::CreateNew(_)) => None,
-        None => Some(agent.session()),
+        None => Some(app.agent.session()),
     };
     if let Some(candidate_session) = candidate_session {
         validate_native_compaction_replay(config.compaction.mode, candidate_session, &model)?;
     }
     // Do not tear down the working agent or its executable extensions until
     // the complete candidate route and reasoning configuration is known valid.
-    executable_extensions.shutdown_blocking();
-    drop(agent);
+    app.executable_extensions.shutdown_blocking();
+    drop(app);
     let mut session = match selection {
         Some(SessionSelection::CreateNew(path)) => {
             if let Some(parent) = path.parent() {

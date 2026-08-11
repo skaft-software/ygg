@@ -35,6 +35,13 @@ Interactive resume hydrates only a bounded active-branch tail for first paint;
 the complete branch is materialized when the user first navigates beyond that
 tail or selects the complete semantic transcript.
 
+Session discovery uses a workspace-local disposable SQLite projection of
+bounded active-branch titles keyed by transcript size and modification time.
+JSONL remains authoritative: cache misses and stale fingerprints are streamed
+under the same byte/record bounds, cache failures fall back to JSONL, and
+normally dropped `App` instances refresh their already-replayed active session
+without reopening it. The catalog is never a prerequisite for resume.
+
 ## System prompt
 
 The stable, model-agnostic base contract gives both local and cloud models an

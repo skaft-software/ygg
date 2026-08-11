@@ -360,6 +360,16 @@ pub struct App {
     pub executable_extensions: crate::extensions::ExecutableExtensions,
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // The catalog is disposable: shutdown must never fail because this
+        // best-effort projection could not be refreshed.
+        let _ = self
+            .sessions
+            .refresh_catalog_for_open_session(self.agent.session());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

@@ -6,6 +6,19 @@ conversation and branch history. Readable names and tags live in small sidecars
 under the workspace store's `.metadata/` directory so older binaries can still
 open the conversation unchanged.
 
+## Discovery catalog
+
+Each workspace store may also contain `.catalog/sessions-v1.sqlite3`. This is a
+private, disposable SQLite projection used to make session listing and the
+resume picker independent of total transcript bytes. It contains bounded
+derived titles and transcript size/mtime fingerprints; JSONL and `.metadata/`
+remain authoritative. Ygg streams only missing or stale transcripts, refreshes
+the active row when an app closes normally, and removes rows for missing
+sessions. An unavailable, locked, corrupt, oversized, or newer-version catalog
+never blocks session access: Ygg falls back to bounded JSONL scans, and rebuilds
+catalogs whose SQLite contents are corrupt. Deleting the `.catalog/` directory
+is safe; Ygg recreates it on demand.
+
 ## Commands
 
 ```console

@@ -29,7 +29,7 @@
 use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::PathBuf;
 
 use fs2::FileExt;
@@ -464,37 +464,6 @@ fn write_json_line<T: Serialize>(buf: &mut Vec<u8>, record: &T) -> Result<(), Se
 const MAX_SESSION_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SESSION_RECORDS: usize = 1_000_000;
 
-/// Decode every completed JSONL record strictly while allowing an interrupted
-/// append to end in arbitrary bytes. A crash can tear a write in the middle of
-/// a multibyte UTF-8 scalar, so decoding the complete file before locating its
-/// final unterminated segment would incorrectly make that recoverable tail
-/// fatal.
-fn session_text_with_torn_tail(bytes: &[u8]) -> Result<&str, SessionError> {
-    let completed_end = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |position| position + 1);
-    if let Err(error) = std::str::from_utf8(&bytes[..completed_end]) {
-        let line = bytes[..error.valid_up_to()]
-            .iter()
-            .filter(|byte| **byte == b'\n')
-            .count()
-            + 1;
-        return Err(SessionError::Corrupt {
-            line,
-            message: format!("invalid UTF-8: {error}"),
-        });
-    }
-
-    match std::str::from_utf8(bytes) {
-        Ok(content) => Ok(content),
-        // The completed prefix was validated above, so any remaining UTF-8
-        // error belongs exclusively to the final unterminated write.
-        Err(_) => Ok(std::str::from_utf8(&bytes[..completed_end])
-            .expect("the completed session prefix was validated above")),
-    }
-}
-
 /// Build DFS entry/exit times for the parent-linked entry forest in linear
 /// time. Parent records are guaranteed to precede children during replay, but
 /// branches may be interleaved in insertion order, so numeric entry positions
@@ -820,9 +789,7 @@ impl Session {
         }
         let mut reader = file.try_clone()?;
         reader.seek(std::io::SeekFrom::Start(0))?;
-        let mut content_bytes = Vec::with_capacity(file_len as usize);
-        reader.read_to_end(&mut content_bytes)?;
-        let content = session_text_with_torn_tail(&content_bytes)?;
+        let mut reader = BufReader::with_capacity(1024 * 1024, reader);
 
         let mut entries: Vec<Entry> = Vec::new();
         let mut index: HashMap<EntryId, usize> = HashMap::new();
@@ -835,36 +802,74 @@ impl Session {
         let mut usage_records: Vec<UsageRecord> = Vec::new();
 
         // Byte offset of the end of the last accepted record, so a torn tail
-        // can be truncated away below.
-        let mut valid_end: usize = 0;
-        let mut segments = content.split_inclusive('\n').peekable();
+        // can be truncated away below. Only one physical line is buffered at a
+        // time; parsed entries remain the authoritative in-memory replay.
+        let mut valid_end = 0u64;
+        let mut observed_end = 0u64;
+        let mut final_record_had_newline = true;
+        let mut line_bytes = Vec::new();
         let mut line_no = 0usize;
         let mut persisted_records = 0usize;
-        while let Some(segment) = segments.next() {
+        loop {
+            line_bytes.clear();
+            let read_limit = max_file_bytes
+                .saturating_sub(observed_end)
+                .saturating_add(1);
+            let bytes_read = reader
+                .by_ref()
+                .take(read_limit)
+                .read_until(b'\n', &mut line_bytes)?;
+            if bytes_read == 0 {
+                break;
+            }
+            observed_end = observed_end
+                .checked_add(u64::try_from(bytes_read).map_err(|_| {
+                    SessionError::Limit("session read length does not fit u64".to_owned())
+                })?)
+                .ok_or_else(|| SessionError::Limit("session read length overflow".to_owned()))?;
+            if observed_end > max_file_bytes {
+                return Err(SessionError::Limit(format!(
+                    "session exceeds the {max_file_bytes}-byte limit while being read"
+                )));
+            }
             line_no += 1;
             if line_no > max_records {
                 return Err(SessionError::Limit(format!(
                     "session has more than {max_records} records"
                 )));
             }
-            let is_last = segments.peek().is_none();
-            let line = segment.strip_suffix('\n').unwrap_or(segment);
-            let record: SessionRecord = match serde_json::from_str(line) {
-                Ok(r) => r,
-                // Only the final line may be torn by an interrupted write;
-                // anything earlier was completed by a successful append. A
-                // trailing newline proves the writer completed that record,
-                // so a malformed newline-terminated final line is corruption
-                // rather than a recoverable torn tail.
-                Err(_) if is_last && !segment.ends_with('\n') => break,
-                Err(e) => {
+            let has_newline = line_bytes.last() == Some(&b'\n');
+            let line_bytes = if has_newline {
+                &line_bytes[..line_bytes.len() - 1]
+            } else {
+                line_bytes.as_slice()
+            };
+            let line = match std::str::from_utf8(line_bytes) {
+                Ok(line) => line,
+                // A crash may tear the final write in the middle of a UTF-8
+                // scalar. Newline-terminated records remain strict UTF-8.
+                Err(_) if !has_newline => break,
+                Err(error) => {
                     return Err(SessionError::Corrupt {
                         line: line_no,
-                        message: e.to_string(),
+                        message: format!("invalid UTF-8: {error}"),
                     })
                 }
             };
-            valid_end += segment.len();
+            let record: SessionRecord = match serde_json::from_str(line) {
+                Ok(record) => record,
+                // `read_until` returns a non-newline-terminated segment only
+                // at EOF, so malformed bytes are recoverable only here.
+                Err(_) if !has_newline => break,
+                Err(error) => {
+                    return Err(SessionError::Corrupt {
+                        line: line_no,
+                        message: error.to_string(),
+                    })
+                }
+            };
+            valid_end = observed_end;
+            final_record_had_newline = has_newline;
             persisted_records += 1;
             match record {
                 SessionRecord::Entry(entry) => {
@@ -1068,22 +1073,19 @@ impl Session {
             message: "numeric entry ID exhausts the u64 ID space".to_owned(),
         })?;
 
-        if recover_tail && valid_end < content_bytes.len() {
+        if recover_tail && valid_end < observed_end {
             // Torn final line: truncate it away so the next append starts on
             // a fresh line rather than merging into the torn bytes (which
             // would corrupt the record for every later reopen).
-            file.set_len(valid_end as u64)?;
+            file.set_len(valid_end)?;
         }
 
-        if recover_tail && valid_end > 0 && !content[..valid_end].ends_with('\n') {
+        if recover_tail && valid_end > 0 && !final_record_had_newline {
             // The final record parsed but lost its newline in an interrupted
             // write; complete the line so the next append cannot merge into it.
-            let repaired_len = u64::try_from(valid_end)
-                .ok()
-                .and_then(|length| length.checked_add(1))
-                .ok_or_else(|| {
-                    SessionError::Limit("repaired session file length overflow".to_owned())
-                })?;
+            let repaired_len = valid_end.checked_add(1).ok_or_else(|| {
+                SessionError::Limit("repaired session file length overflow".to_owned())
+            })?;
             if repaired_len > max_file_bytes {
                 return Err(SessionError::Limit(format!(
                     "repair would grow session to {repaired_len} bytes (limit {max_file_bytes})"
