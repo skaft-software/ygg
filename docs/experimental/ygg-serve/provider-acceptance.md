@@ -60,11 +60,14 @@ The test proves:
 - bearer authentication and provider-qualified model selection;
 - streamed text;
 - a streamed `read` tool call and tool-result replay on the next request;
-- retries after fixture `429` throttling and `408` timeout responses;
+- retries after fixture `429` throttling and `408` timeout responses, including
+  a `429` sequence that exhausts automatic retries;
 - explicit `/compact`, durable checkpointing, process restart, and resume;
 - cancellation of an in-flight stream; and
-- bounded provider/phase failure diagnostics that omit the provider body,
-  fixture token, prompt canaries, request IDs, and provider error codes.
+- bounded provider/phase failure diagnostics that are visible after retry
+  exhaustion, omit the provider body, fixture token, prompt canaries, request
+  IDs, and provider error codes, and never project model-only failed-turn
+  context as an assistant response.
 
 Run it after building the feature-enabled binary:
 

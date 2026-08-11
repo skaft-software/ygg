@@ -578,6 +578,73 @@ describe("conversation composer", () => {
     expect(context).toHaveAccessibleName(/project files 30,000/);
   });
 
+  it("replaces active retrying state with the terminal provider failure", () => {
+    const session = structuredClone(fixtureSessions["session-live"]!);
+    session.context.run = {
+      phase: "retrying",
+      responsesStarted: 1,
+      responsesFinished: 0,
+      responsesDiscarded: 1,
+      responseActive: false,
+      toolCallsStarted: 0,
+      toolCallsFinished: 0,
+      toolExecutionsStarted: 0,
+      toolExecutionsFinished: 0,
+      compactionsStarted: 0,
+      compactionsCompleted: 0,
+      compactionsFailed: 0,
+    };
+    const props = {
+      bootstrap: structuredClone(fixtureBootstrap),
+      onSubmit: noOp,
+      onInterrupt: noOp,
+      onConfigure: noOp,
+      onResolveApproval: noOp,
+      onResolveUserInput: noOp,
+      onOpenOutput: vi.fn(),
+      onOpenSource: vi.fn(),
+    };
+    const { rerender } = render(<Conversation session={session} {...props} />);
+
+    expect(screen.getByText("Retrying")).toBeVisible();
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    const failed = structuredClone(session);
+    failed.status = "failed";
+    failed.activeRunId = undefined;
+    failed.context.run = {
+      ...failed.context.run!,
+      phase: "finished",
+      terminalState: "failed",
+      responsesStarted: 4,
+      responsesDiscarded: 4,
+    };
+    failed.items = failed.items.map((item) => ({
+      ...item,
+      state: "committed" as const,
+    }));
+    failed.items.push({
+      id: "provider-failure",
+      runId: "run-live",
+      turnId: "live-turn",
+      kind: "run_outcome",
+      outcome: "failed",
+      durationMs: 1_200,
+      summary: "provider=custom/e2e model=e2e-model phase=connection",
+      review: completionReview("Provider request failed", 1_200),
+      state: "committed",
+      createdAt: new Date().toISOString(),
+    });
+    rerender(<Conversation session={failed} {...props} />);
+
+    expect(screen.queryByText("Retrying")).toBeNull();
+    const failure = screen.getByRole("alert");
+    expect(failure).toHaveTextContent("Model response failed");
+    expect(failure).toHaveTextContent(
+      "provider=custom/e2e model=e2e-model phase=connection",
+    );
+  });
+
   it("edits, retries with a model, and forks only from durable checkpoints", async () => {
     const user = userEvent.setup();
     const session = structuredClone(fixtureSessions["session-fresh"]!);
@@ -1092,6 +1159,40 @@ describe("conversation composer", () => {
       );
       unmount();
     }
+  });
+
+  it("renders a failed outcome without a reasoning or action group", () => {
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    session.status = "failed";
+    session.items.push({
+      id: "failed-run-outcome",
+      runId: "failed-run",
+      turnId: "failed-turn",
+      kind: "run_outcome",
+      outcome: "failed",
+      durationMs: 0,
+      summary: "provider=custom/e2e model=e2e-model phase=connection",
+      review: completionReview("Provider request failed", 0),
+      state: "committed",
+      createdAt: new Date().toISOString(),
+    });
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "provider=custom/e2e model=e2e-model phase=connection",
+    );
   });
 
   it("omits unavailable run timing instead of claiming zero work", () => {

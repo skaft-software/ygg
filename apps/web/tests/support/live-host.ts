@@ -49,6 +49,8 @@ export const TIMEOUT_PROMPT = "E2E_TIMEOUT";
 export const TIMEOUT_REPLY = "E2E_TIMEOUT_ASSISTANT";
 export const ERROR_PROMPT = "E2E_PROVIDER_ERROR";
 export const ERROR_DIAGNOSTIC = "E2E_PROVIDER_FAILURE";
+export const FAILED_TURN_CONTEXT_MARKER =
+  "The previous assistant turn failed before completion. Do not continue that request unless the user asks again.";
 export const COMPACTION_PROMPT = "E2E_COMPACTION_REQUEST";
 export const COMPACTION_REPLY = "## Goal\nPreserve deterministic E2E history.\n\n## Progress\nConfigured-provider compaction completed.";
 
@@ -474,12 +476,15 @@ export class DeterministicChatProvider {
     }
 
     if (prompt === ERROR_PROMPT) {
-      response.writeHead(400, { "content-type": "application/json" });
+      response.writeHead(429, {
+        "content-type": "application/json",
+        "retry-after": "0",
+      });
       response.end(
         JSON.stringify({
           error: {
-            type: "invalid_request_error",
-            code: "e2e_invalid_request",
+            type: "rate_limit_error",
+            code: "e2e_rate_limit",
             message: `${ERROR_DIAGNOSTIC}: Bearer ${LIVE_PROVIDER_TOKEN}`,
           },
         }),

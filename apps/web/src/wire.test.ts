@@ -664,6 +664,36 @@ describe("authoritative Rust wire contract", () => {
     });
   });
 
+  it("uses the sanitized terminal diagnostic as the failed run summary", () => {
+    const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
+    const snapshot = clone(sessionSnapshotGolden) as unknown as {
+      items: unknown[];
+    };
+    const failed = clone(completionReviewItemGolden) as unknown as {
+      payload: {
+        data: {
+          outcome: string;
+          message?: string;
+        };
+      };
+    };
+    failed.payload.data.outcome = "failed";
+    failed.payload.data.message =
+      "provider=custom/e2e model=e2e-model phase=connection";
+    snapshot.items.push(failed);
+
+    expect(
+      projectSessionSnapshot(snapshot, {
+        summary: bootstrap.sessions[0],
+        models: bootstrap.models,
+      }).items.at(-1),
+    ).toMatchObject({
+      kind: "run_outcome",
+      outcome: "failed",
+      summary: "provider=custom/e2e model=e2e-model phase=connection",
+    });
+  });
+
   it("strictly projects structured test evidence in a completion review", () => {
     const { bootstrap } = projectHostBootstrap(hostBootstrapGolden);
     const snapshot = clone(sessionSnapshotGolden) as unknown as {

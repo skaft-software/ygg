@@ -34,7 +34,9 @@ inspection evidence.
   after completion, so detailed reasoning, commands, metadata, output, and
   completion review remain reachable without redundant rows. Completed
   one-action runs use the action row directly rather than a nested generic
-  summary, and evidence-free outcomes do not add empty review disclosures.
+  summary, and evidence-free successful outcomes do not add empty review
+  disclosures. Failed outcomes remain visible with their sanitized terminal
+  diagnostic even when a run produced no reasoning or action group.
 - Composer text, supported attachments, model, reasoning, authority, send,
   stop, steer, and queued follow-up use real controls.
 - Typing a trailing `@` token opens a keyboard-first trusted-file completion;
@@ -59,7 +61,11 @@ inspection evidence.
 - Host, origin, request, frame, replay, and attachment bounds are enforced.
 - Public errors are sanitized. Configured-provider failures identify the
   provider/model and failure phase or bounded HTTP status without exposing
-  provider bodies, prompts, request IDs, error codes, or credentials.
+  provider bodies, prompts, request IDs, error codes, or credentials. Automatic
+  retries show `Retrying` only while active, then settle to the visible failed
+  outcome when exhausted.
+- Model-only synthetic assistant context is not projected into transcript or
+  checkoutable branch UI.
 - Invalid, oversized, aliased, or symlinked persisted pull-request evidence fails
   closed; temporary GitHub unavailability never erases the last valid state.
 - PDF ingestion rejects deeply nested direct structures in an iterative bounded

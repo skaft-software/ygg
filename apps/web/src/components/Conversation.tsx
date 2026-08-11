@@ -1604,7 +1604,21 @@ const TranscriptItemView = memo(function TranscriptItemView({
       );
 
     case "run_outcome":
-      return null;
+      if (item.outcome !== "failed") return null;
+      return (
+        <section
+          className={`run-outcome is-failed ${animate ? "is-entering" : ""}`}
+          role="alert"
+        >
+          <span>
+            <AlertTriangle aria-hidden="true" />
+          </span>
+          <div className="run-outcome-copy">
+            <strong>Model response failed</strong>
+            <p>{item.summary}</p>
+          </div>
+        </section>
+      );
 
   }
 });
@@ -1783,6 +1797,7 @@ function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
     }
     if (
       item.kind === "run_outcome" &&
+      item.outcome !== "failed" &&
       lastWorkIndexByRun.has(workIdentity(item))
     ) {
       index += 1;
