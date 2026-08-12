@@ -1989,11 +1989,12 @@ impl InteractiveShell {
 
     pub fn set_workspace(&mut self, root: PathBuf) {
         let mut state = self.state.borrow_mut();
-        // update_status re-asserts the workspace after every turn; only a
-        // real root change invalidates the lazily built mention index.
-        if state.workspace.as_deref() != Some(root.as_path()) {
-            state.file_index = None;
+        // update_status re-asserts the workspace after every turn. Historic
+        // tool summaries and their cached layouts only change with the root.
+        if state.workspace.as_deref() == Some(root.as_path()) {
+            return;
         }
+        state.file_index = None;
         state.workspace = Some(root);
         state.refresh_tool_displays();
     }

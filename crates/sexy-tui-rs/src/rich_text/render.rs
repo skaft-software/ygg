@@ -1522,12 +1522,16 @@ impl RichRenderer {
         #[cfg(feature = "syntax-highlighting")]
         if self.options.syntax_highlighting {
             if let Some(language) = language {
-                if let Some(highlighted) = super::highlight::highlight(source, language) {
-                    for region in highlighted.into_iter().flatten() {
+                if let Some(highlighted) = self
+                    .syntax_cache
+                    .borrow_mut()
+                    .get_or_insert(language, source)
+                {
+                    for region in highlighted.iter().flatten() {
                         let token_style = region
                             .role
                             .map_or(diff_style, |role| diff_style.merge(self.theme.style(role)));
-                        runs.push(RichRun::new(region.text, token_style, None));
+                        runs.push(RichRun::new(region.text.clone(), token_style, None));
                     }
                     return Some(runs);
                 }
@@ -2155,7 +2159,10 @@ impl SyntaxCache {
         language: &str,
         code: &str,
     ) -> Option<Arc<Vec<super::highlight::HighlightedLine>>> {
-        const MAX_ENTRIES: usize = 24;
+        // Unified diffs cache one highlighted source row at a time. Keep the
+        // byte budget authoritative while allowing large histories of short
+        // rows to survive a width reflow without cycling the cache.
+        const MAX_ENTRIES: usize = 65_536;
         const MAX_BYTES: usize = 4 * 1024 * 1024;
         let mut hasher = DefaultHasher::new();
         code.hash(&mut hasher);
@@ -2394,6 +2401,37 @@ mod tests {
         assert!(
             rendered.contains("\x1b[38;2;6;7;8m\"text\""),
             "{rendered:?}"
+        );
+    }
+
+    #[cfg(feature = "syntax-highlighting")]
+    #[test]
+    fn public_diff_renderer_reuses_syntax_highlighting_across_widths() {
+        let renderer = renderer(ColorDepth::TrueColor, true);
+        let diff = UnifiedDiff::parse(
+            "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -0,0 +1 @@\n+fn main() { println!(\"hello\"); }",
+        );
+
+        renderer.render_diff(&diff, 100, DiffRenderOptions::default());
+        assert_eq!(
+            renderer.syntax_cache_stats(),
+            SyntaxCacheStats {
+                misses: 1,
+                entries: 1,
+                bytes: 32,
+                ..SyntaxCacheStats::default()
+            }
+        );
+
+        renderer.render_diff(&diff, 40, DiffRenderOptions::default());
+        assert_eq!(
+            renderer.syntax_cache_stats(),
+            SyntaxCacheStats {
+                hits: 1,
+                misses: 1,
+                entries: 1,
+                bytes: 32,
+            }
         );
     }
 
