@@ -21,8 +21,9 @@ use ygg_ai::{
 };
 
 use crate::compaction::{
-    build_handoff_message, finish_handoff, prepare_handoff, HandoffPreparation,
-    SUMMARIZATION_SYSTEM_PROMPT,
+    build_handoff_message, build_turn_prefix_handoff_message, choose_first_kept_by_tokens,
+    finish_handoff, prepare_handoff, HandoffPreparation, DEFAULT_KEEP_RECENT_TOKENS,
+    SUMMARIZATION_SYSTEM_PROMPT, SUMMARY_OUTPUT_TOKENS, TURN_PREFIX_OUTPUT_TOKENS,
 };
 use crate::context::{ContextBreakdown, ContextSnapshot, ContextTracker};
 use crate::events::{
@@ -279,7 +280,7 @@ pub struct Agent {
     compaction_model: Option<Model>,
     auto_compaction_mode: AgentCompactionMode,
     compaction_threshold_fraction: f64,
-    compaction_keep_recent_turns: usize,
+    compaction_keep_recent_tokens: u64,
     session_id: String,
     tool_scope: String,
     completion_policy: CompletionPolicy,
@@ -1882,7 +1883,7 @@ struct CompactionContext<'a> {
     abort: &'a AbortFlag,
     mode: AgentCompactionMode,
     threshold_fraction: f64,
-    keep_recent_turns: usize,
+    keep_recent_tokens: u64,
     events: &'a mpsc::UnboundedSender<AgentEvent>,
     context: &'a ContextTracker,
 }
@@ -1909,7 +1910,7 @@ impl<'a> CompactionContext<'a> {
         abort: &'a AbortFlag,
         mode: AgentCompactionMode,
         threshold_fraction: f64,
-        keep_recent_turns: usize,
+        keep_recent_tokens: u64,
         events: &'a mpsc::UnboundedSender<AgentEvent>,
         context: &'a ContextTracker,
     ) -> Self {
@@ -1928,7 +1929,7 @@ impl<'a> CompactionContext<'a> {
             abort,
             mode,
             threshold_fraction,
-            keep_recent_turns,
+            keep_recent_tokens,
             events,
             context,
         }
@@ -2020,23 +2021,67 @@ impl<'a> CompactionContext<'a> {
         Ok(assistant_text(&response))
     }
 
-    /// Generate one Pi-compatible structured handoff in a tool-free request.
+    /// Generate a Pi-compatible structured handoff, including a dedicated
+    /// summary when the retained boundary splits the current turn.
     async fn summarize(
         &mut self,
         preparation: &HandoffPreparation,
     ) -> Result<Option<String>, AgentError> {
-        self.call(
-            SUMMARIZATION_SYSTEM_PROMPT,
-            vec![build_handoff_message(preparation)],
-            4096,
-        )
-        .await
+        let history = if preparation.messages.is_empty() {
+            preparation
+                .previous_summary
+                .clone()
+                .or_else(|| Some("No prior history.".to_owned()))
+        } else {
+            self.call(
+                SUMMARIZATION_SYSTEM_PROMPT,
+                vec![build_handoff_message(preparation)],
+                SUMMARY_OUTPUT_TOKENS,
+            )
+            .await?
+        };
+        let Some(mut summary) = history else {
+            return Ok(None);
+        };
+
+        if !preparation.turn_prefix_messages.is_empty() {
+            let Some(prefix_summary) = self
+                .call(
+                    SUMMARIZATION_SYSTEM_PROMPT,
+                    vec![build_turn_prefix_handoff_message(
+                        &preparation.turn_prefix_messages,
+                    )],
+                    TURN_PREFIX_OUTPUT_TOKENS,
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            summary.push_str("\n\n---\n\n**Turn Context (split turn):**\n\n");
+            summary.push_str(&prefix_summary);
+        }
+
+        Ok(Some(summary))
     }
 
-    fn preferred_boundary(&self) -> Option<EntryId> {
-        let starts = turn_starts(self.session);
-        (starts.len() > self.keep_recent_turns)
-            .then(|| starts[starts.len() - self.keep_recent_turns].clone())
+    fn preferred_boundary(&self) -> Result<Option<EntryId>, AgentError> {
+        let Some(candidate) =
+            choose_first_kept_by_tokens(self.session, self.keep_recent_tokens, |message| {
+                estimate_messages_tokens(std::slice::from_ref(message))
+            })?
+        else {
+            return Ok(None);
+        };
+        // Pi's cut-point fallback may select the oldest visible message when
+        // the token budget exceeds the available history. That is a no-op for
+        // an agent compaction unless a split-turn prefix is available; allow
+        // the episode fallback below to make progress in that case.
+        let preparation = prepare_handoff(self.session, &candidate)?;
+        if preparation.messages.is_empty() && preparation.turn_prefix_messages.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(candidate))
+        }
     }
 
     fn oldest_reducible_boundary(&self) -> Option<EntryId> {
@@ -2188,7 +2233,7 @@ impl<'a> CompactionContext<'a> {
         let id = self.begin_compaction(system, tools, reason)?;
         let operation = async {
             let preparation = prepare_handoff(self.session, &first_kept)?;
-            if preparation.messages.is_empty() {
+            if preparation.messages.is_empty() && preparation.turn_prefix_messages.is_empty() {
                 return Err(AgentError::ContextExceeded {
                     estimate: 0,
                     budget: self
@@ -2286,11 +2331,11 @@ impl<'a> CompactionContext<'a> {
                 native_attempted = true;
                 continue;
             }
-            // `keep_recent_turns` is a preference, not permission to sail past
+            // `keep_recent_tokens` is a preference, not permission to sail past
             // the configured threshold. If the retained episodes themselves
             // are unusually large, compact the oldest reducible episode.
             let boundary = self
-                .preferred_boundary()
+                .preferred_boundary()?
                 .or_else(|| self.oldest_reducible_boundary());
             if let Some(first_kept) = boundary {
                 self.compact_boundary(first_kept, &active_system, tools, reason)
@@ -2319,12 +2364,12 @@ impl<'a> CompactionContext<'a> {
                 .await?;
             return Ok(());
         }
-        let boundary = (self.mode == AgentCompactionMode::Local)
-            .then(|| {
-                self.preferred_boundary()
-                    .or_else(|| self.oldest_reducible_boundary())
-            })
-            .flatten();
+        let boundary = if self.mode == AgentCompactionMode::Local {
+            self.preferred_boundary()?
+                .or_else(|| self.oldest_reducible_boundary())
+        } else {
+            None
+        };
         if let Some(first_kept) = boundary {
             self.compact_boundary(first_kept, system, tools, CompactionReason::Overflow)
                 .await?;
@@ -2474,7 +2519,7 @@ impl Agent {
             compaction_model: None,
             auto_compaction_mode: AgentCompactionMode::Local,
             compaction_threshold_fraction: 0.85,
-            compaction_keep_recent_turns: 4,
+            compaction_keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             session_id,
             tool_scope,
             completion_policy: CompletionPolicy::Natural,
@@ -2611,13 +2656,14 @@ impl Agent {
     ///
     /// `threshold_fraction` is the fraction of the complete model context
     /// window reserved by current input plus the requested output allowance.
-    /// `keep_recent_turns` is a preference: when those turns alone exceed the
-    /// configured threshold or capacity, recovery compacts the oldest episode.
+    /// `keep_recent_tokens` is the approximate verbatim tail budget; when the
+    /// retained tail alone exceeds the configured threshold or capacity,
+    /// recovery advances the boundary until the request fits.
     pub fn set_compaction_policy(
         &mut self,
         enabled: bool,
         threshold_fraction: f64,
-        keep_recent_turns: usize,
+        keep_recent_tokens: u64,
     ) -> Result<(), AgentError> {
         self.set_compaction_mode(
             if enabled {
@@ -2626,7 +2672,7 @@ impl Agent {
                 AgentCompactionMode::Disabled
             },
             threshold_fraction,
-            keep_recent_turns,
+            keep_recent_tokens,
         )
     }
 
@@ -2635,7 +2681,7 @@ impl Agent {
         &mut self,
         mode: AgentCompactionMode,
         threshold_fraction: f64,
-        keep_recent_turns: usize,
+        keep_recent_tokens: u64,
     ) -> Result<(), AgentError> {
         if !threshold_fraction.is_finite() || threshold_fraction <= 0.0 || threshold_fraction > 1.0
         {
@@ -2643,9 +2689,9 @@ impl Agent {
                 "threshold fraction must be finite and between 0 and 1".to_owned(),
             ));
         }
-        if keep_recent_turns == 0 {
+        if keep_recent_tokens == 0 {
             return Err(AgentError::InvalidCompactionPolicy(
-                "keep_recent_turns must be at least 1".to_owned(),
+                "keep_recent_tokens must be at least 1".to_owned(),
             ));
         }
         if mode == AgentCompactionMode::NativeResponses
@@ -2668,16 +2714,16 @@ impl Agent {
         }
         self.auto_compaction_mode = mode;
         self.compaction_threshold_fraction = threshold_fraction;
-        self.compaction_keep_recent_turns = keep_recent_turns;
+        self.compaction_keep_recent_tokens = keep_recent_tokens;
         Ok(())
     }
 
     /// Current autonomous compaction policy `(enabled, threshold, keep)`.
-    pub fn compaction_policy(&self) -> (bool, f64, usize) {
+    pub fn compaction_policy(&self) -> (bool, f64, u64) {
         (
             self.auto_compaction_mode != AgentCompactionMode::Disabled,
             self.compaction_threshold_fraction,
-            self.compaction_keep_recent_turns,
+            self.compaction_keep_recent_tokens,
         )
     }
 
@@ -2995,7 +3041,7 @@ impl Agent {
         let max_session_cost_microdollars = self.max_session_cost_microdollars;
         let auto_compaction_mode = self.auto_compaction_mode;
         let compaction_threshold_fraction = self.compaction_threshold_fraction;
-        let compaction_keep_recent_turns = self.compaction_keep_recent_turns;
+        let compaction_keep_recent_tokens = self.compaction_keep_recent_tokens;
         let provider_retries_enabled = self.provider_retries_enabled;
         let stream_lifecycle = lifecycle.clone();
         let session = &mut self.session;
@@ -3131,7 +3177,7 @@ impl Agent {
                         &abort,
                         auto_compaction_mode,
                         compaction_threshold_fraction,
-                        compaction_keep_recent_turns,
+                        compaction_keep_recent_tokens,
                         &compaction_event_tx,
                         &stream_context,
                     );
@@ -3267,7 +3313,7 @@ impl Agent {
                                 &abort,
                                 auto_compaction_mode,
                                 compaction_threshold_fraction,
-                                compaction_keep_recent_turns,
+                                compaction_keep_recent_tokens,
                                 &compaction_event_tx,
                                 &stream_context,
                             );
@@ -3401,7 +3447,7 @@ impl Agent {
                                         &abort,
                                         auto_compaction_mode,
                                         compaction_threshold_fraction,
-                                        compaction_keep_recent_turns,
+                                        compaction_keep_recent_tokens,
                                         &compaction_event_tx,
                                         &stream_context,
                                     );

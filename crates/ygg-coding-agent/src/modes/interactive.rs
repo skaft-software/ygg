@@ -1500,7 +1500,7 @@ fn configure_auto_compaction(
     if let Err(error) = app.agent.set_compaction_mode(
         agent_mode,
         candidate_threshold,
-        app.config.compaction.keep_recent_turns,
+        app.config.compaction.keep_recent_tokens,
     ) {
         shell.error(format!("auto-compaction was not changed: {error}"));
         return Ok(());
@@ -1511,10 +1511,10 @@ fn configure_auto_compaction(
     app.config.compaction.mode = candidate_mode;
     app.config.compaction.threshold_fraction = candidate_threshold;
     shell.notice(format!(
-        "auto-compaction {} at {:.0}% · keep {} recent turns · this process",
+        "auto-compaction {} at {:.0}% · keep ~{} recent tokens · this process",
         candidate_mode.label(),
         candidate_threshold * 100.0,
-        app.config.compaction.keep_recent_turns,
+        app.config.compaction.keep_recent_tokens,
     ));
     Ok(())
 }
@@ -2259,10 +2259,10 @@ async fn run_idle_command(
             } else {
                 shell.set_run_label("compacting…");
                 shell.render();
-                let original_keep = app.config.compaction.keep_recent_turns;
-                app.config.compaction.keep_recent_turns = 1;
+                let original_keep = app.config.compaction.keep_recent_tokens;
+                app.config.compaction.keep_recent_tokens = 1;
                 let result = await_with_ctrl_c(attempt_compaction(&mut app), shell, input).await;
-                app.config.compaction.keep_recent_turns = original_keep;
+                app.config.compaction.keep_recent_tokens = original_keep;
                 match result {
                     Some(Ok(outcome)) => {
                         report_compaction(shell, &outcome, app.agent.session());

@@ -224,7 +224,7 @@ struct CompactionLayer {
     /// Deprecated boolean spelling retained for existing configuration.
     enabled: Option<bool>,
     threshold_fraction: Option<f64>,
-    keep_recent_turns: Option<usize>,
+    keep_recent_tokens: Option<u64>,
     compact_model: Option<String>,
 }
 
@@ -311,8 +311,8 @@ impl ConfigLayer {
                 if newer.threshold_fraction.is_some() {
                     current.threshold_fraction = newer.threshold_fraction;
                 }
-                if newer.keep_recent_turns.is_some() {
-                    current.keep_recent_turns = newer.keep_recent_turns;
+                if newer.keep_recent_tokens.is_some() {
+                    current.keep_recent_tokens = newer.keep_recent_tokens;
                 }
                 if newer.compact_model.is_some() {
                     current.compact_model = newer.compact_model;
@@ -609,7 +609,7 @@ const COMPACTION_KEYS: &[&str] = &[
     "policy",
     "enabled",
     "threshold_fraction",
-    "keep_recent_turns",
+    "keep_recent_tokens",
     "compact_model",
 ];
 
@@ -648,7 +648,7 @@ fn config_key_suggestion(key: &str) -> Option<&'static str> {
                 "policy" => "compaction.policy",
                 "enabled" => "compaction.enabled",
                 "threshold_fraction" => "compaction.threshold_fraction",
-                "keep_recent_turns" => "compaction.keep_recent_turns",
+                "keep_recent_tokens" => "compaction.keep_recent_tokens",
                 "compact_model" => "compaction.compact_model",
                 _ => unreachable!("compaction suggestion came from the fixed schema"),
             }
@@ -819,7 +819,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
     let compaction_mode = env_value("YGG_COMPACTION_MODE");
     let compaction_enabled = env_parse("YGG_AUTO_COMPACT")?;
     let threshold_fraction = env_parse("YGG_COMPACTION_THRESHOLD_FRACTION")?;
-    let keep_recent_turns = env_parse("YGG_COMPACTION_KEEP_RECENT_TURNS")?;
+    let keep_recent_tokens = env_parse("YGG_COMPACTION_KEEP_RECENT_TOKENS")?;
     let compact_model = env_value("YGG_COMPACT_MODEL");
     Ok(ConfigLayer {
         model: env_value("YGG_MODEL"),
@@ -855,13 +855,13 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         compaction: (compaction_mode.is_some()
             || compaction_enabled.is_some()
             || threshold_fraction.is_some()
-            || keep_recent_turns.is_some()
+            || keep_recent_tokens.is_some()
             || compact_model.is_some())
         .then_some(CompactionLayer {
             mode: compaction_mode,
             enabled: compaction_enabled,
             threshold_fraction,
-            keep_recent_turns,
+            keep_recent_tokens,
             compact_model,
         }),
     })
@@ -1057,8 +1057,8 @@ fn build_config_with_global_path(
             }
             compaction.threshold_fraction = value;
         }
-        if let Some(value) = layer.keep_recent_turns {
-            compaction.keep_recent_turns = value.max(1);
+        if let Some(value) = layer.keep_recent_tokens {
+            compaction.keep_recent_tokens = value.max(1);
         }
         if let Some(value) = layer.compact_model {
             let value = value.trim();
@@ -1438,7 +1438,7 @@ mod tests {
         assert_eq!(loaded.diagnostics[0].column, 1);
         assert_eq!(
             loaded.diagnostics[0].suggestion,
-            Some("compaction.keep_recent_turns")
+            Some("compaction.keep_recent_tokens")
         );
         assert_eq!(loaded.diagnostics[1].key, "modle");
         assert_eq!(loaded.diagnostics[1].line, 2);
@@ -1745,7 +1745,7 @@ mod tests {
         )
         .unwrap();
         let project: ConfigLayer = toml::from_str(
-            "cost_warning_microdollars = 40\nshow_turn_cost = true\n[compaction]\nkeep_recent_turns = 2",
+            "cost_warning_microdollars = 40\nshow_turn_cost = true\n[compaction]\nkeep_recent_tokens = 2",
         )
         .unwrap();
         let mut merged = global;
@@ -1756,7 +1756,7 @@ mod tests {
         let compaction = merged.compaction.unwrap();
         assert_eq!(compaction.enabled, Some(false));
         assert_eq!(compaction.compact_model.as_deref(), Some("cheap"));
-        assert_eq!(compaction.keep_recent_turns, Some(2));
+        assert_eq!(compaction.keep_recent_tokens, Some(2));
     }
 
     #[test]
@@ -1863,7 +1863,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "model_alias = \"keep\"\nnotes = [\n  \"first\",\n  \"second\",\n]\n[compaction]\nkeep_recent_turns = 4\n",
+            "model_alias = \"keep\"\nnotes = [\n  \"first\",\n  \"second\",\n]\n[compaction]\nkeep_recent_tokens = 4\n",
         )
         .unwrap();
 
@@ -1875,7 +1875,7 @@ mod tests {
         assert_eq!(parsed["model_alias"].as_str(), Some("keep"));
         assert_eq!(parsed["notes"].as_array().unwrap().len(), 2);
         assert_eq!(
-            parsed["compaction"]["keep_recent_turns"].as_integer(),
+            parsed["compaction"]["keep_recent_tokens"].as_integer(),
             Some(4)
         );
     }

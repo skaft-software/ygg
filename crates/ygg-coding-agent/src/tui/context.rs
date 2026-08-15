@@ -58,7 +58,7 @@ pub(crate) struct ContextReport {
     output_reserve: u64,
     compaction_mode: CompactionMode,
     auto_compact_threshold: u64,
-    keep_recent_turns: usize,
+    keep_recent_tokens: u64,
     slices: Vec<ContextSlice>,
 }
 
@@ -106,7 +106,7 @@ impl ContextReport {
         let compaction_mode = app.config.compaction.mode;
         let auto_compact_enabled = compaction_mode.enabled();
         let threshold_fraction = app.config.compaction.threshold_fraction;
-        let keep_recent_turns = app.config.compaction.keep_recent_turns;
+        let keep_recent_tokens = app.config.compaction.keep_recent_tokens;
         let auto_compact_threshold = if auto_compact_enabled {
             ((context_window as f64) * threshold_fraction).floor() as u64
         } else {
@@ -198,7 +198,7 @@ impl ContextReport {
             output_reserve,
             compaction_mode,
             auto_compact_threshold,
-            keep_recent_turns,
+            keep_recent_tokens,
             slices,
         }
     }
@@ -221,7 +221,7 @@ impl ContextReport {
         ));
         let policy = if self.compaction_mode.enabled() {
             format!(
-                "auto-compact {} at {} ({:.0}%) · keeps {} recent turn{}",
+                "auto-compact {} at {} ({:.0}%) · keeps ~{} recent tokens",
                 self.compaction_mode.label(),
                 compact_tokens(self.auto_compact_threshold),
                 if self.context_window == 0 {
@@ -229,8 +229,7 @@ impl ContextReport {
                 } else {
                     self.auto_compact_threshold as f64 * 100.0 / self.context_window as f64
                 },
-                self.keep_recent_turns,
-                if self.keep_recent_turns == 1 { "" } else { "s" }
+                compact_tokens(self.keep_recent_tokens)
             )
         } else {
             "auto-compact off".to_owned()
@@ -357,7 +356,7 @@ mod tests {
             output_reserve: 32_000,
             compaction_mode: CompactionMode::Local,
             auto_compact_threshold: 170_000,
-            keep_recent_turns: 4,
+            keep_recent_tokens: 4,
             slices: vec![
                 ContextSlice {
                     kind: ContextKind::System,

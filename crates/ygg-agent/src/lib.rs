@@ -88,10 +88,11 @@ pub use cache::{
     CACHE_MISS_NOISE_TOKENS,
 };
 pub use compaction::{
-    build_branch_handoff_message, build_handoff_message, finish_branch_handoff, finish_handoff,
-    format_file_operations, prepare_branch_handoff, prepare_handoff, serialize_conversation,
-    BranchHandoffPreparation, CompactionDetails, HandoffPreparation, BRANCH_SUMMARY_PREAMBLE,
-    SUMMARIZATION_SYSTEM_PROMPT,
+    build_branch_handoff_message, build_handoff_message, build_turn_prefix_handoff_message,
+    choose_first_kept_by_tokens, finish_branch_handoff, finish_handoff, format_file_operations,
+    prepare_branch_handoff, prepare_handoff, serialize_conversation, BranchHandoffPreparation,
+    CompactionDetails, HandoffPreparation, BRANCH_SUMMARY_PREAMBLE, DEFAULT_KEEP_RECENT_TOKENS,
+    SUMMARIZATION_SYSTEM_PROMPT, SUMMARY_OUTPUT_TOKENS, TURN_PREFIX_OUTPUT_TOKENS,
 };
 pub use context::{
     ActiveContextCompaction, ContextBreakdown, ContextSnapshot, FinishedContextCompaction,

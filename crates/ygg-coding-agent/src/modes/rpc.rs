@@ -2205,7 +2205,7 @@ async fn handle_idle_command(
                     AgentCompactionMode::Disabled
                 },
                 app.config.compaction.threshold_fraction,
-                app.config.compaction.keep_recent_turns,
+                app.config.compaction.keep_recent_tokens,
             )?;
             output.success(id.as_deref(), &kind, None)?;
         }

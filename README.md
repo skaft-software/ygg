@@ -389,13 +389,13 @@ See [docs/sessions.md](docs/sessions.md) for the record schema, branch semantics
 
 ### Context and compaction
 
-ygg estimates the next provider-visible request against the active model's context window. Local compaction creates a bounded summary at a safe completed-turn boundary, preserves recent turns, and keeps active skill state. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
+ygg estimates the next provider-visible request against the active model's context window. Local compaction creates a bounded summary at a safe completed-turn boundary, preserves an approximately token-bounded recent tail, and keeps active skill state. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
 
 ```toml
 [compaction]
 mode = "local" # disabled, local, or native-responses
 threshold_fraction = 0.85
-keep_recent_turns = 4
+keep_recent_tokens = 20000
 compact_model = "openrouter/anthropic/claude-haiku-4.5"
 ```
 
@@ -540,7 +540,7 @@ offline = false
 [compaction]
 mode = "local"
 threshold_fraction = 0.85
-keep_recent_turns = 4
+keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
 
