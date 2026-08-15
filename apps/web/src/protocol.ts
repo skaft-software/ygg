@@ -22,6 +22,7 @@ export type GoalStatus =
 export type GoalAction = "pause" | "resume" | "clear";
 
 export interface GoalState {
+  revision: number;
   objective: string;
   status: GoalStatus;
   turnBudget: number | null;
@@ -943,6 +944,14 @@ export type SessionEvent =
       >;
     }
   | {
+      type: "session.goalChanged";
+      sessionId: string;
+      actorGeneration?: number;
+      sequence: number;
+      goal: GoalState | null;
+      revision: number;
+    }
+  | {
       type: "session.pullRequestChanged";
       sessionId: string;
       actorGeneration?: number;
@@ -1125,6 +1134,18 @@ export type ClientCommand =
     }
   | {
       id: string;
+      type: "session.goal.set";
+      sessionId: string;
+      objective: string;
+      turnBudget?: number | null;
+    }
+  | {
+      id: string;
+      type: "session.goal.pause" | "session.goal.resume" | "session.goal.clear";
+      sessionId: string;
+    }
+  | {
+      id: string;
       type: "session.steer";
       sessionId: string;
       prompt: string;
@@ -1251,6 +1272,7 @@ export type CommandErrorCode =
   | "payloadTooLarge"
   | "unauthorized"
   | "invalidBoundary"
+  | "invalidGoal"
   | "locked"
   | "unavailable"
   | "internal";

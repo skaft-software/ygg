@@ -7,7 +7,7 @@ use crate::bounds::{
     MAX_EVENT_BYTES, MAX_PUBLIC_TEXT_BYTES,
 };
 use crate::{
-    ArtifactRef, AuthorityProfile, CatalogCursor, ContextUsage, DurableEntryId, ItemId,
+    ArtifactRef, AuthorityProfile, CatalogCursor, ContextUsage, DurableEntryId, GoalState, ItemId,
     ItemLifecycle, ModelSelection, PendingRequest, PullRequestSummary, RunId, SessionBranchEntry,
     SessionCursor, SessionId, SessionItem, SessionLiveState, SessionSnapshot, SessionSummary,
     SourceRef, ToolActivity, UsageSnapshot, PROTOCOL_VERSION,
@@ -64,6 +64,15 @@ pub enum EventPayload {
         model: ModelSelection,
         /// Effective authority after host clamping.
         authority: AuthorityProfile,
+    },
+    /// Durable continuation goal state changed.
+    #[serde(rename = "session.goalChanged")]
+    GoalChanged {
+        /// Current goal, or none after clearing it.
+        goal: Option<GoalState>,
+        /// Monotonic projection revision, including a cleared-goal tombstone.
+        #[serde(default)]
+        revision: u64,
     },
     /// User-owned session catalog metadata changed.
     #[serde(rename = "session.metadataChanged")]
@@ -355,6 +364,17 @@ impl ProtocolValidation for EventPayload {
                 }
             }
             Self::SessionSettingsChanged { model, .. } => model.validate()?,
+            Self::GoalChanged { goal, revision } => {
+                if let Some(goal) = goal {
+                    goal.validate()?;
+                    if goal.revision > *revision {
+                        return Err(ValidationError::new(
+                            "event.goal.revision",
+                            "must not be older than the goal state revision",
+                        ));
+                    }
+                }
+            }
             Self::SessionMetadataChanged {
                 title,
                 pinned,

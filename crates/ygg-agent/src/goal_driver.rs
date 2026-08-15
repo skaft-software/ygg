@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Grace period between a settled turn and an automatic goal continuation.
@@ -19,7 +20,8 @@ pub const DEFAULT_GOAL_GRACE_PERIOD: Duration = Duration::from_secs(2);
 pub const GOAL_CONTINUATION_PROMPT_TEMPLATE: &str = "Continue working toward the goal: {objective}.\nCheck progress against concrete evidence (files, command output, tests) before deciding.\nIf the goal is fully achieved, end your reply with GOAL_COMPLETE.\nIf you cannot make further progress, end your reply with GOAL_BLOCKED and the reason.";
 
 /// Lifecycle state shared by goal stores and the continuation driver.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum GoalStatus {
     /// The driver may continue working toward the objective.
@@ -35,8 +37,12 @@ pub enum GoalStatus {
 }
 
 /// The bounded goal data required by the continuation driver.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GoalState {
+    /// Monotonically increasing durable state revision.
+    #[serde(default)]
+    pub revision: u64,
     /// The objective the driver should pursue.
     pub objective: String,
     /// Current lifecycle state.
@@ -201,14 +207,31 @@ impl GoalDriver {
             return Ok(GoalDecision::Inactive);
         };
 
-        if goal.status != GoalStatus::Active {
-            self.set_state(match goal.status {
-                GoalStatus::Paused => DriverState::Idle,
-                GoalStatus::Complete | GoalStatus::Blocked | GoalStatus::BudgetLimited => {
-                    DriverState::Idle
+        if matches!(goal.status, GoalStatus::Active | GoalStatus::BudgetLimited) {
+            // A budget reservation changes the durable status before the
+            // provider response settles. Inspect markers first so the final
+            // reserved turn can still complete or block the goal.
+            match detect_goal_marker(response) {
+                Some(GoalMarker::Complete) => {
+                    self.store
+                        .mark_complete(&self.session_id)
+                        .map_err(GoalDriverError::Store)?;
+                    self.set_state(DriverState::Idle);
+                    return Ok(GoalDecision::Complete);
                 }
-                GoalStatus::Active => DriverState::Idle,
-            });
+                Some(GoalMarker::Blocked) => {
+                    self.store
+                        .mark_blocked(&self.session_id)
+                        .map_err(GoalDriverError::Store)?;
+                    self.set_state(DriverState::Idle);
+                    return Ok(GoalDecision::Blocked);
+                }
+                None => {}
+            }
+        }
+
+        if goal.status != GoalStatus::Active {
+            self.set_state(DriverState::Idle);
             return Ok(match goal.status {
                 GoalStatus::Paused => GoalDecision::Paused,
                 GoalStatus::Complete => GoalDecision::Complete,
@@ -216,24 +239,6 @@ impl GoalDriver {
                 GoalStatus::BudgetLimited => GoalDecision::BudgetLimited,
                 GoalStatus::Active => GoalDecision::Inactive,
             });
-        }
-
-        match detect_goal_marker(response) {
-            Some(GoalMarker::Complete) => {
-                self.store
-                    .mark_complete(&self.session_id)
-                    .map_err(GoalDriverError::Store)?;
-                self.set_state(DriverState::Idle);
-                return Ok(GoalDecision::Complete);
-            }
-            Some(GoalMarker::Blocked) => {
-                self.store
-                    .mark_blocked(&self.session_id)
-                    .map_err(GoalDriverError::Store)?;
-                self.set_state(DriverState::Idle);
-                return Ok(GoalDecision::Blocked);
-            }
-            None => {}
         }
 
         if source == GoalTurnSource::Continuation && !made_tool_call {
@@ -253,13 +258,15 @@ impl GoalDriver {
     /// The current goal is re-read before reserving the turn, so a concurrent
     /// pause, clear, completion, or budget update wins over a stale wait.
     pub fn fire_continuation(&self) -> Result<Option<GoalContinuation>, GoalDriverError> {
-        if !self.is_waiting() {
+        // Claim the wait before touching durable state. A timer and a retry
+        // can otherwise both observe `Waiting` and consume two reservations.
+        if !self.claim_waiting() {
             return Ok(None);
         }
-        let Some(goal) = self
-            .store
-            .get(&self.session_id)
-            .map_err(GoalDriverError::Store)?
+        let Some(goal) = self.store.get(&self.session_id).map_err(|error| {
+            self.set_state(DriverState::Idle);
+            GoalDriverError::Store(error)
+        })?
         else {
             self.set_state(DriverState::Idle);
             return Ok(None);
@@ -269,10 +276,13 @@ impl GoalDriver {
             return Ok(None);
         }
 
-        let goal = self
-            .store
-            .record_turn(&self.session_id)
-            .map_err(GoalDriverError::Store)?;
+        let goal = match self.store.record_turn(&self.session_id) {
+            Ok(goal) => goal,
+            Err(error) => {
+                self.set_state(DriverState::Idle);
+                return Err(GoalDriverError::Store(error));
+            }
+        };
         if !matches!(goal.status, GoalStatus::Active | GoalStatus::BudgetLimited) {
             self.set_state(DriverState::Idle);
             return Ok(None);
@@ -294,7 +304,7 @@ impl GoalDriver {
             self.set_state(DriverState::Idle);
             return Ok(());
         };
-        if goal.status == GoalStatus::Active {
+        if matches!(goal.status, GoalStatus::Active | GoalStatus::BudgetLimited) {
             self.store
                 .pause(&self.session_id)
                 .map_err(GoalDriverError::Store)?;
@@ -303,10 +313,17 @@ impl GoalDriver {
         Ok(())
     }
 
-    fn is_waiting(&self) -> bool {
+    fn claim_waiting(&self) -> bool {
         self.state
             .lock()
-            .map(|state| matches!(*state, DriverState::Waiting))
+            .map(|mut state| {
+                if matches!(*state, DriverState::Waiting) {
+                    *state = DriverState::Running;
+                    true
+                } else {
+                    false
+                }
+            })
             .unwrap_or(false)
     }
 
@@ -355,6 +372,7 @@ mod tests {
         fn active(budget: Option<u32>) -> Self {
             Self {
                 state: Arc::new(Mutex::new(Some(GoalState {
+                    revision: 1,
                     objective: "finish the tests".into(),
                     status: GoalStatus::Active,
                     turn_budget: budget,

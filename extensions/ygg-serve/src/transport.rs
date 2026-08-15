@@ -3,7 +3,10 @@
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path as FilePath, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex as StdMutex,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -29,13 +32,13 @@ use tokio::task::JoinHandle;
 
 use crate::embedded_web::WebBundle;
 use crate::{
-    AttachmentError, FileEntryId, GoalAction, GoalStore, GoalStoreError, HostCommandEnvelope,
-    HostService, ProjectFileSystemError, ProjectId, ProtocolValidation, PtyAttachment, PtyError,
-    PtyEvent, PtyExit, PtyManager, PtyOpenRequest, SanitizedError, ServiceError,
-    SessionCommandEnvelope, SessionCursor, SessionId, SessionSupervisor, SupervisorError,
-    TerminalConfig, MAX_ATTACHMENT_FILE_BYTES, MAX_COMMAND_BYTES, MAX_DOCUMENT_FILE_BYTES,
-    MAX_PROJECT_FILE_PATH_BYTES, MAX_PROJECT_FILE_WRITE_BYTES, MAX_PTY_INPUT_BYTES,
-    PROTOCOL_VERSION,
+    AckDisposition, AttachmentError, CommandId, DeviceId, FileEntryId, GoalAction, GoalState,
+    GoalStore, GoalStoreError, HostCommandEnvelope, HostService, ProjectFileSystemError, ProjectId,
+    ProtocolValidation, PtyAttachment, PtyError, PtyEvent, PtyExit, PtyManager, PtyOpenRequest,
+    SanitizedError, ServiceError, SessionCommand, SessionCommandEnvelope, SessionCursor, SessionId,
+    SessionSupervisor, SupervisorError, TerminalConfig, MAX_ATTACHMENT_FILE_BYTES,
+    MAX_COMMAND_BYTES, MAX_DOCUMENT_FILE_BYTES, MAX_PROJECT_FILE_PATH_BYTES,
+    MAX_PROJECT_FILE_WRITE_BYTES, MAX_PTY_INPUT_BYTES, PROTOCOL_VERSION,
 };
 
 const MAX_QUERY_BYTES: usize = 4 * 1024;
@@ -51,6 +54,8 @@ const MAX_CONCURRENT_SESSION_EXPORTS: usize = 1;
 const MAX_PROJECT_FILE_WRITE_REQUEST_BYTES: usize =
     MAX_PROJECT_FILE_WRITE_BYTES * 6 + MAX_PROJECT_FILE_PATH_BYTES * 6 + 1024;
 const X_YGG_WEB_BUNDLE: HeaderName = HeaderName::from_static("x-ygg-web-bundle");
+const X_YGG_GOAL_REVISION: HeaderName = HeaderName::from_static("x-ygg-goal-revision");
+static NEXT_HTTP_GOAL_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Loopback listener configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1430,6 +1435,15 @@ async fn command_discovery<H: HostService>(
     }
 }
 
+fn goal_response(goal: Option<GoalState>, revision: u64) -> Response {
+    let mut response = Json(goal).into_response();
+    response.headers_mut().insert(
+        X_YGG_GOAL_REVISION,
+        HeaderValue::from_str(&revision.to_string()).unwrap(),
+    );
+    response
+}
+
 async fn session_goal<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
     Path(raw_session_id): Path<String>,
@@ -1444,10 +1458,11 @@ async fn session_goal<H: HostService>(
     if let Err(error) = state.supervisor.session_view(&session_id).await {
         return supervisor_error_response(error);
     }
-    match state.goal_store.get(&session_id) {
-        Ok(goal) => Json(goal).into_response(),
-        Err(error) => goal_error_response(error),
-    }
+    let (goal, revision) = match state.goal_store.snapshot(&session_id) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return goal_error_response(error),
+    };
+    goal_response(goal, revision)
 }
 
 async fn update_goal<H: HostService>(
@@ -1466,22 +1481,65 @@ async fn update_goal<H: HostService>(
         Ok(payload) => payload,
         Err(_) => return invalid_request(),
     };
-    if let Err(error) = state.supervisor.session_view(&session_id).await {
-        return supervisor_error_response(error);
-    }
-    let result = match (request.objective, request.action) {
-        (Some(objective), None) => state
-            .goal_store
-            .set(&session_id, &objective, request.turn_budget)
-            .map(Some),
-        (None, Some(action)) if request.turn_budget.is_none() => {
-            state.goal_store.apply(&session_id, action)
-        }
+    let view = match state.supervisor.session_view(&session_id).await {
+        Ok(view) => view,
+        Err(error) => return supervisor_error_response(error),
+    };
+    let command = match (request.objective, request.action) {
+        (Some(objective), None) => SessionCommand::SetGoal {
+            objective,
+            turn_budget: request.turn_budget,
+        },
+        (None, Some(action)) if request.turn_budget.is_none() => match action {
+            GoalAction::Pause => SessionCommand::PauseGoal,
+            GoalAction::Resume => SessionCommand::ResumeGoal,
+            GoalAction::Clear => SessionCommand::ClearGoal,
+        },
         _ => return invalid_request(),
     };
-    match result {
-        Ok(goal) => Json(goal).into_response(),
-        Err(error) => goal_error_response(error),
+    let command_id = match CommandId::new(format!(
+        "http-goal-{}",
+        NEXT_HTTP_GOAL_COMMAND_ID.fetch_add(1, Ordering::Relaxed)
+    )) {
+        Ok(command_id) => command_id,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                SanitizedError::internal(),
+            )
+        }
+    };
+    let device_id = match DeviceId::new("http-goal") {
+        Ok(device_id) => device_id,
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                SanitizedError::internal(),
+            )
+        }
+    };
+    let envelope = SessionCommandEnvelope::new(
+        state.supervisor.host_id(),
+        device_id,
+        session_id.clone(),
+        command_id,
+        now_ms(),
+        Some(view.snapshot.actor_generation),
+        command,
+    );
+    let admission = match state.supervisor.command(envelope, now_ms()).await {
+        Ok(admission) => admission,
+        Err(error) => return supervisor_error_response(error),
+    };
+    match &admission.ack.disposition {
+        AckDisposition::Accepted { .. } => {
+            let (goal, revision) = match state.goal_store.snapshot(&session_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return goal_error_response(error),
+            };
+            goal_response(goal, revision)
+        }
+        AckDisposition::Rejected { error } => command_error_response(error.clone()),
     }
 }
 
@@ -2198,6 +2256,20 @@ fn goal_error_response(error: GoalStoreError) -> Response {
     }
 }
 
+fn command_error_response(error: SanitizedError) -> Response {
+    let status = match error.code {
+        crate::ErrorCode::InvalidGoal
+        | crate::ErrorCode::InvalidCommand
+        | crate::ErrorCode::InvalidBoundary => StatusCode::BAD_REQUEST,
+        crate::ErrorCode::NotFound => StatusCode::NOT_FOUND,
+        crate::ErrorCode::Unauthorized => StatusCode::FORBIDDEN,
+        crate::ErrorCode::Locked => StatusCode::CONFLICT,
+        crate::ErrorCode::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error_response(status, error)
+}
+
 fn service_error_response(error: ServiceError) -> Response {
     match error {
         ServiceError::NotFound => error_response(
@@ -2219,6 +2291,13 @@ fn service_error_response(error: ServiceError) -> Response {
             SanitizedError::public(
                 crate::ErrorCode::InvalidCommand,
                 "The requested local resource operation is invalid.",
+            ),
+        ),
+        ServiceError::InvalidGoal => error_response(
+            StatusCode::BAD_REQUEST,
+            SanitizedError::public(
+                crate::ErrorCode::InvalidGoal,
+                "The goal objective, budget, or lifecycle transition is invalid.",
             ),
         ),
         ServiceError::PayloadTooLarge => error_response(
@@ -2489,12 +2568,13 @@ mod tests {
     use crate::{
         ActorOwnerState, AttachmentPolicy, AttachmentRef, AttachmentStore, AttentionState,
         AuthorityProfile, ColorScheme, ContextUsage, CreateSessionRequest, DriverCommandOutcome,
-        HostCapabilities, HostDescriptor, HostId, InputModality, ModelSelection, ModelSummary,
-        ProjectFileEntry, ProjectFileEntryKind, ProjectFileRead, ProjectFileSearchResult,
-        ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ServiceError, SessionCommand,
-        SessionCursor, SessionDriver, SessionLiveState, SessionSeed, SessionSnapshot,
-        SessionSummary, StoredAttachment, StoredResource, SupervisorConfig, ThemeDensity, ThemeDto,
-        ThemeId, ThemeMotion, ThemeOption, ThemeSourceClass, ThemeTypography,
+        GoalAction, GoalStore, HostCapabilities, HostDescriptor, HostId, InputModality,
+        ModelSelection, ModelSummary, ProjectFileEntry, ProjectFileEntryKind, ProjectFileRead,
+        ProjectFileSearchResult, ProjectFileSystemError, ProjectFileTree, ProjectFileWrite,
+        ServiceError, SessionCommand, SessionCursor, SessionDriver, SessionLiveState, SessionSeed,
+        SessionSnapshot, SessionSummary, StoredAttachment, StoredResource, SupervisorConfig,
+        ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeSourceClass,
+        ThemeTypography,
     };
 
     use super::*;
@@ -2512,6 +2592,7 @@ mod tests {
         project_file_browser: bool,
         project_file_write: bool,
         project_file_writes: Arc<Mutex<Vec<ProjectFileWriteRecord>>>,
+        goals: GoalStore,
         _goal_root: Arc<tempfile::TempDir>,
         export_started: Arc<Notify>,
         export_release: Arc<Notify>,
@@ -2522,6 +2603,7 @@ mod tests {
             let attachment_root = Arc::new(tempfile::tempdir().unwrap());
             let attachments = AttachmentStore::open(attachment_root.path()).unwrap();
             let goal_root = Arc::new(tempfile::tempdir().unwrap());
+            let goals = GoalStore::open(&goal_root.path().join("goals")).unwrap();
             Self {
                 creates: Arc::new(AtomicUsize::new(0)),
                 opens: Arc::new(AtomicUsize::new(0)),
@@ -2532,6 +2614,7 @@ mod tests {
                 project_file_browser: false,
                 project_file_write: false,
                 project_file_writes: Arc::new(Mutex::new(Vec::new())),
+                goals,
                 _goal_root: goal_root,
                 export_started: Arc::new(Notify::new()),
                 export_release: Arc::new(Notify::new()),
@@ -2553,7 +2636,7 @@ mod tests {
         }
     }
 
-    struct MockDriver(SessionSeed);
+    struct MockDriver(SessionSeed, GoalStore);
 
     #[async_trait]
     impl SessionDriver for MockDriver {
@@ -2563,9 +2646,28 @@ mod tests {
 
         async fn dispatch(
             &mut self,
-            _command: SessionCommand,
+            command: SessionCommand,
         ) -> Result<DriverCommandOutcome, ServiceError> {
-            Ok(DriverCommandOutcome::default())
+            let session_id = &self.0.snapshot.session_id;
+            let result = match command {
+                SessionCommand::SetGoal {
+                    objective,
+                    turn_budget,
+                } => self.1.set(session_id, &objective, turn_budget).map(|_| ()),
+                SessionCommand::PauseGoal => {
+                    self.1.apply(session_id, GoalAction::Pause).map(|_| ())
+                }
+                SessionCommand::ResumeGoal => {
+                    self.1.apply(session_id, GoalAction::Resume).map(|_| ())
+                }
+                SessionCommand::ClearGoal => {
+                    self.1.apply(session_id, GoalAction::Clear).map(|_| ())
+                }
+                _ => return Ok(DriverCommandOutcome::default()),
+            };
+            result
+                .map(|_| DriverCommandOutcome::default())
+                .map_err(|_| ServiceError::InvalidGoal)
         }
     }
 
@@ -2903,7 +3005,7 @@ mod tests {
             let id = SessionId::new(format!("fresh-{number}")).unwrap();
             let seed = seed(id.clone(), request.provisional, number as u64 + 1);
             self.seeds.lock().unwrap().insert(id, seed.clone());
-            Ok(MockDriver(seed))
+            Ok(MockDriver(seed, self.goals.clone()))
         }
 
         async fn open_session(&self, session_id: &SessionId) -> Result<Self::Driver, ServiceError> {
@@ -2913,7 +3015,7 @@ mod tests {
                 .unwrap()
                 .get(session_id)
                 .cloned()
-                .map(MockDriver)
+                .map(|seed| MockDriver(seed, self.goals.clone()))
                 .ok_or(ServiceError::NotFound)
         }
     }
@@ -3839,6 +3941,7 @@ mod tests {
         )
         .await;
         assert!(created.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_header(&created, "x-ygg-goal-revision"), Some("1"));
         assert_eq!(response_json(&created)["objective"], "Ship the README");
         assert_eq!(response_json(&created)["status"], "active");
         assert_eq!(response_json(&created)["turnBudget"], 10);
@@ -3864,6 +3967,7 @@ mod tests {
             .unwrap();
         let restored = request(address, authenticated_get_request(address, &path, cookie)).await;
         assert!(restored.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_header(&restored, "x-ygg-goal-revision"), Some("1"));
         assert_eq!(response_json(&restored)["objective"], "Ship the README");
 
         let paused = request(
@@ -3872,6 +3976,7 @@ mod tests {
         )
         .await;
         assert!(paused.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_header(&paused, "x-ygg-goal-revision"), Some("2"));
         assert_eq!(response_json(&paused)["status"], "paused");
         let resumed = request(
             address,
@@ -3879,6 +3984,7 @@ mod tests {
         )
         .await;
         assert!(resumed.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_header(&resumed, "x-ygg-goal-revision"), Some("3"));
         assert_eq!(response_json(&resumed)["status"], "active");
         let cleared = request(
             address,
@@ -3886,9 +3992,14 @@ mod tests {
         )
         .await;
         assert!(cleared.starts_with("HTTP/1.1 200"));
+        assert_eq!(response_header(&cleared, "x-ygg-goal-revision"), Some("4"));
         assert_eq!(response_json(&cleared), serde_json::Value::Null);
         let after_clear = request(address, authenticated_get_request(address, &path, cookie)).await;
         assert!(after_clear.starts_with("HTTP/1.1 200"));
+        assert_eq!(
+            response_header(&after_clear, "x-ygg-goal-revision"),
+            Some("4")
+        );
         assert_eq!(response_json(&after_clear), serde_json::Value::Null);
         server.shutdown().await.unwrap();
     }

@@ -240,6 +240,12 @@ export function reduceSessionEvent(
         sequence: event.sequence,
       };
 
+    case "session.goalChanged":
+      return {
+        ...snapshot,
+        sequence: event.sequence,
+      };
+
     case "session.pullRequestChanged":
       return {
         ...snapshot,

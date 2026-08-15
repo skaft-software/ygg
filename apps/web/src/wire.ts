@@ -14,6 +14,7 @@ import type {
   ContextUsage,
   CompletionReview,
   DocumentReference,
+  GoalState,
   HostBootstrap,
   HostEvent,
   LifetimeUsage,
@@ -235,6 +236,53 @@ const attentionStates = [
 ] as const;
 
 const wireAuthorities = ["readOnly", "workspace", "fullAccess"] as const;
+const goalStatuses = [
+  "active",
+  "paused",
+  "complete",
+  "blocked",
+  "budget_limited",
+] as const;
+
+function projectGoalState(value: unknown, path: string): GoalState | null {
+  if (value === null) return null;
+  const goal = object(value, path, [
+    "revision",
+    "objective",
+    "status",
+    "turnBudget",
+    "turnsUsed",
+    "createdAt",
+  ]);
+  const turnBudget =
+    goal.turnBudget === undefined || goal.turnBudget === null
+      ? null
+      : number(goal.turnBudget, `${path}.turnBudget`);
+  if (turnBudget !== null && (turnBudget === 0 || turnBudget > 100_000)) {
+    throw new WireContractError(
+      `${path}.turnBudget`,
+      "must be absent or within the durable goal budget limit",
+    );
+  }
+  const turnsUsed = number(goal.turnsUsed, `${path}.turnsUsed`);
+  if (turnBudget !== null && turnsUsed > turnBudget) {
+    throw new WireContractError(
+      `${path}.turnsUsed`,
+      "must not exceed the configured turn budget",
+    );
+  }
+  return {
+    revision:
+      goal.revision === undefined
+        ? 0
+        : number(goal.revision, `${path}.revision`),
+    objective: boundedString(goal.objective, `${path}.objective`, 4_096),
+    status: enumeration(goal.status, `${path}.status`, goalStatuses),
+    turnBudget,
+    turnsUsed,
+    createdAt: boundedString(goal.createdAt, `${path}.createdAt`, 64),
+  };
+}
 
 function projectStatus(value: unknown, path: string): SessionStatus {
   const state = enumeration(value, path, liveStates);
@@ -3836,6 +3884,28 @@ export function projectEventEnvelope(
         },
       };
     }
+    case "session.goalChanged": {
+      const data = object(event.data, "event.event.data", ["goal", "revision"]);
+      const goal = projectGoalState(data.goal, "event.event.data.goal");
+      const revision =
+        data.revision === undefined
+          ? (goal?.revision ?? 0)
+          : number(data.revision, "event.event.data.revision");
+      if (data.revision !== undefined && goal && revision < goal.revision) {
+        throw new WireContractError(
+          "event.event.data.revision",
+          "must not be older than the goal state revision",
+        );
+      }
+      return {
+        type: "session.goalChanged",
+        sessionId,
+        actorGeneration,
+        sequence,
+        goal,
+        revision,
+      };
+    }
     case "session.settingsChanged": {
       const data = object(event.data, "event.event.data", [
         "model",
@@ -4285,6 +4355,7 @@ function projectSanitizedError(
     "payloadTooLarge",
     "unauthorized",
     "invalidBoundary",
+    "invalidGoal",
     "locked",
     "unavailable",
     "internal",
@@ -4632,6 +4703,37 @@ export function encodeClientCommand(
         type: "session.invokeSlashCommand",
         data: { invocation: { invocation } },
       },
+      context,
+    );
+  }
+  if (
+    command.type === "session.goal.set" ||
+    command.type === "session.goal.pause" ||
+    command.type === "session.goal.resume" ||
+    command.type === "session.goal.clear"
+  ) {
+    const type =
+      command.type === "session.goal.set"
+        ? "session.goal.set"
+        : command.type === "session.goal.pause"
+          ? "session.goal.pause"
+          : command.type === "session.goal.resume"
+            ? "session.goal.resume"
+            : "session.goal.clear";
+    return sessionEnvelope(
+      command,
+      command.type === "session.goal.set"
+        ? {
+            type,
+            data: {
+              objective: command.objective,
+              ...(command.turnBudget !== undefined &&
+              command.turnBudget !== null
+                ? { turnBudget: command.turnBudget }
+                : {}),
+            },
+          }
+        : { type, data: {} },
       context,
     );
   }

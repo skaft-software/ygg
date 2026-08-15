@@ -28,7 +28,7 @@ import type {
   UsageStats,
 } from "./protocol";
 import { sessionIdFromPathname, YggStore } from "./store";
-import type { YggTransport } from "./transport";
+import type { GoalResponse, YggTransport } from "./transport";
 
 type SessionLoader = (
   sessionId: string,
@@ -67,6 +67,7 @@ class TestTransport implements YggTransport {
     command,
   ) => ({ commandId: command.id, accepted: true });
   readonly goals = new Map<string, GoalState>();
+  readonly goalRevisions = new Map<string, number>();
 
   async getProjectCatalog(): Promise<ProjectCatalog> {
     return clone(this.projectCatalog);
@@ -165,17 +166,27 @@ class TestTransport implements YggTransport {
     return clone(this.commandDiscovery);
   }
 
-  async getGoal(sessionId: string): Promise<GoalState | null> {
-    return clone(this.goals.get(sessionId) ?? null);
+  async getGoal(sessionId: string): Promise<GoalResponse> {
+    const goal = this.goals.get(sessionId);
+    return {
+      goal: clone(goal ?? null),
+      revision: Math.max(goal?.revision ?? 0, this.goalRevisions.get(sessionId) ?? 0),
+    };
   }
 
   async updateGoal(
     sessionId: string,
     mutation: GoalMutation,
-  ): Promise<GoalState | null> {
+  ): Promise<GoalResponse> {
     if ("objective" in mutation) {
+      const current = this.goals.get(sessionId);
+      const revision = Math.max(
+        current?.revision ?? 0,
+        this.goalRevisions.get(sessionId) ?? 0,
+      ) + 1;
       const now = new Date().toISOString();
       const goal: GoalState = {
+        revision,
         objective: mutation.objective,
         status: "active",
         turnBudget: mutation.turnBudget ?? null,
@@ -183,20 +194,30 @@ class TestTransport implements YggTransport {
         createdAt: now,
       };
       this.goals.set(sessionId, goal);
-      return clone(goal);
+      this.goalRevisions.set(sessionId, revision);
+      return { goal: clone(goal), revision };
     }
     if (mutation.action === "clear") {
+      const current = this.goals.get(sessionId);
+      if (current) this.goalRevisions.set(sessionId, current.revision + 1);
       this.goals.delete(sessionId);
-      return null;
+      return {
+        goal: null,
+        revision: this.goalRevisions.get(sessionId) ?? 0,
+      };
     }
     const goal = this.goals.get(sessionId);
     if (!goal) throw new Error("No goal is configured for this session.");
+    const status = mutation.action === "pause" ? "paused" : "active";
+    const revision = status === goal.status ? goal.revision : goal.revision + 1;
     const next: GoalState = {
       ...goal,
-      status: mutation.action === "pause" ? "paused" : "active",
+      status,
+      revision,
     };
     this.goals.set(sessionId, next);
-    return clone(next);
+    this.goalRevisions.set(sessionId, revision);
+    return { goal: clone(next), revision };
   }
 
   async send(command: ClientCommand): Promise<CommandAck> {
@@ -405,6 +426,7 @@ describe("YggStore", () => {
   it("loads and persists the selected session goal through lifecycle commands", async () => {
     const transport = new TestTransport();
     transport.goals.set("session-fresh", {
+      revision: 2,
       objective: "ship the release",
       status: "active",
       turnBudget: 3,
@@ -428,6 +450,123 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("does not let a stale goal event regress the selected projection", async () => {
+    const transport = new TestTransport();
+    transport.goals.set("session-fresh", {
+      revision: 2,
+      objective: "initial objective",
+      status: "active",
+      turnBudget: null,
+      turnsUsed: 0,
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    const store = new YggStore(transport);
+
+    await store.initialize();
+    transport.emit({
+      type: "session.goalChanged",
+      sessionId: "session-fresh",
+      sequence: 2,
+      revision: 3,
+      goal: {
+        revision: 3,
+        objective: "new objective",
+        status: "active",
+        turnBudget: null,
+        turnsUsed: 0,
+        createdAt: "2026-01-01T00:00:00Z",
+      },
+    });
+    transport.emit({
+      type: "session.goalChanged",
+      sessionId: "session-fresh",
+      sequence: 3,
+      revision: 2,
+      goal: {
+        revision: 2,
+        objective: "stale objective",
+        status: "active",
+        turnBudget: null,
+        turnsUsed: 0,
+        createdAt: "2026-01-01T00:00:00Z",
+      },
+    });
+    await nextFrame();
+
+    expect(store.selectedGoal).toMatchObject({
+      revision: 3,
+      objective: "new objective",
+    });
+    expect(store.selectedSession?.sequence).toBe(3);
+    store.dispose();
+  });
+
+  it("uses a durable tombstone revision when loading an empty goal", async () => {
+    const transport = new TestTransport();
+    transport.goalRevisions.set("session-fresh", 3);
+    const store = new YggStore(transport);
+
+    await store.initialize();
+    transport.emit({
+      type: "session.goalChanged",
+      sessionId: "session-fresh",
+      sequence: 2,
+      revision: 2,
+      goal: {
+        revision: 2,
+        objective: "stale objective",
+        status: "active",
+        turnBudget: null,
+        turnsUsed: 0,
+        createdAt: "2026-01-01T00:00:00Z",
+      },
+    });
+    await nextFrame();
+
+    expect(store.selectedGoal).toBeNull();
+    store.dispose();
+  });
+
+  it("does not resurrect a cleared goal from a stale event", async () => {
+    const transport = new TestTransport();
+    transport.goals.set("session-fresh", {
+      revision: 2,
+      objective: "initial objective",
+      status: "active",
+      turnBudget: null,
+      turnsUsed: 0,
+      createdAt: "2026-01-01T00:00:00Z",
+    });
+    const store = new YggStore(transport);
+
+    await store.initialize();
+    transport.emit({
+      type: "session.goalChanged",
+      sessionId: "session-fresh",
+      sequence: 2,
+      revision: 3,
+      goal: null,
+    });
+    transport.emit({
+      type: "session.goalChanged",
+      sessionId: "session-fresh",
+      sequence: 3,
+      revision: 2,
+      goal: {
+        revision: 2,
+        objective: "stale objective",
+        status: "active",
+        turnBudget: null,
+        turnsUsed: 0,
+        createdAt: "2026-01-01T00:00:00Z",
+      },
+    });
+    await nextFrame();
+
+    expect(store.selectedGoal).toBeNull();
+    expect(store.selectedSession?.sequence).toBe(3);
+    store.dispose();
+  });
   it("retries a transport failure with the same command identity", async () => {
     const transport = new TestTransport();
     let attempt = 0;

@@ -57,6 +57,10 @@ import {
 } from "./wire";
 
 type EventListener = (event: HostEvent) => void;
+export interface GoalResponse {
+  goal: GoalState | null;
+  revision: number;
+}
 export type TransportConnectionState =
   "connecting" | "connected" | "reconnecting";
 type ConnectionListener = (state: TransportConnectionState) => void;
@@ -73,11 +77,11 @@ export interface YggTransport {
   ): Promise<HostBootstrap>;
   getSession(sessionId: string, signal?: AbortSignal): Promise<SessionSnapshot>;
   getCommandDiscovery(sessionId: string): Promise<CommandDiscovery>;
-  getGoal(sessionId: string, signal?: AbortSignal): Promise<GoalState | null>;
+  getGoal(sessionId: string, signal?: AbortSignal): Promise<GoalResponse>;
   updateGoal(
     sessionId: string,
     mutation: GoalMutation,
-  ): Promise<GoalState | null>;
+  ): Promise<GoalResponse>;
   send(command: ClientCommand): Promise<CommandAck>;
   ingestAttachment(file: File): Promise<AttachmentRef>;
   ingestDocument(sessionId: string, file: File): Promise<DocumentReference>;
@@ -434,22 +438,53 @@ function decodeGoalState(value: unknown): GoalState | null {
     throw new Error("Goal API returned an invalid response.");
   }
   const result = value as Record<string, unknown>;
+  const objective = result.objective;
+  const turnBudget = result.turnBudget;
   const turnsUsed = result.turnsUsed;
   if (
-    typeof result.objective !== "string" ||
+    typeof result.revision !== "number" ||
+    !Number.isSafeInteger(result.revision) ||
+    result.revision < 0 ||
+    typeof objective !== "string" ||
+    objective.trim().length === 0 ||
+    objective.length > 4_096 ||
     typeof result.status !== "string" ||
     !goalStatuses.has(result.status) ||
-    (typeof result.turnBudget !== "number" && result.turnBudget !== null) ||
-    (typeof result.turnBudget === "number" &&
-      (!Number.isInteger(result.turnBudget) || result.turnBudget < 0)) ||
+    (typeof turnBudget !== "number" && turnBudget !== null) ||
+    (typeof turnBudget === "number" &&
+      (!Number.isSafeInteger(turnBudget) ||
+        turnBudget === 0 ||
+        turnBudget > 100_000)) ||
     typeof turnsUsed !== "number" ||
-    !Number.isInteger(turnsUsed) ||
+    !Number.isSafeInteger(turnsUsed) ||
     turnsUsed < 0 ||
-    typeof result.createdAt !== "string"
+    (turnBudget !== null &&
+      typeof turnBudget === "number" &&
+      turnsUsed > turnBudget) ||
+    typeof result.createdAt !== "string" ||
+    result.createdAt.trim().length === 0 ||
+    result.createdAt.length > 64
   ) {
     throw new Error("Goal API returned an invalid response.");
   }
   return result as unknown as GoalState;
+}
+
+function decodeGoalResponse(response: Response, value: unknown): GoalResponse {
+  const goal = decodeGoalState(value);
+  const rawRevision = response.headers.get("x-ygg-goal-revision");
+  if (rawRevision === null) {
+    return { goal, revision: goal?.revision ?? 0 };
+  }
+  const normalizedRevision = rawRevision.trim();
+  if (!/^\d+$/.test(normalizedRevision)) {
+    throw new Error("Goal API returned an invalid revision.");
+  }
+  const revision = Number(normalizedRevision);
+  if (!Number.isSafeInteger(revision) || (goal !== null && goal.revision !== revision)) {
+    throw new Error("Goal API returned an invalid revision.");
+  }
+  return { goal, revision };
 }
 
 export class FixtureTransport implements YggTransport {
@@ -463,6 +498,7 @@ export class FixtureTransport implements YggTransport {
   private documents = new Map<string, DocumentReference[]>();
   private projectFiles = new Map<string, Map<string, FixtureProjectFile>>();
   private goals = new Map<string, GoalState>();
+  private goalRevisions = new Map<string, number>();
 
   async getProjectCatalog(): Promise<ProjectCatalog> {
     return {
@@ -712,24 +748,33 @@ export class FixtureTransport implements YggTransport {
     };
   }
 
-  async getGoal(sessionId: string): Promise<GoalState | null> {
+  async getGoal(sessionId: string): Promise<GoalResponse> {
     if (!this.sessions[sessionId]) {
       throw new Error(`Unknown fixture session ${sessionId}`);
     }
     const goal = this.goals.get(sessionId);
-    return goal ? clone(goal) : null;
+    return {
+      goal: goal ? clone(goal) : null,
+      revision: Math.max(goal?.revision ?? 0, this.goalRevisions.get(sessionId) ?? 0),
+    };
   }
 
   async updateGoal(
     sessionId: string,
     mutation: GoalMutation,
-  ): Promise<GoalState | null> {
+  ): Promise<GoalResponse> {
     if (!this.sessions[sessionId]) {
       throw new Error(`Unknown fixture session ${sessionId}`);
     }
     if ("objective" in mutation) {
+      const current = this.goals.get(sessionId);
+      const revision = Math.max(
+        current?.revision ?? 0,
+        this.goalRevisions.get(sessionId) ?? 0,
+      ) + 1;
       const now = new Date().toISOString();
       const goal: GoalState = {
+        revision,
         objective: mutation.objective,
         status: "active",
         turnBudget: mutation.turnBudget ?? null,
@@ -737,20 +782,31 @@ export class FixtureTransport implements YggTransport {
         createdAt: now,
       };
       this.goals.set(sessionId, goal);
-      return clone(goal);
+      this.goalRevisions.set(sessionId, revision);
+      return { goal: clone(goal), revision };
     }
     const current = this.goals.get(sessionId);
     if (mutation.action === "clear") {
+      if (current) {
+        this.goalRevisions.set(sessionId, current.revision + 1);
+      }
       this.goals.delete(sessionId);
-      return null;
+      return {
+        goal: null,
+        revision: this.goalRevisions.get(sessionId) ?? 0,
+      };
     }
     if (!current) throw new Error("No goal is configured for this session.");
+    const status = mutation.action === "pause" ? "paused" : "active";
+    const revision = status === current.status ? current.revision : current.revision + 1;
     const next: GoalState = {
       ...current,
-      status: mutation.action === "pause" ? "paused" : "active",
+      status,
+      revision,
     };
     this.goals.set(sessionId, next);
-    return clone(next);
+    this.goalRevisions.set(sessionId, revision);
+    return { goal: clone(next), revision };
   }
 
   subscribe(listener: EventListener): () => void {
@@ -774,6 +830,7 @@ export class FixtureTransport implements YggTransport {
     this.attachmentUrls.clear();
     this.documents.clear();
     this.goals.clear();
+    this.goalRevisions.clear();
   }
 
   async ingestAttachment(file: File): Promise<AttachmentRef> {
@@ -2242,7 +2299,7 @@ export class HttpTransport implements YggTransport {
   async getGoal(
     sessionId: string,
     signal?: AbortSignal,
-  ): Promise<GoalState | null> {
+  ): Promise<GoalResponse> {
     const response = await fetch(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`,
       {
@@ -2254,13 +2311,13 @@ export class HttpTransport implements YggTransport {
     if (!response.ok) {
       throw new Error(`Goal failed with ${response.status}`);
     }
-    return decodeGoalState(await response.json());
+    return decodeGoalResponse(response, await response.json());
   }
 
   async updateGoal(
     sessionId: string,
     mutation: GoalMutation,
-  ): Promise<GoalState | null> {
+  ): Promise<GoalResponse> {
     const response = await fetch(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/goal`,
       {
@@ -2276,7 +2333,7 @@ export class HttpTransport implements YggTransport {
     if (!response.ok) {
       throw new Error(`Goal update failed with ${response.status}`);
     }
-    return decodeGoalState(await response.json());
+    return decodeGoalResponse(response, await response.json());
   }
 
   async send(command: ClientCommand): Promise<CommandAck> {

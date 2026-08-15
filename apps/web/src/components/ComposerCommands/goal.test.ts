@@ -21,6 +21,7 @@ describe("goal composer commands", () => {
     expect(parseGoalCommand("/goal")).toEqual({ type: "help" });
     expect(
       goalStatusMessage({
+        revision: 1,
         objective: "ship the release",
         status: "active",
         turnBudget: 4,

@@ -4,6 +4,7 @@ import type { GoalState } from "../protocol";
 import { GoalBadge } from "./GoalBadge";
 
 const goal: GoalState = {
+  revision: 1,
   objective: "ship the release",
   status: "active",
   turnBudget: 4,

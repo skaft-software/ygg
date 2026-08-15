@@ -76,6 +76,20 @@ const initialState: YggState = {
 
 const commandId = () => crypto.randomUUID();
 
+function acceptsGoalProjection(
+  current: GoalState | null,
+  candidate: GoalState | null,
+  currentRevision: number,
+  candidateRevision: number,
+): boolean {
+  if (candidateRevision < currentRevision) return false;
+  return (
+    candidate === null ||
+    current === null ||
+    candidate.revision >= current.revision
+  );
+}
+
 export type SessionRouteMode = "push" | "replace" | "none";
 
 export function sessionIdFromPathname(pathname: string): string | null {
@@ -216,6 +230,7 @@ export class YggStore {
   private deferredDuringResync = new Map<string, SessionEvent[]>();
   private createSessionTail: Promise<void> = Promise.resolve();
   private initializationGeneration = 0;
+  private goalRevision = 0;
   private disposed = false;
 
   constructor(private readonly transport: YggTransport) {}
@@ -252,6 +267,7 @@ export class YggStore {
     if (!events.length || !this.state.bootstrap) return;
 
     let next = this.state;
+    let goalRevision = this.goalRevision;
     let changed = false;
 
     for (let eventIndex = 0; eventIndex < events.length; eventIndex += 1) {
@@ -402,13 +418,34 @@ export class YggStore {
         return candidate;
       });
       const sessionChanged = Boolean(updated && updated !== current);
-      if (summaryChanged || sessionChanged) {
+      const goalEventAccepted =
+        event.type === "session.goalChanged" &&
+        event.sessionId === next.selectedSessionId &&
+        acceptsGoalProjection(
+          next.goal,
+          event.goal,
+          goalRevision,
+          event.revision,
+        );
+      const goalChanged =
+        goalEventAccepted &&
+        current !== undefined &&
+        updated !== current;
+      if (goalChanged) {
+        goalRevision = Math.max(
+          goalRevision,
+          event.revision,
+          event.goal?.revision ?? 0,
+        );
+      }
+      if (summaryChanged || sessionChanged || goalChanged) {
         next = {
           ...next,
           bootstrap:
             bootstrap && summaries && summaryChanged
               ? { ...bootstrap, sessions: summaries }
               : bootstrap,
+          goal: goalChanged ? event.goal : next.goal,
           sessions:
             updated && sessionChanged
               ? { ...next.sessions, [event.sessionId]: updated }
@@ -418,7 +455,10 @@ export class YggStore {
       }
     }
 
-    if (changed) this.publish(next);
+    if (changed) {
+      this.goalRevision = goalRevision;
+      this.publish(next);
+    }
   }
 
   private async resyncSession(
@@ -560,6 +600,7 @@ export class YggStore {
         (project) => project.trusted && project.available && !project.archived,
       );
       if (!hasRunnableProject) {
+        this.goalRevision = 0;
         this.publish({
           ready: true,
           connecting: false,
@@ -598,6 +639,7 @@ export class YggStore {
       );
       if (!this.isCurrentInitialization(generation)) return;
       if (bootstrap.selectedSessionId === null) {
+        this.goalRevision = 0;
         this.publish({
           ready: true,
           connecting: false,
@@ -613,11 +655,12 @@ export class YggStore {
         return;
       }
       const selectedSessionId = bootstrap.selectedSessionId;
-      const [selected, goal] = await Promise.all([
+      const [selected, goalResponse] = await Promise.all([
         this.transport.getSession(selectedSessionId),
         this.transport.getGoal(selectedSessionId),
       ]);
       if (!this.isCurrentInitialization(generation)) return;
+      const goal = goalResponse.goal;
       const selectedSummaryTitle = bootstrap.sessions.find(
         (summary) => summary.id === selected.sessionId,
       )?.title;
@@ -638,6 +681,7 @@ export class YggStore {
           : summary,
       );
       if (!this.isCurrentInitialization(generation)) return;
+      this.goalRevision = goalResponse.revision;
       this.publish({
         ready: true,
         connecting: false,
@@ -740,9 +784,28 @@ export class YggStore {
   ): Promise<GoalState | null> {
     const session = this.selectedSession;
     if (!session) throw new Error("No task is selected.");
-    const goal = await this.transport.updateGoal(session.sessionId, mutation);
+    const goalResponse = await this.transport.updateGoal(
+      session.sessionId,
+      mutation,
+    );
+    const goal = goalResponse.goal;
     if (this.state.selectedSessionId === session.sessionId) {
-      this.publish({ ...this.state, goal });
+      const candidateRevision = goalResponse.revision;
+      if (
+        acceptsGoalProjection(
+          this.state.goal,
+          goal,
+          this.goalRevision,
+          candidateRevision,
+        )
+      ) {
+        this.goalRevision = Math.max(
+          this.goalRevision,
+          candidateRevision,
+          goal?.revision ?? 0,
+        );
+        this.publish({ ...this.state, goal });
+      }
     }
     return goal;
   }
@@ -849,11 +912,12 @@ export class YggStore {
     }
 
     try {
-      const [snapshot, goal] = await Promise.all([
+      const [snapshot, goalResponse] = await Promise.all([
         this.state.sessions[sessionId] ??
           this.transport.getSession(sessionId, controller.signal),
         this.transport.getGoal(sessionId, controller.signal),
       ]);
+      const goal = goalResponse.goal;
       const summaryTitle = this.state.bootstrap?.sessions.find(
         (summary) => summary.id === sessionId,
       )?.title;
@@ -870,6 +934,7 @@ export class YggStore {
       ) {
         return;
       }
+      this.goalRevision = goalResponse.revision;
       this.publish({
         ...this.state,
         bootstrap: this.state.bootstrap
@@ -956,10 +1021,11 @@ export class YggStore {
     sessionId: string,
     bootstrap: HostBootstrap,
   ): Promise<void> {
-    const [snapshot, goal] = await Promise.all([
+    const [snapshot, goalResponse] = await Promise.all([
       this.transport.getSession(sessionId),
       this.transport.getGoal(sessionId),
     ]);
+    const goal = goalResponse.goal;
     const summary: SessionSummary = {
       id: snapshot.sessionId,
       projectId: snapshot.projectId,
@@ -975,6 +1041,7 @@ export class YggStore {
       attentionCount: 0,
     };
     const currentBootstrap = this.state.bootstrap ?? bootstrap;
+    this.goalRevision = goalResponse.revision;
     this.publish({
       ...this.state,
       bootstrap: {

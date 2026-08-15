@@ -508,6 +508,11 @@ impl<H: HostService> SessionSupervisor<H> {
         self.state.lock().await.actors.len()
     }
 
+    /// Stable host identity used by session command envelopes.
+    pub fn host_id(&self) -> crate::HostId {
+        self.host.descriptor().id
+    }
+
     /// Current host-catalog revision.
     pub fn catalog_cursor(&self) -> CatalogCursor {
         CatalogCursor(self.catalog_cursor.load(Ordering::Acquire))

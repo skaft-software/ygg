@@ -71,6 +71,7 @@ pub mod events;
 pub mod extension;
 pub mod extension_process;
 pub mod goal_driver;
+pub mod goal_store;
 pub mod input;
 pub mod sandbox;
 pub mod secure_fs;
@@ -98,11 +99,6 @@ pub use context::{
     ActiveContextCompaction, ContextBreakdown, ContextSnapshot, FinishedContextCompaction,
     RunPhase, RunTerminalState,
 };
-pub use goal_driver::{
-    continuation_prompt, detect_goal_marker, GoalContinuation, GoalDecision, GoalDriver,
-    GoalDriverError, GoalMarker, GoalState, GoalStatus, GoalStore, GoalTurnSource,
-    DEFAULT_GOAL_GRACE_PERIOD, GOAL_CONTINUATION_PROMPT_TEMPLATE,
-};
 pub use events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
     OutputChannel, QueueDeliveryMode,
@@ -123,6 +119,15 @@ pub use extension_process::{
     ExtensionUiSurface, RenderedToolCall, ToolCallOutput as ExtensionToolCallOutput,
     ToolDefinition as ExtensionToolDefinition, ToolRenderSegment, EXTENSION_API_VERSION,
     EXTENSION_MANIFEST_FILENAME,
+};
+pub use goal_driver::{
+    continuation_prompt, detect_goal_marker, GoalContinuation, GoalDecision, GoalDriver,
+    GoalDriverError, GoalMarker, GoalState, GoalStatus, GoalStore, GoalTurnSource,
+    DEFAULT_GOAL_GRACE_PERIOD, GOAL_CONTINUATION_PROMPT_TEMPLATE,
+};
+pub use goal_store::{
+    DurableGoalStore, DurableGoalStoreError, GoalAction, MAX_GOAL_OBJECTIVE_BYTES,
+    MAX_GOAL_TURN_BUDGET,
 };
 pub use input::{InputPart, UserInput};
 pub use sandbox::SandboxConfig;
