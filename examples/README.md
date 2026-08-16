@@ -16,6 +16,8 @@ extension into a project.
   themes that can also be copied and edited as project themes.
 - [`extensions/hello-world/`](extensions/hello-world/) — a minimal executable
   JSON-RPC extension.
+- [`extensions/caffeinate/`](extensions/caffeinate/) — a macOS sleep inhibitor
+  active while Ygg processes a prompt.
 - [`extensions/git-tools/`](extensions/git-tools/) — a custom command, git
   status tool, status-line contribution, and tool renderer.
 - [`extensions/local-model-workflow/`](extensions/local-model-workflow/) —

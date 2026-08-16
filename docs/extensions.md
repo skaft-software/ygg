@@ -254,6 +254,8 @@ The SDK-backed examples remain small and copyable:
 
 - [`hello-world`](../examples/extensions/hello-world) demonstrates the minimum
   process and protocol handshake.
+- [`caffeinate`](../examples/extensions/caffeinate) uses lifecycle hooks to run
+  a macOS sleep inhibitor while Ygg processes a prompt.
 - [`git-tools`](../examples/extensions/git-tools) contributes a bounded custom
   tool, command, and semantic renderer.
 - [`local-model-workflow`](../examples/extensions/local-model-workflow)
