@@ -18,8 +18,9 @@ use crate::tui::terminal::{TerminalSize, YggTerminal};
 
 /// Welcome-card motion is short-lived and limited to roughly 60 fps.
 const RENDER_INTERVAL: Duration = Duration::from_millis(16);
-/// Transcript activity shares one restrained one-second breathing cycle.
-/// Toggling the glyph ourselves works in terminals that ignore SGR blink.
+/// Transcript activity shares one restrained one-second cycle: the model dot
+/// blinks, and active tool or shell dots breathe between `•` and `·`.
+/// Toggling the cell ourselves works in terminals that ignore SGR blink.
 const EVENT_DOT_TOGGLE_INTERVAL: Duration = Duration::from_millis(500);
 /// Resize events are normally delivered by crossterm, but polling while idle
 /// also catches terminal-manager resizes that do not emit an event.

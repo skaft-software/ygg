@@ -2171,7 +2171,7 @@ fn hidden_reasoning_stream_does_not_grow_native_scrollback() {
     let visible = terminal.screen().contents();
     assert!(visible.contains("Thinking"), "{visible:?}");
     assert!(!visible.contains("Working"), "{visible:?}");
-    assert!(visible.contains("ctrl+o · unfold"), "{visible:?}");
+    assert!(visible.contains("(ctrl+o to expand)"), "{visible:?}");
     assert!(!visible.contains("private sentinel"), "{visible:?}");
     let state = shell.state.borrow();
     let TranscriptBlock::Reasoning(reasoning) = state.transcript.last().unwrap() else {
@@ -2481,7 +2481,12 @@ fn compaction_disclosure_preserves_native_presentation() {
         terminal.set_scrollback(0);
         let visible = terminal.screen().contents();
         assert!(visible.contains("compaction-detail-39"), "{visible}");
-        assert!(visible.contains("│ ›"), "composer disappeared: {visible}");
+        assert!(
+            visible
+                .lines()
+                .any(|line| line == "─".repeat(WIDTH as usize)),
+            "composer disappeared: {visible}"
+        );
 
         shell.expand_focused_tool();
         shell.render();
@@ -2503,7 +2508,9 @@ fn compaction_disclosure_preserves_native_presentation() {
         assert!(collapsed.contains("ctrl+o to view"), "{collapsed}");
         assert!(!collapsed.contains("compaction-detail-"), "{collapsed}");
         assert!(
-            collapsed.contains("│ ›"),
+            collapsed
+                .lines()
+                .any(|line| line == "─".repeat(WIDTH as usize)),
             "composer disappeared: {collapsed}"
         );
 
@@ -3005,9 +3012,10 @@ fn streamed_table_and_wrapped_lists_survive_shrink_scroll_and_resize() {
     terminal.set_size(256, WIDTH);
     terminal.set_scrollback(usize::MAX);
     let physical = terminal.screen().contents();
+    let rule = "─".repeat(WIDTH as usize);
     assert_eq!(
-        physical.matches("│ ›").count(),
-        1,
+        physical.lines().filter(|line| line == &rule).count(),
+        2,
         "mutable composer was committed to scrollback:\n{physical}"
     );
     for sentinel in [
@@ -4322,7 +4330,7 @@ fn reasoning_enabled_run_shows_fallback_before_provider_deltas() {
         .collect::<Vec<_>>();
     assert_eq!(rendered.len(), 2, "{rendered:?}");
     assert!(rendered[0].contains("• Thinking"), "{rendered:?}");
-    assert!(rendered[1].contains("ctrl+o · unfold"), "{rendered:?}");
+    assert!(rendered[1].contains("(ctrl+o to expand)"), "{rendered:?}");
 }
 
 #[test]
@@ -4350,7 +4358,7 @@ fn collapsed_reasoning_dot_blinks_without_moving_the_label() {
     }
     let quiet = render(&shell);
     assert!(!quiet.contains('•'), "{quiet:?}");
-    assert!(quiet.contains('·'), "{quiet:?}");
+    assert!(!quiet.contains('·'), "{quiet:?}");
     let visual_label_column = |line: &str| {
         let offset = line.find("Thinking").expect("reasoning label");
         visible_width(&line[..offset])
@@ -4358,7 +4366,7 @@ fn collapsed_reasoning_dot_blinks_without_moving_the_label() {
     assert_eq!(
         visual_label_column(&visible),
         visual_label_column(&quiet),
-        "breathing the dot must not move the reasoning label"
+        "blinking the dot must not move the reasoning label"
     );
 }
 
@@ -4409,7 +4417,7 @@ fn collapsed_reasoning_aligns_with_tool_event_margin() {
         .expect("reasoning row");
     let disclosure_line = reasoning_lines
         .iter()
-        .find(|line| line.contains("ctrl+o · unfold"))
+        .find(|line| line.contains("(ctrl+o to expand)"))
         .expect("reasoning disclosure row");
     let visual_column = |line: &str, needle: &str| {
         line.find(needle)
@@ -4464,7 +4472,7 @@ fn reasoning_off_run_uses_a_truthful_non_expandable_working_status() {
         .collect::<Vec<_>>();
     assert_eq!(promoted.len(), 2, "{promoted:?}");
     assert!(promoted[0].contains("Thinking"), "{promoted:?}");
-    assert!(promoted[1].contains("ctrl+o · unfold"), "{promoted:?}");
+    assert!(promoted[1].contains("(ctrl+o to expand)"), "{promoted:?}");
     assert!(!promoted.join("\n").contains("provider-private detail"));
 }
 
@@ -4614,7 +4622,7 @@ fn streamed_reasoning_shows_one_live_indicator_until_ctrl_o() {
     let initial = transcript(&shell);
     assert_eq!(initial.len(), 2, "{initial:?}");
     assert!(initial[0].contains("Thinking"), "{initial:?}");
-    assert!(initial[1].contains("ctrl+o · unfold"), "{initial:?}");
+    assert!(initial[1].contains("(ctrl+o to expand)"), "{initial:?}");
     assert!(!initial.join("\n").contains("first private sentinel"));
 
     let continuation = (0..128)
@@ -4647,7 +4655,7 @@ fn streamed_reasoning_shows_one_live_indicator_until_ctrl_o() {
     let expanded = transcript(&shell).join("\n");
     assert!(expanded.contains("first private sentinel"), "{expanded}");
     assert!(expanded.contains("private reasoning row 127"), "{expanded}");
-    assert!(!expanded.contains("ctrl+o · unfold"), "{expanded}");
+    assert!(!expanded.contains("(ctrl+o to expand)"), "{expanded}");
 
     shell.expand_focused_tool();
     assert_eq!(transcript(&shell), initial);
@@ -4686,7 +4694,11 @@ fn a_new_reasoning_event_retires_the_previous_ctrl_o_hint() {
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>()
         .join("\n");
-    assert_eq!(rendered.matches("ctrl+o · unfold").count(), 1, "{rendered}");
+    assert_eq!(
+        rendered.matches("(ctrl+o to expand)").count(),
+        1,
+        "{rendered}"
+    );
     shell.expand_focused_tool();
     let expanded = shell
         .state
@@ -4698,7 +4710,7 @@ fn a_new_reasoning_event_retires_the_previous_ctrl_o_hint() {
         .join("\n");
     assert!(expanded.contains("first thought"), "{expanded}");
     assert!(expanded.contains("second thought"), "{expanded}");
-    assert!(!expanded.contains("ctrl+o · unfold"), "{expanded}");
+    assert!(!expanded.contains("(ctrl+o to expand)"), "{expanded}");
 }
 
 #[test]
@@ -5373,7 +5385,7 @@ fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
     assert_eq!(
         event_margin_marker(&reasoning, &theme, false, true)
             .map(|marker| strip_terminal_sequences(&marker)),
-        Some("·".into())
+        Some(" ".into())
     );
     let outcome = TranscriptBlock::Outcome(OutcomeBlock::new(
         RunOutcome::CompletedWithWarnings {
@@ -5985,7 +5997,7 @@ fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
     assert_eq!(plain_footer(&shell, 30, now), "  Qwen3.6 35B A3B  $0");
 
     let surface = plain_composer_surface(&shell, 100, now);
-    assert_eq!(surface.len(), 4, "one editor row, two borders, one footer");
+    assert_eq!(surface.len(), 4, "one editor row, two rules, one footer");
     assert!(!surface[surface.len() - 2].is_empty());
     assert_eq!(surface.last().unwrap(), &plain_footer(&shell, 100, now));
     assert!(surface.iter().all(|line| visible_width(line) <= 100));
@@ -6794,8 +6806,8 @@ fn transcript_and_composer_have_exactly_one_breathing_row() {
         .collect::<Vec<_>>();
     let composer = lines
         .iter()
-        .position(|line| line.starts_with('┌') || line.starts_with('╭') || line.starts_with('+'))
-        .expect("composer top border");
+        .position(|line| !line.is_empty() && line.chars().all(|c| c == '─' || c == '-'))
+        .expect("composer top rule");
     assert!(composer > 0);
     assert!(lines[composer - 1].is_empty());
     assert!(composer < 2 || !lines[composer - 2].is_empty());
@@ -6932,15 +6944,18 @@ fn explicit_theme_preserves_composer_and_code_chrome() {
     assert!(theme.rich_renderer().options().code_borders);
     let shell = InteractiveShell::test_shell_with_theme(theme);
     let rendered = plain_composer_surface(&shell, 60, Instant::now());
-    assert!(rendered.first().is_some_and(|line| line.starts_with('┌')
-        || line.starts_with('╭')
-        || line.starts_with('+')));
+    let is_rule = |line: &String| line.chars().all(|c| c == '─' || c == '-');
+    assert!(rendered.first().is_some_and(is_rule));
     assert!(rendered
         .get(1)
-        .is_some_and(|line| line.starts_with('│') || line.starts_with('|')));
-    assert!(rendered.get(2).is_some_and(|line| line.starts_with('└')
-        || line.starts_with('╰')
-        || line.starts_with('+')));
+        .is_some_and(|line| line.starts_with('›') || line.starts_with('>')));
+    assert!(
+        rendered
+            .get(1)
+            .is_some_and(|line| !line.contains('│') && !line.contains('|')),
+        "composer rows must not carry side borders"
+    );
+    assert!(rendered.get(2).is_some_and(is_rule));
 }
 
 fn theme_with_layout(layout: &str) -> YggTheme {
@@ -7379,8 +7394,8 @@ fn theme_header_footer_status_and_composer_padding_have_narrow_fallbacks() {
 
     let now = Instant::now();
     let composer = plain_composer_surface(&shell, 80, now);
-    assert_eq!(composer.len(), 3, "hidden footer leaves only the box");
-    assert!(composer[1].starts_with("│   ›"), "{composer:?}");
+    assert_eq!(composer.len(), 3, "hidden footer leaves only the frame");
+    assert!(composer[1].starts_with('›'), "{composer:?}");
     assert!(composer.iter().all(|line| visible_width(line) == 80));
 
     let wide_header = shell_chrome(&shell.state.borrow(), 80, now).header;

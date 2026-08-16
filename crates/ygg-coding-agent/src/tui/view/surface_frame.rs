@@ -161,7 +161,11 @@ pub(super) fn event_margin_marker(
             None
         }
         TranscriptBlock::Reasoning(reasoning) if collapsed_reasoning => {
-            Some(theme.model_fg(reasoning.model_lab, active_phase_dot))
+            Some(if active_dot_visible {
+                theme.model_fg(reasoning.model_lab, active_dot)
+            } else {
+                " ".to_owned()
+            })
         }
         TranscriptBlock::Reasoning(_) => None,
         TranscriptBlock::Tool(panel) if !panel.finished => {

@@ -73,26 +73,28 @@ submitted. PDFs are not decoded or sent as multimodal
 payloads: a dropped PDF receives a composer chip, but submission resolves that
 chip to the file path as text so the model can inspect it with file tools.
 
-The compiled default composer leaves the terminal canvas unfilled. Its outline
-is a restrained form of the model accent at rest and the captured executing
-model accent while focused or active, but it never animates. The border holds
-model identity; the transcript owns liveness. Fenced Markdown code is
-borderless and uses `#202630` on known dark profiles or `#f1f5f4` on known
-light profiles, falling back to an unpainted surface when the background is
-unknown. Named and custom themes keep their authored chrome.
+The compiled default composer leaves the terminal canvas unfilled. It is
+framed by a top and bottom rule in a restrained form of the model accent at
+rest and the captured executing model accent while focused or active, but it
+never animates. The rules hold model identity; the transcript owns liveness.
+Content rows span the full width with no side borders, so prompt text
+selected from the composer copies without border characters. Fenced Markdown
+code is borderless and uses `#202630` on known dark profiles or `#f1f5f4` on
+known light profiles, falling back to an unpainted surface when the background
+is unknown. Named and custom themes keep their authored chrome.
 
 ## Reasoning presentation
 
-Live reasoning is collapsed into a plain-weight row whose model-colored marker
-breathes between `•` and `·` once per second, plus a subdued
-`└ ctrl+o · unfold` disclosure row. The heading cache advances only from
-semantic ATX headings or paragraphs consisting solely of bold text. It never
-infers a label from body prose, sanitizes provider text before display, and uses
-`Thinking` until the model emits a heading. A reasoning-off wait uses the same
-transient pulse with the truthful label `Working`, but no disclosure affordance;
-compaction similarly uses `Compacting context`. Completed collapsed reasoning
-and transient activity leave no rows. `Ctrl+O` preserves the existing full,
-verbatim Markdown rendering.
+Live reasoning is collapsed into a plain-weight row whose model-colored dot
+blinks once per second, plus a subdued `└ (ctrl+o to expand)` disclosure row.
+The heading cache advances only from semantic ATX headings or paragraphs
+consisting solely of bold text. It never infers a label from body prose,
+sanitizes provider text before display, and uses `Thinking` until the model
+emits a heading. A reasoning-off wait uses the same transient blink with the
+truthful label `Working`, but no disclosure affordance; compaction similarly
+uses `Compacting context`. Completed collapsed reasoning and transient
+activity leave no rows. `Ctrl+O` preserves the existing full, verbatim
+Markdown rendering.
 
 ## Run outcomes
 

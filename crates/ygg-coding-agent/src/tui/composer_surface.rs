@@ -1,5 +1,5 @@
-//! Composer surface: a clean bordered multiline input area with a stable
-//! status footer below and quiet, model-adaptive colour.
+//! Composer surface: a clean multiline input area framed by top and bottom
+//! rules, with a stable status footer below and quiet, model-adaptive colour.
 
 use std::time::Instant;
 
@@ -57,30 +57,19 @@ fn unicode(state: &super::view::ShellState) -> bool {
     state.theme.unicode()
 }
 
-fn glyphs(state: &super::view::ShellState) -> (&str, &str, &str, &str) {
-    (
-        state.theme.glyph("top_left"),
-        state.theme.glyph("top_right"),
-        state.theme.glyph("bottom_left"),
-        state.theme.glyph("bottom_right"),
-    )
-}
-
 fn horiz(state: &super::view::ShellState) -> &str {
     state.theme.glyph("horizontal")
 }
 
-fn vert(state: &super::view::ShellState) -> &str {
-    state.theme.glyph("vertical")
-}
-
 // ---------------------------------------------------------------------------
-// Unified composer box
+// Unified composer frame
 // ---------------------------------------------------------------------------
 
-/// Render the entire bordered composer: top edge, content rows with side
-/// borders, and bottom edge. The outline remains byte-stable while work runs;
-/// live motion belongs to the semantic transcript entry doing the work.
+/// Render the entire composer: a top rule, full-width content rows, and a
+/// bottom rule. The rules are plain horizontal lines with no corners, and
+/// content rows carry no side borders, so text selected from the prompt
+/// copies without border characters. The rules remain byte-stable while work
+/// runs; live motion belongs to the semantic transcript entry doing the work.
 fn render_composer_box(
     state: &super::view::ShellState,
     width: u16,
@@ -93,17 +82,9 @@ fn render_composer_box(
     }
 
     let theme = &state.theme;
-    let horizontal_padding = usize::from(theme.layout_for_width(width).composer_padding);
-    let inner_width = w.saturating_sub(2 + horizontal_padding.saturating_mul(2));
-    if inner_width == 0 {
-        return render_plain_content(state, width);
-    }
-    let padding = " ".repeat(horizontal_padding);
-    let (tl, tr, bl, br) = glyphs(state);
     let h = horiz(state);
-    let v = vert(state);
 
-    // The outline identifies the selected/executing model without pretending
+    // The rules identify the selected/executing model without pretending
     // to measure progress. Idle chrome stays quiet; focus and work use the
     // captured run accent as one stable colour.
     let run_active = state.run.is_active();
@@ -113,7 +94,7 @@ fn render_composer_box(
         theme.role_rgb("model_accent")
     }
     .unwrap_or((128, 128, 128));
-    // Keep the resting border close to the terminal background. On a light
+    // Keep the resting rules close to the terminal background. On a light
     // profile this moves toward white rather than turning into a black box;
     // focused input and active work use the model accent.
     let idle_border = theme.composer_idle_rgb(accent);
@@ -125,19 +106,14 @@ fn render_composer_box(
     } else {
         idle_border
     };
-    let border_cell = |glyph: &str| -> String { theme.rgb_fg(border_rgb, glyph) };
-    let render_horizontal_border = |top: bool| -> String {
-        let (left, right) = if top { (tl, tr) } else { (bl, br) };
-        theme.rgb_fg(
-            border_rgb,
-            &format!("{left}{}{right}", h.repeat(w.saturating_sub(2))),
-        )
-    };
+    // Plain full-width rules, with no corner glyphs, so nothing in the
+    // composer row carries a border character into copied text.
+    let render_rule = || -> String { theme.rgb_fg(border_rgb, &h.repeat(w)) };
 
     let mut lines = Vec::with_capacity(content_rows + 2);
 
-    // ---- top border ----
-    lines.push(render_horizontal_border(true));
+    // ---- top rule ----
+    lines.push(render_rule());
 
     // ---- content rows ----
     let marker = theme.bold(&theme.model_fg(
@@ -152,17 +128,15 @@ fn render_composer_box(
     // layout, positions the terminal cursor there, and the backend requests a
     // steady block shape. Inserting a beam glyph here would shift the text.
     let cursor_marker = composer_cursor_marker(state);
-    let framed_row = |left: &str, content: &str, right: &str| {
+    // Rows span the full width between the rules; nothing else frames the
+    // prompt, so selected text copies without border characters.
+    let render_row = |content: &str| -> String {
         let content_width = visible_width(content);
-        let content = if content_width > inner_width {
-            fit_line(content, inner_width as u16)
+        if content_width > w {
+            fit_line(content, width)
         } else {
-            format!(
-                "{content}{}",
-                " ".repeat(inner_width.saturating_sub(content_width))
-            )
-        };
-        format!("{left}{padding}{content}{padding}{right}")
+            format!("{content}{}", " ".repeat(w.saturating_sub(content_width)))
+        }
     };
 
     let (editor, editor_cursor) = if let Some(prompt) = &state.tool_input_prompt {
@@ -173,24 +147,15 @@ fn render_composer_box(
 
     if editor.is_empty() {
         for i in 0..content_rows {
-            let left = border_cell(v);
-            let right = border_cell(v);
             if i == 0 {
-                lines.push(framed_row(
-                    &left,
-                    &format!("{marker} {cursor_marker}"),
-                    &right,
-                ));
+                lines.push(render_row(&format!("{marker} {cursor_marker}")));
             } else {
-                lines.push(framed_row(&left, "", &right));
+                lines.push(render_row(""));
             }
         }
     } else {
-        let layout = state.cached_editor_layout(
-            (inner_width as u16).max(2),
-            Some(&editor),
-            Some(editor_cursor),
-        );
+        let layout =
+            state.cached_editor_layout((w as u16).max(2), Some(&editor), Some(editor_cursor));
         let total_lines = layout.lines.len();
         let overflow = total_lines.saturating_sub(content_rows);
         let visible_rows = if overflow > 0 {
@@ -217,14 +182,10 @@ fn render_composer_box(
                 "{ellipsis} {hidden_above} more line{} above",
                 if hidden_above == 1 { "" } else { "s" }
             );
-            let left = border_cell(v);
-            let right = border_cell(v);
-            rendered.push(framed_row(&left, &theme.fg("model_accent", &msg), &right));
+            rendered.push(render_row(&theme.fg("model_accent", &msg)));
         }
 
         for index in start..end {
-            let left = border_cell(v);
-            let right = border_cell(v);
             let vis_line = &layout.lines[index];
             let content = if index == layout.cursor_row {
                 let cursor = editor_cursor.clamp(vis_line.start, vis_line.visible_end);
@@ -241,14 +202,7 @@ fn render_composer_box(
             } else {
                 "  ".to_owned()
             };
-            let row_text = format!("{prefix}{content}");
-            let cw = visible_width(&row_text);
-            let padded = if cw >= inner_width {
-                fit_line(&row_text, inner_width as u16)
-            } else {
-                format!("{row_text}{}", " ".repeat(inner_width.saturating_sub(cw)))
-            };
-            rendered.push(framed_row(&left, &padded, &right));
+            rendered.push(render_row(&format!("{prefix}{content}")));
         }
 
         if hidden_below > 0 {
@@ -257,22 +211,18 @@ fn render_composer_box(
                 "{ellipsis} {hidden_below} more line{} below",
                 if hidden_below == 1 { "" } else { "s" }
             );
-            let left = border_cell(v);
-            let right = border_cell(v);
-            rendered.push(framed_row(&left, &theme.fg("model_accent", &msg), &right));
+            rendered.push(render_row(&theme.fg("model_accent", &msg)));
         }
 
         while rendered.len() < content_rows {
-            let left = border_cell(v);
-            let right = border_cell(v);
-            rendered.push(framed_row(&left, "", &right));
+            rendered.push(render_row(""));
         }
 
         lines.append(&mut rendered);
     }
 
-    // ---- bottom border ----
-    lines.push(render_horizontal_border(false));
+    // ---- bottom rule ----
+    lines.push(render_rule());
 
     lines
 }
@@ -852,7 +802,7 @@ fn compact_token_limit(n: u64) -> String {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Render the full composer surface: top border, content rows, bottom border,
+/// Render the full composer surface: a top rule, content rows, a bottom rule,
 /// then a status footer line.
 pub fn render_composer_surface(
     state: &super::view::ShellState,
@@ -882,9 +832,9 @@ pub fn render_composer_surface(
         let padding = layout.composer_padding.min(width.saturating_sub(3));
         width.saturating_sub(padding.saturating_add(2)).max(1)
     } else {
-        width
-            .saturating_sub(2 + layout.composer_padding.saturating_mul(2))
-            .max(1)
+        // The boxed composer frames with top and bottom rules only, so its
+        // content spans the full terminal width.
+        width.max(1)
     };
     let visual_lines = if editor.is_empty() {
         1
@@ -903,7 +853,7 @@ pub fn render_composer_surface(
 
     let mut lines = Vec::with_capacity(content_rows + 4);
 
-    // Unified composer box with a stable model-adaptive outline.
+    // Unified composer frame with stable model-adaptive rules.
     lines.append(&mut render_composer_box(state, width, now, content_rows));
 
     // Stable semantic footer/status surface.

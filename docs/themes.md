@@ -253,7 +253,7 @@ built-in identity or telemetry surface.
 
 ## Current semantic coverage
 
-Theme glyphs currently drive composer borders, prompt markers, wordmarks,
+Theme glyphs currently drive composer rules, prompt markers, wordmarks,
 semantic separators, transcript rails/branches, reasoning markers, run
 outcomes, and narrow ASCII fallbacks. Markdown's internal list/detail/status
 glyphs still come from sexy-tui-rs's capability-aware glyph set; the remaining
@@ -269,8 +269,9 @@ and `compaction`. Every layout field alters the current renderer:
 - `density` selects zero, one, or two rows between semantic transcript blocks.
 - `transcript_inset` moves and reflows transcript content without breaking
   mouse-selection coordinates.
-- `composer_padding` controls boxed and compact prompt padding and aligns the
-  footer/status sentence.
+- `composer_padding` controls compact prompt padding and aligns the
+  footer/status sentence. The boxed prompt frames with full-width top and
+  bottom rules; its content rows carry no side borders.
 - `show_header` moves model identity into the pinned header band. The compiled
   default leaves it off to preserve Ygg's sparse default geometry.
 - `show_footer` retains identity in the footer when the header is hidden, while

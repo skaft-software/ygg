@@ -33,11 +33,10 @@ pub(super) fn collapsed_reasoning_lines(
         let disclosure_indent = if include_margin_marker { "  " } else { "" };
         let mut lines = vec![label];
         if reasoning.show_reasoning_hint {
-            let separator = if theme.unicode() { "·" } else { "." };
             lines.push(subdued_text(
                 theme,
                 &format!(
-                    "{disclosure_indent}{} ctrl+o {separator} unfold",
+                    "{disclosure_indent}{} (ctrl+o to expand)",
                     theme.glyph("last_branch"),
                 ),
             ));
@@ -189,7 +188,7 @@ mod tests {
         let live = render_reasoning(&reasoning, &renderer, &theme, 80, false);
         assert_eq!(live.len(), 2, "{live:?}");
         assert!(strip_terminal_sequences(&live[0]).contains("• Thinking"));
-        assert!(strip_terminal_sequences(&live[1]).contains("└ ctrl+o · unfold"));
+        assert!(strip_terminal_sequences(&live[1]).contains("└ (ctrl+o to expand)"));
         assert!(!live[0].contains("\x1b[1m"), "{live:?}");
         let accent = theme
             .model_rgb(Some(ModelLab::Alibaba))
@@ -221,7 +220,7 @@ mod tests {
         let lines = render_reasoning(&reasoning, &theme.reasoning_renderer(), &theme, 16, false);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].starts_with("* A heading"), "{lines:?}");
-        assert!(lines[1].starts_with("  `- ctrl+o ."), "{lines:?}");
+        assert!(lines[1].starts_with("  `- (ctrl+o"), "{lines:?}");
         assert!(lines.iter().all(|line| visible_width(line) <= 16));
         assert!(lines.iter().all(|line| !line.contains('\x1b')));
     }
