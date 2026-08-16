@@ -231,14 +231,10 @@ fn goal_deadline_after_user_change(
 fn goal_mutation_outcome(
     plan: &WorkerPlan,
     command: SessionCommand,
-    goal_driver: Option<&GoalDriver>,
 ) -> Result<DriverCommandOutcome, ServiceError> {
     let Some(store) = plan.goal_store.as_ref() else {
         return Err(ServiceError::InvalidBoundary);
     };
-    if let Some(goal_driver) = goal_driver {
-        goal_driver.user_spoke();
-    }
     let goal = apply_goal_command(store, &plan.session_id, command)?;
     let revision = store
         .revision(&plan.session_id)
@@ -3642,12 +3638,15 @@ async fn run_worker(
             | SessionCommand::PauseGoal
             | SessionCommand::ResumeGoal
             | SessionCommand::ClearGoal) => {
-                goal_deadline = None;
-                let outcome = goal_mutation_outcome(&plan, command, goal_driver.as_ref());
-                if outcome.is_ok() {
-                    goal_deadline =
-                        goal_deadline_after_user_change(goal_driver.as_ref()).unwrap_or_default();
-                }
+                let prior_goal_deadline = goal_deadline;
+                let outcome = goal_mutation_outcome(&plan, command);
+                goal_deadline = if outcome.is_ok() {
+                    goal_deadline_after_user_change(goal_driver.as_ref()).unwrap_or_default()
+                } else {
+                    // Rejected mutations must not cancel a continuation that
+                    // was already waiting for its grace-period deadline.
+                    prior_goal_deadline
+                };
                 let _ = message.response.send(outcome);
             }
             SessionCommand::SubmitPrompt { input } => {
@@ -6083,7 +6082,7 @@ async fn handle_active_command(
         command @ (SessionCommand::SetGoal { .. }
         | SessionCommand::PauseGoal
         | SessionCommand::ResumeGoal
-        | SessionCommand::ClearGoal) => goal_mutation_outcome(plan, command, goal_driver),
+        | SessionCommand::ClearGoal) => goal_mutation_outcome(plan, command),
         SessionCommand::Rename { title } => rename_session_outcome(plan, &title),
         SessionCommand::SetPinned { pinned } => pin_session_outcome(plan, pinned),
         SessionCommand::SetArchived { archived } => archive_session_outcome(plan, archived),
