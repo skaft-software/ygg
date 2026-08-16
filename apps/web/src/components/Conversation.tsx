@@ -1786,11 +1786,14 @@ function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
       }
       const ownsOutcome =
         lastWorkIndexByRun.get(identity) === lastIndex - 1;
+      const outcome = ownsOutcome ? outcomeByRun.get(identity) : undefined;
       rows.push({
         kind: "work",
         id: `work-${workItems[0]!.id}`,
         items: workItems,
-        outcome: ownsOutcome ? outcomeByRun.get(identity) : undefined,
+        // Failed outcomes carry the provider diagnostic, so keep them as
+        // standalone rows instead of collapsing them into the work summary.
+        outcome: outcome?.outcome === "failed" ? undefined : outcome,
       });
       index = lastIndex;
       continue;

@@ -1195,6 +1195,61 @@ describe("conversation composer", () => {
     );
   });
 
+  it("renders a failed outcome after work items", () => {
+    const session = structuredClone(fixtureSessions["session-fresh"]!);
+    const createdAt = new Date().toISOString();
+    session.status = "failed";
+    session.items.push(
+      {
+        id: "failed-work",
+        runId: "failed-run",
+        turnId: "failed-turn",
+        kind: "action",
+        actionKind: "file_search",
+        phase: "investigated",
+        status: "succeeded",
+        rawToolName: "search",
+        label: "Searched files",
+        observedOutputBytes: 0,
+        droppedOutputBytes: 0,
+        changedPaths: [],
+        sourceIds: [],
+        outputIds: [],
+        state: "committed",
+        createdAt,
+      },
+      {
+        id: "failed-work-outcome",
+        runId: "failed-run",
+        turnId: "failed-turn",
+        kind: "run_outcome",
+        outcome: "failed",
+        durationMs: 10,
+        summary: "provider=custom/e2e model=e2e-model phase=connection",
+        review: completionReview("Provider request failed", 10),
+        state: "committed",
+        createdAt,
+      },
+    );
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={() => {}}
+        onOpenSource={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "provider=custom/e2e model=e2e-model phase=connection",
+    );
+  });
+
   it("omits unavailable run timing instead of claiming zero work", () => {
     const session = structuredClone(fixtureSessions["session-fresh"]!);
     session.items.push({
