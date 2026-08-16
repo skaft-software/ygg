@@ -2652,6 +2652,59 @@ impl Agent {
         self.compaction_model.as_ref()
     }
 
+    /// Approximate token budget used to migrate one deprecated retained turn.
+    const LEGACY_COMPACTION_TOKENS_PER_TURN: u64 = 1_000;
+
+    /// Configure autonomous compaction with the deprecated turn-count API.
+    ///
+    /// Each retained turn maps to a 1,000-token tail budget. Use
+    /// [`Self::set_compaction_token_policy`] for exact token control.
+    #[deprecated(note = "use set_compaction_token_policy")]
+    pub fn set_compaction_policy(
+        &mut self,
+        enabled: bool,
+        threshold_fraction: f64,
+        keep_recent_turns: usize,
+    ) -> Result<(), AgentError> {
+        self.set_compaction_token_policy(
+            enabled,
+            threshold_fraction,
+            u64::try_from(keep_recent_turns)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(Self::LEGACY_COMPACTION_TOKENS_PER_TURN),
+        )
+    }
+
+    /// Configure autonomous compaction with the deprecated turn-count API.
+    #[deprecated(note = "use set_compaction_token_mode")]
+    pub fn set_compaction_mode(
+        &mut self,
+        mode: AgentCompactionMode,
+        threshold_fraction: f64,
+        keep_recent_turns: usize,
+    ) -> Result<(), AgentError> {
+        self.set_compaction_token_mode(
+            mode,
+            threshold_fraction,
+            u64::try_from(keep_recent_turns)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(Self::LEGACY_COMPACTION_TOKENS_PER_TURN),
+        )
+    }
+
+    /// Current deprecated turn-count compaction policy.
+    #[deprecated(note = "use compaction_token_policy")]
+    pub fn compaction_policy(&self) -> (bool, f64, usize) {
+        let (enabled, threshold, tokens) = self.compaction_token_policy();
+        (
+            enabled,
+            threshold,
+            usize::try_from(tokens / Self::LEGACY_COMPACTION_TOKENS_PER_TURN)
+                .unwrap_or(usize::MAX)
+                .max(1),
+        )
+    }
+
     /// Configure autonomous context compaction for subsequent runs.
     ///
     /// `threshold_fraction` is the fraction of the complete model context
@@ -2659,13 +2712,13 @@ impl Agent {
     /// `keep_recent_tokens` is the approximate verbatim tail budget; when the
     /// retained tail alone exceeds the configured threshold or capacity,
     /// recovery advances the boundary until the request fits.
-    pub fn set_compaction_policy(
+    pub fn set_compaction_token_policy(
         &mut self,
         enabled: bool,
         threshold_fraction: f64,
         keep_recent_tokens: u64,
     ) -> Result<(), AgentError> {
-        self.set_compaction_mode(
+        self.set_compaction_token_mode(
             if enabled {
                 AgentCompactionMode::Local
             } else {
@@ -2677,7 +2730,7 @@ impl Agent {
     }
 
     /// Configure the autonomous compaction strategy for subsequent runs.
-    pub fn set_compaction_mode(
+    pub fn set_compaction_token_mode(
         &mut self,
         mode: AgentCompactionMode,
         threshold_fraction: f64,
@@ -2719,7 +2772,7 @@ impl Agent {
     }
 
     /// Current autonomous compaction policy `(enabled, threshold, keep)`.
-    pub fn compaction_policy(&self) -> (bool, f64, u64) {
+    pub fn compaction_token_policy(&self) -> (bool, f64, u64) {
         (
             self.auto_compaction_mode != AgentCompactionMode::Disabled,
             self.compaction_threshold_fraction,

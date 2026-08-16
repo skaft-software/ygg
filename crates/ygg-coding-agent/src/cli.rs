@@ -225,6 +225,8 @@ struct CompactionLayer {
     enabled: Option<bool>,
     threshold_fraction: Option<f64>,
     keep_recent_tokens: Option<u64>,
+    /// Deprecated turn-count retention, mapped to 1,000 tokens per turn.
+    keep_recent_turns: Option<usize>,
     compact_model: Option<String>,
 }
 
@@ -313,6 +315,10 @@ impl ConfigLayer {
                 }
                 if newer.keep_recent_tokens.is_some() {
                     current.keep_recent_tokens = newer.keep_recent_tokens;
+                    current.keep_recent_turns = None;
+                } else if newer.keep_recent_turns.is_some() {
+                    current.keep_recent_turns = newer.keep_recent_turns;
+                    current.keep_recent_tokens = None;
                 }
                 if newer.compact_model.is_some() {
                     current.compact_model = newer.compact_model;
@@ -610,6 +616,7 @@ const COMPACTION_KEYS: &[&str] = &[
     "enabled",
     "threshold_fraction",
     "keep_recent_tokens",
+    "keep_recent_turns",
     "compact_model",
 ];
 
@@ -649,6 +656,7 @@ fn config_key_suggestion(key: &str) -> Option<&'static str> {
                 "enabled" => "compaction.enabled",
                 "threshold_fraction" => "compaction.threshold_fraction",
                 "keep_recent_tokens" => "compaction.keep_recent_tokens",
+                "keep_recent_turns" => "compaction.keep_recent_turns",
                 "compact_model" => "compaction.compact_model",
                 _ => unreachable!("compaction suggestion came from the fixed schema"),
             }
@@ -820,6 +828,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
     let compaction_enabled = env_parse("YGG_AUTO_COMPACT")?;
     let threshold_fraction = env_parse("YGG_COMPACTION_THRESHOLD_FRACTION")?;
     let keep_recent_tokens = env_parse("YGG_COMPACTION_KEEP_RECENT_TOKENS")?;
+    let keep_recent_turns = env_parse("YGG_COMPACTION_KEEP_RECENT_TURNS")?;
     let compact_model = env_value("YGG_COMPACT_MODEL");
     Ok(ConfigLayer {
         model: env_value("YGG_MODEL"),
@@ -856,12 +865,14 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
             || compaction_enabled.is_some()
             || threshold_fraction.is_some()
             || keep_recent_tokens.is_some()
+            || keep_recent_turns.is_some()
             || compact_model.is_some())
         .then_some(CompactionLayer {
             mode: compaction_mode,
             enabled: compaction_enabled,
             threshold_fraction,
             keep_recent_tokens,
+            keep_recent_turns,
             compact_model,
         }),
     })
@@ -1059,6 +1070,12 @@ fn build_config_with_global_path(
         }
         if let Some(value) = layer.keep_recent_tokens {
             compaction.keep_recent_tokens = value.max(1);
+        } else if let Some(value) = layer.keep_recent_turns {
+            const LEGACY_TOKENS_PER_TURN: u64 = 1_000;
+            compaction.keep_recent_tokens = u64::try_from(value)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(LEGACY_TOKENS_PER_TURN)
+                .max(1);
         }
         if let Some(value) = layer.compact_model {
             let value = value.trim();
@@ -1438,7 +1455,7 @@ mod tests {
         assert_eq!(loaded.diagnostics[0].column, 1);
         assert_eq!(
             loaded.diagnostics[0].suggestion,
-            Some("compaction.keep_recent_tokens")
+            Some("compaction.keep_recent_turns")
         );
         assert_eq!(loaded.diagnostics[1].key, "modle");
         assert_eq!(loaded.diagnostics[1].line, 2);

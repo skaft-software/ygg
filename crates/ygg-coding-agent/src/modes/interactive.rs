@@ -1497,7 +1497,7 @@ fn configure_auto_compaction(
         CompactionMode::Local => AgentCompactionMode::Local,
         CompactionMode::NativeResponses => AgentCompactionMode::NativeResponses,
     };
-    if let Err(error) = app.agent.set_compaction_mode(
+    if let Err(error) = app.agent.set_compaction_token_mode(
         agent_mode,
         candidate_threshold,
         app.config.compaction.keep_recent_tokens,

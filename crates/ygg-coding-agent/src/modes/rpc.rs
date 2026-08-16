@@ -2198,7 +2198,7 @@ async fn handle_idle_command(
             } else {
                 CompactionMode::Disabled
             };
-            app.agent.set_compaction_mode(
+            app.agent.set_compaction_token_mode(
                 if enabled {
                     AgentCompactionMode::Local
                 } else {
