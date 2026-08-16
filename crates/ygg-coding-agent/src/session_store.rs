@@ -632,6 +632,35 @@ enum SummaryRecord {
 }
 
 /// Derive the oldest user title on the active branch, if one exists.
+fn active_branch_catalog_config(session: &Session) -> (Option<String>, Option<String>) {
+    let mut model = None;
+    let mut reasoning = None;
+    let mut cursor = session.head_ref();
+    while let Some(id) = cursor {
+        let Some(entry) = session.entry(id) else {
+            break;
+        };
+        if let EntryValue::Config {
+            model: configured_model,
+            reasoning: configured_reasoning,
+            ..
+        } = &entry.value
+        {
+            if model.is_none() {
+                model = configured_model.clone();
+            }
+            if reasoning.is_none() {
+                reasoning = configured_reasoning.clone();
+            }
+            if model.is_some() && reasoning.is_some() {
+                break;
+            }
+        }
+        cursor = entry.parent.as_ref();
+    }
+    (model, reasoning)
+}
+
 fn active_branch_catalog_title(session: &Session) -> Option<String> {
     let mut oldest: Option<&str> = None;
     let mut cursor = session.head_ref();
@@ -1286,9 +1315,56 @@ impl SessionStore {
     /// workspace catalog.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub(crate) fn catalog_by_id(&self, id: &str) -> anyhow::Result<SessionCatalogEntry> {
-        Ok(self
-            .inspect_candidate(self.candidate_by_id(id)?, false)?
-            .catalog)
+        let candidate = self.candidate_by_id(id)?;
+        let fingerprint = catalog_fingerprint(&candidate);
+        let (mut catalog, cached) = SessionCatalog::open_loaded(&self.dir)?;
+        if let Some(summary) = fingerprint.and_then(|fingerprint| {
+            cached
+                .get(id)
+                .filter(|cached| cached.fingerprint == fingerprint)
+                .map(|cached| cached.summary.clone())
+        }) {
+            let CachedTranscriptSummary::Summary {
+                title,
+                configured_model,
+                configured_reasoning,
+            } = summary
+            else {
+                anyhow::bail!("session {id:?} is unreadable");
+            };
+            let metadata = title
+                .as_ref()
+                .map(|_| self.load_metadata(id))
+                .transpose()?
+                .unwrap_or_default();
+            return Ok(SessionCatalogEntry {
+                meta: title
+                    .map(|title| self.meta_from_parts(candidate, id.to_owned(), title, metadata)),
+                configured_model,
+                configured_reasoning,
+            });
+        }
+        let inspection = self.inspect_candidate(candidate, false)?;
+        if let Some(fingerprint) = fingerprint {
+            let summary = CachedTranscriptSummary::Summary {
+                title: inspection
+                    .catalog
+                    .meta
+                    .as_ref()
+                    .map(|meta| meta.title.clone()),
+                configured_model: inspection.catalog.configured_model.clone(),
+                configured_reasoning: inspection.catalog.configured_reasoning.clone(),
+            };
+            catalog.apply(
+                &[CatalogUpdate {
+                    id: id.to_owned(),
+                    fingerprint,
+                    summary,
+                }],
+                &HashSet::new(),
+            )?;
+        }
+        Ok(inspection.catalog)
     }
 
     /// Build catalog metadata from the already authorized, fully replayed
@@ -1328,11 +1404,14 @@ impl SessionStore {
         }
         let fingerprint = catalog_fingerprint(&candidate)
             .ok_or_else(|| anyhow::anyhow!("session fingerprint is outside catalog bounds"))?;
+        let (configured_model, configured_reasoning) = active_branch_catalog_config(session);
         let update = CatalogUpdate {
             id: id.to_owned(),
             fingerprint,
             summary: CachedTranscriptSummary::Summary {
                 title: active_branch_catalog_title(session),
+                configured_model,
+                configured_reasoning,
             },
         };
         let (mut catalog, _) = SessionCatalog::open_loaded(&self.dir)?;
@@ -1365,7 +1444,7 @@ impl SessionStore {
         summary: CachedTranscriptSummary,
     ) -> Option<SessionMeta> {
         let fallback_title = match summary {
-            CachedTranscriptSummary::Summary { title } => title?,
+            CachedTranscriptSummary::Summary { title, .. } => title?,
             CachedTranscriptSummary::Unreadable => "(unreadable session)".to_owned(),
         };
         let metadata = self.load_metadata(&id).unwrap_or_default();
@@ -1424,6 +1503,8 @@ impl SessionStore {
                     Ok(transcript) => {
                         let summary = CachedTranscriptSummary::Summary {
                             title: transcript.title,
+                            configured_model: transcript.configured_model,
+                            configured_reasoning: transcript.configured_reasoning,
                         };
                         if let Some(fingerprint) = fingerprint.filter(|_| catalog.is_some()) {
                             updates.push(CatalogUpdate {
@@ -2938,8 +3019,13 @@ mod tests {
         );
         assert_eq!(inspection.usage_records[0].total_tokens, 31);
 
+        // Populate the catalog before the targeted Serve lookup. The lookup must
+        // retain the persisted configuration without reopening the transcript.
+        store.list();
         let catalog = store.catalog_by_id("target").unwrap();
         assert_eq!(catalog.meta.unwrap().title, "target title");
+        assert_eq!(catalog.configured_model.as_deref(), Some("target-config"));
+        assert_eq!(catalog.configured_reasoning.as_deref(), Some("high"));
         assert!(store.catalog_by_id("corrupt").is_err());
         assert!(store.get_by_id("corrupt").is_err());
     }

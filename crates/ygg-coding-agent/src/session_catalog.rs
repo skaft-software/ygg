@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OpenFlags};
 
 const CATALOG_DIRECTORY: &str = ".catalog";
 const CATALOG_FILE: &str = "sessions-v1.sqlite3";
-const CATALOG_SCHEMA_VERSION: i64 = 1;
+const CATALOG_SCHEMA_VERSION: i64 = 2;
 const MAX_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
 const STATUS_SUMMARY: i64 = 0;
 const STATUS_UNREADABLE: i64 = 1;
@@ -25,7 +25,11 @@ pub(crate) struct CatalogFingerprint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CachedTranscriptSummary {
-    Summary { title: Option<String> },
+    Summary {
+        title: Option<String>,
+        configured_model: Option<String>,
+        configured_reasoning: Option<String>,
+    },
     Unreadable,
 }
 
@@ -110,9 +114,11 @@ impl SessionCatalog {
                      file_size INTEGER NOT NULL CHECK (file_size >= 0),
                      modified_ns INTEGER NOT NULL CHECK (modified_ns >= 0),
                      status INTEGER NOT NULL CHECK (status IN (0, 1)),
-                     title TEXT
+                     title TEXT,
+                     configured_model TEXT,
+                     configured_reasoning TEXT
                  ) WITHOUT ROWID;
-                 PRAGMA user_version = 1;",
+                 PRAGMA user_version = 2;",
             )?;
         } else {
             connection.execute_batch(
@@ -121,7 +127,9 @@ impl SessionCatalog {
                      file_size INTEGER NOT NULL CHECK (file_size >= 0),
                      modified_ns INTEGER NOT NULL CHECK (modified_ns >= 0),
                      status INTEGER NOT NULL CHECK (status IN (0, 1)),
-                     title TEXT
+                     title TEXT,
+                     configured_model TEXT,
+                     configured_reasoning TEXT
                  ) WITHOUT ROWID;",
             )?;
         }
@@ -132,7 +140,7 @@ impl SessionCatalog {
     pub(crate) fn load(&self) -> anyhow::Result<HashMap<String, CachedSession>> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, file_size, modified_ns, status, title FROM sessions")?;
+            .prepare("SELECT id, file_size, modified_ns, status, title, configured_model, configured_reasoning FROM sessions")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -140,16 +148,23 @@ impl SessionCatalog {
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut sessions = HashMap::new();
         for row in rows {
-            let (id, file_size, modified_ns, status, title) = row?;
+            let (id, file_size, modified_ns, status, title, configured_model, configured_reasoning) =
+                row?;
             let Ok(file_size) = u64::try_from(file_size) else {
                 continue;
             };
             let summary = match status {
-                STATUS_SUMMARY => CachedTranscriptSummary::Summary { title },
+                STATUS_SUMMARY => CachedTranscriptSummary::Summary {
+                    title,
+                    configured_model,
+                    configured_reasoning,
+                },
                 STATUS_UNREADABLE => CachedTranscriptSummary::Unreadable,
                 _ => continue,
             };
@@ -178,29 +193,41 @@ impl SessionCatalog {
         let transaction = self.connection.transaction()?;
         {
             let mut upsert = transaction.prepare(
-                "INSERT INTO sessions (id, file_size, modified_ns, status, title)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO sessions (id, file_size, modified_ns, status, title, configured_model, configured_reasoning)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                      file_size = excluded.file_size,
                      modified_ns = excluded.modified_ns,
                      status = excluded.status,
-                     title = excluded.title",
+                     title = excluded.title,
+                     configured_model = excluded.configured_model,
+                     configured_reasoning = excluded.configured_reasoning",
             )?;
             for update in updates {
                 let file_size = i64::try_from(update.fingerprint.file_size)
                     .map_err(|_| anyhow::anyhow!("session size does not fit SQLite INTEGER"))?;
-                let (status, title) = match &update.summary {
-                    CachedTranscriptSummary::Summary { title } => {
-                        (STATUS_SUMMARY, title.as_deref())
-                    }
-                    CachedTranscriptSummary::Unreadable => (STATUS_UNREADABLE, None),
+                let (status, title, configured_model, configured_reasoning) = match &update.summary
+                {
+                    CachedTranscriptSummary::Summary {
+                        title,
+                        configured_model,
+                        configured_reasoning,
+                    } => (
+                        STATUS_SUMMARY,
+                        title.as_deref(),
+                        configured_model.as_deref(),
+                        configured_reasoning.as_deref(),
+                    ),
+                    CachedTranscriptSummary::Unreadable => (STATUS_UNREADABLE, None, None, None),
                 };
                 upsert.execute(params![
                     update.id,
                     file_size,
                     update.fingerprint.modified_ns,
                     status,
-                    title
+                    title,
+                    configured_model,
+                    configured_reasoning
                 ])?;
             }
         }
