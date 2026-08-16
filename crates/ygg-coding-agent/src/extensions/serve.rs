@@ -5757,7 +5757,6 @@ async fn start_and_drive_run(
                             plan,
                             projection,
                             events,
-                            goal_driver,
                         )
                         .await;
                     }
@@ -6030,7 +6029,6 @@ async fn handle_active_command(
     plan: &WorkerPlan,
     projection: &mut ProjectionState,
     events: &mpsc::Sender<TimestampedEvent>,
-    goal_driver: Option<&GoalDriver>,
 ) {
     let outcome = match message.command {
         SessionCommand::Steer { input } => match resolve_prompt_input(plan, input).await {
