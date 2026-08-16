@@ -1,8 +1,9 @@
 # caffeinate executable extension
 
 This Python example uses the dependency-free `ygg-extension-sdk` package to
-keep a Mac awake while Ygg is processing a prompt. It starts
-`/usr/bin/caffeinate -i -w <extension-pid>` at the `before_prompt` boundary,
+keep a Mac awake while Ygg is processing a prompt. If Ygg cannot report a
+terminal outcome (for example, an interrupted run), the inhibitor expires after
+30 minutes. It starts `/usr/bin/caffeinate -i -t 1800` at the `before_prompt` boundary,
 releases it after a complete assistant response, and cleans it up when the
 extension shuts down or loses its protocol stream.
 

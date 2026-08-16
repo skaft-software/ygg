@@ -10,6 +10,10 @@ from ygg_extension import Extension
 
 
 CAFFEINATE = Path("/usr/bin/caffeinate")
+# A terminal run outcome normally stops this process through after_response.
+# Bound the fallback too: an interrupted Ygg run otherwise leaves the extension
+# alive with no lifecycle callback to release the inhibitor.
+MAX_INHIBIT_SECONDS = 30 * 60
 ext = Extension()
 inhibitor = None
 last_error = None
@@ -44,7 +48,7 @@ def start_inhibitor():
 
     try:
         process = subprocess.Popen(
-            [str(CAFFEINATE), "-i", "-w", str(os.getpid())],
+            [str(CAFFEINATE), "-i", "-t", str(MAX_INHIBIT_SECONDS)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

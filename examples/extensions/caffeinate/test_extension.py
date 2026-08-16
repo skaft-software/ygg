@@ -101,7 +101,7 @@ class CaffeinateTests(unittest.TestCase):
             self.assertTrue(module.start_inhibitor())
             self.assertTrue(module.start_inhibitor())
             popen.assert_called_once_with(
-                ["/usr/bin/caffeinate", "-i", "-w", str(module.os.getpid())],
+                ["/usr/bin/caffeinate", "-i", "-t", str(module.MAX_INHIBIT_SECONDS)],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
