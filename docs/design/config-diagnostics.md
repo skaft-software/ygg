@@ -41,7 +41,7 @@ sorted, and deduplicated per source. A diagnostic contains:
 Example:
 
 ```text
-warning: project config /repo/.ygg/config.toml:8:1: unknown configuration key "compaction.keep_recent_turn"; did you mean "compaction.keep_recent_turns"?
+warning: project config /repo/.ygg/config.toml:8:1: unknown configuration key "compaction.keep_recent_turn"; did you mean "compaction.keep_recent_tokens"?
 ```
 
 Known compatibility aliases are part of the schema and do not warn. These

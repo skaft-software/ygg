@@ -3,8 +3,9 @@
 use std::io::{self, Write};
 
 use ygg_agent::{
-    build_handoff_message, finish_handoff, prepare_handoff, EntryId, EntryValue,
-    HandoffPreparation, InputPart, Session, SUMMARIZATION_SYSTEM_PROMPT,
+    build_handoff_message, build_turn_prefix_handoff_message, finish_handoff, prepare_handoff,
+    EntryId, HandoffPreparation, InputPart, Session, SUMMARIZATION_SYSTEM_PROMPT,
+    SUMMARY_OUTPUT_TOKENS, TURN_PREFIX_OUTPUT_TOKENS,
 };
 use ygg_ai::{
     AssistantPart, Media, Message, OutputFormat, OutputModalities, ReasoningConfig, Request,
@@ -153,81 +154,13 @@ pub fn context_window(model: &ygg_ai::Model) -> u64 {
     model.spec.limits.context_window
 }
 
-fn active_branch_ids(session: &Session) -> Vec<EntryId> {
-    let mut reverse = Vec::new();
-    let mut cursor = session.head();
-    while let Some(id) = cursor {
-        let Some(entry) = session.entry(&id) else {
-            break;
-        };
-        reverse.push(id);
-        cursor = entry.parent.clone();
-    }
-    reverse.reverse();
-    reverse
-}
-
-/// Full-fidelity entries retained by the compaction nearest the active head.
-/// Older ancestry remains durable for branching but must not be selected as a
-/// fresh compaction boundary.
-fn model_visible_branch_ids(session: &Session) -> Vec<EntryId> {
-    let ids = active_branch_ids(session);
-    let first_kept = ids.iter().rev().find_map(|id| {
-        let entry = session.entry(id)?;
-        match &entry.value {
-            EntryValue::Compaction { first_kept, .. } => Some(first_kept),
-            _ => None,
-        }
-    });
-    let start = first_kept
-        .and_then(|first_kept| ids.iter().position(|id| id == first_kept))
-        .unwrap_or_default();
-    ids.into_iter().skip(start).collect()
-}
-
-fn is_assistant(entry: &ygg_agent::Entry) -> bool {
-    matches!(&entry.value, EntryValue::Message(Message::Assistant(_)))
-}
-
-fn previous_message_is_user(session: &Session, entry: &ygg_agent::Entry) -> bool {
-    let mut cursor = entry.parent.as_ref();
-    while let Some(id) = cursor {
-        let Some(previous) = session.entry(id) else {
-            return false;
-        };
-        match &previous.value {
-            EntryValue::Message(Message::User(user)) => return !user.content.is_empty(),
-            EntryValue::Message(Message::Assistant(_)) => return false,
-            EntryValue::Compaction { .. }
-            | EntryValue::ResponsesTurn { .. }
-            | EntryValue::ResponsesCompaction { .. }
-            | EntryValue::Config { .. }
-            | EntryValue::PromptTemplateSelected { .. }
-            | EntryValue::SkillActivated { .. }
-            | EntryValue::SkillResourceRead { .. }
-            | EntryValue::SkillDeactivated { .. } => cursor = previous.parent.as_ref(),
-        }
-    }
-    false
-}
-
-/// Select the assistant entry beginning the oldest of the requested recent
-/// turns. Starting at an assistant preserves summary/user/assistant context
-/// alternation and keeps any following tool results with their tool call.
-pub fn choose_first_kept(session: &Session, keep_recent_turns: usize) -> Option<EntryId> {
-    let starts = model_visible_branch_ids(session)
-        .into_iter()
-        .filter(|id| {
-            session.entry(id).is_some_and(|entry| {
-                is_assistant(entry) && previous_message_is_user(session, entry)
-            })
-        })
-        .collect::<Vec<_>>();
-    let keep_recent_turns = keep_recent_turns.max(1);
-    if starts.len() <= keep_recent_turns {
-        return None;
-    }
-    Some(starts[starts.len() - keep_recent_turns].clone())
+/// Select the first retained entry using the shared Pi-compatible token walk.
+pub fn choose_first_kept(session: &Session, keep_recent_tokens: u64) -> Option<EntryId> {
+    ygg_agent::choose_first_kept_by_tokens(session, keep_recent_tokens, |message| {
+        estimate_messages_tokens(std::slice::from_ref(message))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Call a tool-free compaction subagent, persist its billable telemetry, and
@@ -292,8 +225,7 @@ async fn compaction_call(
     Ok(text)
 }
 
-/// Produce one Pi-compatible structured handoff without replaying the original
-/// history through additional question/answer calls.
+/// Produce the main structured checkpoint summary.
 pub async fn summarize(
     client: &ygg_ai::AiClient,
     model: &ygg_ai::Model,
@@ -308,9 +240,42 @@ pub async fn summarize(
         cache_retention,
         SUMMARIZATION_SYSTEM_PROMPT,
         vec![build_handoff_message(preparation)],
-        4096,
+        SUMMARY_OUTPUT_TOKENS,
     )
     .await
+}
+
+/// Produce the dedicated summary for the prefix of a split turn.
+async fn summarize_turn_prefix(
+    client: &ygg_ai::AiClient,
+    model: &ygg_ai::Model,
+    session: &mut Session,
+    cache_retention: ygg_ai::CacheRetention,
+    messages: &[Message],
+) -> anyhow::Result<String> {
+    compaction_call(
+        client,
+        model,
+        session,
+        cache_retention,
+        SUMMARIZATION_SYSTEM_PROMPT,
+        vec![build_turn_prefix_handoff_message(messages)],
+        TURN_PREFIX_OUTPUT_TOKENS,
+    )
+    .await
+}
+
+fn summary_request_size(model: &ygg_ai::Model, message: &Message, output_limit: u64) -> (u64, u64) {
+    let output_tokens = model.spec.limits.max_output_tokens.clamp(1, output_limit);
+    let estimated_input = estimate_text_tokens(SUMMARIZATION_SYSTEM_PROMPT)
+        .saturating_add(estimate_messages_tokens(std::slice::from_ref(message)))
+        .saturating_add(FRAMING_OVERHEAD_TOKENS);
+    let input_budget = model
+        .spec
+        .limits
+        .context_window
+        .saturating_sub(output_tokens);
+    (estimated_input, input_budget)
 }
 
 /// Attempt one nonfatal semantic-boundary compaction.
@@ -324,17 +289,23 @@ pub async fn attempt_compaction(app: &mut App) -> anyhow::Result<CompactionOutco
         });
     }
 
-    let first_kept =
-        match choose_first_kept(app.agent.session(), app.config.compaction.keep_recent_turns) {
-            Some(entry) => entry,
-            None => {
-                return Ok(CompactionOutcome::Skipped {
-                    reason: "no safe turn boundary to compact".into(),
-                })
-            }
-        };
+    let first_kept = match choose_first_kept(
+        app.agent.session(),
+        app.config.compaction.keep_recent_tokens,
+    ) {
+        Some(entry) => entry,
+        None => {
+            return Ok(CompactionOutcome::Skipped {
+                reason: "no safe turn boundary to compact".into(),
+            })
+        }
+    };
     let preparation = match prepare_handoff(app.agent.session(), &first_kept) {
-        Ok(preparation) if !preparation.messages.is_empty() => preparation,
+        Ok(preparation)
+            if !preparation.messages.is_empty() || !preparation.turn_prefix_messages.is_empty() =>
+        {
+            preparation
+        }
         Ok(_) => {
             return Ok(CompactionOutcome::Skipped {
                 reason: "no prior messages to summarize".into(),
@@ -357,54 +328,105 @@ pub async fn attempt_compaction(app: &mut App) -> anyhow::Result<CompactionOutco
         .cloned()
         .unwrap_or_else(|| app.model.clone());
     let cache_retention = app.config.cache_retention;
-    let summary_messages = vec![build_handoff_message(&preparation)];
-    let estimated_input = estimate_text_tokens(SUMMARIZATION_SYSTEM_PROMPT)
-        .saturating_add(estimate_messages_tokens(&summary_messages))
-        .saturating_add(FRAMING_OVERHEAD_TOKENS);
-    let summary_output_tokens = model.spec.limits.max_output_tokens.clamp(1, 4096);
-    let input_budget = model
-        .spec
-        .limits
-        .context_window
-        .saturating_sub(summary_output_tokens);
-    if estimated_input > input_budget {
-        return Ok(CompactionOutcome::Skipped {
-            reason: format!(
-                "compaction input exceeds summary model capacity ({estimated_input} > {input_budget} tokens)"
-            ),
-        });
-    }
-    if let Err(error) =
-        app.agent
-            .ensure_request_cost_capacity(&model, estimated_input, summary_output_tokens)
-    {
-        return Ok(CompactionOutcome::Skipped {
-            reason: error.to_string(),
-        });
-    }
-    let summary = match summarize(
-        &client,
-        &model,
-        app.agent.session_mut(),
-        cache_retention,
-        &preparation,
-    )
-    .await
-    {
-        Ok(summary) => finish_handoff(summary, &preparation.details),
-        Err(error) => {
+
+    let mut summary = if preparation.messages.is_empty() {
+        preparation
+            .previous_summary
+            .clone()
+            .unwrap_or_else(|| "No prior history.".to_owned())
+    } else {
+        let summary_message = build_handoff_message(&preparation);
+        let (estimated_input, input_budget) =
+            summary_request_size(&model, &summary_message, SUMMARY_OUTPUT_TOKENS);
+        if estimated_input > input_budget {
+            return Ok(CompactionOutcome::Skipped {
+                reason: format!(
+                    "compaction input exceeds summary model capacity ({estimated_input} > {input_budget} tokens)"
+                ),
+            });
+        }
+        let output_tokens = model
+            .spec
+            .limits
+            .max_output_tokens
+            .clamp(1, SUMMARY_OUTPUT_TOKENS);
+        if let Err(error) =
+            app.agent
+                .ensure_request_cost_capacity(&model, estimated_input, output_tokens)
+        {
             return Ok(CompactionOutcome::Skipped {
                 reason: error.to_string(),
-            })
+            });
+        }
+        match summarize(
+            &client,
+            &model,
+            app.agent.session_mut(),
+            cache_retention,
+            &preparation,
+        )
+        .await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                return Ok(CompactionOutcome::Skipped {
+                    reason: error.to_string(),
+                })
+            }
         }
     };
+
+    if !preparation.turn_prefix_messages.is_empty() {
+        let prefix_message = build_turn_prefix_handoff_message(&preparation.turn_prefix_messages);
+        let (estimated_input, input_budget) =
+            summary_request_size(&model, &prefix_message, TURN_PREFIX_OUTPUT_TOKENS);
+        if estimated_input > input_budget {
+            return Ok(CompactionOutcome::Skipped {
+                reason: format!(
+                    "split-turn prefix exceeds summary model capacity ({estimated_input} > {input_budget} tokens)"
+                ),
+            });
+        }
+        let output_tokens = model
+            .spec
+            .limits
+            .max_output_tokens
+            .clamp(1, TURN_PREFIX_OUTPUT_TOKENS);
+        if let Err(error) =
+            app.agent
+                .ensure_request_cost_capacity(&model, estimated_input, output_tokens)
+        {
+            return Ok(CompactionOutcome::Skipped {
+                reason: error.to_string(),
+            });
+        }
+        let prefix_summary = match summarize_turn_prefix(
+            &client,
+            &model,
+            app.agent.session_mut(),
+            cache_retention,
+            &preparation.turn_prefix_messages,
+        )
+        .await
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                return Ok(CompactionOutcome::Skipped {
+                    reason: error.to_string(),
+                })
+            }
+        };
+        summary.push_str("\n\n---\n\n**Turn Context (split turn):**\n\n");
+        summary.push_str(&prefix_summary);
+    }
+    let summary = finish_handoff(summary, &preparation.details);
     match app
         .agent
         .session_mut()
         .compact_with_details(summary, first_kept, preparation.details)
     {
         Ok(_) => Ok(CompactionOutcome::Compacted {
-            elided: preparation.messages.len(),
+            elided: preparation.messages.len() + preparation.turn_prefix_messages.len(),
         }),
         Err(error) => Ok(CompactionOutcome::Skipped {
             reason: error.to_string(),
@@ -415,6 +437,7 @@ pub async fn attempt_compaction(app: &mut App) -> anyhow::Result<CompactionOutco
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use ygg_agent::EntryValue;
     use ygg_ai::{
         AssistantMessage, Media, ModelId, Protocol, ToolCall, ToolCallId, ToolResult,
         ToolResultPart, UserMessage,
@@ -483,9 +506,13 @@ pub(crate) mod tests {
         let first_kept = choose_first_kept(&session, 2).unwrap();
         session.compact("first summary", first_kept).unwrap();
 
-        // Exactly the requested two full-fidelity turns remain. The durable
-        // pre-summary ancestry must not make another compaction appear safe.
-        assert_eq!(choose_first_kept(&session, 2), None);
+        // The visible tail starts at the previous compaction boundary. A
+        // budget smaller than that tail selects the boundary itself, but must
+        // not make history behind it eligible again.
+        let boundary = choose_first_kept(&session, 2).unwrap();
+        let preparation = prepare_handoff(&session, &boundary).unwrap();
+        assert!(preparation.messages.is_empty());
+        assert!(preparation.turn_prefix_messages.is_empty());
 
         session.append(user("new user 1")).unwrap();
         session.append(assistant("new assistant 1")).unwrap();
@@ -497,18 +524,25 @@ pub(crate) mod tests {
             preparation.previous_summary.as_deref(),
             Some("first summary")
         );
-        assert!(preparation.messages.iter().any(|message| {
+        assert!(!preparation.messages.iter().any(|message| {
             matches!(message, Message::User(user) if user.content.iter().any(|part| matches!(part, UserPart::Text(text) if text == "user 4")))
         }));
-        assert!(!preparation.messages.iter().any(|message| {
-            matches!(message, Message::User(user) if user.content.iter().any(|part| matches!(part, UserPart::Text(text) if text == "user 2")))
+        assert!(preparation.turn_prefix_messages.iter().any(|message| {
+            matches!(message, Message::User(user) if user.content.iter().any(|part| matches!(part, UserPart::Text(text) if text == "new user 2")))
         }));
     }
 
     #[test]
-    fn single_turn_has_no_safe_compaction_boundary() {
+    fn single_turn_can_split_at_an_assistant_boundary() {
         let (_directory, session) = turns(1);
-        assert_eq!(choose_first_kept(&session, 4), None);
+        let first_kept = choose_first_kept(&session, 4).unwrap();
+        let preparation = prepare_handoff(&session, &first_kept).unwrap();
+        assert!(preparation.messages.is_empty());
+        assert_eq!(preparation.turn_prefix_messages.len(), 1);
+        assert!(matches!(
+            preparation.turn_prefix_messages.first(),
+            Some(Message::User(_))
+        ));
     }
 
     #[test]
@@ -526,7 +560,7 @@ pub(crate) mod tests {
         }
         let selected = choose_first_kept(&session, 2).unwrap();
         assert_ne!(selected, abandoned);
-        assert!(active_branch_ids(&session).contains(&selected));
+        assert!(session.entry(&selected).is_some());
     }
 
     #[test]
@@ -657,11 +691,16 @@ pub(crate) mod tests {
                 .append(assistant(&format!("I see it {index}")))
                 .unwrap();
         }
-        let first_kept = choose_first_kept(&session, 2).unwrap();
+        let first_kept = choose_first_kept(&session, 3_300).unwrap();
         session.compact("summary", first_kept).unwrap();
         let context = session.context().unwrap();
         assert!(matches!(context.first(), Some(Message::User(_))));
-        assert_eq!(context.len(), 4);
+        assert_eq!(context.len(), 7);
+    }
+
+    #[test]
+    fn default_retention_matches_pi_token_budget() {
+        assert_eq!(CompactionPolicy::default().keep_recent_tokens, 20_000);
     }
 
     #[test]

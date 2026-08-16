@@ -842,7 +842,7 @@ export class LiveHostHarness {
     );
     await writeFile(
       join(this.homeDir, ".ygg", "config.toml"),
-      "[compaction]\nmode = \"local\"\nthreshold_fraction = 0.85\nkeep_recent_turns = 1\n",
+      "[compaction]\nmode = \"local\"\nthreshold_fraction = 0.85\nkeep_recent_tokens = 1\n",
       { mode: 0o600 },
     );
   }

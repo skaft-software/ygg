@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ygg_agent::SandboxConfig;
+use ygg_agent::{SandboxConfig, DEFAULT_KEEP_RECENT_TOKENS};
 
 pub use crate::tui::terminal::ColorMode;
 use ygg_ai::{
@@ -362,7 +362,7 @@ impl CompactionMode {
 pub struct CompactionPolicy {
     pub mode: CompactionMode,
     pub threshold_fraction: f64,
-    pub keep_recent_turns: usize,
+    pub keep_recent_tokens: u64,
     /// Optional model override for summary calls. When absent, bootstrap uses
     /// the active model; when present, bootstrap resolves this ID in the model
     /// catalog before constructing the agent.
@@ -374,7 +374,7 @@ impl Default for CompactionPolicy {
         Self {
             mode: CompactionMode::Local,
             threshold_fraction: 0.85,
-            keep_recent_turns: 4,
+            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             compact_model: None,
         }
     }

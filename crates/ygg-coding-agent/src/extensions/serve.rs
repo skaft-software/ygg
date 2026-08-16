@@ -4332,10 +4332,10 @@ async fn invoke_idle_slash_command(
         ),
         commands::Command::Compact => {
             let mut app = app;
-            let original_keep_recent_turns = app.config.compaction.keep_recent_turns;
-            app.config.compaction.keep_recent_turns = 1;
+            let original_keep_recent_tokens = app.config.compaction.keep_recent_tokens;
+            app.config.compaction.keep_recent_tokens = 1;
             let result = attempt_compaction(&mut app).await;
-            app.config.compaction.keep_recent_turns = original_keep_recent_turns;
+            app.config.compaction.keep_recent_tokens = original_keep_recent_tokens;
             let outcome = match result {
                 Ok(_) => {
                     let _ = sync_session_usage(&plan.usage, &plan.session_id, app.agent.session());

@@ -2198,14 +2198,14 @@ async fn handle_idle_command(
             } else {
                 CompactionMode::Disabled
             };
-            app.agent.set_compaction_mode(
+            app.agent.set_compaction_token_mode(
                 if enabled {
                     AgentCompactionMode::Local
                 } else {
                     AgentCompactionMode::Disabled
                 },
                 app.config.compaction.threshold_fraction,
-                app.config.compaction.keep_recent_turns,
+                app.config.compaction.keep_recent_tokens,
             )?;
             output.success(id.as_deref(), &kind, None)?;
         }

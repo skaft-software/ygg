@@ -3852,10 +3852,10 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     agent.set_prompt_model_source(Some(crate::tui::theme::model_lab(&model).key().to_owned()));
     agent.set_prompt_color(Some(crate::tui::theme::prompt_color_for_model(&model)));
     agent.set_compaction_model(compact_model);
-    agent.set_compaction_mode(
+    agent.set_compaction_token_mode(
         agent_compaction_mode(config.compaction.mode),
         config.compaction.threshold_fraction,
-        config.compaction.keep_recent_turns,
+        config.compaction.keep_recent_tokens,
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
 
@@ -4022,10 +4022,10 @@ pub fn rebuild_app(
     agent.set_prompt_model_source(Some(crate::tui::theme::model_lab(&model).key().to_owned()));
     agent.set_prompt_color(Some(crate::tui::theme::prompt_color_for_model(&model)));
     agent.set_compaction_model(compact_model);
-    agent.set_compaction_mode(
+    agent.set_compaction_token_mode(
         agent_compaction_mode(config.compaction.mode),
         config.compaction.threshold_fraction,
-        config.compaction.keep_recent_turns,
+        config.compaction.keep_recent_tokens,
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
 

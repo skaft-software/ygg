@@ -16,6 +16,13 @@ pub const SUMMARIZATION_SYSTEM_PROMPT: &str = r#"You are a context summarization
 
 Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary."#;
 
+/// Default amount of recent model-visible conversation retained verbatim.
+pub const DEFAULT_KEEP_RECENT_TOKENS: u64 = 20_000;
+/// Maximum output budget for the main structured checkpoint summary.
+pub const SUMMARY_OUTPUT_TOKENS: u64 = 13_107; // floor(0.8 * Pi's 16,384-token reserve)
+/// Maximum output budget for a split-turn prefix summary.
+pub const TURN_PREFIX_OUTPUT_TOKENS: u64 = 8_192; // floor(0.5 * Pi's 16,384-token reserve)
+
 const SUMMARIZATION_PROMPT: &str = r#"The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
 Use this EXACT format:
@@ -94,6 +101,21 @@ Summary of that exploration:
 
 "#;
 
+const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = r#"This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+
+Summarize the prefix to provide context for the retained suffix:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the kept recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix."#;
+
 const BRANCH_SUMMARY_PROMPT: &str = r#"Create a structured summary of this conversation branch for context when returning later.
 
 Use this EXACT format:
@@ -138,8 +160,10 @@ pub struct CompactionDetails {
 /// Owned input for one structured handoff request.
 #[derive(Clone, Debug)]
 pub struct HandoffPreparation {
-    /// New messages being folded into the checkpoint.
+    /// Older messages being folded into the checkpoint.
     pub messages: Vec<Message>,
+    /// Prefix of a turn whose recent suffix begins at the kept boundary.
+    pub turn_prefix_messages: Vec<Message>,
     /// Previous structured checkpoint, when this updates an earlier compaction.
     pub previous_summary: Option<String>,
     /// Cumulative deterministic file lists for the resulting checkpoint.
@@ -270,16 +294,47 @@ pub fn prepare_handoff(
         None => (None, 0, FileOperations::default()),
     };
 
+    // An assistant cut point splits the turn that started at the nearest
+    // preceding user message. This applies both to a first assistant reply
+    // and to a later assistant suffix after tool results; Pi does not limit
+    // split detection to tool-result boundaries.
+    let split_turn_start = if first_kept_index > boundary_start
+        && matches!(
+            &branch[first_kept_index].value,
+            EntryValue::Message(Message::Assistant(_))
+        ) {
+        (boundary_start..first_kept_index)
+            .rev()
+            .find(|index| match &branch[*index].value {
+                EntryValue::Message(message) => is_turn_start_user(message),
+                _ => false,
+            })
+    } else {
+        None
+    };
+
+    let history_end = split_turn_start.unwrap_or(first_kept_index);
     let mut messages = Vec::new();
-    for entry in &branch[boundary_start..first_kept_index] {
+    for entry in &branch[boundary_start..history_end] {
         if let EntryValue::Message(message) = &entry.value {
             extract_file_operations(message, &mut operations);
             messages.push(message.clone());
         }
     }
 
+    let mut turn_prefix_messages = Vec::new();
+    if let Some(turn_start) = split_turn_start {
+        for entry in &branch[turn_start..first_kept_index] {
+            if let EntryValue::Message(message) = &entry.value {
+                extract_file_operations(message, &mut operations);
+                turn_prefix_messages.push(message.clone());
+            }
+        }
+    }
+
     Ok(HandoffPreparation {
         messages,
+        turn_prefix_messages,
         previous_summary,
         details: operations.finish(),
     })
@@ -402,6 +457,79 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
     sections.join("\n\n")
 }
 
+fn is_turn_start_user(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::User(user)
+            if !user.content.is_empty()
+                && user
+                    .content
+                    .iter()
+                    .any(|part| !matches!(part, UserPart::ToolResult(_)))
+    )
+}
+
+fn model_visible_branch_entries(session: &Session) -> Result<Vec<&Entry>, SessionError> {
+    let branch = active_branch_entries(session)?;
+    let first_kept = branch.iter().rev().find_map(|entry| match &entry.value {
+        EntryValue::Compaction { first_kept, .. } => Some(first_kept),
+        _ => None,
+    });
+    let start = first_kept
+        .and_then(|first_kept| branch.iter().position(|entry| &entry.id == first_kept))
+        .unwrap_or_default();
+    Ok(branch.into_iter().skip(start).collect())
+}
+
+/// Select the first retained entry using Pi's token-budgeted backward walk.
+///
+/// Candidates are user turn starts and assistant messages, while tool-result
+/// messages are never selected so the retained context stays protocol-valid.
+/// The fallback keeps from the oldest visible candidate when the requested
+/// token budget exceeds the visible history.
+pub fn choose_first_kept_by_tokens<F>(
+    session: &Session,
+    keep_recent_tokens: u64,
+    estimate_message_tokens: F,
+) -> Result<Option<EntryId>, SessionError>
+where
+    F: Fn(&Message) -> u64,
+{
+    let entries = model_visible_branch_entries(session)?;
+    let mut candidates = Vec::new();
+    // Pi treats user messages and assistant messages as valid cut points, but
+    // never cuts at a tool result because it must remain paired with its call.
+    for (index, entry) in entries.iter().enumerate() {
+        let is_cut_point = match &entry.value {
+            EntryValue::Message(message) => {
+                matches!(message, Message::Assistant(_)) || is_turn_start_user(message)
+            }
+            _ => false,
+        };
+        if is_cut_point {
+            candidates.push((index, entry.id.clone()));
+        }
+    }
+    let budget = keep_recent_tokens.max(1);
+    let mut accumulated = 0u64;
+    for index in (0..entries.len()).rev() {
+        if let EntryValue::Message(message) = &entries[index].value {
+            accumulated = accumulated.saturating_add(estimate_message_tokens(message));
+        }
+        if accumulated >= budget {
+            if let Some((_, id)) = candidates.iter().find(|(candidate, _)| *candidate >= index) {
+                return Ok(Some(id.clone()));
+            }
+            break;
+        }
+    }
+
+    // Match Pi's fallback when the visible history is smaller than the
+    // requested tail: keep from its oldest valid cut point. The caller still
+    // skips the attempt when that leaves no history to summarize.
+    Ok(candidates.first().map(|(_, id)| id.clone()))
+}
+
 /// Build the single user message sent to the tool-free summary model.
 pub fn build_handoff_message(preparation: &HandoffPreparation) -> Message {
     let conversation = serialize_conversation(&preparation.messages);
@@ -416,6 +544,16 @@ pub fn build_handoff_message(preparation: &HandoffPreparation) -> Message {
     }
     Message::User(UserMessage {
         content: vec![UserPart::Text(prompt)],
+    })
+}
+
+/// Build the dedicated Pi-style summary request for a split turn prefix.
+pub fn build_turn_prefix_handoff_message(messages: &[Message]) -> Message {
+    let conversation = serialize_conversation(messages);
+    Message::User(UserMessage {
+        content: vec![UserPart::Text(format!(
+            "<conversation>\n{conversation}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"
+        ))],
     })
 }
 
@@ -515,11 +653,56 @@ mod tests {
     }
 
     #[test]
+    fn token_budget_selects_a_user_boundary_without_counting_turns() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        let mut user_ids = Vec::new();
+        for index in 0..3 {
+            user_ids.push(
+                session
+                    .append(EntryValue::Message(Message::User(UserMessage {
+                        content: vec![UserPart::Text(format!("request {index}"))],
+                    })))
+                    .unwrap(),
+            );
+            session
+                .append(EntryValue::Message(assistant(vec![AssistantPart::Text(
+                    format!("answer {index}"),
+                )])))
+                .unwrap();
+        }
+
+        let selected = choose_first_kept_by_tokens(&session, 20, |_| 10)
+            .unwrap()
+            .expect("three turns provide a retained boundary");
+        assert_eq!(selected, user_ids[2]);
+    }
+
+    #[test]
+    fn turn_prefix_handoff_uses_the_dedicated_split_turn_contract() {
+        let Message::User(user) =
+            build_turn_prefix_handoff_message(&[Message::User(UserMessage {
+                content: vec![UserPart::Text("original request".into())],
+            })])
+        else {
+            panic!("handoff is a user message");
+        };
+        let UserPart::Text(prompt) = &user.content[0] else {
+            panic!("handoff is text");
+        };
+        assert!(prompt.contains("## Original Request"));
+        assert!(prompt.contains("## Early Progress"));
+        assert!(prompt.contains("## Context for Suffix"));
+        assert!(prompt.contains("original request"));
+    }
+
+    #[test]
     fn handoff_prompt_uses_the_exact_structured_checkpoint_contract() {
         let message = build_handoff_message(&HandoffPreparation {
             messages: vec![Message::User(UserMessage {
                 content: vec![UserPart::Text("fix it".into())],
             })],
+            turn_prefix_messages: Vec::new(),
             previous_summary: None,
             details: CompactionDetails::default(),
         });
@@ -549,6 +732,7 @@ mod tests {
     fn repeated_handoff_uses_previous_summary_update_contract() {
         let message = build_handoff_message(&HandoffPreparation {
             messages: Vec::new(),
+            turn_prefix_messages: Vec::new(),
             previous_summary: Some("## Goal\nkeep this".into()),
             details: CompactionDetails::default(),
         });
