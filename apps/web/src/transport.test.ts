@@ -51,10 +51,10 @@ class FakeWebSocket {
   }
 }
 
-const jsonResponse = (value: unknown) =>
+const jsonResponse = (value: unknown, headers: HeadersInit = {}) =>
   new Response(JSON.stringify(value), {
     status: 200,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
   });
 
 function deferred<T>() {
@@ -101,6 +101,7 @@ describe("HTTP Ygg transport", () => {
 
   it("supports persistent goal reads and lifecycle mutations", async () => {
     const goal = {
+      revision: 1,
       objective: "ship the release",
       status: "active",
       turnBudget: 4,
@@ -109,15 +110,26 @@ describe("HTTP Ygg transport", () => {
     };
     const fetchMock = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(jsonResponse(goal))
-      .mockResolvedValueOnce(jsonResponse({ ...goal, status: "paused" }));
+      .mockResolvedValueOnce(jsonResponse(goal, { "x-ygg-goal-revision": "1" }))
+      .mockResolvedValueOnce(
+        jsonResponse(
+          { ...goal, status: "paused", revision: 2 },
+          { "x-ygg-goal-revision": "2" },
+        ),
+      );
     vi.stubGlobal("fetch", fetchMock);
     const transport = new HttpTransport("device-browser");
 
-    await expect(transport.getGoal("session/one")).resolves.toEqual(goal);
+    await expect(transport.getGoal("session/one")).resolves.toEqual({
+      goal,
+      revision: 1,
+    });
     await expect(
       transport.updateGoal("session/one", { action: "pause" }),
-    ).resolves.toMatchObject({ status: "paused" });
+    ).resolves.toMatchObject({
+      goal: { status: "paused", revision: 2 },
+      revision: 2,
+    });
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       "/api/v1/sessions/session%2Fone/goal",
     );
@@ -127,6 +139,20 @@ describe("HTTP Ygg transport", () => {
     });
     expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
       action: "pause",
+    });
+  });
+
+  it("retains tombstone revisions for cleared goals", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse(null, { "x-ygg-goal-revision": "7" }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(new HttpTransport().getGoal("session/one")).resolves.toEqual({
+      goal: null,
+      revision: 7,
     });
   });
 

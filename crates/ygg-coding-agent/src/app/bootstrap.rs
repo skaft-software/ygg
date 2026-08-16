@@ -12,8 +12,8 @@ use futures_util::StreamExt;
 use sha2::{Digest as _, Sha256};
 use ygg_agent::secure_fs::{create_regular_file_for_append, open_regular_file_for_append};
 use ygg_agent::{
-    Agent, AgentCompactionMode, AgentConfig, CoreTools, EntryValue, ExtensionHost, Session,
-    SkillRegistry,
+    Agent, AgentCompactionMode, AgentConfig, CoreTools, DurableGoalStore, EntryValue,
+    ExtensionHost, GoalDriver, Session, SkillRegistry,
 };
 use ygg_ai::{
     AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model, ModelCatalog, ModelId,
@@ -3745,6 +3745,31 @@ fn configured_extensions(
     (extensions, executable_extensions)
 }
 
+fn terminal_goal_store(config: &Config) -> anyhow::Result<Arc<DurableGoalStore>> {
+    // Serve and the terminal intentionally use the same private directory and
+    // file schema. The terminal does not depend on Serve being enabled; this
+    // is only a shared on-disk location for first-party frontends.
+    let session_dir = if config.session_dir.is_absolute() {
+        config.session_dir.clone()
+    } else {
+        std::env::current_dir()?.join(&config.session_dir)
+    };
+    let root = session_dir.join(".serve").join("goals");
+    DurableGoalStore::open(&root)
+        .map(Arc::new)
+        .map_err(|error| anyhow::anyhow!("unable to open durable goal store: {error}"))
+}
+
+fn terminal_goal_session_id(session: &Session) -> anyhow::Result<String> {
+    session
+        .path()
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("current session has no valid goal identity"))
+}
+
 pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> anyhow::Result<App> {
     let Bootstrap {
         mut config,
@@ -3753,6 +3778,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         client,
         prepared_session,
     } = boot;
+    let mut system = system;
     let model = catalog.resolve(&launch.model)?;
     let compact_model = config
         .compaction
@@ -3796,7 +3822,6 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         config.skill_paths.clone(),
         config.workspace_trusted,
     )?);
-    let mut system = system;
     system.push_str(&format_skills_for_prompt(&skills.descriptors()));
     let prompts = Arc::new(PromptRegistry::discover(
         &config.workspace,
@@ -3808,6 +3833,9 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     validate_explicit_tool_policy(&config, &extensions, &model)?;
     let system_tokens = estimate_text_tokens(&system);
     let tool_schema_tokens = tool_schema_reserve(&extensions.tool_definitions());
+    let goal_store = terminal_goal_store(&config)?;
+    let goal_session_id = terminal_goal_session_id(&session)?;
+    let goal_driver = GoalDriver::new(goal_store.clone(), goal_session_id.clone());
     let mut agent = Agent::new(AgentConfig {
         client: client.clone(),
         model: model.clone(),
@@ -3846,6 +3874,9 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         skills,
         prompts,
         executable_extensions,
+        goal_store,
+        goal_driver,
+        goal_session_id,
     })
 }
 
@@ -3865,8 +3896,9 @@ pub fn rebuild_app(
     let model = app.model.clone();
     let reasoning = app.reasoning.clone();
     let reasoning_mode = app.reasoning_mode;
-    let mut system = app.system.clone();
+    let system = app.system.clone();
     let old_skills = Arc::clone(&app.skills);
+    let goal_store = Arc::clone(&app.goal_store);
     let compact_model = config
         .compaction
         .compact_model
@@ -3876,6 +3908,7 @@ pub fn rebuild_app(
         .with_context(|| "configured compaction model could not be resolved")?;
     let current_path = app.agent.session().path().to_owned();
     let old_skill_metadata = format_skills_for_prompt(&old_skills.descriptors());
+    let mut system = system;
     if !old_skill_metadata.is_empty() && system.ends_with(&old_skill_metadata) {
         system.truncate(system.len() - old_skill_metadata.len());
     }
@@ -3950,6 +3983,8 @@ pub fn rebuild_app(
         }
     };
     append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
+    let goal_session_id = terminal_goal_session_id(&session)?;
+    let goal_driver = GoalDriver::new(goal_store.clone(), goal_session_id.clone());
 
     config.model = Some(model.spec.id.clone());
     config.reasoning = reasoning.clone();
@@ -4009,6 +4044,9 @@ pub fn rebuild_app(
         skills,
         prompts,
         executable_extensions,
+        goal_store,
+        goal_driver,
+        goal_session_id,
     })
 }
 

@@ -5,7 +5,7 @@ pub mod bootstrap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ygg_agent::Agent;
+use ygg_agent::{Agent, DurableGoalStore, GoalDriver};
 use ygg_ai::{
     AiClient, Model, ModelCatalog, ModelId, OpenAiChatReasoningMode, ReasoningConfig,
     ReasoningControl, ReasoningEffort, ReasoningMode,
@@ -358,6 +358,9 @@ pub struct App {
     pub skills: Arc<dyn ygg_agent::skills::SkillRegistry>,
     pub prompts: Arc<PromptRegistry>,
     pub executable_extensions: crate::extensions::ExecutableExtensions,
+    pub goal_store: Arc<DurableGoalStore>,
+    pub goal_driver: GoalDriver,
+    pub goal_session_id: String,
 }
 
 impl Drop for App {

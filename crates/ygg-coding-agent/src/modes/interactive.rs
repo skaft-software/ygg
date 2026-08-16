@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
-use tokio::time::{Interval, MissedTickBehavior};
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 #[cfg(unix)]
 use ygg_agent::extension_process::ProcessGroupGuard;
 use ygg_agent::{
-    analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId, Run,
-    RunControl, Session,
+    analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId,
+    GoalDecision, GoalStatus, GoalTurnSource, Run, RunControl, Session,
 };
 use ygg_ai::{ModelId, ReasoningConfig, ReasoningMode, ToolCallId};
 
@@ -135,6 +135,7 @@ pub enum PendingIdleAction {
     ShowTree,
     CheckoutEntry(String),
     Skills(commands::SkillsSubcommand),
+    Goal(commands::GoalCommand),
 }
 
 /// Push an idle action while preserving ordering barriers. Adjacent model or
@@ -177,6 +178,7 @@ pub fn push_pending_action(queue: &mut VecDeque<PendingIdleAction>, action: Pend
 enum Idle {
     Submit(ComposedInput),
     Command(String),
+    GoalContinuation,
     CycleThinking,
     Quit,
 }
@@ -187,6 +189,7 @@ async fn wait_for_prompt<S>(
     scroll_tick: &mut Interval,
     extension_tick: &mut Interval,
     executable_extensions: &mut crate::extensions::ExecutableExtensions,
+    goal_deadline: Option<Instant>,
 ) -> anyhow::Result<Idle>
 where
     S: Stream<Item = std::io::Result<Event>> + Unpin,
@@ -344,11 +347,178 @@ where
                 shell.render();
                 scroll_dirty = false;
             },
+            _ = async {
+                match goal_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Ok(Idle::GoalContinuation),
             _ = extension_tick.tick() => {
                 if apply_extension_background(shell, executable_extensions) {
                     shell.render();
                 }
             }
+        }
+    }
+}
+
+fn goal_status_label(status: GoalStatus) -> &'static str {
+    match status {
+        GoalStatus::Active => "Active",
+        GoalStatus::Paused => "Paused",
+        GoalStatus::Complete => "Complete",
+        GoalStatus::Blocked => "Blocked",
+        GoalStatus::BudgetLimited => "Budget limited",
+        _ => "Unknown",
+    }
+}
+
+fn goal_status_text(app: &App) -> anyhow::Result<String> {
+    let goal = app.goal_store.get(&app.goal_session_id)?;
+    let Some(goal) = goal else {
+        return Ok("No goal is configured for this session.".to_owned());
+    };
+    let remaining = goal
+        .turn_budget
+        .map(|budget| {
+            format!(
+                " · {} turn{} remaining",
+                budget.saturating_sub(goal.turns_used),
+                if budget.saturating_sub(goal.turns_used) == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        })
+        .unwrap_or_default();
+    Ok(format!(
+        "{} goal: {}{}",
+        goal_status_label(goal.status),
+        goal.objective,
+        remaining
+    ))
+}
+
+fn arm_goal_deadline(app: &App) -> anyhow::Result<Option<Instant>> {
+    match app
+        .goal_driver
+        .turn_settled(GoalTurnSource::User, "", false)?
+    {
+        GoalDecision::Wait { delay, .. } => Ok(Some(Instant::now() + delay)),
+        _ => Ok(None),
+    }
+}
+
+fn recovered_goal_deadline(app: &App) -> anyhow::Result<Option<Instant>> {
+    if app
+        .goal_store
+        .get(&app.goal_session_id)?
+        .is_some_and(|goal| goal.status == GoalStatus::Active)
+    {
+        arm_goal_deadline(app)
+    } else {
+        Ok(None)
+    }
+}
+
+fn apply_goal_command(
+    app: &App,
+    shell: &mut InteractiveShell,
+    command: commands::GoalCommand,
+    goal_deadline: &mut Option<Instant>,
+) -> anyhow::Result<()> {
+    use ygg_agent::GoalAction as DurableGoalAction;
+
+    match command {
+        commands::GoalCommand::Help => shell.show_overlay_text(
+            "Goal commands\n\n/goal <objective>\n/goal status\n/goal pause\n/goal resume\n/goal clear"
+                .to_owned(),
+        ),
+        commands::GoalCommand::Status => match goal_status_text(app) {
+            Ok(status) => shell.show_overlay_text(status),
+            Err(error) => shell.error(format!("unable to read goal: {error}")),
+        },
+        commands::GoalCommand::Set(objective) => match app
+            .goal_store
+            .set(&app.goal_session_id, &objective, None)
+        {
+            Ok(goal) => {
+                app.goal_driver.user_spoke();
+                *goal_deadline = arm_goal_deadline(app)?;
+                shell.notice(format!(
+                    "goal set · {} goal: {}",
+                    goal_status_label(goal.status), goal.objective
+                ));
+            }
+            Err(error) => shell.error(format!("unable to set goal: {error}")),
+        },
+        commands::GoalCommand::Pause => {
+            match app
+                .goal_store
+                .apply(&app.goal_session_id, DurableGoalAction::Pause)
+            {
+                Ok(Some(goal)) => {
+                    *goal_deadline = None;
+                    app.goal_driver.user_spoke();
+                    shell.notice(format!("goal paused · {}", goal.objective));
+                }
+                Ok(None) => shell.error("no goal is configured for this session".to_owned()),
+                Err(error) => shell.error(format!("unable to pause goal: {error}")),
+            }
+        }
+        commands::GoalCommand::Resume => {
+            match app
+                .goal_store
+                .apply(&app.goal_session_id, DurableGoalAction::Resume)
+            {
+                Ok(Some(goal)) => {
+                    app.goal_driver.user_spoke();
+                    *goal_deadline = arm_goal_deadline(app)?;
+                    shell.notice(format!("goal resumed · {}", goal.objective));
+                }
+                Ok(None) => shell.error("no goal is configured for this session".to_owned()),
+                Err(error) => shell.error(format!("unable to resume goal: {error}")),
+            }
+        }
+        commands::GoalCommand::Clear => {
+            match app
+                .goal_store
+                .apply(&app.goal_session_id, DurableGoalAction::Clear)
+            {
+                Ok(None) => {
+                    *goal_deadline = None;
+                    app.goal_driver.user_spoke();
+                    shell.notice("goal cleared");
+                }
+                Ok(Some(_)) => unreachable!("clearing a goal returns no state"),
+                Err(error) => shell.error(format!("unable to clear goal: {error}")),
+            }
+        }
+    }
+    Ok(())
+}
+fn settle_goal(
+    app: &App,
+    shell: &mut InteractiveShell,
+    source: GoalTurnSource,
+    response: &str,
+    made_tool_call: bool,
+    completed: bool,
+) -> Option<GoalDecision> {
+    if !completed {
+        let _ = app.goal_driver.session_error();
+        return None;
+    }
+    match app
+        .goal_driver
+        .turn_settled(source, response, made_tool_call)
+    {
+        Ok(decision) => Some(decision),
+        Err(error) => {
+            let _ = app.goal_driver.session_error();
+            shell.error(format!("unable to update goal state: {error}"));
+            None
         }
     }
 }
@@ -373,6 +543,7 @@ fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> a
         Command::Tree => PendingIdleAction::ShowTree,
         Command::Checkout(id) => PendingIdleAction::CheckoutEntry(id),
         Command::Skills(sub) => PendingIdleAction::Skills(sub),
+        Command::Goal(goal) => PendingIdleAction::Goal(goal),
         other => anyhow::bail!("{other:?} cannot be queued as an idle action"),
     };
     push_pending_action(queue, action);
@@ -835,6 +1006,7 @@ pub async fn drive_active_run<S>(
     max_cost_microdollars: Option<u64>,
     cost_warning_microdollars: Option<u64>,
     executable_extensions: &mut crate::extensions::ExecutableExtensions,
+    made_tool_call: &mut bool,
 ) -> anyhow::Result<RunEnded>
 where
     S: Stream<Item = std::io::Result<Event>> + Unpin,
@@ -1125,6 +1297,7 @@ where
             event = run.next() => match event {
                 Some(event) => {
                     if let AgentEvent::ToolStarted { id, name, args } = &event {
+                        *made_tool_call = true;
                         extension_tool_calls.insert(id.clone(), (name.clone(), args.clone()));
                     }
                     if let AgentEvent::ToolProgress {
@@ -1677,6 +1850,7 @@ async fn apply_pending_actions(
     shell: &mut InteractiveShell,
     input: &mut EventStream,
     pending_actions: &mut VecDeque<PendingIdleAction>,
+    goal_deadline: &mut Option<Instant>,
 ) -> anyhow::Result<App> {
     while let Some(action) = pending_actions.pop_front() {
         match action {
@@ -1795,6 +1969,9 @@ async fn apply_pending_actions(
                 } else {
                     execute_skills_command(&mut app, shell, sub).await?;
                 }
+            }
+            PendingIdleAction::Goal(command) => {
+                apply_goal_command(&app, shell, command, goal_deadline)?;
             }
         }
         request_extension_ui(shell, &mut app);
@@ -2030,6 +2207,7 @@ async fn run_idle_command(
     shell: &mut InteractiveShell,
     input: &mut EventStream,
     command: Command,
+    goal_deadline: &mut Option<Instant>,
 ) -> anyhow::Result<IdleCommandOutcome> {
     match command {
         Command::Help(topic) => {
@@ -2308,6 +2486,9 @@ async fn run_idle_command(
         Command::Skills(sub) => {
             execute_skills_command(&mut app, shell, sub).await?;
         }
+        Command::Goal(goal) => {
+            apply_goal_command(&app, shell, goal, goal_deadline)?;
+        }
         Command::Unknown(text) => {
             let (extension_name, extension_arguments) = split_prompt_invocation(&text)
                 .map(|(name, arguments)| {
@@ -2582,6 +2763,8 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     shell.render();
 
     let mut pending_actions = VecDeque::new();
+    let mut goal_deadline = recovered_goal_deadline(&app)?;
+    let mut next_prompt_source = GoalTurnSource::User;
     'interactive: loop {
         if shell.close_requested() {
             shutdown_for_exit(&mut app).await;
@@ -2596,6 +2779,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     &mut scroll_tick,
                     &mut extension_tick,
                     &mut app.executable_extensions,
+                    goal_deadline,
                 )
                 .await?
             }
@@ -2604,6 +2788,21 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
             Idle::Quit => {
                 shutdown_for_exit(&mut app).await;
                 break;
+            }
+            Idle::GoalContinuation => {
+                goal_deadline = None;
+                match app.goal_driver.fire_continuation() {
+                    Ok(Some(continuation)) => {
+                        next_prompt_source = GoalTurnSource::Continuation;
+                        startup_prompt = Some(continuation.prompt);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = app.goal_driver.session_error();
+                        shell.error(format!("goal continuation unavailable: {error}"));
+                        shell.render();
+                    }
+                }
             }
             Idle::CycleThinking => {
                 let level = next_thinking_level(&app)?;
@@ -2621,8 +2820,14 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     startup_prompt = Some(command_input);
                     continue;
                 }
-                match run_idle_command(app, &mut shell, &mut input, commands::parse(&command_input))
-                    .await?
+                match run_idle_command(
+                    app,
+                    &mut shell,
+                    &mut input,
+                    commands::parse(&command_input),
+                    &mut goal_deadline,
+                )
+                .await?
                 {
                     IdleCommandOutcome::Continue(next) => app = *next,
                     IdleCommandOutcome::Submit { app: next, prompt } => {
@@ -2637,6 +2842,12 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 }
             }
             Idle::Submit(mut composed) => {
+                let prompt_source = next_prompt_source;
+                next_prompt_source = GoalTurnSource::User;
+                if prompt_source == GoalTurnSource::User {
+                    goal_deadline = None;
+                    app.goal_driver.user_spoke();
+                }
                 // Shell escapes have the same authority as the model `bash`
                 // tool and executable extensions. Never let this local UX
                 // bypass the product-wide process gate.
@@ -2995,6 +3206,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 shell.render();
                 let control = run.control();
                 let mut quit_requested = false;
+                let mut made_tool_call = false;
                 let ended = drive_active_run(
                     &mut run,
                     &control,
@@ -3006,6 +3218,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     app.config.max_cost_microdollars,
                     app.config.cost_warning_microdollars,
                     &mut app.executable_extensions,
+                    &mut made_tool_call,
                 )
                 .await?;
                 drop(run);
@@ -3014,10 +3227,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     shutdown_for_exit(&mut app).await;
                     break 'interactive;
                 }
-                // Hooks observe only the assistant output from this successful
-                // run. Looking up the latest persisted assistant after a
-                // failed/aborted run would resend a previous turn.
-                if matches!(ended, RunEnded::Completed) {
+                let goal_decision = if matches!(ended, RunEnded::Completed) {
                     let response = crate::extensions::latest_assistant_text(app.agent.session());
                     let notifications = tokio::select! {
                         biased;
@@ -3038,7 +3248,34 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     } else {
                         shell.notice("extension after_response hooks cancelled");
                     }
-                }
+                    settle_goal(
+                        &app,
+                        &mut shell,
+                        prompt_source,
+                        &response,
+                        made_tool_call,
+                        true,
+                    )
+                } else {
+                    settle_goal(&app, &mut shell, prompt_source, "", made_tool_call, false)
+                };
+                goal_deadline = match goal_decision {
+                    Some(GoalDecision::Wait { delay, .. }) => Some(Instant::now() + delay),
+                    Some(GoalDecision::Complete) => {
+                        shell.notice("goal completed");
+                        None
+                    }
+                    Some(GoalDecision::Blocked) => {
+                        shell.notice("goal blocked");
+                        None
+                    }
+                    Some(GoalDecision::BudgetLimited) => {
+                        shell.notice("goal continuation budget exhausted");
+                        None
+                    }
+                    Some(GoalDecision::Suppressed) => None,
+                    Some(GoalDecision::Paused) | Some(GoalDecision::Inactive) | None => None,
+                };
                 // The run's tools may have created files; refresh mention
                 // completion lazily on the next `@`.
                 shell.invalidate_file_index();
@@ -3057,8 +3294,14 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     shutdown_for_exit(&mut app).await;
                     break;
                 }
-                app = apply_pending_actions(app, &mut shell, &mut input, &mut pending_actions)
-                    .await?;
+                app = apply_pending_actions(
+                    app,
+                    &mut shell,
+                    &mut input,
+                    &mut pending_actions,
+                    &mut goal_deadline,
+                )
+                .await?;
             }
         }
     }
@@ -3496,6 +3739,7 @@ mod tests {
             None,
             None,
             &mut executable_extensions,
+            &mut false,
         )
         .await
         .unwrap();
@@ -3570,6 +3814,7 @@ mod tests {
             None,
             None,
             &mut executable_extensions,
+            &mut false,
         )
         .await
         .unwrap();
@@ -3670,6 +3915,7 @@ mod tests {
             None,
             None,
             &mut executable_extensions,
+            &mut false,
         )
         .await
         .unwrap();

@@ -19,8 +19,9 @@ use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, oneshot};
 use ygg_agent::{
     AgentEvent, CompactionReason, ContextBreakdown as AgentContextBreakdown,
-    ContextSnapshot as AgentContextSnapshot, Entry, EntryId, EntryValue, FinishReason, InputPart,
-    OutputChannel, RunControl, RunPhase as AgentRunPhase,
+    ContextSnapshot as AgentContextSnapshot, Entry, EntryId, EntryValue, FinishReason,
+    GoalDecision, GoalDriver, GoalState as AgentGoalState, GoalStore as AgentGoalStore,
+    GoalTurnSource, InputPart, OutputChannel, RunControl, RunPhase as AgentRunPhase,
     RunTerminalState as AgentRunTerminalState, Session, SessionRunOutcome, SessionRunOutcomeStatus,
     ToolError, ToolOutput, ToolProgress, UserInput,
 };
@@ -39,27 +40,27 @@ use ygg_serve_backend::{
     ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
     DocumentReference, DocumentStore, DocumentStoreError, DriverCommandOutcome, DurableEntryId,
     EventPayload, EvidenceCoverage, FileChange, FileEntryId, FinalizeCompletion, FinalizeDecision,
-    GoalStore, HostCapabilities, HostDescriptor, HostId, HostService, InferenceRequest,
-    InferenceRequestStore, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
-    LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing, ModelInputPricingTier,
-    ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProjectFileRead,
-    ProjectFileSearchResult, ProjectFileSystem, ProjectFileSystemError, ProjectFileTree,
-    ProjectFileWrite, ProjectId, ProjectRegistry, ProjectRegistryError, ProjectSummary,
-    PromptInput, ProtocolValidation, PullRequestState, PullRequestSummary, RegistryProjectId,
-    RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer,
-    RequestId, RequestKind, RequestState, RunId, RuntimeId, SearchDocument, SearchDocumentKind,
-    SearchError, SemanticRole, ServiceError, SessionBranchEntry, SessionBranchEntryKind,
-    SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor, SessionDriver,
-    SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot,
-    SessionSummary, SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId,
-    SourceKind, SourceRef, StoredAttachment, StoredResource, StructuredTestResults,
-    SupervisorConfig, TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput,
-    ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle,
-    ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity, ToolActivityStatus,
-    ToolKind, ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest,
-    TranscriptSearchResult, TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary,
-    TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId, UsageActivity,
-    UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
+    GoalAction, GoalState as ServeGoalState, GoalStore, GoalStoreError, HostCapabilities,
+    HostDescriptor, HostId, HostService, InferenceRequest, InferenceRequestStore, InputModality,
+    ItemDelta, ItemId, ItemLifecycle, ItemPayload, LifetimeUsage, LoopbackConfig, LoopbackServer,
+    ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary, PendingRequest,
+    PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult, ProjectFileSystem,
+    ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ProjectId, ProjectRegistry,
+    ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation, PullRequestState,
+    PullRequestSummary, RegistryProjectId, RegistryProjectState, RepositoryContextError,
+    RepositoryContextSnapshot, RequestAnswer, RequestId, RequestKind, RequestState, RunId,
+    RuntimeId, SearchDocument, SearchDocumentKind, SearchError, SemanticRole, ServiceError,
+    SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState,
+    SessionCommand, SessionCursor, SessionDriver, SessionId, SessionItem, SessionLiveState,
+    SessionRetention, SessionSeed, SessionSnapshot, SessionSummary, SessionSupervisor,
+    SkillSuggestion, SlashCommandInvocation, SourceId, SourceKind, SourceRef, StoredAttachment,
+    StoredResource, StructuredTestResults, SupervisorConfig, TestCommandOutcome, TestCommandStatus,
+    TestFramework, TestOutputInput, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion,
+    ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity,
+    ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
+    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
+    TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
+    UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
     MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES,
     PROTOCOL_VERSION,
 };
@@ -87,6 +88,161 @@ const MAX_OPAQUE_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
 const EXTERNAL_EFFECTS_WARNING: &str = "Conversation branching changes only Ygg's transcript. Filesystem, command, network, and other external effects from later work are not rolled back.";
 
 static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Adapter from the optional Serve goal persistence to the provider-neutral
+/// continuation driver. The actor owns when this adapter is invoked; the
+/// store itself remains durable and frontend-independent.
+#[derive(Clone)]
+struct ServeGoalStore {
+    store: GoalStore,
+}
+
+impl ServeGoalStore {
+    fn session_id(raw: &str) -> Result<SessionId, String> {
+        SessionId::new(raw.to_owned()).map_err(|_| "invalid session id".to_owned())
+    }
+
+    fn state(state: ygg_serve_backend::GoalState) -> AgentGoalState {
+        state
+    }
+
+    fn result(
+        result: Result<ygg_serve_backend::GoalState, ygg_serve_backend::GoalStoreError>,
+    ) -> Result<AgentGoalState, String> {
+        result.map(Self::state).map_err(|error| error.to_string())
+    }
+}
+
+impl AgentGoalStore for ServeGoalStore {
+    fn get(&self, session_id: &str) -> Result<Option<AgentGoalState>, String> {
+        let session_id = Self::session_id(session_id)?;
+        self.store
+            .get(&session_id)
+            .map(|state| state.map(Self::state))
+            .map_err(|error| error.to_string())
+    }
+
+    fn record_turn(&self, session_id: &str) -> Result<AgentGoalState, String> {
+        let session_id = Self::session_id(session_id)?;
+        Self::result(self.store.record_turn(&session_id))
+    }
+
+    fn mark_complete(&self, session_id: &str) -> Result<AgentGoalState, String> {
+        let session_id = Self::session_id(session_id)?;
+        Self::result(self.store.mark_complete(&session_id))
+    }
+
+    fn mark_blocked(&self, session_id: &str) -> Result<AgentGoalState, String> {
+        let session_id = Self::session_id(session_id)?;
+        Self::result(self.store.mark_blocked(&session_id))
+    }
+
+    fn pause(&self, session_id: &str) -> Result<AgentGoalState, String> {
+        let session_id = Self::session_id(session_id)?;
+        let state = self
+            .store
+            .apply(&session_id, GoalAction::Pause)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "goal was cleared".to_owned())?;
+        Ok(Self::state(state))
+    }
+}
+
+fn goal_service_error(error: GoalStoreError) -> ServiceError {
+    match error {
+        GoalStoreError::InvalidObjective
+        | GoalStoreError::InvalidTurnBudget
+        | GoalStoreError::NotFound
+        | GoalStoreError::InvalidTransition => ServiceError::InvalidGoal,
+        GoalStoreError::UnsafePath | GoalStoreError::CorruptState | GoalStoreError::Storage(_) => {
+            ServiceError::Internal
+        }
+    }
+}
+
+fn goal_event(goal: Option<ServeGoalState>, revision: u64) -> TimestampedEvent {
+    event(EventPayload::GoalChanged { goal, revision })
+}
+
+fn current_goal(
+    store: Option<&GoalStore>,
+    session_id: &SessionId,
+) -> Result<Option<ServeGoalState>, ServiceError> {
+    store
+        .map(|store| store.get(session_id).map_err(goal_service_error))
+        .transpose()
+        .map(|goal| goal.flatten())
+}
+
+fn current_goal_event(
+    store: Option<&GoalStore>,
+    session_id: &SessionId,
+) -> Result<TimestampedEvent, ServiceError> {
+    let goal = current_goal(store, session_id)?;
+    let revision = store
+        .map(|store| store.revision(session_id).map_err(goal_service_error))
+        .transpose()?
+        .unwrap_or(0);
+    Ok(goal_event(goal, revision))
+}
+
+fn apply_goal_command(
+    store: &GoalStore,
+    session_id: &SessionId,
+    command: SessionCommand,
+) -> Result<Option<ServeGoalState>, ServiceError> {
+    match command {
+        SessionCommand::SetGoal {
+            objective,
+            turn_budget,
+        } => store
+            .set(session_id, &objective, turn_budget)
+            .map(Some)
+            .map_err(goal_service_error),
+        SessionCommand::PauseGoal => store
+            .apply(session_id, GoalAction::Pause)
+            .map_err(goal_service_error),
+        SessionCommand::ResumeGoal => store
+            .apply(session_id, GoalAction::Resume)
+            .map_err(goal_service_error),
+        SessionCommand::ClearGoal => store
+            .apply(session_id, GoalAction::Clear)
+            .map_err(goal_service_error),
+        _ => Err(ServiceError::InvalidBoundary),
+    }
+}
+
+fn goal_deadline_after_user_change(
+    goal_driver: Option<&GoalDriver>,
+) -> Result<Option<tokio::time::Instant>, ServiceError> {
+    let Some(goal_driver) = goal_driver else {
+        return Ok(None);
+    };
+    goal_driver.user_spoke();
+    match goal_driver
+        .turn_settled(GoalTurnSource::User, "", false)
+        .map_err(|_| ServiceError::Internal)?
+    {
+        GoalDecision::Wait { delay, .. } => Ok(Some(tokio::time::Instant::now() + delay)),
+        _ => Ok(None),
+    }
+}
+
+fn goal_mutation_outcome(
+    plan: &WorkerPlan,
+    command: SessionCommand,
+) -> Result<DriverCommandOutcome, ServiceError> {
+    let Some(store) = plan.goal_store.as_ref() else {
+        return Err(ServiceError::InvalidBoundary);
+    };
+    let goal = apply_goal_command(store, &plan.session_id, command)?;
+    let revision = store
+        .revision(&plan.session_id)
+        .map_err(goal_service_error)?;
+    Ok(DriverCommandOutcome::with_events(vec![goal_event(
+        goal, revision,
+    )]))
+}
 
 pub async fn run(
     config: Config,
@@ -1091,6 +1247,7 @@ impl YggHost {
             trusted_files: Arc::clone(&self.trusted_files),
             search_index: Arc::clone(&self.search_index),
             resources: self.resources.clone(),
+            goal_store: Some(self.goals.clone()),
             usage: Arc::clone(&self.usage),
             pull_requests: Arc::clone(&self.pull_requests),
             pull_request_projection: Arc::new(Mutex::new(None)),
@@ -1175,6 +1332,7 @@ impl YggHost {
             trusted_files: Arc::clone(&self.trusted_files),
             search_index: Arc::clone(&self.search_index),
             resources: self.resources.clone(),
+            goal_store: Some(self.goals.clone()),
             usage: Arc::clone(&self.usage),
             pull_requests: Arc::clone(&self.pull_requests),
             pull_request_projection: Arc::new(Mutex::new(seed.summary.pull_request.clone())),
@@ -2567,6 +2725,7 @@ struct WorkerPlan {
     trusted_files: Arc<Mutex<HashMap<String, TrustedProjectFiles>>>,
     search_index: Arc<Mutex<TranscriptSearchIndex>>,
     resources: Option<ygg_serve_backend::ResourceStore>,
+    goal_store: Option<GoalStore>,
     usage: Arc<Mutex<InferenceRequestStore>>,
     pull_requests: Arc<Mutex<PullRequestStore>>,
     pull_request_projection: Arc<Mutex<Option<PullRequestSummary>>>,
@@ -3193,9 +3352,11 @@ enum RunPromptInput {
 }
 
 enum RunDriveOutcome {
-    Admitted,
+    Admitted {
+        goal: Option<ygg_agent::GoalDecision>,
+    },
     Rejected {
-        admission: oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>,
+        admission: Option<oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>>,
         error: ServiceError,
     },
 }
@@ -3320,6 +3481,13 @@ impl ProjectionState {
     }
 }
 
+fn schedule_goal(decision: Option<GoalDecision>) -> Option<tokio::time::Instant> {
+    match decision {
+        Some(GoalDecision::Wait { delay, .. }) => Some(tokio::time::Instant::now() + delay),
+        _ => None,
+    }
+}
+
 async fn run_worker(
     mut plan: WorkerPlan,
     mut commands: mpsc::Receiver<WorkerMessage>,
@@ -3332,7 +3500,121 @@ async fn run_worker(
         PullRequestRefreshPlan::from(&plan),
         events.clone(),
     ));
-    while let Some(message) = commands.recv().await {
+    let goal_driver = plan.goal_store.as_ref().map(|store| {
+        GoalDriver::new(
+            Arc::new(ServeGoalStore {
+                store: store.clone(),
+            }),
+            plan.session_id.as_str(),
+        )
+    });
+    let mut goal_deadline = match goal_driver.as_ref() {
+        Some(driver)
+            if current_goal(plan.goal_store.as_ref(), &plan.session_id)
+                .ok()
+                .flatten()
+                .is_some_and(|goal| matches!(goal.status, ygg_agent::GoalStatus::Active)) =>
+        {
+            match driver.turn_settled(GoalTurnSource::User, "", false) {
+                Ok(decision) => schedule_goal(Some(decision)),
+                Err(_) => {
+                    let _ = driver.session_error();
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    loop {
+        let message = tokio::select! {
+            message = commands.recv() => message,
+            _ = async {
+                if let Some(deadline) = goal_deadline {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                goal_deadline = None;
+                let Some(driver) = goal_driver.as_ref() else {
+                    continue;
+                };
+                let mut owned_app = match app.take() {
+                    Some(app) => app,
+                    None => match build_worker_app(&mut plan) {
+                        Ok(app) => app,
+                        Err(_) => {
+                            let _ = driver.session_error();
+                            continue;
+                        }
+                    },
+                };
+                let continuation = match driver.fire_continuation() {
+                    Ok(continuation) => continuation,
+                    Err(_) => {
+                        let _ = driver.session_error();
+                        None
+                    }
+                };
+                let Some(continuation) = continuation else {
+                    app = Some(owned_app);
+                    continue;
+                };
+                if let Ok(goal_event) =
+                    current_goal_event(plan.goal_store.as_ref(), &plan.session_id)
+                {
+                    let _ = events.send(goal_event).await;
+                }
+                let session_path = owned_app.agent.session().path().to_owned();
+                plan.launch.session = SessionSelection::OpenExisting(session_path);
+                let input = PromptInput {
+                    text: continuation.prompt,
+                    attachments: Vec::new(),
+                    document_ids: Vec::new(),
+                    project_file_ids: Vec::new(),
+                };
+                match start_and_drive_run(
+                    &mut owned_app,
+                    RunPromptInput::New(input),
+                    None,
+                    Some(driver),
+                    GoalTurnSource::Continuation,
+                    &plan,
+                    &mut projection,
+                    &mut commands,
+                    &events,
+                    None,
+                )
+                .await
+                {
+                    Ok(RunDriveOutcome::Admitted { goal }) => {
+                        goal_deadline = schedule_goal(goal);
+                        app = Some(owned_app);
+                    }
+                    Ok(RunDriveOutcome::Rejected { admission, error }) => {
+                        let _ = driver.session_error();
+                        if let Some(admission) = admission {
+                            let _ = admission.send(Err(error));
+                        }
+                        app = Some(owned_app);
+                    }
+                    Err(_) => {
+                        let _ = driver.session_error();
+                        let _ = events
+                            .send(event(EventPayload::SessionStateChanged {
+                                state: SessionLiveState::Failed,
+                                active_run_id: None,
+                            }))
+                            .await;
+                        app = Some(owned_app);
+                    }
+                }
+                continue;
+            }
+        };
+        let Some(message) = message else {
+            break;
+        };
         let message = match message {
             WorkerMessage::Command(message) => message,
             WorkerMessage::CommandDiscovery { response } => {
@@ -3352,7 +3634,26 @@ async fn run_worker(
             }
         };
         match message.command {
+            command @ (SessionCommand::SetGoal { .. }
+            | SessionCommand::PauseGoal
+            | SessionCommand::ResumeGoal
+            | SessionCommand::ClearGoal) => {
+                let prior_goal_deadline = goal_deadline;
+                let outcome = goal_mutation_outcome(&plan, command);
+                goal_deadline = if outcome.is_ok() {
+                    goal_deadline_after_user_change(goal_driver.as_ref()).unwrap_or_default()
+                } else {
+                    // Rejected mutations must not cancel a continuation that
+                    // was already waiting for its grace-period deadline.
+                    prior_goal_deadline
+                };
+                let _ = message.response.send(outcome);
+            }
             SessionCommand::SubmitPrompt { input } => {
+                goal_deadline = None;
+                if let Some(driver) = goal_driver.as_ref() {
+                    driver.user_spoke();
+                }
                 let mut owned_app = match app.take() {
                     Some(app) => app,
                     None => match build_worker_app(&mut plan) {
@@ -3369,20 +3670,30 @@ async fn run_worker(
                     &mut owned_app,
                     RunPromptInput::New(input),
                     None,
+                    goal_driver.as_ref(),
+                    GoalTurnSource::User,
                     &plan,
                     &mut projection,
                     &mut commands,
                     &events,
-                    message.response,
+                    Some(message.response),
                 )
                 .await
                 {
-                    Ok(RunDriveOutcome::Admitted) => app = Some(owned_app),
+                    Ok(RunDriveOutcome::Admitted { goal }) => {
+                        goal_deadline = schedule_goal(goal);
+                        app = Some(owned_app);
+                    }
                     Ok(RunDriveOutcome::Rejected { admission, error }) => {
-                        let _ = admission.send(Err(error));
+                        if let Some(admission) = admission {
+                            let _ = admission.send(Err(error));
+                        }
                         app = Some(owned_app);
                     }
                     Err(_) => {
+                        if let Some(driver) = goal_driver.as_ref() {
+                            let _ = driver.session_error();
+                        }
                         let _ = events
                             .send(event(EventPayload::SessionStateChanged {
                                 state: SessionLiveState::Failed,
@@ -3397,6 +3708,10 @@ async fn run_worker(
                 source_user_entry_id,
                 input,
             } => {
+                goal_deadline = None;
+                if let Some(driver) = goal_driver.as_ref() {
+                    driver.user_spoke();
+                }
                 let owned_app = match app.take() {
                     Some(app) => app,
                     None => match build_worker_app(&mut plan) {
@@ -3433,6 +3748,7 @@ async fn run_worker(
                     RunPromptInput::New(input),
                     provenance,
                     None,
+                    goal_driver.as_ref(),
                     &mut plan,
                     &mut projection,
                     &mut commands,
@@ -3441,7 +3757,8 @@ async fn run_worker(
                 )
                 .await
                 {
-                    Ok((owned_app, post_ack_failed)) => {
+                    Ok((owned_app, post_ack_failed, goal)) => {
+                        goal_deadline = schedule_goal(goal);
                         app = Some(owned_app);
                         if post_ack_failed {
                             let _ = events
@@ -3462,6 +3779,10 @@ async fn run_worker(
                 source_assistant_entry_id,
                 model,
             } => {
+                goal_deadline = None;
+                if let Some(driver) = goal_driver.as_ref() {
+                    driver.user_spoke();
+                }
                 let owned_app = match app.take() {
                     Some(app) => app,
                     None => match build_worker_app(&mut plan) {
@@ -3517,6 +3838,7 @@ async fn run_worker(
                     RunPromptInput::Replay(replay),
                     provenance,
                     model,
+                    goal_driver.as_ref(),
                     &mut plan,
                     &mut projection,
                     &mut commands,
@@ -3525,7 +3847,8 @@ async fn run_worker(
                 )
                 .await
                 {
-                    Ok((owned_app, post_ack_failed)) => {
+                    Ok((owned_app, post_ack_failed, goal)) => {
+                        goal_deadline = schedule_goal(goal);
                         app = Some(owned_app);
                         if post_ack_failed {
                             let _ = events
@@ -3749,17 +4072,24 @@ async fn run_worker(
                             &mut owned_app,
                             input,
                             None,
+                            goal_driver.as_ref(),
+                            GoalTurnSource::User,
                             &plan,
                             &mut projection,
                             &mut commands,
                             &events,
-                            message.response,
+                            Some(message.response),
                         )
                         .await
                         {
-                            Ok(RunDriveOutcome::Admitted) => app = Some(owned_app),
+                            Ok(RunDriveOutcome::Admitted { goal }) => {
+                                goal_deadline = schedule_goal(goal);
+                                app = Some(owned_app);
+                            }
                             Ok(RunDriveOutcome::Rejected { admission, error }) => {
-                                let _ = admission.send(Err(error));
+                                if let Some(admission) = admission {
+                                    let _ = admission.send(Err(error));
+                                }
                                 app = Some(owned_app);
                             }
                             Err(_) => {
@@ -4556,12 +4886,13 @@ async fn drive_sibling_conversation_branch(
     input: RunPromptInput,
     provenance: ConversationBranchProvenance,
     model_override: Option<ModelSelection>,
+    goal_driver: Option<&GoalDriver>,
     plan: &mut WorkerPlan,
     projection: &mut ProjectionState,
     commands: &mut mpsc::Receiver<WorkerMessage>,
     events: &mpsc::Sender<TimestampedEvent>,
     admission: oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>,
-) -> Result<(App, bool), ServiceError> {
+) -> Result<(App, bool, Option<GoalDecision>), ServiceError> {
     let path = owned_app.agent.session().path().to_owned();
     let previous_head = owned_app
         .agent
@@ -4581,20 +4912,20 @@ async fn drive_sibling_conversation_branch(
             });
             if !available {
                 let _ = admission.send(Err(ServiceError::InvalidBoundary));
-                return Ok((owned_app, false));
+                return Ok((owned_app, false, None));
             }
             let model = match owned_app.catalog.resolve(&ModelId(selection.model.clone())) {
                 Ok(model) => model,
                 Err(_) => {
                     let _ = admission.send(Err(ServiceError::InvalidBoundary));
-                    return Ok((owned_app, false));
+                    return Ok((owned_app, false, None));
                 }
             };
             let reasoning = match config::parse_reasoning(&selection.reasoning) {
                 Ok(reasoning) => reasoning,
                 Err(_) => {
                     let _ = admission.send(Err(ServiceError::InvalidBoundary));
-                    return Ok((owned_app, false));
+                    return Ok((owned_app, false, None));
                 }
             };
             (Some(model), Some(reasoning))
@@ -4605,7 +4936,7 @@ async fn drive_sibling_conversation_branch(
         checkout_before_user_entry(owned_app.agent.session_mut(), &source_user_entry_id)
     {
         let _ = admission.send(Err(error));
-        return Ok((owned_app, false));
+        return Ok((owned_app, false, None));
     }
     let selection = SessionSelection::OpenExisting(path.clone());
     let mut candidate = match rebuild_app(
@@ -4619,7 +4950,7 @@ async fn drive_sibling_conversation_branch(
         Err(_) => {
             let restored = restore_checkout_owner(&path, previous_head, plan)?;
             let _ = admission.send(Err(ServiceError::Internal));
-            return Ok((restored, false));
+            return Ok((restored, false, None));
         }
     };
     let previous_model = plan.launch.model.clone();
@@ -4633,24 +4964,28 @@ async fn drive_sibling_conversation_branch(
         &mut candidate,
         input,
         Some(provenance),
+        goal_driver,
+        GoalTurnSource::User,
         plan,
         projection,
         commands,
         events,
-        admission,
+        Some(admission),
     )
     .await
     {
-        Ok(RunDriveOutcome::Admitted) => Ok((candidate, false)),
+        Ok(RunDriveOutcome::Admitted { goal }) => Ok((candidate, false, goal)),
         Ok(RunDriveOutcome::Rejected { admission, error }) => {
             plan.launch.model = previous_model;
             plan.launch.reasoning = previous_reasoning;
             plan.launch.reasoning_mode = previous_reasoning_mode;
             let restored = rollback_checkout_candidate(candidate, &path, previous_head, plan)?;
-            let _ = admission.send(Err(error));
-            Ok((restored, false))
+            if let Some(admission) = admission {
+                let _ = admission.send(Err(error));
+            }
+            Ok((restored, false, None))
         }
-        Err(_) => Ok((candidate, true)),
+        Err(_) => Ok((candidate, true, None)),
     }
 }
 
@@ -5163,11 +5498,13 @@ async fn start_and_drive_run(
     app: &mut App,
     input: RunPromptInput,
     branch_provenance: Option<ConversationBranchProvenance>,
+    goal_driver: Option<&GoalDriver>,
+    goal_source: GoalTurnSource,
     plan: &WorkerPlan,
     projection: &mut ProjectionState,
     commands: &mut mpsc::Receiver<WorkerMessage>,
     events: &mpsc::Sender<TimestampedEvent>,
-    admission: oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>,
+    admission: Option<oneshot::Sender<Result<DriverCommandOutcome, ServiceError>>>,
 ) -> Result<RunDriveOutcome, ServiceError> {
     if let Some(limit) = app.config.max_cost_microdollars {
         if app.agent.session().total_cost_microdollars() >= limit {
@@ -5359,11 +5696,13 @@ async fn start_and_drive_run(
             active_run_id: Some(run_id.clone()),
         }),
     ]);
-    if admission
-        .send(Ok(DriverCommandOutcome::run(run_id.clone(), immediate)))
-        .is_err()
-    {
-        control.abort();
+    if let Some(admission) = admission {
+        if admission
+            .send(Ok(DriverCommandOutcome::run(run_id.clone(), immediate)))
+            .is_err()
+        {
+            control.abort();
+        }
     }
     plan.pull_request_discovery_enabled
         .store(true, Ordering::Release);
@@ -5411,8 +5750,16 @@ async fn start_and_drive_run(
                 };
                 match command {
                     WorkerMessage::Command(command) => {
-                handle_active_command(command, &run_id, &control, plan, projection, events).await;
-            }
+                        handle_active_command(
+                            command,
+                            &run_id,
+                            &control,
+                            plan,
+                            projection,
+                            events,
+                        )
+                        .await;
+                    }
                     WorkerMessage::CommandDiscovery { response } => {
                         let _ = response.send(Ok(command_discovery.clone()));
                     }
@@ -5645,7 +5992,34 @@ async fn start_and_drive_run(
             .after_response(&response_text)
             .await;
     }
-    Ok(RunDriveOutcome::Admitted)
+    let goal = match goal_driver {
+        Some(driver) if completed => match driver.turn_settled(
+            goal_source,
+            &response_text,
+            !projection.tool_calls.is_empty(),
+        ) {
+            Ok(goal) => Some(goal),
+            Err(_) => {
+                let _ = driver.session_error();
+                None
+            }
+        },
+        Some(driver) => {
+            let _ = driver.session_error();
+            None
+        }
+        None => None,
+    };
+    if goal_driver.is_some() {
+        events
+            .send(current_goal_event(
+                plan.goal_store.as_ref(),
+                &plan.session_id,
+            )?)
+            .await
+            .map_err(|_| ServiceError::Unavailable)?;
+    }
+    Ok(RunDriveOutcome::Admitted { goal })
 }
 
 async fn handle_active_command(
@@ -5703,6 +6077,10 @@ async fn handle_active_command(
             },
             Err(error) => Err(error),
         },
+        command @ (SessionCommand::SetGoal { .. }
+        | SessionCommand::PauseGoal
+        | SessionCommand::ResumeGoal
+        | SessionCommand::ClearGoal) => goal_mutation_outcome(plan, command),
         SessionCommand::Rename { title } => rename_session_outcome(plan, &title),
         SessionCommand::SetPinned { pinned } => pin_session_outcome(plan, pinned),
         SessionCommand::SetArchived { archived } => archive_session_outcome(plan, archived),
@@ -10549,6 +10927,7 @@ mod tests {
             trusted_files: Arc::new(Mutex::new(HashMap::new())),
             search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources: None,
+            goal_store: None,
             usage: Arc::new(Mutex::new(InferenceRequestStore::open(&state_dir).unwrap())),
             pull_requests: Arc::new(Mutex::new(PullRequestStore::open(&state_dir).unwrap())),
             pull_request_projection: Arc::new(Mutex::new(None)),
@@ -13355,6 +13734,7 @@ mod tests {
             trusted_files: Arc::new(Mutex::new(HashMap::new())),
             search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources: None,
+            goal_store: None,
             usage: Arc::new(Mutex::new(
                 InferenceRequestStore::open(directory.path()).unwrap(),
             )),
@@ -13934,6 +14314,7 @@ mod tests {
             trusted_files: Arc::new(Mutex::new(HashMap::new())),
             search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
             resources: None,
+            goal_store: None,
             usage: Arc::new(Mutex::new(
                 InferenceRequestStore::open(directory.path()).unwrap(),
             )),

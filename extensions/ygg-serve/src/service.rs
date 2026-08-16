@@ -244,6 +244,9 @@ pub enum ServiceError {
     /// Command is invalid while the driver is in its current state.
     #[error("invalid command boundary")]
     InvalidBoundary,
+    /// The durable goal objective, budget, or lifecycle transition is invalid.
+    #[error("invalid goal")]
+    InvalidGoal,
     /// Requested capability is temporarily unavailable.
     #[error("temporarily unavailable")]
     Unavailable,
@@ -285,6 +288,10 @@ impl ServiceError {
             Self::InvalidBoundary => SanitizedError::public(
                 ErrorCode::InvalidBoundary,
                 "This command is not valid at the current run boundary.",
+            ),
+            Self::InvalidGoal => SanitizedError::public(
+                ErrorCode::InvalidGoal,
+                "The goal objective, budget, or lifecycle transition is invalid.",
             ),
             Self::Unavailable => SanitizedError::public(
                 ErrorCode::Unavailable,

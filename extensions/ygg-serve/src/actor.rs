@@ -733,7 +733,8 @@ fn reduce_snapshot(snapshot: &mut SessionSnapshot, event: &EventPayload) -> Resu
             snapshot.authority = *authority;
         }
         EventPayload::SessionMetadataChanged { .. }
-        | EventPayload::SessionPullRequestChanged { .. } => {}
+        | EventPayload::SessionPullRequestChanged { .. }
+        | EventPayload::GoalChanged { .. } => {}
         EventPayload::SessionDurableHeadChanged { durable_entry_id } => {
             if durable_entry_id.as_ref().is_some_and(|head| {
                 !snapshot

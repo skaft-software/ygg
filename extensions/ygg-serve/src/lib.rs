@@ -77,7 +77,10 @@ pub use fs::{
     MAX_PROJECT_FILE_SEARCH_FILES, MAX_PROJECT_FILE_SEARCH_QUERY_BYTES,
     MAX_PROJECT_FILE_SEARCH_RESULTS, MAX_PROJECT_FILE_TREE_ENTRIES, MAX_PROJECT_FILE_WRITE_BYTES,
 };
-pub use goal::{GoalAction, GoalState, GoalStatus, GoalStore, GoalStoreError};
+pub use goal::{
+    GoalAction, GoalState, GoalStatus, GoalStore, GoalStoreError, MAX_GOAL_OBJECTIVE_BYTES,
+    MAX_GOAL_TURN_BUDGET,
+};
 pub use ids::{
     ArtifactId, CommandId, DeviceId, DurableEntryId, HostId, ItemId, ProjectId, RequestId, RunId,
     SessionId, SourceId, ThemeId, TurnId,

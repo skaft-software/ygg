@@ -11,7 +11,8 @@ use crate::bounds::{
 use crate::{
     AuthorityProfile, CatalogCursor, CommandId, DeviceId, DocumentId, DurableEntryId, ErrorCode,
     FileEntryId, HostId, ModelSelection, ProjectId, RequestId, RunId, SanitizedError,
-    SessionCatalogState, SessionCursor, SessionId, PROTOCOL_VERSION,
+    SessionCatalogState, SessionCursor, SessionId, MAX_GOAL_OBJECTIVE_BYTES, MAX_GOAL_TURN_BUDGET,
+    PROTOCOL_VERSION,
 };
 
 /// Host-scoped commands that do not target an existing session actor.
@@ -352,6 +353,24 @@ pub enum SessionCommand {
         /// Exact slash-prefixed invocation.
         invocation: SlashCommandInvocation,
     },
+    /// Replace or create the durable session goal.
+    #[serde(rename = "session.goal.set")]
+    SetGoal {
+        /// Bounded objective.
+        objective: String,
+        /// Maximum automatic continuation turns, or unlimited when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_budget: Option<u32>,
+    },
+    /// Pause the durable session goal.
+    #[serde(rename = "session.goal.pause")]
+    PauseGoal,
+    /// Resume the durable session goal.
+    #[serde(rename = "session.goal.resume")]
+    ResumeGoal,
+    /// Clear the durable session goal.
+    #[serde(rename = "session.goal.clear")]
+    ClearGoal,
     /// Stop the current run.
     #[serde(rename = "session.abort")]
     Abort {
@@ -759,7 +778,27 @@ impl ProtocolValidation for SessionCommandEnvelope {
             | SessionCommand::FollowUp { input }
             | SessionCommand::EditUserTurn { input, .. } => input.validate()?,
             SessionCommand::InvokeSlashCommand { invocation } => invocation.validate()?,
-            SessionCommand::Abort { .. } => {}
+            SessionCommand::SetGoal {
+                objective,
+                turn_budget,
+            } => {
+                validate_public_text(
+                    "command.goal.objective",
+                    objective,
+                    MAX_GOAL_OBJECTIVE_BYTES,
+                    false,
+                )?;
+                if turn_budget.is_some_and(|budget| budget == 0 || budget > MAX_GOAL_TURN_BUDGET) {
+                    return Err(ValidationError::new(
+                        "command.goal.turnBudget",
+                        "must be absent or within the durable goal budget limit",
+                    ));
+                }
+            }
+            SessionCommand::PauseGoal
+            | SessionCommand::ResumeGoal
+            | SessionCommand::ClearGoal
+            | SessionCommand::Abort { .. } => {}
             SessionCommand::AnswerRequest { answer, .. } => match answer {
                 RequestAnswer::Approval { .. } => {}
                 RequestAnswer::Text { text } => {

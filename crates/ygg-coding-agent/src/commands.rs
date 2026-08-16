@@ -45,6 +45,8 @@ pub enum Command {
     Skills(SkillsSubcommand),
     /// Inspect or reload explicitly enabled executable extensions.
     Extensions(ExtensionsSubcommand),
+    /// Inspect or mutate the durable session goal.
+    Goal(GoalCommand),
     Unknown(String),
 }
 
@@ -58,6 +60,23 @@ pub enum AutoCompactSetting {
 pub enum ExtensionsSubcommand {
     List,
     Reload,
+}
+
+/// Subcommands for the `/goal` slash command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalCommand {
+    /// Set or replace the objective.
+    Set(String),
+    /// Show the current objective and lifecycle state.
+    Status,
+    /// Pause automatic continuation.
+    Pause,
+    /// Resume a paused objective.
+    Resume,
+    /// Remove the objective.
+    Clear,
+    /// Show goal command usage.
+    Help,
 }
 
 /// Subcommands for the `/skills` slash command.
@@ -196,6 +215,12 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
         "inspect or reload executable extensions",
         true
     ),
+    slash!(
+        "goal",
+        "/goal [objective|status|pause|resume|clear]",
+        "inspect or manage the durable session goal",
+        true
+    ),
     slash!("quit", "/quit", "exit Ygg", false),
 ];
 
@@ -273,6 +298,27 @@ pub fn complete_slash_command(input: &str) -> Option<String> {
     ))
 }
 
+fn parse_goal_command(argument: &str) -> GoalCommand {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        return GoalCommand::Status;
+    }
+
+    let mut words = argument.splitn(2, char::is_whitespace);
+    let first = words.next().unwrap_or_default();
+    let rest = words.next().map(str::trim).unwrap_or_default();
+    match first.to_ascii_lowercase().as_str() {
+        "status" if rest.is_empty() => GoalCommand::Status,
+        "pause" if rest.is_empty() => GoalCommand::Pause,
+        "resume" if rest.is_empty() => GoalCommand::Resume,
+        "clear" if rest.is_empty() => GoalCommand::Clear,
+        "help" if rest.is_empty() => GoalCommand::Help,
+        "set" if !rest.is_empty() => GoalCommand::Set(rest.to_owned()),
+        "set" => GoalCommand::Help,
+        _ => GoalCommand::Set(argument.to_owned()),
+    }
+}
+
 /// Parse a slash command without interpreting models, paths, or capabilities.
 pub fn parse(input: &str) -> Command {
     let input = input.trim();
@@ -335,6 +381,11 @@ pub fn parse(input: &str) -> Command {
             ["reload"] => Command::Extensions(ExtensionsSubcommand::Reload),
             _ => Command::Unknown(input.to_owned()),
         };
+    }
+
+    if full_name == "goal" {
+        let argument = body[name.len()..].trim();
+        return Command::Goal(parse_goal_command(argument));
     }
 
     if full_name == "help" {
