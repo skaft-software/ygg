@@ -8225,6 +8225,13 @@ async fn publish_tool_progress(
         .map_err(|_| ServiceError::Unavailable)
 }
 
+fn is_local_synthetic_assistant(entry: &Entry) -> bool {
+    entry
+        .metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.local_synthetic_assistant)
+}
+
 fn project_new_entries(
     session: &Session,
     workspace: &Path,
@@ -8238,6 +8245,9 @@ fn project_new_entries(
     let start = projection.known_entries.min(entries.len());
     let mut items = Vec::new();
     for entry in &entries[start..] {
+        if is_local_synthetic_assistant(entry) {
+            continue;
+        }
         let attachments = attachment_refs_for_entry(
             entry,
             attachment_store,
@@ -8425,11 +8435,15 @@ fn branch_delta_events(
 }
 
 fn project_branch_entry(entry: &Entry) -> Result<SessionBranchEntry, ServiceError> {
-    let kind = match &entry.value {
-        EntryValue::Message(Message::User(_)) => SessionBranchEntryKind::UserMessage,
-        EntryValue::Message(Message::Assistant(_)) => SessionBranchEntryKind::AssistantMessage,
-        EntryValue::Compaction { .. } => SessionBranchEntryKind::Compaction,
-        _ => SessionBranchEntryKind::Internal,
+    let kind = if is_local_synthetic_assistant(entry) {
+        SessionBranchEntryKind::Internal
+    } else {
+        match &entry.value {
+            EntryValue::Message(Message::User(_)) => SessionBranchEntryKind::UserMessage,
+            EntryValue::Message(Message::Assistant(_)) => SessionBranchEntryKind::AssistantMessage,
+            EntryValue::Compaction { .. } => SessionBranchEntryKind::Compaction,
+            _ => SessionBranchEntryKind::Internal,
+        }
     };
     Ok(SessionBranchEntry {
         entry_id: DurableEntryId::new(entry.id.0.clone()).map_err(|_| ServiceError::InvalidSeed)?,
@@ -8446,6 +8460,9 @@ fn project_branch_entry(entry: &Entry) -> Result<SessionBranchEntry, ServiceErro
 }
 
 fn branch_entry_label(entry: &Entry) -> String {
+    if is_local_synthetic_assistant(entry) {
+        return "Internal session state".into();
+    }
     let candidate = match &entry.value {
         EntryValue::Message(Message::User(message)) => entry
             .metadata
@@ -9021,6 +9038,9 @@ fn seed_from_session(
     }
     let mut pending_attachments = VecDeque::new();
     for entry in chain {
+        if is_local_synthetic_assistant(entry) {
+            continue;
+        }
         let attachments = attachment_refs_for_entry(
             entry,
             attachment_store,
@@ -14305,6 +14325,107 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn synthetic_failed_turn_marker_is_hidden_live_and_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("failed-turn-marker.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("question".into())],
+            })))
+            .unwrap();
+        let marker = "The previous assistant turn failed before completion. Do not continue that request unless the user asks again.";
+        let marker_id = session
+            .append_with_metadata(
+                EntryValue::Message(Message::Assistant(AssistantMessage {
+                    content: vec![AssistantPart::Text(marker.into())],
+                    model: ModelId("test-model".into()),
+                    protocol: Protocol::AnthropicMessages,
+                })),
+                Some(EntryMetadata {
+                    local_synthetic_assistant: true,
+                    ..EntryMetadata::default()
+                }),
+            )
+            .unwrap();
+        let diagnostic = "provider=custom/e2e model=e2e-model phase=connection";
+        session
+            .append_run_outcome(SessionRunOutcome {
+                status: SessionRunOutcomeStatus::Failed,
+                message: Some(diagnostic.into()),
+            })
+            .unwrap();
+
+        let session_id = SessionId::new("failed-turn-marker").unwrap();
+        let mut projection = ProjectionState::new(0);
+        let live = project_new_entries(
+            &session,
+            directory.path(),
+            &mut projection,
+            Some(&RunId::new("run-1-1").unwrap()),
+            None,
+            None,
+            &session_id,
+        )
+        .unwrap();
+        assert_eq!(projection.known_entries, session.entries().len());
+        assert!(!live
+            .iter()
+            .any(|item| matches!(item.payload, ItemPayload::AssistantMessage { .. })));
+        assert!(live.iter().any(|item| matches!(
+            &item.payload,
+            ItemPayload::RunOutcome {
+                outcome: ygg_serve_backend::RunOutcome::Failed,
+                message: Some(message),
+                ..
+            } if message == diagnostic
+        )));
+        assert!(!serde_json::to_string(&live).unwrap().contains(marker));
+
+        let branches = branch_graph(&session).unwrap();
+        let marker_branch = branches
+            .entries
+            .iter()
+            .find(|entry| entry.entry_id.as_str() == marker_id.0)
+            .expect("synthetic marker remains as a structural branch node");
+        assert_eq!(marker_branch.kind, SessionBranchEntryKind::Internal);
+        assert!(!marker_branch.checkoutable);
+        assert_eq!(marker_branch.label, "Internal session state");
+        assert!(!serde_json::to_string(&branches).unwrap().contains(marker));
+        branches.validate().unwrap();
+        drop(session);
+
+        let reopened = Session::open_read_only(&path).unwrap();
+        let seed = seed_from_session(
+            &reopened,
+            session_id,
+            SessionSeedOptions {
+                workspace: directory.path(),
+                project_id: None,
+                model: ModelSelection {
+                    provider: "test".into(),
+                    model: "test-model".into(),
+                    reasoning: "off".into(),
+                },
+                authority: AuthorityProfile::FullAccess,
+                generation: 2,
+                meta: None,
+                attachment_store: None,
+                resource_store: None,
+            },
+        )
+        .unwrap();
+        let public_snapshot = serde_json::to_string(&seed.snapshot).unwrap();
+        assert!(!public_snapshot.contains(marker));
+        assert!(public_snapshot.contains(diagnostic));
+        assert!(!seed
+            .snapshot
+            .items
+            .iter()
+            .any(|item| matches!(item.payload, ItemPayload::AssistantMessage { .. })));
     }
 
     #[test]

@@ -1624,7 +1624,8 @@ kbd {
 .transcript > .work-group.is-complete,
 .transcript > .approval-card,
 .transcript > .user-input-card,
-.transcript > .run-outcome {
+.transcript > .run-outcome,
+.transcript > .transcript-item-anchor > .run-outcome {
   content-visibility: auto;
   contain-intrinsic-block-size: auto 96px;
 }
@@ -3093,33 +3094,52 @@ kbd {
 
 .run-outcome {
   display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: center;
-  gap: 9px;
-  padding-top: 17px;
-  color: var(--text-soft);
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  margin: 8px 0 12px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface-raised));
 }
 
 .run-outcome > span {
-  width: 25px;
-  height: 25px;
+  width: 27px;
+  height: 27px;
   display: grid;
   place-items: center;
   border-radius: 50%;
-  color: var(--success);
-  background: color-mix(in srgb, var(--success) 12%, transparent);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 13%, transparent);
+}
+
+.run-outcome > span svg {
+  width: 15px;
+  height: 15px;
 }
 
 .run-outcome.is-entering > span {
   animation: completion-pulse 420ms cubic-bezier(0.165, 0.84, 0.44, 1);
 }
 
-.run-outcome.is-failed > span {
-  color: var(--danger);
+.run-outcome-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
-.run-outcome em {
-  color: var(--text-faint);
+.run-outcome-copy strong {
+  font-weight: 620;
+}
+
+.run-outcome-copy p {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: var(--font-meta);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .completion-review {
@@ -8280,14 +8300,6 @@ kbd {
   .user-input-form {
     align-items: stretch;
     flex-direction: column;
-  }
-
-  .run-outcome {
-    grid-template-columns: auto 1fr;
-  }
-
-  .run-outcome em {
-    grid-column: 2;
   }
 
   .completion-review-change-tree [role="treeitem"] > button > span {

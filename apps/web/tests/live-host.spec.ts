@@ -12,6 +12,7 @@ import {
   ERROR_DIAGNOSTIC,
   ERROR_PROMPT,
   EXPORT_CANARY,
+  FAILED_TURN_CONTEXT_MARKER,
   LIVE_API_MODEL,
   LIVE_MODEL_ID,
   LIVE_PROVIDER_ENDPOINT_ID,
@@ -549,23 +550,39 @@ test("runs the authenticated production host lifecycle end to end", async ({
       expect(JSON.stringify(snapshot.items)).not.toContain(BRANCH_B_PROMPT);
     });
 
-    await test.step("publishes bounded provider/phase diagnostics without credentials", async () => {
+    await test.step("publishes exhausted provider retries as a visible bounded failure", async () => {
       await sendPrompt(page, ERROR_PROMPT);
-      const request = await host.provider.waitForPrompt(ERROR_PROMPT);
-      expectDeterministicRequest(request);
+      for (let attempt = 1; attempt <= 4; attempt += 1) {
+        const request = await host.provider.waitForPromptAttempt(
+          ERROR_PROMPT,
+          attempt,
+        );
+        expectDeterministicRequest(request);
+      }
       const expected =
         `provider=${LIVE_PROVIDER_ENDPOINT_ID} model=${LIVE_MODEL_ID} phase=HTTP response`;
       await expect(page.locator(".header-status")).toHaveText("Failed");
 
+      const failure = page.locator(".run-outcome");
+      await expect(failure).toContainText("Model response failed");
+      await expect(failure).toContainText(expected);
+      await expect(page.getByText("Retrying", { exact: true })).toHaveCount(0);
+
       const snapshot = await sessionSnapshot(page, origin, sessionId);
       const publicSnapshot = JSON.stringify(snapshot);
       expect(publicSnapshot).toContain(expected);
-      expect(publicSnapshot).not.toContain("status 400");
+      expect(publicSnapshot).not.toContain("status 429");
       expect(publicSnapshot).not.toContain(ERROR_DIAGNOSTIC);
       expect(publicSnapshot).not.toContain(LIVE_PROVIDER_TOKEN);
-      expect(await page.locator("body").innerText()).not.toContain(
-        LIVE_PROVIDER_TOKEN,
-      );
+      expect(publicSnapshot).not.toContain(FAILED_TURN_CONTEXT_MARKER);
+      const visibleText = await page.locator("body").innerText();
+      expect(visibleText).not.toContain(LIVE_PROVIDER_TOKEN);
+      expect(visibleText).not.toContain(FAILED_TURN_CONTEXT_MARKER);
+      expect(
+        host.provider.requests.filter(
+          (request) => request.prompt === ERROR_PROMPT,
+        ),
+      ).toHaveLength(4);
     });
 
     host.provider.assertHealthy();

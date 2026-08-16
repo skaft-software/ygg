@@ -1604,7 +1604,21 @@ const TranscriptItemView = memo(function TranscriptItemView({
       );
 
     case "run_outcome":
-      return null;
+      if (item.outcome !== "failed") return null;
+      return (
+        <section
+          className={`run-outcome is-failed ${animate ? "is-entering" : ""}`}
+          role="alert"
+        >
+          <span>
+            <AlertTriangle aria-hidden="true" />
+          </span>
+          <div className="run-outcome-copy">
+            <strong>Model response failed</strong>
+            <p>{item.summary}</p>
+          </div>
+        </section>
+      );
 
   }
 });
@@ -1772,17 +1786,21 @@ function transcriptRows(items: TranscriptItem[]): TranscriptRow[] {
       }
       const ownsOutcome =
         lastWorkIndexByRun.get(identity) === lastIndex - 1;
+      const outcome = ownsOutcome ? outcomeByRun.get(identity) : undefined;
       rows.push({
         kind: "work",
         id: `work-${workItems[0]!.id}`,
         items: workItems,
-        outcome: ownsOutcome ? outcomeByRun.get(identity) : undefined,
+        // Failed outcomes carry the provider diagnostic, so keep them as
+        // standalone rows instead of collapsing them into the work summary.
+        outcome: outcome?.outcome === "failed" ? undefined : outcome,
       });
       index = lastIndex;
       continue;
     }
     if (
       item.kind === "run_outcome" &&
+      item.outcome !== "failed" &&
       lastWorkIndexByRun.has(workIdentity(item))
     ) {
       index += 1;
