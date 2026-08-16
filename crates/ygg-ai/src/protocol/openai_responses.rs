@@ -14,7 +14,7 @@ use crate::types::{
     ReasoningConfig, ReasoningMode, ReasoningState, ReasoningStateKind, Request, StopReason,
     ToolCallId, ToolChoice, ToolDef, ToolResultPart, Usage, UserPart,
 };
-use crate::validate::{normalize_request_reasoning, validate_request};
+use crate::validate::{normalize_reasoning_config, normalize_request_reasoning, validate_request};
 
 // --- Private OpenAI Responses Request DTOs ---
 
@@ -60,6 +60,10 @@ struct ResponsesRequest {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ResponsesInputItem {
+    AdditionalTools {
+        role: String,
+        tools: Vec<serde_json::Value>,
+    },
     Message {
         role: String,
         content: Vec<ResponsesContentPart>,
@@ -140,7 +144,7 @@ struct ResponsesReasoningConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    mode: Option<&'static str>,
+    context: Option<&'static str>,
     // Request visible summary deltas in addition to encrypted continuation
     // state. Without this, reasoning-capable Codex models think silently.
     summary: &'static str,
@@ -198,37 +202,98 @@ fn map_responses_tools(
     )
 }
 
+fn map_responses_lite_tools(
+    model: &crate::catalog::Model,
+    tools: &[ToolDef],
+) -> Vec<serde_json::Value> {
+    if tools.is_empty() || !model.spec.capabilities.tools {
+        return Vec::new();
+    }
+    let tools = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "strict": false,
+                "parameters": tool.parameters,
+            })
+        })
+        .collect::<Vec<_>>();
+    vec![serde_json::json!({
+        "type": "namespace",
+        "name": "functions",
+        "description": "",
+        "tools": tools,
+    })]
+}
+
+fn responses_lite_prefix(
+    model: &crate::catalog::Model,
+    instructions: Option<&str>,
+    tools: &[ToolDef],
+) -> Vec<crate::responses::ResponsesItem> {
+    let mut prefix = vec![opaque_input_item(ResponsesInputItem::AdditionalTools {
+        role: "developer".to_owned(),
+        tools: map_responses_lite_tools(model, tools),
+    })];
+    if let Some(instructions) = instructions.filter(|instructions| !instructions.is_empty()) {
+        prefix.push(opaque_input_item(ResponsesInputItem::Message {
+            role: "developer".to_owned(),
+            content: vec![ResponsesContentPart::InputText {
+                text: instructions.to_owned(),
+            }],
+        }));
+    }
+    prefix
+}
+
+fn responses_reasoning_effort(
+    model: &crate::catalog::Model,
+    effort: crate::types::ReasoningEffort,
+) -> &'static str {
+    use crate::types::{AgentDelegation, ReasoningEffort};
+
+    match effort {
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::Xhigh => "xhigh",
+        ReasoningEffort::Max => "max",
+        // Provider-advertised Ultra plus V2 denotes an agent orchestration
+        // tier. Current Codex wire requests use maximum model reasoning while
+        // the host supplies delegation.
+        ReasoningEffort::Ultra
+            if model.spec.capabilities.agent_delegation == Some(AgentDelegation::V2) =>
+        {
+            "max"
+        }
+        ReasoningEffort::Ultra => "ultra",
+    }
+}
+
 fn map_responses_reasoning(
     model: &crate::catalog::Model,
     reasoning: &ReasoningConfig,
-    reasoning_mode: ReasoningMode,
+    _reasoning_mode: ReasoningMode,
 ) -> Option<ResponsesReasoningConfig> {
     model.spec.capabilities.reasoning.as_ref()?;
     let effort = match reasoning {
-        ReasoningConfig::Effort(effort) => Some(
-            match effort {
-                crate::types::ReasoningEffort::Minimal => "minimal",
-                crate::types::ReasoningEffort::Low => "low",
-                crate::types::ReasoningEffort::Medium => "medium",
-                crate::types::ReasoningEffort::High => "high",
-                crate::types::ReasoningEffort::Xhigh => "xhigh",
-                crate::types::ReasoningEffort::Max => "max",
-            }
-            .to_owned(),
-        ),
+        ReasoningConfig::Effort(effort) => {
+            Some(responses_reasoning_effort(model, *effort).to_owned())
+        }
         ReasoningConfig::Off | ReasoningConfig::On | ReasoningConfig::Budget(_) => None,
     };
-    let mode = (reasoning_mode == ReasoningMode::Pro
-        && model
-            .spec
-            .capabilities
-            .reasoning
-            .as_ref()
-            .is_some_and(|capability| capability.supports_pro_mode))
-    .then_some("pro");
-    (effort.is_some() || mode.is_some()).then_some(ResponsesReasoningConfig {
+    let context = model
+        .spec
+        .capabilities
+        .responses_lite
+        .then_some("all_turns");
+    (effort.is_some() || context.is_some()).then_some(ResponsesReasoningConfig {
         effort,
-        mode,
+        context,
         summary: "auto",
     })
 }
@@ -258,7 +323,7 @@ fn map_responses_text(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_compact_request(
     model: &crate::catalog::Model,
-    input: crate::responses::ResponsesInput,
+    mut input: crate::responses::ResponsesInput,
     instructions: Option<String>,
     tools: &[ToolDef],
     reasoning: &ReasoningConfig,
@@ -270,20 +335,42 @@ pub(crate) fn build_compact_request(
     // The private ChatGPT Codex compact route accepts the same active tool and
     // generation controls as normal Responses calls. Public OpenAI compact
     // currently exposes a narrower schema and may reject these extra fields.
+    let responses_lite = model.spec.capabilities.responses_lite;
+    let reasoning = normalize_reasoning_config(reasoning, &model.spec.capabilities);
     let rich_codex_schema = model.endpoint.id.0 == "openai-codex"
         || model.spec.cache.session_affinity_format
-            == Some(crate::types::SessionAffinityFormat::Codex);
-    let tools = rich_codex_schema
-        .then(|| map_responses_tools(model, tools))
-        .flatten()
-        .map(|tools| {
-            tools
-                .into_iter()
-                .map(|tool| serde_json::to_value(tool).expect("Responses tool serializes"))
-                .collect()
-        });
+            == Some(crate::types::SessionAffinityFormat::Codex)
+        || responses_lite;
+    let mapped_tools = if responses_lite {
+        None
+    } else {
+        rich_codex_schema
+            .then(|| map_responses_tools(model, tools))
+            .flatten()
+            .map(|tools| {
+                tools
+                    .into_iter()
+                    .map(|tool| serde_json::to_value(tool).expect("Responses tool serializes"))
+                    .collect()
+            })
+    };
+    let parallel_tool_calls = if responses_lite {
+        Some(false)
+    } else {
+        mapped_tools
+            .as_ref()
+            .map(|_| model.spec.capabilities.parallel_tool_calls)
+    };
+    let (input, instructions) = if responses_lite {
+        input.strip_image_details_for_responses_lite();
+        let mut items = responses_lite_prefix(model, instructions.as_deref(), tools);
+        items.extend(input.into_items());
+        (crate::responses::ResponsesInput::new(items), None)
+    } else {
+        (input, instructions)
+    };
     let reasoning = rich_codex_schema
-        .then(|| map_responses_reasoning(model, reasoning, reasoning_mode))
+        .then(|| map_responses_reasoning(model, reasoning.as_ref(), reasoning_mode))
         .flatten()
         .map(|config| serde_json::to_value(config).expect("Responses reasoning serializes"));
     let text = rich_codex_schema
@@ -294,10 +381,8 @@ pub(crate) fn build_compact_request(
         model: model.spec.api_name.clone(),
         input,
         instructions,
-        parallel_tool_calls: tools
-            .as_ref()
-            .map(|_| model.spec.capabilities.parallel_tool_calls),
-        tools,
+        parallel_tool_calls,
+        tools: mapped_tools,
         reasoning,
         text,
         prompt_cache_key: prompt_cache_key_for(cache_retention, session_id),
@@ -310,6 +395,12 @@ pub(crate) fn responses_affinity_headers(
     session_id: Option<&str>,
 ) -> Result<http::HeaderMap, AiError> {
     let mut headers = http::HeaderMap::new();
+    if model.spec.capabilities.responses_lite {
+        headers.insert(
+            http::HeaderName::from_static("x-openai-internal-codex-responses-lite"),
+            http::HeaderValue::from_static("true"),
+        );
+    }
     let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
         return Ok(headers);
     };
@@ -692,7 +783,10 @@ pub(crate) fn build_request(
     );
 
     // 4. Map tools & tool_choice
-    let tools_opt = map_responses_tools(model, &req.tools);
+    let responses_lite = model.spec.capabilities.responses_lite;
+    let tools_opt = (!responses_lite)
+        .then(|| map_responses_tools(model, &req.tools))
+        .flatten();
 
     let tool_choice_opt = if !model.spec.capabilities.tools {
         None
@@ -739,20 +833,23 @@ pub(crate) fn build_request(
         req.max_output_tokens
     };
 
-    let wire_input = req
-        .responses
-        .as_ref()
-        .and_then(|options| options.input.as_ref())
-        .map(|input| serde_json::to_value(input).expect("ResponsesInput serializes"))
-        .unwrap_or_else(|| {
-            serde_json::to_value(canonical_input).expect("Responses input serializes")
-        });
     let responses_options = req.responses.as_ref();
-    let instructions = responses_options
-        .and_then(|options| options.input.as_ref())
+    let raw_input = responses_options.and_then(|options| options.input.as_ref());
+    let refresh_instructions = raw_input
         .is_some_and(crate::responses::ResponsesInput::contains_compaction)
         .then(|| req.system.clone())
         .flatten();
+    let mut input = raw_input.cloned().unwrap_or(canonical_input);
+    let instructions = if responses_lite {
+        input.strip_image_details_for_responses_lite();
+        let mut items = responses_lite_prefix(model, refresh_instructions.as_deref(), &req.tools);
+        items.extend(input.into_items());
+        input = crate::responses::ResponsesInput::new(items);
+        None
+    } else {
+        refresh_instructions
+    };
+    let wire_input = serde_json::to_value(input).expect("Responses input serializes");
     let responses_req = ResponsesRequest {
         model: model.spec.api_name.clone(),
         input: wire_input,
@@ -763,11 +860,15 @@ pub(crate) fn build_request(
             .and_then(|options| options.context_management.clone()),
         tools: tools_opt,
         tool_choice: tool_choice_opt,
-        // Do not rely on a provider default. A model advertised as sequential
-        // must receive `false`; a parallel-capable model receives `true`.
-        // Omit the setting entirely when no tools are exposed.
-        parallel_tool_calls: (!req.tools.is_empty() && model.spec.capabilities.tools)
-            .then_some(model.spec.capabilities.parallel_tool_calls),
+        // Responses Lite requires an explicit `false`. Otherwise, do not rely
+        // on a provider default when tools are exposed, and omit the field when
+        // there are no tools.
+        parallel_tool_calls: if responses_lite {
+            Some(false)
+        } else {
+            (!req.tools.is_empty() && model.spec.capabilities.tools)
+                .then_some(model.spec.capabilities.parallel_tool_calls)
+        },
         max_output_tokens,
         temperature: req.temperature,
         reasoning: reasoning_opt,
@@ -1609,7 +1710,6 @@ mod tests {
                         control: crate::types::ReasoningControl::Effort,
                         exposes_text: true,
                         preserves_state: true,
-                        supports_pro_mode: false,
                         effort_budgets: None,
                         openai_chat_mode: crate::types::OpenAiChatReasoningMode::Standard,
                         min_effort: crate::types::ReasoningEffort::Minimal,
@@ -1618,6 +1718,8 @@ mod tests {
                 } else {
                     None
                 },
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: true,
             },
             limits: ModelLimits {
@@ -1688,6 +1790,89 @@ mod tests {
         assert_eq!(body["input"][1]["role"], "user");
         assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][1]["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn responses_lite_uses_header_and_input_items_for_tools_and_instructions() {
+        let mut model = make_test_model(true);
+        let mut spec = (*model.spec).clone();
+        spec.capabilities.responses_lite = true;
+        spec.capabilities.agent_delegation = Some(crate::types::AgentDelegation::V2);
+        spec.capabilities.reasoning.as_mut().unwrap().max_effort =
+            crate::types::ReasoningEffort::Ultra;
+        model.spec = Arc::new(spec);
+
+        let mut req = user_req(
+            vec![UserPart::Text("Hello".to_owned())],
+            CompatibilityMode::Strict,
+        );
+        req.system = Some("System instructions".to_owned());
+        req.reasoning = ReasoningConfig::Effort(crate::types::ReasoningEffort::Ultra);
+        req.tools.push(ToolDef {
+            name: "read".to_owned(),
+            description: "Read a file".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+        });
+
+        let parts = build_request(&model, &req).unwrap();
+        assert_eq!(
+            parts
+                .headers
+                .get("x-openai-internal-codex-responses-lite")
+                .unwrap(),
+            "true"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["tools"][0]["type"], "namespace");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "functions");
+        assert_eq!(body["input"][0]["tools"][0]["tools"][0]["name"], "read");
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            "System instructions"
+        );
+        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert!(body["reasoning"].get("mode").is_none());
+    }
+
+    #[test]
+    fn responses_lite_disables_parallel_calls_without_tools_and_strips_image_detail() {
+        let mut model = make_test_model(true);
+        let mut spec = (*model.spec).clone();
+        spec.capabilities.responses_lite = true;
+        model.spec = Arc::new(spec);
+
+        let req = user_req(
+            vec![UserPart::Media(Media::Image(ImageMedia {
+                source: ImageSource::Url(url::Url::parse("https://example.com/image.png").unwrap()),
+                media_type: None,
+                detail: Some(crate::types::ImageDetail::High),
+            }))],
+            CompatibilityMode::Strict,
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["tools"], serde_json::json!([]));
+        assert_eq!(body["input"][1]["role"], "user");
+        assert_eq!(
+            body["input"][1]["content"][0]["image_url"],
+            "https://example.com/image.png"
+        );
+        assert!(body["input"][1]["content"][0].get("detail").is_none());
     }
 
     #[test]
@@ -1823,33 +2008,27 @@ mod tests {
     }
 
     #[test]
-    fn pro_reasoning_mode_is_serialized_only_for_entitled_routes() {
-        let base = make_test_model(true);
-        let mut spec = (*base.spec).clone();
-        spec.capabilities
-            .reasoning
-            .as_mut()
-            .unwrap()
-            .supports_pro_mode = true;
-        let model = Model {
-            spec: Arc::new(spec),
-            endpoint: base.endpoint.clone(),
-        };
+    fn legacy_pro_reasoning_mode_is_never_serialized() {
+        let model = make_test_model(true);
         let mut req = user_req(
             vec![UserPart::Text("review this migration".to_string())],
-            CompatibilityMode::Strict,
+            CompatibilityMode::Lossy,
         );
         req.reasoning = ReasoningConfig::Effort(crate::types::ReasoningEffort::Medium);
         req.reasoning_mode = crate::types::ReasoningMode::Pro;
 
         let parts = build_request(&model, &req).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
-        assert_eq!(body["reasoning"]["mode"], "pro");
+        assert!(body["reasoning"].get("mode").is_none());
         assert_eq!(body["reasoning"]["effort"], "medium");
+        assert!(parts
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "ignored_reasoning_mode"));
 
-        let unsupported = build_request(&make_test_model(true), &req);
+        req.compatibility = CompatibilityMode::Strict;
         assert!(matches!(
-            unsupported,
+            build_request(&model, &req),
             Err(AiError::Unsupported(
                 crate::error::UnsupportedError::ReasoningMode
             ))
@@ -1899,17 +2078,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_emits_xhigh_and_max_strings() {
-        // The two top tiers map to their wire strings; `max` is what engages
-        // gpt-5.6-sol's server-side subagents.
+    fn reasoning_effort_emits_xhigh_max_and_ultra_strings() {
         for (effort, expected) in [
             (crate::types::ReasoningEffort::Xhigh, "xhigh"),
             (crate::types::ReasoningEffort::Max, "max"),
+            (crate::types::ReasoningEffort::Ultra, "ultra"),
         ] {
             let mut model = make_test_model(true);
             let mut spec = (*model.spec).clone();
             spec.capabilities.reasoning.as_mut().unwrap().max_effort =
-                crate::types::ReasoningEffort::Max;
+                crate::types::ReasoningEffort::Ultra;
             model.spec = std::sync::Arc::new(spec);
             let mut req = user_req(
                 vec![UserPart::Text("hi".to_string())],

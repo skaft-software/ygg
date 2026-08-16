@@ -32,7 +32,7 @@
 
 ---
 
-ygg is a local-first coding agent written in Rust. It combines a provider-independent inference layer, durable branchable sessions, explicit tools, image and audio input, configurable compaction, and a customizable terminal interface.
+ygg is a local-first coding agent written in Rust. It combines a provider-independent inference layer, durable branchable sessions, explicit tools, image and audio input, configurable compaction, model-advertised Ultra reasoning with bounded task delegation, and a customizable terminal interface.
 
 It supports local OpenAI-compatible servers alongside OpenAI, Anthropic, OpenRouter, and other hosted providers. There is no hosted ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local, inspectable JSONL.
 
@@ -179,6 +179,18 @@ ChatGPT subscription users can use the hosted device flow instead of manually ma
 ygg --login codex
 ygg --model gpt-5.6
 ```
+
+When that account's live Codex catalog advertises both the `ultra` effort and
+V2 collaboration for the selected model, Ultra enables maximum reasoning plus
+automatic bounded task delegation:
+
+```sh
+ygg --model gpt-5.6-sol --reasoning ultra
+```
+
+Ygg does not infer Ultra, collaboration, or the Responses Lite transport from a
+model name or subscription plan. Account-scoped cached live metadata is honored;
+a missing or unusable cache falls back conservatively without those capabilities.
 
 ### Use custom OpenAI-compatible providers
 
@@ -327,14 +339,23 @@ Built-in provider presets include OpenAI, Anthropic, OpenRouter, DeepSeek, Groq,
 
 Capability handling is model-specific. ygg validates modalities, tool use, structured output, output limits, and reasoning before sending a request. When a custom endpoint reports an exact reasoning control—off-only, binary on/off, or named levels—the picker and request wire values follow that metadata exactly.
 
+Codex routes that advertise Responses Lite use that transport contract for both
+ordinary and native compact requests. Ygg sends the Lite header, places tool
+schemas and developer instructions in input items, explicitly disables parallel
+tool calls, requests reasoning context across all turns, and removes only
+unsupported image-detail hints. This behavior is capability-driven rather than
+coupled to an endpoint name or OAuth plan.
+
 ### Reasoning without transcript noise
 
-Reasoning is collapsed by default while remaining available with `Ctrl+O`. During generation, a fixed two-row status uses the generating model's lab color: its activity dot blinks beside a plain-weight label. It shows only the latest explicit Markdown heading emitted by the model—an ATX heading or standalone bold-heading paragraph—and falls back to `Thinking`; ordinary reasoning body text is never promoted into the collapsed label. Completed reasoning disappears again when collapsed.
+Reasoning is collapsed by default while remaining available with `Ctrl+O`. During generation, a fixed two-row status uses a blinking, model-colored event-margin dot beside a plain-weight label, with an aligned disclosure elbow below. It shows only the latest explicit Markdown heading emitted by the model—an ATX heading or standalone bold-heading paragraph—and falls back to `Thinking`; ordinary reasoning body text is never promoted into the collapsed label. Expanded reasoning keeps the same inset without an event-margin dot or a synthetic first-line bullet. Completed reasoning disappears again when collapsed.
 
 ```text
 • Verifying the implementation
-  └ (ctrl+o to expand)
+  ⎿ (ctrl+o to expand)
 ```
+
+Event-margin dots identify active collapsed reasoning, assistant responses, and tool or shell execution. The collapsed-reasoning dot blinks; other active dots pulse through foreground and muted tones without changing glyph size. Successful completed events use green, and failed tools use red.
 
 Select a supported level at launch or while the session is running:
 
@@ -351,9 +372,27 @@ ygg --reasoning high
 /thinking high
 /thinking xhigh
 /thinking max
+/thinking ultra
 ```
 
-The available choices are narrowed to the selected model. Token-budget reasoning is also available for compatible models with `--reasoning budget=N`.
+The available choices are narrowed to the selected model. `ultra` appears only
+when the model advertises Ultra effort and a V2 collaboration protocol that this
+Ygg build can execute. Selecting it installs six collaboration tools
+(`spawn_agent`, `followup_task`, `send_message`, `wait_agent`, `list_agents`, and
+`interrupt_agent`) and tells the root agent to delegate when parallel work would
+materially improve speed or quality.
+
+One Ultra team defaults to four concurrent agents including the root, depth two,
+and sixteen total agents over its lifetime. Children use isolated durable
+sessions, inherit the root's approved tools, sandbox, model, reasoning,
+compaction, completion, output, retry, and cost policies, and are cancelled with
+their descendants when the owning run stops. Team state lives under the session
+directory's private `.delegation/team-*` tree with a synced
+`provenance.jsonl`; persistence failure stops the team rather than continuing
+without an audit trail.
+
+Token-budget reasoning is also available for compatible models with
+`--reasoning budget=N`.
 
 ### Multimodal prompts
 
@@ -512,7 +551,6 @@ Example `~/.ygg/config.toml`:
 ```toml
 model = "custom/Qwen3 Coder Next"
 reasoning = "high"
-reasoning_mode = "standard"
 system_prompt = "You are a careful and concise reviewer."
 cache_retention = "short"
 theme = "default"
@@ -544,7 +582,14 @@ keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_REASONING_MODE`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+
+`reasoning_mode = "pro"`, `YGG_REASONING_MODE=pro`, and
+`--reasoning-mode pro` are accepted only to load legacy configuration and
+sessions. Ygg migrates that selection to `reasoning = "ultra"` only when current
+model metadata advertises complete Ultra/V2 support; otherwise it removes the
+obsolete mode, keeps the independently selected supported effort, and emits a
+warning. New configuration should use `reasoning` alone.
 
 ### CLI reference
 
@@ -553,7 +598,7 @@ Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, 
 | Provider auth | `--login`, `--logout`, `--headless` |
 | Frontend | `--print`, `--plain`, `--color`, `--mouse`, `--show-reasoning` |
 | Session | `--continue`, `--resume`, `--session-dir`, `sessions ...` |
-| Model | `--model`, `--reasoning`, `--reasoning-mode`, `--cache-retention`, `--max-turns` |
+| Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
 | Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--shell-path` |
 | Limits | `--bash-timeout-secs`, `--max-output-bytes` |
@@ -621,15 +666,15 @@ flowchart LR
 
 ### `ygg-ai`
 
-The provider-independent inference crate owns canonical messages, media, tools, reasoning state, structured output, request validation, cross-protocol conversion, authentication, exact integer pricing, SSE parsing, and streaming completion assembly.
+The provider-independent inference crate owns canonical messages, media, tools, reasoning state and effort, structured output, request validation, cross-protocol conversion, authentication, exact integer pricing, SSE parsing, streaming completion assembly, and capability-driven Responses Lite encoding. Collaboration metadata remains a model capability here; host orchestration does not.
 
 ### `ygg-agent`
 
-The agent runtime owns sessions, context reconstruction, compaction, tool execution, steering, follow-ups, cancellation, retries, checkpoints, usage records, cache accounting, and the event stream consumed by frontends.
+The agent runtime owns sessions, context reconstruction, compaction, tool execution, steering, follow-ups, cancellation, retries, checkpoints, usage records, cache accounting, the frontend event stream, and the bounded V2 delegation runtime with isolated child sessions and durable provenance.
 
 ### `ygg-coding-agent`
 
-The product crate owns configuration, provider discovery, credentials, prompts, resources, extensions, session commands, hydration, terminal presentation, themes, and the three user-facing modes.
+The product crate owns configuration, provider discovery, credentials, prompts, resources, extensions, session commands, hydration, terminal presentation, themes, and the three user-facing modes. It decides whether live metadata and the available host runtime form complete Ultra semantics and enables proactive V2 delegation only for that selection.
 
 ### `sexy-tui-rs`
 
@@ -644,7 +689,8 @@ ygg is intentionally honest about where its boundary ends.
 - **Workspace paths:** descriptor-relative, no-follow file operations prevent parent-symlink replacement from redirecting built-in reads and mutations.
 - **Bounded inputs:** provider streams, discovery payloads, configuration, credentials, context, sessions, tool arguments/results, and local reads have byte/count limits.
 - **Crash behavior:** complete records survive; a torn final append is narrowly repairable; unresolved mutation is reported as indeterminate and never replayed.
-- **Cancellation:** provider streams, retry waits, compaction, tools, and descendant process groups observe cancellation.
+- **Cancellation:** provider streams, retry waits, compaction, tools, delegated agents, and descendant process/agent groups observe cancellation.
+- **Delegation provenance:** Ultra team directories and files are owner-private and created through descriptor-relative, no-follow operations. Spawns, messages, follow-ups, status changes, and interrupts are synced before becoming visible; a journal failure cancels the team and rejects further work.
 - **Network recovery:** non-timeout connection-establishment failures and response-body disconnects retry up to five times with visible diagnostics; provisional TUI output is discarded before replacement. Full transport timeouts are terminal. Failures while sending a POST or awaiting response headers are also terminal because provider acceptance is ambiguous.
 - **Secret handling:** credential files are owner-private, sensitive headers are marked, redirects are disabled, provider diagnostics redact request credentials, debug formatting redacts secrets, and session export applies bounded deterministic redaction.
 - **Terminal safety:** untrusted terminal controls are neutralized; terminal capabilities degrade without changing semantic content.

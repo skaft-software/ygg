@@ -69,7 +69,6 @@ pub(super) fn render_block_planned(
             width,
             verbose_tools,
             content_background,
-            true,
         ),
         TranscriptBlock::Tool(panel) => {
             let compact_bash = matches!(panel.name.as_str(), "bash" | "exec")

@@ -164,6 +164,14 @@ pub struct Capabilities {
     pub parallel_tool_calls: bool,
     /// Model reasoning capability options, if supported.
     pub reasoning: Option<ReasoningCapability>,
+    /// Whether this Responses route uses the compact Codex request envelope.
+    /// In that envelope instructions and tool definitions are carried as input
+    /// items rather than top-level request fields.
+    #[serde(default)]
+    pub responses_lite: bool,
+    /// Host-side agent collaboration protocol supported by this model.
+    #[serde(default)]
+    pub agent_delegation: Option<AgentDelegation>,
     /// Whether the model supports structured outputs (JSON schema / mode).
     pub structured_output: bool,
 }
@@ -226,6 +234,15 @@ pub enum Modality {
     Audio,
 }
 
+/// Host-side collaboration protocol advertised for a model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDelegation {
+    /// Codex-style task collaboration with named agents, messaging, waiting,
+    /// interruption, and bounded nested spawning.
+    V2,
+}
+
 /// Model reasoning capabilities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningCapability {
@@ -235,10 +252,6 @@ pub struct ReasoningCapability {
     pub exposes_text: bool,
     /// Whether the model preserves reasoning/thinking signatures or state for continuation.
     pub preserves_state: bool,
-    /// Whether this exact model route is entitled to OpenAI Responses pro mode.
-    /// This is false for API-key routes and non-Pro subscription accounts.
-    #[serde(default)]
-    pub supports_pro_mode: bool,
     /// Budget maps from portable effort to token budgets, required iff control is TokenBudget.
     pub effort_budgets: Option<ReasoningEffortBudgets>,
     /// OpenAI Chat-Completions-specific reasoning behavior.
@@ -915,21 +928,23 @@ pub enum ReasoningConfig {
     Budget(u64),
 }
 
-/// Reasoning execution mode.
+/// Legacy reasoning execution mode retained only for loading older clients and
+/// persisted sessions. New callers should select a [`ReasoningEffort`].
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningMode {
-    /// Normal model execution.
+    /// Ordinary effort-based execution.
     #[default]
     Standard,
-    /// Additional model work for difficult requests. This is available only on
-    /// explicitly entitled OpenAI Responses subscription routes.
+    /// Historical Codex Pro selection. Product layers migrate this to
+    /// [`ReasoningEffort::Ultra`] when the selected model advertises complete
+    /// V2 delegation support; protocol codecs never serialize a mode field.
     Pro,
 }
 
 /// High-level reasoning effort presets.
 ///
-/// Variant declaration order is the semantic ordering (`Minimal` < … < `Max`);
+/// Variant declaration order is the semantic ordering (`Minimal` < … < `Ultra`);
 /// the derived `Ord` is used to clamp a requested effort down to a model's
 /// highest supported tier.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -945,10 +960,12 @@ pub enum ReasoningEffort {
     High,
     /// Extra-high reasoning effort (between `High` and `Max`).
     Xhigh,
-    /// Maximum reasoning effort. On effort-controlled backends this selects the
-    /// strongest tier the provider exposes through the ordinary effort
-    /// parameter (e.g. engaging server-side subagents on `gpt-5.6-sol`).
+    /// Maximum ordinary reasoning effort.
     Max,
+    /// Highest Codex reasoning tier. Models may pair this effort with
+    /// host-managed proactive task delegation when they separately advertise a
+    /// supported collaboration protocol.
+    Ultra,
 }
 
 /// Requested output modalities.
@@ -1216,12 +1233,13 @@ mod tests {
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: false,
-                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: OpenAiChatReasoningMode::Standard,
                     min_effort: ReasoningEffort::Minimal,
                     max_effort: ReasoningEffort::High,
                 }),
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: true,
             },
             limits: ModelLimits {

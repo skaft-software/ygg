@@ -822,11 +822,13 @@ impl AiClient {
         }
         let rich_codex_schema = model.endpoint.id.0 == "openai-codex"
             || model.spec.cache.session_affinity_format
-                == Some(crate::types::SessionAffinityFormat::Codex);
+                == Some(crate::types::SessionAffinityFormat::Codex)
+            || model.spec.capabilities.responses_lite;
         if !rich_codex_schema {
             // Public OpenAI compact has a narrower body than the private Codex
-            // route. Fail closed at the transport boundary even for callers
-            // that constructed the public DTO manually.
+            // and Responses Lite contracts. Fail closed at the transport
+            // boundary even for callers that constructed the public DTO
+            // manually.
             request.tools = None;
             request.parallel_tool_calls = None;
             request.reasoning = None;

@@ -18,8 +18,8 @@ use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use ygg_agent::{
     AgentCompactionMode, AgentError, AgentEvent, BashTool, CancellationToken, EntryValue,
-    FinishReason, InputPart, OutputChannel, QueueDeliveryMode, Run, RunControl, SandboxConfig,
-    SkillRegistry, Tool, ToolContext, ToolProgress, ToolProgressSink, UserInput,
+    InputPart, OutputChannel, QueueDeliveryMode, Run, RunControl, SandboxConfig, SkillRegistry,
+    Tool, ToolContext, ToolProgress, ToolProgressSink, UserInput,
 };
 use ygg_ai::{
     AssistantMessage, AssistantPart, Cost, ImageSource, Media, Message, Modality, Model, ModelId,
@@ -32,6 +32,7 @@ use crate::app::{
 };
 use crate::compaction::{attempt_compaction, estimate_text_tokens, CompactionOutcome};
 use crate::config::{CompactionMode, ThinkingLevel};
+use crate::modes::HostRunOutcome;
 use crate::prompts::{PromptRegistry, PromptRenderContext};
 use crate::resources::{compose_instructions, expand_skill_command};
 
@@ -1416,7 +1417,7 @@ impl EventTranslator {
         event: AgentEvent,
         output: &mut RpcOutput,
         queue: &mut QueueState,
-    ) -> anyhow::Result<Option<FinishReason>> {
+    ) -> anyhow::Result<Option<HostRunOutcome>> {
         match event {
             AgentEvent::OutputDelta { channel, text } => self.emit_delta(output, channel, text)?,
             // The final TurnFinished message carries generated media in the
@@ -1617,36 +1618,49 @@ impl EventTranslator {
                 }
             }
             AgentEvent::RunFinished { reason, .. } => {
-                self.finish_pending_turn(output)?;
-                let (stop_reason, owned_error) = match &reason {
-                    FinishReason::Completed => (None, None),
-                    FinishReason::Aborted => {
-                        (Some("aborted"), Some("Operation aborted".to_owned()))
-                    }
-                    FinishReason::MaxTurns => (
-                        Some("error"),
-                        Some("Maximum agent turns reached".to_owned()),
-                    ),
-                    FinishReason::Failed(error) => (
-                        Some("error"),
-                        Some(rpc_error_diagnostic(&self.model, error)),
-                    ),
-                };
-                if let Some(stop_reason) = stop_reason {
-                    self.finish_interrupted(output, stop_reason, owned_error.as_deref())?;
-                }
-                if let Some(attempt) = self.retry_attempt.take() {
-                    self.pending_retry_end = Some(json!({
-                        "type": "auto_retry_end",
-                        "success": false,
-                        "attempt": attempt,
-                        "finalError": owned_error
-                    }));
-                }
-                return Ok(Some(reason));
+                let outcome = HostRunOutcome::from_finish_reason(
+                    &reason,
+                    &self.model.endpoint.id.0,
+                    &self.model.spec.id.0,
+                );
+                self.settle(outcome.clone(), output)?;
+                return Ok(Some(outcome));
             }
         }
         Ok(None)
+    }
+
+    fn settle(&mut self, outcome: HostRunOutcome, output: &mut RpcOutput) -> anyhow::Result<()> {
+        self.finish_pending_turn(output)?;
+        let (stop_reason, owned_error) = match &outcome {
+            HostRunOutcome::Completed => (None, None),
+            HostRunOutcome::Aborted => (Some("aborted"), Some("Operation aborted".to_owned())),
+            HostRunOutcome::MaxTurns => (
+                Some("error"),
+                Some("Maximum agent turns reached".to_owned()),
+            ),
+            HostRunOutcome::Failed(error) => (Some("error"), Some(error.clone())),
+            HostRunOutcome::StreamLost => (
+                Some("error"),
+                Some(crate::modes::RUN_STREAM_LOST_MESSAGE.to_owned()),
+            ),
+            HostRunOutcome::Shutdown => (
+                Some("aborted"),
+                Some(crate::modes::RUN_SHUTDOWN_MESSAGE.to_owned()),
+            ),
+        };
+        if let Some(stop_reason) = stop_reason {
+            self.finish_interrupted(output, stop_reason, owned_error.as_deref())?;
+        }
+        if let Some(attempt) = self.retry_attempt.take() {
+            self.pending_retry_end = Some(json!({
+                "type": "auto_retry_end",
+                "success": false,
+                "attempt": attempt,
+                "finalError": owned_error
+            }));
+        }
+        Ok(())
     }
 }
 
@@ -1844,7 +1858,7 @@ async fn drive_run(
     translator: &mut EventTranslator,
     queue: &mut QueueState,
     settings: &mut RpcSettings,
-) -> anyhow::Result<(VecDeque<Value>, bool, FinishReason)> {
+) -> anyhow::Result<(VecDeque<Value>, bool, HostRunOutcome)> {
     let control = run.control();
     control.set_steering_mode(settings.steering_mode()).await?;
     control
@@ -1864,6 +1878,17 @@ async fn drive_run(
     let finish = loop {
         tokio::select! {
             biased;
+            _ = crate::tui::terminal::wait_for_shutdown_signal() => {
+                control.abort();
+                ygg_agent::extension_process::terminate_bash_process_groups(
+                    std::time::Duration::from_millis(400),
+                )
+                .await;
+                // Coordinated process shutdown truncates the active RPC turn.
+                // Avoid emitting a partial settlement tail that cannot be
+                // followed by `agent_end` and `agent_settled`.
+                break HostRunOutcome::shutdown();
+            }
             inbound = input.recv(), if !eof => match inbound {
                 Some(RpcInput::Value(command)) => {
                     active_input(
@@ -1880,7 +1905,9 @@ async fn drive_run(
             },
             event = run.next() => {
                 let Some(event) = event else {
-                    anyhow::bail!("agent run ended without RunFinished");
+                    let outcome = HostRunOutcome::stream_lost();
+                    translator.settle(outcome.clone(), output)?;
+                    break outcome;
                 };
                 if let Some(reason) = translator.observe(event, output, queue)? {
                     break reason;
@@ -2525,6 +2552,10 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
         .await?;
         drop(run);
         app.agent.set_system_prompt(app.system.clone());
+        if finish.shutdown_requested() {
+            app.executable_extensions.shutdown().await;
+            return Ok(());
+        }
         deferred.extend(queued);
         eof = input_eof;
         output.send(json!({
@@ -2536,7 +2567,7 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
             output.send(event)?;
         }
         output.send(json!({"type": "agent_settled"}))?;
-        if matches!(finish, FinishReason::Completed) {
+        if finish.allows_after_response() {
             for notification in app
                 .executable_extensions
                 .after_response(&translator.last_assistant_text)

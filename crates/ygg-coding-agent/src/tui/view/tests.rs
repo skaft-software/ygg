@@ -174,6 +174,59 @@ fn emulate_rows(lines: &[String], width: u16) -> vt100::Parser {
     terminal
 }
 
+fn assert_input_suggestions_replace_status_footer(
+    shell: &mut InteractiveShell,
+    expected_hint: &str,
+) {
+    const WIDTH: u16 = 120;
+    shell.set_size(WIDTH, 24);
+    shell.set_context_estimate(80, 272_000);
+
+    let state = shell.state.borrow();
+    let now = Instant::now();
+    let standalone_composer =
+        crate::tui::composer_surface::render_composer_surface(&state, WIDTH, now);
+    assert!(strip_terminal_sequences(
+        standalone_composer
+            .last()
+            .expect("standalone composer should include its status footer")
+    )
+    .contains("80/272k"));
+
+    let chrome = shell_chrome(&state, WIDTH, now);
+    assert!(!chrome.suggestions.is_empty());
+    assert!(chrome
+        .suggestions
+        .iter()
+        .any(|line| { strip_terminal_sequences(line).contains(expected_hint) }));
+    assert!(
+        chrome
+            .composer
+            .iter()
+            .all(|line| !strip_terminal_sequences(line).contains("80/272k")),
+        "autocomplete must replace the model and token status row"
+    );
+
+    let expected_tail = chrome
+        .composer
+        .iter()
+        .chain(&chrome.suggestions)
+        .cloned()
+        .collect::<Vec<_>>();
+    for (mode, rendered) in [
+        ("terminal-owned", render_shell_at(&state, WIDTH, now)),
+        (
+            "application-owned",
+            render_shell_viewport_at(&state, WIDTH, now),
+        ),
+    ] {
+        assert!(
+            rendered.ends_with(&expected_tail),
+            "{mode} suggestions must replace the status row below the composer"
+        );
+    }
+}
+
 /// `vt100` 0.15 ignores ED 3. Recreate its grid at the final saved-line
 /// clear so protocol tests can model the destructive reset before replay.
 /// This deliberately does not pretend to model modern terminal reflow.
@@ -789,6 +842,7 @@ fn slash_command_menu_lists_commands_and_tab_completes_a_unique_prefix() {
         assert!(!popup.contains(removed), "{removed} remained in {popup}");
     }
     assert!(popup.contains("› /new"));
+    assert_input_suggestions_replace_status_footer(&mut shell, "commands");
 
     shell.slash_menu(SlashMenuAction::Last);
     let scrolled = render_slash_suggestions(&shell.state.borrow(), 80, 7).join("\n");
@@ -800,6 +854,12 @@ fn slash_command_menu_lists_commands_and_tab_completes_a_unique_prefix() {
     shell.slash_menu(SlashMenuAction::Select);
     assert_eq!(shell.pending(), "/resume ");
     assert!(!shell.slash_popup_open());
+    let restored = shell_chrome(&shell.state.borrow(), 120, Instant::now());
+    assert!(restored.suggestions.is_empty());
+    assert!(restored
+        .composer
+        .iter()
+        .any(|line| strip_terminal_sequences(line).contains("80/272k")));
 
     shell.drain_editor();
     shell.apply_edit(EditAction::Char('/'));
@@ -808,6 +868,70 @@ fn slash_command_menu_lists_commands_and_tab_completes_a_unique_prefix() {
     }
     shell.complete_slash_command();
     assert_eq!(shell.pending(), "/model ");
+}
+
+#[test]
+fn inline_autocomplete_uses_compact_footers_and_the_model_accent() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), b"x").unwrap();
+
+    let mut shell = InteractiveShell::test_shell();
+    {
+        let mut state = shell.state.borrow_mut();
+        crate::tui::theme::apply_model_lab(&mut state.theme, ModelLab::Anthropic);
+        state.model_lab = Some(ModelLab::Anthropic);
+    }
+    let accent = {
+        let state = shell.state.borrow();
+        let (red, green, blue) = state
+            .theme
+            .model_rgb(state.model_lab)
+            .expect("model accent");
+        format!("\x1b[38;2;{red};{green};{blue}m")
+    };
+
+    shell.apply_edit(EditAction::Char('/'));
+    let slash = render_slash_suggestions(&shell.state.borrow(), 120, 6);
+    assert_eq!(slash.len(), 6, "{slash:?}");
+    let selected = slash.first().expect("selected slash suggestion");
+    assert!(
+        strip_terminal_sequences(selected).starts_with("  › /new"),
+        "{slash:?}"
+    );
+    assert!(selected.contains(&accent), "{selected:?}");
+    let unselected = slash
+        .iter()
+        .find(|line| line.contains("/resume"))
+        .expect("unselected slash suggestion");
+    assert!(!unselected.contains(&accent), "{unselected:?}");
+    let footer = slash.last().expect("slash suggestion footer");
+    let plain_footer = strip_terminal_sequences(footer);
+    assert!(
+        plain_footer.contains("commands 1–5/")
+            && plain_footer.contains("↑↓ navigate · ↵ select · esc close"),
+        "{plain_footer:?}"
+    );
+    assert!(footer.contains(&accent), "{footer:?}");
+
+    shell.drain_editor();
+    shell.set_workspace(dir.path().to_path_buf());
+    for character in "see @main".chars() {
+        shell.apply_edit(EditAction::Char(character));
+    }
+    let paths = shell_chrome(&shell.state.borrow(), 120, Instant::now()).suggestions;
+    let selected = paths
+        .iter()
+        .find(|line| line.contains("src/main.rs"))
+        .expect("selected mention suggestion");
+    assert_eq!(strip_terminal_sequences(selected).trim(), "› src/main.rs");
+    assert!(selected.contains(&accent), "{selected:?}");
+    let footer = paths.last().expect("mention suggestion footer");
+    assert_eq!(
+        strip_terminal_sequences(footer).trim(),
+        "project files · tab complete"
+    );
+    assert!(footer.contains(&accent), "{footer:?}");
 }
 
 #[test]
@@ -907,8 +1031,9 @@ fn mention_completion_inserts_path_reference_for_text_files() {
     let rendered = render_shell(&shell.state.borrow(), 120);
     assert!(rendered
         .iter()
-        .any(|line| line.contains("project files · tab completes")));
+        .any(|line| { strip_terminal_sequences(line).contains("project files · tab complete") }));
     assert!(rendered.iter().any(|line| line.contains("src/main.rs")));
+    assert_input_suggestions_replace_status_footer(&mut shell, "project files");
     shell.complete_path();
     assert_eq!(shell.pending(), "see @src/main.rs ");
 }
@@ -928,8 +1053,9 @@ fn literal_path_completion_descends_through_directories() {
     let rendered = render_shell(&shell.state.borrow(), 120);
     assert!(rendered
         .iter()
-        .any(|line| line.contains("paths · tab completes")));
+        .any(|line| strip_terminal_sequences(line).contains("paths · tab complete")));
     assert!(rendered.iter().any(|line| line.contains("./src/")));
+    assert_input_suggestions_replace_status_footer(&mut shell, "paths");
 
     shell.complete_path();
     assert_eq!(shell.pending(), "inspect ./src/");
@@ -1199,10 +1325,10 @@ fn steering_messages_are_queued_above_prompt_and_delivered_as_a_batch() {
     assert!(queue < prompt);
     assert!(plain
         .iter()
-        .any(|line| line.starts_with("    ↳ check the docs")));
+        .any(|line| line.starts_with("  ⎿ check the docs")));
     assert!(plain
         .iter()
-        .any(|line| line.starts_with("    ↳ then run the tests")));
+        .any(|line| line.starts_with("  ⎿ then run the tests")));
 
     shell.on_agent_event(&AgentEvent::SteeringDelivered {
         messages: vec!["check the docs".into(), "then run the tests".into()],
@@ -3182,7 +3308,7 @@ fn short_transcript_chrome_follows_content_without_viewport_padding() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(steering_plain.contains("Steering prompt · queued"));
-    assert!(steering_plain.contains("    ↳ also inspect tests"));
+    assert!(steering_plain.contains("  ⎿ also inspect tests"));
 
     // The native-scrollback renderer retains committed transcript rows and
     // returns only the mutable suffix after the first frame.
@@ -3239,6 +3365,14 @@ fn slash_popup_height_changes_use_differential_repaint() {
     let mut frame = ShellFrameState::default();
     let initial = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
     assert!(!initial.reanchor_viewport);
+    let composer_row = |update: &sexy_tui_rs::FrameUpdate| {
+        update
+            .replacement
+            .iter()
+            .position(|line| line.contains(CURSOR_MARKER))
+            .expect("composer cursor row")
+    };
+    let initial_composer_row = composer_row(&initial);
 
     for _ in 0..3 {
         shell.apply_edit(EditAction::Backspace);
@@ -3249,6 +3383,11 @@ fn slash_popup_height_changes_use_differential_repaint() {
         !expanded.reanchor_viewport,
         "growing mutable chrome must not replay the viewport"
     );
+    assert_eq!(
+        composer_row(&expanded),
+        initial_composer_row,
+        "suggestion growth must expand below the composer"
+    );
 
     for character in "res".chars() {
         shell.apply_edit(EditAction::Char(character));
@@ -3257,6 +3396,11 @@ fn slash_popup_height_changes_use_differential_repaint() {
     assert!(
         !collapsed.reanchor_viewport,
         "shrinking mutable chrome must clear only its changed tail"
+    );
+    assert_eq!(
+        composer_row(&collapsed),
+        initial_composer_row,
+        "suggestion shrinkage must leave the composer in place"
     );
 }
 
@@ -3288,6 +3432,57 @@ fn native_scrollback_frame_exposes_committed_rows_and_reuses_stable_history() {
     let appended_text = appended.replacement.join("\n");
     assert!(appended_text.contains("new native row"));
     assert!(!appended_text.contains("older 0"));
+}
+
+#[test]
+fn native_ctrl_o_rebuilds_offscreen_compaction_and_contracts_the_complete_frame() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 12);
+    {
+        let mut state = shell.state.borrow_mut();
+        state.push_block(TranscriptBlock::Compaction(Box::new(CompactionBlock {
+            label: "Context compacted".into(),
+            summary: "COMPLETE COMPACTION SUMMARY".into(),
+            expanded: false,
+        })));
+        for number in 0..40 {
+            state.push_block(TranscriptBlock::Notice(format!("later event {number}")));
+        }
+    }
+
+    let mut frame = ShellFrameState::default();
+    let initial = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
+    assert!(!initial.rebuild_scrollback);
+    assert!(initial.pinned.is_some());
+    assert!(initial.stable_prefix + initial.replacement.len() > 12);
+    assert!(!initial
+        .replacement
+        .iter()
+        .any(|line| line.contains("COMPLETE COMPACTION SUMMARY")));
+
+    shell.expand_focused_tool();
+    let expanded = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
+    assert_eq!(expanded.stable_prefix, 0);
+    assert!(expanded.rebuild_scrollback);
+    assert!(expanded.pinned.is_some());
+    assert!(expanded
+        .replacement
+        .iter()
+        .any(|line| line.contains("COMPLETE COMPACTION SUMMARY")));
+
+    shell.expand_focused_tool();
+    let collapsed = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
+    assert_eq!(collapsed.stable_prefix, 0);
+    assert!(collapsed.rebuild_scrollback);
+    assert!(collapsed.pinned.is_some());
+    assert!(!collapsed
+        .replacement
+        .iter()
+        .any(|line| line.contains("COMPLETE COMPACTION SUMMARY")));
+    assert!(collapsed
+        .replacement
+        .iter()
+        .any(|line| line.contains(CURSOR_MARKER)));
 }
 
 #[test]
@@ -4329,12 +4524,12 @@ fn reasoning_enabled_run_shows_fallback_before_provider_deltas() {
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>();
     assert_eq!(rendered.len(), 2, "{rendered:?}");
-    assert!(rendered[0].contains("• Thinking"), "{rendered:?}");
+    assert_eq!(rendered[0], "• Thinking", "{rendered:?}");
     assert!(rendered[1].contains("(ctrl+o to expand)"), "{rendered:?}");
 }
 
 #[test]
-fn collapsed_reasoning_dot_blinks_without_moving_the_label() {
+fn collapsed_reasoning_status_has_a_blinking_event_dot() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
     shell.begin_run("codex");
@@ -4349,29 +4544,19 @@ fn collapsed_reasoning_dot_blinks_without_moving_the_label() {
             .expect("reasoning status row")
     };
 
-    let visible = render(&shell);
-    assert!(visible.contains('•'), "{visible:?}");
+    let before = render(&shell);
+    assert_eq!(before, "• Thinking");
     {
         let mut state = shell.state.borrow_mut();
         assert!(event_dot_animating(&state));
+        assert_eq!(state.active_event_blocks, vec![0]);
         state.advance_event_dot_animation();
     }
-    let quiet = render(&shell);
-    assert!(!quiet.contains('•'), "{quiet:?}");
-    assert!(!quiet.contains('·'), "{quiet:?}");
-    let visual_label_column = |line: &str| {
-        let offset = line.find("Thinking").expect("reasoning label");
-        visible_width(&line[..offset])
-    };
-    assert_eq!(
-        visual_label_column(&visible),
-        visual_label_column(&quiet),
-        "blinking the dot must not move the reasoning label"
-    );
+    assert_eq!(render(&shell), "  Thinking");
 }
 
 #[test]
-fn collapsed_reasoning_aligns_with_tool_event_margin() {
+fn collapsed_reasoning_uses_a_margin_dot_without_an_expanded_content_bullet() {
     let theme = crate::tui::theme::test_theme();
     let renderer = theme.rich_renderer();
     let args = serde_json::json!({"path":"README.md"});
@@ -4387,7 +4572,8 @@ fn collapsed_reasoning_aligns_with_tool_event_margin() {
         None,
     )));
     let reasoning = TranscriptBlock::Reasoning(Box::new(
-        AssistantBlock::streaming_reasoning("").with_model_lab(Some(ModelLab::OpenAi)),
+        AssistantBlock::streaming_reasoning("private detail")
+            .with_model_lab(Some(ModelLab::OpenAi)),
     ));
     let plain = |lines: Vec<String>| {
         lines
@@ -4407,6 +4593,15 @@ fn collapsed_reasoning_aligns_with_tool_event_margin() {
         80,
         false,
     ));
+    let expanded_reasoning_lines = plain(render_block(
+        Some(&tool),
+        &reasoning,
+        &theme,
+        &renderer,
+        &renderer,
+        80,
+        true,
+    ));
     let tool_line = tool_lines
         .iter()
         .find(|line| line.contains("Read"))
@@ -4423,10 +4618,18 @@ fn collapsed_reasoning_aligns_with_tool_event_margin() {
         line.find(needle)
             .map(|offset| visible_width(&line[..offset]))
     };
-    assert_eq!(
-        visual_column(tool_line, "·"),
-        visual_column(reasoning_line, "•"),
-        "event dots must share the margin: {tool_line:?} vs {reasoning_line:?}"
+    assert!(tool_line.starts_with("• "), "{tool_line:?}");
+    assert!(
+        reasoning_line.starts_with("• "),
+        "collapsed reasoning must carry the blinking event dot: {reasoning_line:?}"
+    );
+    let expanded_reasoning_line = expanded_reasoning_lines
+        .iter()
+        .find(|line| line.contains("private detail"))
+        .expect("expanded reasoning row");
+    assert!(
+        expanded_reasoning_line.starts_with("  private detail"),
+        "expanded reasoning must retain its gutter without a dot or content bullet: {expanded_reasoning_line:?}"
     );
     assert_eq!(
         visual_column(tool_line, "Read"),
@@ -4435,7 +4638,7 @@ fn collapsed_reasoning_aligns_with_tool_event_margin() {
     );
     assert_eq!(
             visual_column(reasoning_line, "Thinking"),
-            visual_column(disclosure_line, "└"),
+            visual_column(disclosure_line, "⎿"),
             "the disclosure elbow must descend from the first label character: {reasoning_line:?} vs {disclosure_line:?}"
         );
 }
@@ -4453,7 +4656,7 @@ fn reasoning_off_run_uses_a_truthful_non_expandable_working_status() {
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>();
     assert_eq!(rendered.len(), 1, "{rendered:?}");
-    assert!(rendered[0].contains("• Working"), "{rendered:?}");
+    assert_eq!(rendered[0], "• Working", "{rendered:?}");
     assert!(!rendered[0].contains("ctrl+o"), "{rendered:?}");
 
     shell.on_run_event(
@@ -4970,8 +5173,8 @@ fn reasoning_is_subdued_without_losing_inline_code_colour() {
         "inline code should be coloured"
     );
     assert!(
-        strip_terminal_sequences(&reasoning_block).starts_with("  · Thinking"),
-        "reasoning keeps the transcript inset without a second dot: {reasoning_block:?}"
+        strip_terminal_sequences(&reasoning_block).starts_with("  Thinking"),
+        "expanded reasoning keeps the transcript inset without a status dot or content bullet: {reasoning_block:?}"
     );
     assert!(reasoning.contains("Session"));
     assert!(
@@ -5001,6 +5204,38 @@ fn reasoning_is_subdued_without_losing_inline_code_colour() {
     assert!(
         !response.contains("\x1b[2m"),
         "ordinary response prose must not inherit reasoning dim"
+    );
+}
+
+#[test]
+fn multiline_prompt_marks_only_the_first_row() {
+    let theme = crate::tui::theme::test_theme();
+    let block = TranscriptBlock::User {
+        text: "help me fix a bug in ygg when the prompt wraps across several rows".into(),
+        model_lab: Some(ModelLab::OpenAi),
+        prompt_color: None,
+        persisted: true,
+    };
+    let rendered = render_block(
+        None,
+        &block,
+        &theme,
+        &theme.rich_renderer(),
+        &theme.reasoning_renderer(),
+        24,
+        false,
+    )
+    .into_iter()
+    .map(|line| strip_terminal_sequences(&line))
+    .collect::<Vec<_>>();
+
+    assert!(rendered.len() > 1, "prompt should wrap: {rendered:?}");
+    assert!(rendered[0].starts_with("› "), "{rendered:?}");
+    assert!(
+        rendered[1..]
+            .iter()
+            .all(|line| line.starts_with("  ") && !line.contains('│') && !line.contains('|')),
+        "continuation rows should be indented without rails: {rendered:?}"
     );
 }
 
@@ -5044,7 +5279,10 @@ fn prompt_row_keeps_exact_persisted_color_across_theme_changes() {
             "persisted prompt background changed: {rendered:?}"
         );
         assert!(!rendered.contains("\x1b[31m"), "{rendered:?}");
-        assert!(visible_width(rendered) <= 40, "{rendered:?}");
+        assert!(
+            rendered.lines().all(|line| visible_width(line) <= 40),
+            "{rendered:?}"
+        );
     }
 }
 
@@ -5069,10 +5307,28 @@ fn persisted_prompt_background_fills_the_semantic_row_in_terminal_cells() {
     );
     let terminal = emulate_rows(&rendered, WIDTH);
     let expected = vt100::Color::Rgb(0x12, 0x34, 0x56);
-    assert_eq!(rendered.len(), 2, "fixture should wrap to two prompt rows");
+    assert_eq!(
+        rendered.len(),
+        4,
+        "highlighted prompts need one padding row on each side"
+    );
     assert!(
-        strip_terminal_sequences(&rendered[0]).starts_with('›'),
-        "prompt should begin at the primary transcript edge: {rendered:?}"
+        strip_terminal_sequences(&rendered[0]).trim().is_empty(),
+        "leading prompt padding should remain visually blank: {rendered:?}"
+    );
+    assert!(
+        strip_terminal_sequences(&rendered[1]).starts_with('›'),
+        "prompt should begin after its leading padding: {rendered:?}"
+    );
+    assert!(
+        strip_terminal_sequences(&rendered[2]).starts_with("  second line"),
+        "highlighted prompt continuations should use a blank indent: {rendered:?}"
+    );
+    assert!(
+        strip_terminal_sequences(rendered.last().expect("trailing padding row"))
+            .trim()
+            .is_empty(),
+        "trailing prompt padding should remain visually blank: {rendered:?}"
     );
     for row in 0..rendered.len() as u16 {
         for column in 0..WIDTH {
@@ -5301,7 +5557,7 @@ fn tool_lifecycle_styles_are_visible_in_terminal_cells() {
 }
 
 #[test]
-fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
+fn event_margin_markers_cover_responses_tools_and_collapsed_reasoning() {
     let theme = crate::tui::theme::test_theme();
     let args = serde_json::json!({"path":"src/lib.rs"});
     let panel = |finished, is_error| {
@@ -5318,53 +5574,42 @@ fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
         )))
     };
 
-    let active = event_margin_marker(&panel(false, false), &theme, true, false)
-        .expect("visible active marker");
-    assert_eq!(strip_terminal_sequences(&active), "•");
-    assert!(!active.contains("\x1b[5m"), "{active:?}");
-    let quiet = event_margin_marker(&panel(false, false), &theme, false, false)
-        .expect("quiet active marker");
-    assert_eq!(strip_terminal_sequences(&quiet), "·");
-
-    let settled_edit =
-        event_margin_marker(&panel(true, false), &theme, false, false).expect("edit marker");
-    assert_eq!(settled_edit, theme.settled_event_dot("neutral", "·"));
-
-    let failed =
-        event_margin_marker(&panel(true, true), &theme, false, false).expect("failure marker");
-    assert_eq!(failed, theme.settled_event_dot("error", "·"));
-
-    let bash_args = serde_json::json!({"command":"cargo test"});
-    let bash = TranscriptBlock::Tool(Box::new(ToolPanel::new(
-        ToolCallId("bash".into()),
-        "bash".into(),
-        bash_args.to_string(),
-        summarize_tool("bash", &bash_args),
-        String::new(),
-        true,
-        false,
-        None,
-        None,
-    )));
-    assert_eq!(
-        event_margin_marker(&bash, &theme, false, false),
-        Some(theme.settled_event_dot("success", "·"))
+    let active_tool = event_margin_marker(&panel(false, false), &theme, true, false)
+        .expect("visible active tool marker");
+    let quiet_tool = event_margin_marker(&panel(false, false), &theme, false, false)
+        .expect("quiet active tool marker");
+    assert_eq!(strip_terminal_sequences(&active_tool), "•");
+    assert_eq!(strip_terminal_sequences(&quiet_tool), "•");
+    assert_eq!(active_tool, theme.fg("foreground", "•"));
+    assert_eq!(quiet_tool, theme.settled_event_dot("neutral", "•"));
+    assert!(!active_tool.contains("\x1b[5m"), "{active_tool:?}");
+    assert_ne!(
+        active_tool, quiet_tool,
+        "active tool dots should pulse through tone"
     );
 
-    let read = TranscriptBlock::Tool(Box::new(ToolPanel::new(
-        ToolCallId("read".into()),
-        "read".into(),
-        args.to_string(),
-        summarize_tool("read", &args),
-        String::new(),
-        true,
-        false,
-        None,
-        None,
-    )));
+    let successful_tool =
+        event_margin_marker(&panel(true, false), &theme, false, false).expect("success marker");
+    assert_eq!(successful_tool, theme.settled_event_dot("success", "•"));
+    let failed_tool =
+        event_margin_marker(&panel(true, true), &theme, false, false).expect("failure marker");
+    assert_eq!(failed_tool, theme.settled_event_dot("error", "•"));
+
+    let streaming_response =
+        TranscriptBlock::Assistant(Box::new(AssistantBlock::streaming("working")));
     assert_eq!(
-        event_margin_marker(&read, &theme, false, false),
-        Some(theme.settled_event_dot("neutral", "·"))
+        event_margin_marker(&streaming_response, &theme, true, false),
+        Some(theme.fg("foreground", "•"))
+    );
+    assert_eq!(
+        event_margin_marker(&streaming_response, &theme, false, false),
+        Some(theme.settled_event_dot("neutral", "•"))
+    );
+    let finished_response =
+        TranscriptBlock::Assistant(Box::new(AssistantBlock::finalized("done".into())));
+    assert_eq!(
+        event_margin_marker(&finished_response, &theme, false, false),
+        Some(theme.settled_event_dot("success", "•"))
     );
 
     let prompt = TranscriptBlock::User {
@@ -5377,6 +5622,7 @@ fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
     let reasoning =
         TranscriptBlock::Reasoning(Box::new(AssistantBlock::streaming_reasoning("private")));
     assert_eq!(event_margin_marker(&reasoning, &theme, true, false), None);
+    assert_eq!(event_margin_marker(&reasoning, &theme, false, false), None);
     assert_eq!(
         event_margin_marker(&reasoning, &theme, true, true)
             .map(|marker| strip_terminal_sequences(&marker)),
@@ -5387,6 +5633,12 @@ fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
             .map(|marker| strip_terminal_sequences(&marker)),
         Some(" ".into())
     );
+    let compaction = TranscriptBlock::Compaction(Box::new(CompactionBlock {
+        label: "Context compacted".into(),
+        summary: "summary".into(),
+        expanded: false,
+    }));
+    assert_eq!(event_margin_marker(&compaction, &theme, true, false), None);
     let outcome = TranscriptBlock::Outcome(OutcomeBlock::new(
         RunOutcome::CompletedWithWarnings {
             elapsed: Duration::from_secs(1),
@@ -5434,24 +5686,83 @@ fn event_dot_animation_invalidates_active_tool_rows_in_lockstep() {
             .rendered_transcript(80)
             .iter()
             .filter(|line| line.contains("Read") || line.contains("Edit"))
-            .map(|line| strip_terminal_sequences(line))
+            .cloned()
             .collect::<Vec<_>>()
+    };
+    let uses_uniform_dot = |lines: &[String]| {
+        lines
+            .iter()
+            .all(|line| strip_terminal_sequences(line).starts_with("• "))
     };
     let visible = active_rows();
     assert_eq!(visible.len(), 2, "{visible:?}");
-    assert!(
-        visible.iter().all(|line| line.starts_with("• ")),
-        "{visible:?}"
-    );
+    assert!(uses_uniform_dot(&visible), "{visible:?}");
 
     shell.state.borrow_mut().advance_event_dot_animation();
     let quiet = active_rows();
     assert_eq!(quiet.len(), 2, "{quiet:?}");
-    assert!(quiet.iter().all(|line| line.starts_with("· ")), "{quiet:?}");
+    assert!(uses_uniform_dot(&quiet), "{quiet:?}");
+    assert_ne!(
+        quiet, visible,
+        "event dots should pulse through colour only"
+    );
 
     shell.state.borrow_mut().advance_event_dot_animation();
     let visible_again = active_rows();
     assert_eq!(visible_again, visible);
+}
+
+#[test]
+fn streaming_response_dot_animates_and_settles_to_success() {
+    let mut shell = InteractiveShell::test_shell();
+    let run_id = shell.begin_run("openai");
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "Streaming answer".into(),
+        },
+    );
+
+    let response_row = || {
+        shell
+            .state
+            .borrow()
+            .rendered_transcript(80)
+            .iter()
+            .find(|line| line.contains("Streaming answer"))
+            .cloned()
+            .expect("streaming response row")
+    };
+    let visible = response_row();
+    assert!(
+        strip_terminal_sequences(&visible).starts_with("• Streaming answer"),
+        "{visible:?}"
+    );
+    {
+        let mut state = shell.state.borrow_mut();
+        assert!(event_dot_animating(&state));
+        assert_eq!(state.active_event_blocks, vec![0]);
+        state.advance_event_dot_animation();
+    }
+    let quiet = response_row();
+    assert_eq!(
+        strip_terminal_sequences(&quiet),
+        strip_terminal_sequences(&visible)
+    );
+    assert_ne!(quiet, visible, "response dot should pulse through colour");
+
+    {
+        let mut state = shell.state.borrow_mut();
+        state.close_streaming_blocks();
+        assert!(!event_dot_animating(&state));
+        assert!(state.active_event_blocks.is_empty());
+        let response = state.transcript.first().expect("finished response");
+        assert_eq!(
+            event_margin_marker(response, &state.theme, false, false),
+            Some(state.theme.settled_event_dot("success", "•"))
+        );
+    }
 }
 
 #[test]
@@ -5465,6 +5776,13 @@ fn event_dot_tracking_stays_bounded_in_long_sessions() {
     }
 
     let run_id = shell.begin_run("openai");
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "streaming response".into(),
+        },
+    );
     let active_index = {
         let state = shell.state.borrow();
         assert_eq!(state.active_event_blocks.len(), 1);
@@ -5843,12 +6161,17 @@ fn bash_wraps_and_indents_output_without_connector_glyphs() {
         &theme.reasoning_renderer(),
         42,
         false,
-    )
-    .into_iter()
-    .map(|line| strip_terminal_sequences(&line))
-    .collect::<Vec<_>>();
+    );
+    assert!(
+        rendered[0].contains(&theme.settled_event_dot("success", "•")),
+        "successful Bash dot should use the settled green tone: {rendered:?}"
+    );
+    let rendered = rendered
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>();
 
-    assert!(rendered[0].starts_with("· Bash"), "{rendered:?}");
+    assert!(rendered[0].starts_with("• Bash"), "{rendered:?}");
     let command_byte = rendered[0].find("node").expect("command on Bash row");
     let command_column = visible_width(&rendered[0][..command_byte]);
     let no_output = rendered

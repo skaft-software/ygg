@@ -5,31 +5,26 @@ use std::io::{IsTerminal, Write};
 use ygg_agent::{AgentEvent, OutputChannel};
 
 use crate::app::bootstrap::{build_app, resolve_launch_print, Bootstrap};
-use crate::modes::{run_ended, timestamp, RunEnded};
+use crate::modes::{timestamp, HostRunOutcome};
 use crate::resources::{compose_instructions, expand_skill_command};
 
 /// Convert an explicit terminal run result to process success or an actionable
 /// nonzero error. A started run must always yield `RunFinished`.
-pub fn classify_finish(finished: Option<RunEnded>) -> anyhow::Result<()> {
-    match finished {
-        Some(RunEnded::Completed) => Ok(()),
-        Some(RunEnded::MaxTurns) => {
+pub fn classify_finish(outcome: HostRunOutcome) -> anyhow::Result<()> {
+    match outcome {
+        HostRunOutcome::Completed | HostRunOutcome::Shutdown => Ok(()),
+        HostRunOutcome::MaxTurns => {
             anyhow::bail!("run hit max turns before completing")
         }
-        Some(RunEnded::Aborted) => anyhow::bail!("run aborted before completing"),
-        Some(RunEnded::Failed(error)) => {
+        HostRunOutcome::Aborted => anyhow::bail!("run aborted before completing"),
+        HostRunOutcome::Failed(error) => {
             let error = sexy_tui_rs::sanitize_line(&error, true);
             anyhow::bail!("run failed: {error}")
         }
-        None => anyhow::bail!("run stream ended without RunFinished (invariant violation)"),
+        HostRunOutcome::StreamLost => {
+            anyhow::bail!("run stream ended without RunFinished (invariant violation)")
+        }
     }
-}
-
-fn terminal_outcome(event: &AgentEvent, endpoint: &str, model: &str) -> Option<RunEnded> {
-    let AgentEvent::RunFinished { reason, .. } = event else {
-        return None;
-    };
-    Some(run_ended(reason, endpoint, model))
 }
 
 fn terminal_safe_output(text: &str, terminal: bool) -> std::borrow::Cow<'_, str> {
@@ -109,13 +104,10 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
     let stdout_is_terminal = std::io::stdout().is_terminal();
     let mut output = std::io::stdout().lock();
     let mut pending_output = String::new();
-    let mut finished = None;
     let mut limit_reached = false;
     let mut last_run_cost = 0u64;
     let mut response_text = String::new();
-    let mut shutdown_requested = false;
-
-    loop {
+    let outcome = loop {
         let event = tokio::select! {
             biased;
             _ = crate::tui::terminal::wait_for_shutdown_signal() => {
@@ -124,18 +116,17 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
                     std::time::Duration::from_millis(400),
                 )
                 .await;
-                shutdown_requested = true;
-                break;
+                break HostRunOutcome::shutdown();
             }
             event = run.next() => event,
         };
         let Some(event) = event else {
-            break;
+            break HostRunOutcome::stream_lost();
         };
         if let Some(outcome) =
-            terminal_outcome(&event, &app.model.endpoint.id.0, &app.model.spec.id.0)
+            HostRunOutcome::from_event(&event, &app.model.endpoint.id.0, &app.model.spec.id.0)
         {
-            finished = Some(outcome);
+            break outcome;
         }
         match event {
             AgentEvent::OutputDelta {
@@ -196,13 +187,12 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
                     }
                 }
             }
-            AgentEvent::RunFinished { .. } => {}
             _ => {}
         }
-    }
+    };
     drop(run);
     app.agent.set_system_prompt(app.system.clone());
-    if shutdown_requested {
+    if outcome.shutdown_requested() {
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(1400),
             app.executable_extensions.shutdown(),
@@ -212,7 +202,7 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
         output.flush()?;
         return Ok(());
     }
-    if matches!(finished, Some(RunEnded::Completed)) && !limit_reached {
+    if outcome.allows_after_response() && !limit_reached {
         for notification in app
             .executable_extensions
             .after_response(&response_text)
@@ -230,7 +220,7 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
             )
         ))
     } else {
-        classify_finish(finished)
+        classify_finish(outcome)
     };
     // A tool error is model-visible and may be recovered by a later turn; the
     // final run outcome, not an intermediate attempt, determines exit status.
@@ -253,18 +243,19 @@ mod tests {
 
     #[test]
     fn classify_finish_has_explicit_success_and_failures() {
-        assert!(classify_finish(Some(RunEnded::Completed)).is_ok());
-        assert!(classify_finish(Some(RunEnded::MaxTurns)).is_err());
-        assert!(classify_finish(Some(RunEnded::Aborted)).is_err());
-        assert!(classify_finish(Some(RunEnded::Failed("nope".into()))).is_err());
-        assert!(classify_finish(None).is_err());
+        assert!(classify_finish(HostRunOutcome::Completed).is_ok());
+        assert!(classify_finish(HostRunOutcome::MaxTurns).is_err());
+        assert!(classify_finish(HostRunOutcome::Aborted).is_err());
+        assert!(classify_finish(HostRunOutcome::Failed("nope".into())).is_err());
+        assert!(classify_finish(HostRunOutcome::StreamLost).is_err());
+        assert!(classify_finish(HostRunOutcome::Shutdown).is_ok());
     }
 
     #[test]
     fn classify_finish_neutralizes_control_sequences_in_errors() {
-        let error = classify_finish(Some(RunEnded::Failed(
+        let error = classify_finish(HostRunOutcome::Failed(
             "provider\x1b]52;c;YXR0YWNr\x07\nforged".into(),
-        )))
+        ))
         .unwrap_err()
         .to_string();
         assert!(!error.contains('\x1b'), "{error:?}");
@@ -288,12 +279,13 @@ mod tests {
         ];
         let mut finished = None;
         for event in &events {
-            if let Some(outcome) = terminal_outcome(event, "test-provider", "test-model") {
+            if let Some(outcome) = HostRunOutcome::from_event(event, "test-provider", "test-model")
+            {
                 finished = Some(outcome);
             }
         }
 
-        assert_eq!(finished, Some(RunEnded::Completed));
-        assert!(classify_finish(finished).is_ok());
+        assert_eq!(finished, Some(HostRunOutcome::Completed));
+        assert!(classify_finish(finished.expect("terminal outcome")).is_ok());
     }
 }

@@ -74,7 +74,7 @@ pub(super) fn surface_roles(kind: &str) -> (&'static str, &'static str, &'static
 fn natural_surface_width(block: &TranscriptBlock, theme: &YggTheme) -> u16 {
     let copy = match block {
         TranscriptBlock::Reasoning(reasoning) if !reasoning.reasoning_expanded => {
-            collapsed_reasoning_lines(theme, reasoning, false).join("\n")
+            collapsed_reasoning_lines(theme, reasoning).join("\n")
         }
         TranscriptBlock::Compaction(compaction) if !compaction.expanded => {
             format!("{} · (ctrl+o to view)", compaction.label)
@@ -84,13 +84,14 @@ fn natural_surface_width(block: &TranscriptBlock, theme: &YggTheme) -> u16 {
     let natural = copy.lines().map(visible_width).max().unwrap_or(1);
     let inner_prefix = match block {
         TranscriptBlock::User { .. } => 2,
-        TranscriptBlock::Reasoning(_) => visible_width(theme.glyph("reasoning")).saturating_add(1),
         TranscriptBlock::Tool(_) => 8,
         TranscriptBlock::Notice(_) | TranscriptBlock::Compaction(_) => {
             visible_width(theme.glyph("note")).saturating_add(1)
         }
         TranscriptBlock::Shell(_) => visible_width(theme.glyph("shell")).saturating_add(1),
-        TranscriptBlock::Assistant(_) | TranscriptBlock::Outcome(_) => 0,
+        TranscriptBlock::Assistant(_)
+        | TranscriptBlock::Reasoning(_)
+        | TranscriptBlock::Outcome(_) => 0,
     };
     u16::try_from(natural.saturating_add(inner_prefix)).unwrap_or(u16::MAX)
 }
@@ -174,13 +175,24 @@ pub(super) fn compile_surface_plan<'a>(
         .saturating_add(chrome_left)
         .saturating_add(padding);
     let content_width = frame_width.saturating_sub(overhead).max(1);
-    let is_user_card = kind == "user" && chrome == ThemeSurfaceChrome::Card;
-    let leading_rows = usize::from(
-        chrome == ThemeSurfaceChrome::Card
-            || chrome == ThemeSurfaceChrome::Rule
-            || heading != ThemeSurfaceHeading::None,
-    ) + usize::from(is_user_card);
-    let trailing_rows = usize::from(chrome == ThemeSurfaceChrome::Card) + usize::from(is_user_card);
+    let has_heading_row = chrome == ThemeSurfaceChrome::Card
+        || chrome == ThemeSurfaceChrome::Rule
+        || heading != ThemeSurfaceHeading::None;
+    let has_bottom_row = chrome == ThemeSurfaceChrome::Card;
+    let highlighted_user = matches!(
+        block,
+        TranscriptBlock::User {
+            prompt_color: Some(_),
+            ..
+        }
+    );
+    // A highlighted prompt gets one painted row above and below its content,
+    // matching the breathing room in the active composer. User cards already
+    // carried that interior padding, including on no-colour terminals.
+    let vertical_padding_rows =
+        usize::from(highlighted_user || (kind == "user" && chrome == ThemeSurfaceChrome::Card));
+    let leading_rows = usize::from(has_heading_row) + vertical_padding_rows;
+    let trailing_rows = usize::from(has_bottom_row) + vertical_padding_rows;
     SurfacePlan {
         kind,
         chrome,

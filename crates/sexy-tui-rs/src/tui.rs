@@ -81,9 +81,9 @@ pub struct FrameUpdate {
     /// from the top of the terminal so later fixed-height chrome remains
     /// anchored to the physical bottom row.
     pub reanchor_viewport: bool,
-    /// The presentation of committed rows changed. Generic inline frames may
-    /// rebuild retained history; pinned frames preserve history and repaint
-    /// only their live suffix.
+    /// The presentation of committed rows changed. Destructively replace
+    /// terminal-owned history with the complete retained frame, including for
+    /// pinned semantic transcripts.
     pub rebuild_scrollback: bool,
 }
 
@@ -1027,12 +1027,21 @@ impl<'a> TUI<'a> {
             }
             return;
         }
+        if rebuild_scrollback && !self.first_render {
+            // Disclosure changes can alter rows that already entered native
+            // history. Replaying only a pinned live suffix leaves those rows
+            // stale, and a later shrink can retain an impossible physical seam
+            // beyond the shorter frame. Replace the complete presentation and
+            // renegotiate its semantic commit cursor on the next frame.
+            self.reset_inline_scrollback(new_lines, rows, previous_frame_has_image);
+            return;
+        }
         if let Some(pinned) = pinned {
             self.write_inline_pinned(
                 new_lines,
                 rows,
                 pinned,
-                reanchor_viewport || rebuild_scrollback,
+                reanchor_viewport,
                 pinned_previous_window,
             );
             return;
@@ -1051,16 +1060,6 @@ impl<'a> TUI<'a> {
             let visible = &new_lines[new_lines.len().saturating_sub(rows)..];
             self.write_all_lines(visible);
             self.inline_bottom_row = visible.len().saturating_sub(1);
-            return;
-        }
-
-        if rebuild_scrollback {
-            // Native scrollback owns committed rows, so it cannot be restyled
-            // in place. Theme switches deliberately replace that presentation:
-            // erase saved lines, then replay the retained frame exactly once.
-            // The renderer thread owns this bounded-by-retained-state write;
-            // ordinary streaming/status updates continue to use lazy tails.
-            self.reset_inline_scrollback(new_lines, rows, previous_frame_has_image);
             return;
         }
 
@@ -2057,6 +2056,7 @@ mod tests {
     struct LazyPinnedLines {
         lines: Rc<RefCell<Vec<String>>>,
         commit_boundary: Rc<Cell<usize>>,
+        rebuild_scrollback: Rc<Cell<bool>>,
     }
 
     impl Component for LazyPinnedLines {
@@ -2083,7 +2083,7 @@ mod tests {
                 )),
                 resize_replay: None,
                 reanchor_viewport: false,
-                rebuild_scrollback: false,
+                rebuild_scrollback: self.rebuild_scrollback.replace(false),
             })
         }
 
@@ -3331,6 +3331,89 @@ mod tests {
     }
 
     #[test]
+    fn pinned_presentation_rebuild_replays_history_and_resets_a_shrinking_seam() {
+        let size = Rc::new(Cell::new((30, 4)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        );
+        let (terminal, clears, _, _, _, writes) = recording_terminal(size, capabilities);
+        let lines = Rc::new(RefCell::new(vec![
+            "expanded summary 0".to_owned(),
+            "expanded summary 1".to_owned(),
+            "expanded summary 2".to_owned(),
+            "later event 3".to_owned(),
+            "later event 4".to_owned(),
+            "later event 5".to_owned(),
+            format!("composer {CURSOR_MARKER}"),
+            "footer".to_owned(),
+        ]));
+        let rebuild_scrollback = Rc::new(Cell::new(true));
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.set_inline_scrollback(true);
+        tui.add_child(Box::new(LazyPinnedLines {
+            lines: lines.clone(),
+            commit_boundary: Rc::new(Cell::new(3)),
+            rebuild_scrollback: rebuild_scrollback.clone(),
+        }));
+        tui.previous_frame = [
+            "collapsed summary",
+            "later event 3",
+            "later event 4",
+            "later event 5",
+            "composer",
+            "footer",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        tui.previous_size = Some((30, 4));
+        tui.first_render = false;
+        tui.inline_history_rows = 2;
+        tui.inline_committed_rows = 2;
+        tui.inline_commit_cursor = Some(test_commit_position(2).cursor);
+        tui.inline_generation = Some(0);
+        tui.inline_window_top = 2;
+        tui.inline_bottom_row = 3;
+        tui.running = true;
+
+        tui.request_render();
+
+        let expanded = writes.borrow().join("");
+        assert!(expanded.contains("\x1b[3J"), "{expanded:?}");
+        for row in 0..=2 {
+            assert!(
+                expanded.contains(&format!("expanded summary {row}")),
+                "{expanded:?}"
+            );
+        }
+        assert_eq!(clears.get(), 1);
+        assert_eq!(tui.inline_history_rows, 4);
+        assert_eq!(tui.inline_window_top, 4);
+        assert_eq!(tui.inline_commit_cursor, None);
+
+        writes.borrow_mut().clear();
+        *lines.borrow_mut() = vec![
+            "collapsed summary".to_owned(),
+            "later event 5".to_owned(),
+            "composer".to_owned(),
+            "footer".to_owned(),
+        ];
+        rebuild_scrollback.set(true);
+        tui.request_render();
+
+        let collapsed = writes.borrow().join("");
+        assert!(collapsed.contains("\x1b[3J"), "{collapsed:?}");
+        for row in ["collapsed summary", "later event 5", "composer", "footer"] {
+            assert_eq!(collapsed.matches(row).count(), 1, "{collapsed:?}");
+        }
+        assert_eq!(clears.get(), 2);
+        assert_eq!(tui.inline_history_rows, 0);
+        assert_eq!(tui.inline_window_top, 0);
+        assert_eq!(tui.inline_bottom_row, 3);
+    }
+
+    #[test]
     fn pinned_resize_resets_scrollback_and_updates_the_next_diff_origin() {
         const KITTY_IMAGE: &str = "\x1b_Ga=T,f=100,i=9,s=1,v=1,c=1,r=1;AAAA\x1b\\";
         let size = Rc::new(Cell::new((30, 4)));
@@ -3364,6 +3447,7 @@ mod tests {
         tui.add_child(Box::new(LazyPinnedLines {
             lines: lines.clone(),
             commit_boundary: Rc::new(Cell::new(2)),
+            rebuild_scrollback: Rc::new(Cell::new(false)),
         }));
         tui.start();
         assert_eq!(tui.inline_window_top, 4);

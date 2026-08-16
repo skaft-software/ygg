@@ -16,7 +16,7 @@ use ygg_ai::ToolCallId;
 use sexy_tui_rs::{sanitize_text, ControlPictures, SanitizeOptions};
 
 use crate::app::bootstrap::{build_app, resolve_launch_print, Bootstrap};
-use crate::modes::{run_ended, timestamp, RunEnded};
+use crate::modes::{timestamp, HostRunOutcome, RUN_STREAM_LOST_MESSAGE};
 use crate::presentation::{
     format_duration, is_hidden_tool_detail, summarize_tool_with_workspace, tool_failure_reason,
     tool_result_is_failure, RunOutcome, RunPhase, RunTracker,
@@ -26,8 +26,7 @@ use crate::tui::theme::YggTheme;
 
 #[derive(Debug, PartialEq, Eq)]
 enum PromptExit {
-    Finished(RunEnded),
-    Shutdown,
+    Finished(HostRunOutcome),
 }
 
 #[derive(Default)]
@@ -54,14 +53,14 @@ impl ProviderAttemptOutput {
 
 #[derive(Default)]
 struct InteractiveExitStatus {
-    first_failure: Option<RunEnded>,
+    first_failure: Option<HostRunOutcome>,
 }
 
 impl InteractiveExitStatus {
     fn observe(&mut self, exit: PromptExit) -> bool {
         match exit {
-            PromptExit::Shutdown => false,
-            PromptExit::Finished(RunEnded::Completed) => true,
+            PromptExit::Finished(HostRunOutcome::Shutdown) => false,
+            PromptExit::Finished(HostRunOutcome::Completed) => true,
             PromptExit::Finished(failure) => {
                 self.first_failure.get_or_insert(failure);
                 true
@@ -71,7 +70,7 @@ impl InteractiveExitStatus {
 
     fn finish(self) -> anyhow::Result<()> {
         match self.first_failure {
-            Some(failure) => crate::modes::print::classify_finish(Some(failure)),
+            Some(failure) => crate::modes::print::classify_finish(failure),
             None => Ok(()),
         }
     }
@@ -79,8 +78,7 @@ impl InteractiveExitStatus {
 
 fn finish_one_shot(exit: PromptExit) -> anyhow::Result<()> {
     match exit {
-        PromptExit::Finished(finished) => crate::modes::print::classify_finish(Some(finished)),
-        PromptExit::Shutdown => Ok(()),
+        PromptExit::Finished(finished) => crate::modes::print::classify_finish(finished),
     }
 }
 
@@ -210,7 +208,7 @@ async fn run_prompt(
             let outcome = tracker.fail(run_id, reason.clone()).expect("active run");
             writeln!(output, "{}", style_log(theme, &outcome_text(&outcome)))?;
             output.flush()?;
-            return Ok(PromptExit::Finished(RunEnded::Failed(reason)));
+            return Ok(PromptExit::Finished(HostRunOutcome::Failed(reason)));
         }
     }
 
@@ -224,7 +222,7 @@ async fn run_prompt(
             let outcome = tracker.fail(run_id, reason.clone()).expect("active run");
             writeln!(output, "{}", style_log(theme, &outcome_text(&outcome)))?;
             output.flush()?;
-            return Ok(PromptExit::Finished(RunEnded::Failed(reason)));
+            return Ok(PromptExit::Finished(HostRunOutcome::Failed(reason)));
         }
     }
 
@@ -261,7 +259,7 @@ async fn run_prompt(
             let outcome = tracker.fail(run_id, reason.clone()).expect("active run");
             writeln!(output, "{}", style_log(theme, &outcome_text(&outcome)))?;
             output.flush()?;
-            return Ok(PromptExit::Finished(RunEnded::Failed(reason)));
+            return Ok(PromptExit::Finished(HostRunOutcome::Failed(reason)));
         }
     };
     app.executable_extensions
@@ -287,10 +285,7 @@ async fn run_prompt(
     heartbeat.tick().await;
     let mut response_text = String::new();
     let mut attempt_output = ProviderAttemptOutput::default();
-    let mut shutdown_requested = false;
-    let mut finished = None;
-
-    loop {
+    let outcome = loop {
         tokio::select! {
             biased;
             _ = crate::tui::terminal::wait_for_shutdown_signal() => {
@@ -299,18 +294,16 @@ async fn run_prompt(
                     Duration::from_millis(400),
                 )
                 .await;
-                shutdown_requested = true;
-                break;
+                break HostRunOutcome::shutdown();
             }
             event = run.next() => {
                 let Some(event) = event else {
-                    let reason = "run stream ended without a final outcome";
+                    let reason = RUN_STREAM_LOST_MESSAGE;
                     let outcome = tracker
                         .fail(run_id, reason)
                         .expect("active run");
                     write_log(output, &mut response_open, theme, &outcome_text(&outcome))?;
-                    finished = Some(RunEnded::Failed(reason.into()));
-                    break;
+                    break HostRunOutcome::stream_lost();
                 };
                 let accepted_output = attempt_output.observe(&event);
                 let update = tracker.apply_event(run_id, &event);
@@ -477,15 +470,15 @@ async fn run_prompt(
                     AgentEvent::SteeringDelivered { .. }
                     | AgentEvent::FollowUpDelivered { .. } => {}
                     AgentEvent::RunFinished { reason, .. } => {
-                        finished = Some(run_ended(
+                        let outcome = HostRunOutcome::from_finish_reason(
                             reason,
                             &app.model.endpoint.id.0,
                             &app.model.spec.id.0,
-                        ));
+                        );
                         if let Some(outcome) = update.outcome {
                             write_log(output, &mut response_open, theme, &outcome_text(&outcome))?;
                         }
-                        break;
+                        break outcome;
                     }
                 }
                 last_phase = tracker.current().map(|current| current.phase().clone());
@@ -513,10 +506,10 @@ async fn run_prompt(
                 }
             }
         }
-    }
+    };
     drop(run);
     app.agent.set_system_prompt(app.system.clone());
-    if shutdown_requested {
+    if outcome.shutdown_requested() {
         let _ = tokio::time::timeout(
             Duration::from_millis(1400),
             app.executable_extensions.shutdown(),
@@ -524,9 +517,9 @@ async fn run_prompt(
         .await;
         ygg_agent::extension_process::force_kill_registered_process_groups();
         output.flush()?;
-        return Ok(PromptExit::Shutdown);
+        return Ok(PromptExit::Finished(outcome));
     }
-    if matches!(finished, Some(RunEnded::Completed)) {
+    if outcome.allows_after_response() {
         for notification in app
             .executable_extensions
             .after_response(&response_text)
@@ -542,9 +535,7 @@ async fn run_prompt(
     }
     writeln!(output)?;
     output.flush()?;
-    Ok(PromptExit::Finished(finished.unwrap_or_else(|| {
-        RunEnded::Failed("run stream ended without a final outcome".into())
-    })))
+    Ok(PromptExit::Finished(outcome))
 }
 
 /// Run the chronological fallback. A positional prompt is one-shot. Without
@@ -705,19 +696,23 @@ mod tests {
 
     #[test]
     fn one_shot_plain_exit_status_matches_print_mode() {
-        assert!(finish_one_shot(PromptExit::Finished(RunEnded::Completed)).is_ok());
-        assert!(finish_one_shot(PromptExit::Finished(RunEnded::MaxTurns)).is_err());
-        assert!(finish_one_shot(PromptExit::Finished(RunEnded::Aborted)).is_err());
-        assert!(finish_one_shot(PromptExit::Finished(RunEnded::Failed("nope".into()))).is_err());
+        assert!(finish_one_shot(PromptExit::Finished(HostRunOutcome::Completed)).is_ok());
+        assert!(finish_one_shot(PromptExit::Finished(HostRunOutcome::MaxTurns)).is_err());
+        assert!(finish_one_shot(PromptExit::Finished(HostRunOutcome::Aborted)).is_err());
+        assert!(
+            finish_one_shot(PromptExit::Finished(HostRunOutcome::Failed("nope".into()))).is_err()
+        );
+        assert!(finish_one_shot(PromptExit::Finished(HostRunOutcome::StreamLost)).is_err());
+        assert!(finish_one_shot(PromptExit::Finished(HostRunOutcome::Shutdown)).is_ok());
     }
 
     #[test]
     fn interactive_plain_retains_a_requested_run_failure_until_exit() {
         let mut status = InteractiveExitStatus::default();
-        assert!(status.observe(PromptExit::Finished(RunEnded::Failed(
+        assert!(status.observe(PromptExit::Finished(HostRunOutcome::Failed(
             "first request failed".into(),
         ))));
-        assert!(status.observe(PromptExit::Finished(RunEnded::Completed)));
+        assert!(status.observe(PromptExit::Finished(HostRunOutcome::Completed)));
 
         let error = status.finish().unwrap_err().to_string();
         assert!(error.contains("first request failed"), "{error}");

@@ -104,6 +104,40 @@ impl ResponsesInput {
         self.0.iter().any(ResponsesItem::is_compaction)
     }
 
+    /// Removes image detail hints that the Responses Lite input contract does
+    /// not accept. This mirrors Codex request preparation for both messages and
+    /// function-call outputs while leaving all other opaque provider fields
+    /// untouched.
+    pub(crate) fn strip_image_details_for_responses_lite(&mut self) {
+        for item in &mut self.0 {
+            let value = &mut item.0;
+            let Some(object) = value.as_object_mut() else {
+                continue;
+            };
+            let item_type = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let content = match item_type.as_deref() {
+                Some("message") => object.get_mut("content"),
+                Some("function_call_output") | Some("custom_tool_call_output") => {
+                    object.get_mut("output")
+                }
+                _ => None,
+            };
+            let Some(content) = content.and_then(serde_json::Value::as_array_mut) else {
+                continue;
+            };
+            for part in content {
+                if part.get("type").and_then(serde_json::Value::as_str) == Some("input_image") {
+                    if let Some(part) = part.as_object_mut() {
+                        part.remove("detail");
+                    }
+                }
+            }
+        }
+    }
+
     /// Prunes history before the latest compaction item for ordinary server
     /// compaction chaining. This must not be applied to standalone compact
     /// output, whose entire output is the next canonical input window.
@@ -409,6 +443,45 @@ mod tests {
         let item = item("reasoning");
         assert_eq!(item.as_json()["unknown"]["x"], 1);
         assert!(ResponsesItem::new(serde_json::json!(["bad"])).is_err());
+    }
+
+    #[test]
+    fn responses_lite_strips_only_input_image_detail_hints() {
+        let mut input = ResponsesInput::new(vec![
+            ResponsesItem::new(serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,eA==", "detail": "high", "future": true},
+                    {"type": "input_text", "text": "keep", "detail": "future-value"}
+                ],
+                "unknown": {"detail": "keep"}
+            }))
+            .unwrap(),
+            ResponsesItem::new(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,eA==", "detail": "low"}
+                ]
+            }))
+            .unwrap(),
+        ]);
+
+        input.strip_image_details_for_responses_lite();
+
+        assert!(input.items()[0].as_json()["content"][0]
+            .get("detail")
+            .is_none());
+        assert_eq!(input.items()[0].as_json()["content"][0]["future"], true);
+        assert_eq!(
+            input.items()[0].as_json()["content"][1]["detail"],
+            "future-value"
+        );
+        assert_eq!(input.items()[0].as_json()["unknown"]["detail"], "keep");
+        assert!(input.items()[1].as_json()["output"][0]
+            .get("detail")
+            .is_none());
     }
 
     #[test]

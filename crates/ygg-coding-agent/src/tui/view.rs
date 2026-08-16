@@ -765,6 +765,9 @@ impl ShellState {
                 _ => false,
             };
             if updated {
+                if channel == OutputChannel::Text {
+                    self.register_active_event(index);
+                }
                 self.touch_block(index);
                 return;
             }
@@ -791,9 +794,7 @@ impl ShellState {
 
         let index = self.transcript.len();
         let model_lab = self.executing_model_lab();
-        if channel == OutputChannel::Reasoning {
-            self.event_dot_visible = true;
-        }
+        self.event_dot_visible = true;
         self.push_block(match channel {
             OutputChannel::Text => TranscriptBlock::Assistant(Box::new(
                 AssistantBlock::streaming(text).with_model_lab(model_lab),
@@ -803,7 +804,10 @@ impl ShellState {
             )),
         });
         match channel {
-            OutputChannel::Text => self.active_text = Some(index),
+            OutputChannel::Text => {
+                self.active_text = Some(index);
+                self.register_active_event(index);
+            }
             OutputChannel::Reasoning => {
                 self.active_reasoning = Some(index);
                 self.register_active_event(index);
@@ -849,6 +853,7 @@ impl ShellState {
 
     fn close_streaming_blocks(&mut self) {
         if let Some(index) = self.active_text.take() {
+            self.unregister_active_event(index);
             if let Some(TranscriptBlock::Assistant(assistant)) = self.transcript.get_mut(index) {
                 assistant.finish();
                 self.touch_block(index);
@@ -875,6 +880,7 @@ impl ShellState {
         self.active_event_blocks
             .iter()
             .any(|index| match self.transcript.get(*index) {
+                Some(TranscriptBlock::Assistant(assistant)) => !assistant.finished,
                 Some(TranscriptBlock::Reasoning(reasoning)) => {
                     !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
                 }
@@ -892,6 +898,7 @@ impl ShellState {
         for position in 0..self.active_event_blocks.len() {
             let index = self.active_event_blocks[position];
             let visible = match self.transcript.get(index) {
+                Some(TranscriptBlock::Assistant(assistant)) => !assistant.finished,
                 Some(TranscriptBlock::Reasoning(reasoning)) => {
                     !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
                 }
@@ -936,6 +943,19 @@ fn prompt_marker(theme: &YggTheme) -> &str {
 
 pub(crate) fn semantic_separator(theme: &YggTheme) -> &str {
     theme.glyph("separator")
+}
+
+/// Indent continuation rows to the first text cell after an activity marker.
+pub(crate) const ACTIVITY_DETAIL_INDENT: &str = "  ";
+
+/// A shared continuation mark for transient activity details. Keep steering
+/// and collapsed thinking visually aligned without repurposing tree glyphs.
+pub(crate) fn activity_elbow(theme: &YggTheme) -> &'static str {
+    if theme.unicode() {
+        "⎿"
+    } else {
+        "`-"
+    }
 }
 
 /// A low-contrast annotation that remains readable without relying on a
@@ -999,7 +1019,7 @@ fn render_user_prompt(
     // trailing cells. Plain text inside the coloured prompt prevents Markdown
     // resets from punching holes through the provenance background.
     let marker_glyph = sanitize_for_terminal(prompt_marker(theme));
-    let rail_glyph = sanitize_for_terminal(theme.glyph("rail"));
+    let continuation_prefix = " ".repeat(visible_width(&marker_glyph).saturating_add(1));
     let cell = |glyph: &str| {
         let plain = format!("{glyph} ");
         if prompt_color.is_some() {
@@ -1009,10 +1029,13 @@ fn render_user_prompt(
         }
     };
     let marker = cell(&marker_glyph);
-    let rail = cell(&rail_glyph);
     let mut lines = Vec::new();
     for (index, line) in render_result.lines.into_iter().enumerate() {
-        let prefix = if index == 0 { &marker } else { &rail };
+        let prefix = if index == 0 {
+            marker.as_str()
+        } else {
+            continuation_prefix.as_str()
+        };
         if prompt_color.is_some()
             && theme.capabilities().color != crate::tui::terminal::ColorDepth::None
         {
@@ -1021,7 +1044,7 @@ fn render_user_prompt(
                 if index == 0 {
                     format!("{marker_glyph} ")
                 } else {
-                    format!("{rail_glyph} ")
+                    continuation_prefix.clone()
                 },
                 line.plain
             );
@@ -2048,7 +2071,7 @@ impl InteractiveShell {
         }
         let last = suggestions.len().saturating_sub(1);
         state.slash_selection = state.slash_selection.min(last);
-        // Use the actual rendered popup viewport (excluding its one heading
+        // Use the actual rendered popup viewport (excluding its one footer
         // row), so Page Up/Down remain correct after resize, wrapped errors, or
         // composer growth rather than relying on a stale terminal-height guess.
         let page = shell_chrome(&state, state.size.0, Instant::now())

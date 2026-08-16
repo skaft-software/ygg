@@ -639,6 +639,8 @@ fn scripted_model(uri: &str) -> Model {
                 tools: true,
                 parallel_tool_calls: true,
                 reasoning: None,
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: false,
             },
             limits: ModelLimits {
@@ -810,7 +812,6 @@ fn scripted_model_with_reasoning(uri: &str) -> Model {
         control: ReasoningControl::TokenBudget,
         exposes_text: true,
         preserves_state: true,
-        supports_pro_mode: false,
         min_effort: ygg_ai::ReasoningEffort::Minimal,
         effort_budgets: Some(ReasoningEffortBudgets {
             minimal: 1024,

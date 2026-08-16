@@ -8,8 +8,9 @@ releases it after a complete assistant response, and cleans it up when the
 extension shuts down or loses its protocol stream.
 
 The `-i` assertion prevents idle system sleep without forcing the display to
-stay on or overriding explicit sleep choices. Tying the assertion to the
-extension PID also lets macOS release it if the extension exits unexpectedly.
+stay on or overriding explicit sleep choices. The `-t 1800` argument bounds the
+assertion to 30 minutes if Ygg cannot deliver a cleanup boundary. This example
+does not pass `-w`, so it does not bind `caffeinate` to the extension PID.
 `/caffeinate` reports whether the inhibitor is active, and the interactive TUI
 shows an `awake` status contribution while it is running. Unsupported systems
 remain usable and receive a warning when a prompt starts.
@@ -36,8 +37,9 @@ sandbox.
 
 Ygg's current lifecycle API calls `after_response` only for completed runs. If
 a run fails or is aborted, the inhibitor remains active until the next
-completed response, extension reload, or Ygg shutdown. The `-w` parent binding
-still prevents an orphaned assertion after the extension exits.
+completed response, extension reload, Ygg shutdown, protocol-stream loss, or
+the 30-minute fallback timeout. The extension explicitly terminates its
+`caffeinate` child during shutdown and in its top-level cleanup path.
 
 Run the example's dependency-free tests from the repository root with:
 

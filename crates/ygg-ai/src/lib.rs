@@ -67,7 +67,7 @@ pub use responses::{
 pub use stream::{ResponseStream, StreamEvent};
 pub use transform::transform_messages;
 pub use types::{
-    AssistantMessage, AssistantPart, AudioCapabilities, AudioFormat, AudioMedia,
+    AgentDelegation, AssistantMessage, AssistantPart, AudioCapabilities, AudioFormat, AudioMedia,
     AudioOutputDelivery, AudioOutputOptions, AudioPayload, AudioVoice, CacheCompatibility,
     CacheControlFormat, CacheRetention, Capabilities, Endpoint, EndpointId, EndpointTransport,
     ImageDetail, ImageMedia, ImageSource, JsonSchemaFormat, Media, Message, Modality, ModalitySet,

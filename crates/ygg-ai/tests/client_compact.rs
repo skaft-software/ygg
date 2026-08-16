@@ -8,9 +8,11 @@ use std::time::Duration;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use ygg_ai::{
-    AiClient, AiError, Auth, Capabilities, DecodeError, Endpoint, EndpointId, ModalitySet, Model,
-    ModelId, ModelLimits, ModelSpec, Protocol, ResponsesCompactRequest, ResponsesInput,
-    ResponsesItem, TransportPhase,
+    AgentDelegation, AiClient, AiError, Auth, CacheRetention, Capabilities, DecodeError, Endpoint,
+    EndpointId, ModalitySet, Model, ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode,
+    OutputFormat, Protocol, ReasoningCapability, ReasoningConfig, ReasoningControl,
+    ReasoningEffort, ReasoningMode, ResponsesCompactRequest, ResponsesInput, ResponsesItem,
+    ToolDef, TransportPhase,
 };
 
 fn model(base_url: &str, protocol: Protocol) -> Model {
@@ -27,6 +29,8 @@ fn model(base_url: &str, protocol: Protocol) -> Model {
                 tools: false,
                 parallel_tool_calls: false,
                 reasoning: None,
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: false,
             },
             limits: ModelLimits {
@@ -56,6 +60,25 @@ fn codex_model(base_url: &str) -> Model {
     let mut endpoint = (*model.endpoint).clone();
     endpoint.id = EndpointId("openai-codex".into());
     model.endpoint = Arc::new(endpoint);
+    model
+}
+
+fn responses_lite_model(base_url: &str) -> Model {
+    let mut model = model(base_url, Protocol::OpenAiResponses);
+    let spec = Arc::make_mut(&mut model.spec);
+    spec.capabilities.tools = true;
+    spec.capabilities.parallel_tool_calls = true;
+    spec.capabilities.responses_lite = true;
+    spec.capabilities.agent_delegation = Some(AgentDelegation::V2);
+    spec.capabilities.reasoning = Some(ReasoningCapability {
+        control: ReasoningControl::Effort,
+        exposes_text: true,
+        preserves_state: true,
+        effort_budgets: None,
+        openai_chat_mode: OpenAiChatReasoningMode::Standard,
+        min_effort: ReasoningEffort::Minimal,
+        max_effort: ReasoningEffort::Ultra,
+    });
     model
 }
 
@@ -244,6 +267,100 @@ async fn compact_codex_posts_rich_exact_body_and_preserves_complete_output() {
     assert_eq!(response.usage.cache_write_tokens, 5);
     assert_eq!(response.usage.output_tokens, 20);
     assert_eq!(response.usage.reasoning_tokens, 7);
+}
+
+#[test]
+fn compact_for_model_clamps_reasoning_to_the_advertised_range() {
+    let mut model = responses_lite_model("https://example.com/");
+    Arc::make_mut(&mut model.spec)
+        .capabilities
+        .reasoning
+        .as_mut()
+        .unwrap()
+        .max_effort = ReasoningEffort::High;
+
+    let request = ResponsesCompactRequest::for_model(
+        &model,
+        ResponsesInput::default(),
+        None,
+        &[],
+        &ReasoningConfig::Effort(ReasoningEffort::Ultra),
+        ReasoningMode::Standard,
+        &OutputFormat::Text,
+        CacheRetention::None,
+        None,
+    );
+
+    assert_eq!(request.reasoning.unwrap()["effort"], "high");
+}
+
+#[tokio::test]
+async fn compact_responses_lite_uses_advertised_transport_contract() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses/compact"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": [{"type": "compaction", "encrypted_content": "opaque"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let model = responses_lite_model(&format!("{}/", server.uri()));
+    let input = ResponsesInput::new(vec![input_item(serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_image",
+            "image_url": "data:image/png;base64,eA==",
+            "detail": "high"
+        }]
+    }))]);
+    let request = ResponsesCompactRequest::for_model(
+        &model,
+        input,
+        Some("current instructions".into()),
+        &[ToolDef {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }],
+        &ReasoningConfig::Effort(ReasoningEffort::Ultra),
+        ReasoningMode::Standard,
+        &OutputFormat::Text,
+        CacheRetention::Short,
+        None,
+    );
+
+    AiClient::new()
+        .compact_responses(&model, request)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let request = &requests[0];
+    assert_eq!(
+        request.headers["x-openai-internal-codex-responses-lite"],
+        "true"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    assert!(body.get("instructions").is_none());
+    assert!(body.get("tools").is_none());
+    assert_eq!(body["parallel_tool_calls"], false);
+    assert_eq!(body["reasoning"]["effort"], "max");
+    assert_eq!(body["reasoning"]["context"], "all_turns");
+    assert_eq!(body["input"][0]["type"], "additional_tools");
+    assert_eq!(body["input"][0]["role"], "developer");
+    assert_eq!(body["input"][0]["tools"][0]["type"], "namespace");
+    assert_eq!(body["input"][0]["tools"][0]["name"], "functions");
+    assert_eq!(body["input"][0]["tools"][0]["tools"][0]["name"], "read");
+    assert_eq!(body["input"][1]["role"], "developer");
+    assert_eq!(
+        body["input"][1]["content"][0]["text"],
+        "current instructions"
+    );
+    assert_eq!(body["input"][2]["role"], "user");
+    assert!(body["input"][2]["content"][0].get("detail").is_none());
 }
 
 #[tokio::test]

@@ -44,10 +44,13 @@ opens and fixed byte limits:
 | Theme | 256 KiB |
 | Prompt | 512 KiB |
 | Skill entrypoint | 256 KiB |
-| Extension manifest | 256 KiB |
+| Extension manifest selected by the product resource resolver | 256 KiB |
 
 Prompt expansion, skill resource reads, extension protocol messages, and
 session files have their own narrower purpose-specific limits after discovery.
+The lower-level `ExtensionManifest::load` API has a separate 64 KiB default;
+product discovery reads the selected manifest through the 256 KiB resolver
+bound and then calls `ExtensionManifest::parse`.
 Invalid UTF-8, invalid names, inaccessible roots, rejected links, oversized
 files, parser failures, and precedence decisions become inspectable
 diagnostics. One broken customization does not prevent the core binary from

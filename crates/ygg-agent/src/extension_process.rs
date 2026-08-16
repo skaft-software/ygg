@@ -1585,7 +1585,11 @@ pub struct ToolCallOutput {
     /// Whether the result represents a tool failure.
     #[serde(default)]
     pub is_error: bool,
-    /// Optional structured data retained for frontend or renderer use.
+    /// Optional structured data accepted by API `0.1`.
+    ///
+    /// `ProcessTool` currently discards this value while bridging to native
+    /// `ToolOutput`; callers must not rely on frontend, renderer, or persistence
+    /// retention.
     #[serde(default)]
     pub metadata: serde_json::Value,
 }
@@ -1818,7 +1822,8 @@ pub struct ExtensionRuntimeConfig {
     pub host_state: ExtensionHostState,
     /// Maximum duration of one request.
     pub request_timeout: Duration,
-    /// Grace period before a child is killed during shutdown/reload.
+    /// Per-stage shutdown timeout, applied once to the shutdown request/ack and
+    /// again while waiting for the child to exit during shutdown or reload.
     pub shutdown_timeout: Duration,
     /// Maximum serialized JSON line size.
     pub max_message_bytes: usize,
@@ -2441,8 +2446,9 @@ impl ExtensionProcess {
         })
     }
 
-    /// Requests graceful shutdown, then kills the child after the configured
-    /// grace period. Returns whether it acknowledged and exited gracefully.
+    /// Requests graceful shutdown using the configured per-stage timeout, waits
+    /// for child exit using that timeout again, then kills it if needed. Returns
+    /// whether it acknowledged and exited within their respective stages.
     pub async fn shutdown(&self) -> bool {
         let _guard = self.inner.reload_guard.lock().await;
         let connection = read_std_lock(&self.inner.connection).clone();

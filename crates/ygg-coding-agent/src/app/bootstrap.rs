@@ -12,18 +12,19 @@ use futures_util::StreamExt;
 use sha2::{Digest as _, Sha256};
 use ygg_agent::secure_fs::{create_regular_file_for_append, open_regular_file_for_append};
 use ygg_agent::{
-    Agent, AgentCompactionMode, AgentConfig, CoreTools, DurableGoalStore, EntryValue,
-    ExtensionHost, GoalDriver, Session, SkillRegistry,
+    Agent, AgentCompactionMode, AgentConfig, CoreTools, DelegationConfig, DurableGoalStore,
+    EntryValue, ExtensionHost, GoalDriver, Session, SkillRegistry,
 };
 use ygg_ai::{
-    AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model, ModelCatalog, ModelId,
-    ModelLimits, ModelSpec, OpenAiChatReasoningMode, Pricing, PricingTier, Protocol,
-    ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningMode, TokenRate, ToolDef,
+    AgentDelegation, AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model,
+    ModelCatalog, ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode, Pricing, PricingTier,
+    Protocol, ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningMode, TokenRate,
+    ToolDef,
 };
 
 use crate::app::{
-    level_from_reasoning, normalize_reasoning_for_model, normalize_reasoning_mode_for_model,
-    thinking_to_reasoning, App,
+    level_from_reasoning, model_supports_ultra, normalize_reasoning_for_model,
+    normalize_reasoning_selection_for_model, thinking_to_reasoning, App,
 };
 use crate::config::{CompactionMode, Config, ResumeSelector};
 use crate::extensions::ExecutableExtensions;
@@ -955,12 +956,13 @@ fn register_openai_compatible_models(
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: true,
-                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: OpenAiChatReasoningMode::Standard,
                     min_effort: ygg_ai::ReasoningEffort::Minimal,
                     max_effort: ygg_ai::ReasoningEffort::High,
                 }),
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: protocol != Protocol::OpenAiChat,
             },
             limits: ModelLimits {
@@ -1027,6 +1029,8 @@ fn register_anthropic_compatible_models(
                 // Inventing adaptive-thinking support makes older models reject
                 // otherwise valid requests, so discovery remains conservative.
                 reasoning: None,
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: true,
             },
             limits: ModelLimits {
@@ -1113,12 +1117,13 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
                 control: ReasoningControl::Effort,
                 exposes_text: true,
                 preserves_state: false,
-                supports_pro_mode: false,
                 effort_budgets: None,
                 openai_chat_mode: OpenAiChatReasoningMode::DeepSeekThinking,
                 min_effort: ygg_ai::ReasoningEffort::High,
                 max_effort: ygg_ai::ReasoningEffort::Xhigh,
             }),
+            responses_lite: false,
+            agent_delegation: None,
             structured_output: false,
         },
         limits: ModelLimits {
@@ -1179,12 +1184,13 @@ fn register_discovered_deepseek_models(catalog: &mut ModelCatalog) -> anyhow::Re
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: false,
-                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: OpenAiChatReasoningMode::DeepSeekThinking,
                     min_effort: ygg_ai::ReasoningEffort::Minimal,
                     max_effort: ygg_ai::ReasoningEffort::High,
                 }),
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: false,
             },
             limits: ModelLimits {
@@ -1392,12 +1398,13 @@ fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<V
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: false,
-                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: OpenAiChatReasoningMode::OpenRouter,
                     min_effort: ygg_ai::ReasoningEffort::Minimal,
                     max_effort: ygg_ai::ReasoningEffort::High,
                 }),
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: false,
             },
             limits: ModelLimits {
@@ -1458,7 +1465,6 @@ fn static_model_reasoning(model: &StaticModelPreset) -> Option<ReasoningCapabili
         control: ReasoningControl::Effort,
         exposes_text: true,
         preserves_state: model.protocol != Protocol::OpenAiChat,
-        supports_pro_mode: false,
         effort_budgets: None,
         openai_chat_mode: if model.protocol == Protocol::OpenAiChat
             && model.id.starts_with("deepseek-")
@@ -1505,6 +1511,8 @@ fn register_static_models(
                 tools: true,
                 parallel_tool_calls: model.protocol != Protocol::OpenAiChat,
                 reasoning: static_model_reasoning(model),
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: model.protocol != Protocol::OpenAiChat,
             },
             limits: ModelLimits {
@@ -2002,7 +2010,6 @@ fn custom_reasoning_capability(
             control: ReasoningControl::AlwaysOn,
             exposes_text: true,
             preserves_state: false,
-            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: fixed_mode,
             min_effort: ygg_ai::ReasoningEffort::Minimal,
@@ -2052,7 +2059,6 @@ fn custom_reasoning_capability(
         control,
         exposes_text: true,
         preserves_state: false,
-        supports_pro_mode: false,
         effort_budgets: None,
         openai_chat_mode,
         min_effort,
@@ -2506,6 +2512,8 @@ fn register_custom_openai_provider(
                 tools: model.tools,
                 parallel_tool_calls: model.tools && model.parallel_tool_calls,
                 reasoning: custom_reasoning_capability(model),
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: model.structured_output,
             },
             limits: ModelLimits {
@@ -2748,12 +2756,12 @@ const CODEX_LEGACY_CONTEXT_WINDOW: u64 = 272_000;
 const CODEX_5_6_CONTEXT_WINDOW: u64 = 372_000;
 const CODEX_PRO_CONTEXT_WINDOW: u64 = 1_000_000;
 const CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
-const CODEX_MODEL_CACHE_VERSION: u8 = 1;
+const CODEX_MODEL_CACHE_VERSION: u8 = 2;
 const CODEX_MODEL_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // This is the Codex `/models` schema compatibility version Ygg implements,
 // not Ygg's package version. Sending `0.1.0` causes the backend to filter out
 // models that require a contemporary Codex client.
-const CODEX_MODELS_CLIENT_VERSION: &str = "0.145.0";
+const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct DiscoveredCodexModel {
@@ -2763,6 +2771,10 @@ struct DiscoveredCodexModel {
     max_output_tokens: u64,
     min_effort: ygg_ai::ReasoningEffort,
     max_effort: ygg_ai::ReasoningEffort,
+    #[serde(default)]
+    responses_lite: bool,
+    #[serde(default)]
+    agent_delegation: Option<AgentDelegation>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -2795,6 +2807,7 @@ fn reasoning_effort(value: &str) -> Option<ygg_ai::ReasoningEffort> {
         "high" => Some(ygg_ai::ReasoningEffort::High),
         "xhigh" | "extra_high" => Some(ygg_ai::ReasoningEffort::Xhigh),
         "max" => Some(ygg_ai::ReasoningEffort::Max),
+        "ultra" => Some(ygg_ai::ReasoningEffort::Ultra),
         _ => None,
     }
 }
@@ -2879,6 +2892,15 @@ fn codex_models_from_response(
                 .unwrap_or(CODEX_MAX_OUTPUT_TOKENS)
                 .min(context_window);
         let (min_effort, max_effort) = codex_reasoning_range(entry, id);
+        let responses_lite = entry
+            .get("use_responses_lite")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let agent_delegation = entry
+            .get("multi_agent_version")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|version| version.eq_ignore_ascii_case("v2"))
+            .then_some(AgentDelegation::V2);
         models.push(DiscoveredCodexModel {
             id: id.to_owned(),
             context_window,
@@ -2886,6 +2908,8 @@ fn codex_models_from_response(
             max_output_tokens,
             min_effort,
             max_effort,
+            responses_lite,
+            agent_delegation,
         });
     }
     models.sort_by(|left, right| left.id.cmp(&right.id));
@@ -3075,6 +3099,8 @@ fn fallback_codex_models(
                 max_output_tokens: limits.max_output_tokens,
                 min_effort: ygg_ai::ReasoningEffort::Minimal,
                 max_effort: codex_max_effort(model_id),
+                responses_lite: false,
+                agent_delegation: None,
             }
         })
         .collect()
@@ -3233,10 +3259,6 @@ fn register_openai_codex(
             },
         }
     };
-    let pro_subscription = initial_claims
-        .plan
-        .as_ref()
-        .is_some_and(crate::auth::codex::ChatGptPlan::supports_pro_reasoning_mode);
     let resolver = std::sync::Arc::new(codex::CodexResolver::new(store));
 
     let mut default_headers = http::HeaderMap::new();
@@ -3275,7 +3297,6 @@ fn register_openai_codex(
         };
         let pricing = codex_pricing(&model.id);
         let supports_image_input = codex_supports_image_input(&model.id);
-        let supports_pro_mode = pro_subscription && model.id.starts_with("gpt-5.6");
         catalog.register_model(ModelSpec {
             id: catalog_id,
             endpoint: EndpointId(codex::ENDPOINT_ID.into()),
@@ -3295,12 +3316,13 @@ fn register_openai_codex(
                     control: ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: true,
-                    supports_pro_mode,
                     effort_budgets: None,
                     openai_chat_mode: OpenAiChatReasoningMode::Standard,
                     min_effort: model.min_effort,
                     max_effort: model.max_effort,
                 }),
+                responses_lite: model.responses_lite,
+                agent_delegation: model.agent_delegation,
                 structured_output: false,
             },
             limits: ModelLimits {
@@ -3537,6 +3559,11 @@ fn launch_configuration_parts(
     };
     let reasoning_mode = if config.reasoning_mode_explicit {
         config.reasoning_mode
+    } else if config.reasoning_explicit {
+        // A current explicit effort selection supersedes the obsolete persisted
+        // Pro bit; otherwise migration would silently replace the user's
+        // requested effort with Ultra.
+        ReasoningMode::Standard
     } else {
         persisted.reasoning_mode.unwrap_or(config.reasoning_mode)
     };
@@ -3770,6 +3797,34 @@ fn terminal_goal_session_id(session: &Session) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("current session has no valid goal identity"))
 }
 
+fn configure_v2_delegation(
+    agent: &mut Agent,
+    model: &Model,
+    reasoning: &ReasoningConfig,
+) -> anyhow::Result<()> {
+    if !matches!(
+        reasoning,
+        ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
+    ) {
+        return Ok(());
+    }
+    if !model_supports_ultra(model) {
+        anyhow::bail!(
+            "Ultra requires an available V2 delegation runtime for model {}",
+            model.spec.id.0
+        );
+    }
+    let session_parent = agent
+        .session()
+        .path()
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("session path has no parent directory"))?;
+    agent
+        .enable_v2_delegation(DelegationConfig::new(session_parent.join(".delegation")).proactive())
+        .with_context(|| "could not initialize the Ultra V2 delegation runtime")?;
+    Ok(())
+}
+
 pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> anyhow::Result<App> {
     let Bootstrap {
         mut config,
@@ -3808,8 +3863,11 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         },
     };
 
-    let reasoning_mode = normalize_reasoning_mode_for_model(launch.reasoning_mode, &model)?;
-    let reasoning = normalize_reasoning_for_model(&launch.reasoning, &model)?;
+    let (reasoning, reasoning_mode, migration_diagnostic) =
+        normalize_reasoning_selection_for_model(&launch.reasoning, launch.reasoning_mode, &model)?;
+    if let Some(diagnostic) = migration_diagnostic {
+        crate::output::stderr!("warning: {diagnostic}");
+    }
     validate_native_compaction_replay(config.compaction.mode, &session, &model)?;
     append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
     config.model = Some(model.spec.id.clone());
@@ -3831,8 +3889,6 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     let (extensions, executable_extensions) =
         configured_extensions(&config, &session, &model, &reasoning, &sessions);
     validate_explicit_tool_policy(&config, &extensions, &model)?;
-    let system_tokens = estimate_text_tokens(&system);
-    let tool_schema_tokens = tool_schema_reserve(&extensions.tool_definitions());
     let goal_store = terminal_goal_store(&config)?;
     let goal_session_id = terminal_goal_session_id(&session)?;
     let goal_driver = GoalDriver::new(goal_store.clone(), goal_session_id.clone());
@@ -3858,6 +3914,9 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         config.compaction.keep_recent_tokens,
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
+    configure_v2_delegation(&mut agent, &model, &reasoning)?;
+    let system_tokens = estimate_text_tokens(agent.system_prompt());
+    let tool_schema_tokens = tool_schema_reserve(&agent.registered_tool_definitions());
 
     Ok(App {
         agent,
@@ -3943,10 +4002,14 @@ pub fn rebuild_app(
         }
         (None, None) => normalize_reasoning_for_model(&reasoning, &model)?,
     };
-    let reasoning_mode = new_reasoning_mode
+    let requested_reasoning_mode = new_reasoning_mode
         .or(persisted.reasoning_mode)
         .unwrap_or(reasoning_mode);
-    let reasoning_mode = normalize_reasoning_mode_for_model(reasoning_mode, &model)?;
+    let (reasoning, reasoning_mode, migration_diagnostic) =
+        normalize_reasoning_selection_for_model(&reasoning, requested_reasoning_mode, &model)?;
+    if let Some(diagnostic) = migration_diagnostic {
+        crate::output::stderr!("warning: {diagnostic}");
+    }
     let candidate_session = match selection.as_ref() {
         Some(SessionSelection::OpenExisting(_)) => prepared_session.as_ref(),
         Some(SessionSelection::CreateNew(_)) => None,
@@ -3996,7 +4059,6 @@ pub fn rebuild_app(
         config.workspace_trusted,
     )?);
     system.push_str(&format_skills_for_prompt(&skills.descriptors()));
-    let system_tokens = estimate_text_tokens(&system);
     let prompts = Arc::new(PromptRegistry::discover(
         &config.workspace,
         &config.prompt_paths,
@@ -4005,7 +4067,6 @@ pub fn rebuild_app(
     let (extensions, executable_extensions) =
         configured_extensions(&config, &session, &model, &reasoning, &sessions);
     validate_explicit_tool_policy(&config, &extensions, &model)?;
-    let tool_schema_tokens = tool_schema_reserve(&extensions.tool_definitions());
     let mut agent = Agent::new(AgentConfig {
         client: client.clone(),
         model: model.clone(),
@@ -4028,6 +4089,9 @@ pub fn rebuild_app(
         config.compaction.keep_recent_tokens,
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
+    configure_v2_delegation(&mut agent, &model, &reasoning)?;
+    let system_tokens = estimate_text_tokens(agent.system_prompt());
+    let tool_schema_tokens = tool_schema_reserve(&agent.registered_tool_definitions());
 
     Ok(App {
         agent,

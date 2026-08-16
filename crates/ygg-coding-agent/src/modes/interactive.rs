@@ -29,7 +29,7 @@ use crate::compaction::{
     attempt_compaction, context_window, estimate_next_request_tokens, CompactionOutcome,
 };
 use crate::config::{CompactionMode, ThinkingLevel};
-use crate::modes::{run_ended, RunEnded};
+use crate::modes::{HostRunOutcome, RUN_STREAM_LOST_MESSAGE};
 use crate::presentation::RunId;
 use crate::prompts::{render_and_record, RenderedPrompt};
 use crate::resources::{compose_instructions, expand_skill_command};
@@ -37,8 +37,8 @@ use crate::session_tree::render_session_tree;
 use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
-    confirmation_picker, extension_confirmation_picker, optional_model_picker,
-    reasoning_mode_picker, session_picker, theme_picker, thinking_picker, tool_input_picker,
+    confirmation_picker, extension_confirmation_picker, optional_model_picker, session_picker,
+    theme_picker, thinking_picker, tool_input_picker,
 };
 use crate::tui::theme::{
     available_themes, background_from_terminal_rgb, load_named_theme_for_background, load_theme,
@@ -1004,7 +1004,7 @@ pub async fn drive_active_run<S>(
     cost_warning_microdollars: Option<u64>,
     executable_extensions: &mut crate::extensions::ExecutableExtensions,
     made_tool_call: &mut bool,
-) -> anyhow::Result<RunEnded>
+) -> anyhow::Result<HostRunOutcome>
 where
     S: Stream<Item = std::io::Result<Event>> + Unpin,
 {
@@ -1058,7 +1058,7 @@ where
                     Duration::from_millis(400),
                 )
                 .await;
-                return Ok(RunEnded::Aborted);
+                return Ok(HostRunOutcome::shutdown());
             }
             result = futures_util::future::OptionFuture::from(in_flight.as_mut().map(|f| f.as_mut())), if in_flight.is_some() => {
                 // A run may have ended before a pending control was delivered.
@@ -1315,7 +1315,7 @@ where
                                     Duration::from_millis(400),
                                 )
                                 .await;
-                                return Ok(RunEnded::Aborted);
+                                return Ok(HostRunOutcome::shutdown());
                             }
                             result = confirmation_picker(shell, input, request) => result,
                         };
@@ -1444,16 +1444,18 @@ where
                         let (endpoint, model) = shell
                             .current_run_route()
                             .unwrap_or_else(|| ("unknown".to_owned(), "unknown".to_owned()));
-                        return Ok(run_ended(&reason, &endpoint, &model));
+                        return Ok(HostRunOutcome::from_finish_reason(
+                            &reason,
+                            &endpoint,
+                            &model,
+                        ));
                     }
                 }
                 None => {
                     shell.restore_queued_steering();
-                    shell.fail_run(run_id, "run stream ended without a final outcome");
+                    shell.fail_run(run_id, RUN_STREAM_LOST_MESSAGE);
                     shell.render();
-                    return Ok(RunEnded::Failed(
-                        "run stream ended without RunFinished".into(),
-                    ));
+                    return Ok(HostRunOutcome::stream_lost());
                 }
             },
         }
@@ -1729,26 +1731,11 @@ async fn thinking_configuration_picker(
     shell: &mut InteractiveShell,
     input: &mut EventStream,
 ) -> anyhow::Result<Option<(ReasoningMode, ThinkingLevel)>> {
-    let supports_pro = app
-        .model
-        .spec
-        .capabilities
-        .reasoning
-        .as_ref()
-        .is_some_and(|capability| capability.supports_pro_mode);
-    let mode = if supports_pro {
-        let Some(mode) = reasoning_mode_picker(shell, input, app.reasoning_mode).await? else {
-            return Ok(None);
-        };
-        mode
-    } else {
-        ReasoningMode::Standard
-    };
     let levels = supported_levels(&app.model);
     let Some(level) = thinking_picker(shell, input, &levels).await? else {
         return Ok(None);
     };
-    Ok(Some((mode, level)))
+    Ok(Some((ReasoningMode::Standard, level)))
 }
 
 fn session_tree_text(session: &Session) -> String {
@@ -3214,7 +3201,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     shutdown_for_exit(&mut app).await;
                     break 'interactive;
                 }
-                let goal_decision = if matches!(ended, RunEnded::Completed) {
+                let goal_decision = if ended.allows_after_response() {
                     let response = crate::extensions::latest_assistant_text(app.agent.session());
                     let notifications = tokio::select! {
                         biased;
@@ -3619,6 +3606,8 @@ mod tests {
                     tools: true,
                     parallel_tool_calls: false,
                     reasoning: None,
+                    responses_lite: false,
+                    agent_delegation: None,
                     structured_output: false,
                 },
                 limits: ModelLimits {
@@ -3732,7 +3721,7 @@ mod tests {
         .unwrap();
         drop(run);
 
-        assert_eq!(ended, RunEnded::Aborted);
+        assert_eq!(ended, HostRunOutcome::Aborted);
         assert!(quit);
         assert!(shell.debug_snapshot().contains("Interrupted"));
     }
@@ -3807,7 +3796,7 @@ mod tests {
         .unwrap();
         drop(run);
 
-        assert_eq!(ended, RunEnded::Completed);
+        assert_eq!(ended, HostRunOutcome::Completed);
         assert!(!quit);
         assert_eq!(
             pending.pop_front(),
@@ -3908,7 +3897,7 @@ mod tests {
         .unwrap();
         drop(run);
 
-        assert_eq!(ended, RunEnded::Aborted);
+        assert_eq!(ended, HostRunOutcome::Aborted);
         assert_eq!(shell.pending(), "steer first\n\nsteer second");
         assert!(shell.debug_snapshot().contains("Interrupted"));
         let context = agent.session().context().unwrap();

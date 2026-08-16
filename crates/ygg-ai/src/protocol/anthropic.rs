@@ -170,13 +170,17 @@ struct AnthropicOutputFormat {
 /// scale. Anthropic exposes `low`|`medium`|`high`|`xhigh`|`max` (no `minimal`
 /// tier), so `Minimal` folds into `low`.
 fn anthropic_effort(effort: crate::types::ReasoningEffort) -> String {
-    use crate::types::ReasoningEffort::{High, Low, Max, Medium, Minimal, Xhigh};
+    use crate::types::ReasoningEffort::{High, Low, Max, Medium, Minimal, Ultra, Xhigh};
     match effort {
         Minimal | Low => "low",
         Medium => "medium",
         High => "high",
         Xhigh => "xhigh",
         Max => "max",
+        // Anthropic does not currently advertise an Ultra tier. This arm is a
+        // defensive fallback for direct codec use; normal request
+        // normalization clamps Ultra to the model's advertised maximum.
+        Ultra => "max",
     }
     .to_string()
 }
@@ -579,7 +583,8 @@ pub(crate) fn build_request(
                             crate::types::ReasoningEffort::Medium => b.medium,
                             crate::types::ReasoningEffort::High => b.high,
                             crate::types::ReasoningEffort::Xhigh => b.xhigh,
-                            crate::types::ReasoningEffort::Max => b.max,
+                            crate::types::ReasoningEffort::Max
+                            | crate::types::ReasoningEffort::Ultra => b.max,
                         };
                         thinking_opt = Some(AnthropicThinkingConfig {
                             r#type: "enabled".to_string(),
@@ -1089,7 +1094,6 @@ mod tests {
                         control: crate::types::ReasoningControl::TokenBudget,
                         exposes_text: true,
                         preserves_state: true,
-                        supports_pro_mode: false,
                         effort_budgets: Some(crate::types::ReasoningEffortBudgets {
                             minimal: 1024,
                             low: 2048,
@@ -1105,6 +1109,8 @@ mod tests {
                 } else {
                     None
                 },
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: true,
             },
             limits: ModelLimits {

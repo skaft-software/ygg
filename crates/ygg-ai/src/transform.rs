@@ -550,6 +550,8 @@ mod tests {
                     tools: true,
                     parallel_tool_calls: true,
                     reasoning: None,
+                    responses_lite: false,
+                    agent_delegation: None,
                     structured_output: false,
                 },
                 limits: ModelLimits {

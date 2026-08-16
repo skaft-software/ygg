@@ -7,7 +7,7 @@
 //! Platforms without descriptor-relative primitives fail closed.
 
 use std::io::Read;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// Failures produced by bounded descriptor-based file access.
 #[derive(Debug, thiserror::Error)]
@@ -219,6 +219,30 @@ pub fn create_regular_file_for_append(path: &Path) -> Result<std::fs::File, Secu
 pub fn create_private_directory_all(path: &Path) -> Result<(), SecureFileError> {
     validate_absolute_file_path(path)?;
     imp::create_private_directory_all(path)
+}
+
+/// Create a uniquely named owner-only child directory without following path
+/// replacements during allocation.
+///
+/// `parent` must be absolute. `prefix` is restricted to portable filename
+/// characters and the random suffix is generated from the operating system's
+/// cryptographically secure random source. The final directory create is
+/// exclusive and descriptor-relative to the validated private parent.
+pub(crate) fn create_unique_private_directory(
+    parent: &Path,
+    prefix: &str,
+) -> Result<PathBuf, SecureFileError> {
+    validate_absolute_file_path(parent)?;
+    if prefix.is_empty()
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(SecureFileError::InvalidPath(prefix.to_owned()));
+    }
+    imp::create_private_directory_all(parent)?;
+    let name = imp::create_unique_private_directory(parent, prefix)?;
+    Ok(parent.join(name))
 }
 
 /// Open an owner-only directory as a stable advisory-lock anchor.
@@ -674,6 +698,43 @@ mod imp {
         }
         created.disarm();
         Ok(())
+    }
+
+    pub(super) fn create_unique_private_directory(
+        parent: &Path,
+        prefix: &str,
+    ) -> Result<OsString, SecureFileError> {
+        let parent: OwnedFd = open_private_directory_for_lock(parent)?.into();
+        for _ in 0..TEMP_NAME_ATTEMPTS {
+            let name = OsString::from(format!("{prefix}{}", random_temp_suffix()?));
+            let mut created = CreatedDirectories {
+                entries: Vec::new(),
+            };
+            let Some(directory) =
+                create_directory_at(&parent, &name, Mode::from_raw_mode(0o700), &mut created)?
+            else {
+                continue;
+            };
+            make_private_directory(&directory)?;
+
+            let expected = rustix::fs::fstat(&directory)
+                .map_err(|error| SecureFileError::Io(io_error(error)))?;
+            let actual = rustix::fs::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|error| SecureFileError::Io(io_error(error)))?;
+            if rustix::fs::FileType::from_raw_mode(actual.st_mode)
+                != rustix::fs::FileType::Directory
+                || (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)
+            {
+                return Err(SecureFileError::Changed);
+            }
+
+            created.disarm();
+            return Ok(name);
+        }
+        Err(SecureFileError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique private directory",
+        )))
     }
 
     pub(super) fn open_private_directory_for_lock(
@@ -2085,15 +2146,70 @@ mod imp {
         }
     }
 
+    pub(super) fn create_unique_private_directory(
+        parent: &Path,
+        prefix: &str,
+    ) -> Result<OsString, SecureFileError> {
+        let parent = open_private_directory_for_lock(parent)?;
+        for _ in 0..TEMP_NAME_ATTEMPTS {
+            let name = OsString::from(format!("{prefix}{}", random_temp_suffix()?));
+            let created_directory = with_private_descriptor(true, |descriptor| {
+                nt_open_at(
+                    parent.as_raw_handle(),
+                    &name,
+                    PRIVATE_DIRECTORY_CREATE_ACCESS,
+                    FILE_CREATE,
+                    FILE_DIRECTORY_FILE,
+                    FILE_ATTRIBUTE_DIRECTORY,
+                    descriptor,
+                )
+            });
+            let (directory, _) = match created_directory {
+                Ok(created) => created,
+                Err(SecureFileError::Io(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let mut created = CreatedDirectories {
+                entries: Vec::new(),
+            };
+            created.record(&directory)?;
+            make_private_acl(&directory, true)?;
+
+            let expected = file_identity(&directory)?;
+            let (actual, _) = open_directory_at(&parent, &name, false, true)?;
+            let actual = file_identity(&actual)?;
+            if !actual.is_directory()
+                || actual.is_reparse_point()
+                || (actual.volume, actual.index) != (expected.volume, expected.index)
+            {
+                return Err(SecureFileError::Changed);
+            }
+
+            created.disarm();
+            return Ok(name);
+        }
+        Err(SecureFileError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique private directory",
+        )))
+    }
+
     pub(super) fn open_private_directory_for_lock(path: &Path) -> Result<File, SecureFileError> {
         let (root_path, names) = split_absolute(path)?;
         if names.is_empty() {
             return Err(invalid_path(path));
         }
         let mut directory = open_root(&root_path)?;
-        for component in names {
-            let (next, _) = open_directory_at(&directory, &component, false, true)?;
-            validate_private_acl(&next, true)?;
+        for (index, component) in names.iter().enumerate() {
+            let final_component = index + 1 == names.len();
+            let (next, _) = open_directory_at(&directory, component, false, final_component)?;
+            if final_component {
+                validate_private_acl(&next, true)?;
+            }
             directory = next;
         }
         Ok(directory)
@@ -2564,6 +2680,13 @@ mod imp {
         unsupported()
     }
 
+    pub(super) fn create_unique_private_directory(
+        _parent: &Path,
+        _prefix: &str,
+    ) -> Result<std::ffi::OsString, SecureFileError> {
+        unsupported()
+    }
+
     pub(super) fn open_private_directory_for_lock(
         _path: &Path,
     ) -> Result<std::fs::File, SecureFileError> {
@@ -2687,6 +2810,54 @@ mod tests {
             read_regular_file_bounded(&path, 16),
             Err(SecureFileError::TooLarge { .. })
         ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn unique_private_directories_are_distinct_and_owner_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap().join("private");
+
+        let first = create_unique_private_directory(&parent, "team-").unwrap();
+        let second = create_unique_private_directory(&parent, "team-").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(parent.as_path()));
+        assert!(first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("team-"));
+        open_private_directory_for_lock(&first).unwrap();
+        open_private_directory_for_lock(&second).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unique_private_directory_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let outside = root.join("outside");
+        let parent = root.join("private");
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, &parent).unwrap();
+
+        assert!(create_unique_private_directory(&parent, "team-").is_err());
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn unique_private_directory_rejects_path_prefixes() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap().join("private");
+
+        assert!(matches!(
+            create_unique_private_directory(&parent, "../team-"),
+            Err(SecureFileError::InvalidPath(_))
+        ));
+        assert!(!parent.exists());
     }
 
     #[test]

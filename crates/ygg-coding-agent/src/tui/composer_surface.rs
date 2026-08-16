@@ -756,12 +756,7 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
     fit_line(&line, width)
 }
 
-fn append_status_footer(
-    lines: &mut Vec<String>,
-    state: &super::view::ShellState,
-    width: u16,
-    now: Instant,
-) {
+pub(crate) fn status_footer_visible(state: &super::view::ShellState, width: u16) -> bool {
     let layout = state.theme.layout_for_width(width);
     let has_extension = state
         .extension_footer
@@ -772,7 +767,16 @@ fn append_status_footer(
             .as_ref()
             .is_some_and(|(text, _)| !text.trim().is_empty());
     let has_identity = layout.show_footer && !layout.show_header;
-    if has_identity || layout.show_status_line || has_extension {
+    has_identity || layout.show_status_line || has_extension
+}
+
+fn append_status_footer(
+    lines: &mut Vec<String>,
+    state: &super::view::ShellState,
+    width: u16,
+    now: Instant,
+) {
+    if status_footer_visible(state, width) {
         lines.push(render_status_footer(state, width, now));
     }
 }

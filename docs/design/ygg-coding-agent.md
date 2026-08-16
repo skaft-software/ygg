@@ -26,7 +26,11 @@ Startup resolves the persistent session before final model selection:
 3. Explicit `--model` and `--reasoning` flags override recovered values.
    Project/global defaults apply only when the session has no corresponding
    value.
-4. Resolve and normalize the model/reasoning pair.
+4. Resolve the model and normalize reasoning against its advertised
+   capabilities. A persisted legacy Pro bit migrates to Ultra only when the
+   route advertises Ultra effort and V2 collaboration and the host has an
+   executable V2 runtime; otherwise it is cleared with a warning while the
+   independently selected effort is retained.
 5. Append the effective configuration as provenance before constructing
    `Agent`, except when an existing session already ends in the same marker.
 
@@ -113,8 +117,20 @@ in order:
 - Skill tools: `search_skills`, `load_skill`, `read_skill_resource`.
 
 Context budgeting reserves the serialized schemas from that exact host rather
-than reproducing a hard-coded subset. A consuming rebuild drops the old Agent
-before reopening its session, so only one append handle owns a session file.
+than reproducing a hard-coded subset. When delegation is installed, bootstrap
+recomputes the reserve from `agent.system_prompt()` and
+`agent.registered_tool_definitions()` so its instructions and schemas count.
+A consuming rebuild drops the old Agent before reopening its session, so only
+one append handle owns a session file.
+
+When the normalized effort is Ultra, bootstrap enables proactive V2 delegation
+under a private random team directory inside the session's `.delegation`
+storage. Lower reasoning efforts never install those tools. The coding host
+chooses this activation policy, while `ygg-agent` enforces execution, isolation,
+provenance, limits, and cancellation; `ygg-ai` only reports the provider
+capability. Delegated children inherit the root's approved extensions, sandbox,
+model/reasoning and cache settings, compaction/completion/output policy, retry
+and turn bounds, and cost ceiling.
 
 ## Skills
 
@@ -183,6 +199,29 @@ future messages therefore fork without deleting the abandoned branch.
 current reload generation. A malformed manifest, rejected link, or ID mismatch
 does not prevent healthy skills from loading and no longer disappears into
 startup-only stderr.
+
+## OpenAI Codex discovery and Ultra
+
+Authenticated Codex discovery sends client version `0.147.0` and parses the
+provider's reasoning levels, `use_responses_lite`, and
+`multi_agent_version: "v2"`. Cache schema version 2 preserves those fields and
+is scoped to the authenticated account context. Missing, stale, malformed, or
+offline metadata falls back conservatively: Ygg does not infer Ultra, Responses
+Lite, or delegation from model names or OAuth plans.
+
+Ultra is selectable only when the selected model advertises the `ultra` effort
+and V2 delegation and the linked `ygg-agent` host reports an executable V2
+runtime. This avoids advertising “maximum reasoning with automatic task
+delegation” when only the model-side label is present. The legacy persisted
+`ReasoningMode::Pro` value remains readable for durable sessions, but no picker
+or new configuration writes it and no codec serializes `reasoning.mode`.
+Eligible legacy selections migrate at startup to Ultra; ineligible ones retain
+their effort with Pro cleared and a warning.
+
+Routes advertising Responses Lite use the transport contract implemented by
+`ygg-ai`, including its ordinary and compact request shapes. This product layer
+only discovers and propagates the capability; it does not reconstruct the wire
+format or infer support from the endpoint identity.
 
 ## Authentication
 

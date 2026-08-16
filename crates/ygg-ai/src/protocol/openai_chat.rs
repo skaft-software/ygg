@@ -339,6 +339,7 @@ fn provider_effort(value: &str) -> Option<ReasoningEffort> {
         "high" => Some(ReasoningEffort::High),
         "xhigh" | "x-high" | "extra_high" => Some(ReasoningEffort::Xhigh),
         "max" => Some(ReasoningEffort::Max),
+        "ultra" => Some(ReasoningEffort::Ultra),
         _ => None,
     }
 }
@@ -728,6 +729,7 @@ pub(crate) fn build_request(
                 crate::types::ReasoningEffort::High => "high".to_string(),
                 crate::types::ReasoningEffort::Xhigh => "xhigh".to_string(),
                 crate::types::ReasoningEffort::Max => "max".to_string(),
+                crate::types::ReasoningEffort::Ultra => "ultra".to_string(),
             }),
             ReasoningConfig::Budget(_) => None,
         }
@@ -744,6 +746,7 @@ pub(crate) fn build_request(
                     crate::types::ReasoningEffort::High => "high",
                     crate::types::ReasoningEffort::Xhigh => "xhigh",
                     crate::types::ReasoningEffort::Max => "max",
+                    crate::types::ReasoningEffort::Ultra => "ultra",
                 }
                 .to_string(),
             }),
@@ -2314,7 +2317,6 @@ mod tests {
                         control: crate::types::ReasoningControl::Effort,
                         exposes_text: true,
                         preserves_state: true,
-                        supports_pro_mode: false,
                         effort_budgets: None,
                         openai_chat_mode: crate::types::OpenAiChatReasoningMode::Standard,
                         min_effort: crate::types::ReasoningEffort::Minimal,
@@ -2323,6 +2325,8 @@ mod tests {
                 } else {
                     None
                 },
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: structured,
             },
             limits: ModelLimits {

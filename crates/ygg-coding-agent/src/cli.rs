@@ -88,11 +88,11 @@ pub struct Cli {
     /// Model id override.
     #[arg(long)]
     pub model: Option<String>,
-    /// Reasoning: off, minimal, low, medium, high, xhigh, max, or budget=N.
+    /// Reasoning: off, minimal, low, medium, high, xhigh, max, ultra, or budget=N.
     #[arg(long)]
     pub reasoning: Option<String>,
-    /// Reasoning execution mode: standard or pro. Pro requires an entitled ChatGPT OAuth model.
-    #[arg(long, value_name = "MODE")]
+    /// Deprecated persisted-session compatibility; Pro migrates to Ultra when V2 delegation is advertised.
+    #[arg(long, value_name = "MODE", hide = true)]
     pub reasoning_mode: Option<String>,
     /// Prompt-cache retention: none, short, or long.
     #[arg(long, value_name = "POLICY")]

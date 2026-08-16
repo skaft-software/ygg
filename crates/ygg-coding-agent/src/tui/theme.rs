@@ -705,16 +705,29 @@ impl YggTheme {
 
     pub(crate) fn settled_event_dot(&self, tone: &str, text: &str) -> String {
         let source = match tone {
-            "success" => Rgb {
-                red: 78,
-                green: 170,
-                blue: 106,
-            },
-            "error" => Rgb {
-                red: 207,
-                green: 77,
-                blue: 77,
-            },
+            // One-cell outcome markers need full-strength signal colours;
+            // blending them toward the terminal background makes both states
+            // look muted or nearly white at a glance.
+            "success" => {
+                return self.color_text(
+                    Rgb {
+                        red: 82,
+                        green: 200,
+                        blue: 116,
+                    },
+                    text,
+                );
+            }
+            "error" => {
+                return self.color_text(
+                    Rgb {
+                        red: 230,
+                        green: 83,
+                        blue: 83,
+                    },
+                    text,
+                );
+            }
             _ => self.resolve_rgb("muted").unwrap_or(Rgb {
                 red: 119,
                 green: 119,
@@ -2943,6 +2956,20 @@ mod tests {
                 "{model_id} did not use the {lab:?} prompt color"
             );
         }
+    }
+
+    #[test]
+    fn settled_event_dots_keep_full_strength_signal_colors() {
+        let theme = test_theme_with(TerminalCapabilities::test(
+            true,
+            true,
+            ColorDepth::TrueColor,
+        ));
+
+        let success = theme.settled_event_dot("success", "•");
+        let error = theme.settled_event_dot("error", "•");
+        assert!(success.contains("\x1b[38;2;82;200;116m"), "{success:?}");
+        assert!(error.contains("\x1b[38;2;230;83;83m"), "{error:?}");
     }
 
     #[test]

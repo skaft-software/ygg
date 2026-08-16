@@ -85,12 +85,6 @@ impl ChatGptPlan {
     pub(crate) fn uses_max_context_window(&self) -> bool {
         matches!(self, Self::Pro | Self::ProLite)
     }
-
-    /// ChatGPT Pro subscriptions enable GPT-5.6 pro mode. Pro Lite has a
-    /// separate entitlement and must not be treated as Pro here.
-    pub(crate) fn supports_pro_reasoning_mode(&self) -> bool {
-        matches!(self, Self::Pro)
-    }
 }
 
 /// Routing and entitlement claims derived from a subscription JWT. Account
@@ -479,9 +473,6 @@ mod tests {
         assert!(ChatGptPlan::Pro.uses_max_context_window());
         assert!(ChatGptPlan::ProLite.uses_max_context_window());
         assert!(!ChatGptPlan::Plus.uses_max_context_window());
-        assert!(ChatGptPlan::Pro.supports_pro_reasoning_mode());
-        assert!(!ChatGptPlan::ProLite.supports_pro_reasoning_mode());
-        assert!(!ChatGptPlan::Plus.supports_pro_reasoning_mode());
         assert_eq!(
             ChatGptPlan::from_raw(" Future_Tier "),
             Some(ChatGptPlan::Unknown("future_tier".into()))

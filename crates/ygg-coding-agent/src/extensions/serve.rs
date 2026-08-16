@@ -19,9 +19,9 @@ use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, oneshot};
 use ygg_agent::{
     AgentEvent, CompactionReason, ContextBreakdown as AgentContextBreakdown,
-    ContextSnapshot as AgentContextSnapshot, Entry, EntryId, EntryValue, FinishReason,
-    GoalDecision, GoalDriver, GoalState as AgentGoalState, GoalStore as AgentGoalStore,
-    GoalTurnSource, InputPart, OutputChannel, RunControl, RunPhase as AgentRunPhase,
+    ContextSnapshot as AgentContextSnapshot, Entry, EntryId, EntryValue, GoalDecision, GoalDriver,
+    GoalState as AgentGoalState, GoalStore as AgentGoalStore, GoalTurnSource, InputPart,
+    OutputChannel, RunControl, RunPhase as AgentRunPhase,
     RunTerminalState as AgentRunTerminalState, Session, SessionRunOutcome, SessionRunOutcomeStatus,
     ToolError, ToolOutput, ToolProgress, UserInput,
 };
@@ -70,6 +70,7 @@ use crate::app::{reasoning_label, supported_levels, App, Reconfig};
 use crate::commands;
 use crate::compaction::attempt_compaction;
 use crate::config::{self, Config};
+use crate::modes::HostRunOutcome;
 use crate::resources::{compose_instructions, validate_skill_requirements};
 use crate::session_store::{
     SessionCatalogEntry, SessionMeta, SessionStorageLifecycle, SessionStore, SessionUsageRecord,
@@ -5709,16 +5710,15 @@ async fn start_and_drive_run(
     plan.pull_request_refresh_requested.notify_one();
 
     let mut response_text = String::new();
-    let mut completed = false;
-    let terminal;
+    let outcome;
     loop {
         tokio::select! {
             event = run.next() => {
                 let Some(agent_event) = event else {
-                    terminal = TerminalProjection::failed("The run stream ended unexpectedly.");
+                    outcome = HostRunOutcome::stream_lost();
                     break;
                 };
-                let outcome = project_agent_event(
+                let projected_outcome = project_agent_event(
                     agent_event,
                     &run_id,
                     plan,
@@ -5736,16 +5736,15 @@ async fn start_and_drive_run(
                     events,
                 )
                 .await?;
-                if let Some(outcome) = outcome {
-                    completed = outcome.state == SessionLiveState::Done;
-                    terminal = outcome;
+                if let Some(projected_outcome) = projected_outcome {
+                    outcome = projected_outcome;
                     break;
                 }
             }
             command = commands.recv() => {
                 let Some(command) = command else {
                     control.abort();
-                    terminal = TerminalProjection::stopped();
+                    outcome = HostRunOutcome::shutdown();
                     break;
                 };
                 match command {
@@ -5775,6 +5774,8 @@ async fn start_and_drive_run(
         events,
     )
     .await?;
+    let completed = outcome.allows_after_response();
+    let terminal = TerminalProjection::from_host_outcome(&outcome);
     sync_session_usage(&plan.usage, &plan.session_id, app.agent.session())?;
     let settled_at_ms = now_ms();
     let unfinished = projection
@@ -7170,7 +7171,7 @@ async fn project_agent_event(
     context_projection: &mut RunContextProjection,
     events: &mpsc::Sender<TimestampedEvent>,
     response_text: &mut String,
-) -> Result<Option<TerminalProjection>, ServiceError> {
+) -> Result<Option<HostRunOutcome>, ServiceError> {
     match agent_event {
         AgentEvent::OutputDelta { channel, text } => {
             let text = bounded_text(&text, MAX_ITEM_TEXT_BYTES);
@@ -7337,21 +7338,11 @@ async fn project_agent_event(
             projection.finish_turn();
         }
         AgentEvent::RunFinished { reason, .. } => {
-            let terminal = match reason {
-                FinishReason::Completed => TerminalProjection::completed(),
-                FinishReason::Aborted => TerminalProjection::stopped(),
-                FinishReason::Failed(error) => {
-                    TerminalProjection::failed(ygg_agent::public_error_diagnostic(
-                        &error,
-                        &provider_model.endpoint.id.0,
-                        &provider_model.spec.id.0,
-                    ))
-                }
-                FinishReason::MaxTurns => {
-                    TerminalProjection::failed("The maximum model-turn limit was reached.")
-                }
-            };
-            return Ok(Some(terminal));
+            return Ok(Some(HostRunOutcome::from_finish_reason(
+                &reason,
+                &provider_model.endpoint.id.0,
+                &provider_model.spec.id.0,
+            )));
         }
         AgentEvent::SteeringDelivered { messages } => {
             attribute_delivered_prompt_context(
@@ -8071,6 +8062,16 @@ struct TerminalProjection {
 }
 
 impl TerminalProjection {
+    fn from_host_outcome(outcome: &HostRunOutcome) -> Self {
+        match outcome {
+            HostRunOutcome::Completed => Self::completed(),
+            HostRunOutcome::Aborted | HostRunOutcome::Shutdown => Self::stopped(),
+            HostRunOutcome::Failed(error) => Self::failed(error.clone()),
+            HostRunOutcome::MaxTurns => Self::failed("The maximum model-turn limit was reached."),
+            HostRunOutcome::StreamLost => Self::failed(crate::modes::RUN_STREAM_LOST_MESSAGE),
+        }
+    }
+
     fn completed() -> Self {
         Self {
             state: SessionLiveState::Done,
@@ -9883,6 +9884,7 @@ fn thinking_label(level: crate::config::ThinkingLevel) -> String {
         crate::config::ThinkingLevel::High => "high",
         crate::config::ThinkingLevel::Xhigh => "xhigh",
         crate::config::ThinkingLevel::Max => "max",
+        crate::config::ThinkingLevel::Ultra => "ultra",
     }
     .into()
 }

@@ -149,46 +149,43 @@ pub(super) fn event_margin_marker(
     active_dot_visible: bool,
     collapsed_reasoning: bool,
 ) -> Option<String> {
-    let active_dot = if theme.unicode() { "•" } else { "*" };
-    let quiet_dot = if theme.unicode() { "·" } else { "." };
-    let active_phase_dot = if active_dot_visible {
-        active_dot
-    } else {
-        quiet_dot
+    let event_dot = if theme.unicode() { "•" } else { "*" };
+    // Active response and tool dots pulse through tone rather than swapping
+    // differently sized glyphs. Their settled colour communicates the result.
+    let active_phase_dot = || {
+        if active_dot_visible {
+            theme.fg("foreground", event_dot)
+        } else {
+            theme.settled_event_dot("neutral", event_dot)
+        }
     };
     match block {
-        TranscriptBlock::User { .. } | TranscriptBlock::Outcome(_) | TranscriptBlock::Notice(_) => {
-            None
-        }
         TranscriptBlock::Reasoning(reasoning) if collapsed_reasoning => {
             Some(if active_dot_visible {
-                theme.model_fg(reasoning.model_lab, active_dot)
+                theme.model_fg(reasoning.model_lab, event_dot)
             } else {
                 " ".to_owned()
             })
         }
         TranscriptBlock::Reasoning(_) => None,
-        TranscriptBlock::Tool(panel) if !panel.finished => {
-            Some(theme.fg("foreground", active_phase_dot))
-        }
-        TranscriptBlock::Tool(panel) if panel.is_error => {
-            Some(theme.settled_event_dot("error", quiet_dot))
-        }
-        TranscriptBlock::Tool(panel) if matches!(panel.name.as_str(), "bash" | "exec") => {
-            Some(theme.settled_event_dot("success", quiet_dot))
-        }
-        TranscriptBlock::Shell(shell) if shell.running => {
-            Some(theme.fg("foreground", active_phase_dot))
-        }
-        TranscriptBlock::Shell(shell) => Some(theme.settled_event_dot(
-            if shell.exit_code == 0 {
-                "success"
-            } else {
-                "error"
-            },
-            quiet_dot,
-        )),
-        _ => Some(theme.settled_event_dot("neutral", quiet_dot)),
+        TranscriptBlock::Assistant(assistant) if !assistant.finished => Some(active_phase_dot()),
+        TranscriptBlock::Assistant(_) => Some(theme.settled_event_dot("success", event_dot)),
+        TranscriptBlock::Tool(panel) if !panel.finished => Some(active_phase_dot()),
+        TranscriptBlock::Tool(panel) => Some(if panel.is_error {
+            theme.settled_event_dot("error", event_dot)
+        } else {
+            theme.settled_event_dot("success", event_dot)
+        }),
+        TranscriptBlock::Shell(shell) if shell.running => Some(active_phase_dot()),
+        TranscriptBlock::Shell(shell) => Some(if shell.exit_code == 0 {
+            theme.settled_event_dot("success", event_dot)
+        } else {
+            theme.settled_event_dot("error", event_dot)
+        }),
+        TranscriptBlock::User { .. }
+        | TranscriptBlock::Outcome(_)
+        | TranscriptBlock::Notice(_)
+        | TranscriptBlock::Compaction(_) => None,
     }
 }
 
@@ -209,31 +206,34 @@ pub(super) fn decorate_surface(
             + content.len()
             + plan.geometry.trailing_rows,
     );
+    let has_heading_row = plan.chrome == ThemeSurfaceChrome::Card
+        || plan.chrome == ThemeSurfaceChrome::Rule
+        || plan.heading != ThemeSurfaceHeading::None;
+    let has_bottom_row = plan.chrome == ThemeSurfaceChrome::Card;
+    let leading_padding_rows = plan.geometry.leading_rows - usize::from(has_heading_row);
+    let trailing_padding_rows = plan.geometry.trailing_rows - usize::from(has_bottom_row);
+
     rows.extend(std::iter::repeat_n(
         String::new(),
         plan.geometry.transition_rows,
     ));
-    if plan.geometry.leading_rows > 0 {
+    if has_heading_row {
         rows.push(styled_surface_heading(plan, theme));
     }
-    if plan.geometry.leading_rows > 1 {
-        rows.extend(std::iter::repeat_n(
-            render_surface_content_line("", plan, theme, prompt_color),
-            plan.geometry.leading_rows - 1,
-        ));
-    }
+    rows.extend(std::iter::repeat_n(
+        render_surface_content_line("", plan, theme, prompt_color),
+        leading_padding_rows,
+    ));
     rows.extend(
         content
             .iter()
             .map(|line| render_surface_content_line(line, plan, theme, prompt_color)),
     );
-    if plan.geometry.trailing_rows > 1 {
-        rows.extend(std::iter::repeat_n(
-            render_surface_content_line("", plan, theme, prompt_color),
-            plan.geometry.trailing_rows - 1,
-        ));
-    }
-    if plan.geometry.trailing_rows > 0 {
+    rows.extend(std::iter::repeat_n(
+        render_surface_content_line("", plan, theme, prompt_color),
+        trailing_padding_rows,
+    ));
+    if has_bottom_row {
         let (_, border_role, _) = surface_roles(plan.kind);
         let middle = horizontal_rule(theme, usize::from(plan.frame_width.saturating_sub(2)));
         let bottom = format!(

@@ -259,6 +259,7 @@ pub enum ThinkingLevel {
     High,
     Xhigh,
     Max,
+    Ultra,
 }
 
 impl ThinkingLevel {
@@ -272,8 +273,9 @@ impl ThinkingLevel {
             "high" => Ok(Self::High),
             "xhigh" | "x-high" => Ok(Self::Xhigh),
             "max" => Ok(Self::Max),
+            "ultra" => Ok(Self::Ultra),
             _ => anyhow::bail!(
-                "invalid thinking level {value:?}; use off, on, minimal, low, medium, high, xhigh, or max"
+                "invalid thinking level {value:?}; use off, on, minimal, low, medium, high, xhigh, max, or ultra"
             ),
         }
     }
@@ -286,6 +288,7 @@ impl ThinkingLevel {
             Self::High => ReasoningEffort::High,
             Self::Xhigh => ReasoningEffort::Xhigh,
             Self::Max => ReasoningEffort::Max,
+            Self::Ultra => ReasoningEffort::Ultra,
             Self::Off | Self::On => {
                 unreachable!("binary thinking is not represented by ReasoningEffort")
             }
@@ -299,7 +302,7 @@ impl ThinkingLevel {
             Self::Medium => budgets.medium,
             Self::High => budgets.high,
             Self::Xhigh => budgets.xhigh,
-            Self::Max => budgets.max,
+            Self::Max | Self::Ultra => budgets.max,
             Self::Off | Self::On => 0,
         }
     }
@@ -314,6 +317,7 @@ impl ThinkingLevel {
             Self::High => "high",
             Self::Xhigh => "xhigh",
             Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 }
@@ -478,6 +482,7 @@ pub fn parse_reasoning(value: &str) -> anyhow::Result<ReasoningConfig> {
         "high" => ReasoningConfig::Effort(ReasoningEffort::High),
         "xhigh" | "x-high" => ReasoningConfig::Effort(ReasoningEffort::Xhigh),
         "max" => ReasoningConfig::Effort(ReasoningEffort::Max),
+        "ultra" => ReasoningConfig::Effort(ReasoningEffort::Ultra),
         other => {
             let budget = other
                 .strip_prefix("budget=")

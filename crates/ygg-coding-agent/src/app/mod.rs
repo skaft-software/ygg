@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use ygg_agent::{Agent, DurableGoalStore, GoalDriver};
 use ygg_ai::{
-    AiClient, Model, ModelCatalog, ModelId, OpenAiChatReasoningMode, ReasoningConfig,
-    ReasoningControl, ReasoningEffort, ReasoningMode,
+    AgentDelegation, AiClient, Model, ModelCatalog, ModelId, OpenAiChatReasoningMode,
+    ReasoningConfig, ReasoningControl, ReasoningEffort, ReasoningMode,
 };
 
 use crate::config::Config;
@@ -27,7 +27,38 @@ pub fn reasoning_label(reasoning: &ReasoningConfig) -> String {
         ReasoningConfig::Effort(ygg_ai::ReasoningEffort::High) => "high".to_owned(),
         ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Xhigh) => "xhigh".to_owned(),
         ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Max) => "max".to_owned(),
+        ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra) => "ultra".to_owned(),
         ReasoningConfig::Budget(budget) => format!("budget={budget}"),
+    }
+}
+
+/// Whether the selected route can provide complete Ultra semantics. Ultra is
+/// more than a wire effort: it also requires the host-side V2 collaboration
+/// runtime advertised by model metadata.
+pub fn model_supports_ultra(model: &Model) -> bool {
+    model
+        .spec
+        .capabilities
+        .reasoning
+        .as_ref()
+        .is_some_and(|capability| {
+            capability.control == ReasoningControl::Effort
+                && capability.max_effort >= ReasoningEffort::Ultra
+        })
+        && model
+            .spec
+            .capabilities
+            .agent_delegation
+            .is_some_and(|version| {
+                version == AgentDelegation::V2 && ygg_agent::delegation_runtime_supports(version)
+            })
+}
+
+fn reasoning_effort_ceiling(model: &Model, advertised: ReasoningEffort) -> ReasoningEffort {
+    if advertised == ReasoningEffort::Ultra && !model_supports_ultra(model) {
+        ReasoningEffort::Max
+    } else {
+        advertised
     }
 }
 
@@ -66,7 +97,10 @@ pub fn thinking_to_reasoning(
         level.to_effort()
     };
     let effort = raise_effort(
-        clamp_effort(requested, capability.max_effort),
+        clamp_effort(
+            requested,
+            reasoning_effort_ceiling(model, capability.max_effort),
+        ),
         capability.min_effort,
     );
     let effort = match &capability.openai_chat_mode {
@@ -82,6 +116,7 @@ pub fn thinking_to_reasoning(
                     "high" => Some(ReasoningEffort::High),
                     "xhigh" | "x-high" | "extra_high" => Some(ReasoningEffort::Xhigh),
                     "max" => Some(ReasoningEffort::Max),
+                    "ultra" => Some(ReasoningEffort::Ultra),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -129,6 +164,7 @@ fn effort_level(effort: ReasoningEffort) -> ThinkingLevel {
         ReasoningEffort::High => ThinkingLevel::High,
         ReasoningEffort::Xhigh => ThinkingLevel::Xhigh,
         ReasoningEffort::Max => ThinkingLevel::Max,
+        ReasoningEffort::Ultra => ThinkingLevel::Ultra,
     }
 }
 
@@ -173,24 +209,41 @@ pub fn normalize_reasoning_for_model(
     }
 }
 
-/// Validate a reasoning execution mode against the exact resolved route.
-pub fn normalize_reasoning_mode_for_model(
+/// Migrate the obsolete Pro execution bit at the product boundary.
+///
+/// Persisted Pro selections become Ultra only when live metadata advertises
+/// both Ultra effort and V2 delegation. Otherwise the wire mode is removed and
+/// the independently selected effort is normalized normally.
+pub fn normalize_reasoning_selection_for_model(
+    reasoning: &ReasoningConfig,
     mode: ReasoningMode,
     model: &Model,
-) -> anyhow::Result<ReasoningMode> {
-    if mode == ReasoningMode::Pro
-        && !model
-            .spec
-            .capabilities
-            .reasoning
-            .as_ref()
-            .is_some_and(|capability| capability.supports_pro_mode)
-    {
-        anyhow::bail!(
-            "pro reasoning mode requires a GPT-5.6 ChatGPT model on an entitled OpenAI OAuth Pro subscription"
-        );
+) -> anyhow::Result<(ReasoningConfig, ReasoningMode, Option<String>)> {
+    let normalized = normalize_reasoning_for_model(reasoning, model)?;
+    if mode == ReasoningMode::Standard {
+        return Ok((normalized, ReasoningMode::Standard, None));
     }
-    Ok(mode)
+
+    if model_supports_ultra(model) {
+        return Ok((
+            ReasoningConfig::Effort(ReasoningEffort::Ultra),
+            ReasoningMode::Standard,
+            Some(format!(
+                "legacy reasoning_mode=pro migrated to reasoning=ultra with V2 delegation for {}",
+                model.spec.id.0
+            )),
+        ));
+    }
+
+    Ok((
+        normalized.clone(),
+        ReasoningMode::Standard,
+        Some(format!(
+            "legacy reasoning_mode=pro is obsolete; {} does not advertise Ultra with V2 delegation, using standard mode with reasoning={}",
+            model.spec.id.0,
+            reasoning_label(&normalized)
+        )),
+    ))
 }
 
 /// Convert a current model-specific reasoning setting back to a portable level
@@ -257,6 +310,7 @@ pub fn supported_levels(model: &Model) -> Vec<ThinkingLevel> {
                 "high" => Some(ThinkingLevel::High),
                 "xhigh" | "x-high" | "extra_high" => Some(ThinkingLevel::Xhigh),
                 "max" => Some(ThinkingLevel::Max),
+                "ultra" if model_supports_ultra(model) => Some(ThinkingLevel::Ultra),
                 _ => None,
             };
             let level = match (capability.control, level) {
@@ -286,11 +340,13 @@ pub fn supported_levels(model: &Model) -> Vec<ThinkingLevel> {
             ThinkingLevel::High,
             ThinkingLevel::Xhigh,
             ThinkingLevel::Max,
+            ThinkingLevel::Ultra,
         ]
         .into_iter()
         .filter(|level| {
             let effort = level.to_effort();
-            effort >= capability.min_effort && effort <= capability.max_effort
+            effort >= capability.min_effort
+                && effort <= reasoning_effort_ceiling(model, capability.max_effort)
         }),
     );
     levels
@@ -394,37 +450,43 @@ mod tests {
     }
 
     #[test]
-    fn pro_mode_requires_an_entitled_model_route() {
+    fn legacy_pro_migrates_only_when_ultra_and_v2_are_advertised() {
         let unsupported = model_with(Some(ReasoningCapability {
             control: ReasoningControl::Effort,
             exposes_text: true,
             preserves_state: true,
-            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: ygg_ai::OpenAiChatReasoningMode::Standard,
             min_effort: ReasoningEffort::Minimal,
-            max_effort: ReasoningEffort::Max,
+            max_effort: ReasoningEffort::Ultra,
         }));
-        assert!(normalize_reasoning_mode_for_model(ReasoningMode::Pro, &unsupported).is_err());
-        assert_eq!(
-            normalize_reasoning_mode_for_model(ReasoningMode::Standard, &unsupported).unwrap(),
-            ReasoningMode::Standard
-        );
+        let (reasoning, mode, diagnostic) = normalize_reasoning_selection_for_model(
+            &ReasoningConfig::Effort(ReasoningEffort::Max),
+            ReasoningMode::Pro,
+            &unsupported,
+        )
+        .unwrap();
+        assert_eq!(reasoning, ReasoningConfig::Effort(ReasoningEffort::Max));
+        assert_eq!(mode, ReasoningMode::Standard);
+        assert!(diagnostic
+            .unwrap()
+            .contains("does not advertise Ultra with V2"));
 
         let mut spec = (*unsupported.spec).clone();
-        spec.capabilities
-            .reasoning
-            .as_mut()
-            .unwrap()
-            .supports_pro_mode = true;
-        let entitled = Model {
+        spec.capabilities.agent_delegation = Some(AgentDelegation::V2);
+        let supported = Model {
             spec: Arc::new(spec),
             endpoint: unsupported.endpoint,
         };
-        assert_eq!(
-            normalize_reasoning_mode_for_model(ReasoningMode::Pro, &entitled).unwrap(),
-            ReasoningMode::Pro
-        );
+        let (reasoning, mode, diagnostic) = normalize_reasoning_selection_for_model(
+            &ReasoningConfig::Effort(ReasoningEffort::Max),
+            ReasoningMode::Pro,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(reasoning, ReasoningConfig::Effort(ReasoningEffort::Ultra));
+        assert_eq!(mode, ReasoningMode::Standard);
+        assert!(diagnostic.unwrap().contains("migrated"));
     }
 
     #[test]
@@ -433,7 +495,6 @@ mod tests {
             control: ReasoningControl::Effort,
             exposes_text: true,
             preserves_state: false,
-            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: ygg_ai::OpenAiChatReasoningMode::Standard,
             min_effort: ygg_ai::ReasoningEffort::Minimal,
@@ -448,7 +509,6 @@ mod tests {
             control: ReasoningControl::TokenBudget,
             exposes_text: true,
             preserves_state: false,
-            supports_pro_mode: false,
             effort_budgets: Some(ReasoningEffortBudgets {
                 minimal: 1024,
                 low: 2048,
@@ -478,7 +538,6 @@ mod tests {
             control: ReasoningControl::Effort,
             exposes_text: true,
             preserves_state: false,
-            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: ygg_ai::OpenAiChatReasoningMode::Standard,
             min_effort: ReasoningEffort::Minimal,
@@ -547,7 +606,6 @@ mod tests {
             control: ReasoningControl::TokenBudget,
             exposes_text: true,
             preserves_state: false,
-            supports_pro_mode: false,
             effort_budgets: Some(ReasoningEffortBudgets {
                 minimal: 1024,
                 low: 2048,
@@ -576,7 +634,6 @@ mod tests {
             control: ReasoningControl::Toggle,
             exposes_text: true,
             preserves_state: false,
-            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: OpenAiChatReasoningMode::ProviderValues {
                 values: vec!["none".into(), "default".into()],
@@ -604,7 +661,6 @@ mod tests {
             control: ReasoningControl::Effort,
             exposes_text: true,
             preserves_state: false,
-            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: OpenAiChatReasoningMode::ProviderValues {
                 values: vec!["none".into(), "low".into(), "high".into()],
@@ -630,7 +686,6 @@ mod tests {
             control: ReasoningControl::AlwaysOn,
             exposes_text: true,
             preserves_state: false,
-            supports_pro_mode: false,
             effort_budgets: None,
             openai_chat_mode: OpenAiChatReasoningMode::SystemMessage,
             min_effort: ReasoningEffort::Minimal,

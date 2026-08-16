@@ -67,6 +67,7 @@ pub mod agent;
 pub mod cache;
 pub mod compaction;
 pub mod context;
+pub mod delegation;
 pub mod events;
 pub mod extension;
 pub mod extension_process;
@@ -99,6 +100,10 @@ pub use compaction::{
 pub use context::{
     ActiveContextCompaction, ContextBreakdown, ContextSnapshot, FinishedContextCompaction,
     RunPhase, RunTerminalState,
+};
+pub use delegation::{
+    delegation_runtime_supports, DelegatedAgentStatus, DelegationConfig, DelegationError,
+    DelegationLimits, DelegationMode,
 };
 pub use events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,

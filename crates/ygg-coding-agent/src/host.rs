@@ -14,8 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use ygg_agent::{
-    AgentEvent, EntryValue, FinishReason, InputPart, OutputChannel, Session, ToolProgress,
-    UserInput,
+    AgentEvent, EntryValue, InputPart, OutputChannel, Session, ToolProgress, UserInput,
 };
 use ygg_ai::{
     AssistantMessage, AssistantPart, AudioFormat, Auth, CacheRetention, Capabilities, Endpoint,
@@ -28,6 +27,7 @@ use crate::app::bootstrap::{self, LaunchSelection, SessionSelection};
 use crate::config::{
     ColorMode, CompactionPolicy, Config, Mode, MouseMode, ResumeSelector, SandboxPolicy, ToolPolicy,
 };
+use crate::modes::HostRunOutcome;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -898,11 +898,9 @@ async fn run_request(
     let mut steps = 0u64;
     let mut files_changed = BTreeSet::new();
     let mut active_tools: HashMap<String, (String, serde_json::Value)> = HashMap::new();
-    let mut status = "error";
-    let mut terminal_error = String::new();
-    let mut shutdown_requested = false;
+    let mut terminal_head = None;
 
-    loop {
+    let outcome = loop {
         let event = tokio::select! {
             biased;
             _ = crate::tui::terminal::wait_for_shutdown_signal() => {
@@ -911,13 +909,12 @@ async fn run_request(
                     std::time::Duration::from_millis(400),
                 )
                 .await;
-                shutdown_requested = true;
-                break;
+                break HostRunOutcome::shutdown();
             }
             event = run.next() => event,
         };
         let Some(event) = event else {
-            break;
+            break HostRunOutcome::stream_lost();
         };
         match event {
             AgentEvent::OutputDelta { channel, text } => {
@@ -1098,50 +1095,56 @@ async fn run_request(
                     .await?;
             }
             AgentEvent::RunFinished { head, reason } => {
-                match reason {
-                    FinishReason::Completed => status = "completed",
-                    FinishReason::Aborted => {
-                        status = "blocked";
-                        terminal_error = "run aborted".to_owned();
-                    }
-                    FinishReason::MaxTurns => {
-                        status = "blocked";
-                        terminal_error = "run reached the configured turn limit".to_owned();
-                    }
-                    FinishReason::Failed(error) => {
-                        status = "error";
-                        terminal_error = ygg_agent::public_error_diagnostic(
-                            &error,
-                            &app.model.endpoint.id.0,
-                            &app.model.spec.id.0,
-                        );
-                    }
-                }
-                emitter
-                    .emit(
-                        "settled",
-                        serde_json::json!({
-                            "status": status,
-                            "head": head.0,
-                            "error": clip_text(&terminal_error, 64 * 1024),
-                        }),
-                    )
-                    .await?;
+                terminal_head = Some(head.0);
+                break HostRunOutcome::from_finish_reason(
+                    &reason,
+                    &app.model.endpoint.id.0,
+                    &app.model.spec.id.0,
+                );
             }
         }
-    }
+    };
     drop(run);
     app.agent.set_system_prompt(app.system.clone());
-    if shutdown_requested {
+    let (status, terminal_error) = match &outcome {
+        HostRunOutcome::Completed => ("completed", String::new()),
+        HostRunOutcome::Aborted => ("blocked", "run aborted".to_owned()),
+        HostRunOutcome::MaxTurns => (
+            "blocked",
+            "run reached the configured turn limit".to_owned(),
+        ),
+        HostRunOutcome::Failed(error) => ("error", error.clone()),
+        HostRunOutcome::StreamLost | HostRunOutcome::Shutdown => (
+            "error",
+            outcome.failure_message().unwrap_or_default().to_owned(),
+        ),
+    };
+    let terminal_head = terminal_head
+        .or_else(|| app.agent.session().head().map(|head| head.0.clone()))
+        .unwrap_or_default();
+    if outcome.shutdown_requested() {
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(1400),
             app.executable_extensions.shutdown(),
         )
         .await;
         ygg_agent::extension_process::force_kill_registered_process_groups();
+        // Process shutdown truncates the in-flight protocol request. Do not
+        // emit a non-terminal `settled` event that cannot be followed by the
+        // contractually required `final_result` or `protocol_error`.
         return Ok(RunRequestOutcome::Signaled);
     }
-    if status == "completed" {
+    emitter
+        .emit(
+            "settled",
+            serde_json::json!({
+                "status": status,
+                "head": terminal_head,
+                "error": clip_text(&terminal_error, 64 * 1024),
+            }),
+        )
+        .await?;
+    if outcome.allows_after_response() {
         for notification in app
             .executable_extensions
             .after_response(&final_output)
@@ -1374,12 +1377,13 @@ fn register_inline_model(
                 control: ReasoningControl::Effort,
                 exposes_text: true,
                 preserves_state: protocol == Protocol::OpenAiResponses,
-                supports_pro_mode: false,
                 effort_budgets: None,
                 openai_chat_mode: OpenAiChatReasoningMode::Standard,
                 min_effort: ReasoningEffort::Minimal,
                 max_effort: ReasoningEffort::Max,
             }),
+            responses_lite: false,
+            agent_delegation: None,
             structured_output: true,
         },
         limits: ModelLimits {
@@ -2045,6 +2049,8 @@ mod tests {
                 tools: true,
                 parallel_tool_calls: true,
                 reasoning: None,
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: false,
             },
             limits: ModelLimits {

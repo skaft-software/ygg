@@ -66,6 +66,11 @@ require a fresh key press.
 The composer supports multiline editing, bracketed paste, large-paste chips,
 media attachments, dropped paths, gitignore-aware `@` completion, and Tab
 completion for relative, parent, home-relative, and absolute path tokens.
+Slash-command discovery, file mentions, and filesystem completion render inline
+directly below the composer. While matches are visible, the suggestion surface
+temporarily replaces the model and token status row; the status returns as soon
+as completion closes. Matches use compact rows with action hints in a footer,
+and the active match and hint keys use the selected model's adaptive accent.
 Directory completions retain their trailing separator so completion can continue
 one level at a time, and whitespace in completed names is backslash-escaped.
 Media is capability-gated at attachment time and remains ordered with text when
@@ -78,23 +83,27 @@ framed by a top and bottom rule in a restrained form of the model accent at
 rest and the captured executing model accent while focused or active, but it
 never animates. The rules hold model identity; the transcript owns liveness.
 Content rows span the full width with no side borders, so prompt text
-selected from the composer copies without border characters. Fenced Markdown
-code is borderless and uses `#202630` on known dark profiles or `#f1f5f4` on
-known light profiles, falling back to an unpainted surface when the background
-is unknown. Named and custom themes keep their authored chrome.
+selected from the composer copies without border characters. Historical prompts
+mark only their first content row; wrapped and explicit continuation rows use a
+blank indent instead of a vertical rail. Historical prompts with a persisted
+model-color highlight include one painted internal padding row above and below
+their content; those decorative rows stay outside semantic copy.
+Fenced Markdown code is borderless and uses `#202630` on known dark profiles or
+`#f1f5f4` on known light profiles, falling back to an unpainted surface when the
+background is unknown. Named and custom themes keep their authored chrome.
 
 ## Reasoning presentation
 
-Live reasoning is collapsed into a plain-weight row whose model-colored dot
-blinks once per second, plus a subdued `└ (ctrl+o to expand)` disclosure row.
-The heading cache advances only from semantic ATX headings or paragraphs
-consisting solely of bold text. It never infers a label from body prose,
-sanitizes provider text before display, and uses `Thinking` until the model
-emits a heading. A reasoning-off wait uses the same transient blink with the
-truthful label `Working`, but no disclosure affordance; compaction similarly
-uses `Compacting context`. Completed collapsed reasoning and transient
-activity leave no rows. `Ctrl+O` preserves the existing full, verbatim
-Markdown rendering.
+Live reasoning is collapsed into a plain-weight model-colored row with a
+blinking model-colored dot in the event margin, plus a subdued, aligned
+`⎿ (ctrl+o to expand)` disclosure row. The heading cache advances only from
+semantic ATX headings or paragraphs consisting solely of bold text. It never
+infers a label from body prose, sanitizes provider text before display, and uses
+`Thinking` until the model emits a heading. A reasoning-off wait uses the
+truthful label `Working` but no disclosure affordance; compaction similarly uses
+`Compacting context`. Expanded reasoning keeps the same inset without an
+event-margin dot or a synthetic first-row bullet. Completed collapsed reasoning
+and transient activity leave no rows.
 
 ## Run outcomes
 
@@ -106,13 +115,18 @@ recovering raw provider envelopes or headers.
 
 ## Tool presentation
 
-Tool calls expose deterministic intent and lifecycle rows. Raw protocol
-arguments and envelopes, unsanitized failure evidence, and extension-rendered
-payloads remain internal accountability/provenance data and are excluded from
-transcript copy. For operational feedback, the TUI renders bounded sanitized
-projections: search results and Bash/local-shell output use a muted tail, while
-edit/write results use a bounded unified diff. Omission metadata distinguishes a
-collapsible UI tail from bytes already discarded by the tool capture.
+Tool calls expose deterministic intent and lifecycle rows. Event-margin dots
+identify active collapsed reasoning, assistant responses, and tool or shell
+execution, and every dot uses the same glyph footprint. The collapsed-reasoning
+dot blinks; other active dots pulse through foreground and muted tones rather
+than changing size. Successful completed event dots use green, and failed tools
+use red. Raw protocol arguments and envelopes, unsanitized failure evidence,
+and extension-rendered payloads remain internal accountability/provenance data
+and are excluded from transcript copy. For operational feedback, the TUI renders
+bounded sanitized projections: search results and Bash/local-shell output use a
+muted tail, while edit/write results use a bounded unified diff. Omission
+metadata distinguishes a collapsible UI tail from bytes already discarded by
+the tool capture.
 
 Ctrl+O toggles the global disclosure mode for retained reasoning, compaction,
 search output, Bash/local-shell output, and edit/write diffs. `/verbose [on|off]`

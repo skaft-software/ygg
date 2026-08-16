@@ -26,6 +26,10 @@ use crate::compaction::{
     SUMMARIZATION_SYSTEM_PROMPT, SUMMARY_OUTPUT_TOKENS, TURN_PREFIX_OUTPUT_TOKENS,
 };
 use crate::context::{ContextBreakdown, ContextSnapshot, ContextTracker};
+use crate::delegation::{
+    enable_root_delegation, DelegationBinding, DelegationConfig, DelegationError,
+    DelegationTemplate,
+};
 use crate::events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
     OutputChannel, QueueDeliveryMode,
@@ -294,6 +298,7 @@ pub struct Agent {
     prompt_display_text: Option<String>,
     max_session_cost_microdollars: Option<u64>,
     provider_retries_enabled: bool,
+    delegation: Option<DelegationBinding>,
     last_run_lifecycle: Option<Arc<RunLifecycle>>,
 }
 
@@ -308,6 +313,10 @@ impl Drop for Agent {
             // makes dropping a run safe even when the next agent is reopened
             // from the same session file rather than reusing this Agent.
             let _ = persist_pending_cancellations(&mut self.session);
+        }
+
+        if let Some(delegation) = &self.delegation {
+            delegation.request_shutdown();
         }
 
         // Tool process groups are owned by per-call RAII guards. There are no
@@ -360,6 +369,7 @@ pub struct Run<'a> {
     control: RunControl,
     lifecycle: Arc<RunLifecycle>,
     context: Arc<ContextTracker>,
+    delegation: Option<DelegationBinding>,
 }
 
 impl Run<'_> {
@@ -398,6 +408,9 @@ impl Drop for Run<'_> {
         if !self.lifecycle.finished.load(Ordering::Acquire) {
             self.lifecycle.dropped.store(true, Ordering::Release);
             self.context.run_dropped();
+            if let Some(delegation) = &self.delegation {
+                delegation.request_shutdown();
+            }
         }
     }
 }
@@ -430,6 +443,14 @@ impl RunControl {
             .map_err(|_| AgentError::RunEnded)
     }
 
+    /// Attempts to enqueue steering without allowing a producer to wait behind
+    /// the run's bounded control queue.
+    pub(crate) fn try_steer(&self, input: impl Into<UserInput>) -> Result<(), AgentError> {
+        self.tx
+            .try_send(Control::Steer(input.into()))
+            .map_err(|_| AgentError::RunEnded)
+    }
+
     /// Queues input for after the current run settles: when the model completes
     /// a turn without tool calls, the run continues with this input instead of
     /// finishing.
@@ -437,6 +458,14 @@ impl RunControl {
         self.tx
             .send(Control::FollowUp(input.into()))
             .await
+            .map_err(|_| AgentError::RunEnded)
+    }
+
+    /// Attempts to enqueue a follow-up without allowing a producer to wait
+    /// behind the run's bounded control queue.
+    pub(crate) fn try_follow_up(&self, input: impl Into<UserInput>) -> Result<(), AgentError> {
+        self.tx
+            .try_send(Control::FollowUp(input.into()))
             .map_err(|_| AgentError::RunEnded)
     }
 
@@ -698,7 +727,7 @@ fn reasoning_token_budget(model: &Model, reasoning: &ReasoningConfig) -> u64 {
                     ygg_ai::ReasoningEffort::Medium => budgets.medium,
                     ygg_ai::ReasoningEffort::High => budgets.high,
                     ygg_ai::ReasoningEffort::Xhigh => budgets.xhigh,
-                    ygg_ai::ReasoningEffort::Max => budgets.max,
+                    ygg_ai::ReasoningEffort::Max | ygg_ai::ReasoningEffort::Ultra => budgets.max,
                 })
             })
             .unwrap_or_default(),
@@ -2530,6 +2559,7 @@ impl Agent {
             prompt_display_text: None,
             max_session_cost_microdollars: None,
             provider_retries_enabled: true,
+            delegation: None,
             last_run_lifecycle: None,
         })
     }
@@ -2576,6 +2606,86 @@ impl Agent {
     /// starts.
     pub fn set_system_prompt(&mut self, system: impl Into<String>) {
         self.system = system.into();
+        let delegation_instructions = self
+            .delegation
+            .as_ref()
+            .map(|binding| binding.system_instructions().to_owned())
+            .filter(|instructions| !instructions.is_empty());
+        if let Some(instructions) = delegation_instructions {
+            self.append_system_instructions(instructions);
+        }
+    }
+
+    /// Returns the complete system prompt used by subsequent runs.
+    pub fn system_prompt(&self) -> &str {
+        &self.system
+    }
+
+    /// Enables the bounded host-side V2 collaboration runtime.
+    ///
+    /// Child agents inherit the resolved model, sandbox, approved extension
+    /// tools, reasoning, compaction, completion, and cost settings present at
+    /// this idle boundary. Each child receives an isolated durable session.
+    pub fn enable_v2_delegation(
+        &mut self,
+        config: DelegationConfig,
+    ) -> Result<std::path::PathBuf, DelegationError> {
+        if self.delegation.is_some() {
+            return Err(DelegationError::AlreadyEnabled);
+        }
+        let template = DelegationTemplate {
+            client: self.client.clone(),
+            model: self.model.clone(),
+            base_system: self.system.clone(),
+            sandbox: self.sandbox.clone(),
+            extensions: self.extensions.clone(),
+            max_turns: self.max_turns,
+            reasoning: self.reasoning.clone(),
+            reasoning_mode: self.reasoning_mode,
+            cache_retention: self.cache_retention,
+            compaction_model: self.compaction_model.clone(),
+            auto_compaction_mode: self.auto_compaction_mode,
+            auto_compaction_threshold: self.compaction_threshold_fraction,
+            compaction_keep_recent_tokens: self.compaction_keep_recent_tokens,
+            completion_policy: self.completion_policy,
+            output_modalities: self.output_modalities.clone(),
+            max_output_tokens: self.max_output_tokens,
+            max_session_cost_microdollars: self.max_session_cost_microdollars,
+            provider_retries_enabled: self.provider_retries_enabled,
+        };
+        let binding = enable_root_delegation(self, config, template)?;
+        let team_directory = binding.team_directory().to_path_buf();
+        self.delegation = Some(binding);
+        Ok(team_directory)
+    }
+
+    /// Returns the private team directory when V2 delegation is enabled.
+    pub fn delegation_team_directory(&self) -> Option<&std::path::Path> {
+        self.delegation
+            .as_ref()
+            .map(DelegationBinding::team_directory)
+    }
+
+    pub(crate) fn append_system_instructions(&mut self, instructions: String) {
+        if !self.system.is_empty() {
+            self.system.push_str("\n\n");
+        }
+        self.system.push_str(&instructions);
+    }
+
+    pub(crate) fn install_delegation_tools(&mut self, tools: Vec<Arc<dyn Tool>>) {
+        self.extensions.tools.extend(tools);
+    }
+
+    pub(crate) fn set_delegation_binding(
+        &mut self,
+        binding: DelegationBinding,
+    ) -> Result<(), DelegationError> {
+        if self.delegation.is_some() {
+            return Err(DelegationError::AlreadyEnabled);
+        }
+        self.delegation = Some(binding);
+        Ok(())
     }
 
     /// Set the stable semantic creator/source key persisted with future user
@@ -2790,6 +2900,11 @@ impl Agent {
         self.max_output_tokens
     }
 
+    /// Apply the root agent's resolved output reservation to a delegated child.
+    pub(crate) fn inherit_max_output_tokens(&mut self, max_output_tokens: u64) {
+        self.max_output_tokens = max_output_tokens;
+    }
+
     /// Estimate the next request using the same provider-reconciled baseline
     /// as autonomous capacity checks, without mutating the session.
     pub fn request_context_estimate(&self) -> Result<RequestContextEstimate, SessionError> {
@@ -2925,6 +3040,15 @@ impl Agent {
     /// Returns the selected completion policy.
     pub fn completion_policy(&self) -> CompletionPolicy {
         self.completion_policy
+    }
+
+    /// Provider schemas for all currently executable tools, in wire order.
+    pub fn registered_tool_definitions(&self) -> Vec<ToolDef> {
+        self.extensions
+            .tools
+            .iter()
+            .map(|tool| tool.definition())
+            .collect()
     }
 
     /// Exact registered tool names after the frontend has applied all policy
@@ -3096,6 +3220,8 @@ impl Agent {
         let compaction_threshold_fraction = self.compaction_threshold_fraction;
         let compaction_keep_recent_tokens = self.compaction_keep_recent_tokens;
         let provider_retries_enabled = self.provider_retries_enabled;
+        let stream_delegation = self.delegation.clone();
+        let run_delegation = self.delegation.clone();
         let stream_lifecycle = lifecycle.clone();
         let session = &mut self.session;
 
@@ -4232,6 +4358,12 @@ impl Agent {
                 reason = FinishReason::Failed(error.into());
             }
             let head = session.head().unwrap_or(first_entry);
+            if let Some(delegation) = &stream_delegation {
+                // A delegation team is scoped to this owning run. Stop any
+                // worker, deferred follow-up, or permit waiter that outlives
+                // the root/parent result, regardless of terminal reason.
+                delegation.request_shutdown();
+            }
             stream_context.run_finished(&reason);
             stream_lifecycle.finished.store(true, Ordering::Release);
             let ev = AgentEvent::RunFinished { head, reason };
@@ -4244,6 +4376,7 @@ impl Agent {
             control,
             lifecycle,
             context,
+            delegation: run_delegation,
         })
     }
 

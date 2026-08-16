@@ -18,6 +18,13 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   configured providers, typed media, seeded history, and durable sessions.
 - Added first-use, owner-only Codex credential migration from legacy Codex and
   Hamr stores without modifying the source credentials.
+- Added metadata-gated Ultra reasoning with automatic bounded V2 task
+  delegation, including spawn, follow-up, peer messaging, race-free waiting,
+  interruption, descendant cancellation, and inheritance of the root's approved
+  tools and execution policies.
+- Added isolated child sessions and descriptor-relative private team storage
+  with synced `provenance.jsonl`; delegation fails closed if provenance cannot be
+  persisted.
 - Added both Ygg binaries to deterministic, Git-tracked release archives,
   binary/source installers, containers, and release smoke tests.
 - Added credential-free configured-provider acceptance for Serve covering
@@ -38,6 +45,18 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Made headless native-host interactions fail closed: tool confirmations are
   denied, typed input requests are cancelled, protocol frames are bounded, and
   session/image/provider inputs are validated at their system boundaries.
+- Replaced the obsolete OpenAI Codex Pro wire mode with provider-advertised
+  `ultra` effort. Persisted Pro selections remain readable and migrate only when
+  the route advertises Ultra plus V2 collaboration and the host can execute it;
+  no codec emits `reasoning.mode`.
+- Updated authenticated Codex discovery to parse advertised reasoning levels,
+  `use_responses_lite`, and `multi_agent_version: "v2"` using cache schema 2 and
+  client version `0.147.0`. Offline or incomplete metadata does not infer those
+  capabilities from model names or OAuth plans.
+- Matched current Responses Lite ordinary and compact requests, including
+  explicit `parallel_tool_calls: false`, developer-message instructions,
+  input-item `additional_tools`, `reasoning.context: "all_turns"`, and narrow
+  removal of image-detail hints.
 - Enforced dependency review, high-severity npm audit, plus `cargo audit` and
   `cargo deny` for both lockfiles on pull-request and release paths.
 

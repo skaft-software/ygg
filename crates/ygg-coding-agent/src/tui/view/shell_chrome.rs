@@ -120,8 +120,10 @@ pub(super) fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> Shel
         })
         .unwrap_or_default();
 
-    // Render the new integrated composer surface (model status + input)
-    let composer = crate::tui::composer_surface::render_composer_surface(state, width, now);
+    // Render the integrated composer surface with its ordinary status row.
+    // Autocomplete can claim that row below once we know it has real matches.
+    let footer_visible = crate::tui::composer_surface::status_footer_visible(state, width);
+    let mut composer = crate::tui::composer_surface::render_composer_surface(state, width, now);
     if state.panel.is_some() {
         // The focused picker must retain at least its filter row and cursor,
         // even when a tiny terminal also has a wrapped error message.
@@ -138,8 +140,16 @@ pub(super) fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> Shel
     let panel = render_panel_with_limit(state, width, remaining);
     remaining = remaining.saturating_sub(panel.len());
 
-    let suggestion_limit = remaining.min(10);
+    // Let autocomplete reuse the status row, including in a short terminal
+    // where that reclaimed row is what makes a choice plus its hint fit.
+    let suggestion_limit = remaining
+        .saturating_add(if footer_visible { 1 } else { 0 })
+        .min(10);
     let suggestions = render_input_suggestions(state, width, suggestion_limit);
+    if footer_visible && !suggestions.is_empty() {
+        composer.pop();
+        remaining = remaining.saturating_add(1);
+    }
     remaining = remaining.saturating_sub(suggestions.len());
 
     let pending_limit = remaining.min(4);
@@ -166,9 +176,12 @@ pub(super) fn append_viewport_chrome(lines: &mut Vec<String>, chrome: ShellChrom
     lines.extend(chrome.header);
     lines.extend(chrome.error);
     lines.extend(chrome.pending);
-    lines.extend(chrome.suggestions);
     lines.extend(chrome.panel);
     lines.extend(chrome.composer);
+    // Input discovery expands downward from the composer and temporarily
+    // occupies the status row, keeping model/token telemetry from competing
+    // with the active choices.
+    lines.extend(chrome.suggestions);
 }
 
 pub(super) fn append_chrome(
@@ -190,9 +203,11 @@ pub(super) fn append_chrome(
     lines.extend(chrome.header);
     lines.extend(chrome.error);
     lines.extend(chrome.pending);
-    lines.extend(chrome.suggestions);
     lines.extend(chrome.panel);
     lines.extend(chrome.composer);
+    // Keep autocomplete adjacent to the composer in terminal-owned mode as
+    // well as in the application-owned viewport above.
+    lines.extend(chrome.suggestions);
 }
 
 pub(super) fn shell_chrome_rows(chrome: &ShellChrome) -> usize {

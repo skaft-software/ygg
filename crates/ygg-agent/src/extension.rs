@@ -57,7 +57,7 @@ pub trait ToolCallHook: Send + Sync {
 
 /// Registry of tools and event observers, filled by extensions and consumed
 /// by [`Agent::new`](crate::Agent::new).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ExtensionHost {
     pub(crate) tools: Vec<Arc<dyn Tool>>,
     pub(crate) observers: Vec<Arc<dyn EventObserver>>,

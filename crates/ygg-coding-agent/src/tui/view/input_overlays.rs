@@ -2,7 +2,7 @@
 
 use sexy_tui_rs::visible_width;
 
-use super::{fit_line, semantic_separator, ShellState};
+use super::{activity_elbow, fit_line, semantic_separator, ShellState, ACTIVITY_DETAIL_INDENT};
 use crate::commands;
 use crate::tui::composer;
 
@@ -87,6 +87,55 @@ pub(super) fn input_slash_suggestions(state: &ShellState) -> Vec<InputSlashSugge
     suggestions
 }
 
+fn suggestion_key_hint(state: &ShellState, key: &str, label: &str) -> String {
+    format!(
+        "{} {}",
+        state
+            .theme
+            .bold(&state.theme.model_fg(state.model_lab, key)),
+        state.theme.fg("muted", label)
+    )
+}
+
+fn suggestion_separator(state: &ShellState) -> String {
+    state.theme.fg("muted", semantic_separator(&state.theme))
+}
+
+fn slash_suggestion_footer(
+    state: &ShellState,
+    width: u16,
+    start: usize,
+    end: usize,
+    total: usize,
+    visible_rows: usize,
+) -> String {
+    let scope = if total > visible_rows {
+        let range_separator = if state.theme.unicode() { "–" } else { "-" };
+        format!(
+            "commands {}{range_separator}{end}/{total}",
+            start.saturating_add(1)
+        )
+    } else {
+        "commands".to_owned()
+    };
+    let (navigation_key, select_key) = if state.theme.unicode() {
+        ("↑↓", "↵")
+    } else {
+        ("up/down", "enter")
+    };
+    let separator = suggestion_separator(state);
+    fit_line(
+        &format!(
+            "  {}{separator}{}{separator}{}{separator}{}",
+            state.theme.fg("muted", &scope),
+            suggestion_key_hint(state, navigation_key, "navigate"),
+            suggestion_key_hint(state, select_key, "select"),
+            suggestion_key_hint(state, "esc", "close"),
+        ),
+        width,
+    )
+}
+
 pub(super) fn render_slash_suggestions(
     state: &ShellState,
     width: u16,
@@ -100,6 +149,9 @@ pub(super) fn render_slash_suggestions(
         return Vec::new();
     }
 
+    // Keep one compact hint row below the choices. Moving the metadata to the
+    // footer makes autocomplete read as an inline continuation of the composer
+    // rather than a second panel with its own heading.
     let item_rows = max_rows.saturating_sub(1).max(1);
     let selected = state
         .slash_selection
@@ -114,13 +166,8 @@ pub(super) fn render_slash_suggestions(
     start = start.min(max_start);
     let end = start.saturating_add(item_rows).min(suggestions.len());
 
-    let heading = if suggestions.len() > item_rows {
-        format!("  commands  {}–{}/{}", start + 1, end, suggestions.len())
-    } else {
-        "  commands".to_owned()
-    };
-    let mut lines = vec![state.theme.fg("muted", &fit_line(&heading, width))];
     let marker = state.theme.glyph("prompt");
+    let marker_width = visible_width(marker).max(1);
     let label_width = suggestions[start..end]
         .iter()
         .map(|command| {
@@ -137,11 +184,20 @@ pub(super) fn render_slash_suggestions(
         .max()
         .unwrap_or(1)
         .min(30)
-        .min(usize::from(width).saturating_sub(6).max(1));
+        .min(
+            usize::from(width)
+                .saturating_sub(2 + marker_width + 1)
+                .max(1),
+        );
+    let mut lines = Vec::with_capacity(end.saturating_sub(start) + 1);
     for (index, command) in suggestions[start..end].iter().enumerate() {
         let absolute = start + index;
         let selected_row = absolute == selected;
-        let prefix = if selected_row { marker } else { " " };
+        let prefix = if selected_row {
+            marker.to_owned()
+        } else {
+            " ".repeat(marker_width)
+        };
         let raw_label = format!(
             "/{}{}",
             command.name,
@@ -160,27 +216,41 @@ pub(super) fn render_slash_suggestions(
             "{label}{}",
             " ".repeat(label_width.saturating_sub(visible_width(&label)))
         );
-        let description_width =
-            usize::from(width).saturating_sub(visible_width(prefix) + visible_width(&label) + 4);
+        let choice = format!("{prefix} {label}");
+        let choice = if selected_row {
+            state
+                .theme
+                .bold(&state.theme.model_fg(state.model_lab, &choice))
+        } else {
+            state.theme.fg("foreground", &choice)
+        };
+        let fixed_width = 2 + marker_width + 1 + label_width;
+        let description_width = usize::from(width).saturating_sub(fixed_width + 2);
         let description = sexy_tui_rs::truncate_to_width(
             &command.description,
             description_width,
             Some(if state.theme.unicode() { "…" } else { "..." }),
         );
-        let row = format!("  {prefix} {label}  {description}");
-        lines.push(if selected_row {
-            state
-                .theme
-                .bold(&state.theme.fg("model_accent", &fit_line(&row, width)))
+        let row = if description.is_empty() {
+            format!("  {choice}")
         } else {
-            state.theme.fg("muted", &fit_line(&row, width))
-        });
+            format!("  {choice}  {}", state.theme.fg("muted", &description))
+        };
+        lines.push(fit_line(&row, width));
     }
+    lines.push(slash_suggestion_footer(
+        state,
+        width,
+        start,
+        end,
+        suggestions.len(),
+        item_rows,
+    ));
     lines
 }
 
 fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
-    if max_rows == 0 || state.editor_cursor != state.editor.len() {
+    if max_rows < 2 || state.editor_cursor != state.editor.len() {
         return Vec::new();
     }
 
@@ -221,24 +291,41 @@ fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> V
         return Vec::new();
     }
 
-    let heading = if state.theme.unicode() {
-        format!("  {heading_label} · tab completes")
-    } else {
-        format!("  {heading_label} - tab completes")
-    };
-    let mut lines = vec![state.theme.fg("model_accent", &heading)];
     let item_rows = max_rows.saturating_sub(1).min(5);
-    let available_width = usize::from(width).saturating_sub(2);
+    let marker = state.theme.glyph("prompt");
+    let marker_width = visible_width(marker).max(1);
+    let available_width = usize::from(width)
+        .saturating_sub(2 + marker_width + 1)
+        .max(1);
+    let mut lines = Vec::with_capacity(item_rows.saturating_add(1));
     for (index, path) in matches.into_iter().take(item_rows).enumerate() {
         let safe_path = super::sanitize_for_terminal(&path);
-        let line = sexy_tui_rs::truncate_to_width(&safe_path, available_width, None);
-        let line = format!("  {line}");
-        lines.push(if index == 0 {
-            state.theme.fg("model_accent", &line)
+        let path = sexy_tui_rs::truncate_to_width(&safe_path, available_width, None);
+        let prefix = if index == 0 {
+            marker.to_owned()
         } else {
-            state.theme.dim(&line)
-        });
+            " ".repeat(marker_width)
+        };
+        let choice = format!("{prefix} {path}");
+        let choice = if index == 0 {
+            state
+                .theme
+                .bold(&state.theme.model_fg(state.model_lab, &choice))
+        } else {
+            state.theme.fg("muted", &choice)
+        };
+        lines.push(fit_line(&format!("  {choice}"), width));
     }
+
+    let separator = suggestion_separator(state);
+    lines.push(fit_line(
+        &format!(
+            "  {}{separator}{}",
+            state.theme.fg("muted", heading_label),
+            suggestion_key_hint(state, "tab", "complete"),
+        ),
+        width,
+    ));
     lines
 }
 
@@ -275,7 +362,7 @@ pub(super) fn render_pending_steering(
         )
     };
     let mut lines = vec![format!(
-        "  {}",
+        "{ACTIVITY_DETAIL_INDENT}{}",
         state.theme.bold(&state.theme.fg("model_accent", &heading))
     )];
     let item_rows = max_rows.saturating_sub(1);
@@ -294,15 +381,17 @@ pub(super) fn render_pending_steering(
         };
         let compact =
             super::sanitize_for_terminal(&message.display).replace(['\r', '\n'], line_separator);
-        let arrow = if state.theme.unicode() { "↳" } else { "->" };
-        let prefix = format!("    {} ", state.theme.fg("model_accent", arrow));
+        let prefix = format!(
+            "{ACTIVITY_DETAIL_INDENT}{} ",
+            state.theme.fg("model_accent", activity_elbow(&state.theme))
+        );
         let line = format!("{prefix}{}", state.theme.fg("muted", &compact));
         lines.push(fit_line(&line, width));
     }
     let hidden = state.steering_queue.len().saturating_sub(visible);
     if hidden > 0 {
         lines.push(state.theme.dim(&format!(
-            "    {} {hidden} more steering prompts",
+            "{ACTIVITY_DETAIL_INDENT}{} {hidden} more steering prompts",
             if state.theme.unicode() { "…" } else { "..." }
         )));
     }

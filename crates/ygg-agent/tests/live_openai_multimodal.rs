@@ -57,6 +57,8 @@ async fn live_openai_compatible_inline_png_reaches_the_model() {
                 tools: false,
                 parallel_tool_calls: false,
                 reasoning: None,
+                responses_lite: false,
+                agent_delegation: None,
                 structured_output: false,
             },
             limits: ModelLimits {

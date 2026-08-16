@@ -27,6 +27,25 @@ pub(crate) fn provider_ref_is_usable(
             .is_none_or(|expires_at| expires_at > SystemTime::now())
 }
 
+/// Returns a request-local reasoning selection with portable effort clamped to
+/// the model's advertised range.
+pub(crate) fn normalize_reasoning_config<'a>(
+    reasoning: &'a ReasoningConfig,
+    caps: &Capabilities,
+) -> Cow<'a, ReasoningConfig> {
+    let (ReasoningConfig::Effort(effort), Some(capability)) = (reasoning, &caps.reasoning) else {
+        return Cow::Borrowed(reasoning);
+    };
+    let effective = (*effort)
+        .max(capability.min_effort)
+        .min(capability.max_effort);
+    if effective == *effort {
+        Cow::Borrowed(reasoning)
+    } else {
+        Cow::Owned(ReasoningConfig::Effort(effective))
+    }
+}
+
 /// Returns a request-local copy with portable effort clamped to the model's
 /// advertised range. Keeping this normalization beside validation ensures all
 /// codecs, including direct codec tests, apply identical model gating.
@@ -34,19 +53,13 @@ pub(crate) fn normalize_request_reasoning<'a>(
     req: &'a Request,
     caps: &Capabilities,
 ) -> Cow<'a, Request> {
-    let (ReasoningConfig::Effort(effort), Some(capability)) = (&req.reasoning, &caps.reasoning)
-    else {
-        return Cow::Borrowed(req);
-    };
-    let effective = (*effort)
-        .max(capability.min_effort)
-        .min(capability.max_effort);
-    if effective == *effort {
+    let normalized = normalize_reasoning_config(&req.reasoning, caps);
+    if matches!(normalized, Cow::Borrowed(_)) {
         return Cow::Borrowed(req);
     }
-    let mut normalized = req.clone();
-    normalized.reasoning = ReasoningConfig::Effort(effective);
-    Cow::Owned(normalized)
+    let mut request = req.clone();
+    request.reasoning = normalized.into_owned();
+    Cow::Owned(request)
 }
 
 /// Validates a request against the model's capabilities and protocol constraints.
@@ -565,22 +578,18 @@ pub(crate) fn validate_request(
         }
     }
 
-    // 7. Reasoning capability, execution mode, and control checks
+    // 7. Legacy execution mode and reasoning control checks. Protocol codecs
+    // cannot represent Pro mode; product layers must migrate it to Ultra after
+    // checking the selected model's effort and delegation metadata.
     if req.reasoning_mode == ReasoningMode::Pro {
-        let supported = protocol == Protocol::OpenAiResponses
-            && caps
-                .reasoning
-                .as_ref()
-                .is_some_and(|capability| capability.supports_pro_mode);
-        if !supported {
-            if mode == CompatibilityMode::Strict {
-                return Err(AiError::Unsupported(UnsupportedError::ReasoningMode));
-            }
-            diagnostics.push(Diagnostic {
-                code: "ignored_reasoning_mode".to_string(),
-                message: "Pro reasoning mode is unavailable on this model route".to_string(),
-            });
+        if mode == CompatibilityMode::Strict {
+            return Err(AiError::Unsupported(UnsupportedError::ReasoningMode));
         }
+        diagnostics.push(Diagnostic {
+            code: "ignored_reasoning_mode".to_string(),
+            message: "Legacy Pro reasoning mode must be migrated to Ultra by the caller"
+                .to_string(),
+        });
     }
 
     if req.reasoning != ReasoningConfig::Off {
@@ -727,7 +736,6 @@ mod tests {
                     control: crate::types::ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: true,
-                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: crate::types::OpenAiChatReasoningMode::Standard,
                     min_effort: crate::types::ReasoningEffort::Minimal,
@@ -736,6 +744,8 @@ mod tests {
             } else {
                 None
             },
+            responses_lite: false,
+            agent_delegation: None,
             structured_output: structured,
         }
     }
@@ -1005,7 +1015,6 @@ mod matrix_tests {
                     control: crate::types::ReasoningControl::Effort,
                     exposes_text: true,
                     preserves_state: true,
-                    supports_pro_mode: false,
                     effort_budgets: None,
                     openai_chat_mode: crate::types::OpenAiChatReasoningMode::Standard,
                     min_effort: crate::types::ReasoningEffort::Minimal,
@@ -1014,6 +1023,8 @@ mod matrix_tests {
             } else {
                 None
             },
+            responses_lite: false,
+            agent_delegation: None,
             structured_output: structured,
         }
     }

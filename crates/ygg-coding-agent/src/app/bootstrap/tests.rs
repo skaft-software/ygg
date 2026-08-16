@@ -754,7 +754,10 @@ fn offline_codex_registration_uses_account_cache_or_fallback_without_discovery()
                 "models": [{
                     "slug": "cached-account-model",
                     "context_window": 196_000,
-                    "max_output_tokens": 24_000
+                    "max_output_tokens": 24_000,
+                    "use_responses_lite": true,
+                    "multi_agent_version": "v2",
+                    "supported_reasoning_levels": ["high", "ultra"]
                 }]
             }),
             Some(&crate::auth::codex::ChatGptPlan::Plus),
@@ -770,6 +773,21 @@ fn offline_codex_registration_uses_account_cache_or_fallback_without_discovery()
         .unwrap();
     assert_eq!(model.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
     assert_eq!(model.spec.limits.context_window, 196_000);
+    assert!(model.spec.capabilities.responses_lite);
+    assert_eq!(
+        model.spec.capabilities.agent_delegation,
+        Some(ygg_ai::AgentDelegation::V2)
+    );
+    assert_eq!(
+        model
+            .spec
+            .capabilities
+            .reasoning
+            .as_ref()
+            .unwrap()
+            .max_effort,
+        ygg_ai::ReasoningEffort::Ultra
+    );
 
     let fallback_path = directory.path().join("fallback-codex.json");
     write_codex_credential(&fallback_path, false, "plus");
@@ -787,60 +805,32 @@ fn offline_codex_registration_uses_account_cache_or_fallback_without_discovery()
 }
 
 #[test]
-fn codex_pro_mode_is_exposed_only_to_pro_oauth_accounts_and_gpt_5_6() {
+fn codex_fallback_never_infers_ultra_or_delegation_from_oauth_plan() {
     let directory = tempfile::tempdir().unwrap();
-
-    let pro_path = directory.path().join("pro-codex.json");
-    write_codex_credential(&pro_path, false, "pro");
-    let mut pro_catalog = base_model_catalog(true).unwrap();
-    register_openai_codex(
-        &mut pro_catalog,
-        crate::auth::codex::CredentialStore::new(pro_path),
-        true,
-    )
-    .unwrap();
-    let pro_model = pro_catalog.resolve(&ModelId("gpt-5.6-sol".into())).unwrap();
-    assert!(
-        pro_model
-            .spec
-            .capabilities
-            .reasoning
-            .as_ref()
-            .unwrap()
-            .supports_pro_mode
-    );
-    let older = pro_catalog.resolve(&ModelId("gpt-5.5".into())).unwrap();
-    assert!(
-        !older
-            .spec
-            .capabilities
-            .reasoning
-            .as_ref()
-            .unwrap()
-            .supports_pro_mode
-    );
-
-    let plus_path = directory.path().join("plus-codex.json");
-    write_codex_credential(&plus_path, false, "plus");
-    let mut plus_catalog = base_model_catalog(true).unwrap();
-    register_openai_codex(
-        &mut plus_catalog,
-        crate::auth::codex::CredentialStore::new(plus_path),
-        true,
-    )
-    .unwrap();
-    let plus_model = plus_catalog
-        .resolve(&ModelId("gpt-5.6-sol".into()))
+    for plan in ["pro", "plus"] {
+        let path = directory.path().join(format!("{plan}-codex.json"));
+        write_codex_credential(&path, false, plan);
+        let mut catalog = base_model_catalog(true).unwrap();
+        register_openai_codex(
+            &mut catalog,
+            crate::auth::codex::CredentialStore::new(path),
+            true,
+        )
         .unwrap();
-    assert!(
-        !plus_model
-            .spec
-            .capabilities
-            .reasoning
-            .as_ref()
-            .unwrap()
-            .supports_pro_mode
-    );
+        let model = catalog.resolve(&ModelId("gpt-5.6-sol".into())).unwrap();
+        assert_ne!(
+            model
+                .spec
+                .capabilities
+                .reasoning
+                .as_ref()
+                .unwrap()
+                .max_effort,
+            ygg_ai::ReasoningEffort::Ultra
+        );
+        assert_eq!(model.spec.capabilities.agent_delegation, None);
+        assert!(!model.spec.capabilities.responses_lite);
+    }
 }
 
 #[test]
@@ -880,9 +870,12 @@ fn codex_discovery_accepts_account_catalog_and_uses_live_metadata() {
                 "slug": "gpt-5.6-luna",
                 "context_window": 400_000,
                 "max_output_tokens": 150_000,
+                "use_responses_lite": true,
+                "multi_agent_version": "v2",
                 "supported_reasoning_levels": [
                     {"effort": "low"},
-                    {"effort": "max"}
+                    {"effort": "max"},
+                    {"effort": "ultra"}
                 ]
             },
             {"slug": "gpt-account-preview"},
@@ -900,7 +893,9 @@ fn codex_discovery_accepts_account_catalog_and_uses_live_metadata() {
     assert_eq!(luna.max_context_window, 400_000);
     assert_eq!(luna.max_output_tokens, 150_000);
     assert_eq!(luna.min_effort, ygg_ai::ReasoningEffort::Low);
-    assert_eq!(luna.max_effort, ygg_ai::ReasoningEffort::Max);
+    assert_eq!(luna.max_effort, ygg_ai::ReasoningEffort::Ultra);
+    assert!(luna.responses_lite);
+    assert_eq!(luna.agent_delegation, Some(ygg_ai::AgentDelegation::V2));
     assert_eq!(
         models
             .iter()
@@ -1754,6 +1749,42 @@ fn print_resume_restores_session_model_and_reasoning_unless_cli_overrides() {
     let launch = resolve_launch_print(&bootstrap(overridden).unwrap(), "unused").unwrap();
     assert_eq!(launch.model.0, "gpt-4o-mini");
     assert_eq!(launch.reasoning, ReasoningConfig::Off);
+}
+
+#[test]
+fn explicit_reasoning_clears_a_persisted_legacy_pro_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut process_config = config(directory.path(), Some("gpt-5.4-mini-responses"));
+    process_config.resume = ResumeSelector::Continue;
+    process_config.reasoning = ReasoningConfig::Effort(ygg_ai::ReasoningEffort::High);
+    process_config.reasoning_explicit = true;
+    process_config.reasoning_mode_explicit = false;
+    let boot = bootstrap(process_config).unwrap();
+    let path = boot.sessions.new_path("2026-07-12T00-00-00Z");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut session = Session::create(&path).unwrap();
+    session
+        .append(EntryValue::Config {
+            model: Some("gpt-5.4-mini-responses".to_string()),
+            reasoning: Some("max".to_string()),
+            reasoning_mode: Some("pro".to_string()),
+        })
+        .unwrap();
+    session
+        .append(EntryValue::Message(ygg_ai::Message::User(
+            ygg_ai::UserMessage {
+                content: vec![ygg_ai::UserPart::Text("resumable prompt".into())],
+            },
+        )))
+        .unwrap();
+    drop(session);
+
+    let launch = resolve_launch_print(&boot, "unused").unwrap();
+    assert_eq!(
+        launch.reasoning,
+        ReasoningConfig::Effort(ygg_ai::ReasoningEffort::High)
+    );
+    assert_eq!(launch.reasoning_mode, ReasoningMode::Standard);
 }
 
 #[test]

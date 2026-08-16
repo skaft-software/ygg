@@ -7,7 +7,9 @@
 > **stderr**, which Ygg drains and exposes as bounded diagnostic events.
 >
 > Extensions send process-to-host messages at any time after initialization.
-> The host closes stdin to signal shutdown; the extension should exit promptly.
+> For graceful shutdown, the host sends a JSON-RPC `shutdown` request; the
+> extension acknowledges it and exits promptly. Stdin EOF means the transport
+> was lost or finally torn down and should also make the extension exit.
 
 ## Transport defaults
 
@@ -16,7 +18,15 @@
 | Max JSON line | 1 MiB (`DEFAULT_EXTENSION_MESSAGE_BYTES`) |
 | In-flight requests | 64 (`DEFAULT_PENDING_REQUESTS`) |
 | Request timeout | 30 s |
-| Shutdown grace | 3 s |
+| Normal shutdown request/ack stage | 2 s (`ExtensionRuntimeConfig::shutdown_timeout`) |
+| Normal post-request process-exit stage | 2 s (the same per-stage timeout) |
+| Normal product aggregate shutdown | 3 s (all extension shutdowns run concurrently) |
+| Coordinated-signal extension-shutdown cap | 1.4 s in interactive, plain, print, and host modes; then force-kill registered process groups |
+
+Product discovery reads a selected extension manifest through the resource
+resolver's 256 KiB bound. The lower-level `ExtensionManifest::load` API instead
+defaults to 64 KiB; the product discovery path calls `parse` on the resolver's
+bounded text and does not use that lower-level default.
 
 ---
 
@@ -105,10 +115,9 @@ The **first** host request, sent immediately after the child process starts.
 **Negotiation rules:**
 - `api_version` in the response must match the host version exactly, or the
   child is rejected.
-- `tools` and `commands` returned must be a *superset of nothing* — every name
-  declared in `contributes` must appear; the extension may return fewer fields
-  (e.g. drop a command at runtime by omitting it), but it cannot add tools or
-  commands not declared in the manifest.
+- The duplicate-free sets of `tools` and `commands` returned must exactly equal
+  the corresponding names declared in `contributes`. Order does not matter;
+  omissions, additions, and duplicate names all reject initialization.
 - Each tool must have a non-empty `description` and `parameters` must be a
   JSON Schema object.
 - `source` is one of `"project"`, `"global"`, or `"explicit"`.
@@ -155,12 +164,7 @@ Invoke a model-callable tool.
   "id": 2,
   "result": {
     "content": "branch=main\nstate=clean\ncounts=staged:0,modified:0,untracked:0,ignored:0,conflicted:0",
-    "is_error": false,
-    "metadata": {
-      "branch": "main",
-      "clean": true,
-      "counts": { "staged": 0, "modified": 0, "untracked": 0, "ignored": 0, "conflicted": 0 }
-    }
+    "is_error": false
   }
 }
 ```
@@ -168,8 +172,10 @@ Invoke a model-callable tool.
 **Fields:**
 - `content` — compact model-visible result text (string).
 - `is_error` — if `true`, the result is treated as a tool error.
-- `metadata` — optional structured data for frontend/renderer use; not sent
-  to the model.
+- `metadata` — optional JSON accepted by the API `0.1` decoder for compatibility.
+  The current subprocess adapter discards it while constructing native
+  `ToolOutput`; it is not sent to the model and has no frontend, renderer, or
+  persistence guarantee.
 
 ---
 
@@ -241,9 +247,13 @@ Invoke a lifecycle hook (declared in `contributes.hooks`).
 
 `payload` is hook-specific:
 - `before_prompt`: `{ "prompt": string }`
-- `after_response`: `{ "message_id": string }`
-- `before_tool_call`: `{ "tool": string, "arguments": { ... } }`
-- `after_tool_call`: `{ "tool": string, "output": string, "is_error": bool }`
+- `after_response`: `{ "response": string }`
+- `before_tool_call`: `{ "name": string, "arguments": { ... } }`
+- `after_tool_call`: `{ "name": string, "arguments": { ... }, "output": string, "is_error": bool }`
+
+API `0.1` invokes `after_response` only after a successful, complete assistant
+response. It is not a terminal-run hook and is not invoked for failure,
+cancellation, interruption, frontend loss, or shutdown.
 
 **Response:**
 
@@ -414,7 +424,19 @@ Sent when the host wants the extension to exit gracefully.
 }
 ```
 
-The host waits `shutdown_timeout` seconds, then kills the process.
+On normal shutdown, the host first waits `shutdown_timeout` (2 seconds by
+default) for the JSON-RPC reply. Whether the request is acknowledged or times
+out, it then waits up to the same per-stage timeout for the child to exit. If
+the child does not exit, Ygg terminates the child process group. Normal product
+shutdown runs these per-connection sequences concurrently inside a separate
+3-second aggregate deadline; dropping a remaining connection also terminates
+its process group.
+
+Interactive, plain, print, and host coordinated-signal exits instead cap the
+whole extension-shutdown attempt at 1.4 seconds, then force-kill all registered
+process groups. That outer cap may cut either normal 2-second stage short.
+Closing stdin is not the graceful shutdown signal; it is a
+transport-loss/final-teardown fallback.
 
 ---
 
@@ -474,7 +496,8 @@ The host **answers** the same `id`:
 }
 ```
 
-- The `id` must be a string ≤ 64 bytes, or a number.
+- The `id` must be a string no longer than 256 UTF-8 bytes, or an unsigned
+  64-bit integer.
 - The extension **must** wait for the answer before proceeding with the
   confirmed action.
 - Dropping the request or using a non-interactive frontend denies it.
@@ -654,9 +677,9 @@ extension-specific server errors.
 │    │   notification, confirmation/request,          │  │
 │    │   context/contribution, status/contribution    │  │
 │    └──────────────────────────────────────────────┘  │
-│ 6. Host sends shutdown                               │
-│ 7. Extension responds, exits                         │
-│ 8. Host waits grace period, then kills if alive      │
+│ 6. Host sends a shutdown request                     │
+│ 7. Extension acknowledges, then exits                │
+│ 8. Host waits the bounded exit stage; kills if alive │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -665,11 +688,11 @@ shut down. If the new child fails, the old process stays active. Pending
 confirmation IDs carry a process generation and cannot be answered against
 the replacement.
 
-**Contact policies:**
-- `permanent` — started at session start, kept alive.
-- `on_demand` — started only when needed for a tool/command/hook call.
-- `auto_permanent` — same as permanent but only if the binary exists on disk.
-- `tool_execute` — started fresh for each tool call.
+API `0.1` has one implemented process lifetime and no manifest contact-policy
+field: every enabled, trusted extension is started while the product extension
+host is constructed and remains resident until reload, shutdown, or connection
+failure. On reload, the replacement is initialized before the active generation
+is swapped; the old generation is then shut down.
 
 ---
 

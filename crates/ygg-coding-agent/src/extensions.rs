@@ -55,6 +55,24 @@ const EVENT_DRAIN_PER_RECEIVER_BUDGET: usize = 8;
 const CONFIRMATION_DENIAL_QUEUE_CAPACITY: usize = 64;
 const CONFIRMATION_DENIAL_CONCURRENCY: usize = 8;
 
+#[derive(serde::Serialize)]
+struct BeforePromptHookPayload<'a> {
+    prompt: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct AfterResponseHookPayload<'a> {
+    response: &'a str,
+}
+
+fn before_prompt_hook_payload(prompt: &str) -> serde_json::Value {
+    serde_json::json!(BeforePromptHookPayload { prompt })
+}
+
+fn after_response_hook_payload(response: &str) -> serde_json::Value {
+    serde_json::json!(AfterResponseHookPayload { response })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ConfiguredTrustGrant {
     Global { name: String },
@@ -791,7 +809,7 @@ impl ExecutableExtensions {
                     PROMPT_RPC_DEADLINE,
                     process.run_hook(
                         ExtensionHook::BeforePrompt,
-                        serde_json::json!({ "prompt": prompt }),
+                        before_prompt_hook_payload(&prompt),
                         execution.clone(),
                     ),
                 )
@@ -906,7 +924,7 @@ impl ExecutableExtensions {
                 AFTER_RESPONSE_RPC_DEADLINE,
                 process.run_hook(
                     ExtensionHook::AfterResponse,
-                    serde_json::json!({ "response": response }),
+                    after_response_hook_payload(response),
                     process.current_context(),
                 ),
             )
@@ -1909,6 +1927,157 @@ command = "does-not-exist"
             .iter()
             .all(|message| message.ends_with("[… diagnostic truncated …]")));
         assert!(diagnostics.dropped > 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prompt_hooks_use_the_production_wire_payloads() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("prompt-hooks.jsonl");
+        let fixture = temp.path().join("prompt-hooks.sh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+set -eu
+log=$1
+
+read_request() {
+  IFS= read -r request
+  printf '%s\n' "$request" >> "$log"
+}
+
+request_id() {
+  printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'
+}
+
+read_request
+id=$(request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{"api_version":"0.1","tools":[],"commands":[]}}\n' "$id"
+
+read_request
+id=$(request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{"disposition":{"action":"continue"},"context":[],"notifications":[]}}\n' "$id"
+
+read_request
+id=$(request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{"disposition":{"action":"continue"},"context":[],"notifications":[]}}\n' "$id"
+
+read_request
+id=$(request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+
+        let mut manifest = ExtensionManifest::parse(
+            r#"
+name = "prompt-hooks"
+version = "0.1.0"
+api_version = "0.1"
+
+[entrypoint]
+command = "prompt-hooks.sh"
+
+[contributes]
+hooks = ["before_prompt", "after_response"]
+"#,
+        )
+        .unwrap();
+        manifest.entrypoint.args = vec![log_path.to_string_lossy().into_owned()];
+        let manifest_path = temp.path().join(EXTENSION_MANIFEST_FILENAME);
+        let mut runtime = ExtensionRuntimeConfig::new(temp.path());
+        runtime.request_timeout = Duration::from_secs(2);
+        runtime.shutdown_timeout = Duration::from_secs(2);
+        let process = ExtensionProcess::start(
+            DiscoveredExtension {
+                manifest,
+                manifest_path,
+                source: ExtensionSource::Explicit,
+                activation: ygg_agent::extension_process::ExtensionActivation {
+                    enabled: true,
+                    trust: ExtensionTrust::Trusted,
+                },
+            },
+            runtime,
+        )
+        .await
+        .unwrap();
+
+        let mut extensions = ExecutableExtensions::default();
+        extensions.receivers.push(process.subscribe());
+        extensions.processes.push(process.clone());
+        let composition = extensions
+            .compose_prompt("system", "Explain the contract".into())
+            .await
+            .unwrap();
+        assert_eq!(composition.system, "system");
+        assert_eq!(composition.prompt, "Explain the contract");
+        assert!(composition.notifications.is_empty());
+        assert!(extensions
+            .after_response("The contract is bounded.")
+            .await
+            .is_empty());
+        extensions.shutdown().await;
+        assert!(!process.is_running());
+
+        let frames = std::fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 4, "unexpected wire transcript: {frames:#?}");
+        let context = serde_json::json!({
+            "workspace": temp.path(),
+            "execution_scope": null,
+            "host": {
+                "session_id": null,
+                "session_name": null,
+                "model": null,
+                "reasoning": null,
+                "active_skills": [],
+            },
+        });
+        assert_eq!(
+            frames[1],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "hook/run",
+                "params": {
+                    "hook": "before_prompt",
+                    "payload": {"prompt": "Explain the contract"},
+                    "context": context,
+                },
+            })
+        );
+        assert_eq!(
+            frames[2],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "hook/run",
+                "params": {
+                    "hook": "after_response",
+                    "payload": {"response": "The contract is bounded."},
+                    "context": context,
+                },
+            })
+        );
+        assert_eq!(
+            frames[3],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "shutdown",
+                "params": {},
+            })
+        );
     }
 
     #[tokio::test]

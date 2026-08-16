@@ -1,7 +1,7 @@
-use sexy_tui_rs::{strip_terminal_sequences, visible_width, Color, RichRenderer};
+use sexy_tui_rs::{strip_terminal_sequences, Color, RichRenderer};
 
 use super::assistant_block::AssistantBlock;
-use super::{finish_transcript_block, fit_line, subdued_text};
+use super::{activity_elbow, finish_transcript_block, fit_line, subdued_text};
 use crate::tui::terminal::ColorDepth;
 use crate::tui::theme::YggTheme;
 
@@ -13,7 +13,6 @@ fn live_reasoning_label(theme: &YggTheme, reasoning: &AssistantBlock) -> String 
 pub(super) fn collapsed_reasoning_lines(
     theme: &YggTheme,
     reasoning: &AssistantBlock,
-    include_margin_marker: bool,
 ) -> Vec<String> {
     // Finished reasoning leaves no trace in the collapsed transcript. Genuine
     // private reasoning keeps a stable disclosure row; truthful non-expandable
@@ -22,23 +21,11 @@ pub(super) fn collapsed_reasoning_lines(
         Vec::new()
     } else {
         let label = live_reasoning_label(theme, reasoning);
-        let label = if include_margin_marker {
-            format!(
-                "{} {label}",
-                theme.model_fg(reasoning.model_lab, theme.glyph("bullet"))
-            )
-        } else {
-            label
-        };
-        let disclosure_indent = if include_margin_marker { "  " } else { "" };
         let mut lines = vec![label];
         if reasoning.show_reasoning_hint {
             lines.push(subdued_text(
                 theme,
-                &format!(
-                    "{disclosure_indent}{} (ctrl+o to expand)",
-                    theme.glyph("last_branch"),
-                ),
+                &format!("{} (ctrl+o to expand)", activity_elbow(theme)),
             ));
         }
         lines
@@ -52,13 +39,10 @@ pub(super) fn render_reasoning_on_surface(
     width: u16,
     show_reasoning: bool,
     background: Option<Color>,
-    use_margin_marker: bool,
 ) -> Vec<String> {
-    let marker = theme.glyph("reasoning");
-    let prefix_width = visible_width(marker).saturating_add(1);
     let non_expandable_activity = reasoning.text.is_empty() && !reasoning.show_reasoning_hint;
     if non_expandable_activity || (!reasoning.reasoning_expanded && !show_reasoning) {
-        return collapsed_reasoning_lines(theme, reasoning, !use_margin_marker)
+        return collapsed_reasoning_lines(theme, reasoning)
             .into_iter()
             .map(|line| {
                 let line = fit_line(&line, width);
@@ -70,26 +54,13 @@ pub(super) fn render_reasoning_on_surface(
             })
             .collect();
     }
-    let content_width = width.saturating_sub(prefix_width as u16).max(1);
-    let lines = finish_transcript_block(reasoning.render_on_surface(
-        renderer,
-        theme,
-        content_width,
-        background,
-    ));
 
-    lines
+    // Expanded reasoning already owns a distinct transcript inset and muted
+    // prose style. Do not turn its first row into a one-item bulleted list;
+    // every Markdown row starts from the same reasoning content gutter.
+    finish_transcript_block(reasoning.render_on_surface(renderer, theme, width, background))
         .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            if line.is_empty() {
-                String::new()
-            } else if index == 0 {
-                fit_line(&format!("{} {line}", theme.fg("muted", marker)), width)
-            } else {
-                fit_line(&format!("{}{line}", " ".repeat(prefix_width)), width)
-            }
-        })
+        .map(|line| fit_line(&line, width))
         .collect()
 }
 
@@ -110,15 +81,7 @@ mod tests {
         width: u16,
         show_reasoning: bool,
     ) -> Vec<String> {
-        render_reasoning_on_surface(
-            reasoning,
-            renderer,
-            theme,
-            width,
-            show_reasoning,
-            None,
-            false,
-        )
+        render_reasoning_on_surface(reasoning, renderer, theme, width, show_reasoning, None)
     }
 
     #[test]
@@ -160,6 +123,30 @@ mod tests {
     }
 
     #[test]
+    fn expanded_reasoning_has_no_first_line_bullet() {
+        let theme = theme::test_theme();
+        let mut reasoning = AssistantBlock::streaming_reasoning(
+            "First private thought.\n\nSecond private thought.",
+        );
+        reasoning.reasoning_expanded = true;
+
+        let lines = render_reasoning(&reasoning, &theme.reasoning_renderer(), &theme, 80, true)
+            .into_iter()
+            .map(|line| strip_terminal_sequences(&line))
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+
+        assert!(lines[0].starts_with("First private thought."), "{lines:?}");
+        assert!(lines[1].starts_with("Second private thought."), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.starts_with('•') && !line.starts_with('·')),
+            "expanded reasoning must not look like a bulleted list: {lines:?}"
+        );
+    }
+
+    #[test]
     fn collapsed_reasoning_label_is_plain_model_colored_text() {
         let theme = theme::test_theme();
         let reasoning = AssistantBlock::streaming_reasoning("## Verifying `implementation`")
@@ -187,8 +174,8 @@ mod tests {
             AssistantBlock::streaming_reasoning("private").with_model_lab(Some(ModelLab::Alibaba));
         let live = render_reasoning(&reasoning, &renderer, &theme, 80, false);
         assert_eq!(live.len(), 2, "{live:?}");
-        assert!(strip_terminal_sequences(&live[0]).contains("• Thinking"));
-        assert!(strip_terminal_sequences(&live[1]).contains("└ (ctrl+o to expand)"));
+        assert_eq!(strip_terminal_sequences(&live[0]), "Thinking");
+        assert!(strip_terminal_sequences(&live[1]).contains("⎿ (ctrl+o to expand)"));
         assert!(!live[0].contains("\x1b[1m"), "{live:?}");
         let accent = theme
             .model_rgb(Some(ModelLab::Alibaba))
@@ -219,8 +206,8 @@ mod tests {
         );
         let lines = render_reasoning(&reasoning, &theme.reasoning_renderer(), &theme, 16, false);
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].starts_with("* A heading"), "{lines:?}");
-        assert!(lines[1].starts_with("  `- (ctrl+o"), "{lines:?}");
+        assert!(lines[0].starts_with("A heading"), "{lines:?}");
+        assert!(lines[1].starts_with("`- (ctrl+o"), "{lines:?}");
         assert!(lines.iter().all(|line| visible_width(line) <= 16));
         assert!(lines.iter().all(|line| !line.contains('\x1b')));
     }
@@ -234,10 +221,10 @@ mod tests {
 
         let lines = render_reasoning(&activity, &theme.reasoning_renderer(), &theme, 80, false);
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(strip_terminal_sequences(&lines[0]).contains("• Working"));
+        assert_eq!(strip_terminal_sequences(&lines[0]), "Working");
 
         let verbose = render_reasoning(&activity, &theme.reasoning_renderer(), &theme, 80, true);
         assert_eq!(verbose.len(), 1, "{verbose:?}");
-        assert!(strip_terminal_sequences(&verbose[0]).contains("• Working"));
+        assert_eq!(strip_terminal_sequences(&verbose[0]), "Working");
     }
 }

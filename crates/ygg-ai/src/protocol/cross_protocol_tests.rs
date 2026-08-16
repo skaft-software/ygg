@@ -50,7 +50,6 @@ fn make_model(
                     },
                     exposes_text: true,
                     preserves_state: true,
-                    supports_pro_mode: false,
                     effort_budgets: if protocol == Protocol::AnthropicMessages {
                         Some(ReasoningEffortBudgets {
                             minimal: 1024,
@@ -70,6 +69,8 @@ fn make_model(
             } else {
                 None
             },
+            responses_lite: false,
+            agent_delegation: None,
             structured_output: true,
         },
         limits: ModelLimits {

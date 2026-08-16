@@ -24,6 +24,8 @@ fn make_test_model(base_url_str: &str, protocol: Protocol) -> Model {
             tools: false,
             parallel_tool_calls: false,
             reasoning: None,
+            responses_lite: false,
+            agent_delegation: None,
             structured_output: false,
         },
         limits: ModelLimits {
