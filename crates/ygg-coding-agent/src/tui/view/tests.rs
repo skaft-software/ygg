@@ -994,7 +994,7 @@ fn mention_completion_attaches_media_files() {
 }
 
 #[test]
-fn set_workspace_keeps_the_file_index_when_the_root_is_unchanged() {
+fn set_workspace_keeps_file_index_and_layout_when_the_root_is_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), b"x").unwrap();
 
@@ -1003,17 +1003,36 @@ fn set_workspace_keeps_the_file_index_when_the_root_is_unchanged() {
     for character in "@a".chars() {
         shell.apply_edit(EditAction::Char(character));
     }
+    let generation = {
+        let state = shell.state.borrow();
+        drop(state.rendered_transcript(80));
+        let cache = state.transcript_cache.borrow();
+        assert_eq!(cache.width, Some(80));
+        assert!(!cache.dirty);
+        cache.generation
+    };
     assert!(shell.state.borrow().file_index.is_some());
 
-    // Re-asserting the same root (update_status runs after every turn)
-    // must not drop the lazily built index and force a workspace re-walk.
+    // Re-asserting the same root (update_status runs after every turn) must
+    // preserve both the lazily built mention index and historic layout.
     shell.set_workspace(dir.path().to_path_buf());
-    assert!(shell.state.borrow().file_index.is_some());
+    let state = shell.state.borrow();
+    assert!(state.file_index.is_some());
+    let cache = state.transcript_cache.borrow();
+    assert_eq!(cache.width, Some(80));
+    assert!(!cache.dirty);
+    assert_eq!(cache.generation, generation);
+    drop(cache);
+    drop(state);
 
-    // A genuinely different root invalidates it.
+    // A genuinely different root invalidates both workspace-derived caches.
     let other = tempfile::tempdir().unwrap();
     shell.set_workspace(other.path().to_path_buf());
-    assert!(shell.state.borrow().file_index.is_none());
+    let state = shell.state.borrow();
+    assert!(state.file_index.is_none());
+    let cache = state.transcript_cache.borrow();
+    assert_eq!(cache.width, None);
+    assert!(cache.dirty);
 }
 
 #[test]

@@ -736,7 +736,6 @@ impl<'a> TUI<'a> {
             .then(|| self.root.render_update(width, render_commit_cursor))
             .flatten();
         let previous_len = self.previous_frame.len();
-        let previous_frame_has_image = self.previous_frame.iter().any(|line| is_image_line(line));
         // A prefix beyond the retained frame cannot be validated. Fall back to
         // the component's full renderer rather than pairing its replacement
         // with the wrong historic rows. Width reflow likewise requires a full
@@ -767,6 +766,11 @@ impl<'a> TUI<'a> {
         let rebuild_scrollback = lazy_update
             .as_ref()
             .is_some_and(|update| update.rebuild_scrollback);
+        // Kitty placements only need a full-frame presence check when a
+        // destructive inline replay may erase them. Ordinary differential
+        // frames inspect just the rows they repaint below.
+        let previous_frame_has_image = (reset_scrollback_on_resize || rebuild_scrollback)
+            && self.previous_frame.iter().any(|line| is_image_line(line));
         let pinned = lazy_update.as_ref().and_then(|update| update.pinned);
         // Lazy frame assembly reuses `previous_frame` with `mem::take` below.
         // Preserve only the old physical viewport needed by pinned diffing;
@@ -3176,6 +3180,7 @@ mod tests {
     #[test]
     fn presentation_reset_clears_and_rebuilds_native_scrollback_once() {
         const RESET: &str = "\x1b[0m\x1b]8;;\x1b\\";
+        const KITTY_IMAGE: &str = "\x1b_Ga=T,f=100,i=4,s=1,v=1,c=1,r=1;AAAA\x1b\\";
         let size = Rc::new(Cell::new((30, 4)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
@@ -3195,7 +3200,13 @@ mod tests {
             rebuild_scrollback: Rc::new(Cell::new(true)),
         }));
         tui.previous_frame = (0..6)
-            .map(|index| format!("old-theme row {index}{RESET}"))
+            .map(|index| {
+                if index == 2 {
+                    format!("{KITTY_IMAGE}{RESET}")
+                } else {
+                    format!("old-theme row {index}{RESET}")
+                }
+            })
             .collect();
         tui.previous_size = Some((30, 4));
         tui.first_render = false;
@@ -3205,9 +3216,13 @@ mod tests {
         tui.request_render();
 
         let output = writes.borrow().join("");
+        let delete_images = output
+            .find(&delete_all_kitty_images())
+            .expect("presentation reset did not delete Kitty placements");
         let clear_saved = output
             .find("\x1b[3J")
             .expect("presentation reset did not erase saved lines");
+        assert!(delete_images < clear_saved, "{output:?}");
         let rebuilt = &output[clear_saved + "\x1b[3J".len()..];
         assert_eq!(clears.get(), 1);
         assert!(!rebuilt.contains("old-theme"), "{rebuilt:?}");

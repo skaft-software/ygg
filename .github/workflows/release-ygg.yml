@@ -291,9 +291,13 @@ jobs:
           ref: ${{ needs.resolve.outputs.source_commit }}
           path: source
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+      # Keep release optimization independent from the workspace's 1.86 MSRV.
+      # This immutable action revision installs Rust 1.97.1.
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5
         with:
           targets: ${{ matrix.target }}
+      - name: Verify release Rust compiler
+        run: test "$(rustc --version | awk '{print $2}')" = "1.97.1"
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
         with:
           key: ygg-binary-release-${{ matrix.target }}
