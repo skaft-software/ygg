@@ -53,8 +53,7 @@ use self::panel_render::render_panel;
 use self::reasoning_render::collapsed_reasoning_lines;
 #[cfg(test)]
 use self::renderer_runtime::{
-    event_dot_animating, reconcile_terminal_size, shimmer_animating, ShellComponent,
-    ShellFrameState,
+    event_dot_animating, reconcile_terminal_size, ShellComponent, ShellFrameState,
 };
 use self::renderer_runtime::{render_loop, RenderCommand, SharedState};
 #[cfg(test)]
@@ -103,8 +102,6 @@ struct ShellOutput {
     exit_code: i32,
     /// True while the child process is still running.
     running: bool,
-    /// Current spinner frame character (Unicode braille).
-    spinner: String,
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +296,10 @@ pub(crate) struct ShellState {
     /// Shared phase for every active event marker. This is presentation-only
     /// and toggles at a fixed cadence on the renderer thread.
     event_dot_visible: bool,
+    /// Small set of transcript indices that can currently own the shared
+    /// activity pulse. Keeping it explicit makes each tick O(active work)
+    /// instead of O(total session history).
+    active_event_blocks: Vec<usize>,
     /// Snapshot backing an intentionally tail-only first paint. The complete
     /// branch is materialized on scroll or before a destructive resize replay,
     /// so resume readiness does not scale with old history.
@@ -436,18 +437,14 @@ pub(crate) struct ShellState {
     /// Non-agent work such as compaction or sign-in. Agent runs never use this
     /// field; their phase always comes from `run`.
     pub(crate) run_label: String,
-    /// Wall-clock anchor for the current working shimmer. Keeping this outside
-    /// the run phase means a phase transition cannot change the wave velocity
-    /// or reset its position.
-    pub(crate) shimmer_started_at: Option<Instant>,
     /// Global transcript disclosure mode. Ctrl+O and `/verbose` toggle this.
     pub(crate) verbose_tools: bool,
     pub(crate) size: (u16, u16),
     /// Start of the animated invocation header. It remains mutable until the
     /// first real conversation block so model changes can recolor it in place.
     startup_card_started_at: Option<Instant>,
-    /// Cached editor layout so the composer shimmer animation doesn't
-    /// re-wrap the prompt on every frame.
+    /// Cached editor layout so input and transcript updates do not repeatedly
+    /// re-wrap an unchanged prompt.
     cached_layout: RefCell<Option<EditorLayoutCache>>,
 }
 
@@ -592,6 +589,70 @@ impl ShellState {
         }
     }
 
+    fn register_active_event(&mut self, index: usize) {
+        if !self.active_event_blocks.contains(&index) {
+            self.active_event_blocks.push(index);
+        }
+    }
+
+    fn unregister_active_event(&mut self, index: usize) {
+        self.active_event_blocks.retain(|active| *active != index);
+    }
+
+    fn reindex_active_events_after_removal(&mut self, removed: usize) {
+        for active in &mut self.active_event_blocks {
+            if *active > removed {
+                *active -= 1;
+            }
+        }
+    }
+
+    fn remove_transient_activity_block(&mut self, index: usize) {
+        if index >= self.transcript.len() {
+            return;
+        }
+        self.unregister_active_event(index);
+        self.transcript.remove(index);
+        self.transcript_commit_ids.remove(index);
+        self.block_revisions.remove(index);
+        self.reindex_active_events_after_removal(index);
+        self.active_text = self
+            .active_text
+            .and_then(|active| (active != index).then_some(active - usize::from(active > index)));
+        self.active_reasoning = self
+            .active_reasoning
+            .and_then(|active| (active != index).then_some(active - usize::from(active > index)));
+        for panel_index in self.tool_panels.values_mut() {
+            if *panel_index > index {
+                *panel_index -= 1;
+            }
+        }
+        if !self.follow_tail {
+            self.new_output_count = self.new_output_count.saturating_sub(1);
+        }
+        let selection_touches_removed =
+            self.transcript_selection.as_ref().is_some_and(|selection| {
+                selection.anchor.block == index || selection.focus.block == index
+            });
+        if selection_touches_removed {
+            self.transcript_selection = None;
+            self.selection_dragging = false;
+        } else if let Some(selection) = &mut self.transcript_selection {
+            selection.anchor.block -= usize::from(selection.anchor.block > index);
+            selection.focus.block -= usize::from(selection.focus.block > index);
+        }
+        if self
+            .pending_selection_anchor
+            .is_some_and(|position| position.block == index)
+        {
+            self.pending_selection_anchor = None;
+            self.selection_dragging = false;
+        } else if let Some(position) = &mut self.pending_selection_anchor {
+            position.block -= usize::from(position.block > index);
+        }
+        self.invalidate_transcript_layout();
+    }
+
     fn show_tool_details(&self, _block: &TranscriptBlock) -> bool {
         self.verbose_tools
     }
@@ -607,7 +668,12 @@ impl ShellState {
     }
 
     fn open_reasoning_status(&mut self) {
-        if !self.reasoning_status_enabled() || self.active_reasoning.is_some() {
+        let expandable = self.reasoning_status_enabled();
+        self.open_activity_status((!expandable).then_some("Working"), expandable);
+    }
+
+    fn open_activity_status(&mut self, label: Option<&str>, show_reasoning_hint: bool) {
+        if self.active_reasoning.is_some() {
             return;
         }
         if let Some(previous) = self
@@ -623,19 +689,49 @@ impl ShellState {
         let index = self.transcript.len();
         let model_lab = self.executing_model_lab();
         self.event_dot_visible = true;
-        self.push_block(TranscriptBlock::Reasoning(Box::new(
-            AssistantBlock::streaming_reasoning("").with_model_lab(model_lab),
-        )));
+        let mut status = AssistantBlock::streaming_reasoning("").with_model_lab(model_lab);
+        status.reasoning_heading = label.map(str::to_owned);
+        status.show_reasoning_hint = show_reasoning_hint;
+        self.push_block(TranscriptBlock::Reasoning(Box::new(status)));
         self.active_reasoning = Some(index);
+        self.register_active_event(index);
+    }
+
+    fn close_activity_status(&mut self, label: &str) {
+        let Some(index) = self.active_reasoning else {
+            return;
+        };
+        let matches = matches!(
+            self.transcript.get(index),
+            Some(TranscriptBlock::Reasoning(reasoning))
+                if reasoning.text.is_empty()
+                    && !reasoning.show_reasoning_hint
+                    && reasoning.reasoning_heading.as_deref() == Some(label)
+        );
+        if matches {
+            self.remove_transient_activity_block(index);
+        }
     }
 
     fn append_text_block(&mut self, channel: OutputChannel, text: &str) {
         if channel == OutputChannel::Text {
-            if let Some(index) = self.active_reasoning.take() {
-                if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(index)
-                {
-                    reasoning.finish_reasoning();
-                    self.touch_block(index);
+            if let Some(index) = self.active_reasoning {
+                let transient = matches!(
+                    self.transcript.get(index),
+                    Some(TranscriptBlock::Reasoning(reasoning))
+                        if reasoning.text.is_empty()
+                );
+                if transient {
+                    self.remove_transient_activity_block(index);
+                } else {
+                    self.active_reasoning = None;
+                    self.unregister_active_event(index);
+                    if let Some(TranscriptBlock::Reasoning(reasoning)) =
+                        self.transcript.get_mut(index)
+                    {
+                        reasoning.finish_reasoning();
+                        self.touch_block(index);
+                    }
                 }
             }
         }
@@ -652,6 +748,17 @@ impl ShellState {
                 Some(TranscriptBlock::Reasoning(existing))
                     if channel == OutputChannel::Reasoning =>
                 {
+                    if existing.text.is_empty()
+                        && !existing.show_reasoning_hint
+                        && existing.reasoning_heading.as_deref() == Some("Working")
+                    {
+                        // A reasoning-off placeholder is still truthful before
+                        // first output. If the provider nevertheless emits a
+                        // private trace, promote it to the normal expandable
+                        // reasoning presentation.
+                        existing.reasoning_heading = None;
+                        existing.show_reasoning_hint = true;
+                    }
                     existing.append_reasoning(text);
                     true
                 }
@@ -697,7 +804,10 @@ impl ShellState {
         });
         match channel {
             OutputChannel::Text => self.active_text = Some(index),
-            OutputChannel::Reasoning => self.active_reasoning = Some(index),
+            OutputChannel::Reasoning => {
+                self.active_reasoning = Some(index);
+                self.register_active_event(index);
+            }
         }
     }
 
@@ -716,9 +826,11 @@ impl ShellState {
             if index >= self.transcript.len() {
                 continue;
             }
+            self.unregister_active_event(index);
             self.transcript.remove(index);
             self.transcript_commit_ids.remove(index);
             self.block_revisions.remove(index);
+            self.reindex_active_events_after_removal(index);
             for panel_index in self.tool_panels.values_mut() {
                 if *panel_index > index {
                     *panel_index -= 1;
@@ -743,7 +855,16 @@ impl ShellState {
             }
         }
         if let Some(index) = self.active_reasoning.take() {
-            if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(index) {
+            self.unregister_active_event(index);
+            let transient = matches!(
+                self.transcript.get(index),
+                Some(TranscriptBlock::Reasoning(reasoning)) if reasoning.text.is_empty()
+            );
+            if transient {
+                self.remove_transient_activity_block(index);
+            } else if let Some(TranscriptBlock::Reasoning(reasoning)) =
+                self.transcript.get_mut(index)
+            {
                 reasoning.finish_reasoning();
                 self.touch_block(index);
             }
@@ -751,40 +872,36 @@ impl ShellState {
     }
 
     fn has_active_event_dot(&self) -> bool {
-        self.transcript.iter().rev().any(|block| match block {
-            TranscriptBlock::Reasoning(reasoning) => {
-                !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
-            }
-            TranscriptBlock::Tool(panel) => !panel.finished,
-            TranscriptBlock::Shell(shell) => shell.running,
-            _ => false,
-        })
+        self.active_event_blocks
+            .iter()
+            .any(|index| match self.transcript.get(*index) {
+                Some(TranscriptBlock::Reasoning(reasoning)) => {
+                    !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
+                }
+                Some(TranscriptBlock::Tool(panel)) => !panel.finished,
+                Some(TranscriptBlock::Shell(shell)) => shell.running,
+                _ => false,
+            })
     }
 
     fn advance_event_dot_animation(&mut self) {
-        let active = self
-            .transcript
-            .iter()
-            .enumerate()
-            .filter_map(|(index, block)| match block {
-                TranscriptBlock::Reasoning(reasoning)
-                    if !self.verbose_tools
-                        && !reasoning.finished
-                        && !reasoning.reasoning_expanded =>
-                {
-                    Some(index)
-                }
-                TranscriptBlock::Tool(panel) if !panel.finished => Some(index),
-                TranscriptBlock::Shell(shell) if shell.running => Some(index),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if active.is_empty() {
+        if !self.has_active_event_dot() {
             return;
         }
         self.event_dot_visible = !self.event_dot_visible;
-        for index in active {
-            self.touch_block(index);
+        for position in 0..self.active_event_blocks.len() {
+            let index = self.active_event_blocks[position];
+            let visible = match self.transcript.get(index) {
+                Some(TranscriptBlock::Reasoning(reasoning)) => {
+                    !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
+                }
+                Some(TranscriptBlock::Tool(panel)) => !panel.finished,
+                Some(TranscriptBlock::Shell(shell)) => shell.running,
+                _ => false,
+            };
+            if visible {
+                self.touch_block(index);
+            }
         }
     }
 
@@ -1268,7 +1385,6 @@ impl InteractiveShell {
             .run
             .begin_route(&provider_status, provider, model)
             .expect("a new prompt is accepted only after the previous run terminates");
-        state.shimmer_started_at = Some(Instant::now());
         state.open_reasoning_status();
         id
     }
@@ -1299,9 +1415,6 @@ impl InteractiveShell {
                 .session_work_elapsed
                 .saturating_add(run.elapsed_at(Instant::now()));
         }
-        // The run's shimmer anchor is animation-only. Leaving it populated
-        // after completion made the idle footer behave like a wall clock.
-        state.shimmer_started_at = None;
         state.close_streaming_blocks();
         let tokens_per_second = state
             .last_turn_tokens_per_second
@@ -1422,11 +1535,13 @@ impl InteractiveShell {
                 // beside the replacement compacted context.
                 state.discard_streaming_blocks();
                 state.run_label = "compacting".into();
+                state.open_activity_status(Some("Compacting context"), false);
                 state.turn_generation_started_at = None;
                 state.turn_streamed_output_bytes = 0;
             }
             AgentEvent::CompactionFinished { reason, result } => {
                 state.run_label.clear();
+                state.close_activity_status("Compacting context");
                 match result {
                     Ok(info) => {
                         let reason = match reason {
@@ -1478,6 +1593,7 @@ impl InteractiveShell {
                     model_lab,
                 ))));
                 state.tool_panels.insert(id.clone(), index);
+                state.register_active_event(index);
             }
             AgentEvent::ToolProgress { id, progress } => {
                 let index = state.tool_panels.get(id).copied();
@@ -1552,6 +1668,7 @@ impl InteractiveShell {
                     }
                 }
                 if let Some(index) = index {
+                    state.unregister_active_event(index);
                     state.touch_block(index);
                 }
                 if let Some((used, _)) = state.run_context_estimate.as_mut() {
@@ -2190,6 +2307,7 @@ impl InteractiveShell {
 
     pub fn set_run_label(&mut self, label: &str) {
         let mut state = self.state.borrow_mut();
+        let was_compacting = state.run_label == "compacting";
         let run_label = if label == "idle" || label.starts_with("run:") {
             String::new()
         } else {
@@ -2198,12 +2316,13 @@ impl InteractiveShell {
                 .trim_end_matches("...")
                 .to_owned()
         };
-        if run_label == "compacting" {
-            state.shimmer_started_at = Some(Instant::now());
-        } else if run_label.is_empty() {
-            state.shimmer_started_at = None;
+        if was_compacting && run_label != "compacting" {
+            state.close_activity_status("Compacting context");
         }
         state.run_label = run_label;
+        if state.run_label == "compacting" {
+            state.open_activity_status(Some("Compacting context"), false);
+        }
     }
 
     pub fn set_size(&mut self, columns: u16, rows: u16) {
@@ -2911,20 +3030,22 @@ impl InteractiveShell {
         state.push_block(TranscriptBlock::Notice(message.into()));
     }
 
-    /// Append a running shell command placeholder with a spinner.
+    /// Append a running shell command placeholder. The shared transcript
+    /// activity marker supplies its restrained pulse.
     /// Returns the block id so the caller can update and finalize it.
     pub fn append_shell_in_progress(&mut self, command: String) -> String {
         let mut state = self.state.borrow_mut();
         state.event_dot_visible = true;
         let id = format!("shell-{}", state.transcript.len());
+        let index = state.transcript.len();
         state.push_block(TranscriptBlock::Shell(Box::new(ShellOutput {
             id: id.clone(),
             command,
             output: String::new(),
             exit_code: 0,
             running: true,
-            spinner: "⠋".to_string(),
         })));
+        state.register_active_event(index);
         id
     }
 
@@ -2945,21 +3066,6 @@ impl InteractiveShell {
         }
     }
 
-    /// Update the spinner character on an in-progress shell block.
-    pub fn update_shell_spinner(&mut self, id: &str, spinner: &str) {
-        let mut state = self.state.borrow_mut();
-        let index = state
-            .transcript
-            .iter()
-            .rposition(|block| matches!(block, TranscriptBlock::Shell(shell) if shell.id == id));
-        if let Some(index) = index {
-            if let TranscriptBlock::Shell(shell) = &mut state.transcript[index] {
-                shell.spinner = spinner.to_string();
-            }
-            state.touch_block(index);
-        }
-    }
-
     /// Finalize a shell block with its output and exit code.
     pub fn finalize_shell(&mut self, id: &str, output: String, exit_code: i32) {
         let mut state = self.state.borrow_mut();
@@ -2972,8 +3078,8 @@ impl InteractiveShell {
                 shell.running = false;
                 shell.output = output;
                 shell.exit_code = exit_code;
-                shell.spinner.clear();
             }
+            state.unregister_active_event(index);
             state.touch_block(index);
         }
     }
@@ -3068,6 +3174,7 @@ impl InteractiveShell {
         state.transcript_epoch = state.transcript_epoch.wrapping_add(1);
         state.next_transcript_commit_id = NextTranscriptCommitId::default();
         state.transcript.clear();
+        state.active_event_blocks.clear();
         state.transcript_commit_ids.clear();
         state.block_revisions.clear();
         state.invalidate_transcript_layout();
@@ -3104,7 +3211,6 @@ impl InteractiveShell {
         state.run_price_display = None;
         state.run_context_estimate = None;
         state.run_label.clear();
-        state.shimmer_started_at = None;
         state.overlay = None;
         state.error = None;
         append_hydrated_items(&mut state, items);

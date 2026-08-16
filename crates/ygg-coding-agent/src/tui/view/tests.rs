@@ -2171,7 +2171,7 @@ fn hidden_reasoning_stream_does_not_grow_native_scrollback() {
     let visible = terminal.screen().contents();
     assert!(visible.contains("Thinking"), "{visible:?}");
     assert!(!visible.contains("Working"), "{visible:?}");
-    assert!(visible.contains("ctrl+o to expand"), "{visible:?}");
+    assert!(visible.contains("ctrl+o · unfold"), "{visible:?}");
     assert!(!visible.contains("private sentinel"), "{visible:?}");
     let state = shell.state.borrow();
     let TranscriptBlock::Reasoning(reasoning) = state.transcript.last().unwrap() else {
@@ -2303,6 +2303,10 @@ fn autonomous_compaction_events_show_work_success_and_failure_inline() {
     );
     assert!(!footer.contains("Working"), "{footer}");
     assert!(!footer.contains("compacting"), "{footer}");
+    let compacting =
+        strip_terminal_sequences(&shell.state.borrow().rendered_transcript(80).join("\n"));
+    assert!(compacting.contains("• Compacting context"), "{compacting}");
+    assert!(!compacting.contains("ctrl+o"), "{compacting}");
 
     shell.on_run_event(
         run_id,
@@ -2321,6 +2325,7 @@ fn autonomous_compaction_events_show_work_success_and_failure_inline() {
         collapsed.contains("Context compacted automatically"),
         "{collapsed}"
     );
+    assert!(!collapsed.contains("Compacting context"), "{collapsed}");
     assert!(!collapsed.contains("auto-summary sentinel"), "{collapsed}");
     shell.expand_focused_tool();
     let expanded =
@@ -3142,10 +3147,9 @@ fn short_transcript_chrome_follows_content_without_viewport_padding() {
         },
     );
     let streamed = render_shell_at(&shell.state.borrow(), 80, now);
-    // Active reasoning occupies two rows; the first answer delta replaces it
-    // with one transition row plus one assistant row, so the composer stays
-    // at the same content-relative position.
-    assert_eq!(composer_row(&streamed), initial_composer);
+    // Active reasoning occupies two rows. Once real output arrives, the empty
+    // display-only status disappears and the assistant owns a single row.
+    assert_eq!(composer_row(&streamed) + 1, initial_composer);
     assert!(streamed.len() < 40);
 
     shell.on_run_event(
@@ -4318,7 +4322,7 @@ fn reasoning_enabled_run_shows_fallback_before_provider_deltas() {
         .collect::<Vec<_>>();
     assert_eq!(rendered.len(), 2, "{rendered:?}");
     assert!(rendered[0].contains("• Thinking"), "{rendered:?}");
-    assert!(rendered[1].contains("ctrl+o to expand"), "{rendered:?}");
+    assert!(rendered[1].contains("ctrl+o · unfold"), "{rendered:?}");
 }
 
 #[test]
@@ -4344,16 +4348,17 @@ fn collapsed_reasoning_dot_blinks_without_moving_the_label() {
         assert!(event_dot_animating(&state));
         state.advance_event_dot_animation();
     }
-    let hidden = render(&shell);
-    assert!(!hidden.contains('•'), "{hidden:?}");
+    let quiet = render(&shell);
+    assert!(!quiet.contains('•'), "{quiet:?}");
+    assert!(quiet.contains('·'), "{quiet:?}");
     let visual_label_column = |line: &str| {
         let offset = line.find("Thinking").expect("reasoning label");
         visible_width(&line[..offset])
     };
     assert_eq!(
         visual_label_column(&visible),
-        visual_label_column(&hidden),
-        "blinking the dot must not move the reasoning label"
+        visual_label_column(&quiet),
+        "breathing the dot must not move the reasoning label"
     );
 }
 
@@ -4404,14 +4409,14 @@ fn collapsed_reasoning_aligns_with_tool_event_margin() {
         .expect("reasoning row");
     let disclosure_line = reasoning_lines
         .iter()
-        .find(|line| line.contains("ctrl+o to expand"))
+        .find(|line| line.contains("ctrl+o · unfold"))
         .expect("reasoning disclosure row");
     let visual_column = |line: &str, needle: &str| {
         line.find(needle)
             .map(|offset| visible_width(&line[..offset]))
     };
     assert_eq!(
-        visual_column(tool_line, "•"),
+        visual_column(tool_line, "·"),
         visual_column(reasoning_line, "•"),
         "event dots must share the margin: {tool_line:?} vs {reasoning_line:?}"
     );
@@ -4428,11 +4433,122 @@ fn collapsed_reasoning_aligns_with_tool_event_margin() {
 }
 
 #[test]
-fn reasoning_off_run_does_not_create_a_fallback_status() {
+fn reasoning_off_run_uses_a_truthful_non_expandable_working_status() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "off");
-    shell.begin_run("codex");
-    assert!(shell.state.borrow().transcript.is_empty());
+    let run_id = shell.begin_run("codex");
+    let rendered = shell
+        .state
+        .borrow()
+        .rendered_transcript(80)
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>();
+    assert_eq!(rendered.len(), 1, "{rendered:?}");
+    assert!(rendered[0].contains("• Working"), "{rendered:?}");
+    assert!(!rendered[0].contains("ctrl+o"), "{rendered:?}");
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Reasoning,
+            text: "provider-private detail".into(),
+        },
+    );
+    let promoted = shell
+        .state
+        .borrow()
+        .rendered_transcript(80)
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>();
+    assert_eq!(promoted.len(), 2, "{promoted:?}");
+    assert!(promoted[0].contains("Thinking"), "{promoted:?}");
+    assert!(promoted[1].contains("ctrl+o · unfold"), "{promoted:?}");
+    assert!(!promoted.join("\n").contains("provider-private detail"));
+}
+
+#[test]
+fn empty_working_status_leaves_no_ghost_block_when_interrupted() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_identity("codex", "gpt-5.3-codex-spark", "off");
+    let run_id = shell.begin_run("codex");
+
+    shell.interrupt_run(run_id);
+
+    let state = shell.state.borrow();
+    assert!(
+        state
+            .transcript
+            .iter()
+            .all(|block| !matches!(block, TranscriptBlock::Reasoning(_))),
+        "a display-only status must not become durable transcript history"
+    );
+    assert!(state.active_event_blocks.is_empty());
+}
+
+#[test]
+fn empty_thinking_status_is_replaced_by_the_first_text_block() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
+    let run_id = shell.begin_run("codex");
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "Ready.".into(),
+        },
+    );
+
+    let state = shell.state.borrow();
+    assert!(matches!(
+        state.transcript.first(),
+        Some(TranscriptBlock::Assistant(_))
+    ));
+    assert!(state
+        .transcript
+        .iter()
+        .all(|block| !matches!(block, TranscriptBlock::Reasoning(_))));
+}
+
+#[test]
+fn removing_a_tail_status_preserves_an_older_semantic_selection() {
+    let mut shell = InteractiveShell::test_shell();
+    {
+        let mut state = shell.state.borrow_mut();
+        state.push_block(TranscriptBlock::Notice("older transcript".into()));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: TranscriptPosition {
+                block: 0,
+                offset: 0,
+                trailing_affinity: false,
+            },
+            focus: TranscriptPosition {
+                block: 0,
+                offset: 5,
+                trailing_affinity: false,
+            },
+        });
+    }
+    shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
+    let run_id = shell.begin_run("codex");
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "Ready.".into(),
+        },
+    );
+
+    let state = shell.state.borrow();
+    let selection = state
+        .transcript_selection
+        .as_ref()
+        .expect("older selection should survive removal of the empty tail status");
+    assert_eq!(selection.anchor.block, 0);
+    assert_eq!(selection.focus.block, 0);
 }
 
 #[test]
@@ -4451,6 +4567,12 @@ fn reasoning_status_reopens_after_tools_for_the_next_model_turn() {
         },
     );
     assert!(shell.state.borrow().active_reasoning.is_none());
+    assert!(shell
+        .state
+        .borrow()
+        .transcript
+        .iter()
+        .all(|block| !matches!(block, TranscriptBlock::Reasoning(_))));
     shell.on_run_event(
         run_id,
         &AgentEvent::ToolFinished {
@@ -4492,7 +4614,7 @@ fn streamed_reasoning_shows_one_live_indicator_until_ctrl_o() {
     let initial = transcript(&shell);
     assert_eq!(initial.len(), 2, "{initial:?}");
     assert!(initial[0].contains("Thinking"), "{initial:?}");
-    assert!(initial[1].contains("ctrl+o to expand"), "{initial:?}");
+    assert!(initial[1].contains("ctrl+o · unfold"), "{initial:?}");
     assert!(!initial.join("\n").contains("first private sentinel"));
 
     let continuation = (0..128)
@@ -4525,7 +4647,7 @@ fn streamed_reasoning_shows_one_live_indicator_until_ctrl_o() {
     let expanded = transcript(&shell).join("\n");
     assert!(expanded.contains("first private sentinel"), "{expanded}");
     assert!(expanded.contains("private reasoning row 127"), "{expanded}");
-    assert!(!expanded.contains("ctrl+o to expand"), "{expanded}");
+    assert!(!expanded.contains("ctrl+o · unfold"), "{expanded}");
 
     shell.expand_focused_tool();
     assert_eq!(transcript(&shell), initial);
@@ -4564,11 +4686,7 @@ fn a_new_reasoning_event_retires_the_previous_ctrl_o_hint() {
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>()
         .join("\n");
-    assert_eq!(
-        rendered.matches("ctrl+o to expand").count(),
-        1,
-        "{rendered}"
-    );
+    assert_eq!(rendered.matches("ctrl+o · unfold").count(), 1, "{rendered}");
     shell.expand_focused_tool();
     let expanded = shell
         .state
@@ -4580,7 +4698,7 @@ fn a_new_reasoning_event_retires_the_previous_ctrl_o_hint() {
         .join("\n");
     assert!(expanded.contains("first thought"), "{expanded}");
     assert!(expanded.contains("second thought"), "{expanded}");
-    assert!(!expanded.contains("ctrl+o to expand"), "{expanded}");
+    assert!(!expanded.contains("ctrl+o · unfold"), "{expanded}");
 }
 
 #[test]
@@ -5192,17 +5310,17 @@ fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
         .expect("visible active marker");
     assert_eq!(strip_terminal_sequences(&active), "•");
     assert!(!active.contains("\x1b[5m"), "{active:?}");
-    let hidden = event_margin_marker(&panel(false, false), &theme, false, false)
-        .expect("hidden active marker");
-    assert_eq!(hidden, " ");
+    let quiet = event_margin_marker(&panel(false, false), &theme, false, false)
+        .expect("quiet active marker");
+    assert_eq!(strip_terminal_sequences(&quiet), "·");
 
     let settled_edit =
         event_margin_marker(&panel(true, false), &theme, false, false).expect("edit marker");
-    assert_eq!(settled_edit, theme.settled_event_dot("neutral", "•"));
+    assert_eq!(settled_edit, theme.settled_event_dot("neutral", "·"));
 
     let failed =
         event_margin_marker(&panel(true, true), &theme, false, false).expect("failure marker");
-    assert_eq!(failed, theme.settled_event_dot("error", "•"));
+    assert_eq!(failed, theme.settled_event_dot("error", "·"));
 
     let bash_args = serde_json::json!({"command":"cargo test"});
     let bash = TranscriptBlock::Tool(Box::new(ToolPanel::new(
@@ -5218,7 +5336,7 @@ fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
     )));
     assert_eq!(
         event_margin_marker(&bash, &theme, false, false),
-        Some(theme.settled_event_dot("success", "•"))
+        Some(theme.settled_event_dot("success", "·"))
     );
 
     let read = TranscriptBlock::Tool(Box::new(ToolPanel::new(
@@ -5234,7 +5352,7 @@ fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
     )));
     assert_eq!(
         event_margin_marker(&read, &theme, false, false),
-        Some(theme.settled_event_dot("neutral", "•"))
+        Some(theme.settled_event_dot("neutral", "·"))
     );
 
     let prompt = TranscriptBlock::User {
@@ -5253,8 +5371,9 @@ fn event_margin_markers_toggle_live_and_settle_with_tool_specific_tones() {
         Some("•".into())
     );
     assert_eq!(
-        event_margin_marker(&reasoning, &theme, false, true),
-        Some(" ".into())
+        event_margin_marker(&reasoning, &theme, false, true)
+            .map(|marker| strip_terminal_sequences(&marker)),
+        Some("·".into())
     );
     let outcome = TranscriptBlock::Outcome(OutcomeBlock::new(
         RunOutcome::CompletedWithWarnings {
@@ -5278,6 +5397,7 @@ fn event_dot_animation_invalidates_active_tool_rows_in_lockstep() {
         let mut state = shell.state.borrow_mut();
         for (id, name) in [("read", "read"), ("edit", "edit")] {
             let args = serde_json::json!({"path":"src/lib.rs"});
+            let index = state.transcript.len();
             state.push_block(TranscriptBlock::Tool(Box::new(ToolPanel::new(
                 ToolCallId(id.into()),
                 name.into(),
@@ -5289,6 +5409,7 @@ fn event_dot_animation_invalidates_active_tool_rows_in_lockstep() {
                 None,
                 None,
             ))));
+            state.register_active_event(index);
         }
         state.event_dot_visible = true;
         assert!(event_dot_animating(&state));
@@ -5312,16 +5433,42 @@ fn event_dot_animation_invalidates_active_tool_rows_in_lockstep() {
     );
 
     shell.state.borrow_mut().advance_event_dot_animation();
-    let hidden = active_rows();
-    assert_eq!(hidden.len(), 2, "{hidden:?}");
-    assert!(
-        hidden.iter().all(|line| line.starts_with("  ")),
-        "{hidden:?}"
-    );
+    let quiet = active_rows();
+    assert_eq!(quiet.len(), 2, "{quiet:?}");
+    assert!(quiet.iter().all(|line| line.starts_with("· ")), "{quiet:?}");
 
     shell.state.borrow_mut().advance_event_dot_animation();
     let visible_again = active_rows();
     assert_eq!(visible_again, visible);
+}
+
+#[test]
+fn event_dot_tracking_stays_bounded_in_long_sessions() {
+    let mut shell = InteractiveShell::test_shell();
+    {
+        let mut state = shell.state.borrow_mut();
+        for index in 0..10_000 {
+            state.push_block(TranscriptBlock::Notice(format!("history {index}")));
+        }
+    }
+
+    let run_id = shell.begin_run("openai");
+    let active_index = {
+        let state = shell.state.borrow();
+        assert_eq!(state.active_event_blocks.len(), 1);
+        state.active_event_blocks[0]
+    };
+    shell.state.borrow_mut().advance_event_dot_animation();
+    {
+        let state = shell.state.borrow();
+        assert_eq!(state.block_revisions[active_index], 1);
+        assert!(state.block_revisions[..active_index]
+            .iter()
+            .all(|revision| *revision == 0));
+    }
+
+    shell.interrupt_run(run_id);
+    assert!(shell.state.borrow().active_event_blocks.is_empty());
 }
 
 #[test]
@@ -5508,53 +5655,54 @@ fn compiled_default_composer_keeps_the_terminal_background_unfilled() {
 }
 
 #[test]
-fn compiled_default_shimmer_moves_only_while_work_is_active() {
+fn compiled_default_composer_border_is_static_during_work() {
     use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
     use crate::tui::theme::TerminalBackground;
 
     let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
     let theme = crate::tui::theme::test_theme_for(TerminalBackground::Dark, capabilities);
     let mut shell = InteractiveShell::test_shell_with_theme(theme);
-    shell.state.borrow_mut().reasoning = "high".into();
-    let idle_now = Instant::now();
-    assert!(!shimmer_animating(&shell.state.borrow()));
+    shell.set_identity("anthropic", "claude-sonnet-4", "high");
+    let now = Instant::now();
     let idle_before =
-        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 80, idle_now);
+        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 80, now);
     let idle_after = crate::tui::composer_surface::render_composer_surface(
         &shell.state.borrow(),
         80,
-        idle_now + Duration::from_millis(250),
+        now + Duration::from_secs(5),
     );
     assert_eq!(idle_before[0], idle_after[0]);
 
     let run_id = shell.begin_run("anthropic");
-    let started = shell
-        .state
-        .borrow()
-        .shimmer_started_at
-        .expect("active run shimmer anchor");
-    assert!(shimmer_animating(&shell.state.borrow()));
+    let accent = {
+        let state = shell.state.borrow();
+        state
+            .theme
+            .model_rgb(state.run_model_lab)
+            .expect("captured run model accent")
+    };
     let active_before =
-        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 80, started);
+        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 80, now);
     let active_after = crate::tui::composer_surface::render_composer_surface(
         &shell.state.borrow(),
         80,
-        started + Duration::from_millis(250),
+        now + Duration::from_secs(5),
     );
-    assert_ne!(active_before[0], active_after[0]);
+    assert_eq!(active_before[0], active_after[0]);
+    assert_ne!(idle_before[0], active_before[0]);
+    assert!(active_before[0].contains(&format!("38;2;{};{};{}", accent.0, accent.1, accent.2)));
     assert!(active_before[..3]
         .iter()
         .chain(&active_after[..3])
         .all(|line| !line.contains("\x1b[48;2;")));
 
     shell.interrupt_run(run_id);
-    assert!(!shimmer_animating(&shell.state.borrow()));
     let rest = crate::tui::composer_surface::render_composer_surface(
         &shell.state.borrow(),
         80,
-        started + Duration::from_secs(1),
+        now + Duration::from_secs(10),
     );
-    assert_ne!(active_after[0], rest[0]);
+    assert_eq!(idle_before[0], rest[0]);
 }
 
 #[test]
@@ -5688,7 +5836,7 @@ fn bash_wraps_and_indents_output_without_connector_glyphs() {
     .map(|line| strip_terminal_sequences(&line))
     .collect::<Vec<_>>();
 
-    assert!(rendered[0].starts_with("• Bash"), "{rendered:?}");
+    assert!(rendered[0].starts_with("· Bash"), "{rendered:?}");
     let command_byte = rendered[0].find("node").expect("command on Bash row");
     let command_column = visible_width(&rendered[0][..command_byte]);
     let no_output = rendered
@@ -6408,7 +6556,6 @@ fn ctrl_o_toggles_all_expandable_transcript_blocks() {
             output: shell_output,
             exit_code: 0,
             running: false,
-            spinner: "".into(),
         })));
         state.push_block(TranscriptBlock::Compaction(Box::new(CompactionBlock {
             label: "Context compacted".into(),
@@ -7356,7 +7503,6 @@ fn populate_theme_fixture(shell: &mut InteractiveShell) {
         output: "test result: ok. 386 passed".into(),
         exit_code: 0,
         running: false,
-        spinner: "✓".into(),
     })));
     state.push_block(TranscriptBlock::Notice(
         "Extension reloaded with one status contribution.".into(),

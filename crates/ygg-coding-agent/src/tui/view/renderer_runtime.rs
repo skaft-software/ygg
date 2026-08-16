@@ -3,7 +3,6 @@
 use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use sexy_tui_rs::{CommitCursor, Component, FrameUpdate, TUI};
@@ -17,19 +16,11 @@ use super::welcome_card::welcome_animating;
 use super::ShellState;
 use crate::tui::terminal::{TerminalSize, YggTerminal};
 
-/// Default render cap — roughly 60 fps. Decorative shimmer uses the separate,
-/// deliberately slower cap below; input and streamed output stay on this path.
+/// Welcome-card motion is short-lived and limited to roughly 60 fps.
 const RENDER_INTERVAL: Duration = Duration::from_millis(16);
-/// Modern terminals get a restrained 20 FPS shimmer. The retained renderer
-/// emits only changed border cells, so this leaves input and streaming work
-/// well ahead of decorative frames.
-const ANIMATION_RENDER_INTERVAL: Duration = Duration::from_millis(50);
-/// Wake near the next eligible animation frame; input commands still preempt
-/// this wait through the bounded render channel.
-const ANIMATION_POLL_TIMEOUT: Duration = Duration::from_millis(45);
-/// Tool activity dots share one restrained 900 ms cycle. Toggling the cell
-/// ourselves works in terminals that intentionally ignore SGR blink.
-const EVENT_DOT_TOGGLE_INTERVAL: Duration = Duration::from_millis(450);
+/// Transcript activity shares one restrained one-second breathing cycle.
+/// Toggling the glyph ourselves works in terminals that ignore SGR blink.
+const EVENT_DOT_TOGGLE_INTERVAL: Duration = Duration::from_millis(500);
 /// Resize events are normally delivered by crossterm, but polling while idle
 /// also catches terminal-manager resizes that do not emit an event.
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -59,34 +50,24 @@ pub(super) enum RenderCommand {
     Stop,
 }
 
-/// True when the perimeter-shimmer animation is visible and moving. When
-/// false we can use a lazy poll interval to save CPU.
-pub(super) fn shimmer_animating(state: &ShellState) -> bool {
-    let capabilities = state.theme.capabilities();
-    if !capabilities.animation
-        || capabilities.color == crate::tui::terminal::ColorDepth::None
-        || state.size.0 < 12
-    {
-        return false;
-    }
-    if state.run_label == "compacting" {
-        return true;
-    }
-    let Some(run) = state.run.current() else {
-        return false;
-    };
-    if !run.is_active() || state.reasoning.trim().eq_ignore_ascii_case("off") {
-        return false;
-    }
-    // The helper returns a fixed positive velocity only for working phases;
-    // approval waits deliberately leave the border still and do not need a
-    // high-frequency repaint.
-    crate::tui::composer_surface::phase_speed_for(Some(run.phase())) > 0.0
-}
-
 pub(super) fn event_dot_animating(state: &ShellState) -> bool {
     let capabilities = state.theme.capabilities();
     capabilities.animation && capabilities.interactive && state.has_active_event_dot()
+}
+
+fn render_wake_requires_frame(
+    semantic_command: bool,
+    resized: bool,
+    welcome: bool,
+    event_dot_due: bool,
+) -> bool {
+    semantic_command || resized || welcome || event_dot_due
+}
+
+fn frame_coalesce_delay(last_render: Option<Instant>, now: Instant) -> Duration {
+    last_render
+        .map(|last| (last + RENDER_INTERVAL).saturating_duration_since(now))
+        .unwrap_or_default()
 }
 
 /// Reconcile the renderer's shared dimensions with the terminal itself. This
@@ -152,45 +133,27 @@ pub(super) fn render_loop(
     let mut last_render: Option<Instant> = None;
     let mut last_event_dot_toggle = Instant::now();
     loop {
-        // Choose the poll timeout based on whether the shimmer animation
-        // would be rendered this frame. When it is, use a short timeout so
-        // the wave stays fluid on high-refresh terminals. Otherwise use a
-        // 100 ms status/resize poll; idle timeouts do not render unless the
-        // terminal dimensions actually changed.
-        let (animating, welcome, event_dot, is_active) = {
+        // Only the short-lived welcome card gets a high-frequency wake. Work
+        // itself is event-driven; the transcript pulse owns the sole slow
+        // timer once a run is underway.
+        let (welcome, event_dot) = {
             let shell = state.borrow();
-            let active = shell.run.is_active();
-            let compacting = shell.run_label == "compacting";
-            let shimmer = (active || compacting) && shimmer_animating(&shell);
             let welcome = welcome_animating(&shell, Instant::now());
             let event_dot = event_dot_animating(&shell);
-            (
-                shimmer || welcome,
-                welcome,
-                event_dot,
-                active || compacting || welcome || event_dot,
-            )
+            (welcome, event_dot)
         };
         if !event_dot {
             last_event_dot_toggle = Instant::now();
         }
-        let command = if animating {
-            let poll = if welcome {
-                RENDER_INTERVAL
-            } else {
-                ANIMATION_POLL_TIMEOUT
-            };
-            match rx.recv_timeout(poll) {
-                Ok(command) => Some(command),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+        let poll = if welcome {
+            RENDER_INTERVAL
         } else {
-            match rx.recv_timeout(RESIZE_POLL_INTERVAL) {
-                Ok(command) => Some(command),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
+            RESIZE_POLL_INTERVAL
+        };
+        let command = match rx.recv_timeout(poll) {
+            Ok(command) => Some(command),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if matches!(command, Some(RenderCommand::Stop)) {
             break;
@@ -201,26 +164,14 @@ pub(super) fn render_loop(
         } else {
             false
         };
-        if command.is_none() && !resized && !animating && !is_active {
+        let advance_event_dot =
+            event_dot && last_event_dot_toggle.elapsed() >= EVENT_DOT_TOGGLE_INTERVAL;
+        let semantic_command = matches!(command, Some(RenderCommand::Render));
+        if !render_wake_requires_frame(semantic_command, resized, welcome, advance_event_dot) {
             continue;
         }
 
-        // Cap rendering to a sensible upper bound. Shimmer is deliberately
-        // slower than input/streaming frames and changes only a few cells.
-        let cap = if welcome {
-            RENDER_INTERVAL
-        } else if animating {
-            ANIMATION_RENDER_INTERVAL
-        } else {
-            RENDER_INTERVAL
-        };
-        if let Some(last) = last_render {
-            let elapsed = last.elapsed();
-            if elapsed < cap {
-                thread::sleep(cap - elapsed);
-            }
-        }
-
+        // Coalesce everything already queued into the latest semantic state.
         let mut stop = false;
         while let Ok(next) = rx.try_recv() {
             if matches!(next, RenderCommand::Stop) {
@@ -232,8 +183,28 @@ pub(super) fn render_loop(
             break;
         }
 
-        let advance_event_dot =
-            event_dot && last_event_dot_toggle.elapsed() >= EVENT_DOT_TOGGLE_INTERVAL;
+        // Bound high-throughput model streams to one frame per terminal refresh
+        // without bringing back the old uninterruptible animation sleep. The
+        // receiver remains live during the short deadline: more semantic work
+        // is folded into the pending frame, and Stop takes effect immediately.
+        if let Some(last) = last_render {
+            let delay = frame_coalesce_delay(Some(last), Instant::now());
+            let deadline = Instant::now() + delay;
+            while !delay.is_zero() && Instant::now() < deadline {
+                match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(RenderCommand::Render) => {}
+                    Ok(RenderCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        stop = true;
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                }
+            }
+        }
+        if stop {
+            break;
+        }
+
         if welcome || advance_event_dot {
             let mut shell = state.borrow_mut();
             if welcome {
@@ -249,6 +220,40 @@ pub(super) fn render_loop(
     }
 
     tui.stop();
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{frame_coalesce_delay, render_wake_requires_frame};
+
+    #[test]
+    fn active_state_without_a_concrete_wake_never_requests_a_frame() {
+        assert!(!render_wake_requires_frame(false, false, false, false));
+    }
+
+    #[test]
+    fn semantic_work_and_due_visual_transitions_each_request_a_frame() {
+        assert!(render_wake_requires_frame(true, false, false, false));
+        assert!(render_wake_requires_frame(false, true, false, false));
+        assert!(render_wake_requires_frame(false, false, true, false));
+        assert!(render_wake_requires_frame(false, false, false, true));
+    }
+
+    #[test]
+    fn semantic_bursts_coalesce_for_at_most_one_terminal_frame() {
+        let last = Instant::now();
+        assert_eq!(
+            frame_coalesce_delay(Some(last), last + Duration::from_millis(1)),
+            Duration::from_millis(15)
+        );
+        assert_eq!(
+            frame_coalesce_delay(Some(last), last + Duration::from_millis(16)),
+            Duration::ZERO
+        );
+        assert_eq!(frame_coalesce_delay(None, last), Duration::ZERO);
+    }
 }
 
 #[derive(Default)]

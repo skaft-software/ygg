@@ -149,44 +149,42 @@ pub(super) fn event_margin_marker(
     active_dot_visible: bool,
     collapsed_reasoning: bool,
 ) -> Option<String> {
-    let dot = if theme.unicode() { "•" } else { "." };
+    let active_dot = if theme.unicode() { "•" } else { "*" };
+    let quiet_dot = if theme.unicode() { "·" } else { "." };
+    let active_phase_dot = if active_dot_visible {
+        active_dot
+    } else {
+        quiet_dot
+    };
     match block {
         TranscriptBlock::User { .. } | TranscriptBlock::Outcome(_) | TranscriptBlock::Notice(_) => {
             None
         }
         TranscriptBlock::Reasoning(reasoning) if collapsed_reasoning => {
-            Some(if active_dot_visible {
-                theme.model_fg(reasoning.model_lab, dot)
-            } else {
-                " ".to_owned()
-            })
+            Some(theme.model_fg(reasoning.model_lab, active_phase_dot))
         }
         TranscriptBlock::Reasoning(_) => None,
-        TranscriptBlock::Tool(panel) if !panel.finished => Some(if active_dot_visible {
-            theme.fg("foreground", dot)
-        } else {
-            " ".to_owned()
-        }),
+        TranscriptBlock::Tool(panel) if !panel.finished => {
+            Some(theme.fg("foreground", active_phase_dot))
+        }
         TranscriptBlock::Tool(panel) if panel.is_error => {
-            Some(theme.settled_event_dot("error", dot))
+            Some(theme.settled_event_dot("error", quiet_dot))
         }
         TranscriptBlock::Tool(panel) if matches!(panel.name.as_str(), "bash" | "exec") => {
-            Some(theme.settled_event_dot("success", dot))
+            Some(theme.settled_event_dot("success", quiet_dot))
         }
-        TranscriptBlock::Shell(shell) if shell.running => Some(if active_dot_visible {
-            theme.fg("foreground", dot)
-        } else {
-            " ".to_owned()
-        }),
+        TranscriptBlock::Shell(shell) if shell.running => {
+            Some(theme.fg("foreground", active_phase_dot))
+        }
         TranscriptBlock::Shell(shell) => Some(theme.settled_event_dot(
             if shell.exit_code == 0 {
                 "success"
             } else {
                 "error"
             },
-            dot,
+            quiet_dot,
         )),
-        _ => Some(theme.settled_event_dot("neutral", dot)),
+        _ => Some(theme.settled_event_dot("neutral", quiet_dot)),
     }
 }
 

@@ -372,7 +372,6 @@ mod tests {
             output: five_lines,
             exit_code: 0,
             running: false,
-            spinner: String::new(),
         }));
         let long_shell = TranscriptBlock::Shell(Box::new(ShellOutput {
             id: "long".to_owned(),
@@ -380,7 +379,6 @@ mod tests {
             output: six_lines,
             exit_code: 0,
             running: false,
-            spinner: String::new(),
         }));
         assert!(finalized_block_rows_are_stable(&short_shell));
         assert!(!finalized_block_rows_are_stable(&long_shell));

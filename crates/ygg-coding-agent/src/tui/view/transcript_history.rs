@@ -138,6 +138,9 @@ pub(super) fn materialize_deferred_session_history(state: &SharedState) -> Resul
     state.active_reasoning = state
         .active_reasoning
         .map(|index| index.saturating_add(prepended_blocks));
+    for index in &mut state.active_event_blocks {
+        *index = index.saturating_add(prepended_blocks);
+    }
     if let Some(selection) = &mut state.transcript_selection {
         selection.anchor.block = selection.anchor.block.saturating_add(prepended_blocks);
         selection.focus.block = selection.focus.block.saturating_add(prepended_blocks);

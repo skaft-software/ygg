@@ -1,19 +1,11 @@
 //! Composer surface: a clean bordered multiline input area with a stable
-//! status footer below, model-adaptive colour, truecolour gradient on the
-//! top edge, and the Ygg flowing-gradient working animation.
+//! status footer below and quiet, model-adaptive colour.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use sexy_tui_rs::{visible_width, CURSOR_MARKER};
 
-use crate::tui::terminal::ColorDepth;
 use crate::tui::view::fit_line;
-
-/// How many full gradient cycles per second. The wave uses one fixed velocity
-/// in every working phase, so a provider/tool transition cannot make it jump
-/// faster or slower.
-const ANIMATION_FREQ: f64 = 1.0;
-const ANIMATION_SPEED: f64 = 1.0;
 
 fn composer_cursor_marker(state: &super::view::ShellState) -> &'static str {
     if state.panel.is_some() {
@@ -58,125 +50,6 @@ pub fn composer_overflow_count(editor_lines: usize, visible_rows: usize) -> usiz
 }
 
 // ---------------------------------------------------------------------------
-// Colour helpers
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-fn lighten(r: u8, g: u8, b: u8, factor: f64) -> (u8, u8, u8) {
-    (
-        (r as f64 + (255.0 - r as f64) * factor).round() as u8,
-        (g as f64 + (255.0 - g as f64) * factor).round() as u8,
-        (b as f64 + (255.0 - b as f64) * factor).round() as u8,
-    )
-}
-
-#[allow(dead_code)]
-fn darken(r: u8, g: u8, b: u8, factor: f64) -> (u8, u8, u8) {
-    (
-        (r as f64 * (1.0 - factor)).round() as u8,
-        (g as f64 * (1.0 - factor)).round() as u8,
-        (b as f64 * (1.0 - factor)).round() as u8,
-    )
-}
-
-#[allow(dead_code)]
-fn build_gradient(r: u8, g: u8, b: u8, width: usize) -> Vec<(u8, u8, u8)> {
-    if width == 0 {
-        return Vec::new();
-    }
-    let mut gradient = Vec::with_capacity(width);
-    for i in 0..width {
-        let pos = (i as f64) / (width.max(1) as f64);
-        let factor = (1.0 - 2.0 * (pos - 0.5).abs()) * 0.35;
-        let (cr, cg, cb) = if factor >= 0.0 {
-            lighten(r, g, b, factor)
-        } else {
-            darken(r, g, b, -factor)
-        };
-        gradient.push((cr, cg, cb));
-    }
-    gradient
-}
-
-fn thinking_intensity(reasoning: &str, compacting: bool) -> f64 {
-    if compacting {
-        return 0.7;
-    }
-    match reasoning.trim().to_ascii_lowercase().as_str() {
-        "off" => 0.0,
-        "minimal" | "min" => 0.2,
-        "low" => 0.35,
-        "medium" | "med" => 0.5,
-        "high" => 0.7,
-        "xhigh" | "x-high" => 0.85,
-        "max" => 1.0,
-        _ => 0.7,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Animation — flowing gradient around the composer perimeter
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BorderPos {
-    TopLeft,
-    TopEdge { col: usize },
-    TopRight,
-    RightEdge { row: usize },
-    BottomRight,
-    BottomEdge { col: usize },
-    BottomLeft,
-    LeftEdge { row: usize },
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BorderCellStyle {
-    rgb: (u8, u8, u8),
-    encoding_key: u32,
-    bold: bool,
-}
-
-impl BorderCellStyle {
-    fn has_same_encoding(self, other: Self) -> bool {
-        self.encoding_key == other.encoding_key && self.bold == other.bold
-    }
-}
-
-fn get_gp(pos: BorderPos, w: usize, content_rows: usize) -> usize {
-    match pos {
-        BorderPos::TopLeft => 0,
-        BorderPos::TopEdge { col } => col,
-        BorderPos::TopRight => w.saturating_sub(1),
-        BorderPos::RightEdge { row } => w + row,
-        BorderPos::BottomRight => w + content_rows,
-        BorderPos::BottomEdge { col } => {
-            w + content_rows + (w.saturating_sub(1).saturating_sub(col))
-        }
-        BorderPos::BottomLeft => 2 * w + content_rows - 1,
-        BorderPos::LeftEdge { row } => {
-            2 * w + content_rows + (content_rows.saturating_sub(1).saturating_sub(row))
-        }
-    }
-}
-
-fn phase_speed(phase: Option<&crate::presentation::RunPhase>) -> f64 {
-    phase_speed_for(phase)
-}
-
-/// Public version so the render loop can decide whether fast-refresh is needed.
-/// Every working phase deliberately returns the same velocity. Waiting for
-/// approval, a finished run, and idle state keep the border still.
-pub fn phase_speed_for(phase: Option<&crate::presentation::RunPhase>) -> f64 {
-    match phase {
-        Some(crate::presentation::RunPhase::AwaitingApproval { .. })
-        | Some(crate::presentation::RunPhase::Finished(_))
-        | None => 0.0,
-        Some(_) => ANIMATION_SPEED,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Bordered composer box
 // ---------------------------------------------------------------------------
 
@@ -202,16 +75,16 @@ fn vert(state: &super::view::ShellState) -> &str {
 }
 
 // ---------------------------------------------------------------------------
-// Unified composer box with perimeter shimmer
+// Unified composer box
 // ---------------------------------------------------------------------------
 
 /// Render the entire bordered composer: top edge, content rows with side
-/// borders, and bottom edge.  The shimmer travels clockwise around the full
-/// perimeter.
+/// borders, and bottom edge. The outline remains byte-stable while work runs;
+/// live motion belongs to the semantic transcript entry doing the work.
 fn render_composer_box(
     state: &super::view::ShellState,
     width: u16,
-    now: Instant,
+    _now: Instant,
     content_rows: usize,
 ) -> Vec<String> {
     let w = usize::from(width);
@@ -226,13 +99,13 @@ fn render_composer_box(
         return render_plain_content(state, width);
     }
     let padding = " ".repeat(horizontal_padding);
-    let caps = theme.capabilities();
-    let color_depth = caps.color;
     let (tl, tr, bl, br) = glyphs(state);
     let h = horiz(state);
     let v = vert(state);
 
-    // ---- gradient / semantic border colours ----
+    // The outline identifies the selected/executing model without pretending
+    // to measure progress. Idle chrome stays quiet; focus and work use the
+    // captured run accent as one stable colour.
     let run_active = state.run.is_active();
     let accent = if run_active {
         theme.model_rgb(state.run_model_lab)
@@ -246,142 +119,19 @@ fn render_composer_box(
     let idle_border = theme.composer_idle_rgb(accent);
     let focused =
         state.panel.is_none() && (!state.editor.is_empty() || state.tool_input_prompt.is_some());
-
-    // ---- animation ----
     let compacting = state.run_label == "compacting";
-    let speed = if compacting {
-        ANIMATION_SPEED
+    let border_rgb = if focused || run_active || compacting {
+        accent
     } else {
-        phase_speed(state.run.current().map(|r| r.phase()))
+        idle_border
     };
-    let animation_active = caps.animation
-        && color_depth != ColorDepth::None
-        && (run_active || compacting)
-        && speed > 0.0;
-    // Use one wall-clock anchor for the whole run instead of the current phase
-    // elapsed time. Phase transitions can then update the footer without
-    // resetting the wave or changing its apparent velocity.
-    let elapsed = state
-        .shimmer_started_at
-        .map(|start| now.saturating_duration_since(start))
-        .or_else(|| state.run.current().map(|run| run.phase_elapsed_at(now)))
-        .unwrap_or(Duration::ZERO);
-    let perimeter = 2 * w + 2 * content_rows;
-
-    // Flowing-gradient phase offset: moves clockwise over time.
-    let offset: f64 = if animation_active && perimeter > 0 {
-        (elapsed.as_secs_f64() * ANIMATION_FREQ * speed).fract()
-    } else {
-        0.0
-    };
-
-    // Thinking level determines shimmer saturation/brightness.
-    let reasoning = if run_active {
-        state.run_reasoning.as_deref().unwrap_or(&state.reasoning)
-    } else {
-        &state.reasoning
-    };
-    let level_factor = thinking_intensity(reasoning, compacting);
-    let shimmer_active = animation_active && level_factor > 0.0 && perimeter > 0;
-
-    // Precompute the travelling wave for every perimeter position once per
-    // frame.  Each border cell previously called cos() and powf() individually;
-    // the LUT replaces ~250 float-CPU calls with a single indexed load.
-    let wave_lut: Vec<f64> = if shimmer_active {
-        (0..perimeter)
-            .map(|gp| {
-                let phase = ((gp as f64) / (perimeter as f64) - offset + 1.0).fract();
-                let raw = ((phase - 0.5) * 2.0 * std::f64::consts::PI).cos();
-                (raw * 0.5 + 0.5).powf(3.0)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // ---- colour helpers ----
-    let border_style = |pos: BorderPos| -> BorderCellStyle {
-        let (r, g, b) = accent;
-        let (idle_r, idle_g, idle_b) = idle_border;
-
-        let wave = if shimmer_active {
-            wave_lut[get_gp(pos, w, content_rows)]
-        } else {
-            0.0
-        };
-
-        let (cr, cg, cb) = if shimmer_active {
-            let curr_r =
-                (idle_r as f64 + (r as f64 - idle_r as f64) * level_factor * wave).round() as u8;
-            let curr_g =
-                (idle_g as f64 + (g as f64 - idle_g as f64) * level_factor * wave).round() as u8;
-            let curr_b =
-                (idle_b as f64 + (b as f64 - idle_b as f64) * level_factor * wave).round() as u8;
-            (curr_r, curr_g, curr_b)
-        } else if focused || run_active || compacting {
-            accent
-        } else {
-            (idle_r, idle_g, idle_b)
-        };
-
-        let rgb = (cr, cg, cb);
-        BorderCellStyle {
-            rgb,
-            encoding_key: theme.rgb_fg_key(rgb),
-            bold: color_depth == ColorDepth::Ansi16 && shimmer_active && wave > 0.5,
-        }
-    };
-
-    let render_border_run = |style: BorderCellStyle, text: &str| -> String {
-        let styled = theme.rgb_fg(style.rgb, text);
-        if style.bold {
-            theme.bold(&styled)
-        } else {
-            styled
-        }
-    };
-
-    let border_cell =
-        |pos: BorderPos, ch: &str| -> String { render_border_run(border_style(pos), ch) };
-
-    // Horizontal edges dominate composer bytes. Group adjacent cells by the
-    // colour sequence the terminal will actually receive (after ANSI
-    // quantization), while retaining exact per-cell shimmer geometry.
+    let border_cell = |glyph: &str| -> String { theme.rgb_fg(border_rgb, glyph) };
     let render_horizontal_border = |top: bool| -> String {
-        let mut line = String::with_capacity(w.saturating_mul(4));
-        let mut run = String::new();
-        let mut current_style: Option<BorderCellStyle> = None;
-        for col in 0..w {
-            let (pos, glyph) = if top {
-                if col == 0 {
-                    (BorderPos::TopLeft, tl)
-                } else if col + 1 == w {
-                    (BorderPos::TopRight, tr)
-                } else {
-                    (BorderPos::TopEdge { col }, h)
-                }
-            } else if col == 0 {
-                (BorderPos::BottomLeft, bl)
-            } else if col + 1 == w {
-                (BorderPos::BottomRight, br)
-            } else {
-                (BorderPos::BottomEdge { col }, h)
-            };
-            let style = border_style(pos);
-            if current_style.is_some_and(|current| current.has_same_encoding(style)) {
-                run.push_str(glyph);
-                continue;
-            }
-            if let Some(current) = current_style.replace(style) {
-                line.push_str(&render_border_run(current, &run));
-                run.clear();
-            }
-            run.push_str(glyph);
-        }
-        if let Some(current) = current_style {
-            line.push_str(&render_border_run(current, &run));
-        }
-        line
+        let (left, right) = if top { (tl, tr) } else { (bl, br) };
+        theme.rgb_fg(
+            border_rgb,
+            &format!("{left}{}{right}", h.repeat(w.saturating_sub(2))),
+        )
     };
 
     let mut lines = Vec::with_capacity(content_rows + 2);
@@ -423,8 +173,8 @@ fn render_composer_box(
 
     if editor.is_empty() {
         for i in 0..content_rows {
-            let left = border_cell(BorderPos::LeftEdge { row: i }, v);
-            let right = border_cell(BorderPos::RightEdge { row: i }, v);
+            let left = border_cell(v);
+            let right = border_cell(v);
             if i == 0 {
                 lines.push(framed_row(
                     &left,
@@ -467,16 +217,14 @@ fn render_composer_box(
                 "{ellipsis} {hidden_above} more line{} above",
                 if hidden_above == 1 { "" } else { "s" }
             );
-            let ri = rendered.len();
-            let left = border_cell(BorderPos::LeftEdge { row: ri }, v);
-            let right = border_cell(BorderPos::RightEdge { row: ri }, v);
+            let left = border_cell(v);
+            let right = border_cell(v);
             rendered.push(framed_row(&left, &theme.fg("model_accent", &msg), &right));
         }
 
         for index in start..end {
-            let ri = rendered.len();
-            let left = border_cell(BorderPos::LeftEdge { row: ri }, v);
-            let right = border_cell(BorderPos::RightEdge { row: ri }, v);
+            let left = border_cell(v);
+            let right = border_cell(v);
             let vis_line = &layout.lines[index];
             let content = if index == layout.cursor_row {
                 let cursor = editor_cursor.clamp(vis_line.start, vis_line.visible_end);
@@ -509,16 +257,14 @@ fn render_composer_box(
                 "{ellipsis} {hidden_below} more line{} below",
                 if hidden_below == 1 { "" } else { "s" }
             );
-            let ri = rendered.len();
-            let left = border_cell(BorderPos::LeftEdge { row: ri }, v);
-            let right = border_cell(BorderPos::RightEdge { row: ri }, v);
+            let left = border_cell(v);
+            let right = border_cell(v);
             rendered.push(framed_row(&left, &theme.fg("model_accent", &msg), &right));
         }
 
         while rendered.len() < content_rows {
-            let ri = rendered.len();
-            let left = border_cell(BorderPos::LeftEdge { row: ri }, v);
-            let right = border_cell(BorderPos::RightEdge { row: ri }, v);
+            let left = border_cell(v);
+            let right = border_cell(v);
             rendered.push(framed_row(&left, "", &right));
         }
 
@@ -714,9 +460,9 @@ fn identity_variants(full_model: &str, model_names: &[String], thinking: &str) -
 }
 
 fn activity_variants(_state: &super::view::ShellState, _now: Instant) -> Vec<String> {
-    // Live activity belongs in the transcript: reasoning owns the braille
-    // shimmer, and active tools own a blinking margin marker. Keeping the
-    // footer informational avoids a second competing activity surface.
+    // Live activity belongs in the transcript: reasoning and tools share one
+    // restrained margin pulse. Keeping the footer informational avoids a
+    // second competing activity surface.
     Vec::new()
 }
 
@@ -1157,7 +903,7 @@ pub fn render_composer_surface(
 
     let mut lines = Vec::with_capacity(content_rows + 4);
 
-    // Unified composer box with perimeter shimmer on all four edges
+    // Unified composer box with a stable model-adaptive outline.
     lines.append(&mut render_composer_box(state, width, now, content_rows));
 
     // Stable semantic footer/status surface.
@@ -1278,134 +1024,5 @@ mod tests {
     fn overflow_count() {
         assert_eq!(composer_overflow_count(5, 3), 2);
         assert_eq!(composer_overflow_count(3, 5), 0);
-    }
-
-    #[test]
-    fn gradient_builds_symmetric() {
-        let g = build_gradient(100, 150, 200, 5);
-        assert_eq!(g.len(), 5);
-        let mid = g[2].0 as u32 + g[2].1 as u32 + g[2].2 as u32;
-        let edge = g[0].0 as u32 + g[0].1 as u32 + g[0].2 as u32;
-        assert!(mid >= edge);
-    }
-
-    #[test]
-    fn gradient_empty() {
-        assert!(build_gradient(100, 100, 100, 0).is_empty());
-    }
-
-    #[test]
-    fn get_gp_maps_clockwise() {
-        let w = 80;
-        let cr = 3;
-        let perimeter = 2 * w + 2 * cr; // 160 + 6 = 166
-
-        // Top-left: 0
-        assert_eq!(get_gp(BorderPos::TopLeft, w, cr), 0);
-        // Top edge: col 1 to 78
-        assert_eq!(get_gp(BorderPos::TopEdge { col: 1 }, w, cr), 1);
-        assert_eq!(get_gp(BorderPos::TopEdge { col: w - 2 }, w, cr), w - 2);
-        // Top-right: 79
-        assert_eq!(get_gp(BorderPos::TopRight, w, cr), w - 1);
-
-        // Right edge: row 0 to cr-1 (top to bottom)
-        assert_eq!(get_gp(BorderPos::RightEdge { row: 0 }, w, cr), w);
-        assert_eq!(
-            get_gp(BorderPos::RightEdge { row: cr - 1 }, w, cr),
-            w + cr - 1
-        );
-
-        // Bottom-right: w + cr
-        assert_eq!(get_gp(BorderPos::BottomRight, w, cr), w + cr);
-
-        // Bottom edge: col 1 to w-2 (right to left)
-        assert_eq!(
-            get_gp(BorderPos::BottomEdge { col: w - 2 }, w, cr),
-            w + cr + 1
-        );
-        assert_eq!(
-            get_gp(BorderPos::BottomEdge { col: 1 }, w, cr),
-            w + cr + w - 2
-        );
-
-        // Bottom-left: 2 * w + cr - 1
-        assert_eq!(get_gp(BorderPos::BottomLeft, w, cr), 2 * w + cr - 1);
-
-        // Left edge: row 0 to cr-1 (bottom to top, so row cr-1 is closest to bottom-left)
-        assert_eq!(
-            get_gp(BorderPos::LeftEdge { row: cr - 1 }, w, cr),
-            2 * w + cr
-        );
-        assert_eq!(get_gp(BorderPos::LeftEdge { row: 0 }, w, cr), perimeter - 1);
-    }
-
-    #[test]
-    fn thinking_levels_scale_monotonically() {
-        let levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-        let intensities = levels
-            .iter()
-            .map(|level| thinking_intensity(level, false))
-            .collect::<Vec<_>>();
-        assert!(intensities.windows(2).all(|pair| pair[0] < pair[1]));
-        assert_eq!(intensities.first(), Some(&0.0));
-        assert_eq!(intensities.last(), Some(&1.0));
-    }
-
-    #[test]
-    fn working_shimmer_velocity_is_phase_independent() {
-        use crate::presentation::RunPhase;
-
-        let phases = [
-            RunPhase::Preparing {
-                summary: String::new(),
-            },
-            RunPhase::AwaitingProvider {
-                provider: String::new(),
-            },
-            RunPhase::Thinking,
-            RunPhase::StreamingResponse,
-            RunPhase::PreparingToolCall,
-            RunPhase::RunningTool {
-                summary: String::new(),
-            },
-        ];
-        let speeds: Vec<_> = phases
-            .iter()
-            .map(|phase| phase_speed_for(Some(phase)))
-            .collect();
-        assert!(speeds.iter().all(|speed| *speed == speeds[0]));
-        assert!(speeds[0] > 0.0);
-        assert_eq!(
-            phase_speed_for(Some(&RunPhase::AwaitingApproval {
-                prompt: String::new(),
-            })),
-            0.0
-        );
-    }
-
-    #[test]
-    fn sine_wave_brightness_is_symmetric() {
-        // Sharp cosine wave (powf 3.0): at phase 0.5 the peak is 1.0.
-        let phase = 0.5;
-        let raw = ((phase - 0.5) * 2.0 * std::f64::consts::PI).cos();
-        let peak = (raw * 0.5 + 0.5).powf(3.0);
-        assert!((peak - 1.0).abs() < 0.001);
-
-        // At phase 0.0 and 1.0 it's near 0.0.
-        let valley1_raw = ((0.0 - 0.5) * 2.0 * std::f64::consts::PI).cos();
-        let valley1 = (valley1_raw * 0.5 + 0.5).powf(3.0);
-        let valley2_raw = ((1.0 - 0.5) * 2.0 * std::f64::consts::PI).cos();
-        let valley2 = (valley2_raw * 0.5 + 0.5).powf(3.0);
-        assert!((valley1 - 0.0).abs() < 0.001);
-        assert!((valley2 - 0.0).abs() < 0.001);
-
-        // The wave is symmetric around 0.5.
-        let left_raw = ((0.3 - 0.5) * 2.0 * std::f64::consts::PI).cos();
-        let left = (left_raw * 0.5 + 0.5).powf(3.0);
-        let right_raw = ((0.7 - 0.5) * 2.0 * std::f64::consts::PI).cos();
-        let right = (right_raw * 0.5 + 0.5).powf(3.0);
-        assert!((left - right).abs() < 0.001);
-        // With powf 3 the values are smaller away from the peak.
-        assert!(left > 0.1 && left < 1.0);
     }
 }

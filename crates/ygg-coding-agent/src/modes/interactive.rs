@@ -608,8 +608,6 @@ where
     F: Future<Output = anyhow::Result<T>>,
 {
     let mut operation = Box::pin(operation);
-    let mut render_tick = tokio::time::interval(Duration::from_millis(50));
-    render_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut input_open = true;
     shell.set_run_label(label);
     shell.render();
@@ -666,7 +664,6 @@ where
                 }
                 None => input_open = false,
             },
-            _ = render_tick.tick() => shell.render(),
         }
     }
 }
@@ -2903,11 +2900,6 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     #[cfg(unix)]
                     let group_guard = ProcessGroupGuard::bash(child.id());
 
-                    // Animate a braille spinner while the process runs.
-                    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                    let mut spinner_tick = tokio::time::interval(Duration::from_millis(80));
-                    spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                    let mut frame: usize = 0;
                     let mut stdout_pipe = child.stdout.take();
                     let mut stderr_pipe = child.stderr.take();
                     let output_budget = app.config.sandbox.max_output_bytes;
@@ -3012,11 +3004,6 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                                     );
                                     shell.render();
                                 }
-                            }
-                            _ = spinner_tick.tick() => {
-                                shell.update_shell_spinner(&shell_id, SPINNER[frame]);
-                                frame = (frame + 1) % SPINNER.len();
-                                shell.render();
                             }
                         }
                     };

@@ -636,7 +636,7 @@ impl YggTheme {
 
     /// Resting composer chrome is a background-adjacent form of the model
     /// accent. Moving toward white on light profiles and black on dark ones
-    /// keeps the outline quiet before the shimmer moves toward full accent.
+    /// keeps the outline quiet until focus or active work uses full accent.
     pub(crate) fn composer_idle_rgb(&self, accent: (u8, u8, u8)) -> (u8, u8, u8) {
         let source = Rgb {
             red: accent.0,
@@ -670,28 +670,6 @@ impl YggTheme {
             },
             text,
         )
-    }
-
-    /// Stable key for the foreground sequence `rgb_fg` will actually emit.
-    /// Gradient renderers can use this to combine adjacent cells after colour
-    /// quantization instead of reopening the same SGR sequence per glyph.
-    pub(crate) fn rgb_fg_key(&self, color: (u8, u8, u8)) -> u32 {
-        let color = Rgb {
-            red: color.0,
-            green: color.1,
-            blue: color.2,
-        };
-        match self.capabilities.color {
-            ColorDepth::None => 0,
-            ColorDepth::Ansi16 => 0x0100_0000 | u32::from(nearest_ansi16_code(color)),
-            ColorDepth::Ansi256 => 0x0200_0000 | u32::from(nearest_ansi256(color)),
-            ColorDepth::TrueColor => {
-                0x0300_0000
-                    | (u32::from(color.red) << 16)
-                    | (u32::from(color.green) << 8)
-                    | u32::from(color.blue)
-            }
-        }
     }
 
     fn color_text(&self, color: Rgb, text: &str) -> String {

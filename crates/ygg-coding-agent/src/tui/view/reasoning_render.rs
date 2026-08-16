@@ -15,9 +15,9 @@ pub(super) fn collapsed_reasoning_lines(
     reasoning: &AssistantBlock,
     include_margin_marker: bool,
 ) -> Vec<String> {
-    // Finished reasoning leaves no trace in the collapsed transcript. Active
-    // reasoning occupies exactly two rows so heading updates cannot reflow the
-    // transcript around it.
+    // Finished reasoning leaves no trace in the collapsed transcript. Genuine
+    // private reasoning keeps a stable disclosure row; truthful non-expandable
+    // activity such as reasoning-off waits uses only the living status line.
     if reasoning.finished {
         Vec::new()
     } else {
@@ -31,16 +31,18 @@ pub(super) fn collapsed_reasoning_lines(
             label
         };
         let disclosure_indent = if include_margin_marker { "  " } else { "" };
-        vec![
-            label,
-            subdued_text(
+        let mut lines = vec![label];
+        if reasoning.show_reasoning_hint {
+            let separator = if theme.unicode() { "·" } else { "." };
+            lines.push(subdued_text(
                 theme,
                 &format!(
-                    "{disclosure_indent}{} (ctrl+o to expand)",
-                    theme.glyph("last_branch")
+                    "{disclosure_indent}{} ctrl+o {separator} unfold",
+                    theme.glyph("last_branch"),
                 ),
-            ),
-        ]
+            ));
+        }
+        lines
     }
 }
 
@@ -55,7 +57,8 @@ pub(super) fn render_reasoning_on_surface(
 ) -> Vec<String> {
     let marker = theme.glyph("reasoning");
     let prefix_width = visible_width(marker).saturating_add(1);
-    if !reasoning.reasoning_expanded && !show_reasoning {
+    let non_expandable_activity = reasoning.text.is_empty() && !reasoning.show_reasoning_hint;
+    if non_expandable_activity || (!reasoning.reasoning_expanded && !show_reasoning) {
         return collapsed_reasoning_lines(theme, reasoning, !use_margin_marker)
             .into_iter()
             .map(|line| {
@@ -186,7 +189,7 @@ mod tests {
         let live = render_reasoning(&reasoning, &renderer, &theme, 80, false);
         assert_eq!(live.len(), 2, "{live:?}");
         assert!(strip_terminal_sequences(&live[0]).contains("• Thinking"));
-        assert!(strip_terminal_sequences(&live[1]).contains("└ (ctrl+o to expand)"));
+        assert!(strip_terminal_sequences(&live[1]).contains("└ ctrl+o · unfold"));
         assert!(!live[0].contains("\x1b[1m"), "{live:?}");
         let accent = theme
             .model_rgb(Some(ModelLab::Alibaba))
@@ -218,8 +221,24 @@ mod tests {
         let lines = render_reasoning(&reasoning, &theme.reasoning_renderer(), &theme, 16, false);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].starts_with("* A heading"), "{lines:?}");
-        assert!(lines[1].starts_with("  `- (ctrl+o to"), "{lines:?}");
+        assert!(lines[1].starts_with("  `- ctrl+o ."), "{lines:?}");
         assert!(lines.iter().all(|line| visible_width(line) <= 16));
         assert!(lines.iter().all(|line| !line.contains('\x1b')));
+    }
+
+    #[test]
+    fn non_expandable_activity_is_one_truthful_row() {
+        let theme = theme::test_theme();
+        let mut activity = AssistantBlock::streaming_reasoning("");
+        activity.reasoning_heading = Some("Working".into());
+        activity.show_reasoning_hint = false;
+
+        let lines = render_reasoning(&activity, &theme.reasoning_renderer(), &theme, 80, false);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(strip_terminal_sequences(&lines[0]).contains("• Working"));
+
+        let verbose = render_reasoning(&activity, &theme.reasoning_renderer(), &theme, 80, true);
+        assert_eq!(verbose.len(), 1, "{verbose:?}");
+        assert!(strip_terminal_sequences(&verbose[0]).contains("• Working"));
     }
 }
