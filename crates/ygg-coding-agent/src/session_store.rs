@@ -1,14 +1,19 @@
 #![allow(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use ygg_agent::{EntryId, EntryValue, Session};
 use ygg_ai::{EndpointId, Message, ModelId, Protocol, UserPart};
+
+use crate::session_catalog::{
+    CachedTranscriptSummary, CatalogFingerprint, CatalogUpdate, SessionCatalog,
+};
 
 static NEXT_SESSION_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
@@ -126,6 +131,25 @@ pub const SESSION_TRASH_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
 struct SessionCandidate {
     path: PathBuf,
     modified: SystemTime,
+    file_size: u64,
+}
+
+fn catalog_fingerprint(candidate: &SessionCandidate) -> Option<CatalogFingerprint> {
+    if candidate.file_size > MAX_SESSION_FILE_BYTES as u64 {
+        return None;
+    }
+    let modified_ns = i64::try_from(
+        candidate
+            .modified
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+    )
+    .ok()?;
+    Some(CatalogFingerprint {
+        file_size: candidate.file_size,
+        modified_ns,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,6 +632,35 @@ enum SummaryRecord {
 }
 
 /// Derive the oldest user title on the active branch, if one exists.
+fn active_branch_catalog_config(session: &Session) -> (Option<String>, Option<String>) {
+    let mut model = None;
+    let mut reasoning = None;
+    let mut cursor = session.head_ref();
+    while let Some(id) = cursor {
+        let Some(entry) = session.entry(id) else {
+            break;
+        };
+        if let EntryValue::Config {
+            model: configured_model,
+            reasoning: configured_reasoning,
+            ..
+        } = &entry.value
+        {
+            if model.is_none() {
+                model = configured_model.clone();
+            }
+            if reasoning.is_none() {
+                reasoning = configured_reasoning.clone();
+            }
+            if model.is_some() && reasoning.is_some() {
+                break;
+            }
+        }
+        cursor = entry.parent.as_ref();
+    }
+    (model, reasoning)
+}
+
 fn active_branch_catalog_title(session: &Session) -> Option<String> {
     let mut oldest: Option<&str> = None;
     let mut cursor = session.head_ref();
@@ -766,27 +819,6 @@ fn corrupt_summary(line: usize, message: impl std::fmt::Display) -> anyhow::Erro
     anyhow::anyhow!("corrupt session record at line {line}: {message}")
 }
 
-fn summary_text_with_torn_tail(bytes: &[u8]) -> anyhow::Result<&str> {
-    let completed_end = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |position| position + 1);
-    if let Err(error) = std::str::from_utf8(&bytes[..completed_end]) {
-        let line = bytes[..error.valid_up_to()]
-            .iter()
-            .filter(|byte| **byte == b'\n')
-            .count()
-            + 1;
-        return Err(corrupt_summary(line, format!("invalid UTF-8: {error}")));
-    }
-
-    match std::str::from_utf8(bytes) {
-        Ok(content) => Ok(content),
-        Err(_) => Ok(std::str::from_utf8(&bytes[..completed_end])
-            .expect("the completed summary prefix was validated above")),
-    }
-}
-
 /// Result of a bounded transcript scan before filesystem catalog metadata is applied.
 #[derive(Debug)]
 struct TranscriptSummary {
@@ -814,28 +846,60 @@ fn summarize_session_with_usage(
     retain_usage_records: bool,
 ) -> anyhow::Result<TranscriptSummary> {
     let path = absolute_read_path(path)?;
-    let bytes = ygg_agent::secure_fs::read_regular_file_bounded(&path, MAX_SESSION_FILE_BYTES)?;
-    let content = summary_text_with_torn_tail(&bytes)?;
+    let file = ygg_agent::secure_fs::open_regular_file_for_read(&path)?;
+    let file_len = file.metadata()?.len();
+    if file_len > MAX_SESSION_FILE_BYTES as u64 {
+        anyhow::bail!("session is {file_len} bytes (limit {MAX_SESSION_FILE_BYTES})");
+    }
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
     let mut entries = HashMap::<EntryId, SummaryEntry>::new();
     let mut head = None;
     let mut checkpoints = Vec::<(EntryId, EntryId, usize)>::new();
     let mut usage_records = Vec::<SessionUsageRecord>::new();
-    let mut segments = content.split_inclusive('\n').peekable();
+    let mut line_bytes = Vec::new();
+    let mut observed_bytes = 0usize;
     let mut line_no = 0usize;
 
-    while let Some(segment) = segments.next() {
+    loop {
+        line_bytes.clear();
+        let read_limit = MAX_SESSION_FILE_BYTES
+            .saturating_sub(observed_bytes)
+            .saturating_add(1);
+        let bytes_read = reader
+            .by_ref()
+            .take(u64::try_from(read_limit).expect("session byte limit fits u64"))
+            .read_until(b'\n', &mut line_bytes)?;
+        if bytes_read == 0 {
+            break;
+        }
+        observed_bytes = observed_bytes
+            .checked_add(bytes_read)
+            .ok_or_else(|| anyhow::anyhow!("session read length overflow"))?;
+        if observed_bytes > MAX_SESSION_FILE_BYTES {
+            anyhow::bail!(
+                "session exceeds the {MAX_SESSION_FILE_BYTES}-byte limit while being read"
+            );
+        }
         line_no += 1;
         if line_no > MAX_SESSION_RECORDS {
             anyhow::bail!("session has more than {MAX_SESSION_RECORDS} records");
         }
-        let is_last = segments.peek().is_none();
-        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let has_newline = line_bytes.last() == Some(&b'\n');
+        let line_bytes = if has_newline {
+            &line_bytes[..line_bytes.len() - 1]
+        } else {
+            line_bytes.as_slice()
+        };
+        let line = match std::str::from_utf8(line_bytes) {
+            Ok(line) => line,
+            Err(_) if !has_newline => break,
+            Err(error) => return Err(corrupt_summary(line_no, format!("invalid UTF-8: {error}"))),
+        };
         let record: SummaryRecord = match serde_json::from_str(line) {
             Ok(record) => record,
-            // An interrupted append cannot have written its terminating
-            // newline before the preceding JSON bytes. Only an unterminated
-            // final segment is therefore eligible for torn-tail recovery.
-            Err(_) if is_last && !segment.ends_with('\n') => break,
+            // `read_until` returns a non-newline-terminated segment only at
+            // EOF, so malformed bytes are recoverable only at that boundary.
+            Err(_) if !has_newline => break,
             Err(error) => return Err(corrupt_summary(line_no, error)),
         };
 
@@ -1108,8 +1172,13 @@ impl SessionStore {
                 if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                     return None;
                 }
-                let modified = entry.metadata().ok()?.modified().ok()?;
-                Some(SessionCandidate { path, modified })
+                let metadata = entry.metadata().ok()?;
+                let modified = metadata.modified().ok()?;
+                Some(SessionCandidate {
+                    path,
+                    modified,
+                    file_size: metadata.len(),
+                })
             })
             .collect::<Vec<_>>();
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.modified));
@@ -1158,6 +1227,7 @@ impl SessionStore {
         Ok(SessionCandidate {
             path,
             modified: metadata.modified()?,
+            file_size: metadata.len(),
         })
     }
 
@@ -1245,9 +1315,56 @@ impl SessionStore {
     /// workspace catalog.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub(crate) fn catalog_by_id(&self, id: &str) -> anyhow::Result<SessionCatalogEntry> {
-        Ok(self
-            .inspect_candidate(self.candidate_by_id(id)?, false)?
-            .catalog)
+        let candidate = self.candidate_by_id(id)?;
+        let fingerprint = catalog_fingerprint(&candidate);
+        let (mut catalog, cached) = SessionCatalog::open_loaded(&self.dir)?;
+        if let Some(summary) = fingerprint.and_then(|fingerprint| {
+            cached
+                .get(id)
+                .filter(|cached| cached.fingerprint == fingerprint)
+                .map(|cached| cached.summary.clone())
+        }) {
+            let CachedTranscriptSummary::Summary {
+                title,
+                configured_model,
+                configured_reasoning,
+            } = summary
+            else {
+                anyhow::bail!("session {id:?} is unreadable");
+            };
+            let metadata = title
+                .as_ref()
+                .map(|_| self.load_metadata(id))
+                .transpose()?
+                .unwrap_or_default();
+            return Ok(SessionCatalogEntry {
+                meta: title
+                    .map(|title| self.meta_from_parts(candidate, id.to_owned(), title, metadata)),
+                configured_model,
+                configured_reasoning,
+            });
+        }
+        let inspection = self.inspect_candidate(candidate, false)?;
+        if let Some(fingerprint) = fingerprint {
+            let summary = CachedTranscriptSummary::Summary {
+                title: inspection
+                    .catalog
+                    .meta
+                    .as_ref()
+                    .map(|meta| meta.title.clone()),
+                configured_model: inspection.catalog.configured_model.clone(),
+                configured_reasoning: inspection.catalog.configured_reasoning.clone(),
+            };
+            catalog.apply(
+                &[CatalogUpdate {
+                    id: id.to_owned(),
+                    fingerprint,
+                    summary,
+                }],
+                &HashSet::new(),
+            )?;
+        }
+        Ok(inspection.catalog)
     }
 
     /// Build catalog metadata from the already authorized, fully replayed
@@ -1273,6 +1390,46 @@ impl SessionStore {
         )))
     }
 
+    /// Refresh the disposable title projection from an already replayed session.
+    /// This keeps a normally closed session warm without reopening its JSONL.
+    pub(crate) fn refresh_catalog_for_open_session(&self, session: &Session) -> anyhow::Result<()> {
+        let id = session
+            .path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow::anyhow!("opened session path has no UTF-8 filename stem"))?;
+        let candidate = self.candidate_by_id(id)?;
+        if absolute_read_path(session.path())? != absolute_read_path(&candidate.path)? {
+            anyhow::bail!("opened session does not belong to this workspace store");
+        }
+        let fingerprint = catalog_fingerprint(&candidate)
+            .ok_or_else(|| anyhow::anyhow!("session fingerprint is outside catalog bounds"))?;
+        let (configured_model, configured_reasoning) = active_branch_catalog_config(session);
+        let update = CatalogUpdate {
+            id: id.to_owned(),
+            fingerprint,
+            summary: CachedTranscriptSummary::Summary {
+                title: active_branch_catalog_title(session),
+                configured_model,
+                configured_reasoning,
+            },
+        };
+        let (mut catalog, _) = SessionCatalog::open_loaded(&self.dir)?;
+        catalog.apply(&[update], &HashSet::new())
+    }
+
+    /// Remove one disposable row after its authoritative transcript is removed.
+    pub(crate) fn remove_catalog_entry(&self, id: &str) -> anyhow::Result<()> {
+        if !session_id_is_valid(id) {
+            anyhow::bail!("invalid session id {id:?}");
+        }
+        if !SessionCatalog::exists(&self.dir) {
+            return Ok(());
+        }
+        let (mut catalog, _) = SessionCatalog::open_loaded(&self.dir)?;
+        catalog.apply(&[], &HashSet::from([id.to_owned()]))
+    }
+
     /// Load one session's validated catalog metadata without scanning unrelated
     /// transcripts.
     #[cfg(test)]
@@ -1280,46 +1437,120 @@ impl SessionStore {
         Ok(self.catalog_by_id(id)?.meta)
     }
 
-    fn summarize(&self, candidate: SessionCandidate) -> Option<SessionMeta> {
-        let id = candidate
-            .path
-            .file_stem()
-            .and_then(|value| value.to_str())?
-            .to_owned();
-        let transcript = match summarize_catalog_session(&candidate.path) {
-            Ok(transcript) => transcript,
-            Err(_) => {
-                let metadata = self.load_metadata(&id).unwrap_or_default();
-                return Some(self.meta_from_parts(
-                    candidate,
-                    id,
-                    "(unreadable session)".to_owned(),
-                    metadata,
-                ));
-            }
+    fn meta_from_cached_summary(
+        &self,
+        candidate: SessionCandidate,
+        id: String,
+        summary: CachedTranscriptSummary,
+    ) -> Option<SessionMeta> {
+        let fallback_title = match summary {
+            CachedTranscriptSummary::Summary { title, .. } => title?,
+            CachedTranscriptSummary::Unreadable => "(unreadable session)".to_owned(),
         };
-        let title = transcript.title?;
-        Some(self.meta_from_parts(
-            candidate,
-            id.clone(),
-            title,
-            self.load_metadata(&id).unwrap_or_default(),
-        ))
+        let metadata = self.load_metadata(&id).unwrap_or_default();
+        Some(self.meta_from_parts(candidate, id, fallback_title, metadata))
+    }
+
+    fn discover_with_summarizer<F>(
+        &self,
+        candidates: Vec<SessionCandidate>,
+        first_only: bool,
+        summarizer: F,
+    ) -> Vec<SessionMeta>
+    where
+        F: Fn(&Path) -> anyhow::Result<TranscriptSummary>,
+    {
+        let current_ids = candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        let (catalog, cached) = match SessionCatalog::open_loaded(&self.dir) {
+            Ok((catalog, cached)) => (Some(catalog), cached),
+            Err(_) => (None, HashMap::new()),
+        };
+        let stale_ids = cached
+            .keys()
+            .filter(|id| !current_ids.contains(*id))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut updates = Vec::new();
+        let mut discovered = Vec::new();
+
+        for candidate in candidates {
+            let Some(id) = candidate
+                .path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let fingerprint = catalog_fingerprint(&candidate);
+            let summary = fingerprint
+                .and_then(|fingerprint| {
+                    cached
+                        .get(&id)
+                        .filter(|cached| cached.fingerprint == fingerprint)
+                })
+                .map(|cached| cached.summary.clone())
+                .unwrap_or_else(|| match summarizer(&candidate.path) {
+                    Ok(transcript) => {
+                        let summary = CachedTranscriptSummary::Summary {
+                            title: transcript.title,
+                            configured_model: transcript.configured_model,
+                            configured_reasoning: transcript.configured_reasoning,
+                        };
+                        if let Some(fingerprint) = fingerprint.filter(|_| catalog.is_some()) {
+                            updates.push(CatalogUpdate {
+                                id: id.clone(),
+                                fingerprint,
+                                summary: summary.clone(),
+                            });
+                        }
+                        summary
+                    }
+                    // I/O failures can be transient, so unreadable projections
+                    // are shown but deliberately not retained in the catalog.
+                    Err(_) => CachedTranscriptSummary::Unreadable,
+                });
+            if let Some(meta) = self.meta_from_cached_summary(candidate, id, summary) {
+                discovered.push(meta);
+                if first_only {
+                    break;
+                }
+            }
+        }
+
+        if let Some(mut catalog) = catalog {
+            let _ = catalog.apply(&updates, &stale_ids);
+        }
+        discovered
     }
 
     /// List sessions newest-first by filesystem modification time.
     pub fn list(&self) -> Vec<SessionMeta> {
-        self.candidates()
-            .into_iter()
-            .filter_map(|candidate| self.summarize(candidate))
-            .collect()
+        let candidates = self.candidates();
+        if candidates.is_empty() && !SessionCatalog::exists(&self.dir) {
+            return Vec::new();
+        }
+        self.discover_with_summarizer(candidates, false, summarize_catalog_session)
     }
 
     /// Return the newest session or an actionable error when none exists.
     pub fn latest(&self) -> anyhow::Result<SessionMeta> {
-        self.candidates()
+        let candidates = self.candidates();
+        if candidates.is_empty() && !SessionCatalog::exists(&self.dir) {
+            anyhow::bail!("no sessions for this workspace yet");
+        }
+        self.discover_with_summarizer(candidates, true, summarize_catalog_session)
             .into_iter()
-            .find_map(|candidate| self.summarize(candidate))
+            .next()
             .ok_or_else(|| anyhow::anyhow!("no sessions for this workspace yet"))
     }
 
@@ -1622,6 +1853,7 @@ impl SessionStore {
         remove_staged_deletion_files(&metadata_dir, id)?;
         std::fs::File::open(&self.dir)?.sync_all()?;
         std::fs::File::open(metadata_dir)?.sync_all()?;
+        let _ = self.remove_catalog_entry(id);
         Ok(())
     }
 
@@ -1641,6 +1873,7 @@ impl SessionStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        let _ = self.remove_catalog_entry(id);
         Ok(())
     }
 }
@@ -1967,6 +2200,243 @@ mod tests {
         let latest = store.latest().unwrap();
         assert_eq!(latest.path, older_path);
         assert_eq!(latest.title, "resumable");
+    }
+
+    #[test]
+    fn warm_catalog_avoids_transcript_scans_and_keeps_metadata_live() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("warm.jsonl");
+        let mut session = Session::create(path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("warm title".into())],
+            })))
+            .unwrap();
+        drop(session);
+
+        let scans = std::cell::Cell::new(0);
+        let first = store.discover_with_summarizer(store.candidates(), false, |path| {
+            scans.set(scans.get() + 1);
+            summarize_catalog_session(path)
+        });
+        assert_eq!(scans.get(), 1);
+        assert_eq!(first[0].title, "warm title");
+        assert!(SessionCatalog::path(store.dir()).is_file());
+
+        scans.set(0);
+        let second = store.discover_with_summarizer(store.candidates(), false, |path| {
+            scans.set(scans.get() + 1);
+            summarize_catalog_session(path)
+        });
+        assert_eq!(scans.get(), 0);
+        assert_eq!(second[0].title, "warm title");
+
+        store.rename("warm", "Renamed without replay").unwrap();
+        let renamed = store.discover_with_summarizer(store.candidates(), false, |path| {
+            scans.set(scans.get() + 1);
+            summarize_catalog_session(path)
+        });
+        assert_eq!(scans.get(), 0);
+        assert_eq!(renamed[0].title, "Renamed without replay");
+    }
+
+    #[test]
+    fn catalog_fingerprint_rescans_only_changed_transcripts() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("changed.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("old".into())],
+            })))
+            .unwrap();
+        drop(session);
+        assert_eq!(store.list()[0].title, "old");
+
+        let replacement_path = store.dir().join("replacement.tmp");
+        let mut replacement = Session::create(&replacement_path).unwrap();
+        replacement
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("a distinct replacement title".into())],
+            })))
+            .unwrap();
+        drop(replacement);
+        std::fs::copy(&replacement_path, &path).unwrap();
+        std::fs::remove_file(replacement_path).unwrap();
+
+        let scans = std::cell::Cell::new(0);
+        let changed = store.discover_with_summarizer(store.candidates(), false, |path| {
+            scans.set(scans.get() + 1);
+            summarize_catalog_session(path)
+        });
+        assert_eq!(scans.get(), 1);
+        assert_eq!(changed[0].title, "a distinct replacement title");
+
+        scans.set(0);
+        let warm = store.discover_with_summarizer(store.candidates(), false, |path| {
+            scans.set(scans.get() + 1);
+            summarize_catalog_session(path)
+        });
+        assert_eq!(scans.get(), 0);
+        assert_eq!(warm[0].title, "a distinct replacement title");
+    }
+
+    #[test]
+    fn open_session_refresh_keeps_mutated_transcripts_warm() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("active.jsonl");
+        let mut session = Session::create(path).unwrap();
+        let branch_root = session
+            .append(EntryValue::Message(Message::Assistant(
+                ygg_ai::AssistantMessage {
+                    content: Vec::new(),
+                    model: ModelId("model".into()),
+                    protocol: Protocol::OpenAiChat,
+                },
+            )))
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("first branch".into())],
+            })))
+            .unwrap();
+        assert_eq!(store.list()[0].title, "first branch");
+
+        session.checkout(branch_root).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("second branch".into())],
+            })))
+            .unwrap();
+        store.refresh_catalog_for_open_session(&session).unwrap();
+        drop(session);
+
+        let scans = std::cell::Cell::new(0);
+        let listed = store.discover_with_summarizer(store.candidates(), false, |path| {
+            scans.set(scans.get() + 1);
+            summarize_catalog_session(path)
+        });
+        assert_eq!(scans.get(), 0);
+        assert_eq!(listed[0].title, "second branch");
+    }
+
+    #[test]
+    fn corrupt_catalog_falls_back_without_touching_transcripts() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("authoritative.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("authoritative".into())],
+            })))
+            .unwrap();
+        drop(session);
+        let authoritative_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(store.list().len(), 1);
+        std::fs::write(SessionCatalog::path(store.dir()), b"not a sqlite database").unwrap();
+
+        let scans = std::cell::Cell::new(0);
+        let listed = store.discover_with_summarizer(store.candidates(), false, |path| {
+            scans.set(scans.get() + 1);
+            summarize_catalog_session(path)
+        });
+        assert_eq!(scans.get(), 1);
+        assert_eq!(listed[0].title, "authoritative");
+        assert_eq!(std::fs::read(&path).unwrap(), authoritative_bytes);
+
+        scans.set(0);
+        let rebuilt = store.discover_with_summarizer(store.candidates(), false, |path| {
+            scans.set(scans.get() + 1);
+            summarize_catalog_session(path)
+        });
+        assert_eq!(scans.get(), 0);
+        assert_eq!(rebuilt[0].title, "authoritative");
+        assert_eq!(std::fs::read(path).unwrap(), authoritative_bytes);
+    }
+
+    #[test]
+    fn catalog_removes_rows_for_missing_transcripts() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("removed.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("remove me".into())],
+            })))
+            .unwrap();
+        drop(session);
+        assert_eq!(store.list().len(), 1);
+        assert!(SessionCatalog::open(store.dir())
+            .unwrap()
+            .load()
+            .unwrap()
+            .contains_key("removed"));
+
+        std::fs::remove_file(path).unwrap();
+        assert!(store.list().is_empty());
+        assert!(!SessionCatalog::open(store.dir())
+            .unwrap()
+            .load()
+            .unwrap()
+            .contains_key("removed"));
+    }
+
+    #[test]
+    fn newer_catalog_schema_falls_back_without_downgrading() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path());
+        std::fs::create_dir_all(store.dir()).unwrap();
+        let path = store.dir().join("future.jsonl");
+        let mut session = Session::create(path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("future compatible".into())],
+            })))
+            .unwrap();
+        drop(session);
+        assert_eq!(store.list().len(), 1);
+        let catalog_path = SessionCatalog::path(store.dir());
+        let connection = rusqlite::Connection::open(&catalog_path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        connection.pragma_update(None, "user_version", 99).unwrap();
+        drop(connection);
+        let future_catalog_bytes = std::fs::read(&catalog_path).unwrap();
+
+        let scans = std::cell::Cell::new(0);
+        let listed = store.discover_with_summarizer(store.candidates(), false, |path| {
+            scans.set(scans.get() + 1);
+            summarize_catalog_session(path)
+        });
+        assert_eq!(scans.get(), 1);
+        assert_eq!(listed[0].title, "future compatible");
+        assert_eq!(std::fs::read(&catalog_path).unwrap(), future_catalog_bytes);
+        let connection = rusqlite::Connection::open(catalog_path).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 99);
+        let journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete");
     }
 
     #[test]
@@ -2549,8 +3019,13 @@ mod tests {
         );
         assert_eq!(inspection.usage_records[0].total_tokens, 31);
 
+        // Populate the catalog before the targeted Serve lookup. The lookup must
+        // retain the persisted configuration without reopening the transcript.
+        store.list();
         let catalog = store.catalog_by_id("target").unwrap();
         assert_eq!(catalog.meta.unwrap().title, "target title");
+        assert_eq!(catalog.configured_model.as_deref(), Some("target-config"));
+        assert_eq!(catalog.configured_reasoning.as_deref(), Some("high"));
         assert!(store.catalog_by_id("corrupt").is_err());
         assert!(store.get_by_id("corrupt").is_err());
     }

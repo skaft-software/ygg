@@ -718,6 +718,7 @@ fn delete(store: &SessionStore, id: &str) -> anyhow::Result<()> {
             );
         }
     }
+    let _ = store.remove_catalog_entry(id);
     crate::output::stdout_line(format!(
         "Moved session {id} to {} (recoverable by moving it back).",
         destination.display()
@@ -746,12 +747,14 @@ fn repair(store: &SessionStore, id: &str) -> anyhow::Result<()> {
     let stamp = unix_seconds(SystemTime::now());
     let backup = backup_dir.join(format!("{id}-{stamp}.jsonl"));
     crate::auth::write_private_atomic(&backup, &before, ".session-repair-")?;
-    drop(Session::open(&path).map_err(|error| {
+    let repaired = Session::open(&path).map_err(|error| {
         anyhow::anyhow!(
             "repair validation failed; the source was not changed and backup is at {}: {error}",
             backup.display()
         )
-    })?);
+    })?;
+    let _ = store.refresh_catalog_for_open_session(&repaired);
+    drop(repaired);
     let after = path.metadata()?.len();
     crate::output::stdout_line(format!(
         "Repaired session {id}: {} -> {} bytes. Backup: {}",

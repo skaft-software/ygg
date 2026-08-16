@@ -69,6 +69,7 @@ ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking", "stream"] }
 base64 = "0.22"
 regex = "1"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 semver = "1"
 async-trait = "0.1"
 tempfile = "3"

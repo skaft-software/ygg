@@ -20,6 +20,7 @@ mod prompts;
 mod providers;
 mod resource_resolver;
 mod resources;
+mod session_catalog;
 mod session_commands;
 mod session_store;
 mod session_tree;
