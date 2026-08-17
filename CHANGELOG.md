@@ -2,6 +2,58 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## Unreleased
+
+### Added
+
+- Added executable-extension API `0.2` with exact feature negotiation,
+  host-capped concurrency, one serialized writer, cooperative cancellation with
+  bounded tombstones/escalation, request-scoped progress, and correlated child
+  requests, including ephemeral text/secret input that is never logged or
+  persisted.
+- Added typed text/image/audio tool-result parts, declared output schemas,
+  validated structured content and retained metadata, plus generation-scoped
+  artifact publication from bounded inline data or a verified scratch path.
+- Added best-effort session, turn, and tool lifecycle observations; host-owned
+  policy-intent classification (currently default-deny without a domain
+  adapter); optional original-intent-bound single-use approval redemption;
+  manifest-allowlisted, owner-scoped secret brokerage; host-derived
+  session/process ownership; inspectable process health; and deadline-bounded
+  drain/reload.
+- Added transactional `tools/register` and `tools/unregister`, per-process
+  catalog epochs, provider-turn schema/implementation snapshots, and stable
+  owner ordering so long-lived extensions can publish changing tool catalogs
+  without rebuilding the agent.
+- Added optional extension-to-host child-agent sessions with scoped spawn,
+  message, follow-up, list, wait, and interrupt operations. Ownership is derived
+  from the parent request rather than trusted child JSON.
+- Added automatic supervision after a successful extension handshake: crashes
+  withdraw live tools, restart with bounded jittered exponential backoff, and
+  remain fenced from explicit shutdown and stale generations.
+- Added dependency-free Python SDK `0.2` support for negotiation, concurrent
+  dispatch, cancellation tokens, progress, artifacts, lifecycle handlers,
+  policy/approval requests, secret lookup, live tool catalogs, child-agent
+  sessions, and graceful drain while retaining API `0.1` wire support.
+- Migrated the Caffeinate example to a supervised API `0.2` lifecycle
+  extension that reference-counts active turns. Sleep inhibition is no longer
+  native agent-kernel behavior.
+
+### Changed
+
+- Froze executable-extension API `0.1` as a backward-compatible,
+  text-oriented contract. Its optional tool metadata remains accepted but is
+  discarded, and its `after_response` hook remains completion-only.
+- Superseded the earlier host-owned capability design with a tiny agent kernel:
+  JSON-RPC subprocess extensions own MCP, browser, web-search, computer-use,
+  memory, LSP, subagent-orchestration, and caffeinate domain behavior.
+
+The `0.2` foundation does not yet ship first-party MCP, browser, web-search,
+computer-use, memory, LSP, or subagent-orchestration packages. Supervision
+begins only after a successful initial handshake and does not yet detect a hung
+but still-open child; a full application rebuild still recreates extension
+processes. The coding product does not yet configure an approval UI adapter or
+secret provider. OS-level CPU/RSS/FD/PID quotas also remain future kernel work.
+
 ## 0.4.0 — 2026-08-10
 
 ### Added
@@ -70,6 +122,19 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Fixed
 
+- Made delegated mailbox delivery transactional: bounded UTF-8 pages remain
+  leased until an untruncated tool result is durably appended, and failed or
+  truncated persistence restores the page.
+- Preserved accepted steering, queued prompt messages, and follow-ups across
+  interruption, backpressure, and failed runs, retaining queue reservations until
+  durable prompt delivery; rejected oversize or overflowing durable tasks and
+  messages instead of truncating, evicting, or silently releasing them.
+- Rejected stale, future-dated, malformed, incomplete, and inconsistent Codex
+  cache metadata before capability activation, stripped dynamic capabilities
+  offline, and applied legacy-Pro migration precedence consistently at rebuilds.
+- Propagated the effective current root prompt to newly spawned children and
+  securely rolled failed delegation activation back to its exact empty private
+  team directory.
 - Made `/overview` bootstrap from session inventory without creating or opening
   a provisional task, including anchorless reconnect refresh and cancellation of
   stale session-selection navigation.

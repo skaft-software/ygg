@@ -1,6 +1,7 @@
 # Executable Extensions Spike: Daily-Driver Capabilities
 
-> **Status:** research spike and architectural recommendation
+> **Status:** research evidence retained; architecture superseded by the
+> tiny-kernel decision below
 > **Observed:** 2026-08-16
 > **Ygg target:** workspace version `0.4.0`, repository rooted at
 > `84c2fb8b654b107e869ed9b8add29b3a50043e60`
@@ -9,46 +10,81 @@
 
 ## Executive decision
 
-Ygg should keep its language-neutral JSON-RPC subprocess boundary, but API
-`0.1` is not yet a safe foundation for stateful daily-driver features. Before
-shipping advanced executable extensions, Ygg needs end-to-end cancellation,
-correlated progress, structured/media results, complete terminal lifecycle
-outcomes, host-owned policy decisions, and explicit drain/restart semantics.
+This section supersedes the original accepted recommendation in this spike.
+The cross-product evidence remains useful, but the former proposal for
+host-owned WebSearch, Browser, MCP, LSP, memory, delegation, and caffeinate
+managers is no longer Ygg's architecture.
 
 The central architectural conclusion is:
 
-> **Installability is not runtime ownership.** A feature may be distributed by
-> an extension package while Ygg still owns the lifecycle, policy, persistence,
-> and model-facing tool.
-
-Use three integration shapes rather than forcing every feature into an ordinary
-`tool/call`:
-
-1. **Ordinary executable tools** for bounded request/response work.
-2. **Typed provider adapters** for replaceable web, browser, or memory
-   backends, supervised by a host manager.
-3. **Direct standard-protocol managers** for MCP and LSP, where wrapping one
-   subprocess protocol inside another would lose lifecycle and security
-   semantics.
+> **Ygg is a tiny agent kernel. Everything interesting is a subprocess
+> extension speaking JSON-RPC.**
 
 Recommended ownership:
 
-| Capability | Ygg host/core owns | Extension/package seam |
-| --- | --- | --- |
-| WebSearch | model-facing tool, result IDs, citations, cache, URL/network policy, truncation | search/fetch provider adapter |
-| BrowserUse | sessions/tabs, action policy, confirmations, artifacts, cancellation, cleanup | trusted Playwright/CDP or cloud-browser adapter |
-| Caffeinate | turn/task leases and platform inhibitor | none; platform backend is a core implementation detail |
-| Subagents | agent tree, context, budgets, permissions, messaging, persistence, cancellation, workspaces | declarative roles/prompts/tool profiles |
-| MCP | transports, OAuth/secrets, catalogs, approvals, reconnect, cancellation, progress | server configuration/discovery and optional auth helpers |
-| LSP | server processes, document versions, requests, diagnostics, cancellation, cleanup | declarative server descriptors/install guidance |
-| Memory | scopes, provenance, prompt injection, frozen snapshots, retention, writes, consolidation triggers | storage/retrieval/consolidation provider adapter |
+| Ygg host/kernel owns | Subprocess extensions own |
+| --- | --- |
+| model conversations and bounded child model sessions | MCP bridging and MCP server lifecycle |
+| JSON-RPC transport and process supervision/cleanup | web search and result/citation behavior |
+| session, tool-call, and tool-result persistence | browser tabs, contexts, and interaction semantics |
+| user permission and approval enforcement | computer-use observation and actions |
+| generic secrets and artifact brokers | memory retrieval, consolidation, and storage policy |
+| memory/message/concurrency/process limits | LSP clients, documents, and diagnostics |
+| stable session/process resource ownership | subagent orchestration over host-created sessions |
+| | caffeinate/sleep-inhibition behavior |
 
-WebSearch is the best first executable-provider vertical slice: it exercises
-network policy, structured results, progress, cancellation, citations, and
-caching without BrowserUse's long-lived mutable state. Caffeinate should move
-into core immediately as the first consumer of a true terminal turn lifecycle.
-Subagent work can proceed in parallel in core; it should not wait for extension
-API `0.2`.
+The host may expose generic services—child model sessions, secrets, artifacts,
+and approvals—because extensions cannot bootstrap or enforce those services
+themselves. A generic service is not a domain manager. `ygg-mcp`, for example,
+is one long-lived Rust extension that speaks JSON-RPC to Ygg, speaks MCP to its
+servers, and publishes live tools with `tools/register` and
+`tools/unregister`.
+
+Web search, browser use, computer use, hosted agents, and in-harness subagents
+remain separate capabilities. Search is retrieval; browser use owns web-page
+state; computer use controls the OS UI; hosted agents are remote provider
+services; in-harness subagents are bounded child Ygg model sessions requested
+through a host service.
+
+### Implementation status (2026-08-16)
+
+The current checkout implements the API `0.2` transport foundation:
+
+- exact dual-version initialization, required `request_cancellation` and
+  `content_parts`, optional `request_progress`, `artifacts`,
+  `lifecycle_events`, `policy_intents`, and `dynamic_tools`, conditionally
+  offered `agent_sessions`, `approvals`, and `secrets`, plus host-capped
+  concurrency;
+- a bounded serialized writer, cooperative cancellation, late-response
+  tombstones, parent-correlated confirmation/input/artifact/policy/secret
+  requests, ephemeral secret input, and request-scoped progress;
+- typed text/image/audio results, output schemas, validated structured content,
+  retained metadata, and owner-and-generation-scoped verified artifact
+  publication and resolution;
+- best-effort session/turn/tool lifecycle notifications backed by one shared
+  terminal outcome boundary across every product frontend;
+- structured policy intents, an optional original-intent/active-owner-bound
+  single-use approval retry, and an optional manifest-allowlisted,
+  owner-scoped secret broker. The coding product leaves approvals off,
+  configures no secret broker, and defaults generic actions to `deny`;
+- transactional post-initialize tool registration/removal, per-process catalog
+  epochs, and schema/implementation snapshots frozen at model-request
+  boundaries;
+- host-derived resource owners combining durable session identity with
+  process-host-instance and process-generation fences; and
+- inspectable health, explicit drain, candidate-first atomic reload, and
+  automatic post-initialization restart/backoff supervision.
+
+Automatic supervision is implemented after one successful initialization; it
+has no independent heartbeat, does not retry initial launch/handshake failure,
+and its in-memory retry state resets with a full product rebuild.
+Extension-to-host agent-session services remain working-tree functionality
+until their product gates pass. Optional artifact, policy, approval, and secret
+host services are implemented at the kernel boundary; the latter two remain
+disabled/unconfigured in the coding product. The sleep-inhibitor migration is
+complete: no core inhibitor remains, and the example is a supervised API `0.2`,
+version `0.2.0` extension. Protocol/queue/artifact/process-tree bounds are
+implemented; OS CPU/RSS/FD/PID quotas remain kernel work.
 
 ## Scope and evidence standard
 
@@ -105,26 +141,27 @@ The relevant implementation is primarily
 `crates/ygg-agent/src/extension_process.rs`, `crates/ygg-agent/src/tool.rs`, and
 `crates/ygg-coding-agent/src/extensions.rs`.
 
-### Gaps that block daily-driver extensions
+### API `0.1` limits that motivated `0.2`
 
 | Gap | Observed API `0.1` behavior | Consequence |
 | --- | --- | --- |
-| Operation cancellation | `ProcessTool::execute` does not select on `ToolContext.cancellation`; `ProcessConnection::request_inner` has no request-cancel message | Aborting a turn drops the waiter but does not tell the extension to stop work or side effects |
-| Framed-write cancellation | Dropping `FramedWriteGuard` marks the whole connection closed because a write may be partial | Cancellation can sacrifice the persistent service instead of cancelling one operation |
-| Late replies | Dropping `PendingRegistration` only removes the pending sender | There is no explicit cancellation acknowledgement or observable operation outcome |
+| Operation cancellation | The shared host transport safely drops and tombstones a cancelled waiter, but the frozen wire has no `$/cancelRequest` feature | API `0.1` work or side effects may continue after the host stops waiting |
+| Framed-write cancellation | The current bounded serialized writer emits complete frames for both versions | Host-side frame safety is fixed without changing `0.1`, but only `0.2` can cooperatively cancel admitted work |
+| Late replies | The host tombstones dropped request IDs and ignores their late replies | The connection stays healthy, but an API `0.1` child receives no cancellation acknowledgement |
 | Correlated progress | Native progress exists, but extensions can only emit general notifications/status events | Concurrent calls cannot reliably attribute progress or prompts to the initiating operation |
 | Result fidelity | `ToolCallOutput` accepts string `content`, `is_error`, and `metadata`; `ProcessTool` converts success to `ToolOutput::new(content)` | Metadata is discarded and executable extensions cannot return native image/audio media |
 | Terminal lifecycle | Hooks are only `before_prompt`, `after_response`, `before_tool_call`, and `after_tool_call`; product paths call `after_response` after successful complete responses | Failure, cancellation, interruption, frontend loss, and shutdown are not terminal hook outcomes |
 | Policy enforcement | An extension can request a generic confirmation, but it runs with the user's privileges and may bypass that request | Confirmation is cooperative UX, not a security boundary |
-| Service health | Startup and replacement are bounded, but there is no common ready/degraded/parked/backoff state machine | Persistent browser/MCP/LSP/provider failures become ad hoc and noisy |
-| Reload drain | A replacement is swapped and the old connection is shut down; contribution changes are rejected | In-flight work has no documented drain/cancel rule, and schema changes require a larger rebuild |
-| Process lifetime | API `0.1` has one resident lifetime: enabled, trusted processes start during product construction and remain until reload, shutdown, or connection failure | On-demand, per-call, and health-managed lifetimes are not expressible |
+| Service health | The frozen wire has no health negotiation; the host supplies ready/degraded/crashed/drain state plus post-initialization backoff/parked supervision | Capability extensions share one inspectable host lifecycle without moving their domain managers into core |
+| Reload drain | A candidate is initialized, then the old connection stops admission and receives a bounded host-side drain/shutdown before cutover; contribution changes are rejected | API `0.1` has no cooperative cancellation protocol, so unfinished child work cannot acknowledge drain, and schema changes require a larger rebuild |
+| Process lifetime | API `0.1` has one resident contact policy: enabled, trusted processes start during product construction; the host supervisor replaces a generation after an unexpected exit | On-demand and per-call contact policies remain unexpressed, while crash restart stays a generic host concern |
 
-The Caffeinate example demonstrates the terminal-lifecycle problem. It acquires
-at `before_prompt` and releases at `after_response`, shutdown, or stream loss.
-An aborted or failed run can leave `/usr/bin/caffeinate -i -t 1800` active until
-its fallback timeout. The timeout bounds the leak; it does not establish correct
-ownership.
+The former `before_prompt`/`after_response` Caffeinate prototype exposed the
+terminal-lifecycle gap: an aborted or failed run could leave its bounded helper
+active without a matching success hook. The current API `0.2`, version `0.2.0`
+extension is the replacement. It uses `turn/started`, `turn/settled`, and
+`session/settled`, reference-counts overlapping owning/root turns, and cleans up
+on extension shutdown. No sleep-inhibitor path remains in the kernel.
 
 ## Cross-product comparison
 
@@ -132,11 +169,11 @@ Cells summarize the inspected snapshot, not an evergreen product claim.
 
 | Capability | Current Ygg | OpenAI Codex | Claude Code | Google Antigravity | Hermes Agent |
 | --- | --- | --- | --- | --- | --- |
-| **WebSearch** | No first-party search manager; an extension can return text only | Open-source `web.run` extension covers search/image search/open/click/find/screenshot and vertical data commands, with typed begin/end items and result payloads (**OSS**) | Packaged `WebSearch` and `WebFetch` schemas expose domain filtering, URL fetch, processed text, and structured hit URLs/titles (**PACKAGE**) | `NewSearchWebTool` and related symbols indicate an integrated search tool (**STATIC**) | Brave, DDGS, SearXNG, Exa, Parallel, Tavily, and Firecrawl adapters; extraction/cache limits, secret checks, DNS-aware SSRF checks, pinned-IP transport (**OSS**) |
-| **BrowserUse** | No browser manager; native media exists but subprocess tools cannot bridge screenshots | Bundled Browser plugin `26.803.41515` documents persistent tabs/REPL handles, semantic DOM interaction, post-action checks, screenshots, scoped CDP, untrusted-page rules, and action-time confirmation (**PACKAGE**) | No equivalent native persistent browser was established; official marketplace distributes Playwright as an external MCP server (**PACKAGE**) | Browser tools and `BrowserSubagent` symbols indicate integrated browsing/subagent paths (**STATIC**) | Local/cloud providers, CDP and Browser Use, semantic accessibility snapshots, task-isolated persistent sessions, reaping, dialogs, frames/OOPIF, redaction, and network policy (**OSS**) |
-| **Caffeinate** | macOS example extension; success-only hook ownership leaks on abort/failure | Core cross-platform `SleepInhibitor`: macOS IOKit assertion, Linux helper backends with parent-death handling, Windows power request, drop cleanup (**OSS**) | Binary strings indicate macOS `caffeinate`, Linux `systemd-inhibit`, restart/spawn-error/explicit-stop paths (**STATIC**) | No sleep-inhibitor symbols found in the inspected binary (**NEGATIVE/STATIC**) | No sleep-inhibitor implementation found in the inspected tree (**NEGATIVE**) |
-| **Subagents** | No committed subsystem in the cited HEAD; a substantial local untracked V2 prototype exposes spawn/follow-up/message/wait/list/interrupt | Hierarchical registry, roles/paths, optional turn forking, follow-ups, messaging, waits, interrupts, shared depth/concurrency controls (**OSS**) | Packaged `Agent` schema and `claude agents` expose background agents, models/effort/permissions, addressable names, worktree/remote isolation, output and stop controls (**PACKAGE/CLI**) | Agent derivation, cancellation, workspace isolation, and subagent-management symbols are present (**STATIC**) | Isolated child conversations, summary return, parallel/background/nested agents, steering/stopping, limits, stalls/timeouts, worktrees, cost rollups, lifecycle plugins, durable async delivery (**OSS**) |
-| **MCP** | No native manager; a generic extension could wrap MCP but would hide important semantics | Stdio and Streamable HTTP, OAuth/config/env/headers, parallel/deferred startup, reusable connections, required/optional servers, cached revisioned catalogs, resources, cancellation, elicitation, approval policy (**OSS**) | `mcp add/get/list/remove/login/logout`, stdio/HTTP, headers/env, user/local/project scopes, project-config approval, health and OAuth login (**CLI/PACKAGE**) | MCP manager/call symbols plus tools/prompts/resources/progress-related symbols indicate broad support (**STATIC**) | Stdio, Streamable HTTP and SSE; reuse, keepalive, reconnect/backoff/parking/revival, pagination/refresh, tools/resources/prompts, sampling, elicitation, structured/media content, cancellation and cleanup (**OSS**) |
+| **WebSearch** | No first-party search manager; API `0.2` can carry structured/media provider results but does not supply search policy, citations, or cache | Open-source `web.run` extension covers search/image search/open/click/find/screenshot and vertical data commands, with typed begin/end items and result payloads (**OSS**) | Packaged `WebSearch` and `WebFetch` schemas expose domain filtering, URL fetch, processed text, and structured hit URLs/titles (**PACKAGE**) | `NewSearchWebTool` and related symbols indicate an integrated search tool (**STATIC**) | Brave, DDGS, SearXNG, Exa, Parallel, Tavily, and Firecrawl adapters; extraction/cache limits, secret checks, DNS-aware SSRF checks, pinned-IP transport (**OSS**) |
+| **BrowserUse** | No browser manager; API `0.2` bridges verified owner-and-generation-scoped screenshots/audio, but not browser sessions or action policy | Bundled Browser plugin `26.803.41515` documents persistent tabs/REPL handles, semantic DOM interaction, post-action checks, screenshots, scoped CDP, untrusted-page rules, and action-time confirmation (**PACKAGE**) | No equivalent native persistent browser was established; official marketplace distributes Playwright as an external MCP server (**PACKAGE**) | Browser tools and `BrowserSubagent` symbols indicate integrated browsing/subagent paths (**STATIC**) | Local/cloud providers, CDP and Browser Use, semantic accessibility snapshots, task-isolated persistent sessions, reaping, dialogs, frames/OOPIF, redaction, and network policy (**OSS**) |
+| **Caffeinate** | API `0.2` version `0.2.0` extension: terminal lifecycle observations, overlapping-turn reference counting, bounded macOS helper, status, and shutdown cleanup; no core inhibitor | Core cross-platform `SleepInhibitor`: macOS IOKit assertion, Linux helper backends with parent-death handling, Windows power request, drop cleanup (**OSS**) | Binary strings indicate macOS `caffeinate`, Linux `systemd-inhibit`, restart/spawn-error/explicit-stop paths (**STATIC**) | No sleep-inhibitor symbols found in the inspected binary (**NEGATIVE/STATIC**) | No sleep-inhibitor implementation found in the inspected tree (**NEGATIVE**) |
+| **Subagents** | V2 harness orchestration exists; the extension host-service bridge is working-tree implementation so orchestrators can remain subprocesses | Hierarchical registry, roles/paths, optional turn forking, follow-ups, messaging, waits, interrupts, shared depth/concurrency controls (**OSS**) | Packaged `Agent` schema and `claude agents` expose background agents, models/effort/permissions, addressable names, worktree/remote isolation, output and stop controls (**PACKAGE/CLI**) | Agent derivation, cancellation, workspace isolation, and subagent-management symbols are present (**STATIC**) | Isolated child conversations, summary return, parallel/background/nested agents, steering/stopping, limits, stalls/timeouts, worktrees, cost rollups, lifecycle plugins, durable async delivery (**OSS**) |
+| **MCP** | No first-party bridge yet; `dynamic_tools` now supplies the catalog seam for a `ygg-mcp` extension | Stdio and Streamable HTTP, OAuth/config/env/headers, parallel/deferred startup, reusable connections, required/optional servers, cached revisioned catalogs, resources, cancellation, elicitation, approval policy (**OSS**) | `mcp add/get/list/remove/login/logout`, stdio/HTTP, headers/env, user/local/project scopes, project-config approval, health and OAuth login (**CLI/PACKAGE**) | MCP manager/call symbols plus tools/prompts/resources/progress-related symbols indicate broad support (**STATIC**) | Stdio, Streamable HTTP and SSE; reuse, keepalive, reconnect/backoff/parking/revival, pagination/refresh, tools/resources/prompts, sampling, elicitation, structured/media content, cancellation and cleanup (**OSS**) |
 | **LSP** | No host LSP manager | No comparable native LSP subsystem found in the examined Rust sources (**NEGATIVE**) | Generated schemas and official plugins describe definition/references/hover/workspace/document symbols, server commands, language maps, timeouts, transport and diagnostics (**PACKAGE/STATIC**) | In-process `language_server/lsp/lsp.Serve` and related symbols indicate integrated language-server support (**STATIC**) | Lazy long-lived clients per server/workspace, background loop, git-root gating, document versions, push/pull diagnostics, baseline deltas, cancellation, idle reap and graceful shutdown (**OSS**) |
 | **Memory** | Session/context primitives exist, but no scoped memory product or provenance/retrieval lifecycle | Asynchronous two-phase root-session extraction/consolidation, filesystem artifacts, citations/pruning/telemetry; replaceable `MemoriesBackend` tools, while core owns startup orchestration; stable feature default-disabled (**OSS**) | Packaged/static evidence identifies auto-memory settings, project-scoped directory, `MEMORY.md`, pause/resume, disable env var, and provenance tags (**PACKAGE/STATIC**) | Layered memory/retrieval, summary-store, SQLite/WAL, trajectories/watchers/indexed search symbols indicate a broad integrated subsystem (**STATIC**) | Bounded profile-scoped `MEMORY.md`/`USER.md`, frozen session snapshot, locked atomic edits, drift backups, provider isolation, background review, plus SQLite FTS5 session search (**OSS**) |
 
@@ -164,13 +201,13 @@ Cells summarize the inspected snapshot, not an evergreen product claim.
 
 ## Patterns worth carrying into Ygg
 
-### 1. Managers own invariants; adapters own backend variation
+### 1. Extension managers own domain invariants; the kernel owns enforcement
 
 Hermes's web, browser, and memory provider APIs and Codex's memory backend are
-useful extension seams. In each good example, a central manager still owns
-session timing, cache/prompt behavior, cleanup, synchronization, and policy.
-Ygg should copy that split rather than allow a provider subprocess to redefine
-the product lifecycle.
+useful extension seams. In Ygg, the long-lived extension manager owns its
+domain state, caching, protocol lifecycle, and backend variation. The kernel
+owns only enforceable permissions, generic approvals/artifacts/secrets, durable
+session identity, model-session creation, process cleanup, and resource bounds.
 
 ### 2. Search and browsing are different products
 
@@ -198,8 +235,9 @@ terminal result is persisted and sent to the model.
 
 Hermes delivers a background completion as a new turn instead of mutating an
 already completed conversation prefix. Its claim/ack persistence also avoids
-losing completion during a crash. Ygg should use the same principle for
-subagents and other detached work.
+losing completion during a crash. Ygg's subagent-orchestrator extension should
+use the same principle while the host persists and runs the child model
+sessions it creates.
 
 ### 6. Prompt-affecting memory should be frozen
 
@@ -217,73 +255,80 @@ safer than treating missing metadata as read-only.
 ## Recommended Ygg architecture
 
 ```text
-Agent / turn coordinator
-├── terminal lifecycle + cancellation
-├── central policy / approval service
-├── artifact and structured-output store
-├── common service supervisor
-│   ├── WebSearch manager ── typed provider extension
-│   ├── Browser manager ──── trusted browser sidecar/provider
-│   ├── MCP manager ───────── direct MCP transports/servers
-│   ├── LSP manager ───────── direct LSP transports/servers
-│   └── Memory manager ────── local backend or typed provider extension
-├── Delegation manager ────── child Ygg agents/worktrees
-└── Sleep inhibitor ───────── platform backend
+Ygg host / kernel
+├── model loop and child model sessions
+├── bounded JSON-RPC bus
+├── sessions, tool calls, and tool-result persistence
+├── permissions and approvals
+├── extension process supervision and cleanup
+├── stable session/process ownership
+└── memory, message, concurrency, artifact, and process limits
 
-Executable-extension runtime (JSON-RPC/JSONL)
-├── bounded ordinary tools, commands, hooks, UI
-├── typed provider contracts
-└── package-supplied declarative contributions
+Subprocess extensions
+├── ygg-mcp ───────────── MCP servers and live tool catalogs
+├── web search ────────── retrieval, normalization, citations
+├── browser use ───────── tabs, page state, web actions
+├── computer use ──────── desktop observation and actions
+├── memory ────────────── retrieval, consolidation, storage
+├── LSP ───────────────── clients, documents, diagnostics
+├── subagent orchestrator child sessions through host service
+└── caffeinate ────────── platform sleep-inhibition behavior
 ```
 
-A common service supervisor should provide process groups, generation IDs,
-startup/shutdown deadlines, health, backoff, drain, and diagnostics. It should
-not erase domain protocols: MCP and LSP managers still speak MCP and LSP
-respectively.
+A common kernel supervisor provides process groups, generation IDs,
+startup/shutdown deadlines, health, restart/backoff, drain, and diagnostics.
+It never needs to understand MCP, LSP, CDP, a memory schema, or a search
+provider. Each extension speaks its domain protocol on the far side of the Ygg
+JSON-RPC boundary.
 
 ### Core-versus-extension decision rule
 
-Keep a responsibility in core if any of these are true:
+Keep a responsibility in the host only when an extension logically depends on
+it to run or when only the host can enforce it across extensions: model
+conversations, transport, persistence, permissions/approvals, process cleanup,
+stable ownership, and resource limits. Long-lived state, cross-call
+multiplexing, or terminal cleanup do not by themselves make a capability core;
+the supervisor, ownership token, and process-group fence let an extension own
+those safely.
 
-- correctness depends on every terminal path;
-- it changes or persists conversation context;
-- it allocates model, token, concurrency, or workspace budgets;
-- it must enforce approval, secret, network, or filesystem policy;
-- it multiplexes a long-lived process across calls;
-- it must work identically in interactive, print, plain, RPC, and serve modes;
-- a crash can leak a child process, tab, lock, inhibitor, or background result.
-
-Use an extension/provider seam when the implementation is replaceable, has a
-narrow typed contract, can be restarted without corrupting host state, and
-either uses host-brokered authority or is explicitly accepted as trusted local
-code whose extra authority cannot be technically constrained yet.
+Everything else uses the language-neutral subprocess seam. Trusted local code
+may still have authority the host cannot technically sandbox; capability
+metadata remains visible consent, not a security claim.
 
 ### Registration shape
 
-Do not add one generic "managed service" contribution. Package manifests should
-use kind-specific declarations:
+An extension manifest declares the trusted executable and its bootstrap
+contributions. Initialization exactly matches that declaration. An API `0.2`
+extension may then negotiate `dynamic_tools` and publish its live catalog with
+transactional `tools/register` and `tools/unregister` requests. Per-process
+catalog epochs pin calls from an in-flight model turn to the schema and handler
+the model saw; a new process generation starts again at epoch zero. The
+initialize catalog is the only deterministic turn-one catalog. Post-initialize
+mutations appear at the next model-request boundary after publication, with no
+implicit startup-quiescence heuristic.
 
-- executable `web_search`, `browser`, or `memory` provider adapters name an
-  entrypoint and the typed adapter contract they implement;
-- MCP server and language-server entries are declarative launch/transport
-  descriptors; Ygg speaks MCP/LSP directly rather than routing either protocol
-  through `tool/call`;
-- subagent roles/prompts are declarative inputs to core orchestration, not child
-  processes that own the agent tree.
-
-Namespace each contribution by package, kind, and name. Initialization must
-exactly match the declared contribution and may negotiate only additive API
-`0.2` features. A schema or contribution-set change creates a new generation
-and triggers catalog re-registration; existing handles never cross generations.
-Manifest declarations remain consent and discovery metadata, not a sandbox.
+Stateful extensions namespace handles by the host-derived
+`(session_id, extension_instance_id, process_generation)` resource owner. A
+subagent orchestrator uses the agent-session host service rather than receiving
+direct access to the kernel's conversation registry. Secrets, artifacts, and
+approvals likewise use optional generic host services instead of
+domain-specific host managers. Secret names must also appear exactly in the
+manifest's `[capabilities].secrets` allowlist; negotiation alone never widens
+that set.
 
 ## Capability recommendations
+
+The domain requirements below survive the superseded architecture, but their
+owner is the corresponding long-lived extension. References to host artifacts,
+secrets, approvals, model sessions, or process cleanup mean generic kernel
+services; they do not create a host-side search, browser, MCP, LSP, memory, or
+caffeinate manager.
 
 ### WebSearch
 
 #### Product contract
 
-Expose a host-owned search surface with at least:
+The web-search extension should publish a search surface with at least:
 
 - query (including a bounded batch of queries);
 - domain allow/block filters;
@@ -300,25 +345,18 @@ breadth, not architectural prerequisites.
 
 #### Ownership
 
-The provider adapter performs provider-specific request translation, response
-normalization, and declares the authentication scheme it requires. The host
-owns:
-
-- credential lookup and narrowly scoped authentication injection;
-- result-reference allocation and citation rendering;
-- bounded raw-content cache and expiry;
-- output truncation and deterministic model-visible text;
-- query/URL redaction and secret detection;
-- endpoint allow/deny policy and SSRF protection;
-- retries, cancellation, telemetry, and billing-aware limits.
+The extension owns provider translation, normalization, result references,
+citations, caches, truncation, retries, cancellation behavior, and
+billing-aware limits. It declares the authentication and network authority it
+needs. The host supplies only generic secret access, permission/approval
+decisions, artifacts, transport cancellation, and resource ceilings.
 
 Provider credentials should come from a host secret broker or scoped launch
 environment, never an ambient dotenv inherited by every extension. For network
-policy to be enforceable, the preferred provider contract has the host perform
-HTTP through a scoped broker while the adapter builds provider requests and
-normalizes responses. An adapter that opens its own sockets is trusted local
-code; Ygg may validate its declared target and results, but cannot claim to
-constrain a malicious adapter without an OS sandbox.
+policy to be enforceable, a future optional generic egress broker may perform
+HTTP for the extension. An extension that opens its own sockets is trusted
+local code; Ygg may validate declared intent and results, but cannot claim to
+constrain malicious code without an OS sandbox.
 
 #### Network boundary
 
@@ -394,9 +432,10 @@ Ordinary reading and navigation should not prompt. The host derives the risk
 from the action/target and user intent; an adapter's `read_only` or
 `destructive` flag is only a hint.
 
-Secrets should be filled through scoped host tokens where possible and should
-not be returned in snapshots, logs, screenshots, or model-visible text. Raw CDP
-access needs a small allowed domain set or a separate high-risk capability.
+Secrets should be fetched only by exact manifest-allowlisted name from the
+owner-scoped host broker and should not be returned in snapshots, logs,
+screenshots, or model-visible text. Raw CDP access needs a small allowed domain
+set or a separate high-risk capability.
 Main-frame URL checks are insufficient: redirects, subresources, popups,
 downloads, service workers, and browser-originated fetches all need policy.
 Prefer a policy-enforcing egress proxy plus browser interception; without an
@@ -410,54 +449,42 @@ wedged, restart the provider and invalidate its handles. A disconnect after a
 consequential click is an ambiguous outcome and must never be retried
 automatically.
 
-The host owns these rules. A trusted Playwright/CDP sidecar may be distributed
-as an executable extension, but it implements actions against already admitted
-host operations rather than owning confirmations or session policy.
+The browser extension owns these domain rules and requests host approval at the
+last responsible moment. The host owns the final allow/ask/deny decision and
+process/resource fences, not tabs, locators, or browser action semantics.
 
 ### Caffeinate
 
-Implement sleep inhibition in core as a reference-counted RAII lease:
+Sleep inhibition is implemented as the long-lived API `0.2`, version `0.2.0`
+`caffeinate` example extension:
 
-- acquire after an eligible turn/task is admitted;
-- keep one platform assertion while at least one eligible owner is active;
-- release exactly once on completed, failed, cancelled, interrupted, frontend
-  disconnect, and shutdown paths;
-- make repeated acquire/release idempotent;
-- detect and reacquire if a helper process exits unexpectedly;
-- expose failure as a non-fatal status/diagnostic.
+- acquire and release leases from complete turn/task lifecycle observations;
+- share one platform assertion while at least one observed owner is active;
+- treat acquisition failure as non-fatal and expose bounded status;
+- keep helper processes in the extension process group so host cleanup is the
+  final crash/shutdown fence; and
+- discard all leases when the owning process generation changes.
 
-Prevent idle **system** sleep, not display sleep or explicit user sleep.
-Recommended platform backends follow the Codex implementation shape:
-
-- macOS: native IOKit power assertion; `/usr/bin/caffeinate` may be a fallback;
-- Linux: logind inhibitor where practical, with `systemd-inhibit` and
-  `gnome-session-inhibit` helper fallbacks and parent-death/process-group cleanup;
-- Windows: `PowerCreateRequest`/`PowerSetRequest` with system-required;
-- unsupported platforms: no-op with one bounded diagnostic.
-
-A maximum helper duration is a useful final safety net, but a timer must not be
-the primary release mechanism. Extension hooks may observe turn outcomes, but
-core resource cleanup must never depend on successful hook delivery.
+It prevents idle **system** sleep, not display sleep or explicit user sleep.
+The current implementation is intentionally narrow: on macOS it runs one
+`/usr/bin/caffeinate -i -t 1800` helper while at least one owning/root turn is
+active; unsupported systems or a missing executable produce a bounded,
+non-fatal diagnostic. Linux and Windows backends, if added, belong in this
+extension rather than the kernel. No core sleep inhibitor remains.
 
 ### Subagents
 
-Subagents are agent orchestration, not an executable-extension tool
-implementation. Core must own:
+Subagent orchestration belongs in an extension. The kernel host service creates
+and runs bounded child model sessions, persists their conversations/results,
+enforces model/token/time/depth/concurrency and inherited permissions, and
+provides scoped spawn, follow-up, message, wait, list, and interrupt operations.
+The orchestrator extension owns task decomposition, routing, roles, completion
+policy, and how child results re-enter the parent workflow.
 
-- stable agent IDs, parent/child tree, role/path metadata, and status registry;
-- blank/summary/full or explicit turn-fork context modes;
-- model, effort, token, time, depth, and global concurrency budgets;
-- permission inheritance (a child cannot exceed its parent/host policy);
-- spawn, follow-up, message, wait, list, interrupt, and steering operations;
-- cancellation propagation and explicit detach rules;
-- workspace selection and optional temporary git worktrees;
-- completion summaries, artifacts, cost rollups, and cleanup;
-- durable background dispatch and completion delivery.
-
-The local untracked V2 prototype already uses the right control vocabulary:
+The tracked working-tree V2 harness already uses the right control vocabulary:
 `spawn_agent`, `followup_task`, `send_message`, `wait_agent`, `list_agents`, and
-`interrupt_agent`. It should be evaluated and integrated as core work; because
-it is uncommitted, it is not treated as shipped behavior in this spike.
+`interrupt_agent`. The host-service bridge exposes that bounded machinery to a
+process-scoped orchestrator without giving it the global conversation registry.
 
 Background delivery should use a durable state progression such as:
 
@@ -471,16 +498,28 @@ an already completed prefix. Child agents should return a concise summary plus
 references to durable artifacts/worktree changes rather than copying their full
 conversation into the parent.
 
-Extensions may contribute declarative roles, prompts, or restricted tool/model
-profiles. They must not own the child conversation, registry, or workspace
-lifecycle.
+The extension never supplies an arbitrary session owner or widens its
+permissions. Its process principal scopes the child sessions it can address;
+the host owns the conversation records and execution lifecycle. Child trees are
+keyed by extension principal plus durable session owner rather than process
+generation, so a supervised extension restart/reload can resume them; explicit
+extension shutdown stops the owned trees.
+
+In the current working-tree bridge, orchestrators observe child state through
+`agent/list` and `agent/wait`. Delegated child turns do not fan out through the
+extension `session/*` or `turn/*` lifecycle stream; those notifications cover
+the owning/root product session. Child lifecycle fan-out would be an additive
+host-service behavior, not a reason to move orchestration into the kernel.
 
 ### MCP
 
-Build MCP as a host manager speaking MCP directly. Do not require users to wrap
-an MCP server inside a generic Ygg extension: that would duplicate framing and
-hide catalog revisions, annotations, progress, cancellation, sampling,
-elicitation, resources, and transport health.
+Build MCP as a long-lived `ygg-mcp` extension. It speaks MCP directly to its
+servers, translates their tool catalogs onto Ygg's JSON-RPC bus, and publishes
+changes through `tools/register` and `tools/unregister`. The additional local
+hop is cheap beside inference and external execution; replaceability and a
+small host are worth it. MCP catalog revisions, annotations, progress,
+cancellation, sampling, elicitation, resources, and transport health remain
+inside the bridge rather than being flattened into host concepts.
 
 #### Required lifecycle
 
@@ -541,8 +580,8 @@ lower through the same artifact/media bridge as executable tools.
 
 ### Language servers
 
-Ygg should directly manage LSP processes and let extension packages contribute
-declarative descriptors such as:
+An LSP extension should directly manage language-server processes from
+descriptors such as:
 
 - server ID, command and direct args;
 - extension-to-language mapping;
@@ -557,7 +596,7 @@ workspace root. Start lazily only in a trusted project with a matching file.
 Resolve the executable deterministically and show actionable install guidance;
 do not silently download or execute a new project command.
 
-The manager owns:
+The LSP extension owns:
 
 - `initialize`/`initialized` and graceful `shutdown`/`exit`;
 - `didOpen`, monotonic-version `didChange`, `didSave`, and `didClose`;
@@ -575,8 +614,8 @@ roll back a successful edit automatically.
 
 Code actions, rename, `workspace/executeCommand`, or server-initiated edits are
 mutating operations and need a separate policy and optimistic file checks. A
-one-process-per-tool-call LSP extension would lose indexes, document versions,
-and diagnostics, so it is the wrong ownership boundary.
+one-process-per-tool-call tool would lose indexes, document versions, and
+diagnostics, so the LSP extension must be long-lived.
 
 ### Memory
 
@@ -590,10 +629,12 @@ Memory needs explicit layers instead of one unscoped text blob:
 | Transient retrieval | current turn | relevant prior sessions/artifacts | query-time, bounded, provenance-preserving |
 | Procedural skills | installed/project resource | reusable workflows | keep in the existing skill system, not memory |
 
-Core owns scope, provenance, prompt budget, retrieval trigger, write policy,
-editing/deletion, retention, and consolidation timing. A backend extension may
-search, store, or propose a consolidation, but it cannot inject arbitrary
-system context or commit a cross-scope write without host validation.
+The memory extension owns scope semantics, provenance, retrieval, write policy,
+editing/deletion, retention, and consolidation timing. It publishes bounded
+tools/context and uses durable artifacts or its own explicitly authorized
+storage. The host owns the model context budget, session persistence, and final
+permission boundary; an extension cannot grant itself cross-scope authority by
+returning instructions as data.
 
 #### Snapshot and write semantics
 
@@ -624,30 +665,42 @@ place.
 
 ## Executable-extension protocol `0.2`
 
-API `0.1` should remain frozen for existing simple extensions. Introduce `0.2`
-for the breaking result/lifecycle semantics below. Continue exact version
-selection in the manifest, then negotiate additive features during
-`initialize`; do not infer support from extension version strings.
+API `0.1` remains frozen for existing simple extensions. API `0.2` implements
+the breaking result/lifecycle semantics below. The manifest selects the exact
+version, then `initialize` negotiates additive features; support is never
+inferred from extension version strings.
 
-A sketch:
+The host request is:
 
 ```json
 {
   "protocol": {
     "version": "0.2",
     "required_features": ["request_cancellation", "content_parts"],
-    "optional_features": ["request_progress", "artifacts", "lifecycle_events"],
-    "limits": {"max_concurrent_requests": 4}
+    "optional_features": [
+      "request_progress",
+      "artifacts",
+      "lifecycle_events",
+      "policy_intents",
+      "dynamic_tools"
+    ],
+    "limits": {"max_concurrent_requests": 64}
   }
 }
 ```
 
-The initialization response returns the supported subset and an accepted limit;
-the host caps every value. Missing required features reject the candidate before
-registration. The SDK reader loop must never execute a handler inline: it keeps
-reading control frames and schedules handlers behind the negotiated concurrency
-semaphore, which is necessary for a queued or running handler to observe
-cancellation. Domain provider contracts have their own version so a
+The initialization response returns `protocol.version`, the supported feature
+subset, and `limits.max_concurrent_requests`; the host caps the limit. Missing
+required, unknown, or duplicate features and mismatched versions reject the
+candidate before registration. If `lifecycle_events` is negotiated, the
+response may include an exact subscription subset; omission subscribes all six
+events. The host conditionally appends `agent_sessions`, `approvals`, and
+`secrets` only when it has the corresponding service. `approvals` also requires
+`policy_intents`; `secrets` additionally requires a configured broker and a
+non-empty exact manifest allowlist. The SDK reader loop never executes a handler
+inline: it keeps reading control frames and schedules handlers behind the
+negotiated concurrency semaphore, which lets queued or running work observe
+cancellation. Domain provider contracts retain their own version so a
 browser-provider change does not require changing the base JSON-RPC framing
 version.
 
@@ -660,7 +713,7 @@ LSP convention:
 {"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":42,"reason":"user"}}
 ```
 
-Required semantics:
+Implemented semantics:
 
 1. Before the writer starts a frame, cancellation removes the request from the
    queue and sends nothing.
@@ -671,20 +724,20 @@ Required semantics:
    error (use `-32800`) or may win the race with a normal result.
 5. The host tombstones cancelled IDs for a bounded period so a late response is
    ignored and diagnosed rather than killing the connection.
-6. After a configurable grace period, a non-cooperative process is terminated
-   or its domain resource is invalidated according to manager policy.
+6. After the bounded grace period, a non-cooperative process generation is
+   marked degraded and terminated.
 7. Side-effecting operations report cancellation as "requested" rather than
    claiming rollback; an ambiguous external outcome is never replayed.
 
-Replace direct cancellable writes under a mutex with a dedicated bounded writer
-task that serializes complete frames. Dropping a request waiter must not drop a
-partially written future or close an otherwise healthy persistent connection.
+The transport uses a dedicated bounded writer task that serializes complete
+frames. Dropping a request waiter cannot drop a partially written future or
+close an otherwise healthy persistent connection.
 Timeout and host shutdown use the same cancellation machinery but retain
 distinct terminal reasons.
 
 ### 2. Correlated progress and extension-originated requests
 
-Extensions need a request-scoped notification:
+Extensions use a request-scoped notification:
 
 ```json
 {
@@ -698,7 +751,7 @@ Extensions need a request-scoped notification:
 }
 ```
 
-Initial event variants should map directly to native progress:
+Event variants map directly to native progress:
 
 - `status {message, current?, total?, unit?}`;
 - `output {stream: stdout|stderr, encoding: utf8|base64, data}` with bounded
@@ -709,17 +762,22 @@ Sequences are monotonic per request. The host applies existing 8 KiB chunking,
 bounded-channel dropping, and aggregate drop reporting. Progress is never added
 to the model conversation or session transcript as a result.
 
-Every extension-originated confirmation, input, artifact publication, or other
-operation-specific request must carry `parent_request_id`. Global notifications
-and status contributions may omit it. This prevents concurrent extension calls
-from racing to display or answer another call's prompt. When the parent settles,
-the host atomically denies/cancels all unresolved child requests; late replies
-are tombstoned. The same cancellation notification may be used in the opposite
-direction when an extension abandons one of its host requests.
+Every extension-originated confirmation, input, artifact publication, policy
+evaluation, secret lookup, or agent-session operation carries
+`parent_request_id`. Global notifications, context, and status contributions
+may omit it. This prevents concurrent extension calls from racing to display or
+answer another call's prompt. `input/request` carries
+`{prompt, secret, parent_request_id}` and returns `{value: string|null}`;
+prompts/answers are bounded to 16/256 KiB UTF-8, and secret values stay on the
+ephemeral private reply channel and never enter logs, progress, or persistence.
+When the parent settles, the host atomically denies/cancels all unresolved
+child requests; late replies are ignored. The same cancellation notification
+may be used in the opposite direction when an extension abandons one of its
+host requests.
 
 ### 3. Structured and media output
 
-Replace string-only subprocess output with an MCP-like result that bridges to
+API `0.2` replaces string-only subprocess output with an MCP-like result that bridges to
 native `ToolOutput`:
 
 ```json
@@ -742,40 +800,40 @@ native `ToolOutput`:
 Rules:
 
 - text remains the explicit compact model-visible representation;
-- optional `structured_content` is validated against a declared output schema,
-  retained for UI/session use, and lowered to the model only by host policy;
+- `structured_content` is required exactly when the tool declared
+  `output_schema`, validated against that schema, retained for UI/session use,
+  and lowered to the model only by host policy;
 - image/audio parts become existing `ygg_ai::Media` values;
 - arbitrary local paths and remote media URLs are not trusted directly;
-- provider references are accepted only from the matching host/provider manager,
-  not from a generic extension;
-- `metadata` remains non-model-visible but must actually be retained, unlike the
-  current subprocess adapter.
+- media references are accepted only through the matching verified artifact
+  owner and generation, not as arbitrary extension paths or URLs;
+- API `0.2` `metadata` is retained as bounded non-model-visible result detail;
+  frozen API `0.1` continues to accept and discard it.
 
-The current `ToolOutput` struct carries text plus media only. Extend it, or its
-canonical persisted result envelope, with optional `structured_content` and
-vetted metadata rather than creating a subprocess-only parallel model. Provider
-lowering then preserves supported media and emits explicit placeholders when a
-provider cannot represent a part.
+The native canonical result envelope now carries optional
+`structured_content` and vetted metadata rather than creating a subprocess-only
+parallel model. Provider lowering preserves supported media and explicit text.
 
-Large media must be out of line. Give each process generation a host-owned
-scratch directory and support `artifact/publish` with either a small bounded
-inline payload or a relative scratch path plus claimed MIME type, size, and
-SHA-256. The host opens it with descriptor-relative, no-follow semantics, checks
-size/digest/type, ingests it, and returns an opaque artifact ID. A browser
-screenshot should not need to fit base64 plus JSON inside the 1 MiB
-control-frame limit.
+Large media stays out of line. Each process generation receives a host-owned
+scratch directory and `artifact/publish` accepts either bounded inline base64
+or a relative scratch path plus claimed MIME type, size, and SHA-256. The host
+opens it with bounded no-follow semantics, checks size/digest/type, snapshots
+it, and returns an opaque artifact ID bound to the publishing host-derived
+session owner and process generation. Media resolution supplies that same
+owner; another session owner cannot use a leaked ID. A browser screenshot
+should not need to fit base64 plus JSON inside the 1 MiB control-frame limit.
 
 ### 4. Complete lifecycle events
 
-Keep interceptable `before_*` hooks as bounded requests. Add observational,
-non-veto lifecycle notifications:
+Interceptable `before_*` hooks remain bounded requests. API `0.2` adds
+observational, non-veto lifecycle notifications:
 
-- `session_started`, `session_settled`;
-- `turn_started`, `turn_settled`;
-- `tool_started`, `tool_settled` where an extension subscribes to global tool
+- `session/started`, `session/settled`;
+- `turn/started`, `turn/settled`;
+- `tool/started`, `tool/settled` where an extension subscribes to global tool
   observation.
 
-Every admitted turn receives exactly one host-side `turn_settled` outcome:
+Every admitted turn receives exactly one host-side `turn/settled` outcome:
 
 - `completed`;
 - `failed`;
@@ -788,69 +846,134 @@ Every admitted turn receives exactly one host-side `turn_settled` outcome:
 Include stable session/run/turn IDs, duration, and a bounded reason; do not send
 full prompts, secrets, or model output unless a contribution explicitly needs
 and is allowed to receive it. Notification delivery is best effort because the
-process may already have failed. Therefore host cleanup, Caffeinate release,
-and persistence completion remain core finalizers, never extension hooks.
+process may already have failed. Therefore host process cleanup and persistence
+completion remain kernel finalizers. An extension owns its domain cleanup while
+healthy and treats process-group termination/generation invalidation as the
+final crash fence.
 
-Deprecate success-implying `after_response` in favor of `turn_settled`; keep it
-for `0.1` compatibility only.
+The success-implying `after_response` remains frozen for `0.1` compatibility
+only; API `0.2` consumers use `turn/settled`.
 
 ### 5. Host-mediated policy intents
 
-Retain `confirmation/request` as cooperative UI, add parent correlation, and do
-not describe it as enforcement. For host-managed capabilities, classify a
-structured action intent before execution:
+`confirmation/request` remains cooperative UI with parent correlation and is
+not enforcement. Negotiated `policy_intents` sends a structured request:
 
 ```json
-{
-  "kind": "external_side_effect",
-  "operation": "browser.submit_form",
-  "target": {"origin": "https://example.com", "label": "Publish comment"},
-  "data_classes": ["user_text"],
-  "adapter_hints": {"read_only": false, "destructive": false}
-}
+{"jsonrpc":"2.0","id":"policy-1","method":"policy/evaluate","params":{
+  "parent_request_id":42,
+  "intent":{
+    "kind":"external_side_effect",
+    "operation":"browser.submit_form",
+    "target":{"origin":"https://example.com","label":"Publish comment"},
+    "data_classes":["user_text"],
+    "adapter_hints":{"read_only":false,"destructive":false}
+  }
+}}
 ```
 
-The host derives `allow`, `ask`, or `deny` from authoritative context. Adapter
-hints can only increase caution, never lower it. If a cooperative generic
-extension receives an approval token, bind the single-use token to the
-canonical intent hash, process generation, parent request, and expiry.
+The response is `{decision: "allow"|"ask"|"deny", approval_token?: string}`.
+The host derives the decision from authoritative context. Adapter hints can
+only increase caution, never lower it. When conditional `approvals` is offered
+and negotiated alongside `policy_intents`, a trusted frontend approval returns
+`ask` plus a short-lived opaque token. The extension must retry the exact
+original intent under the same still-active owner/parent and process generation.
+The core atomically consumes the token at that retry boundary and returns
+`allow` once; expiry, reuse, or any intent/parent/generation mismatch returns
+`deny` and invalidates a recognized token. Tokens are not remembered policy
+rules and cannot cross a replacement generation. Current coding-product paths
+leave approvals off and have no domain adapter, so the policy supervisor
+returns `deny` without a token.
 
 This token still cannot constrain malicious unsandboxed code. Actual
 enforcement requires either a host-executed broker (network, secret fill,
 artifact write, browser action) or a future OS sandbox. Ygg must continue to say
 so plainly.
 
-### 6. Reload, drain, and health
+### 6. Host-mediated secrets
 
-Standardize process states:
+The conditional `secrets` feature exposes only `secret/get` with
+`{parent_request_id, name}`. The host offers it when a broker is configured and
+the manifest declares at least one exact `[capabilities].secrets` name. For
+every lookup, the broker receives the manifest-bound extension identity, full
+`(session_id, extension_instance_id, process_generation)` owner, active parent
+request, and logical name. Neither identity nor owner is accepted from the
+extension's JSON.
+
+The allowlist is exact and duplicate-free; undeclared names are rejected. A
+broker no-value result and provider failure are deliberately indistinguishable
+as `secret is unavailable`. Values are bounded UTF-8 and stay out of host logs,
+progress, persistence, and ordinary diagnostics. Host broker and writer buffers
+are best-effort wiped, but the receiving extension holds an ordinary language
+string, so this is not end-to-end zeroization. The coding product currently has
+no secret broker and does not offer the feature.
+
+### 7. Dynamic tool catalogs and stable ownership
+
+An extension negotiating `dynamic_tools` starts at catalog epoch `0`, matching
+the exact tools returned during initialize. That catalog is the only
+deterministic turn-one catalog. It may then send transactional `tools/register`
+and `tools/unregister` requests. Each accepted mutation increments the
+per-process epoch and returns the complete policy-accepted name set. Conflicts
+or invalid schemas preserve the old catalog.
+
+The agent snapshots schemas and implementations at each model-request boundary.
+A later catalog mutation appears at the next boundary after publication, never
+halfway through one provider response. There is no implicit quiescence period
+for registrations sent immediately after initialization; first-turn tools must
+be in the bootstrap catalog. Every call into a dynamic extension carries the
+frozen `catalog_revision`; the extension dispatches through the matching
+historical handler snapshot. A replacement generation resets to its initialize
+catalog at epoch zero, and later mutations follow the same next-boundary rule.
+
+API `0.2` model-tool and tool-hook contexts carry a host-derived
+`resource_owner {session_id, extension_instance_id, process_generation}`.
+Stateful extensions key browser, MCP, LSP, memory, and similar handles by that
+triple. The durable session component survives reopening a persisted Ygg
+session at the same canonical path. The instance component changes across a
+complete process-host rebuild, and the generation component prevents a reloaded
+or automatically restarted extension process from accepting stale handles
+within one host instance.
+
+### 8. Reload, drain, and health
+
+The process health vocabulary is:
 
 ```text
 discovered
   -> starting -> initializing -> ready
   -> draining -> stopped
-  -> degraded/crashed -> backoff -> starting
-  -> parked (permanent config/auth/protocol failure)
+  -> degraded/crashed
+  -> backoff/parked (managed restart/permanent-failure state)
 ```
 
 Reload sequence:
 
 1. start and fully negotiate candidate generation `N+1` while `N` remains ready;
-2. if schemas changed, build a complete replacement registry generation rather
-   than mutating registered tools in place;
-3. atomically route new operations to `N+1`;
-4. mark `N` draining and stop new dispatch;
-5. allow explicitly drainable reads to settle and cancel the rest by deadline;
-6. send shutdown, then terminate the process group if needed;
-7. reject all stale progress, handles, approvals, and confirmations from `N`.
+2. if the extension negotiated `dynamic_tools`, reserve the candidate catalog;
+   otherwise reject changed schemas/contributions with `re-registration
+   required` so a product rebuild can replace the static registry safely;
+3. mark `N` draining and stop new dispatch;
+4. allow admitted operations to settle and cancel the rest by deadline;
+5. emit any remaining `N` lifecycle terminals, then use shutdown acknowledgement
+   (or its bounded timeout) as the old-generation processing barrier;
+6. seed replacement session/turn lifecycle state and atomically route new
+   operations to `N+1`;
+7. terminate `N`'s process group if bounded shutdown did not exit cleanly, and
+   reject all stale progress, handles, approvals, secret lookups, and
+   confirmations from `N`.
 
 Never automatically replay an unresolved unsafe tool call. Retry only calls
 whose domain contract and idempotency policy permit it. Browser tab, MCP server,
 and other remote handles include the owning generation and fail stale rather
 than aliasing replacement state.
 
-Expose health transitions and last bounded error to `/extensions` and machine
-interfaces. Optional services degrade without blocking startup; required
-services fail with an actionable reason.
+Health, generation, pending request count, negotiated features, and the last
+bounded error are exposed through `/extensions` inspection. Automatic
+restart/backoff supervision is implemented after one successful initialization.
+It reacts to exit or terminal transport failure rather than heartbeating an
+otherwise live child. A full product rebuild creates a new extension instance
+and resets the supervisor's in-memory retry/parked state.
 
 ## Lifecycle and security state machines
 
@@ -873,15 +996,17 @@ reported as ambiguous and are not retried.
 ### Managed-resource lifecycle
 
 Browser contexts/tabs, MCP connections, LSP clients/documents, artifacts, and
-sleep leases have an explicit owner and generation:
+sleep leases have an explicit session owner and process generation:
 
 ```text
 absent -> creating -> active -> closing -> closed
                     \-> lost/invalidated
 ```
 
-Owner settlement triggers cleanup even if extension event delivery fails.
-Dropping a Rust handle should be a final safety path, not the only normal path.
+Session settlement asks the owning extension to clean up; process settlement
+reaps its process group and invalidates the generation even if event delivery
+fails. The kernel does not need domain-specific handle implementations to make
+stale use fail safely.
 
 ### Approval lifecycle
 
@@ -889,18 +1014,22 @@ Dropping a Rust handle should be a final safety path, not the only normal path.
 intent received
   -> host classification
      -> deny
-     -> ask -> user deny
-            -> allow once
-            -> remember scoped rule
-     -> allow by existing scoped rule
+     -> ask -> user deny -> deny
+            -> user allow -> issue one-use capability
+               -> retry exact intent under same active owner/parent
+                  -> atomically consume -> allow once
+                  -> mismatch/expiry/reuse -> deny
+     -> allow directly
   -> execute admitted operation
   -> record bounded outcome
 ```
 
 Cancellation while waiting is denial. Headless frontends deny unresolved
 interactive prompts unless an explicit non-interactive policy already allows
-the exact intent. Remembered rules bind to identity and schema revisions and
-must never include secret values in logs/session state.
+the exact intent. The implemented capability is not a remembered rule: it is
+bound to the canonical intent, active parent/owner, process generation, and
+short expiry, then consumed even on a recognized mismatch. Approval tokens and
+secret values must never enter logs/session state.
 
 ### Trust boundary
 
@@ -912,10 +1041,12 @@ There are two materially different threat models:
    descriptions/results, LSP text, and retrieved memory. These remain data and
    cannot grant local authority even when transported by a trusted process.
 
-Daily-driver managers should minimize the first boundary by keeping secrets,
-policy, persistence, and consequential actions in the host. A future OS sandbox
-can strengthen generic extensions, but protocol design should not pretend it
-already exists.
+Daily-driver extensions should minimize the first boundary by requesting
+narrowly scoped secrets and approvals from generic host brokers and persisting
+model-visible outcomes through the normal tool/session path. The extension
+still performs its domain actions. Without an OS sandbox or a broker that
+executes a particular operation, Ygg must not claim that a policy request can
+contain malicious trusted code.
 
 ## Persistence, observability, and UX
 
@@ -961,65 +1092,59 @@ allow/deny behavior, cancellation, terminal events, and cleanup.
 
 ## Phased implementation
 
-The ordering below is dependency-driven. Parallel core work is called out
-explicitly.
+The ordering is dependency-driven: finish the kernel bus before building
+capability extensions.
 
-### Phase 0 — make current behavior truthful and terminal
+### Phase 0 — extension API `0.2` foundation (implemented)
 
-- Reconcile the protocol reference with executable behavior and add wire
-  conformance fixtures.
-- Add a host-owned exactly-once turn terminal outcome across every frontend.
-- Move Caffeinate into core using an RAII/reference-counted lease.
-- Define one authoritative set of limits and shutdown timing semantics.
-- Preserve and test process-tree cleanup on cancellation and shutdown.
+- The serialized writer, request cancellation, tombstones, and SDK cancellation
+  tokens are implemented.
+- Request-scoped progress, parent correlation, and ephemeral input are
+  implemented.
+- Content parts, structured output, retained details, and native media bridge
+  through the owner-isolated artifact store.
+- Lifecycle notifications and structured policy-intent transport are present;
+  product policy defaults to deny without a domain adapter.
+- Conditional single-use approval retry and manifest-allowlisted owner-scoped
+  secret brokerage are implemented in the kernel/SDK; the coding product keeps
+  approvals off and configures no broker.
+- Ready/draining/degraded/crashed health and explicit reload drain are active.
+- API `0.1` remains available without emulating `0.2` guarantees.
 
-### Phase 1 — extension API `0.2` foundation
+### Phase 1 — live catalogs and ownership (implemented in this working tree)
 
-- Add the serialized writer task, request cancellation, tombstones, and SDK
-  cancellation tokens.
-- Add request-scoped progress and parent correlation for extension-originated
-  requests.
-- Bridge content parts, structured output, and native media through the artifact
-  store.
-- Add lifecycle notifications and structured policy intents.
-- Implement ready/draining/degraded/parked states and explicit reload drain.
-- Keep API `0.1` available for simple existing extensions; do not emulate `0.2`
-  guarantees for a `0.1` process.
+- Negotiate `dynamic_tools`; implement transactional `tools/register` and
+  `tools/unregister` with per-process epochs.
+- Freeze a coherent schema/implementation snapshot for every model request.
+- Carry host-derived durable session ownership plus process-instance and
+  process-generation fences in API `0.2` tool contexts.
 
-### Phase 2 — proving slices and parallel core work
+### Phase 2 — supervision and host services
 
-- Ship WebSearch manager plus one first-party provider adapter as the protocol
-  vertical slice.
-- Add shared URL/SSRF/redirect policy and citation/cache infrastructure.
-- In parallel, integrate and harden core V2 delegation with durable background
-  completion and workspace isolation.
-- In parallel, ship manual scoped memory plus local session search and frozen
-  session snapshots; defer automatic extraction.
+- Automatic long-lived restart with bounded jittered backoff,
+  stable-generation cutover, crash budget, and parked state is implemented.
+- Finish the product gates for process-principal-scoped child model sessions
+  exposed to a subagent orchestrator extension.
+- Keep artifact, policy, approval, and secret services generic while wiring
+  product-specific adapters without adding domain managers.
 
-### Phase 3 — common managed services
+### Phase 3 — proving extensions
 
-- Build the reusable service supervisor and native MCP manager.
-- Add direct LSP management using the same process/health primitives but LSP's
-  native cancellation/document semantics.
-- Support declarative package contributions for MCP discovery and language
-  server descriptors without proxying their protocols through `tool/call`.
+- Build `ygg-mcp` as the live-catalog proof: one extension, multiple MCP
+  servers, dynamic publication, and generation-safe reconnect.
+- Use the migrated API `0.2` Caffeinate example as the terminal-lifecycle and
+  subprocess-ownership proof; no core inhibitor remains.
+- Ship web search, browser, computer use, memory, LSP, and subagent orchestration
+  as independent extensions, composing only through declared tools and generic
+  host services.
 
-### Phase 4 — BrowserUse
+### Phase 4 — breadth without kernel growth
 
-- Ship a trusted Playwright/CDP sidecar/provider and host Browser manager.
-- Add semantic snapshots, generation-scoped handles, post-action observations,
-  screenshots/artifacts, task isolation, confirmations, and reaping.
-- Add pixel/CUA fallback only after semantic actions and safety evaluation are
-  reliable.
-
-### Phase 5 — automatic memory and provider breadth
-
-- Add root-session extraction/consolidation with provenance, pruning, privacy
-  controls, and evaluation.
-- Add replaceable memory/search/browser providers after the built-in contract is
-  stable.
-- Expand WebSearch commands and MCP/LSP operations based on observed use, not
-  speculative parity.
+- Expand domain behavior inside the owning extensions based on observed use.
+- Keep browser, computer use, web search, hosted agents, and in-harness
+  subagents distinct in permissions, state, and product language.
+- Reject proposals that require the host to understand a capability's external
+  protocol when the JSON-RPC bus and generic brokers are sufficient.
 
 ## Verification gates
 
@@ -1035,25 +1160,42 @@ explicitly.
 - Concurrent calls receive only their own progress, input, confirmations, and
   artifacts.
 - Inline and scratch artifacts reject oversize data, bad digest/MIME, absolute
-  paths, traversal, links, replacement races, and stale generations.
+  paths, traversal, links, replacement races, stale generations, and resolution
+  by a different session owner.
 - Every terminal frontend path emits one outcome and releases every owned lease.
 - Reload never exposes a half-built registry or aliases stale handles.
+- Dynamic registration/replacement/removal is transactional; a model request
+  uses the exact schema and handler snapshot it was shown.
+- Per-process catalog epochs reset only at a new generation, and an old
+  in-flight turn either reaches its pinned handler or gets a deterministic
+  retired-revision error.
+- Unexpected child exit removes dead tools, retries with bounded jittered
+  backoff, and parks after the tested restart budget without racing shutdown or
+  manual reload.
+- Agent-session calls are scoped to the requesting extension principal;
+  idempotent spawn cannot duplicate a child and one extension cannot address
+  another extension's children.
 
 ### Security
 
 - Missing/false/malformed provider and MCP hints cannot lower host risk.
-- Stale or differently hashed approval intents cannot reuse a token/rule.
+- Approval retry succeeds once only for the canonical original intent under the
+  same active owner/parent and generation; mismatch, expiry, and reuse deny.
 - Headless unresolved approval is denial.
+- Secret lookup rejects names outside the exact manifest allowlist, supplies
+  full host-derived principal/owner/parent context to the broker, and collapses
+  no-value/provider failures to the same unavailable response.
 - SSRF tests cover IPv4/IPv6 loopback/private/link-local/metadata, alternate IP
   forms, mixed DNS answers, redirect pivots, rebinding/pinning, and proxy mode.
 - Browser page text and MCP descriptions cannot inject policy decisions.
 - Secrets do not appear in progress, diagnostics, screenshots, session exports,
-  telemetry, or memory.
+  telemetry, or memory; host buffers are best-effort wiped without claiming
+  end-to-end process-memory zeroization.
 
 ### Capability-specific
 
-- Caffeinate releases on success, model error, tool error, user cancel,
-  frontend disconnect, panic/drop simulation, and host shutdown.
+- The caffeinate extension releases on success, model error, tool error, user
+  cancel, frontend disconnect, process crash/restart, and host shutdown.
 - Web citations remain stable across search/open/cache and provider adapters.
 - Browser cancellation invalidates only the necessary resource and never
   retries an ambiguous consequential action.
@@ -1073,19 +1215,20 @@ at least the Python SDK and a deliberately adversarial raw JSON-RPC child.
 ## Protocol-reference discrepancies resolved in this pass
 
 The following mismatches were observed before the 2026-08-16 contract-document
-correction. The canonical prose now describes the inspected API `0.1` runtime;
+correction. The canonical prose now describes both the frozen API `0.1` runtime
+and the implemented API `0.2` contract;
 the rows remain here as an audit record and as conformance-test requirements:
 
 | Topic | Previous documentation | Inspected runtime | Resolution |
 | --- | --- | --- | --- |
 | Initialization contributions | Protocol reference said a process could omit a manifest-declared tool/command | `ensure_same_contributions` requires exact, duplicate-free set equality | Reference now requires exact duplicate-free name sets; SDK guide already did |
 | Hook payloads | `after_response` documented `message_id`; tool hooks documented `tool` | Product sends `{response}`; tool hooks send `name`, and `after_tool_call` also sends `arguments` | Reference and SDK guide now list the serialized runtime payloads |
-| Terminal hook | Name and examples suggested a general response lifecycle | `after_response` is invoked only after successful complete responses in inspected frontend paths | API `0.1` success-only behavior is explicit; `turn_settled` remains an API `0.2` requirement |
+| Terminal hook | Name and examples suggested a general response lifecycle | `after_response` is invoked only after successful complete responses in inspected frontend paths | API `0.1` success-only behavior is explicit; API `0.2` uses `turn/settled` |
 | Tool metadata | Described as retained for frontend/renderer use | `ProcessTool` discards `metadata` when constructing `ToolOutput` | API `0.1` docs now say it is accepted but discarded, with no retention guarantee |
 | Confirmation string ID | Reference said at most 64 bytes | Runtime accepts up to 256 bytes | Reference and SDK guide now specify 256 UTF-8 bytes |
 | Shutdown timing | Reference listed one 3-second grace | `ExtensionRuntimeConfig` defaults to 2 seconds per connection stage; normal product shutdown also has a separate 3-second aggregate deadline, while coordinated-signal exits impose a 1.4-second outer cap before force-kill | Reference now names both normal 2-second stages, the normal 3-second aggregate deadline, and the 1.4-second signal fast path |
 | Shutdown signal | Reference header said the host closes stdin | Runtime first sends a JSON-RPC `shutdown` request, waits, then terminates as needed | Reference and SDK guide now document request/ack/exit/kill ordering; stdin EOF is loss/final teardown |
-| Contact policies | `permanent`, `on_demand`, `auto_permanent`, and `tool_execute` were listed | No manifest field or dispatch implementation was found; enabled/trusted processes start during product construction | Unsupported policies were removed; the single resident API `0.1` lifetime is documented |
+| Contact policies | `permanent`, `on_demand`, `auto_permanent`, and `tool_execute` were listed | No manifest field or dispatch implementation was found; enabled/trusted processes start during product construction | Unsupported policies were removed; the single resident contact policy and generic crash supervisor are documented |
 | Manifest limit | Shared resource docs listed only 256 KiB | Product resolver uses its 256 KiB resource bound then parses; direct `ExtensionManifest::load` defaults to 64 KiB | Both layers and the actual product path are now named |
 | Caffeinate parent binding | Example README said `-w` bound the inhibitor to the extension PID | Example command uses `-i -t 1800` and no `-w` | README now documents timeout plus explicit cleanup without claiming PID binding |
 
@@ -1098,9 +1241,12 @@ serialized fixtures where practical.
 - Do not add more success-only hooks and use them as resource cleanup.
 - Do not call a generic confirmation API "enforced" for unsandboxed code.
 - Do not implement BrowserUse as a fresh one-shot tool process.
-- Do not merge search retrieval and mutable browser control into one manager.
-- Do not proxy MCP or LSP through generic extension tool calls.
-- Do not let a subprocess own child-agent conversations or global budgets.
+- Do not merge search retrieval, browser control, and computer use into one
+  authority boundary.
+- Do not add MCP or LSP protocol managers to the Ygg host; keep each in its
+  long-lived extension and publish model tools over JSON-RPC.
+- Do not let a subagent-orchestrator extension access the global conversation
+  registry or widen budgets; give it a scoped host service instead.
 - Do not let memory providers append arbitrary prompt context every turn.
 - Do not inline screenshots/audio into the 1 MiB JSON control channel by
   default.
@@ -1114,10 +1260,11 @@ serialized fixtures where practical.
 
 - Repository root commit:
   `84c2fb8b654b107e869ed9b8add29b3a50043e60`; workspace version `0.4.0`.
-- The worktree was dirty during inspection. In particular,
+- The worktree was dirty during inspection. In particular, the tracked
   `crates/ygg-agent/src/delegation.rs` and
-  `crates/ygg-agent/tests/delegation.rs` were untracked. Their V2 design informed
-  the recommendation but is not attributed to the commit or treated as shipped.
+  `crates/ygg-agent/tests/delegation.rs` contain working-tree changes beyond the
+  repository-root commit. Their V2 implementation informs the working-tree
+  status above but is not attributed to that commit or treated as shipped.
 - Primary implementation:
   - `crates/ygg-agent/src/extension_process.rs`
   - `crates/ygg-agent/src/extension.rs`
@@ -1261,8 +1408,11 @@ serialized fixtures where practical.
 
 ## Final recommendation
 
-Do not build seven independent generic subprocess tools. First make Ygg's
-transport and terminal lifecycle trustworthy, then build host managers with
-narrow replaceable seams. That preserves the language-agnostic extension API
-without outsourcing the invariants that make WebSearch, BrowserUse, MCP, LSP,
-Subagents, Memory, and Caffeinate safe and pleasant as daily drivers.
+Build the small, bulletproof agent kernel and let independent long-lived
+extensions own every capability above it. Any language can participate through
+the same JSON-RPC bus. Dynamic catalogs let `ygg-mcp` and similar bridges
+publish what they discover; stable ownership and supervision isolate their
+state; scoped host services let an orchestrator create child model sessions
+without moving orchestration into core. The extra local hop is a deliberate
+trade for replaceability, failure isolation, and a host whose responsibilities
+stay easy to name.

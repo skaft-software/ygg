@@ -205,9 +205,13 @@ startup-only stderr.
 Authenticated Codex discovery sends client version `0.147.0` and parses the
 provider's reasoning levels, `use_responses_lite`, and
 `multi_agent_version: "v2"`. Cache schema version 2 preserves those fields and
-is scoped to the authenticated account context. Missing, stale, malformed, or
-offline metadata falls back conservatively: Ygg does not infer Ultra, Responses
-Lite, or delegation from model names or OAuth plans.
+is scoped to the authenticated account context. Only fresh, complete,
+account-matched metadata is registered. Stale or future-dated cache entries are
+refreshed synchronously before online catalog construction; malformed,
+incomplete, duplicate, or inconsistent entries fail closed. Offline launches
+may retain fresh cached model identities and limits but strip Ultra, Responses
+Lite, and delegation. Ygg never infers those dynamic capabilities from model
+names or OAuth plans.
 
 Ultra is selectable only when the selected model advertises the `ultra` effort
 and V2 delegation and the linked `ygg-agent` host reports an executable V2
@@ -216,7 +220,9 @@ delegation” when only the model-side label is present. The legacy persisted
 `ReasoningMode::Pro` value remains readable for durable sessions, but no picker
 or new configuration writes it and no codec serializes `reasoning.mode`.
 Eligible legacy selections migrate at startup to Ultra; ineligible ones retain
-their effort with Pro cleared and a warning.
+their effort with Pro cleared and a warning. At every idle rebuild boundary, an
+explicit effort selection likewise supersedes and clears any restored legacy
+Pro bit unless the caller explicitly selected a mode.
 
 Routes advertising Responses Lite use the transport contract implemented by
 `ygg-ai`, including its ordinary and compact request shapes. This product layer

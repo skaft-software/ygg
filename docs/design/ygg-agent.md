@@ -29,38 +29,50 @@ also instructs the root to use sub-agents when parallel work would materially
 improve speed or quality and to verify child results before integrating them.
 
 Each child has a stable ID and ancestry path, an isolated append-only `Session`,
-and its own agent loop. It inherits the approved extension host/tool set,
-sandbox, model, reasoning and cache settings, compaction model/policy,
-completion policy, output modalities, retry policy, turn limit, and session cost
-ceiling. Children can message peers, steer active work, queue messages for an
-idle worker, receive follow-up runs, wait without lost notifications, and spawn
-within the remaining depth and concurrency bounds.
+and its own agent loop. It inherits the effective root system prompt at spawn
+time, approved extension host/tool set, sandbox, model, reasoning and cache
+settings, compaction model/policy, completion policy, output modalities, resolved
+output-token limit, retry policy, turn limit, and session cost ceiling. Children
+can message peers, steer active work, queue messages for an idle worker, receive
+follow-up runs, wait without lost notifications, and spawn within the remaining
+depth and concurrency bounds.
 
 The default team limit is four concurrent agents including the root, depth two,
-and sixteen total agents including the root over the team's lifetime. Host
+and sixteen total agents including the root during each owning run. Host
 validation permits 2–32 concurrent agents, depth 1–8, and at most 256 total,
 with total capacity never below concurrent capacity. A semaphore and ancestry
 checks enforce those limits independently of model behavior; an idle worker is
 reserved as `Pending` before a follow-up is published so concurrent follow-ups
 cannot start overlapping runs. Each worker command channel is capped at 32;
 the accepted follow-up backlog is capped at 32 messages and 4,325,376 bytes.
-Pending direct messages are capped at 96 and 4,325,376 bytes per child,
-including in-flight steering reservations; overflow is rejected before
-provenance is written rather than evicting accepted work.
+Accepted steering and follow-up reservations remain charged until the child
+emits its durable delivery acknowledgement. Direct messages moved into a child
+prompt likewise remain reserved until the prompt append succeeds; a failed append
+restores them at the front. Failure, interruption, and control backpressure
+requeue unacknowledged work in FIFO order rather than releasing or discarding it.
+Pending direct messages are capped at 96 and 4,325,376 bytes per child, including
+in-flight and prompt-delivery reservations; overflow and inputs above the 128 KiB
+durable-text limit are rejected before provenance is written rather than evicting
+or truncating accepted work.
 Agent mailboxes retain at most 64 messages and 1 MiB; automatic status
-notifications evict only the oldest automatic notifications when necessary and
-are dropped when no such entry can be evicted. Accepted direct messages are
-never evicted, and direct messages to a full root mailbox are rejected.
-Concurrent `wait_agent` calls are
-capped at the configured total-agent limit and released by cancellation-safe
-RAII guards.
+notifications evict only the oldest unleased automatic notifications when
+necessary and are dropped when no such entry can be evicted. Accepted direct
+messages are never evicted, and direct messages to a full root mailbox are
+rejected. `wait_agent` leases a UTF-8-safe bounded page and exposes continuation
+metadata when one message spans pages. The lease commits only after the complete,
+untruncated tool result is durably appended to the owning agent's session;
+cancellation, persistence failure, serialization failure, or generic output
+truncation restores the page. Concurrent `wait_agent` calls are capped at the
+configured total-agent limit and released by cancellation-safe RAII guards.
 
 Delegation state is stored under a descriptor-bound, owner-only random team
 directory. `provenance.jsonl` records `team_started`, `agent_spawned`,
 `agent_status`, `message`, `interrupt_requested`, and `team_shutdown`; child
 session files and the journal are private. Directory allocation, child-session
-creation, and cleanup are descriptor-relative and no-follow. Every spawn,
-message, follow-up, status transition, and interrupt is appended and
+creation, activation rollback, and cleanup are descriptor-relative and no-follow;
+a failed activation removes only its exact empty private team directory and
+reports both activation and rollback failures if cleanup cannot complete. Every
+spawn, message, follow-up, status transition, and interrupt is appended and
 `sync_data`-ed before delivery or visible state mutation. If append or sync
 fails, the manager records a visible persistence diagnostic, rejects new work,
 and cancels every worker rather than operating without provenance.

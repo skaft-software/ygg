@@ -352,7 +352,7 @@ Reasoning is collapsed by default while remaining available with `Ctrl+O`. Durin
 
 ```text
 • Verifying the implementation
-  ⎿ (ctrl+o to expand)
+  └ (ctrl+o to expand)
 ```
 
 Event-margin dots identify active collapsed reasoning, assistant responses, and tool or shell execution. The collapsed-reasoning dot blinks; other active dots pulse through foreground and muted tones without changing glyph size. Successful completed events use green, and failed tools use red.
@@ -383,13 +383,19 @@ Ygg build can execute. Selecting it installs six collaboration tools
 materially improve speed or quality.
 
 One Ultra team defaults to four concurrent agents including the root, depth two,
-and sixteen total agents over its lifetime. Children use isolated durable
-sessions, inherit the root's approved tools, sandbox, model, reasoning,
-compaction, completion, output, retry, and cost policies, and are cancelled with
-their descendants when the owning run stops. Team state lives under the session
+and sixteen total agents during each owning run. Children use isolated durable
+sessions and inherit the root's effective current prompt, approved tools,
+sandbox, model, reasoning, compaction, completion, output, resolved output-token,
+retry, turn, and cost policies. Accepted tasks, direct messages, and follow-ups
+are rejected on overflow instead of being truncated or evicted; interruption and
+run failure preserve unacknowledged work in FIFO order. Bounded `wait_agent`
+pages stay leased until their complete tool result is durably recorded, then use
+UTF-8-safe continuation pages as needed. Children and their descendants are
+cancelled when the owning run stops. Team state lives under the session
 directory's private `.delegation/team-*` tree with a synced
 `provenance.jsonl`; persistence failure stops the team rather than continuing
-without an audit trail.
+without an audit trail, and failed activation securely removes its empty private
+team directory.
 
 Token-budget reasoning is also available for compatible models with
 `--reasoning budget=N`.
@@ -631,7 +637,29 @@ Skills are explicit, inspectable capability packages. ygg discovers metadata, ac
 
 ### Executable extensions
 
-Extensions are JSON-RPC processes over bounded line-delimited frames. Discovery does not execute code. An extension must be enabled and its exact source must independently be trusted; a project configuration cannot grant trust to itself. Replacement processes must handshake successfully before reload swaps them into service. Python extensions can use the dependency-free [`ygg-extension-sdk`](sdk/python/README.md) instead of reimplementing the protocol loop.
+Ygg is a small agent kernel and JSON-RPC bus. MCP bridges, browsers, web search,
+computer use, memory, LSP, subagent orchestration, and caffeinate belong in
+replaceable subprocess extensions; the host owns the model loop, bounded
+transport, sessions, permissions, process cleanup, and generic host services
+that extensions need in order to run.
+
+Extensions speak bounded line-delimited JSON-RPC. API `0.2` supports live tool
+registration/removal, frozen per-model-request catalog snapshots, optional
+host-owned child-agent sessions, durable session/process ownership, artifact
+publication, policy intents with optional single-use approvals,
+manifest-allowlisted owner-scoped secret lookup, and crash restart with bounded
+backoff after a successful handshake. The coding product currently leaves
+approval issuance and secret brokerage unconfigured, so policy requests remain
+default-deny and `secrets` is not offered. Replacement processes must initialize
+successfully before cutover. Python extensions can use the dependency-free
+[`ygg-extension-sdk`](sdk/python/README.md) instead of reimplementing the
+protocol loop.
+
+Discovery does not execute code. An extension must be enabled and its exact
+source independently trusted; a project configuration cannot grant trust to
+itself. Trusted extensions still run with the launching user's OS authority.
+Initial handshake failures and hung-but-open processes are not yet supervised,
+and a full application rebuild currently recreates extension processes.
 
 Start with [examples/README.md](examples/README.md), then read [docs/resources.md](docs/resources.md) and [docs/extensions.md](docs/extensions.md).
 
@@ -659,7 +687,9 @@ flowchart LR
     Agent --> AI["ygg-ai"]
     AI --> Local["Local OpenAI-compatible servers"]
     AI --> Cloud["Cloud providers"]
-    Agent --> Tools["Bounded tools + extensions"]
+    Agent --> Bus["JSON-RPC extension bus"]
+    Bus --> Extensions["MCP · browser · web · LSP · memory · agents · caffeinate"]
+    Agent --> Tools["Bounded host tools"]
     Agent --> Sessions["Append-only branchable sessions"]
     Product --> Resources["Prompts · skills · themes · instructions"]
 ```
@@ -670,7 +700,12 @@ The provider-independent inference crate owns canonical messages, media, tools, 
 
 ### `ygg-agent`
 
-The agent runtime owns sessions, context reconstruction, compaction, tool execution, steering, follow-ups, cancellation, retries, checkpoints, usage records, cache accounting, the frontend event stream, and the bounded V2 delegation runtime with isolated child sessions and durable provenance.
+The agent runtime is the kernel: it owns sessions, model conversations, context
+reconstruction, compaction, tool execution, steering, cancellation, retries,
+checkpoints, usage records, cache accounting, the frontend event stream,
+extension transport/supervision, and bounded child-session services. The
+current native V2 delegation runtime is a transitional consumer of those child
+sessions; domain-specific orchestration belongs behind the extension boundary.
 
 ### `ygg-coding-agent`
 
