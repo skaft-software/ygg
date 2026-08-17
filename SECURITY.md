@@ -17,7 +17,7 @@ Ygg nevertheless treats its own policy and persistence boundaries as security in
 - Explicit built-in file paths are workspace-only by default. Unix file reads and mutations use descriptor-relative, no-follow operations so validation cannot be redirected by a parent-symlink replacement.
 - Project `.ygg/config.toml`, workspace `AGENTS.md`, and workspace skills are ignored unless the user passes `--workspace-trusted`.
 - Trusted project settings may tighten global authority/resource floors but cannot relax them. Environment and explicit CLI settings remain user-controlled higher-trust layers.
-- Every model-requested tool call passes through a host-owned effect broker. The default Controlled policy forces built-in file operations to workspace-relative paths, permits pure and workspace-read effects, requires a one-shot interactive approval for workspace mutation, auto-approves a conservative allowlist of known-safe read-only `bash` commands, and requires one-shot approval for all remaining `bash` host-process calls. It also prevents executable-extension process startup itself, regardless of the lower-level process/shell gates. `--unsafe` (also `--unsafe-bash`) uses a stricter controlled mode where every `bash` call needs confirmation, while `--unsafe-host-effects` / `unsafe_host_effects = true` / `YGG_UNSAFE_HOST_EFFECTS=true` opts into ambient host authority; trusted project config cannot grant that opt-in. Workspace-mutation grants bind the exact principal, run, catalog generation, provider call ID, tool, classification, arguments, and policy version; they are short-lived, atomically single-use, reserved before hooks, and consumed immediately before execution.
+- Every model-requested tool call passes through a host-owned effect broker. By default, ygg uses `--safe`/`ControlledBashApproval`, requiring interactive approval for workspace mutation and every `bash` process call while still denying other ambient host/process/network/delegation/extension effects. `--yolo` switches to `UnsafeHost`, which retains ambient authority for authoritatively classified effects that pass remaining gates. Workspace-mutation grants bind the exact principal, run, catalog generation, provider call ID, tool, classification, arguments, and policy version; they are short-lived, atomically single-use, reserved before hooks, and consumed immediately before execution.
 - Context/config/credential files must be bounded regular files. Workspace context symlinks and special files are rejected.
 - Disabled tools are removed from both the provider schema and execution registry. `--no-edit` disables `edit` and `write`; `--tools read,search` and `--no-tools` provide complete allowlisting.
 - Arbitrary process execution and shell execution are treated as equivalent authority. `bash` requires both compatibility gates, and in `Controlled` mode only safe read-only commands are auto-approved by default while all others need explicit approval.
@@ -33,16 +33,16 @@ Ygg nevertheless treats its own policy and persistence boundaries as security in
 - Run cancellation reaches provider streaming, retry waits, tools, and autonomous compaction. Once cancellation wins a request race, no summary or usage record from that request is committed.
 
 These controls reduce accidental authority and defend documented Ygg boundaries.
-Controlled is an admission policy, not full malicious-worker containment: permitted
+`--safe` is an admission policy, not full malicious-worker containment: permitted
 workspace reads can enter provider-visible context, approved mutations affect the
 live workspace, and Ygg does not yet provide overlay promotion, information-flow
 labels, a native-code isolation backend, or a dedicated egress/secret broker.
-Controlled denies most effect classes that require those missing boundaries; in
-its default mode safe read-only `bash` commands are auto-approved while other host
-process calls require explicit confirmation, and `--unsafe` requires confirmation
-for every `bash` call. They do not contain an effect admitted by the unsafe-host
-opt-in. In particular, an admitted `bash` call can read credentials, access the
-network, and start descendants with the user's authority.
+In its stricter mode, `--safe` requires explicit confirmation for every host
+process call and all file effects remain workspace constrained unless explicitly
+widened by config. These controls do not contain an effect admitted by the
+unsafe-host opt-in (`--yolo`); in particular, an admitted `bash` call under
+`--safe` can still read credentials, access the network, and start descendants
+with the user's authority if no additional policy prevents it.
 
 ## Recommended untrusted-repository workflow
 

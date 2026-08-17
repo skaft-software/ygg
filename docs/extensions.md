@@ -69,12 +69,13 @@ Executable extensions are intentionally a local tinkerer feature. Capability
 declarations are visible consent metadata, not an operating-system sandbox.
 Discovery remains available under every effect policy, but process startup
 requires all three independent gates: enablement, an exact trust grant, and the
-explicit `UnsafeHost` opt-in (`--unsafe-host-effects`,
-`unsafe_host_effects = true`, or `YGG_UNSAFE_HOST_EFFECTS=true`). `Controlled`
-never starts an executable extension, even when the process/shell sandbox flags
-are enabled, and reports that blocked startup in `/extensions`. An admitted
-extension runs as the current user, so use UnsafeHost only inside separate
-OS-level isolation.
+explicit `UnsafeHost` opt-in (`--yolo`, `yolo = true`, or `YGG_YOLO=true`).
+Legacy `--unsafe-host-effects` / `unsafe_host_effects = true` /
+`YGG_UNSAFE_HOST_EFFECTS=true` are still accepted for compatibility.
+`Controlled` never starts an executable extension, even when the process/shell
+sandbox flags are enabled, and reports that blocked startup in `/extensions`. An
+admitted extension runs as the current user, so use UnsafeHost only inside
+separate OS-level isolation.
 
 ## Layout and discovery
 
@@ -98,7 +99,7 @@ discovery and trust; aliases are rejected with a diagnostic.
 Use repeatable command-line options for one-off tinkering:
 
 ```console
-ygg --unsafe-host-effects \
+ygg --yolo \
     --extension-dir ./my-extensions \
     --enable-extension hello-world \
     --trust-extension hello-world
@@ -108,7 +109,7 @@ Or persist activation in the user config:
 
 ```toml
 # Unsafe: use only inside separate OS-level isolation.
-unsafe_host_effects = true
+yolo = true
 enabled_extensions = ["hello-world"]
 trusted_extensions = ["hello-world"]
 ```

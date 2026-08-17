@@ -170,14 +170,14 @@ pub struct Cli {
     /// Trust this workspace and load its project config, AGENTS.md, and skills.
     #[arg(long = "workspace-trusted", alias = "trust-workspace")]
     pub workspace_trusted: bool,
-    /// UNSAFE: use ambient host authority for classified effects and start
-    /// trusted executable extensions. Use only inside OS-level isolation.
+    /// Enable YOLO mode: classified effects and executable extensions run with
+    /// ambient host authority. Use only inside OS-level isolation.
     #[arg(long)]
-    pub unsafe_host_effects: bool,
-    /// In controlled mode, also require explicit approval for every `bash` call.
-    /// This keeps `bash` aligned with command-approval gating behavior.
-    #[arg(long = "unsafe", alias = "unsafe-bash")]
-    pub unsafe_bash: bool,
+    pub yolo: bool,
+    /// Require approval for every bash call, while keeping all other policy
+    /// boundaries on for workspace-relative and ambient host effects.
+    #[arg(long = "safe", conflicts_with = "yolo")]
+    pub safe: bool,
     /// Load only these tools (comma-separated).
     #[arg(long, value_name = "NAMES", value_delimiter = ',', num_args = 1..)]
     pub tools: Option<Vec<String>>,
@@ -248,6 +248,7 @@ struct ConfigLayer {
     color: Option<String>,
     mouse: Option<String>,
     plain: Option<bool>,
+    #[serde(alias = "yolo")]
     unsafe_host_effects: Option<bool>,
     allow_external_paths: Option<bool>,
     allow_edit: Option<bool>,
@@ -358,8 +359,8 @@ impl ConfigLayer {
             }
         }
 
-        // Ambient host effects are opt-in. A project may revoke a user grant,
-        // but may never create host authority when the user/global layer omitted it.
+        // YOLO is opt-in. A project may revoke a user grant, but may never
+        // create host authority when the user/global layer omitted it.
         if project.unsafe_host_effects.take() == Some(false) {
             self.unsafe_host_effects = Some(false);
         }
@@ -601,6 +602,7 @@ const CONFIG_KEYS: &[&str] = &[
     "color",
     "mouse",
     "plain",
+    "yolo",
     "unsafe_host_effects",
     "allow_external_paths",
     "allow_edit",
@@ -856,7 +858,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         color: env_value("YGG_COLOR"),
         mouse: env_value("YGG_MOUSE"),
         plain: env_parse("YGG_PLAIN")?,
-        unsafe_host_effects: env_parse("YGG_UNSAFE_HOST_EFFECTS")?,
+        unsafe_host_effects: env_parse("YGG_YOLO")?.or(env_parse("YGG_UNSAFE_HOST_EFFECTS")?),
         allow_external_paths: env_parse("YGG_ALLOW_EXTERNAL_PATHS")?,
         allow_edit: env_parse("YGG_ALLOW_EDIT")?,
         allow_write: env_parse("YGG_ALLOW_WRITE")?,
@@ -978,12 +980,12 @@ fn build_config_with_global_path(
         None => config::MouseMode::Auto,
     };
     let system_prompt = cli.system_prompt.or(values.system_prompt);
-    let effect_policy = if cli.unsafe_host_effects || values.unsafe_host_effects.unwrap_or(false) {
-        ygg_agent::EffectPolicy::UnsafeHost
-    } else if cli.unsafe_bash {
+    let effect_policy = if cli.safe {
         ygg_agent::EffectPolicy::ControlledBashApproval
+    } else if cli.yolo || values.unsafe_host_effects.unwrap_or(false) {
+        ygg_agent::EffectPolicy::UnsafeHost
     } else {
-        ygg_agent::EffectPolicy::Controlled
+        ygg_agent::EffectPolicy::ControlledBashApproval
     };
 
     let mut sandbox = SandboxPolicy::default();
@@ -1251,8 +1253,8 @@ mod tests {
             enable_extensions: vec![],
             trust_extensions: vec![],
             workspace_trusted: false,
-            unsafe_host_effects: false,
-            unsafe_bash: false,
+            yolo: false,
+            safe: false,
             tools: None,
             exclude_tools: vec![],
             no_tools: false,
@@ -1375,70 +1377,77 @@ mod tests {
     }
 
     #[test]
-    fn effect_policy_is_controlled_by_default_and_unsafe_cli_opt_in_is_explicit() {
+    fn effect_policy_is_safe_by_default_and_yolo_cli_opt_in_is_explicit() {
         let directory = cwd();
         let mut cli = base();
-        cli.workspace = Some(directory.path().into());
-        let config = config_with_empty_global(cli, directory.path()).unwrap();
-        assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::Controlled);
-
-        let mut cli = Cli::try_parse_from(["ygg", "--unsafe-host-effects"]).unwrap();
-        assert!(cli.unsafe_host_effects);
-        cli.workspace = Some(directory.path().into());
-        let config = config_with_empty_global(cli, directory.path()).unwrap();
-        assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::UnsafeHost);
-        assert!(config.sandbox.allow_external_paths);
-    }
-
-    #[test]
-    fn unsafe_bash_cli_opt_in_is_stricter_than_default_controlled() {
-        let directory = cwd();
-
-        let mut cli = Cli::try_parse_from(["ygg", "--unsafe"]).unwrap();
-        assert!(cli.unsafe_bash);
         cli.workspace = Some(directory.path().into());
         let config = config_with_empty_global(cli, directory.path()).unwrap();
         assert_eq!(
             config.effect_policy,
             ygg_agent::EffectPolicy::ControlledBashApproval
         );
+        assert!(!config.sandbox.allow_external_paths);
 
-        let mut cli = Cli::try_parse_from(["ygg", "--unsafe", "--unsafe-host-effects"]).unwrap();
-        assert!(cli.unsafe_bash);
-        assert!(cli.unsafe_host_effects);
+        let mut cli = Cli::try_parse_from(["ygg", "--yolo"]).unwrap();
+        assert!(cli.yolo);
         cli.workspace = Some(directory.path().into());
         let config = config_with_empty_global(cli, directory.path()).unwrap();
         assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::UnsafeHost);
+        assert!(config.sandbox.allow_external_paths);
     }
 
     #[test]
-    fn controlled_effect_policy_forces_workspace_only_paths() {
+    fn safe_cli_opt_in_uses_safe_profile() {
+        let directory = cwd();
+
+        assert!(Cli::try_parse_from(["ygg", "--safe", "--yolo"]).is_err());
+
+        let mut cli = Cli::try_parse_from(["ygg", "--safe"]).unwrap();
+        assert!(cli.safe);
+        cli.workspace = Some(directory.path().into());
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(
+            config.effect_policy,
+            ygg_agent::EffectPolicy::ControlledBashApproval
+        );
+    }
+
+    #[test]
+    fn safe_effect_policy_forces_workspace_only_paths() {
         let directory = cwd();
         assert!(SandboxPolicy::default().allow_external_paths);
 
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
         let config = config_with_empty_global(cli, directory.path()).unwrap();
-        assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::Controlled);
+        assert_eq!(
+            config.effect_policy,
+            ygg_agent::EffectPolicy::ControlledBashApproval
+        );
         assert!(!config.sandbox.allow_external_paths);
 
         let global = directory.path().join("global.toml");
         std::fs::write(&global, "allow_external_paths = true\n").unwrap();
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
+        cli.safe = true;
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(
+            config.effect_policy,
+            ygg_agent::EffectPolicy::ControlledBashApproval
+        );
         assert!(!config.sandbox.allow_external_paths);
 
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
-        cli.unsafe_host_effects = true;
+        cli.yolo = true;
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
         assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::UnsafeHost);
         assert!(config.sandbox.allow_external_paths);
     }
 
     #[test]
-    fn trusted_project_cannot_grant_unsafe_host_effect_authority() {
+    fn trusted_project_cannot_grant_yolo_authority() {
         let directory = cwd();
         let global = directory.path().join("global.toml");
         std::fs::write(&global, "unsafe_host_effects = false\n").unwrap();
@@ -1450,7 +1459,10 @@ mod tests {
         cli.workspace = Some(directory.path().into());
         cli.workspace_trusted = true;
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
-        assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::Controlled);
+        assert_eq!(
+            config.effect_policy,
+            ygg_agent::EffectPolicy::ControlledBashApproval
+        );
 
         std::fs::write(&global, "unsafe_host_effects = true\n").unwrap();
         let mut cli = base();
@@ -1464,12 +1476,15 @@ mod tests {
         cli.workspace = Some(directory.path().into());
         cli.workspace_trusted = true;
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
-        assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::Controlled);
+        assert_eq!(
+            config.effect_policy,
+            ygg_agent::EffectPolicy::ControlledBashApproval
+        );
 
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
         cli.workspace_trusted = true;
-        cli.unsafe_host_effects = true;
+        cli.yolo = true;
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
         assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::UnsafeHost);
     }

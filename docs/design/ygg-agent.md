@@ -23,7 +23,7 @@ Workspace-mutation approval creates a random, short-lived capability bound to th
 
 Sequential, parallel, and crash-recovery dispatch all use this boundary. Static `ToolConcurrency::Parallel` and `ReplaySafety::Safe` declarations are intersected with the exact host classification: only `Pure` and `WorkspaceRead` calls may run in a parallel batch or be replayed after a crash. A denied call is returned to the provider as a paired tool error without invoking hooks or executable code.
 
-The broker is a deterministic admission reference monitor, not an OS sandbox. Controlled intentionally denies effect classes that still lack isolation or dedicated brokers, while allowing safe read-only `bash` commands through the `Controlled` process channel; `--unsafe` is the stricter controlled profile that confirms every `bash` call. UnsafeHost commands and executable extensions retain the Ygg process's ambient user authority.
+The broker is a deterministic admission reference monitor, not an OS sandbox. Controlled intentionally denies effect classes that still lack isolation or dedicated brokers, while allowing safe read-only `bash` commands through the `Controlled` process channel; `--safe` is the stricter controlled profile that confirms every `bash` call. `yolo` mode (`--yolo`) maps to `UnsafeHost`, where classified command and process effects use ambient host authority.
 
 ## Sessions
 

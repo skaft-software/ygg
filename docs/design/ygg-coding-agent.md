@@ -122,20 +122,20 @@ recomputes the reserve from `agent.system_prompt()` and
 `agent.registered_tool_definitions()` so its instructions and schemas count.
 A consuming rebuild drops the old Agent before reopening its session, so only
 one append handle owns a session file. Every Agent also receives a product-owned
-`EffectBroker`. Its default `Controlled` policy forces the effective sandbox to
-workspace-only file paths, allows pure/workspace-read effects, requires exact
-one-shot interactive approval for workspace mutation, auto-approves a conservative
-safe read-only `bash` command allowlist while requiring one-shot approval for
-other `bash` process calls, and denies other ambient host/process, network,
-delegation, and extension effects. A stricter controlled mode (`--unsafe`) keeps
-those same gates but requires one-shot approval for every `bash` process call.
+`EffectBroker`. Its safer default uses `--safe`/`ControlledBashApproval`, where
+workspace mutation and every `bash` process call are approved interactively, while
+other ambient host/process, network, delegation, and extension effects remain
+denied. `--yolo` mode resolves to `UnsafeHost` and requires explicit opt-in. It leaves
+classified effects and path access in the current-user class; `yolo = true` (or the
+corresponding `yolo` config/env forms) enables ambient authority.
 Executable-extension startup is gated separately at the product boundary: even
-enabled, trusted extensions are discovered but never launched unless the resolved
-policy is `UnsafeHost` and the existing process/shell gates also permit startup.
-`unsafe_host_effects = true` / `--unsafe-host-effects` is the explicit
-OS-isolation opt-in; trusted project configuration may revoke but never grant
-it. Delegated children inherit the same broker policy through the root's
-delegation template.
+enabled, trusted extensions are discovered but never launched unless the
+resolved policy is `UnsafeHost` and the existing process/shell gates also permit
+startup. `yolo = true` / `--yolo` / `YGG_YOLO=true` is the explicit OS
+isolation opt-in; legacy `unsafe_host_effects`, `--unsafe-host-effects`, and
+`YGG_UNSAFE_HOST_EFFECTS=true` are still accepted as compatibility aliases.
+Delegated children inherit the same broker policy through the root's delegation
+template.
 
 When the normalized effort is Ultra, bootstrap enables proactive V2 delegation
 under a private random team directory inside the session's `.delegation`

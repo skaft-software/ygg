@@ -306,24 +306,21 @@ All three frontends use the same agent loop, provider layer, session format, saf
 
 The model-visible schema and executable registry are built from the same final
 allowlist. A disabled tool cannot remain advertised to the model. Registration
-does not itself authorize an effect: the default `Controlled` policy allows
-pure computation and workspace reads, requires a one-shot interactive approval
-for each workspace mutation, and denies host reads/mutations, network, delegation,
-and executable-extension calls. `bash` is the one process-capable tool still exposed
-in controlled mode, but the effect broker now auto-approves known-safe read-only
-commands and requires one-shot confirmation for the remaining command invocations;
-all other native process effects remain denied. Unknown effects always fail
-closed.
+does not itself authorize an effect: the default `--safe` policy (`ControlledBashApproval`)
+requires workspace-mutation approval and one-shot approval for every `bash` process
+call while denying other ambient host effects. `bash` is the one process-capable tool
+still exposed in all modes, with only `--yolo` lifting to ambient host authority.
+Unknown effects always fail closed.
 
-`--unsafe` requires confirmation for every `bash` host process call in controlled
-mode. `--unsafe-host-effects` explicitly allows every authoritatively classified
-effect that survives the existing tool and sandbox gates and is also required
-before an enabled, trusted executable extension process may start. `Controlled`
-never starts executable extensions. Controlled also forces
-`allow_external_paths = false`, regardless of the legacy broad path default, so
-file admission and execution remain workspace-relative. UnsafeHost uses the Ygg
-process's ambient OS authority and is intended only inside a separately isolated
-account, container, VM, or platform sandbox.
+`--safe` requires confirmation for every `bash` host process call and keeps workspace
+reads/mutations as controlled. `--yolo` explicitly allows every authoritatively
+classified effect that survives the existing tool and sandbox gates and is also
+required before an enabled, trusted executable extension process may start. `--safe`
+also forces `allow_external_paths = false`, regardless of the legacy broad path
+default, so file admission and execution remain workspace-relative. `--yolo` uses
+the Ygg process's ambient OS authority
+and is intended only inside a separately isolated account, container, VM, or
+platform sandbox.
 
 ```sh
 # Read-only review
@@ -339,11 +336,11 @@ ygg --no-process
 ygg --no-tools
 ```
 
-When `--unsafe-host-effects` is explicitly enabled, `bash` runs with the
-authority of the current operating-system user. Like Pi, it passes every complete
-command to one selected shell with `-c`; on Unix Ygg uses an explicit `shell_path`
-first, then `/bin/bash`, `bash` on `PATH`, and finally `sh`. It does not consult
-`$SHELL`. `--no-process` and `--no-shell` remain equivalent authority gates.
+When `--yolo` is explicitly enabled, `bash` runs with the authority of the
+current operating-system user. Like Pi, it passes every complete command to one
+selected shell with `-c`; on Unix Ygg uses an explicit `shell_path` first, then
+`/bin/bash`, `bash` on `PATH`, and finally `sh`. It does not consult `$SHELL`.
+`--no-process` and `--no-shell` remain equivalent authority gates.
 For untrusted repositories, use a container, VM, or restricted account; see
 [SECURITY.md](SECURITY.md).
 
@@ -400,9 +397,9 @@ when the model advertises Ultra effort and a V2 collaboration protocol that this
 Ygg build can execute. Selecting it installs six collaboration tools
 (`spawn_agent`, `followup_task`, `send_message`, `wait_agent`, `list_agents`, and
 `interrupt_agent`) and tells the root agent to delegate when parallel work would
-materially improve speed or quality. The default Controlled effect policy denies
-delegation; executing those tools currently requires the explicit
-`--unsafe-host-effects` isolation opt-in.
+materially improve speed or quality. The default safe policy does not grant
+`delegation`; executing those tools requires explicit opt-in to host authority via
+`--yolo` or equivalent config.
 
 One Ultra team defaults to four concurrent agents including the root, depth two,
 and sixteen total agents during each owning run. Children use isolated durable
@@ -587,11 +584,11 @@ color = "auto"
 mouse = "auto"
 plain = false
 
-# Secure default: keep model-requested effects under Controlled admission.
-# Set true only inside a separately isolated host environment.
-unsafe_host_effects = false
-# Controlled always forces workspace-only file operations. UnsafeHost honors
-# this configured path gate, but true grants current-user path access.
+# Default to the safer --safe policy; opt in with yolo for ambient authority
+# only in isolated hosts.
+yolo = false
+# --safe resolves to workspace-only path semantics. UnsafeHost may retain a
+# configured true value.
 allow_external_paths = false
 allow_edit = true
 allow_write = true
@@ -615,7 +612,7 @@ keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, `YGG_UNSAFE_HOST_EFFECTS`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Unsafe host effects likewise require `unsafe_host_effects = true`, `YGG_UNSAFE_HOST_EFFECTS=true`, or `--unsafe-host-effects`; a trusted project config cannot grant that authority. Controlled always resolves `allow_external_paths` to false; only UnsafeHost can retain a configured true value. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_YOLO`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls (legacy `YGG_UNSAFE_HOST_EFFECTS` and `unsafe_host_effects` remain accepted as compatibility aliases). Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Unsafe host effects require `yolo = true` or `YGG_YOLO=true`; `--safe` is the approval-only mode. A trusted project config cannot grant this opt-in. `--safe` resolves `allow_external_paths` to false; only `--yolo` can retain a configured true value. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
 `reasoning_mode = "pro"`, `YGG_REASONING_MODE=pro`, and
 `--reasoning-mode pro` are accepted only to load legacy configuration and
@@ -633,7 +630,7 @@ warning. New configuration should use `reasoning` alone.
 | Session | `--continue`, `--resume`, `--session-dir`, `sessions ...` |
 | Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
-| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--unsafe` (also `--unsafe-bash`), `--unsafe-host-effects`, `--shell-path` |
+| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--safe`, `--yolo`, `--shell-path` |
 | Limits | `--bash-timeout-secs`, `--max-output-bytes` |
 | Customization | `--theme`, `--theme-dir`, `--system-prompt`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
 

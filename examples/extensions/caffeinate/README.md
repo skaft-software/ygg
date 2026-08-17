@@ -27,7 +27,7 @@ opt-in. For a project extension, one invocation is:
 
 ```console
 ygg --workspace-trusted \
-    --unsafe-host-effects \
+    --yolo \
     --enable-extension caffeinate \
     --trust-extension caffeinate
 ```
