@@ -5031,10 +5031,7 @@ async fn controlled_effects_are_denied_before_hooks_or_execution() {
     let succeeded = events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::ToolFinished {
-                id,
-                result: Ok(_),
-            } => Some(id.0.as_str()),
+            AgentEvent::ToolFinished { id, result: Ok(_) } => Some(id.0.as_str()),
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
@@ -5068,6 +5065,149 @@ async fn controlled_effects_are_denied_before_hooks_or_execution() {
         assert_single_run_finished(&events),
         FinishReason::Completed
     ));
+}
+
+#[tokio::test]
+async fn controlled_safe_bash_runs_without_approval_prompt() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![
+                tool_turn(&[("call_process", "bash", serde_json::json!({"command": "ls"}))]),
+                text_turn("safe process complete"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.load(&CoreTools);
+    extensions.tool_call_hook(AdmissionHookProbe {
+        before: Arc::clone(&before),
+        after: Arc::clone(&after),
+    });
+    let mut sandbox = SandboxConfig::new(&workspace);
+    sandbox.allow_process = true;
+    sandbox.allow_shell = true;
+
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session: Session::create(session_dir.path().join("session.jsonl")).unwrap(),
+        system: "safe bash test".into(),
+        sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::Controlled),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("run a read-only command").await.unwrap();
+    let mut approvals = 0usize;
+    let mut events = Vec::new();
+    while let Some(event) = run.next().await {
+        if matches!(
+            &event,
+            AgentEvent::ToolProgress {
+                progress: ygg_agent::ToolProgress::Confirmation(_),
+                ..
+            }
+        ) {
+            approvals += 1;
+        }
+        events.push(event);
+    }
+    drop(run);
+
+    assert_eq!(approvals, 0);
+    assert_eq!(before.load(Ordering::SeqCst), 1);
+    assert_eq!(after.load(Ordering::SeqCst), 1);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolFinished {
+            id,
+            result: Ok(_),
+            ..
+        } if id.0 == "call_process"
+    )));
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+}
+
+#[tokio::test]
+async fn controlled_safe_bash_approval_profile_needs_confirmation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![
+                tool_turn(&[("call_process", "bash", serde_json::json!({"command": "ls"}))]),
+                text_turn("safe process complete"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.load(&CoreTools);
+    extensions.tool_call_hook(AdmissionHookProbe {
+        before: Arc::clone(&before),
+        after: Arc::clone(&after),
+    });
+    let mut sandbox = SandboxConfig::new(&workspace);
+    sandbox.allow_process = true;
+    sandbox.allow_shell = true;
+
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session: Session::create(session_dir.path().join("session.jsonl")).unwrap(),
+        system: "safe bash test".into(),
+        sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::ControlledBashApproval),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("run a read-only command").await.unwrap();
+    let mut approvals = 0usize;
+    while let Some(event) = run.next().await {
+        if let AgentEvent::ToolProgress {
+            progress: ygg_agent::ToolProgress::Confirmation(request),
+            ..
+        } = &event
+        {
+            approvals += 1;
+            request.clone().respond(true);
+        }
+    }
+    drop(run);
+
+    assert_eq!(approvals, 1);
+    assert_eq!(before.load(Ordering::SeqCst), 1);
+    assert_eq!(after.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

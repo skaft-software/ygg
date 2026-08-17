@@ -479,7 +479,10 @@ fn path_access(allow_external_paths: bool) -> &'static str {
 fn effect_policy(policy: ygg_agent::EffectPolicy) -> &'static str {
     match policy {
         ygg_agent::EffectPolicy::Controlled => {
-            "controlled (workspace mutation/bash calls need approval; other ambient host effects denied)"
+            "controlled (workspace mutation and unsafe bash calls need approval; other ambient host effects denied)"
+        }
+        ygg_agent::EffectPolicy::ControlledBashApproval => {
+            "controlled (all bash calls need approval; other ambient host effects denied)"
         }
         ygg_agent::EffectPolicy::UnsafeHost => {
             "UNSAFE host (classified effects use ambient OS authority)"
@@ -1145,7 +1148,7 @@ mod tests {
             "Model turns",
             "Tool calls",
             "Security model: local agent with workspace trust gates",
-            "Effect policy: controlled (workspace mutation/bash calls need approval; other ambient host effects denied)",
+            "Effect policy: controlled (workspace mutation and unsafe bash calls need approval; other ambient host effects denied)",
             "Built-in file paths: workspace-only guard",
             "File edits: enabled",
             "Process execution: enabled",

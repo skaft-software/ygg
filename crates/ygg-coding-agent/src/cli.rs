@@ -174,6 +174,10 @@ pub struct Cli {
     /// trusted executable extensions. Use only inside OS-level isolation.
     #[arg(long)]
     pub unsafe_host_effects: bool,
+    /// In controlled mode, also require explicit approval for every `bash` call.
+    /// This keeps `bash` aligned with command-approval gating behavior.
+    #[arg(long = "unsafe", alias = "unsafe-bash")]
+    pub unsafe_bash: bool,
     /// Load only these tools (comma-separated).
     #[arg(long, value_name = "NAMES", value_delimiter = ',', num_args = 1..)]
     pub tools: Option<Vec<String>>,
@@ -976,6 +980,8 @@ fn build_config_with_global_path(
     let system_prompt = cli.system_prompt.or(values.system_prompt);
     let effect_policy = if cli.unsafe_host_effects || values.unsafe_host_effects.unwrap_or(false) {
         ygg_agent::EffectPolicy::UnsafeHost
+    } else if cli.unsafe_bash {
+        ygg_agent::EffectPolicy::ControlledBashApproval
     } else {
         ygg_agent::EffectPolicy::Controlled
     };
@@ -1041,9 +1047,9 @@ fn build_config_with_global_path(
     if offline {
         sandbox.allow_remote_read = false;
     }
-    if effect_policy == ygg_agent::EffectPolicy::Controlled {
+    if effect_policy != ygg_agent::EffectPolicy::UnsafeHost {
         // External-path classification cannot remain stable between admission
-        // and execution. Keep Controlled operations workspace-relative so the
+        // and execution. Keep controlled operations workspace-relative so the
         // broker's workspace/host distinction fails closed.
         sandbox.allow_external_paths = false;
     }
@@ -1246,6 +1252,7 @@ mod tests {
             trust_extensions: vec![],
             workspace_trusted: false,
             unsafe_host_effects: false,
+            unsafe_bash: false,
             tools: None,
             exclude_tools: vec![],
             no_tools: false,
@@ -1381,6 +1388,27 @@ mod tests {
         let config = config_with_empty_global(cli, directory.path()).unwrap();
         assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::UnsafeHost);
         assert!(config.sandbox.allow_external_paths);
+    }
+
+    #[test]
+    fn unsafe_bash_cli_opt_in_is_stricter_than_default_controlled() {
+        let directory = cwd();
+
+        let mut cli = Cli::try_parse_from(["ygg", "--unsafe"]).unwrap();
+        assert!(cli.unsafe_bash);
+        cli.workspace = Some(directory.path().into());
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(
+            config.effect_policy,
+            ygg_agent::EffectPolicy::ControlledBashApproval
+        );
+
+        let mut cli = Cli::try_parse_from(["ygg", "--unsafe", "--unsafe-host-effects"]).unwrap();
+        assert!(cli.unsafe_bash);
+        assert!(cli.unsafe_host_effects);
+        cli.workspace = Some(directory.path().into());
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::UnsafeHost);
     }
 
     #[test]

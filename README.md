@@ -310,11 +310,13 @@ does not itself authorize an effect: the default `Controlled` policy allows
 pure computation and workspace reads, requires a one-shot interactive approval
 for each workspace mutation, and denies host reads/mutations, network, delegation,
 and executable-extension calls. `bash` is the one process-capable tool still exposed
-in controlled mode, but it is also blocked by the effect broker and must be
-approved per call before execution; all other native process effects remain denied.
-Unknown effects always fail closed.
+in controlled mode, but the effect broker now auto-approves known-safe read-only
+commands and requires one-shot confirmation for the remaining command invocations;
+all other native process effects remain denied. Unknown effects always fail
+closed.
 
-`--unsafe-host-effects` explicitly allows every authoritatively classified
+`--unsafe` requires confirmation for every `bash` host process call in controlled
+mode. `--unsafe-host-effects` explicitly allows every authoritatively classified
 effect that survives the existing tool and sandbox gates and is also required
 before an enabled, trusted executable extension process may start. `Controlled`
 never starts executable extensions. Controlled also forces
@@ -337,12 +339,12 @@ ygg --no-process
 ygg --no-tools
 ```
 
-When unsafe host effects are explicitly enabled, `bash` runs with the authority
-of the current operating-system user. Like Pi, it passes every complete command
-to one selected shell with `-c`; on Unix Ygg uses an explicit `shell_path` first,
-then `/bin/bash`, `bash` on `PATH`, and finally `sh`. It does not consult
-`$SHELL`. `--no-process` and `--no-shell` remain equivalent authority gates. For
-untrusted repositories, use a container, VM, or restricted account; see
+When `--unsafe-host-effects` is explicitly enabled, `bash` runs with the
+authority of the current operating-system user. Like Pi, it passes every complete
+command to one selected shell with `-c`; on Unix Ygg uses an explicit `shell_path`
+first, then `/bin/bash`, `bash` on `PATH`, and finally `sh`. It does not consult
+`$SHELL`. `--no-process` and `--no-shell` remain equivalent authority gates.
+For untrusted repositories, use a container, VM, or restricted account; see
 [SECURITY.md](SECURITY.md).
 
 ### Provider and protocol support
@@ -631,7 +633,7 @@ warning. New configuration should use `reasoning` alone.
 | Session | `--continue`, `--resume`, `--session-dir`, `sessions ...` |
 | Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
-| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--unsafe-host-effects`, `--shell-path` |
+| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--unsafe` (also `--unsafe-bash`), `--unsafe-host-effects`, `--shell-path` |
 | Limits | `--bash-timeout-secs`, `--max-output-bytes` |
 | Customization | `--theme`, `--theme-dir`, `--system-prompt`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
 

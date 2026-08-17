@@ -94,7 +94,7 @@ impl Default for SandboxPolicy {
         Self {
             // Preserve the legacy ambient-host baseline only for an explicit
             // UnsafeHost profile. Final configuration resolution forces this
-            // false whenever the effect policy remains Controlled.
+            // false whenever the effect policy remains non-UnsafeHost.
             allow_external_paths: true,
             allow_edit: true,
             allow_write: true,

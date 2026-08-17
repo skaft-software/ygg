@@ -96,10 +96,13 @@ impl ToolEffect {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EffectPolicy {
     /// Allow pure computation and workspace reads, require an exact one-shot
-    /// approval for workspace mutation and controlled `bash` process execution,
-    /// and deny every other effect.
+    /// approval for workspace mutation and potentially auto-approved known-safe
+    /// `bash` process execution, and deny every other effect.
     #[default]
     Controlled,
+    /// A stricter `Controlled` mode where every `bash` process execution, even
+    /// known-safe commands, requires exact one-shot approval.
+    ControlledBashApproval,
     /// Allow every authoritatively classified effect. Unknown tools still fail
     /// closed. This profile runs effects with the Ygg process's ambient OS
     /// authority and is suitable only inside a separately isolated environment.
@@ -151,6 +154,10 @@ pub struct EffectIntent {
     effect: ToolEffect,
     confirmation_arguments: String,
     digest: [u8; 32],
+    /// `bash` command safety classification was conservative and precomputed
+    /// during construction so host-policy decisions stay deterministic without
+    /// reparsing command payloads.
+    bash_requires_approval: bool,
 }
 
 impl fmt::Debug for EffectIntent {
@@ -259,6 +266,7 @@ impl EffectIntent {
         };
         let digest = streaming_digest(&envelope)?;
         let confirmation_arguments = approval_projection(&tool, arguments)?;
+        let bash_requires_approval = requires_bash_host_process_approval(&tool, arguments);
 
         Ok(Self {
             principal,
@@ -269,6 +277,7 @@ impl EffectIntent {
             effect,
             confirmation_arguments,
             digest,
+            bash_requires_approval,
         })
     }
 
@@ -300,6 +309,10 @@ impl EffectIntent {
     /// Host-owned effect classification.
     pub fn effect(&self) -> ToolEffect {
         self.effect
+    }
+
+    fn bash_requires_approval(&self) -> bool {
+        self.bash_requires_approval
     }
 
     /// Bounded, spoof-resistant argument projection included in confirmations.
@@ -662,38 +675,55 @@ impl EffectBroker {
                 "tool has no host-owned effect classification".to_owned(),
             );
         }
+
+        let is_bash = intent.tool() == "bash";
+        let bash_requires_approval = match self.policy {
+            EffectPolicy::UnsafeHost => false,
+            EffectPolicy::ControlledBashApproval => is_bash,
+            EffectPolicy::Controlled => is_bash && intent.bash_requires_approval(),
+        };
+
         match self.policy {
             EffectPolicy::UnsafeHost => EffectRequirement::Allow,
-            EffectPolicy::Controlled => match intent.effect {
-                ToolEffect::Pure | ToolEffect::WorkspaceRead => EffectRequirement::Allow,
-                ToolEffect::WorkspaceMutation => EffectRequirement::Approval,
-                ToolEffect::HostRead => EffectRequirement::Deny(
-                    "reading outside the workspace is unavailable in controlled mode".to_owned(),
-                ),
-                ToolEffect::HostMutation => EffectRequirement::Deny(
-                    "mutating outside the workspace is unavailable in controlled mode".to_owned(),
-                ),
-                ToolEffect::HostProcess => {
-                    if intent.tool() == "bash" {
-                        EffectRequirement::Approval
-                    } else {
-                        EffectRequirement::Deny(
-                            "native execution requires an OS or VM isolation backend".to_owned(),
-                        )
+            EffectPolicy::Controlled | EffectPolicy::ControlledBashApproval => {
+                match intent.effect {
+                    ToolEffect::Pure | ToolEffect::WorkspaceRead => EffectRequirement::Allow,
+                    ToolEffect::WorkspaceMutation => EffectRequirement::Approval,
+                    ToolEffect::HostRead => EffectRequirement::Deny(
+                        "reading outside the workspace is unavailable in controlled mode"
+                            .to_owned(),
+                    ),
+                    ToolEffect::HostMutation => EffectRequirement::Deny(
+                        "mutating outside the workspace is unavailable in controlled mode"
+                            .to_owned(),
+                    ),
+                    ToolEffect::HostProcess => {
+                        if is_bash {
+                            if bash_requires_approval {
+                                EffectRequirement::Approval
+                            } else {
+                                EffectRequirement::Allow
+                            }
+                        } else {
+                            EffectRequirement::Deny(
+                                "native execution requires an OS or VM isolation backend"
+                                    .to_owned(),
+                            )
+                        }
                     }
+                    ToolEffect::Network => EffectRequirement::Deny(
+                        "tool networking requires a trusted egress broker".to_owned(),
+                    ),
+                    ToolEffect::Delegation => EffectRequirement::Deny(
+                        "delegation requires attenuated authority and a team-wide budget ledger"
+                            .to_owned(),
+                    ),
+                    ToolEffect::Extension => EffectRequirement::Deny(
+                        "executable extensions require an OS or VM isolation backend".to_owned(),
+                    ),
+                    ToolEffect::Unknown => unreachable!("unknown effects fail closed above"),
                 }
-                ToolEffect::Network => EffectRequirement::Deny(
-                    "tool networking requires a trusted egress broker".to_owned(),
-                ),
-                ToolEffect::Delegation => EffectRequirement::Deny(
-                    "delegation requires attenuated authority and a team-wide budget ledger"
-                        .to_owned(),
-                ),
-                ToolEffect::Extension => EffectRequirement::Deny(
-                    "executable extensions require an OS or VM isolation backend".to_owned(),
-                ),
-                ToolEffect::Unknown => unreachable!("unknown effects fail closed above"),
-            },
+            }
         }
     }
 }
@@ -702,6 +732,291 @@ impl Default for EffectBroker {
     fn default() -> Self {
         Self::new(EffectPolicy::Controlled)
     }
+}
+
+fn requires_bash_host_process_approval(tool: &str, arguments: &serde_json::Value) -> bool {
+    if tool != "bash" {
+        return false;
+    }
+    let Some(values) = arguments.as_object() else {
+        return true;
+    };
+    let Some(command) = values.get("command").and_then(serde_json::Value::as_str) else {
+        return true;
+    };
+    !is_known_safe_bash_command(command)
+}
+
+fn is_known_safe_bash_command(command: &str) -> bool {
+    let Some(tokens) = tokenize_bash_command_for_safety(command) else {
+        return false;
+    };
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let command = normalize_shell_command_name(tokens[0]);
+    if !matches!(
+        command.as_str(),
+        "cat"
+            | "cd"
+            | "cut"
+            | "echo"
+            | "expr"
+            | "false"
+            | "grep"
+            | "head"
+            | "id"
+            | "ls"
+            | "nl"
+            | "paste"
+            | "pwd"
+            | "rev"
+            | "seq"
+            | "stat"
+            | "tail"
+            | "tr"
+            | "true"
+            | "uname"
+            | "uniq"
+            | "wc"
+            | "which"
+            | "whoami"
+            | "numfmt"
+            | "tac"
+            | "base64"
+            | "find"
+            | "rg"
+            | "git"
+            | "sed"
+    ) {
+        return false;
+    }
+
+    match command.as_str() {
+        "base64" => !tokens.iter().skip(1).any(|argument| {
+            *argument == "-o"
+                || *argument == "--output"
+                || argument.starts_with("--output=")
+                || (argument.starts_with('-') && argument.len() > 2 && argument.starts_with("-o"))
+        }),
+        "find" => {
+            const UNSAFE_FIND_OPTIONS: &[&str] = &[
+                "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0",
+                "-fprintf",
+            ];
+            !tokens
+                .iter()
+                .skip(1)
+                .any(|argument| UNSAFE_FIND_OPTIONS.contains(argument))
+        }
+        "rg" => !tokens.iter().skip(1).any(|argument| {
+            *argument == "--pre"
+                || *argument == "--hostname-bin"
+                || *argument == "--search-zip"
+                || *argument == "-z"
+                || argument.starts_with("--pre=")
+                || argument.starts_with("--hostname-bin=")
+        }),
+        "sed" => {
+            tokens.len() >= 3
+                && tokens.len() <= 4
+                && tokens.get(1).is_some_and(|argument| *argument == "-n")
+                && is_valid_sed_n_arg(tokens.get(2).copied())
+        }
+        "git" => is_safe_git_command(&tokens),
+        _ => true,
+    }
+}
+
+fn tokenize_bash_command_for_safety(command: &str) -> Option<Vec<&str>> {
+    if command.chars().any(|character| {
+        matches!(
+            character,
+            '\n' | '\r'
+                | ';'
+                | '&'
+                | '|'
+                | '>'
+                | '<'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '$'
+                | '`'
+                | '\\'
+                | '\''
+                | '"'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+        )
+    }) {
+        return None;
+    }
+
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    }
+}
+
+fn normalize_shell_command_name(raw: &str) -> String {
+    let normalized = raw.rsplit('/').next().unwrap_or(raw).to_ascii_lowercase();
+    if normalized == "zsh" {
+        "bash".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn is_safe_git_command(tokens: &[&str]) -> bool {
+    let Some((subcommand_index, subcommand)) =
+        find_git_subcommand(tokens, &["status", "log", "diff", "show", "branch"])
+    else {
+        return false;
+    };
+
+    let global_options = &tokens[1..subcommand_index];
+    if git_has_unsafe_global_option(global_options) {
+        return false;
+    }
+
+    let options = &tokens[subcommand_index + 1..];
+    match subcommand {
+        "status" | "log" | "diff" | "show" => git_subcommand_args_are_read_only(options),
+        "branch" => git_subcommand_args_are_read_only(options) && git_branch_is_read_only(options),
+        _ => false,
+    }
+}
+
+fn is_valid_sed_n_arg(pattern: Option<&str>) -> bool {
+    let Some(pattern) = pattern else {
+        return false;
+    };
+    if !pattern.ends_with('p') {
+        return false;
+    }
+
+    let range = pattern.strip_suffix('p').unwrap_or_default();
+    if range.is_empty() {
+        return false;
+    }
+    if range.contains(',') {
+        let mut parts = range.split(',');
+        let first = parts.next();
+        let second = parts.next();
+        if parts.next().is_some() {
+            return false;
+        }
+        first.is_some_and(|first| {
+            !first.is_empty() && first.chars().all(|character| character.is_ascii_digit())
+        }) && second.is_some_and(|second| {
+            !second.is_empty() && second.chars().all(|character| character.is_ascii_digit())
+        })
+    } else {
+        !range.is_empty() && range.chars().all(|character| character.is_ascii_digit())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GitOptionPattern {
+    Exact(&'static str),
+    ShortWithInlineValue(&'static str),
+    Prefix(&'static str),
+}
+
+const UNSAFE_GIT_GLOBAL_OPTIONS: &[GitOptionPattern] = &[
+    GitOptionPattern::Exact("-C"),
+    GitOptionPattern::ShortWithInlineValue("-C"),
+    GitOptionPattern::Exact("-c"),
+    GitOptionPattern::ShortWithInlineValue("-c"),
+    GitOptionPattern::Exact("-p"),
+    GitOptionPattern::Exact("--config-env"),
+    GitOptionPattern::Prefix("--config-env="),
+    GitOptionPattern::Exact("--exec-path"),
+    GitOptionPattern::Prefix("--exec-path="),
+    GitOptionPattern::Exact("--git-dir"),
+    GitOptionPattern::Prefix("--git-dir="),
+    GitOptionPattern::Exact("--namespace"),
+    GitOptionPattern::Prefix("--namespace="),
+    GitOptionPattern::Exact("--paginate"),
+    GitOptionPattern::Exact("--super-prefix"),
+    GitOptionPattern::Prefix("--super-prefix="),
+    GitOptionPattern::Exact("--work-tree"),
+    GitOptionPattern::Prefix("--work-tree="),
+];
+
+const UNSAFE_GIT_SUBCOMMAND_OPTIONS: &[GitOptionPattern] = &[
+    GitOptionPattern::Exact("--output"),
+    GitOptionPattern::Prefix("--output="),
+    GitOptionPattern::Exact("--ext-diff"),
+    GitOptionPattern::Exact("--textconv"),
+    GitOptionPattern::Exact("--exec"),
+    GitOptionPattern::Prefix("--exec="),
+];
+
+fn find_git_subcommand<'a>(tokens: &'a [&'a str], allowed: &[&str]) -> Option<(usize, &'a str)> {
+    tokens
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, token)| {
+            if token.starts_with('-') {
+                None
+            } else if allowed.contains(token) {
+                Some((index, *token))
+            } else {
+                None
+            }
+        })
+}
+
+fn git_matches_option_pattern(argument: &str, patterns: &[GitOptionPattern]) -> bool {
+    patterns.iter().any(|pattern| match pattern {
+        GitOptionPattern::Exact(option) => argument == *option,
+        GitOptionPattern::ShortWithInlineValue(option) => {
+            argument.starts_with(option) && argument.len() > option.len()
+        }
+        GitOptionPattern::Prefix(prefix) => argument.starts_with(prefix),
+    })
+}
+
+fn git_has_unsafe_global_option(global_options: &[&str]) -> bool {
+    global_options
+        .iter()
+        .any(|argument| git_matches_option_pattern(argument, UNSAFE_GIT_GLOBAL_OPTIONS))
+}
+
+fn git_subcommand_args_are_read_only(options: &[&str]) -> bool {
+    !options
+        .iter()
+        .any(|argument| git_matches_option_pattern(argument, UNSAFE_GIT_SUBCOMMAND_OPTIONS))
+}
+
+fn git_branch_is_read_only(options: &[&str]) -> bool {
+    if options.is_empty() {
+        return true;
+    }
+
+    let mut has_read_only_flag = false;
+    for argument in options {
+        match *argument {
+            "--list" | "-l" | "--show-current" | "-a" | "--all" | "-r" | "--remotes" | "-v"
+            | "-vv" | "--verbose" => {
+                has_read_only_flag = true;
+            }
+            argument if argument.starts_with("--format=") => {
+                has_read_only_flag = true;
+            }
+            _ => return false,
+        }
+    }
+    has_read_only_flag
 }
 
 #[derive(Debug)]
@@ -1535,6 +1850,61 @@ mod tests {
         let mutation = intent(serde_json::json!({"path": "a"}));
         assert!(matches!(
             broker.authorize(&mutation, None).await,
+            Err(EffectBrokerError::ApprovalUnavailable { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn controlled_policy_approves_safe_bash_without_progress_channel() {
+        let broker = EffectBroker::new(EffectPolicy::Controlled);
+        let safe = EffectIntent::new(
+            "principal",
+            "run-1",
+            1,
+            "call-1",
+            "bash",
+            ToolEffect::HostProcess,
+            serde_json::json!({"command": "ls -la"}),
+        )
+        .unwrap();
+        assert!(broker.authorize(&safe, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn controlled_policy_requires_approval_for_complex_bash_without_progress_channel() {
+        let broker = EffectBroker::new(EffectPolicy::Controlled);
+        let complex = EffectIntent::new(
+            "principal",
+            "run-1",
+            1,
+            "call-1",
+            "bash",
+            ToolEffect::HostProcess,
+            serde_json::json!({"command": "printf 'owned' > /tmp/owned.txt"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            broker.authorize(&complex, None).await,
+            Err(EffectBrokerError::ApprovalUnavailable { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn controlled_bash_approval_profile_requires_all_bash_approvals_without_progress_channel()
+    {
+        let broker = EffectBroker::new(EffectPolicy::ControlledBashApproval);
+        let safe = EffectIntent::new(
+            "principal",
+            "run-1",
+            1,
+            "call-1",
+            "bash",
+            ToolEffect::HostProcess,
+            serde_json::json!({"command": "ls"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            broker.authorize(&safe, None).await,
             Err(EffectBrokerError::ApprovalUnavailable { .. })
         ));
     }

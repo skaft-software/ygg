@@ -124,11 +124,14 @@ A consuming rebuild drops the old Agent before reopening its session, so only
 one append handle owns a session file. Every Agent also receives a product-owned
 `EffectBroker`. Its default `Controlled` policy forces the effective sandbox to
 workspace-only file paths, allows pure/workspace-read effects, requires exact
-one-shot interactive approval for workspace mutation, and denies ambient host,
-process, network, delegation, and extension effects. Executable-extension
-startup is gated separately at the product boundary: even enabled, trusted
-extensions are discovered but never launched unless the resolved policy is
-`UnsafeHost` and the existing process/shell gates also permit startup.
+one-shot interactive approval for workspace mutation, auto-approves a conservative
+safe read-only `bash` command allowlist while requiring one-shot approval for
+other `bash` process calls, and denies other ambient host/process, network,
+delegation, and extension effects. A stricter controlled mode (`--unsafe`) keeps
+those same gates but requires one-shot approval for every `bash` process call.
+Executable-extension startup is gated separately at the product boundary: even
+enabled, trusted extensions are discovered but never launched unless the resolved
+policy is `UnsafeHost` and the existing process/shell gates also permit startup.
 `unsafe_host_effects = true` / `--unsafe-host-effects` is the explicit
 OS-isolation opt-in; trusted project configuration may revoke but never grant
 it. Delegated children inherit the same broker policy through the root's
