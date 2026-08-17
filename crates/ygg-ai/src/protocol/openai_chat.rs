@@ -690,7 +690,7 @@ pub(crate) fn build_request(
         )
     };
 
-    let tool_choice_opt = if !model.spec.capabilities.tools {
+    let tool_choice_opt = if !model.spec.capabilities.tools || req.tools.is_empty() {
         None
     } else {
         match &req.tool_choice {
@@ -2455,6 +2455,41 @@ mod tests {
             serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
         assert_eq!(body["max_completion_tokens"], 1000);
         assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn omits_tool_choice_when_no_tools_enabled_for_request() {
+        let model = make_test_model(false, false, false, true, false, false);
+        let req = Request {
+            system: Some("System prompt".to_string()),
+            messages: vec![Message::User(UserMessage {
+                content: vec![UserPart::Text("Hello".to_string())],
+            })],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: None,
+            temperature: None,
+            stop: vec![],
+            reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
+        };
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert!(
+            body.get("tools").is_none(),
+            "tools must be omitted when no tool defs are present"
+        );
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools are omitted"
+        );
     }
 
     #[test]
