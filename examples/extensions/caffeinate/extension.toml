@@ -1,7 +1,7 @@
 name = "caffeinate"
-version = "0.1.0"
-api_version = "0.1"
-description = "Keep macOS awake while Ygg is processing a prompt"
+version = "0.2.0"
+api_version = "0.2"
+description = "Keep macOS awake while Ygg owns one or more active turns"
 
 [entrypoint]
 command = "extension.py"
@@ -13,6 +13,5 @@ network = false
 
 [contributes]
 commands = ["caffeinate"]
-hooks = ["before_prompt", "after_response"]
 ui = ["status"]
 notifications = true

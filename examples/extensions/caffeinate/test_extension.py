@@ -71,15 +71,24 @@ def initialize():
         1,
         "initialize",
         {
-            "api_version": "0.1",
+            "api_version": "0.2",
             "contributes": {
                 "commands": ["caffeinate"],
-                "hooks": ["before_prompt", "after_response"],
                 "ui": ["status"],
                 "notifications": True,
             },
+            "protocol": {
+                "version": "0.2",
+                "required_features": ["request_cancellation", "content_parts"],
+                "optional_features": ["lifecycle_events"],
+                "limits": {"max_concurrent_requests": 1},
+            },
         },
     )
+
+
+def notification(method, params):
+    return {"jsonrpc": "2.0", "method": method, "params": params}
 
 
 class CaffeinateTests(unittest.TestCase):
@@ -117,12 +126,9 @@ class CaffeinateTests(unittest.TestCase):
             mock.patch.object(module.sys, "platform", "linux"),
             mock.patch.object(module.subprocess, "Popen") as popen,
         ):
-            result = module.before_prompt({})
+            module.turn_started({"session_id": "s", "turn_id": "t"})
 
-        self.assertEqual(
-            result["notifications"][0]["message"],
-            "unsupported platform (macOS only)",
-        )
+        self.assertEqual(module.last_error, "unsupported platform (macOS only)")
         popen.assert_not_called()
 
     def test_stop_kills_an_inhibitor_that_does_not_terminate(self):
@@ -142,29 +148,50 @@ class CaffeinateTests(unittest.TestCase):
         self.assertTrue(process.killed)
         self.assertIsNone(module.inhibitor)
 
-    def test_protocol_hooks_command_status_and_shutdown(self):
+    def test_overlapping_turns_share_one_inhibitor_until_the_last_settles(self):
+        module = load_extension()
+        process = FakeProcess()
+        with (
+            mock.patch.object(module.sys, "platform", "darwin"),
+            mock.patch.object(module, "CAFFEINATE", ExecutablePath()),
+            mock.patch.object(module.subprocess, "Popen", return_value=process) as popen,
+        ):
+            module.turn_started({"session_id": "s", "turn_id": "one"})
+            module.turn_started({"session_id": "s", "turn_id": "two"})
+            module.turn_settled({"session_id": "s", "turn_id": "one"})
+            self.assertFalse(process.terminated)
+            module.turn_settled({"session_id": "s", "turn_id": "two"})
+
+        popen.assert_called_once()
+        self.assertTrue(process.terminated)
+
+    def test_protocol_lifecycle_command_status_and_shutdown(self):
         module = load_extension()
         process = FakeProcess()
         messages = [
             initialize(),
-            request(
-                2,
-                "hook/run",
-                {"hook": "before_prompt", "payload": {}, "context": {}},
+            notification(
+                "turn/started",
+                {"session_id": "s", "run_id": "r", "turn_id": "t"},
             ),
-            request(3, "status/collect", {"surface": "status", "context": {}}),
+            request(2, "status/collect", {"surface": "status", "context": {}}),
             request(
-                4,
+                3,
                 "command/execute",
                 {"name": "caffeinate", "arguments": [], "context": {}},
             ),
-            request(
-                5,
-                "hook/run",
-                {"hook": "after_response", "payload": {}, "context": {}},
+            notification(
+                "turn/settled",
+                {
+                    "session_id": "s",
+                    "run_id": "r",
+                    "turn_id": "t",
+                    "outcome": "completed",
+                    "duration_ms": 1,
+                },
             ),
-            request(6, "status/collect", {"surface": "status", "context": {}}),
-            request(7, "shutdown"),
+            request(4, "status/collect", {"surface": "status", "context": {}}),
+            request(5, "shutdown"),
         ]
         request_lines = "\n".join(json.dumps(message) for message in messages)
         input_stream = io.StringIO(request_lines + "\n")
@@ -178,13 +205,20 @@ class CaffeinateTests(unittest.TestCase):
             module.ext.run(stdin=input_stream, stdout=output)
 
         replies = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(replies[0]["result"]["commands"][0]["name"], "caffeinate")
-        self.assertEqual(replies[2]["result"]["text"], "awake")
+        replies_by_id = {reply["id"]: reply for reply in replies}
         self.assertEqual(
-            replies[3]["result"]["text"],
+            replies_by_id[1]["result"]["commands"][0]["name"], "caffeinate"
+        )
+        self.assertEqual(
+            replies_by_id[1]["result"]["protocol"]["lifecycle_events"],
+            ["session/settled", "turn/settled", "turn/started"],
+        )
+        self.assertEqual(replies_by_id[2]["result"]["text"], "awake")
+        self.assertEqual(
+            replies_by_id[3]["result"]["text"],
             "Caffeinate is active (pid 4321).",
         )
-        self.assertIsNone(replies[5]["result"])
+        self.assertIsNone(replies_by_id[4]["result"])
         self.assertTrue(process.terminated)
 
 

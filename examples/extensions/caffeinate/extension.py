@@ -5,18 +5,28 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 
 from ygg_extension import Extension
 
 
 CAFFEINATE = Path("/usr/bin/caffeinate")
-# A terminal run outcome normally stops this process through after_response.
-# Bound the fallback too: an interrupted Ygg run otherwise leaves the extension
-# alive with no lifecycle callback to release the inhibitor.
+# Terminal lifecycle notifications normally release the inhibitor. Bound the
+# subprocess fallback too in case the host or protocol stream disappears before
+# a terminal notification can arrive.
 MAX_INHIBIT_SECONDS = 30 * 60
-ext = Extension()
+ext = Extension(
+    api_version="0.2",
+    supported_features=(
+        "request_cancellation",
+        "content_parts",
+        "lifecycle_events",
+    ),
+)
 inhibitor = None
 last_error = None
+active_turns = set()
+state_lock = threading.RLock()
 
 
 def inhibitor_active():
@@ -80,32 +90,38 @@ def stop_inhibitor():
         ext.log.warning("failed to stop caffeinate", error=str(error))
 
 
-def hook_result(notification=None):
-    notifications = [] if notification is None else [notification]
-    return {
-        "disposition": {"action": "continue"},
-        "context": [],
-        "notifications": notifications,
-    }
+def turn_key(event):
+    return (event.get("session_id"), event.get("turn_id"))
 
 
-@ext.hook("before_prompt")
-def before_prompt(payload):
-    if start_inhibitor():
-        return hook_result()
-    return hook_result(
-        {
-            "level": "warning",
-            "title": "Caffeinate unavailable",
-            "message": last_error or "the sleep inhibitor could not be started",
-        }
-    )
+@ext.on_lifecycle("turn/started")
+def turn_started(event):
+    with state_lock:
+        active_turns.add(turn_key(event))
+        if not start_inhibitor():
+            ext.log.warning(
+                "caffeinate unavailable",
+                error=last_error or "the sleep inhibitor could not be started",
+            )
 
 
-@ext.hook("after_response")
-def after_response(payload):
-    stop_inhibitor()
-    return hook_result()
+@ext.on_lifecycle("turn/settled")
+def turn_settled(event):
+    with state_lock:
+        active_turns.discard(turn_key(event))
+        if not active_turns:
+            stop_inhibitor()
+
+
+@ext.on_lifecycle("session/settled")
+def session_settled(event):
+    with state_lock:
+        session_id = event.get("session_id")
+        active_turns.difference_update(
+            [owner for owner in active_turns if owner[0] == session_id]
+        )
+        if not active_turns:
+            stop_inhibitor()
 
 
 @ext.command(
@@ -120,7 +136,7 @@ def caffeinate_command(arguments):
         return {"text": f"Caffeinate is active (pid {inhibitor.pid})."}
     if last_error:
         return {"text": f"Caffeinate is unavailable: {last_error}."}
-    return {"text": "Caffeinate is idle; it runs while Ygg processes a prompt."}
+    return {"text": "Caffeinate is idle; it runs while this extension observes active turns."}
 
 
 @ext.status("status")
@@ -137,7 +153,9 @@ def collect_status(params):
 
 @ext.on_shutdown
 def shutdown(params):
-    stop_inhibitor()
+    with state_lock:
+        active_turns.clear()
+        stop_inhibitor()
 
 
 if __name__ == "__main__":

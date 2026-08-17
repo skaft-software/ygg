@@ -1,11 +1,11 @@
 # caffeinate executable extension
 
-This Python example uses the dependency-free `ygg-extension-sdk` package to
-keep a Mac awake while Ygg is processing a prompt. If Ygg cannot report a
-terminal outcome (for example, an interrupted run), the inhibitor expires after
-30 minutes. It starts `/usr/bin/caffeinate -i -t 1800` at the `before_prompt` boundary,
-releases it after a complete assistant response, and cleans it up when the
-extension shuts down or loses its protocol stream.
+This API `0.2` Python extension keeps a Mac awake while Ygg owns one or more
+active turns. Sleep inhibition is domain behavior, so it lives here rather
+than in the agent kernel. The extension observes `turn/started`,
+`turn/settled`, and `session/settled`, reference-counts overlapping turns, and
+runs one bounded `/usr/bin/caffeinate -i -t 1800` subprocess until the last
+observed turn settles.
 
 The `-i` assertion prevents idle system sleep without forcing the display to
 stay on or overriding explicit sleep choices. The `-t 1800` argument bounds the
@@ -13,7 +13,7 @@ assertion to 30 minutes if Ygg cannot deliver a cleanup boundary. This example
 does not pass `-w`, so it does not bind `caffeinate` to the extension PID.
 `/caffeinate` reports whether the inhibitor is active, and the interactive TUI
 shows an `awake` status contribution while it is running. Unsupported systems
-remain usable and receive a warning when a prompt starts.
+remain usable and receive a diagnostic when a turn starts.
 
 Install the SDK before copying the directory:
 
@@ -35,11 +35,13 @@ uses no network. Its declared `process = true` capability is visible consent
 metadata for launching the sleep inhibitor; it is not an operating-system
 sandbox.
 
-Ygg's current lifecycle API calls `after_response` only for completed runs. If
-a run fails or is aborted, the inhibitor remains active until the next
-completed response, extension reload, Ygg shutdown, protocol-stream loss, or
-the 30-minute fallback timeout. The extension explicitly terminates its
-`caffeinate` child during shutdown and in its top-level cleanup path.
+API `0.2` emits `turn/settled` for completed, failed, interrupted, and cancelled
+root turns, so each terminal path releases its reference. `session/settled`
+cleans up any remaining references for that session. Extension shutdown and
+the top-level protocol cleanup explicitly terminate the child, while the
+30-minute subprocess timeout is a final fail-safe. The `-i` assertion prevents
+idle system sleep only; it does not prevent display sleep or override an
+explicit user sleep request.
 
 Run the example's dependency-free tests from the repository root with:
 
