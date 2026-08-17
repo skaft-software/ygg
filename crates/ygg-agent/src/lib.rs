@@ -64,13 +64,16 @@
 //! precise persistence and recovery rules.
 
 pub mod agent;
+pub mod artifact;
 pub mod cache;
 pub mod compaction;
 pub mod context;
 pub mod delegation;
 pub mod events;
 pub mod extension;
+pub mod extension_policy;
 pub mod extension_process;
+pub mod extension_secret;
 pub mod goal_driver;
 pub mod goal_store;
 pub mod input;
@@ -85,6 +88,13 @@ pub mod tools;
 pub use agent::{
     public_error_diagnostic, Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy,
     RequestContextEstimate, Run, RunControl, RunOutput,
+};
+pub use artifact::{
+    ArtifactError, ArtifactGenerationSettlement, ArtifactId, ArtifactPublication, ArtifactSource,
+    ArtifactStore, ArtifactStoreLimits, PublishedArtifact, ResolvedArtifact,
+    DEFAULT_MAX_ARTIFACTS_PER_GENERATION, DEFAULT_MAX_ARTIFACT_BYTES,
+    DEFAULT_MAX_ARTIFACT_GENERATION_BYTES, DEFAULT_MAX_INLINE_ARTIFACT_BYTES,
+    MAX_ARTIFACT_RELATIVE_PATH_BYTES,
 };
 pub use cache::{
     analyze_session_cache, analyze_session_cache_stats, CacheMiss, CacheStats,
@@ -103,28 +113,53 @@ pub use context::{
 };
 pub use delegation::{
     delegation_runtime_supports, DelegatedAgentStatus, DelegationConfig, DelegationError,
-    DelegationLimits, DelegationMode,
+    DelegationLimits, DelegationMode, COLLABORATION_TOOL_NAMES,
 };
 pub use events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
     OutputChannel, QueueDeliveryMode,
 };
 pub use extension::{EventObserver, Extension, ExtensionHost, ToolCallHook};
+pub use extension_policy::{
+    ExtensionActionIntent, ExtensionAdapterHints, ExtensionApprovalStore, ExtensionApprovalToken,
+    ExtensionIntentPolicy, ExtensionPolicyDecision, ExtensionPolicyError, ExtensionPolicyFrontend,
+    MAX_EXTENSION_ACTION_INTENT_BYTES, MAX_EXTENSION_APPROVALS, MAX_EXTENSION_APPROVAL_TTL,
+};
 pub use extension_process::{
     default_extension_roots, discover_extension_manifests, load_extension_manifest_paths,
+    AgentSessionListRequest, AgentSessionMessageRequest, AgentSessionSpawnRequest,
+    AgentSessionTargetRequest, AgentSessionWaitRequest,
     CommandDefinition as ExtensionCommandDefinition, CommandOutput as ExtensionCommandOutput,
     ConfirmationRequest as ExtensionConfirmationRequest,
     ConfirmationResponse as ExtensionConfirmationResponse, ContextContribution,
     DiscoveredExtension, ExtensionActivation, ExtensionCapabilities, ExtensionCatalog,
     ExtensionContributions, ExtensionDiagnostic, ExtensionDiagnosticLevel, ExtensionEntrypoint,
-    ExtensionEvent, ExtensionExecutionContext, ExtensionFilesystemAccess, ExtensionHook,
-    ExtensionHookDisposition, ExtensionHookOutput, ExtensionHostState, ExtensionManifest,
-    ExtensionManifestInput, ExtensionNotification, ExtensionNotificationLevel, ExtensionPolicy,
-    ExtensionProcess, ExtensionReloadReport, ExtensionRoot, ExtensionRuntimeConfig,
-    ExtensionRuntimeError, ExtensionSource, ExtensionStatusContribution, ExtensionTrust,
-    ExtensionUiSurface, RenderedToolCall, ToolCallOutput as ExtensionToolCallOutput,
-    ToolDefinition as ExtensionToolDefinition, ToolRenderSegment, EXTENSION_API_VERSION,
-    EXTENSION_MANIFEST_FILENAME,
+    ExtensionEvent, ExtensionExecutionContext, ExtensionFilesystemAccess, ExtensionHealthSnapshot,
+    ExtensionHealthState, ExtensionHook, ExtensionHookDisposition, ExtensionHookOutput,
+    ExtensionHostState, ExtensionInputRequest, ExtensionInputResponse, ExtensionLifecycleEvent,
+    ExtensionLifecycleOutcome, ExtensionManifest, ExtensionManifestInput,
+    ExtensionNegotiatedProtocol, ExtensionNotification, ExtensionNotificationLevel,
+    ExtensionOperationToken, ExtensionPolicy, ExtensionPolicyEvaluationRequest,
+    ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionProgressEncoding,
+    ExtensionProgressEvent, ExtensionProgressStream, ExtensionProtocolLimits,
+    ExtensionProtocolRequest, ExtensionProtocolResponse, ExtensionReloadReport, ExtensionRequestId,
+    ExtensionResourceOwner, ExtensionRoot, ExtensionRuntimeConfig, ExtensionRuntimeError,
+    ExtensionSource, ExtensionStatusContribution, ExtensionTrust, ExtensionUiSurface,
+    RenderedToolCall, ToolCallOutput as ExtensionToolCallOutput, ToolCatalogUpdateResponse,
+    ToolDefinition as ExtensionToolDefinition, ToolRegistrationRequest, ToolRenderSegment,
+    ToolUnregistrationRequest, EXTENSION_API_VERSION, EXTENSION_API_VERSION_0_1,
+    EXTENSION_API_VERSION_0_2, EXTENSION_FEATURE_AGENT_SESSIONS, EXTENSION_FEATURE_APPROVALS,
+    EXTENSION_FEATURE_ARTIFACTS, EXTENSION_FEATURE_CONTENT_PARTS, EXTENSION_FEATURE_DYNAMIC_TOOLS,
+    EXTENSION_FEATURE_LIFECYCLE_EVENTS, EXTENSION_FEATURE_POLICY_INTENTS,
+    EXTENSION_FEATURE_REQUEST_CANCELLATION, EXTENSION_FEATURE_REQUEST_PROGRESS,
+    EXTENSION_FEATURE_SECRETS, EXTENSION_MANIFEST_FILENAME,
+    MAX_EXTENSION_CHILD_REQUEST_IDS_PER_GENERATION, MAX_EXTENSION_INPUT_PROMPT_BYTES,
+    MAX_EXTENSION_INPUT_VALUE_BYTES, MAX_EXTENSION_RESULT_CONTENT_PARTS,
+    MAX_EXTENSION_RESULT_MEDIA_BYTES,
+};
+pub use extension_secret::{
+    ExtensionSecretBroker, ExtensionSecretError, ExtensionSecretRequest, ExtensionSecretValue,
+    MAX_EXTENSION_SECRET_BYTES,
 };
 pub use goal_driver::{
     continuation_prompt, detect_goal_marker, GoalContinuation, GoalDecision, GoalDriver,
@@ -147,8 +182,10 @@ pub use skills::{
 };
 pub use tool::{
     content_hash, CancellationToken, ErasedTool, ErasedToolAdapter, OutputStream, ReplaySafety,
-    Tool, ToolContext, ToolDefinition, ToolDescriptor, ToolError, ToolInputRequest,
-    ToolInputResponse, ToolInputValidationIssue, ToolOutput, ToolOutputMediaKind, ToolProgress,
-    ToolProgressSink, TypedTool, TypedToolAdapter, ValidateToolInput, MAX_PROGRESS_CHUNK_BYTES,
+    Tool, ToolConcurrency, ToolContext, ToolDefinition, ToolDescriptor, ToolError,
+    ToolInputRequest, ToolInputResponse, ToolInputValidationIssue, ToolOutput,
+    ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind, ToolOutputValidationError,
+    ToolProgress, ToolProgressSink, TypedTool, TypedToolAdapter, ValidateToolInput,
+    MAX_PROGRESS_CHUNK_BYTES, MAX_TOOL_METADATA_BYTES, MAX_TOOL_STRUCTURED_CONTENT_BYTES,
 };
 pub use tools::{BashTool, CoreTools, EditTool, ReadTool, SearchTool, WriteTool};

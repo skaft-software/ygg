@@ -362,6 +362,92 @@ impl Respond for CompletionCancellationScript {
     }
 }
 
+struct PromptInheritanceScript {
+    state: Arc<ScriptState>,
+}
+
+impl Respond for PromptInheritanceScript {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body = self.state.record(request);
+        let route = if request_system(&body).contains("You are /root/current") {
+            "child"
+        } else {
+            "root"
+        };
+        let index = next_index(&self.state.counters, route);
+        match (route, index) {
+            ("root", 0) => response(tool_turn(&[(
+                "spawn-current",
+                "spawn_agent",
+                serde_json::json!({"task_name": "current", "message": "report the prompt"}),
+            )])),
+            ("root", 1) => response(tool_turn(&[(
+                "wait-current",
+                "wait_agent",
+                serde_json::json!({"timeout_ms": 2_000}),
+            )])),
+            ("root", 2) => response(text_turn("prompt inheritance complete")),
+            ("child", 0) => response(text_turn("current prompt observed")),
+            _ => self.state.unexpected(route, index),
+        }
+    }
+}
+
+struct InterruptedFollowUpScript {
+    state: Arc<ScriptState>,
+}
+
+impl Respond for InterruptedFollowUpScript {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body = self.state.record(request);
+        let route = if request_system(&body).contains("You are /root/resume") {
+            "child"
+        } else {
+            "root"
+        };
+        let index = next_index(&self.state.counters, route);
+        match (route, index) {
+            ("root", 0) => response(tool_turn(&[(
+                "spawn-resume",
+                "spawn_agent",
+                serde_json::json!({"task_name": "resume", "message": "start slowly"}),
+            )])),
+            ("root", 1) => response(tool_turn(&[(
+                "queue-resume",
+                "followup_task",
+                serde_json::json!({
+                    "target": "/root/resume",
+                    "message": "accepted follow-up must survive interruption"
+                }),
+            )]))
+            .set_delay(Duration::from_millis(200)),
+            ("root", 2) => response(tool_turn(&[(
+                "interrupt-resume",
+                "interrupt_agent",
+                serde_json::json!({"target": "/root/resume"}),
+            )])),
+            ("root", 3) | ("root", 4) => response(tool_turn(&[(
+                if index == 3 {
+                    "wait-resume-interrupted"
+                } else {
+                    "wait-resume-completed"
+                },
+                "wait_agent",
+                serde_json::json!({"timeout_ms": 3_000}),
+            )])),
+            ("root", 5) => response(tool_turn(&[(
+                "list-resume",
+                "list_agents",
+                serde_json::json!({}),
+            )])),
+            ("root", 6) => response(text_turn("interrupted follow-up recovered")),
+            ("child", 0) => delayed_response(text_turn("initial task should be interrupted")),
+            ("child", 1) => response(text_turn("follow-up survived interruption")),
+            _ => self.state.unexpected(route, index),
+        }
+    }
+}
+
 struct InFlightDeliveryScript {
     state: Arc<ScriptState>,
 }
@@ -633,28 +719,29 @@ async fn delegation_lifecycle_messaging_followups_interrupts_and_durability() {
         "shutdown"
     );
 
-    let requests = state.requests.lock().unwrap();
-    let alpha_request = requests
-        .iter()
-        .find(|request| request_system(request).contains("You are /root/alpha"))
-        .expect("alpha request");
-    let encoded_alpha_request = alpha_request.to_string();
-    assert!(encoded_alpha_request.contains("delegation integration test agent"));
-    for tool in [
-        "spawn_agent",
-        "followup_task",
-        "send_message",
-        "wait_agent",
-        "list_agents",
-        "interrupt_agent",
-        "read",
-    ] {
-        assert!(
-            encoded_alpha_request.contains(&format!("\"{tool}\"")),
-            "{tool}"
-        );
+    {
+        let requests = state.requests.lock().unwrap();
+        let alpha_request = requests
+            .iter()
+            .find(|request| request_system(request).contains("You are /root/alpha"))
+            .expect("alpha request");
+        let encoded_alpha_request = alpha_request.to_string();
+        assert!(encoded_alpha_request.contains("delegation integration test agent"));
+        for tool in [
+            "spawn_agent",
+            "followup_task",
+            "send_message",
+            "wait_agent",
+            "list_agents",
+            "interrupt_agent",
+            "read",
+        ] {
+            assert!(
+                encoded_alpha_request.contains(&format!("\"{tool}\"")),
+                "{tool}"
+            );
+        }
     }
-    drop(requests);
 
     let events_before_drop = read_provenance(&provenance_path);
     let spawned = events_before_drop
@@ -745,6 +832,92 @@ async fn delegation_lifecycle_messaging_followups_interrupts_and_durability() {
         }
     }
     drop((workspace_guard, session_guard));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn children_spawned_after_a_prompt_update_inherit_the_current_system_prompt() {
+    let server = MockServer::start().await;
+    let state = Arc::new(ScriptState::default());
+    mount_script(
+        &server,
+        PromptInheritanceScript {
+            state: state.clone(),
+        },
+    )
+    .await;
+
+    let mut harness = build_enabled_agent(&server, DelegationLimits::default());
+    harness
+        .agent
+        .set_system_prompt("You are the updated effective root prompt.");
+    let output = harness
+        .agent
+        .complete("spawn with current prompt")
+        .await
+        .unwrap();
+    assert_eq!(output.text, "prompt inheritance complete");
+    assert!(state.unexpected.lock().unwrap().is_empty());
+
+    let requests = state.requests.lock().unwrap();
+    let child = requests
+        .iter()
+        .find(|request| request_system(request).contains("You are /root/current"))
+        .expect("child request");
+    let system = request_system(child);
+    assert!(system.contains("updated effective root prompt"), "{system}");
+    assert!(
+        !system.contains("delegation integration test agent"),
+        "child inherited the activation-time prompt: {system}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepted_followups_survive_interruption() {
+    let server = MockServer::start().await;
+    let state = Arc::new(ScriptState::default());
+    mount_script(
+        &server,
+        InterruptedFollowUpScript {
+            state: state.clone(),
+        },
+    )
+    .await;
+
+    let mut harness = build_enabled_agent(&server, DelegationLimits::default());
+    let output = tokio::time::timeout(
+        Duration::from_secs(8),
+        harness
+            .agent
+            .complete("interrupt after accepting follow-up"),
+    )
+    .await
+    .expect("interrupted follow-up recovery timed out")
+    .unwrap();
+    assert_eq!(output.text, "interrupted follow-up recovered");
+    assert!(state.unexpected.lock().unwrap().is_empty());
+
+    let results = tool_results(harness.agent.session());
+    let queued = parse_result(&results, "queue-resume");
+    assert!(matches!(
+        queued["delivery"].as_str(),
+        Some("follow_up" | "new_run")
+    ));
+    let listed = parse_result(&results, "list-resume");
+    let child = listed_agent(&listed, "/root/resume");
+    assert_eq!(child["status"]["state"], "completed");
+    assert_eq!(child["status"]["output"], "follow-up survived interruption");
+
+    let requests = state.requests.lock().unwrap();
+    let recovered = requests
+        .iter()
+        .filter(|request| request_system(request).contains("You are /root/resume"))
+        .nth(1)
+        .expect("follow-up child request")
+        .to_string();
+    assert!(
+        recovered.contains("accepted follow-up must survive interruption"),
+        "{recovered}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -964,4 +1137,203 @@ async fn aborting_or_dropping_a_root_run_cancels_delegated_workers() {
     .await;
     assert!(state.unexpected.lock().unwrap().is_empty());
     drop(dropped);
+}
+
+struct ReusableAgentScript {
+    state: Arc<ScriptState>,
+}
+
+impl Respond for ReusableAgentScript {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body = self.state.record(request);
+        let route = if request_system(&body).contains("You are /root/reused") {
+            "child"
+        } else {
+            "root"
+        };
+        let index = next_index(&self.state.counters, route);
+        match (route, index) {
+            ("root", 0) | ("root", 4) => response(tool_turn(&[(
+                if index == 0 {
+                    "spawn-reused-1"
+                } else {
+                    "spawn-reused-2"
+                },
+                "spawn_agent",
+                serde_json::json!({"task_name": "reused", "message": format!("task for owning run {}", index / 4 + 1)}),
+            )])),
+            ("root", 1) | ("root", 2) | ("root", 5) | ("root", 6) => response(tool_turn(&[(
+                match index {
+                    1 => "wait-reused-1a",
+                    2 => "wait-reused-1b",
+                    5 => "wait-reused-2a",
+                    _ => "wait-reused-2b",
+                },
+                "wait_agent",
+                serde_json::json!({"timeout_ms": 2_000}),
+            )])),
+            ("root", 3) => response(text_turn("first owning run complete")),
+            ("root", 7) => response(text_turn("second owning run complete")),
+            ("child", 0) => response(text_turn("first child complete")),
+            ("child", 1) => response(text_turn("second child complete")),
+            _ => self.state.unexpected(route, index),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delegation_is_reusable_across_owning_runs_on_the_same_agent() {
+    let server = MockServer::start().await;
+    let state = Arc::new(ScriptState::default());
+    mount_script(
+        &server,
+        ReusableAgentScript {
+            state: state.clone(),
+        },
+    )
+    .await;
+    let mut harness = build_enabled_agent(&server, DelegationLimits::default());
+
+    let first = harness.agent.complete("first owning run").await.unwrap();
+    assert_eq!(first.text, "first owning run complete");
+    let second = harness.agent.complete("second owning run").await.unwrap();
+    assert_eq!(second.text, "second owning run complete");
+    assert!(state.unexpected.lock().unwrap().is_empty());
+
+    let requests = state.requests.lock().unwrap();
+    let child_requests = requests
+        .iter()
+        .filter(|request| request_system(request).contains("You are /root/reused"))
+        .collect::<Vec<_>>();
+    assert_eq!(child_requests.len(), 2, "{child_requests:?}");
+    assert!(child_requests[0]
+        .to_string()
+        .contains("task for owning run 1"));
+    assert!(child_requests[1]
+        .to_string()
+        .contains("task for owning run 2"));
+}
+
+struct StartupRetryScript {
+    state: Arc<ScriptState>,
+    workspace: PathBuf,
+}
+
+impl Respond for StartupRetryScript {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body = self.state.record(request);
+        let route = if request_system(&body).contains("You are /root/startup-retry") {
+            "child"
+        } else {
+            "root"
+        };
+        let index = next_index(&self.state.counters, route);
+        match (route, index) {
+            ("root", 0) => {
+                std::fs::remove_dir(&self.workspace).unwrap();
+                response(tool_turn(&[(
+                    "spawn-startup-retry",
+                    "spawn_agent",
+                    serde_json::json!({
+                        "task_name": "startup-retry",
+                        "message": "initial task that must be delivered exactly once"
+                    }),
+                )]))
+            }
+            ("root", 1) => response(tool_turn(&[(
+                "wait-startup-failure",
+                "wait_agent",
+                serde_json::json!({"timeout_ms": 2_000}),
+            )])),
+            ("root", 2) => {
+                std::fs::create_dir(&self.workspace).unwrap();
+                response(tool_turn(&[(
+                    "wake-startup-retry",
+                    "followup_task",
+                    serde_json::json!({
+                        "target": "/root/startup-retry",
+                        "message": "follow-up accepted while the initial task is retained"
+                    }),
+                )]))
+            }
+            ("root", 3) | ("root", 4) => response(tool_turn(&[(
+                if index == 3 {
+                    "wait-startup-retry-1"
+                } else {
+                    "wait-startup-retry-2"
+                },
+                "wait_agent",
+                serde_json::json!({"timeout_ms": 2_000}),
+            )])),
+            ("root", 5) => response(tool_turn(&[(
+                "list-startup-retry",
+                "list_agents",
+                serde_json::json!({}),
+            )])),
+            ("root", 6) => response(text_turn("startup retry complete")),
+            ("child", 0) => response(text_turn("initial task complete")),
+            ("child", 1) => response(text_turn("follow-up complete")),
+            _ => self.state.unexpected(route, index),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_startup_failure_retains_and_retries_the_initial_task_exactly_once() {
+    let server = MockServer::start().await;
+    let state = Arc::new(ScriptState::default());
+    let mut harness = build_enabled_agent(&server, DelegationLimits::default());
+    mount_script(
+        &server,
+        StartupRetryScript {
+            state: state.clone(),
+            workspace: harness._workspace.path().to_path_buf(),
+        },
+    )
+    .await;
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(8),
+        harness.agent.complete("recover child startup"),
+    )
+    .await
+    .expect("child startup recovery timed out")
+    .unwrap();
+    assert_eq!(output.text, "startup retry complete");
+    assert!(state.unexpected.lock().unwrap().is_empty());
+
+    let results = tool_results(harness.agent.session());
+    let listed = parse_result(&results, "list-startup-retry");
+    let child = listed_agent(&listed, "/root/startup-retry");
+    assert_eq!(child["status"]["state"], "completed");
+    assert_eq!(child["status"]["output"], "follow-up complete");
+
+    let requests = state.requests.lock().unwrap();
+    let child_requests = requests
+        .iter()
+        .filter(|request| request_system(request).contains("You are /root/startup-retry"))
+        .collect::<Vec<_>>();
+    assert_eq!(child_requests.len(), 2, "{child_requests:?}");
+    let initial = child_requests[0].to_string();
+    let follow_up = child_requests[1].to_string();
+    assert!(initial.contains("initial task that must be delivered exactly once"));
+    assert!(!initial.contains("follow-up accepted while the initial task is retained"));
+    assert!(follow_up.contains("follow-up accepted while the initial task is retained"));
+    drop(requests);
+
+    let events = read_provenance(&harness.team_directory.join("provenance.jsonl"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["event"] == "agent_spawned")
+            .count(),
+        1
+    );
+    assert!(events.iter().any(|event| {
+        event["event"] == "agent_status"
+            && event["status"]["state"] == "failed"
+            && event["status"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("task retained for retry"))
+    }));
 }

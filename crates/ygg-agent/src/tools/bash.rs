@@ -522,6 +522,7 @@ mod tests {
                 workspace: &self.workspace,
                 sandbox: &self.sandbox,
                 execution_scope: "bash-test",
+                resource_owner: "bash-test",
                 active_skills: &[],
                 registered_tools: &[],
                 progress: ToolProgressSink::null(),
@@ -622,6 +623,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "bash-detached-descendant-test",
+            resource_owner: "bash-detached-descendant-test",
         };
 
         let output = BashTool
@@ -685,6 +687,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "bash-permission-test",
+            resource_owner: "bash-permission-test",
         };
         for command in [
             "true",
@@ -714,6 +717,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "bash-permission-test",
+            resource_owner: "bash-permission-test",
         };
         let err = BashTool
             .execute(json!({"command": "true"}), &ctx)
@@ -749,6 +753,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "bash-shared-budget-test",
+            resource_owner: "bash-shared-budget-test",
         };
         let out = BashTool
             .execute(
@@ -796,6 +801,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "bash-external-path-test",
+            resource_owner: "bash-external-path-test",
             active_skills: &[],
             registered_tools: &[],
             progress: ToolProgressSink::null(),
@@ -830,6 +836,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "bash-output-test",
+            resource_owner: "bash-output-test",
         };
         let out = BashTool
             .execute(
@@ -867,6 +874,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "bash-timeout-test",
+            resource_owner: "bash-timeout-test",
         };
         let started = std::time::Instant::now();
         let err = BashTool
@@ -900,6 +908,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "bash-per-call-timeout-test",
+            resource_owner: "bash-per-call-timeout-test",
         };
         let started = std::time::Instant::now();
         let err = BashTool
@@ -926,6 +935,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "bash-escaped-pipe-test",
+            resource_owner: "bash-escaped-pipe-test",
         };
         let started = std::time::Instant::now();
         let error = BashTool

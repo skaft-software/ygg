@@ -14,8 +14,11 @@ use crate::tool::{ToolError, ToolOutput, ToolProgress};
 /// one [`AgentEvent::RunFinished`] as its final event, even when it fails or
 /// is aborted. Errors that occur *before* a run starts are returned by
 /// [`Agent::prompt`](crate::Agent::prompt) instead. Tool failures are not run
-/// failures — they arrive as `Err` inside [`AgentEvent::ToolFinished`] and are
-/// returned to the model as error tool results.
+/// failures. Transport/execution failures arrive as `Err` inside
+/// [`AgentEvent::ToolFinished`]; a completed rich result may instead be
+/// `Ok(output)` with [`ToolOutput::is_error`](crate::ToolOutput::is_error)
+/// set, preserving structured media/details while still becoming an error
+/// tool result for the model.
 ///
 /// Streaming events are never persisted in the session; only completed
 /// messages and tool results are.
@@ -124,7 +127,8 @@ pub enum AgentEvent {
     ToolFinished {
         /// The tool call ID this result answers.
         id: ToolCallId,
-        /// The execution outcome; `Err` becomes an error tool result.
+        /// The execution outcome. `Err` and a marked rich `Ok` output both
+        /// become error tool results.
         result: Result<ToolOutput, ToolError>,
     },
 

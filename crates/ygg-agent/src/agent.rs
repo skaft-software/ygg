@@ -28,21 +28,23 @@ use crate::compaction::{
 use crate::context::{ContextBreakdown, ContextSnapshot, ContextTracker};
 use crate::delegation::{
     enable_root_delegation, DelegationBinding, DelegationConfig, DelegationError,
-    DelegationTemplate,
+    DelegationRuntimeSettings, DelegationTemplate,
 };
 use crate::events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
     OutputChannel, QueueDeliveryMode,
 };
 use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
+use crate::extension_process::{ExtensionProcess, EXTENSION_FEATURE_AGENT_SESSIONS};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
 use crate::session::{
     EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRunOutcome,
 };
 use crate::tool::{
-    CancellationToken, ReplaySafety, Tool, ToolContext, ToolError, ToolOutput, ToolOutputMediaKind,
-    ToolProgress, ToolProgressSink, PROGRESS_CHANNEL_CAPACITY,
+    CancellationToken, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
+    ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind, ToolProgress, ToolProgressSink,
+    PROGRESS_CHANNEL_CAPACITY,
 };
 
 /// Errors surfaced by [`Agent`] APIs.
@@ -73,6 +75,9 @@ pub enum AgentError {
     /// Two tools were registered under the same name.
     #[error("duplicate tool name registered: {0}")]
     DuplicateTool(String),
+    /// The configured collaboration runtime could not start an owning run.
+    #[error("delegation error: {0}")]
+    Delegation(String),
     /// The configured workspace root is unusable.
     #[error("invalid workspace: {0}")]
     Workspace(String),
@@ -132,6 +137,7 @@ fn provider_failure_phase(error: &AgentError) -> Option<&'static str> {
         AgentError::IncompleteResponse { .. } => Some("response completion"),
         AgentError::Session(_)
         | AgentError::DuplicateTool(_)
+        | AgentError::Delegation(_)
         | AgentError::Workspace(_)
         | AgentError::CostLimit { .. }
         | AgentError::ContextExceeded { .. }
@@ -286,6 +292,7 @@ pub struct Agent {
     compaction_threshold_fraction: f64,
     compaction_keep_recent_tokens: u64,
     session_id: String,
+    resource_owner: String,
     tool_scope: String,
     completion_policy: CompletionPolicy,
     output_modalities: OutputModalities,
@@ -532,9 +539,14 @@ fn user_message(input: UserInput) -> EntryValue {
     }))
 }
 
-fn notify_observers(observers: &[Arc<dyn EventObserver>], event: &AgentEvent) {
-    for observer in observers {
-        observer.on_event(event);
+struct ObserverDispatch {
+    observers: Vec<Arc<dyn EventObserver>>,
+    resource_owner: String,
+}
+
+fn notify_observers(observers: &ObserverDispatch, event: &AgentEvent) {
+    for observer in &observers.observers {
+        observer.on_event_for_owner(event, &observers.resource_owner);
     }
 }
 
@@ -578,6 +590,82 @@ struct TerminalActionReceipt {
     arguments: String,
     status: &'static str,
     result: String,
+}
+
+struct CompletedToolExecution {
+    result: Result<ToolOutput, ToolError>,
+    progress_rx: mpsc::Receiver<ToolProgress>,
+    progress_sink: ToolProgressSink,
+    cancellation_won: bool,
+}
+
+async fn execute_parallel_tool_call(
+    tool: Arc<dyn Tool>,
+    hooks: &[Arc<dyn ToolCallHook>],
+    name: &str,
+    arguments: serde_json::Value,
+    sandbox: &SandboxConfig,
+    tool_scope: &str,
+    resource_owner: &str,
+    active_skills: &[crate::session::SkillActivatedSnapshot],
+    registered_tools: &[String],
+    cancellation: CancellationToken,
+) -> CompletedToolExecution {
+    let (progress_tx, progress_rx) = mpsc::channel::<ToolProgress>(PROGRESS_CHANNEL_CAPACITY);
+    let progress_sink = ToolProgressSink::live(progress_tx);
+    let tool_ctx = ToolContext {
+        workspace: &sandbox.workspace,
+        sandbox,
+        execution_scope: tool_scope,
+        resource_owner,
+        active_skills,
+        registered_tools,
+        progress: progress_sink.clone(),
+        cancellation: cancellation.clone(),
+    };
+
+    let mut hook_denial = None;
+    for hook in hooks {
+        if let Err(error) = hook.before_tool_call(name, &arguments, &tool_ctx).await {
+            hook_denial = Some(error);
+            break;
+        }
+    }
+
+    let mut cancellation_won = false;
+    let result = if let Some(error) = hook_denial {
+        Err(error)
+    } else if cancellation.is_cancelled() {
+        cancellation_won = true;
+        Err(cancelled_tool_error())
+    } else {
+        let execute = tool.execute(arguments.clone(), &tool_ctx);
+        tokio::pin!(execute);
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                cancellation_won = true;
+                Err(cancelled_tool_error())
+            }
+            result = &mut execute => result,
+        }
+    };
+
+    let (output, is_error) = match &result {
+        Ok(output) => (output.text.as_str(), output.is_error()),
+        Err(error) => (error.message.as_str(), true),
+    };
+    for hook in hooks {
+        hook.after_tool_call(name, &arguments, output, is_error, &tool_ctx)
+            .await;
+    }
+
+    CompletedToolExecution {
+        result,
+        progress_rx,
+        progress_sink,
+        cancellation_won,
+    }
 }
 
 fn bounded_gate_text(text: &str, max_chars: usize) -> String {
@@ -799,6 +887,15 @@ fn active_branch_entries(session: &Session) -> Vec<&crate::session::Entry> {
     reverse
 }
 
+fn resolve_tool_delivery_after_persistence(
+    result: &Result<ToolOutput, ToolError>,
+    text_limit: usize,
+) {
+    if let Ok(output) = result {
+        output.resolve_delivery(output.text.len() <= text_limit);
+    }
+}
+
 fn cancelled_tool_error() -> ToolError {
     ToolError::new(
         "tool execution cancelled by user; state may be partially changed and must not be replayed automatically",
@@ -872,75 +969,215 @@ fn truncate_tool_text(text: &str, limit: usize) -> String {
     result
 }
 
+fn truncate_ordered_tool_text(
+    content_parts: &[ToolOutputContentPart],
+    limit: usize,
+) -> Vec<Option<String>> {
+    let mut lowered = vec![None; content_parts.len()];
+    let text_indices = content_parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| matches!(part, ToolOutputContentPart::Text(_)).then_some(index))
+        .collect::<Vec<_>>();
+    let Some(&first_text_index) = text_indices.first() else {
+        return lowered;
+    };
+    let total_text_bytes = text_indices.iter().fold(0usize, |total, &index| {
+        let ToolOutputContentPart::Text(text) = &content_parts[index] else {
+            unreachable!("text_indices contains only text parts");
+        };
+        total.saturating_add(text.len())
+    });
+    if total_text_bytes <= limit {
+        for index in text_indices {
+            let ToolOutputContentPart::Text(text) = &content_parts[index] else {
+                unreachable!("text_indices contains only text parts");
+            };
+            lowered[index] = Some(text.clone());
+        }
+        return lowered;
+    }
+    if limit == 0 {
+        lowered[first_text_index] = Some(String::new());
+        return lowered;
+    }
+    if limit <= TOOL_TRUNCATION_MARKER.len() {
+        lowered[first_text_index] = Some(TOOL_TRUNCATION_MARKER[..limit].to_owned());
+        return lowered;
+    }
+
+    let available = limit - TOOL_TRUNCATION_MARKER.len();
+    let mut head_remaining = available / 2;
+    let mut tail_remaining = available - head_remaining;
+    let mut prefixes = vec![String::new(); content_parts.len()];
+    let mut suffixes = vec![String::new(); content_parts.len()];
+
+    for &index in &text_indices {
+        if head_remaining == 0 {
+            break;
+        }
+        let ToolOutputContentPart::Text(text) = &content_parts[index] else {
+            unreachable!("text_indices contains only text parts");
+        };
+        let mut end = head_remaining.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        prefixes[index].push_str(&text[..end]);
+        head_remaining -= end;
+    }
+    for &index in text_indices.iter().rev() {
+        if tail_remaining == 0 {
+            break;
+        }
+        let ToolOutputContentPart::Text(text) = &content_parts[index] else {
+            unreachable!("text_indices contains only text parts");
+        };
+        let mut start = text.len().saturating_sub(tail_remaining);
+        while start < text.len() && !text.is_char_boundary(start) {
+            start += 1;
+        }
+        suffixes[index].push_str(&text[start..]);
+        tail_remaining -= text.len() - start;
+    }
+
+    let marker_index = text_indices
+        .iter()
+        .rev()
+        .copied()
+        .find(|&index| !prefixes[index].is_empty())
+        .unwrap_or(first_text_index);
+    for index in text_indices {
+        let mut text = std::mem::take(&mut prefixes[index]);
+        if index == marker_index {
+            text.push_str(TOOL_TRUNCATION_MARKER);
+        }
+        text.push_str(&suffixes[index]);
+        if !text.is_empty() {
+            lowered[index] = Some(text);
+        }
+    }
+    lowered
+}
+
+fn lower_tool_media_part(
+    media: &Media,
+    model: &Model,
+    inline_media: bool,
+    result_parts: &mut Vec<ToolResultPart>,
+    adjacent_media: &mut Vec<Media>,
+    accepted_kinds: &mut Vec<ToolOutputMediaKind>,
+    omissions: &mut Vec<String>,
+) {
+    match media {
+        Media::Image(_) => {
+            if !model
+                .spec
+                .capabilities
+                .input_modalities
+                .contains(ygg_ai::Modality::Image)
+            {
+                omissions
+                    .push("[image omitted: the active model does not accept image input]".into());
+            } else {
+                accepted_kinds.push(ToolOutputMediaKind::Image);
+                if inline_media {
+                    result_parts.push(ToolResultPart::Media(media.clone()));
+                } else {
+                    adjacent_media.push(media.clone());
+                }
+            }
+        }
+        Media::Audio(audio) => {
+            if !model
+                .spec
+                .capabilities
+                .input_modalities
+                .contains(ygg_ai::Modality::Audio)
+            {
+                omissions
+                    .push("[audio omitted: the active model does not accept audio input]".into());
+            } else if model.spec.protocol != Protocol::OpenAiChat {
+                omissions
+                    .push("[audio omitted: this protocol cannot replay audio tool output]".into());
+            } else if !matches!(
+                audio.format,
+                ygg_ai::AudioFormat::Wav | ygg_ai::AudioFormat::Mp3
+            ) {
+                omissions.push(format!(
+                    "[audio omitted: OpenAI Chat accepts WAV or MP3 input, got {:?}]",
+                    audio.format
+                ));
+            } else {
+                accepted_kinds.push(ToolOutputMediaKind::Audio);
+                adjacent_media.push(media.clone());
+            }
+        }
+    }
+}
+
 fn lower_tool_result(
     call_id: ygg_ai::ToolCallId,
     result: &Result<ToolOutput, ToolError>,
     model: &Model,
     text_limit: usize,
-) -> (UserMessage, Vec<ToolOutputMediaKind>, String, bool) {
+) -> (
+    UserMessage,
+    Vec<ToolOutputMediaKind>,
+    String,
+    bool,
+    Option<ToolOutputDetails>,
+) {
     let (raw_text, is_error) = match result {
-        Ok(output) => (output.text.as_str(), false),
+        Ok(output) => (output.text.as_str(), output.is_error()),
         Err(error) => (error.message.as_str(), true),
     };
     let persisted_text = truncate_tool_text(raw_text, text_limit);
-    let mut result_parts = vec![ToolResultPart::Text(persisted_text.clone())];
+    let mut result_parts = Vec::new();
     let mut adjacent_media = Vec::new();
     let mut accepted_kinds = Vec::new();
     let mut omissions = Vec::new();
 
-    if let Ok(output) = result {
-        for media in output.media() {
-            match media {
-                Media::Image(_) => {
-                    if !model
-                        .spec
-                        .capabilities
-                        .input_modalities
-                        .contains(ygg_ai::Modality::Image)
-                    {
-                        omissions.push(
-                            "[image omitted: the active model does not accept image input]"
-                                .to_owned(),
-                        );
-                    } else {
-                        accepted_kinds.push(ToolOutputMediaKind::Image);
-                        match model.spec.protocol {
-                            Protocol::OpenAiResponses | Protocol::AnthropicMessages => {
-                                result_parts.push(ToolResultPart::Media(media.clone()));
-                            }
-                            Protocol::OpenAiChat => adjacent_media.push(media.clone()),
+    match result {
+        Err(_) => result_parts.push(ToolResultPart::Text(persisted_text.clone())),
+        Ok(output)
+            if matches!(
+                model.spec.protocol,
+                Protocol::OpenAiResponses | Protocol::AnthropicMessages
+            ) =>
+        {
+            let bounded_text = truncate_ordered_tool_text(output.content_parts(), text_limit);
+            for (index, part) in output.content_parts().iter().enumerate() {
+                match part {
+                    ToolOutputContentPart::Text(_) => {
+                        if let Some(text) = bounded_text[index].as_ref() {
+                            result_parts.push(ToolResultPart::Text(text.clone()));
                         }
                     }
+                    ToolOutputContentPart::Media(media) => lower_tool_media_part(
+                        media,
+                        model,
+                        true,
+                        &mut result_parts,
+                        &mut adjacent_media,
+                        &mut accepted_kinds,
+                        &mut omissions,
+                    ),
                 }
-                Media::Audio(audio) => {
-                    if !model
-                        .spec
-                        .capabilities
-                        .input_modalities
-                        .contains(ygg_ai::Modality::Audio)
-                    {
-                        omissions.push(
-                            "[audio omitted: the active model does not accept audio input]"
-                                .to_owned(),
-                        );
-                    } else if model.spec.protocol != Protocol::OpenAiChat {
-                        omissions.push(
-                            "[audio omitted: this protocol cannot replay audio tool output]"
-                                .to_owned(),
-                        );
-                    } else if !matches!(
-                        audio.format,
-                        ygg_ai::AudioFormat::Wav | ygg_ai::AudioFormat::Mp3
-                    ) {
-                        omissions.push(format!(
-                            "[audio omitted: OpenAI Chat accepts WAV or MP3 input, got {:?}]",
-                            audio.format
-                        ));
-                    } else {
-                        accepted_kinds.push(ToolOutputMediaKind::Audio);
-                        adjacent_media.push(media.clone());
-                    }
-                }
+            }
+        }
+        Ok(output) => {
+            result_parts.push(ToolResultPart::Text(persisted_text.clone()));
+            for media in output.media() {
+                lower_tool_media_part(
+                    media,
+                    model,
+                    false,
+                    &mut result_parts,
+                    &mut adjacent_media,
+                    &mut accepted_kinds,
+                    &mut omissions,
+                );
             }
         }
     }
@@ -969,6 +1206,7 @@ fn lower_tool_result(
         accepted_kinds,
         presented_text,
         effective_is_error,
+        result.as_ref().ok().and_then(ToolOutput::details).cloned(),
     )
 }
 
@@ -1184,12 +1422,14 @@ fn provider_failure(error: AiError, retries: usize) -> AgentError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_recovery_call(
     tool: Arc<dyn Tool>,
     hooks: &[Arc<dyn ToolCallHook>],
     call: &ToolCall,
     sandbox: &SandboxConfig,
     tool_scope: &str,
+    resource_owner: &str,
     registered_tools: &[String],
     session: &mut Session,
 ) -> Result<Result<ToolOutput, ToolError>, AgentError> {
@@ -1211,6 +1451,7 @@ async fn execute_recovery_call(
                 workspace: &sandbox.workspace,
                 sandbox,
                 execution_scope: tool_scope,
+                resource_owner,
                 active_skills: &active_skills,
                 registered_tools,
                 progress: progress_sink,
@@ -1276,7 +1517,7 @@ async fn execute_recovery_call(
                 }
             }
             let (output, is_error) = match &result {
-                Ok(output) => (output.text.as_str(), false),
+                Ok(output) => (output.text.as_str(), output.is_error()),
                 Err(error) => (error.message.as_str(), true),
             };
             for hook in hooks {
@@ -2529,9 +2770,8 @@ impl Agent {
             )));
         }
         config.sandbox.workspace = workspace;
-        let session_id = config
-            .session_id
-            .unwrap_or_else(|| config.session.cache_key());
+        let resource_owner = config.session.resource_owner_key();
+        let session_id = config.session_id.unwrap_or_else(|| resource_owner.clone());
         let max_output_tokens = agent_max_output_tokens(&config.model, &config.reasoning);
         let tool_scope = next_tool_scope();
         Ok(Self {
@@ -2550,6 +2790,7 @@ impl Agent {
             compaction_threshold_fraction: 0.85,
             compaction_keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             session_id,
+            resource_owner,
             tool_scope,
             completion_policy: CompletionPolicy::Natural,
             output_modalities: OutputModalities::Text,
@@ -2567,6 +2808,10 @@ impl Agent {
     /// Read-only access to the agent's session (its entries and head).
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    pub(crate) fn resource_owner_id(&self) -> &str {
+        &self.resource_owner
     }
 
     /// Persist a non-model-visible terminal marker for a frontend-owned run.
@@ -2598,6 +2843,7 @@ impl Agent {
     /// Configure output modalities for subsequent runs.
     pub fn set_output_modalities(&mut self, output_modalities: OutputModalities) {
         self.output_modalities = output_modalities;
+        self.sync_delegation_runtime_settings();
     }
 
     /// Replace the system prompt at an idle boundary. Product frontends use
@@ -2605,7 +2851,11 @@ impl Agent {
     /// state; the value is cloned into the next run when [`prompt`](Self::prompt)
     /// starts.
     pub fn set_system_prompt(&mut self, system: impl Into<String>) {
-        self.system = system.into();
+        let system = system.into();
+        if let Some(binding) = &self.delegation {
+            binding.update_base_system(system.clone());
+        }
+        self.system = system;
         let delegation_instructions = self
             .delegation
             .as_ref()
@@ -2636,22 +2886,14 @@ impl Agent {
         let template = DelegationTemplate {
             client: self.client.clone(),
             model: self.model.clone(),
-            base_system: self.system.clone(),
+            base_system: std::sync::RwLock::new(self.system.clone()),
             sandbox: self.sandbox.clone(),
             extensions: self.extensions.clone(),
             max_turns: self.max_turns,
             reasoning: self.reasoning.clone(),
             reasoning_mode: self.reasoning_mode,
             cache_retention: self.cache_retention,
-            compaction_model: self.compaction_model.clone(),
-            auto_compaction_mode: self.auto_compaction_mode,
-            auto_compaction_threshold: self.compaction_threshold_fraction,
-            compaction_keep_recent_tokens: self.compaction_keep_recent_tokens,
-            completion_policy: self.completion_policy,
-            output_modalities: self.output_modalities.clone(),
-            max_output_tokens: self.max_output_tokens,
-            max_session_cost_microdollars: self.max_session_cost_microdollars,
-            provider_retries_enabled: self.provider_retries_enabled,
+            runtime: std::sync::RwLock::new(self.delegation_runtime_settings()),
         };
         let binding = enable_root_delegation(self, config, template)?;
         let team_directory = binding.team_directory().to_path_buf();
@@ -2666,6 +2908,55 @@ impl Agent {
             .map(DelegationBinding::team_directory)
     }
 
+    /// Binds an executable extension's negotiated child-session service to
+    /// this root agent's V2 delegation manager.
+    pub fn bind_extension_agent_sessions(
+        &self,
+        process: &ExtensionProcess,
+    ) -> Result<bool, AgentError> {
+        if !process
+            .negotiated_features()
+            .contains(EXTENSION_FEATURE_AGENT_SESSIONS)
+        {
+            return Ok(false);
+        }
+        let binding = self.delegation.as_ref().ok_or_else(|| {
+            AgentError::Delegation(
+                "an extension negotiated agent_sessions before V2 delegation was enabled".into(),
+            )
+        })?;
+        let service = binding
+            .extension_service(
+                process.agent_session_principal(),
+                self.resource_owner.clone(),
+            )
+            .map_err(AgentError::Delegation)?;
+        process
+            .bind_agent_session_service(service)
+            .map_err(|error| AgentError::Delegation(error.to_string()))?;
+        Ok(true)
+    }
+
+    fn delegation_runtime_settings(&self) -> DelegationRuntimeSettings {
+        DelegationRuntimeSettings {
+            compaction_model: self.compaction_model.clone(),
+            auto_compaction_mode: self.auto_compaction_mode,
+            auto_compaction_threshold: self.compaction_threshold_fraction,
+            compaction_keep_recent_tokens: self.compaction_keep_recent_tokens,
+            completion_policy: self.completion_policy,
+            output_modalities: self.output_modalities.clone(),
+            max_output_tokens: self.max_output_tokens,
+            max_session_cost_microdollars: self.max_session_cost_microdollars,
+            provider_retries_enabled: self.provider_retries_enabled,
+        }
+    }
+
+    fn sync_delegation_runtime_settings(&self) {
+        if let Some(binding) = &self.delegation {
+            binding.update_runtime_settings(self.delegation_runtime_settings());
+        }
+    }
+
     pub(crate) fn append_system_instructions(&mut self, instructions: String) {
         if !self.system.is_empty() {
             self.system.push_str("\n\n");
@@ -2674,7 +2965,9 @@ impl Agent {
     }
 
     pub(crate) fn install_delegation_tools(&mut self, tools: Vec<Arc<dyn Tool>>) {
-        self.extensions.tools.extend(tools);
+        for tool in tools {
+            self.extensions.tool_arc(tool);
+        }
     }
 
     pub(crate) fn set_delegation_binding(
@@ -2716,6 +3009,7 @@ impl Agent {
             prompt_color: self.prompt_color.clone(),
             display_text: self.prompt_display_text.take(),
             run_outcome: None,
+            tool_output: None,
             local_synthetic_assistant: false,
         }
     }
@@ -2744,17 +3038,20 @@ impl Agent {
     /// rejected before network I/O.
     pub fn set_max_session_cost_microdollars(&mut self, limit: Option<u64>) {
         self.max_session_cost_microdollars = limit;
+        self.sync_delegation_runtime_settings();
     }
 
     /// Enable or disable transient provider retries for subsequent runs.
     pub fn set_provider_retries_enabled(&mut self, enabled: bool) {
         self.provider_retries_enabled = enabled;
+        self.sync_delegation_runtime_settings();
     }
 
     /// Configure the model used for autonomous context summaries. Passing
     /// `None` keeps summaries on the active conversation model.
     pub fn set_compaction_model(&mut self, model: Option<Model>) {
         self.compaction_model = model;
+        self.sync_delegation_runtime_settings();
     }
 
     /// Read-only access to the autonomous compaction model, if overridden.
@@ -2878,6 +3175,7 @@ impl Agent {
         self.auto_compaction_mode = mode;
         self.compaction_threshold_fraction = threshold_fraction;
         self.compaction_keep_recent_tokens = keep_recent_tokens;
+        self.sync_delegation_runtime_settings();
         Ok(())
     }
 
@@ -2903,6 +3201,7 @@ impl Agent {
     /// Apply the root agent's resolved output reservation to a delegated child.
     pub(crate) fn inherit_max_output_tokens(&mut self, max_output_tokens: u64) {
         self.max_output_tokens = max_output_tokens;
+        self.sync_delegation_runtime_settings();
     }
 
     /// Estimate the next request using the same provider-reconciled baseline
@@ -3035,6 +3334,7 @@ impl Agent {
     /// Selects completion behavior for subsequent runs.
     pub fn set_completion_policy(&mut self, policy: CompletionPolicy) {
         self.completion_policy = policy;
+        self.sync_delegation_runtime_settings();
     }
 
     /// Returns the selected completion policy.
@@ -3044,11 +3344,7 @@ impl Agent {
 
     /// Provider schemas for all currently executable tools, in wire order.
     pub fn registered_tool_definitions(&self) -> Vec<ToolDef> {
-        self.extensions
-            .tools
-            .iter()
-            .map(|tool| tool.definition())
-            .collect()
+        self.extensions.tool_definitions()
     }
 
     /// Exact registered tool names after the frontend has applied all policy
@@ -3057,7 +3353,8 @@ impl Agent {
     pub fn registered_tool_names(&self) -> Vec<String> {
         let mut names = self
             .extensions
-            .tools
+            .tool_snapshot()
+            .1
             .iter()
             .map(|tool| tool.definition().name)
             .collect::<Vec<_>>();
@@ -3095,8 +3392,9 @@ impl Agent {
             return Ok(());
         }
 
+        let (_, tools) = self.extensions.tool_snapshot();
         let mut tool_map: HashMap<String, Arc<dyn Tool>> = HashMap::new();
-        for tool in &self.extensions.tools {
+        for tool in &tools {
             let definition = tool.definition();
             tool_map.insert(definition.name, Arc::clone(tool));
         }
@@ -3104,6 +3402,7 @@ impl Agent {
         registered_tools.sort();
         let sandbox = self.sandbox.clone();
         let tool_scope = self.tool_scope.clone();
+        let resource_owner = self.resource_owner.clone();
         let tool_call_hooks = self.extensions.tool_call_hooks.clone();
         for (call_index, call) in unresolved {
             let result = if call_index >= MAX_TOOL_CALLS_PER_TURN {
@@ -3120,6 +3419,7 @@ impl Agent {
                             &call,
                             &sandbox,
                             &tool_scope,
+                            &resource_owner,
                             &registered_tools,
                             &mut self.session,
                         )
@@ -3131,10 +3431,16 @@ impl Agent {
                     ))),
                 }
             };
-            let (message, _, _, _) =
+            let (message, _, _, _, details) =
                 lower_tool_result(call.id, &result, &self.model, sandbox.max_output_bytes);
-            self.session
-                .append(EntryValue::Message(Message::User(message)))?;
+            self.session.append_with_metadata(
+                EntryValue::Message(Message::User(message)),
+                details.map(|tool_output| EntryMetadata {
+                    tool_output: Some(tool_output),
+                    ..EntryMetadata::default()
+                }),
+            )?;
+            resolve_tool_delivery_after_persistence(&result, sandbox.max_output_bytes);
         }
         Ok(())
     }
@@ -3147,6 +3453,10 @@ impl Agent {
     /// failed, or max-turns — is reported by exactly one
     /// [`AgentEvent::RunFinished`].
     pub async fn prompt(&mut self, input: impl Into<UserInput>) -> Result<Run<'_>, AgentError> {
+        // Direct library callers may not have an explicit construction
+        // boundary. Keep this idempotent fallback so their first owning run
+        // cannot leave dynamic publishers waiting forever.
+        self.extensions.finalize_tool_surface();
         // A previous process may have died after persisting an assistant tool
         // call but before persisting its result. Repair that semantic boundary
         // before appending a new user message; otherwise strict provider
@@ -3201,16 +3511,25 @@ impl Agent {
             .unwrap_or_else(|| model.clone());
         let system = self.system.clone();
         let sandbox = self.sandbox.clone();
-        let tools = self.extensions.tools.clone();
-        let tool_defs: Vec<ToolDef> = tools.iter().map(|tool| tool.definition()).collect();
-        observe_context_tracker(&context, &self.session, &model, &system, &tool_defs)?;
-        let observers = self.extensions.observers.clone();
+        let extension_host = self.extensions.clone();
+        let (_, initial_tools) = extension_host.tool_snapshot();
+        let initial_tool_defs: Vec<ToolDef> =
+            initial_tools.iter().map(|tool| tool.definition()).collect();
+        observe_context_tracker(&context, &self.session, &model, &system, &initial_tool_defs)?;
+        if let Some(delegation) = &self.delegation {
+            delegation.prepare_owning_run()?;
+        }
+        let observers = ObserverDispatch {
+            observers: self.extensions.observers.clone(),
+            resource_owner: self.resource_owner.clone(),
+        };
         let tool_call_hooks = self.extensions.tool_call_hooks.clone();
         let max_turns = self.max_turns;
         let reasoning = self.reasoning.clone();
         let reasoning_mode = self.reasoning_mode;
         let cache_retention = self.cache_retention;
         let session_id = self.session_id.clone();
+        let resource_owner = self.resource_owner.clone();
         let tool_scope = self.tool_scope.clone();
         let completion_policy = self.completion_policy;
         let output_modalities = self.output_modalities.clone();
@@ -3236,6 +3555,9 @@ impl Agent {
             };
             let session = &mut *session_guard;
 
+            let (mut tool_revision, tools) = extension_host.tool_snapshot();
+            let mut tool_defs: Vec<ToolDef> =
+                tools.iter().map(|tool| tool.definition()).collect();
             let mut tool_map: HashMap<String, Arc<dyn Tool>> =
                 HashMap::with_capacity(tools.len());
             for tool in &tools {
@@ -3333,6 +3655,26 @@ impl Agent {
                     }
                 }
 
+                // Freeze one coherent schema/implementation snapshot after
+                // control and steering have settled but before context sizing.
+                // Every call emitted by this request resolves against exactly
+                // the tool set the provider saw.
+                let (current_revision, current_tools) = extension_host.tool_snapshot();
+                if current_revision != tool_revision {
+                    tool_revision = current_revision;
+                    tool_defs = current_tools
+                        .iter()
+                        .map(|tool| tool.definition())
+                        .collect();
+                    tool_map.clear();
+                    tool_map.reserve(current_tools.len());
+                    for tool in &current_tools {
+                        let definition = tool.definition();
+                        tool_map.insert(definition.name, Arc::clone(tool));
+                    }
+                    registered_tools = tool_map.keys().cloned().collect();
+                    registered_tools.sort();
+                }
                 let request_tool_defs = tool_defs.clone();
 
                 // ── Reconstruct and size context for this exact turn ───────
@@ -4071,28 +4413,120 @@ impl Agent {
                     break 'run FinishReason::Completed;
                 }
 
-                // ── Execute tools sequentially, in emitted order ───────────
+                // A model can emit several independent reads/searches in one
+                // turn. Start every explicitly parallel-safe call before
+                // awaiting any of them, but retain model order for persistence
+                // and ToolFinished events. Any mutation, process, unknown tool,
+                // invalid argument payload, or excess call keeps the whole turn
+                // on the established sequential path.
+                let parallel_batch = calls.len() > 1
+                    && calls.len() <= MAX_TOOL_CALLS_PER_TURN
+                    && calls.iter().all(|call| {
+                        call.arguments_value().is_ok()
+                            && tool_map.get(&call.name).is_some_and(|tool| {
+                                tool.concurrency() == ToolConcurrency::Parallel
+                            })
+                    });
+                let mut parallel_results = if parallel_batch {
+                    let active_skills = session
+                        .head()
+                        .and_then(|head| session.resolve_active_skills(&head).ok())
+                        .map(|state| state.active_skills)
+                        .unwrap_or_default();
+                    for call in &calls {
+                        let parsed = call
+                            .arguments_value()
+                            .expect("parallel batch validates arguments before execution");
+                        stream_context.tool_started();
+                        let ev = AgentEvent::ToolStarted {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            args: parsed,
+                        };
+                        notify_observers(&observers, &ev);
+                        yield ev;
+                    }
+
+                    let operations = calls.iter().map(|call| {
+                        execute_parallel_tool_call(
+                            Arc::clone(
+                                tool_map
+                                    .get(&call.name)
+                                    .expect("parallel batch validates registered tools"),
+                            ),
+                            &tool_call_hooks,
+                            &call.name,
+                            call.arguments_value()
+                                .expect("parallel batch validates arguments before execution"),
+                            &sandbox,
+                            &tool_scope,
+                            &resource_owner,
+                            &active_skills,
+                            &registered_tools,
+                            abort.cancellation.clone(),
+                        )
+                    });
+                    let executions = futures_util::future::join_all(operations);
+                    tokio::pin!(executions);
+                    let mut abort_observed = abort.is_set();
+                    let completed = loop {
+                        tokio::select! {
+                            biased;
+                            results = &mut executions => break results,
+                            _ = abort.wait(), if !abort_observed => {
+                                abort_observed = true;
+                            }
+                            control = control_rx.recv(), if control_open => match control {
+                                Some(Control::Steer(input)) => pending_steer.push(input),
+                                Some(Control::FollowUp(input)) => followups.push_back(input),
+                                Some(Control::SetSteeringMode(mode)) => steering_mode = mode,
+                                Some(Control::SetFollowUpMode(mode)) => follow_up_mode = mode,
+                                Some(Control::Abort) => {
+                                    abort.set();
+                                    abort_observed = true;
+                                }
+                                None => control_open = false,
+                            },
+                        }
+                    };
+                    Some(completed.into_iter())
+                } else {
+                    None
+                };
+
+                // ── Commit tool results in emitted order ───────────────────
                 for (call_index, call) in calls.into_iter().enumerate() {
                     let parsed = call.arguments_value();
-                    stream_context.tool_started();
-                    let ev = AgentEvent::ToolStarted {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        args: parsed.as_ref().cloned().unwrap_or(serde_json::Value::Null),
-                    };
-                    notify_observers(&observers, &ev);
-                    yield ev;
+                    let preexecuted = parallel_results.as_mut().and_then(Iterator::next);
+                    if preexecuted.is_none() {
+                        stream_context.tool_started();
+                        let ev = AgentEvent::ToolStarted {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            args: parsed
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                        };
+                        notify_observers(&observers, &ev);
+                        yield ev;
+                    }
 
-                    // Create a fresh progress channel for every tool
-                    // call. Non‑streaming tools (unknown, bad args)
-                    // simply never push into it; the drain below is a
-                    // no‑op.
-                    let (progress_tx, mut progress_rx) =
-                        mpsc::channel::<ToolProgress>(PROGRESS_CHANNEL_CAPACITY);
-                    let progress_sink = ToolProgressSink::live(progress_tx);
-
-                    let mut cancellation_won = false;
-                    let result: Result<ToolOutput, ToolError> = if call_index >= MAX_TOOL_CALLS_PER_TURN {
+                    let CompletedToolExecution {
+                        result,
+                        mut progress_rx,
+                        progress_sink,
+                        cancellation_won,
+                    } = if let Some(execution) = preexecuted {
+                        execution
+                    } else {
+                        // Create a fresh progress channel for every sequential
+                        // call. Non-streaming tools simply never push into it.
+                        let (progress_tx, mut progress_rx) =
+                            mpsc::channel::<ToolProgress>(PROGRESS_CHANNEL_CAPACITY);
+                        let progress_sink = ToolProgressSink::live(progress_tx);
+                        let mut cancellation_won = false;
+                        let result: Result<ToolOutput, ToolError> = if call_index >= MAX_TOOL_CALLS_PER_TURN {
                         Err(ToolError::new(
                             "tool call skipped: per-turn tool-call limit reached",
                         ))
@@ -4117,6 +4551,7 @@ impl Agent {
                                     workspace: &sandbox.workspace,
                                     sandbox: &sandbox,
                                     execution_scope: &tool_scope,
+                                    resource_owner: &resource_owner,
                                     active_skills: &active_skills,
                                     registered_tools: &registered_tools,
                                     progress: progress_sink.clone(),
@@ -4204,7 +4639,7 @@ impl Agent {
                                     }
                                 };
                                 let (output, is_error) = match &result {
-                                    Ok(output) => (output.text.as_str(), false),
+                                    Ok(output) => (output.text.as_str(), output.is_error()),
                                     Err(error) => (error.message.as_str(), true),
                                 };
                                 for hook in &tool_call_hooks {
@@ -4221,6 +4656,13 @@ impl Agent {
                                 }
                             }
                         }
+                        };
+                        CompletedToolExecution {
+                            result,
+                            progress_rx,
+                            progress_sink,
+                            cancellation_won,
+                        }
                     };
 
                     // ── COMMIT BOUNDARY ──────────────────────────────────
@@ -4233,7 +4675,7 @@ impl Agent {
                     // A large early result must never starve later successful
                     // calls in the same model turn. Structured media is lowered
                     // only when the active model/protocol can replay it safely.
-                    let (message, accepted_media, text, is_error) = lower_tool_result(
+                    let (message, accepted_media, text, is_error, details) = lower_tool_result(
                         call.id.clone(),
                         &result,
                         &model,
@@ -4245,11 +4687,19 @@ impl Agent {
                         status: if is_error { "error" } else { "ok" },
                         result: text.clone(),
                     });
-                    if let Err(e) =
-                        session.append(EntryValue::Message(Message::User(message)))
-                    {
+                    if let Err(e) = session.append_with_metadata(
+                        EntryValue::Message(Message::User(message)),
+                        details.map(|tool_output| EntryMetadata {
+                            tool_output: Some(tool_output),
+                            ..EntryMetadata::default()
+                        }),
+                    ) {
                         break 'run FinishReason::Failed(e.into());
                     }
+                    // Internal durable-delivery tools may provisionally lease
+                    // work while executing. Acknowledge it only once the
+                    // complete, untruncated result is in the session.
+                    resolve_tool_delivery_after_persistence(&result, sandbox.max_output_bytes);
 
                     // ── Drain accepted progress before ToolFinished ───────
                     while let Ok(p) = progress_rx.try_recv() {
@@ -4303,8 +4753,9 @@ impl Agent {
 
                     stream_context.tool_finished();
                     let result = match result {
-                        Ok(_output) if is_error => Err(ToolError::new(text.clone())),
-                        Ok(output) => Ok(output.without_media_payloads_for(accepted_media)),
+                        Ok(output) => Ok(output
+                            .without_media_payloads_for(accepted_media)
+                            .with_is_error(is_error)),
                         Err(error) => Err(error),
                     };
                     let ev = AgentEvent::ToolFinished {
@@ -4378,6 +4829,14 @@ impl Agent {
             context,
             delegation: run_delegation,
         })
+    }
+
+    /// Declares the Agent's static tool overlay complete and releases queued
+    /// dynamic extension catalog updates. Products should call this after
+    /// installing collaboration or other post-construction host tools, before
+    /// exposing the Agent for its first prompt.
+    pub fn finalize_tool_surface(&self) {
+        self.extensions.finalize_tool_surface();
     }
 
     /// Runs to completion, returning the aggregate output.
@@ -4457,6 +4916,31 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provisional_delivery_rolls_back_when_generic_tool_output_limiting_truncates_it() {
+        use std::sync::atomic::{AtomicI8, Ordering};
+
+        let resolution = Arc::new(AtomicI8::new(0));
+        let committed = Arc::clone(&resolution);
+        let rolled_back = Arc::clone(&resolution);
+        let result: Result<ToolOutput, ToolError> = Ok(ToolOutput::new("x".repeat(128))
+            .with_delivery_commit(
+                move || committed.store(1, Ordering::SeqCst),
+                move || rolled_back.store(-1, Ordering::SeqCst),
+            ));
+        let model = ygg_ai::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let (_, _, persisted_text, _, _) =
+            lower_tool_result(ygg_ai::ToolCallId("delivery".into()), &result, &model, 32);
+        assert_ne!(persisted_text, result.as_ref().unwrap().text);
+        assert!(persisted_text.len() <= 32);
+
+        resolve_tool_delivery_after_persistence(&result, 32);
+        assert_eq!(resolution.load(Ordering::SeqCst), -1);
+    }
 
     #[test]
     fn response_header_failures_are_not_automatically_replayed() {
@@ -4763,7 +5247,7 @@ mod tests {
             bytes::Bytes::from_static(b"png"),
             "image/png".parse().unwrap(),
         )));
-        let (message, accepted, _, is_error) =
+        let (message, accepted, _, is_error, _) =
             lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
         assert_eq!(accepted, vec![ToolOutputMediaKind::Image]);
         assert!(!is_error);
@@ -4778,6 +5262,94 @@ mod tests {
     }
 
     #[test]
+    fn ordered_tool_parts_keep_text_image_text_order_under_one_text_budget() {
+        let text_limit = TOOL_TRUNCATION_MARKER.len() + 6;
+        for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+            let model = tool_media_model(
+                protocol,
+                ygg_ai::ModalitySet::none().with(ygg_ai::Modality::Image),
+            );
+            let result = Ok(ToolOutput::from_content_parts([
+                ToolOutputContentPart::Text("ABCDEFGHIJKLMNOPQRSTUVWXYZ".into()),
+                ToolOutputContentPart::Media(Media::image_bytes(
+                    bytes::Bytes::from_static(b"png"),
+                    "image/png".parse().unwrap(),
+                )),
+                ToolOutputContentPart::Text("abcdefghijklmnopqrstuvwxyz".into()),
+            ]));
+
+            let (message, accepted, persisted_text, is_error, _) = lower_tool_result(
+                ygg_ai::ToolCallId("call".into()),
+                &result,
+                &model,
+                text_limit,
+            );
+
+            assert_eq!(accepted, vec![ToolOutputMediaKind::Image]);
+            assert!(!is_error);
+            assert!(persisted_text.len() <= text_limit);
+            let UserPart::ToolResult(result) = &message.content[0] else {
+                panic!("expected canonical tool result");
+            };
+            assert_eq!(result.content.len(), 3);
+            assert!(matches!(
+                &result.content[0],
+                ToolResultPart::Text(text)
+                    if text == &format!("ABC{TOOL_TRUNCATION_MARKER}")
+            ));
+            assert!(matches!(
+                result.content[1],
+                ToolResultPart::Media(Media::Image(_))
+            ));
+            assert!(matches!(
+                &result.content[2],
+                ToolResultPart::Text(text) if text == "xyz"
+            ));
+            let provider_text_bytes = result
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    ToolResultPart::Text(text) => Some(text.len()),
+                    ToolResultPart::Media(_) => None,
+                })
+                .sum::<usize>();
+            assert_eq!(provider_text_bytes, text_limit);
+        }
+    }
+
+    #[test]
+    fn lowering_keeps_structured_details_outside_provider_visible_content() {
+        let model = tool_media_model(Protocol::OpenAiResponses, ygg_ai::ModalitySet::none());
+        let result = Ok(ToolOutput::new("Found one source.")
+            .try_with_details(
+                Some(serde_json::json!({"sources": [{"title": "Primary"}]})),
+                Some(serde_json::json!({"cache": "miss"})),
+            )
+            .unwrap());
+        let (message, _, _, is_error, details) =
+            lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
+
+        assert!(!is_error);
+        let details = details.expect("durable details");
+        assert_eq!(
+            details.structured_content(),
+            Some(&serde_json::json!({"sources": [{"title": "Primary"}]}))
+        );
+        assert_eq!(
+            details.metadata(),
+            Some(&serde_json::json!({"cache": "miss"}))
+        );
+        let UserPart::ToolResult(provider_result) = &message.content[0] else {
+            panic!("expected canonical tool result");
+        };
+        assert_eq!(provider_result.content.len(), 1);
+        assert!(matches!(
+            provider_result.content[0],
+            ToolResultPart::Text(ref text) if text == "Found one source."
+        ));
+    }
+
+    #[test]
     fn openai_chat_wav_and_mp3_follow_the_paired_tool_result() {
         let model = tool_media_model(
             Protocol::OpenAiChat,
@@ -4788,7 +5360,7 @@ mod tests {
                 bytes::Bytes::from_static(b"audio"),
                 format,
             )));
-            let (message, accepted, _, is_error) =
+            let (message, accepted, _, is_error, _) =
                 lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
             assert_eq!(accepted, vec![ToolOutputMediaKind::Audio]);
             assert!(!is_error);
@@ -4810,7 +5382,7 @@ mod tests {
             bytes::Bytes::from_static(b"audio"),
             ygg_ai::AudioFormat::Wav,
         )));
-        let (message, accepted, text, is_error) =
+        let (message, accepted, text, is_error, _) =
             lower_tool_result(ygg_ai::ToolCallId("call".into()), &audio, &responses, 4096);
         assert!(accepted.is_empty());
         assert!(is_error);
@@ -4825,7 +5397,7 @@ mod tests {
             bytes::Bytes::from_static(b"audio"),
             ygg_ai::AudioFormat::Aac,
         )));
-        let (message, accepted, text, is_error) =
+        let (message, accepted, text, is_error, _) =
             lower_tool_result(ygg_ai::ToolCallId("call".into()), &aac, &chat, 4096);
         assert!(accepted.is_empty());
         assert!(is_error);

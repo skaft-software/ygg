@@ -249,11 +249,8 @@ fn responses_lite_prefix(
     prefix
 }
 
-fn responses_reasoning_effort(
-    model: &crate::catalog::Model,
-    effort: crate::types::ReasoningEffort,
-) -> &'static str {
-    use crate::types::{AgentDelegation, ReasoningEffort};
+fn responses_reasoning_effort(effort: crate::types::ReasoningEffort) -> &'static str {
+    use crate::types::ReasoningEffort;
 
     match effort {
         ReasoningEffort::Minimal => "minimal",
@@ -262,15 +259,9 @@ fn responses_reasoning_effort(
         ReasoningEffort::High => "high",
         ReasoningEffort::Xhigh => "xhigh",
         ReasoningEffort::Max => "max",
-        // Provider-advertised Ultra plus V2 denotes an agent orchestration
-        // tier. Current Codex wire requests use maximum model reasoning while
-        // the host supplies delegation.
-        ReasoningEffort::Ultra
-            if model.spec.capabilities.agent_delegation == Some(AgentDelegation::V2) =>
-        {
-            "max"
-        }
-        ReasoningEffort::Ultra => "ultra",
+        // Ultra is a host-orchestration tier; current Codex wire requests use
+        // maximum model reasoning while the V2 runtime supplies delegation.
+        ReasoningEffort::Ultra => "max",
     }
 }
 
@@ -281,9 +272,7 @@ fn map_responses_reasoning(
 ) -> Option<ResponsesReasoningConfig> {
     model.spec.capabilities.reasoning.as_ref()?;
     let effort = match reasoning {
-        ReasoningConfig::Effort(effort) => {
-            Some(responses_reasoning_effort(model, *effort).to_owned())
-        }
+        ReasoningConfig::Effort(effort) => Some(responses_reasoning_effort(*effort).to_owned()),
         ReasoningConfig::Off | ReasoningConfig::On | ReasoningConfig::Budget(_) => None,
     };
     let context = model
@@ -2078,11 +2067,11 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_emits_xhigh_max_and_ultra_strings() {
+    fn reasoning_effort_emits_xhigh_and_max_and_maps_ultra_to_max() {
         for (effort, expected) in [
             (crate::types::ReasoningEffort::Xhigh, "xhigh"),
             (crate::types::ReasoningEffort::Max, "max"),
-            (crate::types::ReasoningEffort::Ultra, "ultra"),
+            (crate::types::ReasoningEffort::Ultra, "max"),
         ] {
             let mut model = make_test_model(true);
             let mut spec = (*model.spec).clone();

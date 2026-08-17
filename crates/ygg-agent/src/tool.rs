@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -21,6 +21,21 @@ pub enum ReplaySafety {
     Unsafe,
     /// The tool is read-only or otherwise idempotent and safe to repeat.
     Safe,
+}
+
+/// Whether calls to a tool may overlap other calls from the same model turn.
+///
+/// Parallel execution is deliberately opt-in and stricter than crash replay:
+/// an implementation must be read-only, independent of call order, and must
+/// not require interactive progress handling while it runs. Mutations,
+/// process execution, and extension tools remain sequential by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolConcurrency {
+    /// Preserve the model's emitted order and execute one call at a time.
+    #[default]
+    Sequential,
+    /// Calls may execute concurrently with other parallel-safe calls.
+    Parallel,
 }
 
 /// A tool the model can call.
@@ -44,6 +59,13 @@ pub trait Tool: Send + Sync {
     /// idempotent behavior.
     fn replay_safety(&self) -> ReplaySafety {
         ReplaySafety::Unsafe
+    }
+
+    /// Declares whether independent calls emitted in one model turn may
+    /// overlap. This is separate from [`ReplaySafety`]: an idempotent mutation
+    /// may be safe to retry after a crash while still depending on call order.
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Sequential
     }
 
     /// Executes the tool with the model-provided arguments (a JSON object
@@ -647,6 +669,9 @@ pub struct ToolContext<'a> {
     /// tools use this to isolate persistent PTYs even when multiple agents
     /// share the same workspace.
     pub execution_scope: &'a str,
+    /// Durable session-derived owner for extension resources. Unlike
+    /// `execution_scope`, this survives Agent rebuilds and process reloads.
+    pub resource_owner: &'a str,
     /// Active skills resolved from the session immediately before this tool
     /// call. Tools may use it to authorize skill-scoped operations.
     pub active_skills: &'a [crate::session::SkillActivatedSnapshot],
@@ -727,23 +752,365 @@ impl ToolOutputMediaKind {
     }
 }
 
-/// Successful tool output: compact text plus optional structured media.
+/// One ordered model-visible part of a successful tool output.
+///
+/// Text remains the compact fallback for every provider. Image and audio
+/// parts reuse Ygg's canonical media types so built-in and executable tools
+/// cross the same persistence and provider-lowering boundary.
+#[derive(Clone, Debug)]
+pub enum ToolOutputContentPart {
+    /// Plain model-visible text.
+    Text(String),
+    /// An image or audio payload already vetted by the host.
+    Media(Media),
+}
+
+/// Maximum serialized bytes retained as structured tool output.
+pub const MAX_TOOL_STRUCTURED_CONTENT_BYTES: usize = 256 * 1024;
+/// Maximum serialized bytes retained as non-model-visible tool metadata.
+pub const MAX_TOOL_METADATA_BYTES: usize = 64 * 1024;
+const MAX_TOOL_DETAIL_DEPTH: usize = 32;
+const MAX_TOOL_DETAIL_NODES: usize = 16 * 1024;
+const MAX_TOOL_METADATA_KEY_BYTES: usize = 256;
+
+/// Validated, durable data retained beside a canonical tool result.
+///
+/// Neither field is implicitly sent to a model. Product surfaces may inspect
+/// these values after reopening a session without reparsing compact text.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolOutputDetails {
+    /// Optional machine-readable result produced by the tool.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_json",
+        skip_serializing_if = "Option::is_none"
+    )]
+    structured_content: Option<serde_json::Value>,
+    /// Optional inert host-vetted presentation/provenance metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
+}
+
+impl ToolOutputDetails {
+    /// Validates and constructs durable tool-output details.
+    pub fn try_new(
+        structured_content: Option<serde_json::Value>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<Self, ToolOutputValidationError> {
+        let metadata = normalize_optional_json(metadata);
+        if let Some(value) = structured_content.as_ref() {
+            validate_tool_detail(
+                "structured_content",
+                value,
+                MAX_TOOL_STRUCTURED_CONTENT_BYTES,
+                false,
+            )?;
+        }
+        if let Some(value) = metadata.as_ref() {
+            validate_tool_detail("metadata", value, MAX_TOOL_METADATA_BYTES, true)?;
+        }
+        Ok(Self {
+            structured_content,
+            metadata,
+        })
+    }
+
+    /// Returns the retained machine-readable result.
+    pub fn structured_content(&self) -> Option<&serde_json::Value> {
+        self.structured_content.as_ref()
+    }
+
+    /// Returns the retained non-model-visible metadata object.
+    pub fn metadata(&self) -> Option<&serde_json::Value> {
+        self.metadata.as_ref()
+    }
+
+    /// Returns whether neither optional detail is present.
+    pub fn is_empty(&self) -> bool {
+        self.structured_content.is_none() && self.metadata.is_none()
+    }
+
+    pub(crate) fn into_validated(self) -> Result<Self, ToolOutputValidationError> {
+        Self::try_new(self.structured_content, self.metadata)
+    }
+}
+
+fn deserialize_present_json<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <serde_json::Value as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// Rejection raised while admitting structured content or metadata.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ToolOutputValidationError {
+    /// The serialized JSON value crossed its field-specific hard limit.
+    #[error("{field} exceeds {limit} serialized bytes (got {actual})")]
+    TooLarge {
+        /// Field being validated.
+        field: &'static str,
+        /// Actual serialized byte count.
+        actual: usize,
+        /// Maximum serialized byte count.
+        limit: usize,
+    },
+    /// The JSON tree is too deeply nested for safe downstream inspection.
+    #[error("{field} exceeds the maximum JSON depth of {limit}")]
+    TooDeep {
+        /// Field being validated.
+        field: &'static str,
+        /// Maximum accepted nesting depth.
+        limit: usize,
+    },
+    /// The JSON tree has too many aggregate values.
+    #[error("{field} exceeds the maximum JSON node count of {limit}")]
+    TooManyNodes {
+        /// Field being validated.
+        field: &'static str,
+        /// Maximum accepted aggregate value count.
+        limit: usize,
+    },
+    /// Metadata must be an object so consumers never have to guess its shape.
+    #[error("metadata must be a JSON object")]
+    MetadataNotObject,
+    /// One metadata key is unsuitable for durable host-side inspection.
+    #[error("metadata contains an invalid key")]
+    InvalidMetadataKey,
+}
+
+fn normalize_optional_json(value: Option<serde_json::Value>) -> Option<serde_json::Value> {
+    value.filter(|value| !value.is_null())
+}
+
+fn validate_tool_detail(
+    field: &'static str,
+    value: &serde_json::Value,
+    byte_limit: usize,
+    require_object: bool,
+) -> Result<(), ToolOutputValidationError> {
+    if require_object && !value.is_object() {
+        return Err(ToolOutputValidationError::MetadataNotObject);
+    }
+    let mut nodes = 0usize;
+    let mut pending = vec![(value, 1usize)];
+    while let Some((current, depth)) = pending.pop() {
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_TOOL_DETAIL_NODES {
+            return Err(ToolOutputValidationError::TooManyNodes {
+                field,
+                limit: MAX_TOOL_DETAIL_NODES,
+            });
+        }
+        if depth > MAX_TOOL_DETAIL_DEPTH {
+            return Err(ToolOutputValidationError::TooDeep {
+                field,
+                limit: MAX_TOOL_DETAIL_DEPTH,
+            });
+        }
+        match current {
+            serde_json::Value::Array(values) => {
+                pending.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    if require_object
+                        && (key.is_empty()
+                            || key.len() > MAX_TOOL_METADATA_KEY_BYTES
+                            || key.chars().any(char::is_control))
+                    {
+                        return Err(ToolOutputValidationError::InvalidMetadataKey);
+                    }
+                    pending.push((value, depth + 1));
+                }
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
+        }
+    }
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value).expect("serde_json::Value must serialize");
+    let actual = counter.bytes;
+    if actual > byte_limit {
+        return Err(ToolOutputValidationError::TooLarge {
+            field,
+            actual,
+            limit: byte_limit,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+type ToolOutputResolution = Box<dyn FnOnce() + Send + 'static>;
+
+struct ToolOutputCommitState {
+    hooks: Option<(ToolOutputResolution, ToolOutputResolution)>,
+}
+
+struct ToolOutputCommitInner {
+    state: Mutex<ToolOutputCommitState>,
+}
+
+impl Drop for ToolOutputCommitInner {
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, rollback)) = state.hooks.take() {
+            rollback();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ToolOutputCommit {
+    inner: Arc<ToolOutputCommitInner>,
+}
+
+impl std::fmt::Debug for ToolOutputCommit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pending = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .hooks
+            .is_some();
+        formatter
+            .debug_struct("ToolOutputCommit")
+            .field("pending", &pending)
+            .finish()
+    }
+}
+
+impl ToolOutputCommit {
+    fn new(
+        commit: impl FnOnce() + Send + 'static,
+        rollback: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ToolOutputCommitInner {
+                state: Mutex::new(ToolOutputCommitState {
+                    hooks: Some((Box::new(commit), Box::new(rollback))),
+                }),
+            }),
+        }
+    }
+
+    fn resolve(&self, delivered: bool) {
+        let action = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .hooks
+                .take()
+                .map(|(commit, rollback)| if delivered { commit } else { rollback })
+        };
+        if let Some(action) = action {
+            action();
+        }
+    }
+}
+
+/// Canonical tool output: compact text plus optional structured media and a
+/// semantic error marker. Transport-level failures still use [`ToolError`]; a
+/// completed tool may return a rich error envelope without losing its media or
+/// durable details.
 #[derive(Clone, Debug)]
 pub struct ToolOutput {
     /// Compact, line-oriented text optimized for LLM consumption.
     pub text: String,
     media: Vec<Media>,
     media_kinds: Vec<ToolOutputMediaKind>,
+    content_parts: Vec<ToolOutputContentPart>,
+    details: ToolOutputDetails,
+    is_error: bool,
+    delivery_commit: Option<ToolOutputCommit>,
 }
 
 impl ToolOutput {
     /// Creates a tool output from text.
     pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
         Self {
-            text: text.into(),
+            content_parts: vec![ToolOutputContentPart::Text(text.clone())],
+            text,
             media: Vec::new(),
             media_kinds: Vec::new(),
+            details: ToolOutputDetails::default(),
+            is_error: false,
+            delivery_commit: None,
         }
+    }
+
+    /// Creates an output from ordered text and media parts.
+    ///
+    /// Multiple text parts are joined with newlines for the backward-
+    /// compatible compact [`ToolOutput::text`] representation while their
+    /// original boundaries remain available through [`ToolOutput::content_parts`].
+    pub fn from_content_parts(
+        content_parts: impl IntoIterator<Item = ToolOutputContentPart>,
+    ) -> Self {
+        let content_parts = content_parts.into_iter().collect::<Vec<_>>();
+        let text = content_parts
+            .iter()
+            .filter_map(|part| match part {
+                ToolOutputContentPart::Text(text) => Some(text.as_str()),
+                ToolOutputContentPart::Media(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let media = content_parts
+            .iter()
+            .filter_map(|part| match part {
+                ToolOutputContentPart::Text(_) => None,
+                ToolOutputContentPart::Media(media) => Some(media.clone()),
+            })
+            .collect::<Vec<_>>();
+        let media_kinds = media.iter().map(ToolOutputMediaKind::from_media).collect();
+        Self {
+            text,
+            media,
+            media_kinds,
+            content_parts,
+            details: ToolOutputDetails::default(),
+            is_error: false,
+            delivery_commit: None,
+        }
+    }
+
+    /// Marks whether this completed output represents a semantic tool error.
+    /// Rich content and durable details remain available when this is true.
+    pub fn with_is_error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
+        self
+    }
+
+    /// Returns whether the completed output represents a semantic tool error.
+    pub fn is_error(&self) -> bool {
+        self.is_error
     }
 
     /// Attaches one structured image or audio payload to this output.
@@ -754,8 +1121,57 @@ impl ToolOutput {
     pub fn with_media(mut self, media: Media) -> Self {
         self.media_kinds
             .push(ToolOutputMediaKind::from_media(&media));
-        self.media.push(media);
+        self.media.push(media.clone());
+        self.content_parts.push(ToolOutputContentPart::Media(media));
         self
+    }
+
+    /// Validates and attaches optional structured content and metadata.
+    pub fn try_with_details(
+        mut self,
+        structured_content: Option<serde_json::Value>,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<Self, ToolOutputValidationError> {
+        self.details = ToolOutputDetails::try_new(structured_content, metadata)?;
+        Ok(self)
+    }
+
+    /// Validates and attaches machine-readable structured content.
+    pub fn try_with_structured_content(
+        self,
+        structured_content: serde_json::Value,
+    ) -> Result<Self, ToolOutputValidationError> {
+        let metadata = self.details.metadata.clone();
+        self.try_with_details(Some(structured_content), metadata)
+    }
+
+    /// Validates and attaches an inert non-model-visible metadata object.
+    pub fn try_with_metadata(
+        self,
+        metadata: serde_json::Value,
+    ) -> Result<Self, ToolOutputValidationError> {
+        let structured_content = self.details.structured_content.clone();
+        self.try_with_details(structured_content, Some(metadata))
+    }
+
+    /// Returns the ordered text and media parts.
+    pub fn content_parts(&self) -> &[ToolOutputContentPart] {
+        &self.content_parts
+    }
+
+    /// Returns the retained machine-readable structured result.
+    pub fn structured_content(&self) -> Option<&serde_json::Value> {
+        self.details.structured_content()
+    }
+
+    /// Returns the retained non-model-visible metadata object.
+    pub fn metadata(&self) -> Option<&serde_json::Value> {
+        self.details.metadata()
+    }
+
+    /// Returns validated details suitable for durable session metadata.
+    pub fn details(&self) -> Option<&ToolOutputDetails> {
+        (!self.details.is_empty()).then_some(&self.details)
     }
 
     /// Returns the structured media payloads for canonical persistence.
@@ -766,6 +1182,26 @@ impl ToolOutput {
     /// Returns presentation-safe media metadata without exposing payloads.
     pub fn media_kinds(&self) -> &[ToolOutputMediaKind] {
         &self.media_kinds
+    }
+
+    /// Installs internal resolution hooks for work that is acknowledged only
+    /// after this output is durably appended to the session. Dropping every
+    /// copy without resolution rolls the provisional delivery back.
+    pub(crate) fn with_delivery_commit(
+        mut self,
+        commit: impl FnOnce() + Send + 'static,
+        rollback: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        self.delivery_commit = Some(ToolOutputCommit::new(commit, rollback));
+        self
+    }
+
+    /// Resolve provisional work after the agent's durable tool-result boundary.
+    /// `delivered` must be false when generic output limiting changed the text.
+    pub(crate) fn resolve_delivery(&self, delivered: bool) {
+        if let Some(commit) = &self.delivery_commit {
+            commit.resolve(delivered);
+        }
     }
 
     /// Returns a copy suitable for observers and presentation layers.
@@ -789,6 +1225,19 @@ impl ToolOutput {
             text: self.text.clone(),
             media: Vec::new(),
             media_kinds: media_kinds.into_iter().collect(),
+            content_parts: self
+                .content_parts
+                .iter()
+                .filter_map(|part| match part {
+                    ToolOutputContentPart::Text(text) => {
+                        Some(ToolOutputContentPart::Text(text.clone()))
+                    }
+                    ToolOutputContentPart::Media(_) => None,
+                })
+                .collect(),
+            details: self.details.clone(),
+            is_error: self.is_error,
+            delivery_commit: None,
         }
     }
 }
@@ -854,6 +1303,151 @@ mod tests {
         assert_eq!(presentation.text, "read=vision");
         assert!(presentation.media().is_empty());
         assert_eq!(presentation.media_kinds(), &[ToolOutputMediaKind::Image]);
+    }
+
+    #[test]
+    fn rich_error_marker_survives_presentation_copy() {
+        let ordinary = ToolOutput::new("ok");
+        assert!(!ordinary.is_error());
+
+        let rich_error = ToolOutput::new("extension rejected the action")
+            .try_with_structured_content(serde_json::json!({"code": "rejected"}))
+            .unwrap()
+            .with_is_error(true);
+        assert!(rich_error.is_error());
+        let presentation = rich_error.without_media_payloads();
+        assert!(presentation.is_error());
+        assert_eq!(
+            presentation.structured_content(),
+            Some(&serde_json::json!({"code": "rejected"}))
+        );
+    }
+
+    #[test]
+    fn provisional_tool_delivery_commits_once_or_rolls_back_on_drop() {
+        use std::sync::atomic::{AtomicI8, Ordering};
+
+        let committed = Arc::new(AtomicI8::new(0));
+        let on_commit = Arc::clone(&committed);
+        let on_rollback = Arc::clone(&committed);
+        let output = ToolOutput::new("leased").with_delivery_commit(
+            move || on_commit.store(1, Ordering::SeqCst),
+            move || on_rollback.store(-1, Ordering::SeqCst),
+        );
+        let clone = output.clone();
+        let presentation = output.without_media_payloads();
+        drop((output, presentation));
+        assert_eq!(committed.load(Ordering::SeqCst), 0);
+        clone.resolve_delivery(true);
+        clone.resolve_delivery(false);
+        drop(clone);
+        assert_eq!(committed.load(Ordering::SeqCst), 1);
+
+        let rolled_back = Arc::new(AtomicI8::new(0));
+        let on_commit = Arc::clone(&rolled_back);
+        let on_rollback = Arc::clone(&rolled_back);
+        drop(ToolOutput::new("leased").with_delivery_commit(
+            move || on_commit.store(1, Ordering::SeqCst),
+            move || on_rollback.store(-1, Ordering::SeqCst),
+        ));
+        assert_eq!(rolled_back.load(Ordering::SeqCst), -1);
+    }
+
+    #[test]
+    fn tool_output_retains_ordered_parts_and_vetted_details() {
+        let media = Media::image_bytes(
+            Bytes::from_static(b"\x89PNG\r\n\x1a\n"),
+            "image/png".parse().unwrap(),
+        );
+        let output = ToolOutput::from_content_parts([
+            ToolOutputContentPart::Text("Found one result.".into()),
+            ToolOutputContentPart::Media(media),
+            ToolOutputContentPart::Text("Source is attached.".into()),
+        ])
+        .try_with_details(
+            Some(serde_json::json!({"sources": [{"title": "Primary"}]})),
+            Some(serde_json::json!({"cache": "miss"})),
+        )
+        .unwrap();
+
+        assert_eq!(output.text, "Found one result.\nSource is attached.");
+        assert_eq!(output.content_parts().len(), 3);
+        assert!(matches!(
+            output.content_parts()[0],
+            ToolOutputContentPart::Text(ref text) if text == "Found one result."
+        ));
+        assert!(matches!(
+            output.content_parts()[1],
+            ToolOutputContentPart::Media(Media::Image(_))
+        ));
+        assert_eq!(
+            output.structured_content(),
+            Some(&serde_json::json!({"sources": [{"title": "Primary"}]}))
+        );
+        assert_eq!(
+            output.metadata(),
+            Some(&serde_json::json!({"cache": "miss"}))
+        );
+
+        let presentation = output.without_media_payloads();
+        assert_eq!(presentation.content_parts().len(), 2);
+        assert_eq!(
+            presentation.structured_content(),
+            output.structured_content()
+        );
+        assert_eq!(presentation.metadata(), output.metadata());
+    }
+
+    #[test]
+    fn tool_output_details_distinguish_structured_null_from_missing() {
+        let details = ToolOutputDetails::try_new(Some(serde_json::Value::Null), None).unwrap();
+        assert_eq!(details.structured_content(), Some(&serde_json::Value::Null));
+        assert!(!details.is_empty());
+
+        let serialized = serde_json::to_value(&details).unwrap();
+        assert_eq!(serialized, serde_json::json!({"structured_content": null}));
+        let reopened: ToolOutputDetails = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            reopened.structured_content(),
+            Some(&serde_json::Value::Null)
+        );
+
+        let null_metadata =
+            ToolOutputDetails::try_new(None, Some(serde_json::Value::Null)).unwrap();
+        assert!(null_metadata.is_empty());
+    }
+
+    #[test]
+    fn tool_output_details_reject_unbounded_or_ambiguous_metadata() {
+        assert_eq!(
+            ToolOutputDetails::try_new(None, Some(serde_json::json!(["not", "an", "object"])))
+                .unwrap_err(),
+            ToolOutputValidationError::MetadataNotObject
+        );
+        assert!(matches!(
+            ToolOutputDetails::try_new(
+                Some(serde_json::Value::String(
+                    "x".repeat(MAX_TOOL_STRUCTURED_CONTENT_BYTES)
+                )),
+                None
+            ),
+            Err(ToolOutputValidationError::TooLarge {
+                field: "structured_content",
+                ..
+            })
+        ));
+
+        let mut nested = serde_json::json!(true);
+        for _ in 0..=MAX_TOOL_DETAIL_DEPTH {
+            nested = serde_json::json!([nested]);
+        }
+        assert!(matches!(
+            ToolOutputDetails::try_new(Some(nested), None),
+            Err(ToolOutputValidationError::TooDeep {
+                field: "structured_content",
+                ..
+            })
+        ));
     }
 
     // ── ToolProgressSink unit tests ──────────────────────────────────────

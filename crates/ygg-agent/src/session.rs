@@ -34,6 +34,7 @@ use std::path::PathBuf;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use ygg_ai::{
     Cost, EndpointId, Message, ModelId, StopReason, Usage, UserMessage, UserPart,
     PICODOLLARS_PER_MICRODOLLAR,
@@ -150,6 +151,11 @@ pub struct EntryMetadata {
     /// reconstruct run boundaries after a restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_outcome: Option<SessionRunOutcome>,
+    /// Structured content and inert metadata retained beside a tool-result
+    /// message. These values are presentation/session data and never enter the
+    /// canonical provider-visible message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_output: Option<crate::tool::ToolOutputDetails>,
     /// Marks a locally generated assistant boundary that intentionally has no
     /// authoritative provider sidecar.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -214,11 +220,16 @@ impl EntryMetadata {
                 .then_some(message)
             });
         }
+        self.tool_output = self
+            .tool_output
+            .and_then(|details| details.into_validated().ok())
+            .filter(|details| !details.is_empty());
         (self.prompt_model.is_some()
             || self.prompt_model_source.is_some()
             || self.prompt_color.is_some()
             || self.display_text.is_some()
             || self.run_outcome.is_some()
+            || self.tool_output.is_some()
             || self.local_synthetic_assistant)
             .then_some(self)
     }
@@ -727,6 +738,24 @@ impl Session {
         Self::open_impl(path.into(), false)
     }
 
+    /// Inspect an existing session through a caller-supplied read-only file
+    /// descriptor without repairing or mutating its bytes.
+    ///
+    /// This is the descriptor-bound counterpart to [`Self::open_read_only`].
+    /// The descriptor must refer to a regular file and permit reads.
+    pub fn open_read_only_with_file(
+        path: impl Into<PathBuf>,
+        file: File,
+    ) -> Result<Self, SessionError> {
+        Self::open_file_impl_with_limits(
+            path.into(),
+            file,
+            false,
+            MAX_SESSION_FILE_BYTES,
+            MAX_SESSION_RECORDS,
+        )
+    }
+
     fn open_impl(path: PathBuf, recover_tail: bool) -> Result<Self, SessionError> {
         Self::open_impl_with_limits(
             path,
@@ -745,7 +774,9 @@ impl Session {
         let mut options = OpenOptions::new();
         options.read(true);
         if recover_tail {
-            options.append(true);
+            // Windows tail repair needs FILE_WRITE_DATA in addition to append
+            // access so `set_len` can remove a torn final record.
+            options.write(true).append(true);
         }
         let file = options.open(&path)?;
         Self::open_file_impl_with_limits(path, file, recover_tail, max_file_bytes, max_records)
@@ -1091,6 +1122,7 @@ impl Session {
                     "repair would grow session to {repaired_len} bytes (limit {max_file_bytes})"
                 )));
             }
+            file.seek(std::io::SeekFrom::End(0))?;
             file.write_all(b"\n")?;
         }
         let persisted_len = file.metadata()?.len();
@@ -1117,6 +1149,12 @@ impl Session {
         &self.path
     }
 
+    /// Clones the already-authorized session descriptor for identity-stable
+    /// inspection without reopening its path.
+    pub(crate) fn try_clone_file(&self) -> std::io::Result<File> {
+        self.file.try_clone()
+    }
+
     /// Returns a stable, provider-safe cache-affinity key for this session.
     ///
     /// The key is derived from the full session path, so two sessions with the
@@ -1131,6 +1169,20 @@ impl Session {
             hash = hash.wrapping_mul(FNV_PRIME);
         }
         format!("ygg-{hash:016x}")
+    }
+
+    /// Returns the durable authorization namespace for extension-owned
+    /// resources. Unlike the compact provider cache key, this uses SHA-256 of
+    /// the canonical session descriptor path so alias paths converge and the
+    /// collision bound is suitable for ownership checks.
+    pub fn resource_owner_key(&self) -> String {
+        let identity = self
+            .path
+            .canonicalize()
+            .or_else(|_| std::path::absolute(&self.path))
+            .unwrap_or_else(|_| self.path.clone());
+        let digest = Sha256::digest(identity.to_string_lossy().as_bytes());
+        format!("session-{digest:x}")
     }
 
     /// Append bytes only if this handle still reflects the complete file.
@@ -1167,6 +1219,7 @@ impl Session {
                     "write would grow session past {MAX_SESSION_RECORDS} records"
                 )));
             }
+            self.file.seek(std::io::SeekFrom::End(0))?;
             self.file.write_all(bytes)?;
             self.file.sync_data()?;
             self.persisted_len = new_len;
@@ -1258,7 +1311,24 @@ impl Session {
             .next_id
             .checked_add(1)
             .ok_or_else(|| SessionError::Limit("session entry ID space is exhausted".to_owned()))?;
-        let metadata = metadata.and_then(EntryMetadata::sanitized);
+        let accepts_tool_output_details = matches!(
+            &value,
+            EntryValue::Message(Message::User(message))
+                if message
+                    .content
+                    .iter()
+                    .filter(|part| matches!(part, UserPart::ToolResult(_)))
+                    .count()
+                    == 1
+        );
+        let metadata = metadata
+            .map(|mut metadata| {
+                if !accepts_tool_output_details {
+                    metadata.tool_output = None;
+                }
+                metadata
+            })
+            .and_then(EntryMetadata::sanitized);
         let entry = Entry {
             id: id.clone(),
             parent: self.head.clone(),
@@ -2443,6 +2513,7 @@ mod tests {
                     prompt_color: Some("  #22AACC  ".into()),
                     display_text: Some("visible\ndraft".into()),
                     run_outcome: None,
+                    tool_output: None,
                     local_synthetic_assistant: false,
                 }),
             )
@@ -2456,6 +2527,7 @@ mod tests {
                     prompt_color: Some("rgb(1,2,3)\u{1b}".into()),
                     display_text: Some("bad\u{1b}".into()),
                     run_outcome: None,
+                    tool_output: None,
                     local_synthetic_assistant: false,
                 }),
             )
@@ -2471,6 +2543,7 @@ mod tests {
                 prompt_color: Some("#22aacc".into()),
                 display_text: Some("visible\ndraft".into()),
                 run_outcome: None,
+                tool_output: None,
                 local_synthetic_assistant: false,
             })
         );
@@ -2479,6 +2552,104 @@ mod tests {
         assert!(!persisted.contains("#2243e6"));
         assert!(persisted.contains("#22aacc"));
         assert!(!persisted.contains("[31m"));
+    }
+
+    #[test]
+    fn structured_tool_output_details_survive_reopen_without_entering_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut session = Session::create(&path).unwrap();
+        let details = crate::tool::ToolOutputDetails::try_new(
+            Some(serde_json::json!({
+                "sources": [{"title": "Primary", "url": "https://example.test"}]
+            })),
+            Some(serde_json::json!({"cache": "miss", "elapsed_ms": 12})),
+        )
+        .unwrap();
+        let id = session
+            .append_with_metadata(
+                EntryValue::Message(Message::User(UserMessage {
+                    content: vec![UserPart::ToolResult(ToolResult {
+                        tool_call_id: ToolCallId("call-structured".into()),
+                        content: vec![ygg_ai::ToolResultPart::Text("Found one source.".into())],
+                        is_error: false,
+                    })],
+                })),
+                Some(EntryMetadata {
+                    tool_output: Some(details.clone()),
+                    ..EntryMetadata::default()
+                }),
+            )
+            .unwrap();
+        let invalid_target = session
+            .append_with_metadata(
+                user("ordinary user message"),
+                Some(EntryMetadata {
+                    tool_output: Some(details.clone()),
+                    ..EntryMetadata::default()
+                }),
+            )
+            .unwrap();
+        drop(session);
+
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .entry(&id)
+                .and_then(|entry| entry.metadata.as_ref())
+                .and_then(|metadata| metadata.tool_output.as_ref()),
+            Some(&details)
+        );
+        assert_eq!(reopened.entry(&invalid_target).unwrap().metadata, None);
+        let context = reopened.context().unwrap();
+        let Message::User(message) = &context[0] else {
+            panic!("expected user tool-result message");
+        };
+        let UserPart::ToolResult(result) = &message.content[0] else {
+            panic!("expected tool result");
+        };
+        assert_eq!(result.content.len(), 1);
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert!(persisted.contains("structured_content"));
+        assert!(persisted.contains("elapsed_ms"));
+    }
+
+    #[test]
+    fn explicit_null_structured_tool_output_survives_session_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut session = Session::create(&path).unwrap();
+        let details =
+            crate::tool::ToolOutputDetails::try_new(Some(serde_json::Value::Null), None).unwrap();
+        let id = session
+            .append_with_metadata(
+                EntryValue::Message(Message::User(UserMessage {
+                    content: vec![UserPart::ToolResult(ToolResult {
+                        tool_call_id: ToolCallId("call-null".into()),
+                        content: vec![ygg_ai::ToolResultPart::Text("No value.".into())],
+                        is_error: false,
+                    })],
+                })),
+                Some(EntryMetadata {
+                    tool_output: Some(details),
+                    ..EntryMetadata::default()
+                }),
+            )
+            .unwrap();
+        drop(session);
+
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .entry(&id)
+                .and_then(|entry| entry.metadata.as_ref())
+                .and_then(|metadata| metadata.tool_output.as_ref())
+                .and_then(crate::tool::ToolOutputDetails::structured_content),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("\"structured_content\":null"));
     }
 
     #[test]
@@ -2629,12 +2800,17 @@ mod tests {
         let second_path = second_dir.path().join("session.jsonl");
         let first = Session::create(&first_path).unwrap();
         let first_key = first.cache_key();
+        let first_owner = first.resource_owner_key();
         assert_eq!(first_key, first.cache_key());
+        assert_eq!(first_owner, first.resource_owner_key());
+        assert_eq!(first_owner.len(), "session-".len() + 64);
         drop(first);
         let reopened = Session::open(&first_path).unwrap();
         assert_eq!(first_key, reopened.cache_key());
+        assert_eq!(first_owner, reopened.resource_owner_key());
         let other = Session::create(&second_path).unwrap();
         assert_ne!(first_key, other.cache_key());
+        assert_ne!(first_owner, other.resource_owner_key());
     }
 
     #[test]
@@ -2657,6 +2833,30 @@ mod tests {
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn append_seeks_to_the_durable_end_on_writable_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let mut session = Session::create_with_file(&path, file).unwrap();
+
+        session.append(user("first")).unwrap();
+        session.file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        session.append(user("second")).unwrap();
+        drop(session);
+
+        let reopened = Session::open_read_only(path).unwrap();
+        let context = reopened.context().unwrap();
+        assert_eq!(context.len(), 2);
+        assert_eq!(text_of(&context[0]), "first");
+        assert_eq!(text_of(&context[1]), "second");
     }
 
     #[test]

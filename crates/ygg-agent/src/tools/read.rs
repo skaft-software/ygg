@@ -10,7 +10,9 @@ use serde::Deserialize;
 use ygg_ai::{AudioFormat, Media, Mime, ToolDef};
 
 use crate::secure_fs::{read_regular_file_bounded_by, SecureFileError};
-use crate::tool::{content_hash, ReplaySafety, Tool, ToolContext, ToolError, ToolOutput};
+use crate::tool::{
+    content_hash, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
+};
 use crate::tools::{clip_line, parse_args, MAX_FILE_BYTES};
 /// Display cap for a single line.
 const MAX_LINE_CHARS: usize = 2000;
@@ -113,6 +115,10 @@ impl Tool for ReadTool {
 
     fn replay_safety(&self) -> ReplaySafety {
         ReplaySafety::Safe
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
     }
 
     async fn execute(
@@ -808,6 +814,7 @@ mod tests {
                 workspace: &self.workspace,
                 sandbox: &self.sandbox,
                 execution_scope: "read-test",
+                resource_owner: "read-test",
                 active_skills: &[],
                 registered_tools: &[],
                 progress: ToolProgressSink::null(),
@@ -993,6 +1000,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &f.sandbox,
             execution_scope: "read-test",
+            resource_owner: "read-test",
             active_skills: &[],
             registered_tools: &[],
             progress: ToolProgressSink::null(),
@@ -1211,6 +1219,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "read-test",
+            resource_owner: "read-test",
             active_skills: &[],
             registered_tools: &[],
             progress: ToolProgressSink::null(),
@@ -1261,6 +1270,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "read-test",
+            resource_owner: "read-test",
             active_skills: &[],
             registered_tools: &[],
             progress: ToolProgressSink::null(),

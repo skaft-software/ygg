@@ -6,7 +6,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use ygg_ai::ToolDef;
 
-use crate::tool::{ReplaySafety, Tool, ToolContext, ToolError, ToolOutput};
+use crate::tool::{ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput};
 use crate::tools::{clip_line, parse_args};
 
 /// Display cap for a single match line.
@@ -92,6 +92,10 @@ impl Tool for SearchTool {
 
     fn replay_safety(&self) -> ReplaySafety {
         ReplaySafety::Safe
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
     }
 
     async fn execute(
@@ -282,6 +286,7 @@ mod tests {
                 workspace: &self.workspace,
                 sandbox: &self.sandbox,
                 execution_scope: "search-test",
+                resource_owner: "search-test",
                 active_skills: &[],
                 registered_tools: &[],
                 progress: ToolProgressSink::null(),
@@ -417,6 +422,7 @@ mod tests {
             workspace: &f.workspace,
             sandbox: &sandbox,
             execution_scope: "search-test",
+            resource_owner: "search-test",
             active_skills: &[],
             registered_tools: &[],
             progress: ToolProgressSink::null(),

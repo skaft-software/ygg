@@ -17,7 +17,8 @@ use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 use ygg_agent::{
     Agent, AgentConfig, AgentEvent, CompletionPolicy, CoreTools, EntryId, EntryValue,
     ExtensionHost, FinishReason, InputPart, OutputChannel, OutputStream, ReplaySafety, RunControl,
-    SandboxConfig, Session, Tool, ToolContext, ToolError, ToolOutput, UsageRecordKind, UserInput,
+    SandboxConfig, Session, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
+    UsageRecordKind, UserInput,
 };
 use ygg_ai::{
     AiClient, AssistantMessage, AssistantPart, AudioFormat, AudioOutputOptions, AudioPayload,
@@ -1694,7 +1695,9 @@ async fn authoritative_usage_compacts_and_reports_phase_before_opening_slow_main
     let mut agent = build_agent_from_session(&server.uri(), workspace.path(), session, Some(4));
     // Even when the keep preference exceeds the number of available turns,
     // the configured threshold still has to trigger compaction.
-    agent.set_compaction_policy(true, 0.85, 10).unwrap();
+    agent
+        .set_compaction_token_policy(true, 0.85, 10_000)
+        .unwrap();
 
     let mut run = agent.prompt("new work").await.unwrap();
     let control = run.control();
@@ -1729,15 +1732,14 @@ async fn authoritative_usage_compacts_and_reports_phase_before_opening_slow_main
     drop(run);
 
     let requests = wire_requests(&server).await;
-    assert_eq!(
-        requests.len(),
-        1,
-        "normal provider request opened too early"
+    assert!(!requests.is_empty(), "compaction summary request missing");
+    assert!(
+        requests.iter().all(|request| request
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)),
+        "normal provider request opened before the abort"
     );
-    assert!(requests[0]
-        .get("tools")
-        .and_then(serde_json::Value::as_array)
-        .is_none_or(Vec::is_empty));
     assert!(agent
         .session()
         .entries()
@@ -1764,7 +1766,9 @@ async fn disabled_auto_compaction_allows_below_capacity_request_past_threshold()
         180_000,
     );
     let mut agent = build_agent_from_session(&server.uri(), workspace.path(), session, Some(1));
-    agent.set_compaction_policy(false, 0.85, 4).unwrap();
+    agent
+        .set_compaction_token_policy(false, 0.85, 4_000)
+        .unwrap();
 
     let mut run = agent.prompt("new work").await.unwrap();
     let events = collect(&mut run).await;
@@ -2749,7 +2753,7 @@ async fn one_tool_call_executes_and_persists() {
 }
 
 #[tokio::test]
-async fn multiple_sequential_tool_calls_execute_in_order_and_coalesce() {
+async fn multiple_parallel_safe_tool_calls_start_together_and_coalesce_in_order() {
     let mut h = harness(
         vec![
             tool_turn(&[
@@ -2772,7 +2776,8 @@ async fn multiple_sequential_tool_calls_execute_in_order_and_coalesce() {
         FinishReason::Completed
     ));
 
-    // Sequential, emitted order: started(a), finished(a), started(b), finished(b).
+    // Both reads start before either finishes; completion and persistence stay
+    // deterministic in the model's emitted order.
     let tool_order: Vec<String> = events
         .iter()
         .filter_map(|e| match e {
@@ -2785,8 +2790,8 @@ async fn multiple_sequential_tool_calls_execute_in_order_and_coalesce() {
         tool_order,
         vec![
             "start:call_a",
-            "finish:call_a",
             "start:call_b",
+            "finish:call_a",
             "finish:call_b"
         ]
     );
@@ -2799,6 +2804,78 @@ async fn multiple_sequential_tool_calls_execute_in_order_and_coalesce() {
     let last_message = requests[1]["messages"].as_array().unwrap().last().unwrap();
     assert_eq!(last_message["role"], "user");
     assert_eq!(count_tool_results(last_message), 2);
+}
+
+struct ParallelOverlapProbe {
+    active: Arc<AtomicUsize>,
+    maximum: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for ParallelOverlapProbe {
+    fn definition(&self) -> ygg_ai::ToolDef {
+        ygg_ai::ToolDef {
+            name: "parallel_overlap_probe".into(),
+            description: "Records whether independent calls overlap".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Parallel
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.maximum.fetch_max(active, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(ToolOutput::new("observed"))
+    }
+}
+
+#[tokio::test]
+async fn parallel_safe_tool_implementations_really_overlap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![
+                tool_turn(&[
+                    ("call_a", "parallel_overlap_probe", serde_json::json!({})),
+                    ("call_b", "parallel_overlap_probe", serde_json::json!({})),
+                ]),
+                text_turn("done"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let probe = ParallelOverlapProbe {
+        active: Arc::clone(&active),
+        maximum: Arc::clone(&maximum),
+    };
+    let mut agent = build_agent_with_extra_tool(
+        &server.uri(),
+        workspace.path(),
+        &sessions.path().join("parallel-overlap.jsonl"),
+        Some(4),
+        probe,
+    );
+
+    let output = agent.complete("run both probes").await.unwrap();
+
+    assert!(matches!(output.reason, FinishReason::Completed));
+    assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    assert_eq!(agent.session().entries().len(), 5);
 }
 
 #[tokio::test]
@@ -3470,6 +3547,37 @@ impl Tool for LargeOutputTool {
     }
 }
 
+struct RichErrorTool;
+
+#[async_trait::async_trait]
+impl Tool for RichErrorTool {
+    fn definition(&self) -> ygg_ai::ToolDef {
+        ygg_ai::ToolDef {
+            name: "rich_error".into(),
+            description: "Returns a structured error with supported media".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::new("rich extension failure")
+            .with_media(Media::image_bytes(
+                Bytes::from_static(&[0x89, 0x50, 0x4e, 0x47]),
+                "image/png".parse().unwrap(),
+            ))
+            .try_with_details(
+                Some(serde_json::json!({"code": "machine-code-sentinel"})),
+                Some(serde_json::json!({"trace": "private-trace-sentinel"})),
+            )
+            .unwrap()
+            .with_is_error(true))
+    }
+}
+
 struct RegisteredToolsProbe {
     observed: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -3634,6 +3742,154 @@ fn build_agent_with_extra_tool(
         session_id: None,
     })
     .unwrap()
+}
+
+#[tokio::test]
+async fn marked_tool_output_remains_rich_across_lowering_events_and_session_reopen() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![
+                tool_turn(&[("call_rich_error", "rich_error", serde_json::json!({}))]),
+                text_turn("recovered from the tool error"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let session_path = session_dir.path().join("session.jsonl");
+    let mut agent = build_agent_with_extra_tool(
+        &server.uri(),
+        &workspace,
+        &session_path,
+        Some(4),
+        RichErrorTool,
+    );
+
+    let mut run = agent.prompt("exercise the rich error tool").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    let event_output = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolFinished { result, .. } => Some(
+                result
+                    .as_ref()
+                    .expect("a marked output remains Ok at the event boundary"),
+            ),
+            _ => None,
+        })
+        .expect("ToolFinished");
+    assert!(event_output.is_error());
+    assert_eq!(
+        event_output.media_kinds(),
+        &[ygg_agent::ToolOutputMediaKind::Image]
+    );
+    assert!(
+        event_output.media().is_empty(),
+        "observer copies must not expose binary payloads"
+    );
+    assert_eq!(
+        event_output.structured_content(),
+        Some(&serde_json::json!({"code": "machine-code-sentinel"}))
+    );
+    assert_eq!(
+        event_output.metadata(),
+        Some(&serde_json::json!({"trace": "private-trace-sentinel"}))
+    );
+
+    let persisted_entry = agent
+        .session()
+        .entries()
+        .iter()
+        .find(|entry| {
+            matches!(
+                &entry.value,
+                EntryValue::Message(Message::User(message))
+                    if message.content.iter().any(|part| matches!(
+                        part,
+                        UserPart::ToolResult(result)
+                            if result.tool_call_id.0 == "call_rich_error"
+                    ))
+            )
+        })
+        .expect("durable rich tool result");
+    let persisted_id = persisted_entry.id.clone();
+    let EntryValue::Message(Message::User(message)) = &persisted_entry.value else {
+        unreachable!();
+    };
+    let persisted_result = message
+        .content
+        .iter()
+        .find_map(|part| match part {
+            UserPart::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .expect("canonical tool result");
+    assert!(persisted_result.is_error);
+    assert!(persisted_result
+        .content
+        .iter()
+        .any(|part| matches!(part, ygg_ai::ToolResultPart::Media(Media::Image(_)))));
+    let details = persisted_entry
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.tool_output.as_ref())
+        .expect("durable tool output details")
+        .clone();
+    assert_eq!(
+        details.structured_content(),
+        Some(&serde_json::json!({"code": "machine-code-sentinel"}))
+    );
+    assert_eq!(
+        details.metadata(),
+        Some(&serde_json::json!({"trace": "private-trace-sentinel"}))
+    );
+
+    let requests = wire_requests(&server).await;
+    assert_eq!(requests.len(), 2);
+    let replay = requests[1].to_string();
+    assert!(replay.contains("rich extension failure"));
+    assert!(replay.contains("image"));
+    assert!(!replay.contains("machine-code-sentinel"));
+    assert!(!replay.contains("private-trace-sentinel"));
+
+    drop(agent);
+    let reopened = Session::open(&session_path).unwrap();
+    let reopened_entry = reopened
+        .entry(&persisted_id)
+        .expect("rich result survives session reopen");
+    let reopened_details = reopened_entry
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.tool_output.as_ref())
+        .expect("rich details survive session reopen");
+    assert_eq!(reopened_details, &details);
+    let EntryValue::Message(Message::User(reopened_message)) = &reopened_entry.value else {
+        panic!("reopened rich result must remain a user tool-result message");
+    };
+    let reopened_result = reopened_message
+        .content
+        .iter()
+        .find_map(|part| match part {
+            UserPart::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .expect("reopened canonical tool result");
+    assert!(reopened_result.is_error);
+    assert!(reopened_result
+        .content
+        .iter()
+        .any(|part| matches!(part, ygg_ai::ToolResultPart::Media(Media::Image(_)))));
 }
 
 #[tokio::test]

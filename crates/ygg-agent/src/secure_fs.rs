@@ -161,6 +161,21 @@ pub fn remove_regular_file_if_exists(path: &Path) -> Result<bool, SecureFileErro
     imp::remove_regular_file_if_exists(path)
 }
 
+/// Remove one existing empty owner-only directory through a descriptor-bound
+/// path walk.
+///
+/// Returns `true` if the directory was removed and `false` when it was already
+/// absent. Symbolic links, reparse points, non-directories, non-private
+/// directories, and non-empty directories are rejected. This is intended for
+/// rollback of freshly allocated private directories.
+#[cfg(test)]
+pub(crate) fn remove_empty_private_directory_if_exists(
+    path: &Path,
+) -> Result<bool, SecureFileError> {
+    validate_absolute_file_path(path)?;
+    imp::remove_empty_private_directory_if_exists(path)
+}
+
 /// Read one owner-only regular file through a descriptor-bound path walk.
 ///
 /// In addition to rejecting symbolic links and special files, this requires
@@ -169,6 +184,16 @@ pub fn remove_regular_file_if_exists(path: &Path) -> Result<bool, SecureFileErro
 pub fn read_private_file_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, SecureFileError> {
     validate_absolute_file_path(path)?;
     imp::read_private_file_bounded(path, limit)
+}
+
+/// Open one owner-only regular file for descriptor-bound reads.
+///
+/// This applies the same ownership, link-count, permissions/ACL, and no-follow
+/// checks as [`read_private_file_bounded`] while allowing callers to inspect
+/// metadata and consume bytes through the exact same descriptor.
+pub fn open_private_file_for_read(path: &Path) -> Result<std::fs::File, SecureFileError> {
+    validate_absolute_file_path(path)?;
+    imp::open_private_file_for_read(path)
 }
 
 /// Read one regular file with a content-derived limit selected from its first
@@ -221,18 +246,7 @@ pub fn create_private_directory_all(path: &Path) -> Result<(), SecureFileError> 
     imp::create_private_directory_all(path)
 }
 
-/// Create a uniquely named owner-only child directory without following path
-/// replacements during allocation.
-///
-/// `parent` must be absolute. `prefix` is restricted to portable filename
-/// characters and the random suffix is generated from the operating system's
-/// cryptographically secure random source. The final directory create is
-/// exclusive and descriptor-relative to the validated private parent.
-pub(crate) fn create_unique_private_directory(
-    parent: &Path,
-    prefix: &str,
-) -> Result<PathBuf, SecureFileError> {
-    validate_absolute_file_path(parent)?;
+fn validate_private_directory_prefix(prefix: &str) -> Result<(), SecureFileError> {
     if prefix.is_empty()
         || !prefix
             .bytes()
@@ -240,9 +254,98 @@ pub(crate) fn create_unique_private_directory(
     {
         return Err(SecureFileError::InvalidPath(prefix.to_owned()));
     }
+    Ok(())
+}
+
+/// A private directory paired with the stable filesystem identity captured
+/// when it was authorized. Child operations refuse a replacement directory.
+pub(crate) struct PrivateDirectory {
+    path: PathBuf,
+    identity: imp::PrivateDirectoryIdentity,
+    // Keep the authorized object alive so its filesystem identity cannot be
+    // recycled into a replacement while this capability is in use.
+    _anchor: std::fs::File,
+}
+
+impl PrivateDirectory {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn validate_child_path(&self, path: &Path) -> Result<(), SecureFileError> {
+        validate_absolute_file_path(path)?;
+        if path.parent() != Some(self.path.as_path()) || path.file_name().is_none() {
+            return Err(SecureFileError::InvalidPath(path.display().to_string()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_regular_file_for_append(
+        &self,
+        path: &Path,
+    ) -> Result<std::fs::File, SecureFileError> {
+        self.validate_child_path(path)?;
+        imp::create_regular_file_for_append_in(path, &self.identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_regular_file_for_read(
+        &self,
+        path: &Path,
+    ) -> Result<std::fs::File, SecureFileError> {
+        self.validate_child_path(path)?;
+        imp::open_regular_file_for_read_in(path, &self.identity)
+    }
+
+    pub(crate) fn open_regular_file_for_append(
+        &self,
+        path: &Path,
+    ) -> Result<std::fs::File, SecureFileError> {
+        self.validate_child_path(path)?;
+        imp::open_regular_file_for_append_in(path, &self.identity)
+    }
+
+    pub(crate) fn remove_regular_file_if_exists(
+        &self,
+        path: &Path,
+    ) -> Result<bool, SecureFileError> {
+        self.validate_child_path(path)?;
+        imp::remove_regular_file_if_exists_in(path, &self.identity)
+    }
+
+    pub(crate) fn remove_empty_if_exists(&self) -> Result<bool, SecureFileError> {
+        imp::remove_empty_private_directory_if_exists_bound(&self.path, &self.identity)
+    }
+}
+
+pub(crate) fn create_bound_private_directory(
+    parent: &Path,
+    prefix: &str,
+) -> Result<PrivateDirectory, SecureFileError> {
+    validate_absolute_file_path(parent)?;
+    validate_private_directory_prefix(prefix)?;
     imp::create_private_directory_all(parent)?;
-    let name = imp::create_unique_private_directory(parent, prefix)?;
-    Ok(parent.join(name))
+    let (name, identity, anchor) = imp::create_unique_private_directory(parent, prefix)?;
+    Ok(PrivateDirectory {
+        path: parent.join(name),
+        identity,
+        _anchor: anchor,
+    })
+}
+
+/// Create a uniquely named owner-only child directory without following path
+/// replacements during allocation.
+///
+/// `parent` must be absolute. `prefix` is restricted to portable filename
+/// characters and the random suffix is generated from the operating system's
+/// cryptographically secure random source. The final directory create is
+/// exclusive and descriptor-relative to the validated private parent.
+#[cfg(test)]
+pub(crate) fn create_unique_private_directory(
+    parent: &Path,
+    prefix: &str,
+) -> Result<PathBuf, SecureFileError> {
+    Ok(create_bound_private_directory(parent, prefix)?.path)
 }
 
 /// Open an owner-only directory as a stable advisory-lock anchor.
@@ -416,6 +519,24 @@ mod imp {
         validate_private_file(file)
     }
 
+    fn validate_private_directory(directory: &OwnedFd) -> Result<(), SecureFileError> {
+        let metadata =
+            rustix::fs::fstat(directory).map_err(|error| SecureFileError::Io(io_error(error)))?;
+        if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::Directory
+        {
+            return Err(SecureFileError::NotRegular);
+        }
+        if metadata.st_uid != effective_user_id() {
+            return Err(insecure_private(
+                "directory is not owned by the current user",
+            ));
+        }
+        if metadata.st_mode & 0o7777 != 0o700 {
+            return Err(insecure_private("directory mode is not 0700"));
+        }
+        Ok(())
+    }
+
     fn make_private_directory(directory: &OwnedFd) -> Result<(), SecureFileError> {
         let metadata =
             rustix::fs::fstat(directory).map_err(|error| SecureFileError::Io(io_error(error)))?;
@@ -432,10 +553,38 @@ mod imp {
             rustix::fs::fchmod(directory, Mode::from_raw_mode(0o700))
                 .map_err(|error| SecureFileError::Io(io_error(error)))?;
         }
-        let repaired =
+        validate_private_directory(directory)
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) struct PrivateDirectoryIdentity {
+        device: u64,
+        inode: u64,
+    }
+
+    fn directory_identity(
+        directory: &impl rustix::fd::AsFd,
+    ) -> Result<PrivateDirectoryIdentity, SecureFileError> {
+        let metadata =
             rustix::fs::fstat(directory).map_err(|error| SecureFileError::Io(io_error(error)))?;
-        if repaired.st_uid != effective_user_id() || repaired.st_mode & 0o7777 != 0o700 {
-            return Err(insecure_private("directory mode is not 0700"));
+        if rustix::fs::FileType::from_raw_mode(metadata.st_mode) != rustix::fs::FileType::Directory
+        {
+            return Err(SecureFileError::NotRegular);
+        }
+        Ok(PrivateDirectoryIdentity {
+            device: metadata.st_dev as u64,
+            inode: metadata.st_ino as u64,
+        })
+    }
+
+    fn validate_bound_directory(
+        directory: &OwnedFd,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<(), SecureFileError> {
+        validate_private_directory(directory)?;
+        let actual = directory_identity(directory)?;
+        if (actual.device, actual.inode) != (expected.device, expected.inode) {
+            return Err(SecureFileError::Changed);
         }
         Ok(())
     }
@@ -703,7 +852,7 @@ mod imp {
     pub(super) fn create_unique_private_directory(
         parent: &Path,
         prefix: &str,
-    ) -> Result<OsString, SecureFileError> {
+    ) -> Result<(OsString, PrivateDirectoryIdentity, std::fs::File), SecureFileError> {
         let parent: OwnedFd = open_private_directory_for_lock(parent)?.into();
         for _ in 0..TEMP_NAME_ATTEMPTS {
             let name = OsString::from(format!("{prefix}{}", random_temp_suffix()?));
@@ -728,13 +877,45 @@ mod imp {
                 return Err(SecureFileError::Changed);
             }
 
+            let identity = directory_identity(&directory)?;
             created.disarm();
-            return Ok(name);
+            return Ok((name, identity, std::fs::File::from(directory)));
         }
         Err(SecureFileError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "could not allocate a unique private directory",
         )))
+    }
+
+    fn open_existing_private_directory(path: &Path) -> Result<OwnedFd, SecureFileError> {
+        let path_components = components(path)?;
+        let mut current = open_root()?;
+        for (index, component) in path_components.iter().enumerate() {
+            current = if index == 0 {
+                open_root_component(&current, component)
+            } else {
+                open_directory(&current, component)
+            }
+            .map_err(|error| SecureFileError::Io(io_error(error)))?;
+        }
+        validate_private_directory(&current)?;
+        Ok(current)
+    }
+
+    fn open_bound_parent(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<(OwnedFd, OsString), SecureFileError> {
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| SecureFileError::InvalidPath(path.display().to_string()))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| SecureFileError::InvalidPath(path.display().to_string()))?
+            .to_os_string();
+        let parent = open_existing_private_directory(parent_path)?;
+        validate_bound_directory(&parent, expected)?;
+        Ok((parent, name))
     }
 
     pub(super) fn open_private_directory_for_lock(
@@ -783,7 +964,15 @@ mod imp {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn remove_regular_file_if_exists(path: &Path) -> Result<bool, SecureFileError> {
         let (parent, name) = open_parent(path, false)?;
-        let file = match open_regular_at(&parent, &name) {
+        remove_regular_file_if_exists_at(&parent, &name)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn remove_regular_file_if_exists_at(
+        parent: &OwnedFd,
+        name: &OsStr,
+    ) -> Result<bool, SecureFileError> {
+        let file = match open_regular_at(parent, name) {
             Ok(file) => file,
             Err(SecureFileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(false);
@@ -795,9 +984,9 @@ mod imp {
         for _ in 0..TEMP_NAME_ATTEMPTS {
             let temporary = OsString::from(format!(".ygg-delete-{}", random_temp_suffix()?));
             match rustix::fs::renameat_with(
-                &parent,
-                &name,
-                &parent,
+                parent,
+                name,
+                parent,
                 &temporary,
                 RenameFlags::NOREPLACE,
             ) {
@@ -811,7 +1000,7 @@ mod imp {
             }
 
             let moved_is_expected = matches!(
-                named_file_identity(&parent, &temporary, false),
+                named_file_identity(parent, &temporary, false),
                 Ok(actual) if same_object(actual, expected)
             );
             if !moved_is_expected {
@@ -819,27 +1008,27 @@ mod imp {
                 // has already published there, preserve both objects and let
                 // later recovery handle the randomized orphan.
                 let _ = rustix::fs::renameat_with(
-                    &parent,
+                    parent,
                     &temporary,
-                    &parent,
-                    &name,
+                    parent,
+                    name,
                     RenameFlags::NOREPLACE,
                 );
                 return Err(SecureFileError::Changed);
             }
 
-            match rustix::fs::unlinkat(&parent, &temporary, AtFlags::empty()) {
+            match rustix::fs::unlinkat(parent, &temporary, AtFlags::empty()) {
                 Ok(()) => {
-                    rustix::fs::fsync(&parent)
+                    rustix::fs::fsync(parent)
                         .map_err(|error| SecureFileError::Io(io_error(error)))?;
                     return Ok(true);
                 }
                 Err(error) => {
                     let _ = rustix::fs::renameat_with(
-                        &parent,
+                        parent,
                         &temporary,
-                        &parent,
-                        &name,
+                        parent,
+                        name,
                         RenameFlags::NOREPLACE,
                     );
                     return Err(SecureFileError::Io(io_error(error)));
@@ -857,6 +1046,136 @@ mod imp {
         Err(SecureFileError::PublicationUnavailable)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn remove_regular_file_if_exists_in(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<bool, SecureFileError> {
+        let (parent, name) = open_bound_parent(path, expected)?;
+        remove_regular_file_if_exists_at(&parent, &name)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn remove_regular_file_if_exists_in(
+        _path: &Path,
+        _expected: &PrivateDirectoryIdentity,
+    ) -> Result<bool, SecureFileError> {
+        Err(SecureFileError::PublicationUnavailable)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(test)]
+    pub(super) fn remove_empty_private_directory_if_exists(
+        path: &Path,
+    ) -> Result<bool, SecureFileError> {
+        let (parent, name) = open_parent(path, false)?;
+        remove_empty_private_directory_if_exists_at(&parent, &name, None)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn remove_empty_private_directory_if_exists_at(
+        parent: &OwnedFd,
+        name: &OsStr,
+        bound: Option<&PrivateDirectoryIdentity>,
+    ) -> Result<bool, SecureFileError> {
+        let directory = match open_directory(parent, name) {
+            Ok(directory) => directory,
+            Err(Errno::NOENT) => return Ok(false),
+            Err(error) => return Err(SecureFileError::Io(io_error(error))),
+        };
+        validate_private_directory(&directory)?;
+        if let Some(bound) = bound {
+            validate_bound_directory(&directory, bound)?;
+        }
+        let expected =
+            rustix::fs::fstat(&directory).map_err(|error| SecureFileError::Io(io_error(error)))?;
+
+        for _ in 0..TEMP_NAME_ATTEMPTS {
+            let temporary =
+                OsString::from(format!(".ygg-directory-delete-{}", random_temp_suffix()?));
+            match rustix::fs::renameat_with(
+                parent,
+                name,
+                parent,
+                &temporary,
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => {}
+                Err(Errno::EXIST) => continue,
+                Err(Errno::NOENT) => return Err(SecureFileError::Changed),
+                Err(Errno::NOSYS | Errno::OPNOTSUPP | Errno::INVAL) => {
+                    return Err(SecureFileError::PublicationUnavailable);
+                }
+                Err(error) => return Err(SecureFileError::Io(io_error(error))),
+            }
+
+            let moved_is_expected = open_directory(parent, &temporary)
+                .and_then(|moved| rustix::fs::fstat(&moved))
+                .is_ok_and(|actual| {
+                    (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
+                });
+            if !moved_is_expected {
+                // Never delete a replacement that won the race. Restore it only
+                // into an empty original name; otherwise preserve both paths.
+                let _ = rustix::fs::renameat_with(
+                    parent,
+                    &temporary,
+                    parent,
+                    name,
+                    RenameFlags::NOREPLACE,
+                );
+                return Err(SecureFileError::Changed);
+            }
+
+            match rustix::fs::unlinkat(parent, &temporary, AtFlags::REMOVEDIR) {
+                Ok(()) => {
+                    rustix::fs::fsync(parent)
+                        .map_err(|error| SecureFileError::Io(io_error(error)))?;
+                    return Ok(true);
+                }
+                Err(error) => {
+                    let _ = rustix::fs::renameat_with(
+                        parent,
+                        &temporary,
+                        parent,
+                        name,
+                        RenameFlags::NOREPLACE,
+                    );
+                    return Err(SecureFileError::Io(io_error(error)));
+                }
+            }
+        }
+        Err(SecureFileError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique secure directory deletion name",
+        )))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(test)]
+    pub(super) fn remove_empty_private_directory_if_exists(
+        _path: &Path,
+    ) -> Result<bool, SecureFileError> {
+        Err(SecureFileError::PublicationUnavailable)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn remove_empty_private_directory_if_exists_bound(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<bool, SecureFileError> {
+        let (parent, name) = open_parent(path, false)?;
+        remove_empty_private_directory_if_exists_at(&parent, &name, Some(expected))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn remove_empty_private_directory_if_exists_bound(
+        _path: &Path,
+        _expected: &PrivateDirectoryIdentity,
+    ) -> Result<bool, SecureFileError> {
+        Err(SecureFileError::PublicationUnavailable)
+    }
+
     pub(super) fn read_regular_file_bounded(
         path: &Path,
         limit: usize,
@@ -869,10 +1188,16 @@ mod imp {
         path: &Path,
         limit: usize,
     ) -> Result<Vec<u8>, SecureFileError> {
+        read_open_regular(open_private_file_for_read(path)?, limit)
+    }
+
+    pub(super) fn open_private_file_for_read(
+        path: &Path,
+    ) -> Result<std::fs::File, SecureFileError> {
         let (parent, name) = open_parent(path, false)?;
         let file = open_regular_at(&parent, &name)?;
         validate_private_file(&file)?;
-        read_open_regular(file, limit)
+        Ok(file)
     }
 
     pub(super) fn read_regular_file_bounded_by(
@@ -891,6 +1216,17 @@ mod imp {
         open_regular_at(&parent, &name)
     }
 
+    #[cfg(test)]
+    pub(super) fn open_regular_file_for_read_in(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<std::fs::File, SecureFileError> {
+        let (parent, name) = open_bound_parent(path, expected)?;
+        let file = open_regular_at(&parent, &name)?;
+        validate_private_file(&file)?;
+        Ok(file)
+    }
+
     pub(super) fn open_regular_file_for_append(
         path: &Path,
     ) -> Result<std::fs::File, SecureFileError> {
@@ -907,10 +1243,50 @@ mod imp {
         Ok(file)
     }
 
+    pub(super) fn open_regular_file_for_append_in(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<std::fs::File, SecureFileError> {
+        let (parent, name) = open_bound_parent(path, expected)?;
+        let descriptor = rustix::fs::openat(
+            &parent,
+            &name,
+            OFlags::RDWR | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| SecureFileError::Io(io_error(error)))?;
+        let file = std::fs::File::from(descriptor);
+        make_private_file(&file)?;
+        Ok(file)
+    }
+
     pub(super) fn create_regular_file_for_append(
         path: &Path,
     ) -> Result<std::fs::File, SecureFileError> {
         let (parent, name) = open_parent(path, false)?;
+        let descriptor = rustix::fs::openat(
+            &parent,
+            &name,
+            OFlags::RDWR
+                | OFlags::APPEND
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        )
+        .map_err(|error| SecureFileError::Io(io_error(error)))?;
+        let file = std::fs::File::from(descriptor);
+        validate_private_file(&file)?;
+        Ok(file)
+    }
+
+    pub(super) fn create_regular_file_for_append_in(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<std::fs::File, SecureFileError> {
+        let (parent, name) = open_bound_parent(path, expected)?;
         let descriptor = rustix::fs::openat(
             &parent,
             &name,
@@ -1369,7 +1745,7 @@ mod imp {
     use super::*;
     use std::ffi::{c_void, OsStr, OsString};
     use std::fs::{File, OpenOptions, Permissions};
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, Write};
     use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::fs::OpenOptionsExt as _;
@@ -1407,7 +1783,7 @@ mod imp {
         FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_RENAME_INFO,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES,
-        READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
+        FILE_WRITE_DATA, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -1422,7 +1798,11 @@ mod imp {
     const PRIVATE_INSPECTION_ACCESS: u32 =
         FILE_READ_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | SYNCHRONIZE;
     const PRIVATE_FILE_ACCESS: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | WRITE_DAC;
+    // Session tail recovery truncates torn records before later appends, which
+    // requires FILE_WRITE_DATA on Windows. Callers seek to the durable end
+    // before writing; Session additionally repeats that seek under its lock.
     const APPEND_ACCESS: u32 = FILE_READ_DATA
+        | FILE_WRITE_DATA
         | FILE_APPEND_DATA
         | FILE_READ_ATTRIBUTES
         | FILE_WRITE_ATTRIBUTES
@@ -1438,6 +1818,12 @@ mod imp {
         size: u64,
         creation_time: u64,
         last_write_time: u64,
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) struct PrivateDirectoryIdentity {
+        volume: u32,
+        index: u64,
     }
 
     impl FileIdentity {
@@ -1883,6 +2269,28 @@ mod imp {
         })
     }
 
+    fn private_directory_identity(
+        directory: &File,
+    ) -> Result<PrivateDirectoryIdentity, SecureFileError> {
+        validate_private_acl(directory, true)?;
+        let identity = file_identity(directory)?;
+        Ok(PrivateDirectoryIdentity {
+            volume: identity.volume,
+            index: identity.index,
+        })
+    }
+
+    fn validate_bound_directory(
+        directory: &File,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<(), SecureFileError> {
+        let actual = private_directory_identity(directory)?;
+        if (actual.volume, actual.index) != (expected.volume, expected.index) {
+            return Err(SecureFileError::Changed);
+        }
+        Ok(())
+    }
+
     fn ensure_regular(identity: FileIdentity) -> Result<(), SecureFileError> {
         if identity.is_directory() || identity.is_reparse_point() {
             return Err(SecureFileError::NotRegular);
@@ -2149,7 +2557,7 @@ mod imp {
     pub(super) fn create_unique_private_directory(
         parent: &Path,
         prefix: &str,
-    ) -> Result<OsString, SecureFileError> {
+    ) -> Result<(OsString, PrivateDirectoryIdentity, File), SecureFileError> {
         let parent = open_private_directory_for_lock(parent)?;
         for _ in 0..TEMP_NAME_ATTEMPTS {
             let name = OsString::from(format!("{prefix}{}", random_temp_suffix()?));
@@ -2189,8 +2597,12 @@ mod imp {
                 return Err(SecureFileError::Changed);
             }
 
+            let identity = PrivateDirectoryIdentity {
+                volume: expected.volume,
+                index: expected.index,
+            };
             created.disarm();
-            return Ok(name);
+            return Ok((name, identity, directory));
         }
         Err(SecureFileError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -2215,6 +2627,22 @@ mod imp {
         Ok(directory)
     }
 
+    fn open_bound_parent(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<(File, OsString), SecureFileError> {
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| SecureFileError::InvalidPath(path.display().to_string()))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| SecureFileError::InvalidPath(path.display().to_string()))?
+            .to_os_string();
+        let parent = open_private_directory_for_lock(parent_path)?;
+        validate_bound_directory(&parent, expected)?;
+        Ok((parent, name))
+    }
+
     pub(super) fn remove_regular_file_if_exists(path: &Path) -> Result<bool, SecureFileError> {
         let (parent, name) = open_parent(path, false)?;
         let (file, _) =
@@ -2227,6 +2655,74 @@ mod imp {
             };
         ensure_regular(file_identity(&file)?)?;
         delete_handle(&file)?;
+        Ok(true)
+    }
+
+    pub(super) fn remove_regular_file_if_exists_in(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<bool, SecureFileError> {
+        let (parent, name) = open_bound_parent(path, expected)?;
+        let (file, _) =
+            match open_file_at(&parent, &name, FILE_GENERIC_READ | DELETE, FILE_OPEN, false) {
+                Ok(result) => result,
+                Err(SecureFileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+        validate_private_acl(&file, false)?;
+        delete_handle(&file)?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove_empty_private_directory_if_exists(
+        path: &Path,
+    ) -> Result<bool, SecureFileError> {
+        let (parent, name) = open_parent(path, false)?;
+        let directory = match nt_open_at(
+            parent.as_raw_handle(),
+            &name,
+            PRIVATE_DIRECTORY_INSPECTION_ACCESS | DELETE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            FILE_ATTRIBUTE_DIRECTORY,
+            null(),
+        ) {
+            Ok((directory, _)) => directory,
+            Err(SecureFileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        validate_private_acl(&directory, true)?;
+        delete_handle(&directory)?;
+        Ok(true)
+    }
+
+    pub(super) fn remove_empty_private_directory_if_exists_bound(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<bool, SecureFileError> {
+        let (parent, name) = open_parent(path, false)?;
+        let directory = match nt_open_at(
+            parent.as_raw_handle(),
+            &name,
+            PRIVATE_DIRECTORY_INSPECTION_ACCESS | DELETE,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            FILE_ATTRIBUTE_DIRECTORY,
+            null(),
+        ) {
+            Ok((directory, _)) => directory,
+            Err(SecureFileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        validate_bound_directory(&directory, expected)?;
+        delete_handle(&directory)?;
         Ok(true)
     }
 
@@ -2249,10 +2745,15 @@ mod imp {
         path: &Path,
         limit: usize,
     ) -> Result<Vec<u8>, SecureFileError> {
+        let file = open_private_file_for_read(path)?;
+        read_open_file_bounded(&file, limit)
+    }
+
+    pub(super) fn open_private_file_for_read(path: &Path) -> Result<File, SecureFileError> {
         let (parent, name) = open_parent(path, false)?;
         let (file, _) = open_file_at(&parent, &name, FILE_GENERIC_READ, FILE_OPEN, false)?;
         validate_private_acl(&file, false)?;
-        read_open_file_bounded(&file, limit)
+        Ok(file)
     }
 
     pub(super) fn open_regular_file_for_read(path: &Path) -> Result<File, SecureFileError> {
@@ -2262,17 +2763,50 @@ mod imp {
         Ok(file)
     }
 
+    #[cfg(test)]
+    pub(super) fn open_regular_file_for_read_in(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<File, SecureFileError> {
+        let (parent, name) = open_bound_parent(path, expected)?;
+        let (file, _) = open_file_at(&parent, &name, FILE_GENERIC_READ, FILE_OPEN, false)?;
+        validate_private_acl(&file, false)?;
+        Ok(file)
+    }
+
     pub(super) fn open_regular_file_for_append(path: &Path) -> Result<File, SecureFileError> {
         let (parent, name) = open_parent(path, false)?;
-        let (file, _) = open_file_at(&parent, &name, APPEND_ACCESS, FILE_OPEN, false)?;
+        let (mut file, _) = open_file_at(&parent, &name, APPEND_ACCESS, FILE_OPEN, false)?;
         ensure_regular(file_identity(&file)?)?;
+        file.seek(std::io::SeekFrom::End(0))?;
+        Ok(file)
+    }
+
+    pub(super) fn open_regular_file_for_append_in(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<File, SecureFileError> {
+        let (parent, name) = open_bound_parent(path, expected)?;
+        let (mut file, _) = open_file_at(&parent, &name, APPEND_ACCESS, FILE_OPEN, false)?;
+        validate_private_acl(&file, false)?;
+        file.seek(std::io::SeekFrom::End(0))?;
         Ok(file)
     }
 
     pub(super) fn create_regular_file_for_append(path: &Path) -> Result<File, SecureFileError> {
         let (parent, name) = open_parent(path, false)?;
-        let (file, _) = open_file_at(&parent, &name, APPEND_ACCESS, FILE_CREATE, false)?;
+        let (file, _) = open_file_at(&parent, &name, APPEND_ACCESS, FILE_CREATE, true)?;
         ensure_regular(file_identity(&file)?)?;
+        Ok(file)
+    }
+
+    pub(super) fn create_regular_file_for_append_in(
+        path: &Path,
+        expected: &PrivateDirectoryIdentity,
+    ) -> Result<File, SecureFileError> {
+        let (parent, name) = open_bound_parent(path, expected)?;
+        let (file, _) = open_file_at(&parent, &name, APPEND_ACCESS, FILE_CREATE, true)?;
+        validate_private_acl(&file, false)?;
         Ok(file)
     }
 
@@ -2668,6 +3202,8 @@ mod imp {
 mod imp {
     use super::*;
 
+    pub(super) struct PrivateDirectoryIdentity;
+
     fn unsupported<T>() -> Result<T, SecureFileError> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -2683,7 +3219,8 @@ mod imp {
     pub(super) fn create_unique_private_directory(
         _parent: &Path,
         _prefix: &str,
-    ) -> Result<std::ffi::OsString, SecureFileError> {
+    ) -> Result<(std::ffi::OsString, PrivateDirectoryIdentity, std::fs::File), SecureFileError>
+    {
         unsupported()
     }
 
@@ -2694,6 +3231,27 @@ mod imp {
     }
 
     pub(super) fn remove_regular_file_if_exists(_path: &Path) -> Result<bool, SecureFileError> {
+        unsupported()
+    }
+
+    pub(super) fn remove_regular_file_if_exists_in(
+        _path: &Path,
+        _expected: &PrivateDirectoryIdentity,
+    ) -> Result<bool, SecureFileError> {
+        unsupported()
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove_empty_private_directory_if_exists(
+        _path: &Path,
+    ) -> Result<bool, SecureFileError> {
+        unsupported()
+    }
+
+    pub(super) fn remove_empty_private_directory_if_exists_bound(
+        _path: &Path,
+        _expected: &PrivateDirectoryIdentity,
+    ) -> Result<bool, SecureFileError> {
         unsupported()
     }
 
@@ -2719,8 +3277,22 @@ mod imp {
         unsupported()
     }
 
+    pub(super) fn open_private_file_for_read(
+        _path: &Path,
+    ) -> Result<std::fs::File, SecureFileError> {
+        unsupported()
+    }
+
     pub(super) fn open_regular_file_for_read(
         _path: &Path,
+    ) -> Result<std::fs::File, SecureFileError> {
+        unsupported()
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_regular_file_for_read_in(
+        _path: &Path,
+        _expected: &PrivateDirectoryIdentity,
     ) -> Result<std::fs::File, SecureFileError> {
         unsupported()
     }
@@ -2731,8 +3303,22 @@ mod imp {
         unsupported()
     }
 
+    pub(super) fn open_regular_file_for_append_in(
+        _path: &Path,
+        _expected: &PrivateDirectoryIdentity,
+    ) -> Result<std::fs::File, SecureFileError> {
+        unsupported()
+    }
+
     pub(super) fn create_regular_file_for_append(
         _path: &Path,
+    ) -> Result<std::fs::File, SecureFileError> {
+        unsupported()
+    }
+
+    pub(super) fn create_regular_file_for_append_in(
+        _path: &Path,
+        _expected: &PrivateDirectoryIdentity,
     ) -> Result<std::fs::File, SecureFileError> {
         unsupported()
     }
@@ -2830,6 +3416,66 @@ mod tests {
             .starts_with("team-"));
         open_private_directory_for_lock(&first).unwrap();
         open_private_directory_for_lock(&second).unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn bound_private_directory_rejects_a_replacement_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap().join("private");
+        let bound = create_bound_private_directory(&parent, "team-").unwrap();
+        let moved = parent.join("original-team");
+        std::fs::rename(bound.path(), &moved).unwrap();
+        create_private_directory_all(bound.path()).unwrap();
+        let child = bound.path().join("child.jsonl");
+
+        assert!(matches!(
+            bound.create_regular_file_for_append(&child),
+            Err(SecureFileError::Changed)
+        ));
+        assert!(!child.exists());
+        assert!(moved.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn empty_private_directory_cleanup_is_bounded_to_empty_private_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap().join("private");
+        let empty = create_unique_private_directory(&parent, "team-").unwrap();
+        let nonempty = create_unique_private_directory(&parent, "team-").unwrap();
+        std::fs::write(nonempty.join("provenance.jsonl"), b"record").unwrap();
+
+        assert!(remove_empty_private_directory_if_exists(&empty).unwrap());
+        assert!(!empty.exists());
+        assert!(!remove_empty_private_directory_if_exists(&empty).unwrap());
+        assert!(remove_empty_private_directory_if_exists(&nonempty).is_err());
+        assert_eq!(
+            std::fs::read(nonempty.join("provenance.jsonl")).unwrap(),
+            b"record"
+        );
+        assert_eq!(
+            std::fs::read_dir(&parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>(),
+            vec![nonempty]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_cleanup_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let outside = create_unique_private_directory(&root.join("private"), "outside-").unwrap();
+        let link = root.join("link");
+        symlink(&outside, &link).unwrap();
+
+        assert!(remove_empty_private_directory_if_exists(&link).is_err());
+        assert!(outside.exists());
     }
 
     #[cfg(unix)]

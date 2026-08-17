@@ -28,7 +28,8 @@ pub(crate) fn provider_ref_is_usable(
 }
 
 /// Returns a request-local reasoning selection with portable effort clamped to
-/// the model's advertised range.
+/// the model's advertised range. Ultra is an orchestration tier and is capped
+/// at Max unless the same metadata advertises V2 delegation.
 pub(crate) fn normalize_reasoning_config<'a>(
     reasoning: &'a ReasoningConfig,
     caps: &Capabilities,
@@ -36,9 +37,14 @@ pub(crate) fn normalize_reasoning_config<'a>(
     let (ReasoningConfig::Effort(effort), Some(capability)) = (reasoning, &caps.reasoning) else {
         return Cow::Borrowed(reasoning);
     };
-    let effective = (*effort)
-        .max(capability.min_effort)
-        .min(capability.max_effort);
+    let ceiling = if capability.max_effort == crate::types::ReasoningEffort::Ultra
+        && caps.agent_delegation != Some(crate::types::AgentDelegation::V2)
+    {
+        crate::types::ReasoningEffort::Max
+    } else {
+        capability.max_effort
+    };
+    let effective = (*effort).max(capability.min_effort).min(ceiling);
     if effective == *effort {
         Cow::Borrowed(reasoning)
     } else {
@@ -1327,6 +1333,22 @@ mod matrix_tests {
         req.reasoning = ReasoningConfig::Effort(ReasoningEffort::Minimal);
         let low = normalize_request_reasoning(&req, &capabilities);
         assert_eq!(low.reasoning, ReasoningConfig::Effort(ReasoningEffort::Low));
+
+        req.reasoning = ReasoningConfig::Effort(ReasoningEffort::Ultra);
+        let reasoning = capabilities.reasoning.as_mut().unwrap();
+        reasoning.min_effort = ReasoningEffort::Ultra;
+        reasoning.max_effort = ReasoningEffort::Ultra;
+        let without_v2 = normalize_request_reasoning(&req, &capabilities);
+        assert_eq!(
+            without_v2.reasoning,
+            ReasoningConfig::Effort(ReasoningEffort::Max)
+        );
+        capabilities.agent_delegation = Some(crate::types::AgentDelegation::V2);
+        let with_v2 = normalize_request_reasoning(&req, &capabilities);
+        assert_eq!(
+            with_v2.reasoning,
+            ReasoningConfig::Effort(ReasoningEffort::Ultra)
+        );
     }
 
     #[test]

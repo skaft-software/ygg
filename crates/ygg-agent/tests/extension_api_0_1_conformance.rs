@@ -8,12 +8,15 @@ use std::time::Duration;
 use pretty_assertions::assert_eq;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use ygg_agent::extension_process::{ExtensionActiveSkill, ExtensionRequestId};
+use ygg_agent::extension_process::{
+    ExtensionActiveSkill, ExtensionRequestId, EXTENSION_API_VERSION_0_2,
+    EXTENSION_FEATURE_REQUEST_PROGRESS,
+};
 use ygg_agent::{
     CancellationToken, DiscoveredExtension, ExtensionActivation, ExtensionConfirmationResponse,
     ExtensionEvent, ExtensionHook, ExtensionHostState, ExtensionManifest, ExtensionProcess,
     ExtensionRuntimeConfig, ExtensionRuntimeError, ExtensionSource, ExtensionTrust, SandboxConfig,
-    ToolCallHook, ToolContext, ToolProgressSink, EXTENSION_API_VERSION,
+    ToolCallHook, ToolContext, ToolProgressSink, EXTENSION_API_VERSION_0_1,
     EXTENSION_MANIFEST_FILENAME,
 };
 
@@ -114,6 +117,7 @@ confirmations = true
         workspace: temp.path(),
         sandbox: &sandbox,
         execution_scope: "wire-scope-1",
+        resource_owner: "wire-scope-1",
         active_skills: &active_skills,
         registered_tools: &registered_tools,
         progress: ToolProgressSink::null(),
@@ -142,6 +146,7 @@ confirmations = true
             request_id,
             generation,
             request,
+            ..
         } => {
             assert_eq!(request.prompt, "Apply the wire fixture?");
             assert_eq!(
@@ -181,7 +186,7 @@ confirmations = true
             "id": 1,
             "method": "initialize",
             "params": {
-                "api_version": EXTENSION_API_VERSION,
+                "api_version": EXTENSION_API_VERSION_0_1,
                 "ygg_version": env!("CARGO_PKG_VERSION"),
                 "extension": {
                     "name": "wire-fixture",
@@ -444,6 +449,114 @@ hooks = ["before_prompt"]
 }
 
 #[tokio::test]
+async fn rust_host_runs_a_real_python_sdk_api_0_2_extension_end_to_end() {
+    let temp = TempDir::new().expect("tempdir");
+    let child_path = temp.path().join("python-sdk-v02-extension.py");
+    let shutdown_marker = temp.path().join("python-sdk-v02-shutdown.txt");
+    let python_sdk = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../sdk/python")
+        .canonicalize()
+        .expect("canonical Python SDK path");
+    write_executable(
+        &child_path,
+        r#"#!/usr/bin/env python3
+import os
+from pathlib import Path
+
+from ygg_extension import Extension, text_content, tool_result
+
+extension = Extension(api_version="0.2")
+
+@extension.tool(
+    name="sdk_v02_echo",
+    description="Echo a structured value through API 0.2",
+    parameters={
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    },
+    output_schema={
+        "type": "object",
+        "properties": {"echo": {"type": "string"}},
+        "required": ["echo"],
+        "additionalProperties": False,
+    },
+)
+def sdk_v02_echo(arguments, context):
+    extension.progress(message="halfway", current=1, total=2, unit="steps")
+    value = arguments["text"]
+    return tool_result(
+        text_content("echo:" + value),
+        structured_content={"echo": value},
+        metadata={"sdk": "python", "api": "0.2"},
+    )
+
+@extension.on_shutdown
+def on_shutdown(params, context):
+    Path(os.environ["YGG_TEST_SHUTDOWN_MARKER"]).write_text("shutdown", encoding="utf-8")
+
+extension.run()
+"#,
+    );
+
+    let mut manifest = ExtensionManifest::parse(
+        r#"
+name = "python-sdk-v02"
+version = "0.2.0"
+api_version = "0.2"
+
+[entrypoint]
+command = "python-sdk-v02-extension.py"
+
+[contributes]
+tools = ["sdk_v02_echo"]
+"#,
+    )
+    .expect("manifest");
+    manifest.entrypoint.env.insert(
+        "PYTHONPATH".into(),
+        python_sdk.to_string_lossy().into_owned(),
+    );
+    manifest.entrypoint.env.insert(
+        "YGG_TEST_SHUTDOWN_MARKER".into(),
+        shutdown_marker.to_string_lossy().into_owned(),
+    );
+    let mut config = ExtensionRuntimeConfig::new(temp.path());
+    config.request_timeout = Duration::from_secs(3);
+    config.shutdown_timeout = Duration::from_secs(3);
+    let process = ExtensionProcess::start(
+        trusted_descriptor(temp.path().join(EXTENSION_MANIFEST_FILENAME), manifest),
+        config,
+    )
+    .await
+    .expect("start real Python SDK API 0.2 extension");
+
+    assert_eq!(process.api_version(), EXTENSION_API_VERSION_0_2);
+    assert!(process
+        .negotiated_features()
+        .contains(EXTENSION_FEATURE_REQUEST_PROGRESS));
+    let output = process
+        .call_tool(
+            "sdk_v02_echo",
+            json!({"text": "hello"}),
+            process.current_context(),
+        )
+        .await
+        .expect("API 0.2 Python tool call");
+    assert_eq!(output.content, "echo:hello");
+    assert_eq!(output.structured_content, Some(json!({"echo": "hello"})));
+    assert_eq!(output.metadata, json!({"sdk": "python", "api": "0.2"}));
+    assert!(
+        process.shutdown().await,
+        "Python SDK should drain and shut down"
+    );
+    assert_eq!(
+        std::fs::read_to_string(shutdown_marker).expect("Python SDK shutdown marker"),
+        "shutdown"
+    );
+}
+
+#[tokio::test]
 async fn adversarial_raw_child_must_match_nonempty_tool_and_command_declarations_exactly() {
     fn tool(name: &str) -> Value {
         json!({
@@ -528,7 +641,7 @@ async fn adversarial_raw_child_must_match_nonempty_tool_and_command_declarations
             "jsonrpc": "2.0",
             "id": 1,
             "result": {
-                "api_version": EXTENSION_API_VERSION,
+                "api_version": EXTENSION_API_VERSION_0_1,
                 "tools": initialized_tools,
                 "commands": initialized_commands,
             },
