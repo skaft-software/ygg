@@ -84,6 +84,7 @@ pub mod input;
 pub mod sandbox;
 pub mod secure_fs;
 pub mod session;
+mod shell_safety;
 /// The generic skill substrate containing descriptors, load errors, trust levels, and the registry trait.
 pub mod skills;
 pub mod tool;

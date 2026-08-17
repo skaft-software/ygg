@@ -40,6 +40,8 @@ sha2 = "0.10"
 subtle = "2"
 tempfile = "3"
 base64 = "0.22"
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
 
 # One `libc::kill(-pgid, SIGKILL)` call terminates a cancelled bash tool's whole
 # process group (tokio's kill_on_drop only reaches the direct child).
