@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use ygg_agent::{Agent, AgentConfig, ExtensionHost, InputPart, SandboxConfig, Session, UserInput};
+use ygg_agent::{
+    Agent, AgentConfig, EffectBroker, EffectPolicy, ExtensionHost, InputPart, SandboxConfig,
+    Session, UserInput,
+};
 use ygg_ai::{
     AiClient, Auth, CacheCompatibility, CacheRetention, Capabilities, Endpoint, EndpointId,
     EndpointTransport, Media, Modality, ModalitySet, Model, ModelId, ModelLimits, ModelSpec,
@@ -91,6 +94,7 @@ async fn live_openai_compatible_inline_png_reaches_the_model() {
         session: Session::create(&session_path).unwrap(),
         system: "Answer the user's image question briefly.".into(),
         sandbox: SandboxConfig::new(directory.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions: ExtensionHost::new(),
         max_turns: Some(2),
         reasoning: ReasoningConfig::Off,

@@ -1464,10 +1464,12 @@ and are not retried by this post-initialization supervisor. The supervisor does
 not heartbeat an otherwise live process. A full product rebuild creates a new
 extension instance and supervisor, resetting in-memory retry/parked state.
 
-API `0.1` has one resident contact policy and no manifest contact-policy field:
-every enabled, trusted extension is started while the product extension host is
-constructed. Each generation remains resident until reload, shutdown, or
-connection failure; the host supervisor may create a replacement
+API `0.1` has one resident contact policy and no manifest contact-policy field.
+An enabled, trusted extension is started while the product extension host is
+constructed only when the resolved product policy is UnsafeHost and the
+independent process gate permits startup; Controlled retains discovery without
+a resident child. Each admitted generation remains resident until reload,
+shutdown, or connection failure; the host supervisor may create a replacement
 after failure. On reload, the replacement is initialized before the active
 generation stops admission and shuts down; the replacement is then swapped in.
 Its wire contract remains frozen and does not emulate API `0.2` stateful

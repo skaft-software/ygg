@@ -1248,8 +1248,11 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
             "session directory must stay inside the workspace unless allow_external_paths is enabled"
         );
     }
+    // Protocol v1 is fixed to Controlled. Host-supplied paths may use the
+    // request boundary above, but model-controlled file tools must remain
+    // workspace-relative under that effect policy.
     let mut sandbox = SandboxPolicy {
-        allow_external_paths: request.allow_external_paths,
+        allow_external_paths: false,
         ..SandboxPolicy::default()
     };
     if !request.allow_file_mutation {
@@ -1277,6 +1280,7 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
         reasoning_mode: ygg_ai::ReasoningMode::Standard,
         reasoning_mode_explicit: true,
         cache_retention: CacheRetention::Short,
+        effect_policy: ygg_agent::EffectPolicy::Controlled,
         sandbox,
         theme: None,
         system_prompt: request.system_prompt.clone(),
@@ -2068,6 +2072,18 @@ mod tests {
             pricing: None,
             cache: ygg_ai::CacheCompatibility::default(),
         }
+    }
+
+    #[test]
+    fn controlled_host_config_keeps_model_tools_workspace_relative() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut request = base_request(workspace.path().to_path_buf());
+        request.allow_external_paths = true;
+
+        let config = host_config(&request).unwrap();
+
+        assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::Controlled);
+        assert!(!config.sandbox.allow_external_paths);
     }
 
     #[test]

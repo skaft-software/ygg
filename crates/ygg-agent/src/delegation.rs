@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use ygg_ai::{AssistantPart, ToolDef};
 
 use crate::agent::{Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy};
+use crate::effect::ToolEffect;
 use crate::events::{AgentEvent, FinishReason};
 use crate::extension::ExtensionHost;
 use crate::secure_fs::{self, SecureFileError};
@@ -650,6 +651,7 @@ pub(crate) struct DelegationTemplate {
     pub(crate) model: ygg_ai::Model,
     pub(crate) base_system: RwLock<String>,
     pub(crate) sandbox: crate::SandboxConfig,
+    pub(crate) effect_broker: crate::EffectBroker,
     pub(crate) extensions: ExtensionHost,
     pub(crate) max_turns: Option<u64>,
     pub(crate) reasoning: ygg_ai::ReasoningConfig,
@@ -1485,6 +1487,7 @@ impl DelegationManager {
             session,
             system,
             sandbox: self.template.sandbox.clone(),
+            effect_broker: self.template.effect_broker.clone(),
             extensions: self.template.extensions.clone(),
             max_turns: self.template.max_turns,
             reasoning: self.template.reasoning.clone(),
@@ -2822,6 +2825,10 @@ impl Tool for CollaborationTool {
         self.kind.definition()
     }
 
+    fn effect(&self, _args: &Value, _ctx: &ToolContext<'_>) -> Result<ToolEffect, ToolError> {
+        Ok(ToolEffect::Delegation)
+    }
+
     async fn execute(&self, args: Value, ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let manager = self
             .manager
@@ -3399,6 +3406,7 @@ mod tests {
             model,
             base_system: RwLock::new("test".into()),
             sandbox: crate::SandboxConfig::new(directory),
+            effect_broker: crate::EffectBroker::default(),
             extensions: ExtensionHost::new(),
             max_turns: Some(4),
             reasoning: ygg_ai::ReasoningConfig::Off,

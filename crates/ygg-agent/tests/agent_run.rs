@@ -15,10 +15,10 @@ use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 use ygg_agent::{
-    Agent, AgentConfig, AgentEvent, CompletionPolicy, CoreTools, EntryId, EntryValue,
-    ExtensionHost, FinishReason, InputPart, OutputChannel, OutputStream, ReplaySafety, RunControl,
-    SandboxConfig, Session, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
-    UsageRecordKind, UserInput,
+    Agent, AgentConfig, AgentEvent, CompletionPolicy, CoreTools, EffectBroker, EffectPolicy,
+    EntryId, EntryValue, ExtensionHost, FinishReason, InputPart, OutputChannel, OutputStream,
+    ReplaySafety, RunControl, SandboxConfig, Session, Tool, ToolCallHook, ToolConcurrency,
+    ToolContext, ToolEffect, ToolError, ToolOutput, UsageRecordKind, UserInput,
 };
 use ygg_ai::{
     AiClient, AssistantMessage, AssistantPart, AudioFormat, AudioOutputOptions, AudioPayload,
@@ -793,6 +793,7 @@ fn build_agent_from_session(
         session,
         system: "You are a scripted test agent.".to_string(),
         sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns,
         reasoning: ReasoningConfig::Off,
@@ -853,6 +854,7 @@ fn build_agent_with_reasoning(
         session: Session::create(session_path).unwrap(),
         system: "You are a scripted test agent.".to_string(),
         sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns,
         reasoning,
@@ -883,6 +885,7 @@ fn build_responses_agent_from_session(
         session,
         system: system.to_owned(),
         sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns,
         reasoning: ReasoningConfig::Off,
@@ -1659,6 +1662,7 @@ async fn one_user_task_compacts_completed_tool_episodes_in_loop() {
         session: Session::create(&session_path).unwrap(),
         system: "test".into(),
         sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns: Some(10),
         reasoning: ReasoningConfig::Off,
@@ -1819,6 +1823,7 @@ async fn hard_cost_reservation_blocks_network_before_a_request_can_overshoot() {
         session: Session::create(sessions.path().join("cost-limit.jsonl")).unwrap(),
         system: "cost test".into(),
         sandbox: SandboxConfig::new(workspace.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns: Some(2),
         reasoning: ReasoningConfig::Off,
@@ -1884,6 +1889,7 @@ async fn provider_context_error_forces_one_compaction_before_retry() {
         session: Session::create(&session_path).unwrap(),
         system: "test".into(),
         sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns: Some(10),
         reasoning: ReasoningConfig::Off,
@@ -2010,6 +2016,7 @@ async fn repeated_context_rejection_advances_compaction_without_spending_turns()
         session: Session::create(&session_path).unwrap(),
         system: "test".into(),
         sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         // Exactly three tool responses plus the final response. Failed context
         // opens and summary calls must not consume this logical-turn budget.
@@ -2809,6 +2816,7 @@ async fn multiple_parallel_safe_tool_calls_start_together_and_coalesce_in_order(
 struct ParallelOverlapProbe {
     active: Arc<AtomicUsize>,
     maximum: Arc<AtomicUsize>,
+    effect: ToolEffect,
 }
 
 #[async_trait::async_trait]
@@ -2823,6 +2831,14 @@ impl Tool for ParallelOverlapProbe {
 
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::Parallel
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(self.effect)
     }
 
     async fn execute(
@@ -2862,6 +2878,7 @@ async fn parallel_safe_tool_implementations_really_overlap() {
     let probe = ParallelOverlapProbe {
         active: Arc::clone(&active),
         maximum: Arc::clone(&maximum),
+        effect: ToolEffect::Pure,
     };
     let mut agent = build_agent_with_extra_tool(
         &server.uri(),
@@ -2876,6 +2893,46 @@ async fn parallel_safe_tool_implementations_really_overlap() {
     assert!(matches!(output.reason, FinishReason::Completed));
     assert_eq!(maximum.load(Ordering::SeqCst), 2);
     assert_eq!(agent.session().entries().len(), 5);
+}
+
+#[tokio::test]
+async fn host_classification_overrides_a_parallel_tool_claim() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![
+                tool_turn(&[
+                    ("call_a", "parallel_overlap_probe", serde_json::json!({})),
+                    ("call_b", "parallel_overlap_probe", serde_json::json!({})),
+                ]),
+                text_turn("done"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let probe = ParallelOverlapProbe {
+        active: Arc::clone(&active),
+        maximum: Arc::clone(&maximum),
+        effect: ToolEffect::HostRead,
+    };
+    let mut agent = build_agent_with_extra_tool(
+        &server.uri(),
+        workspace.path(),
+        &sessions.path().join("host-effect-sequential.jsonl"),
+        Some(4),
+        probe,
+    );
+
+    let output = agent.complete("run both probes").await.unwrap();
+
+    assert!(matches!(output.reason, FinishReason::Completed));
+    assert_eq!(maximum.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -3336,6 +3393,7 @@ async fn duplicate_tool_registration_is_rejected() {
         session: Session::create(session_dir.path().join("s.jsonl")).unwrap(),
         system: String::new(),
         sandbox: SandboxConfig::new(workspace_dir.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns: Some(8),
         reasoning: ReasoningConfig::Off,
@@ -3458,6 +3516,14 @@ impl Tool for ProgressTool {
         }
     }
 
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(ToolEffect::Pure)
+    }
+
     async fn execute(
         &self,
         _args: serde_json::Value,
@@ -3487,6 +3553,14 @@ impl Tool for QueuedActivationTool {
             description: "Queues a semantic activation event".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(ToolEffect::HostMutation)
     }
 
     async fn execute(
@@ -3538,6 +3612,14 @@ impl Tool for LargeOutputTool {
         }
     }
 
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(ToolEffect::Pure)
+    }
+
     async fn execute(
         &self,
         _args: serde_json::Value,
@@ -3557,6 +3639,14 @@ impl Tool for RichErrorTool {
             description: "Returns a structured error with supported media".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(ToolEffect::Pure)
     }
 
     async fn execute(
@@ -3590,6 +3680,14 @@ impl Tool for RegisteredToolsProbe {
             description: "Records the final registered tool set".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(ToolEffect::Pure)
     }
 
     async fn execute(
@@ -3636,6 +3734,7 @@ async fn tool_context_sees_the_exact_post_filter_core_and_extension_set() {
         session: Session::create(session_dir.path().join("session.jsonl")).unwrap(),
         system: "test".into(),
         sandbox: SandboxConfig::new(&workspace),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns: Some(4),
         reasoning: ReasoningConfig::Off,
@@ -3660,6 +3759,7 @@ async fn tool_context_sees_the_exact_post_filter_core_and_extension_set() {
 
 struct CountingRecoveryTool {
     calls: Arc<AtomicUsize>,
+    effect: ToolEffect,
 }
 
 struct UnsafeRecoveryTool {
@@ -3674,6 +3774,14 @@ impl Tool for UnsafeRecoveryTool {
             description: "Represents an irreversible external mutation".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(ToolEffect::HostMutation)
     }
 
     async fn execute(
@@ -3694,6 +3802,14 @@ impl Tool for CountingRecoveryTool {
             description: "Counts crash-recovery executions".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         }
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(self.effect)
     }
 
     fn replay_safety(&self) -> ReplaySafety {
@@ -3734,6 +3850,7 @@ fn build_agent_with_extra_tool(
         session: Session::create(session_path).unwrap(),
         system: "You are a scripted test agent.".to_string(),
         sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns,
         reasoning: ReasoningConfig::Off,
@@ -3935,6 +4052,7 @@ async fn crash_recovery_preserves_the_live_tool_call_execution_cap() {
     extensions.load(&CoreTools);
     extensions.tool(CountingRecoveryTool {
         calls: Arc::clone(&calls),
+        effect: ToolEffect::Pure,
     });
     let mut sandbox = SandboxConfig::new(&workspace);
     sandbox.allow_edit = true;
@@ -3946,6 +4064,7 @@ async fn crash_recovery_preserves_the_live_tool_call_execution_cap() {
         session,
         system: "test".into(),
         sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns: Some(2),
         reasoning: ReasoningConfig::Off,
@@ -3985,6 +4104,70 @@ async fn crash_recovery_preserves_the_live_tool_call_execution_cap() {
             Some(ygg_ai::ToolResultPart::Text(text)) if text.contains("per-turn tool-call limit")
         ));
     }
+}
+
+#[tokio::test]
+async fn host_classification_overrides_a_safe_replay_claim() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(text_turn("reconciled")))
+        .mount(&server)
+        .await;
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let mut session =
+        Session::create(session_dir.path().join("classified-recovery.jsonl")).unwrap();
+    session
+        .append(EntryValue::Message(Message::User(UserMessage {
+            content: vec![UserPart::Text("prior request".into())],
+        })))
+        .unwrap();
+    session
+        .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+            content: vec![AssistantPart::ToolCall(ToolCall {
+                id: ygg_ai::ToolCallId("classified-recovery".into()),
+                name: "count_recovery".into(),
+                arguments_json: "{}".into(),
+            })],
+            model: ModelId("scripted".into()),
+            protocol: Protocol::AnthropicMessages,
+        })))
+        .unwrap();
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.load(&CoreTools);
+    extensions.tool(CountingRecoveryTool {
+        calls: Arc::clone(&calls),
+        effect: ToolEffect::HostRead,
+    });
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session,
+        system: "test".into(),
+        sandbox: SandboxConfig::new(&workspace),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
+        extensions,
+        max_turns: Some(2),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let output = agent.complete("continue").await.unwrap();
+
+    assert_eq!(output.text, "reconciled");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body
+        .to_string()
+        .contains("did not replay this host-classified effect"));
 }
 
 #[tokio::test]
@@ -4654,4 +4837,379 @@ async fn complete_surfaces_unsupported_reasoning_as_err() {
         matches!(result, Err(ygg_agent::AgentError::Ai(_))),
         "complete must return the ygg-ai error, got {result:?}"
     );
+}
+
+struct ClassifiedEffectProbe {
+    name: &'static str,
+    effect: ToolEffect,
+    executions: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for ClassifiedEffectProbe {
+    fn definition(&self) -> ygg_ai::ToolDef {
+        ygg_ai::ToolDef {
+            name: self.name.to_owned(),
+            description: "effect admission probe".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(self.effect)
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::new("probe executed"))
+    }
+}
+
+struct AdmissionHookProbe {
+    before: Arc<AtomicUsize>,
+    after: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ToolCallHook for AdmissionHookProbe {
+    async fn before_tool_call(
+        &self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+        _context: &ToolContext<'_>,
+    ) -> Result<(), ToolError> {
+        self.before.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn after_tool_call(
+        &self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+        _output: &str,
+        _is_error: bool,
+        _context: &ToolContext<'_>,
+    ) {
+        self.after.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn controlled_effects_are_denied_before_hooks_or_execution() {
+    let server = MockServer::start().await;
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let external_file = external_dir.path().join("host-secret.txt");
+    std::fs::write(&external_file, "host secret").unwrap();
+    let external_write = external_dir.path().join("must-not-exist.txt");
+    let bash_marker = workspace.join("bash-must-not-run.txt");
+
+    let calls = vec![
+        (
+            "call_host_read",
+            "read",
+            serde_json::json!({"path": external_file}),
+        ),
+        (
+            "call_network",
+            "read",
+            serde_json::json!({"path": "https://example.com/image.png"}),
+        ),
+        (
+            "call_search",
+            "search",
+            serde_json::json!({"query": "secret"}),
+        ),
+        (
+            "call_process",
+            "bash",
+            serde_json::json!({"command": format!("printf ran > {}", bash_marker.display())}),
+        ),
+        (
+            "call_host_mutation",
+            "write",
+            serde_json::json!({"path": external_write, "content": "forbidden"}),
+        ),
+        ("call_delegation", "delegation_probe", serde_json::json!({})),
+        ("call_extension", "extension_probe", serde_json::json!({})),
+        ("call_unknown", "unknown_probe", serde_json::json!({})),
+    ];
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![tool_turn(&calls), text_turn("denials observed")],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let executions = Arc::new(AtomicUsize::new(0));
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.load(&CoreTools);
+    for (name, effect) in [
+        ("delegation_probe", ToolEffect::Delegation),
+        ("extension_probe", ToolEffect::Extension),
+        ("unknown_probe", ToolEffect::Unknown),
+    ] {
+        extensions.tool(ClassifiedEffectProbe {
+            name,
+            effect,
+            executions: Arc::clone(&executions),
+        });
+    }
+    extensions.tool_call_hook(AdmissionHookProbe {
+        before: Arc::clone(&before),
+        after: Arc::clone(&after),
+    });
+    let mut sandbox = SandboxConfig::new(&workspace);
+    sandbox.allow_external_paths = true;
+    sandbox.allow_write = true;
+    sandbox.allow_process = true;
+    sandbox.allow_shell = true;
+    sandbox.allow_remote_read = true;
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session: Session::create(session_dir.path().join("session.jsonl")).unwrap(),
+        system: "effect admission test".into(),
+        sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::Controlled),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("try every denied effect").await.unwrap();
+    let mut events = Vec::new();
+    let mut approvals = 0usize;
+    while let Some(event) = run.next().await {
+        if let AgentEvent::ToolProgress {
+            id,
+            progress: ygg_agent::ToolProgress::Confirmation(request),
+            ..
+        } = &event
+        {
+            if id.0 == "call_process" {
+                approvals += 1;
+                request.clone().respond(true);
+            }
+        }
+        events.push(event);
+    }
+    drop(run);
+
+    let denied = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolFinished {
+                id,
+                result: Err(error),
+            } => Some((id.0.as_str(), error.message.as_str())),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let succeeded = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolFinished {
+                id,
+                result: Ok(_),
+            } => Some(id.0.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    for id in [
+        "call_host_read",
+        "call_network",
+        "call_search",
+        "call_host_mutation",
+        "call_delegation",
+        "call_extension",
+        "call_unknown",
+    ] {
+        assert!(denied.contains_key(id), "missing broker denial for {id}");
+    }
+    assert!(!denied.contains_key("call_process"));
+    assert!(succeeded.contains("call_process"));
+    assert!(denied["call_host_read"].contains("reading outside the workspace"));
+    assert!(denied["call_network"].contains("trusted egress broker"));
+    assert!(denied["call_search"].contains("OS or VM isolation backend"));
+    assert!(denied["call_host_mutation"].contains("mutating outside the workspace"));
+    assert!(denied["call_delegation"].contains("attenuated authority"));
+    assert!(denied["call_extension"].contains("executable extensions"));
+    assert!(denied["call_unknown"].contains("no host-owned effect classification"));
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(approvals, 1);
+    assert_eq!(before.load(Ordering::SeqCst), 1);
+    assert_eq!(after.load(Ordering::SeqCst), 1);
+    assert!(!external_write.exists());
+    assert!(bash_marker.exists());
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+}
+
+#[tokio::test]
+async fn unsafe_host_still_denies_unknown_tools_before_hooks() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![
+                tool_turn(&[("call_unknown", "unknown_probe", serde_json::json!({}))]),
+                text_turn("unknown denied"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.tool(ClassifiedEffectProbe {
+        name: "unknown_probe",
+        effect: ToolEffect::Unknown,
+        executions: Arc::clone(&executions),
+    });
+    extensions.tool_call_hook(AdmissionHookProbe {
+        before: Arc::clone(&before),
+        after: Arc::clone(&after),
+    });
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session: Session::create(session_dir.path().join("session.jsonl")).unwrap(),
+        system: "unknown effect test".into(),
+        sandbox: SandboxConfig::new(workspace_dir.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("call the unknown tool").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolFinished { result: Err(error), .. }
+            if error.message.contains("no host-owned effect classification")
+    )));
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(before.load(Ordering::SeqCst), 0);
+    assert_eq!(after.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn controlled_workspace_mutation_requires_and_consumes_exact_approval() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![
+                tool_turn(&[(
+                    "call_write",
+                    "write",
+                    serde_json::json!({"path": "approved.txt", "content": "approved content"}),
+                )]),
+                text_turn("write complete"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.load(&CoreTools);
+    extensions.tool_call_hook(AdmissionHookProbe {
+        before: Arc::clone(&before),
+        after: Arc::clone(&after),
+    });
+    let mut sandbox = SandboxConfig::new(&workspace);
+    sandbox.allow_write = true;
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session: Session::create(session_dir.path().join("session.jsonl")).unwrap(),
+        system: "approval test".into(),
+        sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::Controlled),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("write the approved file").await.unwrap();
+    let mut events = Vec::new();
+    let mut approvals = 0usize;
+    while let Some(event) = run.next().await {
+        if let AgentEvent::ToolProgress {
+            progress: ygg_agent::ToolProgress::Confirmation(request),
+            ..
+        } = &event
+        {
+            approvals += 1;
+            assert!(request.destructive);
+            assert!(!request.default);
+            let detail = request.detail.as_deref().expect("canonical intent detail");
+            assert!(detail.contains("workspace_mutation"));
+            assert!(detail.contains("approved.txt"));
+            assert!(detail.contains("approved content"));
+            request.clone().respond(true);
+        }
+        events.push(event);
+    }
+    drop(run);
+
+    assert_eq!(approvals, 1);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("approved.txt")).unwrap(),
+        "approved content"
+    );
+    assert_eq!(before.load(Ordering::SeqCst), 1);
+    assert_eq!(after.load(Ordering::SeqCst), 1);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ToolFinished { result: Ok(_), .. })));
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
 }

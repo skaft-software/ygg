@@ -3,11 +3,16 @@
 use serde::Deserialize;
 use ygg_ai::ToolDef;
 
+use crate::effect::ToolEffect;
 use crate::secure_fs::{PreparedMutation, SecureFileError};
 use crate::tool::{content_hash, Tool, ToolContext, ToolError, ToolOutput};
-use crate::tools::{format_unified_diff, parse_args, MAX_FILE_BYTES};
+use crate::tools::{
+    format_unified_creation_diff, format_unified_diff, parse_args, validate_effect_path,
+    validate_expected_hash, MAX_FILE_BYTES,
+};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteArgs {
     path: String,
     content: String,
@@ -56,16 +61,55 @@ impl Tool for WriteTool {
         }
     }
 
-    async fn execute(
+    fn effect(
         &self,
-        args: serde_json::Value,
+        arguments: &serde_json::Value,
         ctx: &ToolContext<'_>,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<ToolEffect, ToolError> {
         if !ctx.sandbox.allow_write {
             return Err(ToolError::new(
                 "error not_permitted\nwrite is disabled by sandbox policy (allow_write=false)",
             ));
         }
+        let arguments = arguments
+            .as_object()
+            .ok_or_else(|| ToolError::new("invalid arguments: expected an object"))?;
+        if arguments.len() > 3
+            || arguments
+                .keys()
+                .any(|key| !matches!(key.as_str(), "path" | "content" | "expected_hash"))
+        {
+            return Err(ToolError::new("invalid arguments: unknown property"));
+        }
+        let path = arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ToolError::new("invalid arguments: `path` must be a string"))?;
+        validate_effect_path(path, ctx.sandbox.allow_external_paths)?;
+        let content = arguments
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ToolError::new("invalid arguments: `content` must be a string"))?;
+        if content.len() > MAX_FILE_BYTES {
+            return Err(ToolError::new(format!(
+                "error too_large\n{path}: content is {} bytes (limit {MAX_FILE_BYTES})",
+                content.len()
+            )));
+        }
+        validate_expected_hash(arguments.get("expected_hash"))?;
+        Ok(if ctx.sandbox.allow_external_paths {
+            ToolEffect::HostMutation
+        } else {
+            ToolEffect::WorkspaceMutation
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        self.effect(&args, ctx)?;
         let args: WriteArgs = parse_args(args)?;
         let display_path = ctx.display_path(&args.path);
         let target = ctx.resolve_create(&args.path)?;
@@ -147,24 +191,7 @@ fn create_or_replace(
             format_unified_diff(path, &old_text, content, &old_text)
         }
     } else {
-        let preview_lines: Vec<&str> = content.lines().take(10).collect();
-        let total = content.lines().count();
-        let mut preview = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{total} @@\n");
-        for line in &preview_lines {
-            preview.push_str(&format!("+{line}\n"));
-        }
-        if total > preview_lines.len() {
-            preview.push_str(&format!(
-                "… {} more line{}\n",
-                total - preview_lines.len(),
-                if total - preview_lines.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            ));
-        }
-        preview
+        format_unified_creation_diff(path, content)
     };
 
     prepared
@@ -218,6 +245,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn effect_uses_ambient_path_authority_without_resolving_the_target() {
+        let mut fixture = fixture();
+        assert_eq!(
+            WriteTool
+                .effect(
+                    &json!({"path": "missing.txt", "content": "content"}),
+                    &fixture.ctx(),
+                )
+                .unwrap(),
+            ToolEffect::WorkspaceMutation
+        );
+        fixture.sandbox.allow_external_paths = true;
+        for path in ["missing.txt", "/definitely/not/a/real/ygg-effect-path"] {
+            assert_eq!(
+                WriteTool
+                    .effect(&json!({"path": path, "content": "content"}), &fixture.ctx(),)
+                    .unwrap(),
+                ToolEffect::HostMutation
+            );
+        }
+
+        fixture.sandbox.allow_write = false;
+        assert!(WriteTool
+            .effect(
+                &json!({"path": "missing.txt", "content": "content"}),
+                &fixture.ctx(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("allow_write=false"));
+    }
+
     #[tokio::test]
     async fn creates_file_and_parent_dirs() {
         let f = fixture();
@@ -266,7 +326,7 @@ mod tests {
         // Wrong hash: rejected, file preserved.
         let err = WriteTool
             .execute(
-                json!({"path": "a.txt", "content": "new", "expected_hash": "0000000000000000"}),
+                json!({"path": "a.txt", "content": "new", "expected_hash": "0".repeat(64)}),
                 &f.ctx(),
             )
             .await

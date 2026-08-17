@@ -26,6 +26,7 @@ use ygg_ai::{Media, ToolDef};
 
 use crate::artifact::{ArtifactId, ArtifactPublication, ArtifactSource, ArtifactStore};
 use crate::delegation::ExtensionDelegationService;
+use crate::effect::ToolEffect;
 use crate::events::AgentEvent;
 use crate::extension::{
     DynamicToolRegistration, EventObserver, Extension, ExtensionHost, ToolCallHook,
@@ -5034,6 +5035,14 @@ impl Tool for ProcessTool {
 
     fn replay_safety(&self) -> ReplaySafety {
         ReplaySafety::Unsafe
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(ToolEffect::Extension)
     }
 
     async fn execute(

@@ -102,9 +102,9 @@ Useful optional fields include:
 | `system_prompt` | Application-owned system context, up to 512 KiB. |
 | `prompt_display_text` | Exact caller-visible transcript text when `prompt` contains model-only composition. It may be empty, is capped at 256 KiB, never reaches the model, and must be sent only when `hello.features.prompt_display_text` is true. |
 | `history` | Seed `user`/`assistant` messages for a new session only; at most 256 messages and 2 MiB. |
-| `tools` | Explicit tool allowlist. `[]` disables tools; omission uses Ygg's default policy. |
-| `allow_file_mutation` | When false, edit, write, process, and shell authority is removed. |
-| `allow_external_paths` | Allows configured tool and media access outside the workspace. |
+| `tools` | Explicit tool registration allowlist. `[]` disables tools; omission uses Ygg's default registered surface. Registration does not bypass effect admission. |
+| `allow_file_mutation` | When false, edit, write, process, and shell authority is removed. True retains those capability gates but does not relax the Controlled effect policy. |
+| `allow_external_paths` | Allows caller-supplied session/media paths outside the workspace. Model-controlled file tools remain workspace-only under the fixed Controlled policy. |
 | `context_files` | Enables or disables normal trusted workspace context files. |
 | `reasoning` | Ygg reasoning level accepted by the selected model. |
 | `max_turns` | Run turn limit; omission defaults to 40. |
@@ -112,7 +112,7 @@ Useful optional fields include:
 | `media` | Ordered typed inputs: `{"type":"image","path":"…"}` or `{"type":"audio","path":"…"}`. At most 12 items: eight images and four audio clips. |
 | `image_paths` | Legacy image-only input. It cannot be combined with `media`. |
 | `prompt_paths`, `skill_paths` | Explicit resource roots. |
-| `extension_paths`, `enabled_extensions`, `trusted_extensions` | Executable-extension discovery and trust configuration. |
+| `extension_paths`, `enabled_extensions`, `trusted_extensions` | Executable-extension discovery and trust configuration. Protocol v1 reports discovery diagnostics but never starts extension processes. |
 | `offline` | Suppresses live model discovery during bootstrap, not provider traffic. |
 
 Prompts are capped at 512 KiB. Caller-visible display text is capped at 256
@@ -193,20 +193,22 @@ error `final_result`; malformed protocol requests use `protocol_error`.
 
 ## Headless safety and cancellation
 
-`ygg-host` never waits for interactive input. Core-tool confirmation requests
-are denied and typed input requests are cancelled. Executable-extension
-confirmations outside a frontend-controlled boundary are also denied.
+`ygg-host` never waits for interactive input. It always uses the Controlled
+effect policy: pure and workspace-read calls may run, while workspace mutation
+requires an approval that the headless host denies and ambient host/process,
+network, delegation, extension, and unknown effects fail closed. Core-tool
+confirmation requests are denied and typed input requests are cancelled.
+Controlled also prevents executable-extension process startup itself; protocol
+v1 exposes no unsafe-host effect opt-in.
 
 Protocol v1 has no in-band abort command. Launch each host in its own process
 group and terminate the entire group on timeout or caller cancellation. The
 `hello` flags `process_group_abort: true` and `in_band_abort: false` make that
 contract explicit. On Unix, `ygg-host` coordinates `HUP`, `INT`, `QUIT`, and
-`TERM`: it aborts the active run, gives registered shell and extension process
-groups a bounded cleanup window, force-kills survivors, and exits with the
-conventional `128 + signal` status. This registration also reaches trusted
-extensions and shell children that created process groups outside the host's
-own group. Normal completion and protocol shutdown ask executable extensions to
-exit gracefully before process teardown.
+`TERM`: it aborts the active run, gives registered shell process groups a
+bounded cleanup window, force-kills survivors, and exits with the conventional
+`128 + signal` status. This registration also reaches shell children that
+created process groups outside the host's own group.
 
 ## Resource and session ownership
 

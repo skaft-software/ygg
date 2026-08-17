@@ -3,11 +3,16 @@
 use serde::Deserialize;
 use ygg_ai::ToolDef;
 
+use crate::effect::ToolEffect;
 use crate::secure_fs::{PreparedMutation, SecureFileError};
 use crate::tool::{content_hash, Tool, ToolContext, ToolError, ToolOutput};
-use crate::tools::{clip_line, format_unified_diff, parse_args, MAX_FILE_BYTES};
+use crate::tools::{
+    clip_line, format_unified_diff, parse_args, validate_effect_path, validate_expected_hash,
+    MAX_FILE_BYTES,
+};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EditArgs {
     path: String,
     /// Exact existing text; must occur exactly once in the file. Non-empty.
@@ -66,16 +71,64 @@ impl Tool for EditTool {
         }
     }
 
-    async fn execute(
+    fn effect(
         &self,
-        args: serde_json::Value,
+        arguments: &serde_json::Value,
         ctx: &ToolContext<'_>,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<ToolEffect, ToolError> {
         if !ctx.sandbox.allow_edit {
             return Err(ToolError::new(
                 "error not_permitted\nedit is disabled by sandbox policy (allow_edit=false)",
             ));
         }
+        let arguments = arguments
+            .as_object()
+            .ok_or_else(|| ToolError::new("invalid arguments: expected an object"))?;
+        if arguments.len() > 4
+            || arguments
+                .keys()
+                .any(|key| !matches!(key.as_str(), "path" | "old" | "new" | "expected_hash"))
+        {
+            return Err(ToolError::new("invalid arguments: unknown property"));
+        }
+        let path = arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ToolError::new("invalid arguments: `path` must be a string"))?;
+        validate_effect_path(path, ctx.sandbox.allow_external_paths)?;
+        let old = arguments
+            .get("old")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ToolError::new("invalid arguments: `old` must be a string"))?;
+        if old.is_empty() {
+            return Err(ToolError::new("invalid arguments: `old` must be non-empty"));
+        }
+        let new = arguments
+            .get("new")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ToolError::new("invalid arguments: `new` must be a string"))?;
+        for (name, value) in [("old", old), ("new", new)] {
+            if value.len() > MAX_FILE_BYTES {
+                return Err(ToolError::new(format!(
+                    "invalid arguments: `{name}` is {} bytes (limit {MAX_FILE_BYTES})",
+                    value.len()
+                )));
+            }
+        }
+        validate_expected_hash(arguments.get("expected_hash"))?;
+        Ok(if ctx.sandbox.allow_external_paths {
+            ToolEffect::HostMutation
+        } else {
+            ToolEffect::WorkspaceMutation
+        })
+    }
+
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        self.effect(&args, ctx)?;
         let args: EditArgs = parse_args(args)?;
         let display_path = ctx.display_path(&args.path);
         let target = ctx.resolve_existing(&args.path)?;
@@ -242,6 +295,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn effect_uses_ambient_path_authority_without_resolving_the_target() {
+        let mut fixture = fixture();
+        assert_eq!(
+            EditTool
+                .effect(
+                    &json!({"path": "missing.txt", "old": "old", "new": "new"}),
+                    &fixture.ctx(),
+                )
+                .unwrap(),
+            ToolEffect::WorkspaceMutation
+        );
+        fixture.sandbox.allow_external_paths = true;
+        for path in ["missing.txt", "/definitely/not/a/real/ygg-effect-path"] {
+            assert_eq!(
+                EditTool
+                    .effect(
+                        &json!({"path": path, "old": "old", "new": "new"}),
+                        &fixture.ctx(),
+                    )
+                    .unwrap(),
+                ToolEffect::HostMutation
+            );
+        }
+
+        fixture.sandbox.allow_edit = false;
+        assert!(EditTool
+            .effect(
+                &json!({"path": "missing.txt", "old": "old", "new": "new"}),
+                &fixture.ctx(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("allow_edit=false"));
+    }
+
     #[tokio::test]
     async fn replace_exact_unique_match() {
         let f = fixture();
@@ -325,7 +414,7 @@ mod tests {
 
         let err = EditTool
             .execute(
-                json!({"path": "m.rs", "old": "let y = 2;", "new": "z", "expected_hash": "deadbeefdeadbeef"}),
+                json!({"path": "m.rs", "old": "let y = 2;", "new": "z", "expected_hash": "0".repeat(64)}),
                 &f.ctx(),
             )
             .await

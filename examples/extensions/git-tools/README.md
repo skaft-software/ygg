@@ -16,8 +16,10 @@ python3 -m pip install ./sdk/python
 ```
 
 Copy the directory to `.ygg/extensions/git-tools/`, then explicitly enable and
-trust `git-tools`. Git must be on `PATH`. The extension runs only read commands,
-sets `GIT_OPTIONAL_LOCKS=0`, never invokes a shell, and does not create commits.
+trust `git-tools` and opt into UnsafeHost (`--unsafe-host-effects`). Controlled
+discovers the manifest but never starts its process. Git must be on `PATH`. The
+extension runs only read commands, sets `GIT_OPTIONAL_LOCKS=0`, never invokes a
+shell, and does not create commits.
 
 Its declared `process = true` capability is visible consent metadata for
 launching `git status`; it is not an operating-system sandbox.

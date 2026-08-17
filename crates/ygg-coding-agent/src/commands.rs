@@ -476,6 +476,17 @@ fn path_access(allow_external_paths: bool) -> &'static str {
     }
 }
 
+fn effect_policy(policy: ygg_agent::EffectPolicy) -> &'static str {
+    match policy {
+        ygg_agent::EffectPolicy::Controlled => {
+            "controlled (workspace mutation/bash calls need approval; other ambient host effects denied)"
+        }
+        ygg_agent::EffectPolicy::UnsafeHost => {
+            "UNSAFE host (classified effects use ambient OS authority)"
+        }
+    }
+}
+
 fn session_activity_counts(session: &ygg_agent::Session) -> (usize, usize) {
     let mut model_turns = 0usize;
     let mut tool_calls = 0usize;
@@ -801,10 +812,10 @@ pub fn cache_text(session: &Session) -> String {
 
 /// Detailed status text suitable for the `/status` overlay.
 ///
-/// The security block states Ygg's model plainly: it is a trusted local agent,
-/// not an OS sandbox. Built-in tools default to the current user's local files;
-/// a host can opt into a workspace-only accidental-path guard, but neither mode
-/// confines spawned processes.
+/// The security block states Ygg's model plainly: it is a local agent, not an
+/// OS sandbox. Controlled forces built-in file access to the workspace;
+/// UnsafeHost may retain configured current-user path access. Neither mode
+/// confines an admitted child process.
 pub fn status_text(app: &App, queued: Option<&Reconfig>) -> String {
     let context_estimate = estimate_next_request_tokens(app, &[]);
     let cache_stats = analyze_session_cache_stats(app.agent.session());
@@ -864,7 +875,7 @@ pub(crate) fn status_text_with_metrics(
         "Provider       {}\nModel          {}\nDisplay model  {}\nAPI model      {}\nEndpoint       {}\nProtocol       {:?}\nTransport      {:?}\nReasoning      {}\nPricing        {}\nContext        ~{} / {} (estimated)\n\
          Workspace      {}\nSession        {} — {}\nSession cost   {} ({})\nCost guardrails limit {} · turn warning {}\nCache hit rate  {}\nModel turns    {}\nTool calls     {}\nSkills         {} active / {} discovered\n\n\
          Extensions     {}\n\n\
-         Security model: local agent with workspace trust gates\nBuilt-in file paths: {}\nFile edits: {}\nFile write: {}\n\
+         Security model: local agent with workspace trust gates\nEffect policy: {}\nBuilt-in file paths: {}\nFile edits: {}\nFile write: {}\n\
          Remote media reads: {}\nProcess execution: {}\nShell execution: {}\nOS isolation: none\n\
          Process privileges: current user\nRepository trust: {}\nQueued reconfiguration: {}",
         provider,
@@ -891,6 +902,7 @@ pub(crate) fn status_text_with_metrics(
         active_skills,
         discovered_skills,
         app.executable_extensions.status_summary(),
+        effect_policy(app.config.effect_policy),
         path_access(sandbox.allow_external_paths),
         gate(sandbox.allow_edit),
         gate(sandbox.allow_write),
@@ -1069,7 +1081,11 @@ mod tests {
             reasoning_mode: ygg_ai::ReasoningMode::Standard,
             reasoning_mode_explicit: false,
             cache_retention: ygg_ai::CacheRetention::Short,
-            sandbox: SandboxPolicy::default(),
+            effect_policy: ygg_agent::EffectPolicy::Controlled,
+            sandbox: SandboxPolicy {
+                allow_external_paths: false,
+                ..SandboxPolicy::default()
+            },
             theme: None,
             system_prompt: None,
             theme_paths: vec![],
@@ -1129,7 +1145,8 @@ mod tests {
             "Model turns",
             "Tool calls",
             "Security model: local agent with workspace trust gates",
-            "Built-in file paths: current-user paths (absolute, ~/ and relative)",
+            "Effect policy: controlled (workspace mutation/bash calls need approval; other ambient host effects denied)",
+            "Built-in file paths: workspace-only guard",
             "File edits: enabled",
             "Process execution: enabled",
             "Shell execution: enabled",

@@ -16,7 +16,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use ygg_agent::{Agent, AgentConfig, CoreTools, ExtensionHost, SandboxConfig, Session};
+//! use ygg_agent::{
+//!     Agent, AgentConfig, CoreTools, EffectBroker, ExtensionHost, SandboxConfig, Session,
+//! };
 //! use ygg_ai::{AiClient, CacheRetention, ModelCatalog, ModelId, ReasoningConfig, ReasoningMode};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,6 +32,7 @@
 //!     session: Session::create("session.jsonl")?,
 //!     system: "You are a coding agent.".into(),
 //!     sandbox: SandboxConfig::new("."),
+//!     effect_broker: EffectBroker::default(),
 //!     extensions,
 //!     max_turns: Some(40),
 //!     reasoning: ReasoningConfig::Off,
@@ -69,6 +72,7 @@ pub mod cache;
 pub mod compaction;
 pub mod context;
 pub mod delegation;
+pub mod effect;
 pub mod events;
 pub mod extension;
 pub mod extension_policy;
@@ -114,6 +118,11 @@ pub use context::{
 pub use delegation::{
     delegation_runtime_supports, DelegatedAgentStatus, DelegationConfig, DelegationError,
     DelegationLimits, DelegationMode, COLLABORATION_TOOL_NAMES,
+};
+pub use effect::{
+    EffectAuthorization, EffectBroker, EffectBrokerError, EffectGrantToken, EffectIntent,
+    EffectPolicy, EffectReceipt, ToolEffect, EFFECT_POLICY_VERSION, MAX_EFFECT_GRANTS,
+    MAX_EFFECT_GRANT_TTL, MAX_EFFECT_INTENT_BYTES,
 };
 pub use events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,

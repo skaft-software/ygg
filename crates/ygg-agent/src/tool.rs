@@ -10,6 +10,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use ygg_ai::{Media, ToolDef};
 
+use crate::effect::ToolEffect;
 use crate::sandbox::{self, SandboxConfig};
 /// Whether an unresolved call may be executed automatically after reopening a
 /// session whose previous process stopped before persisting its result.
@@ -53,6 +54,18 @@ pub trait Tool: Send + Sync {
     /// Returns the tool definition used for provider function-calling.
     /// The definition's `name` must be unique across all registered tools.
     fn definition(&self) -> ToolDef;
+
+    /// Deterministically classifies the authority required by one parsed call.
+    /// The default is deliberately unknown and is denied by every broker
+    /// policy. Implementations are trusted host code; model-provided metadata
+    /// must never select or lower this classification.
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(ToolEffect::Unknown)
+    }
 
     /// Declares whether crash recovery may repeat an unresolved call.
     /// Mutating and extension tools remain unsafe unless they explicitly prove
@@ -132,6 +145,13 @@ pub trait TypedTool: Send + Sync + 'static {
     /// Returns the basic tool descriptor.
     fn descriptor(&self) -> ToolDescriptor;
 
+    /// Declares the host-owned authority class for calls to this typed tool.
+    /// Tools whose class depends on arguments should implement [`Tool`]
+    /// directly so classification can inspect the canonical call.
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Unknown
+    }
+
     /// Executes the tool with the strongly-typed input.
     async fn execute(
         &self,
@@ -145,6 +165,11 @@ pub trait TypedTool: Send + Sync + 'static {
 pub trait ErasedTool: Send + Sync {
     /// Returns a reference to the cached ToolDefinition.
     fn definition(&self) -> &ToolDefinition;
+
+    /// Declares the host-owned authority class for this erased tool.
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Unknown
+    }
 
     /// Executes the tool with erased JSON values.
     async fn execute_erased(
@@ -191,6 +216,10 @@ struct ValidationIssue {
 impl<T: TypedTool + 'static> ErasedTool for TypedToolAdapter<T> {
     fn definition(&self) -> &ToolDefinition {
         &self.definition
+    }
+
+    fn effect(&self) -> ToolEffect {
+        self.inner.effect()
     }
 
     async fn execute_erased(
@@ -269,6 +298,14 @@ impl<E: ErasedTool> Tool for ErasedToolAdapter<E> {
             description: def.descriptor.description.clone(),
             parameters: def.input_schema.clone(),
         }
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        Ok(self.inner.effect())
     }
 
     async fn execute(
@@ -391,7 +428,7 @@ impl std::fmt::Debug for ToolConfirmation {
         formatter
             .debug_struct("ToolConfirmation")
             .field("prompt", &self.prompt)
-            .field("detail", &self.detail)
+            .field("detail", &self.detail.as_ref().map(|_| "[REDACTED]"))
             .field("destructive", &self.destructive)
             .field("default", &self.default)
             .finish_non_exhaustive()
@@ -1495,6 +1532,32 @@ mod tests {
             }
             _ => panic!("expected Output"),
         }
+    }
+
+    #[tokio::test]
+    async fn confirmation_detail_is_redacted_from_debug_output() {
+        let (tx, mut rx) = mpsc::channel::<ToolProgress>(PROGRESS_CHANNEL_CAPACITY);
+        let sink = ToolProgressSink::live(tx);
+        let waiter = tokio::spawn(async move {
+            sink.confirmation(
+                "Approve?".into(),
+                Some("exact-secret-effect-arguments".into()),
+                true,
+                false,
+            )
+            .await
+        });
+        let request = match rx.recv().await.expect("confirmation request") {
+            ToolProgress::Confirmation(request) => request,
+            _ => panic!("expected confirmation request"),
+        };
+
+        let debug = format!("{request:?}");
+        assert!(debug.contains("Approve?"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("exact-secret-effect-arguments"));
+        request.respond(false);
+        assert!(!waiter.await.unwrap());
     }
 
     #[tokio::test]

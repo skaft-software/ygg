@@ -121,7 +121,18 @@ than reproducing a hard-coded subset. When delegation is installed, bootstrap
 recomputes the reserve from `agent.system_prompt()` and
 `agent.registered_tool_definitions()` so its instructions and schemas count.
 A consuming rebuild drops the old Agent before reopening its session, so only
-one append handle owns a session file.
+one append handle owns a session file. Every Agent also receives a product-owned
+`EffectBroker`. Its default `Controlled` policy forces the effective sandbox to
+workspace-only file paths, allows pure/workspace-read effects, requires exact
+one-shot interactive approval for workspace mutation, and denies ambient host,
+process, network, delegation, and extension effects. Executable-extension
+startup is gated separately at the product boundary: even enabled, trusted
+extensions are discovered but never launched unless the resolved policy is
+`UnsafeHost` and the existing process/shell gates also permit startup.
+`unsafe_host_effects = true` / `--unsafe-host-effects` is the explicit
+OS-isolation opt-in; trusted project configuration may revoke but never grant
+it. Delegated children inherit the same broker policy through the root's
+delegation template.
 
 When the normalized effort is Ultra, bootstrap enables proactive V2 delegation
 under a private random team directory inside the session's `.delegation`
@@ -187,7 +198,7 @@ need Agent/session ownership.
 - `/name [name]`, `/export [path]` — name and safely export the current session.
 - `/prompt [name] [arguments]` — inspect or expand prompt templates.
 - `/skills search|load|reload|off ...` — inspect and explicitly activate skills.
-- `/extensions [reload]` — inspect or reload trusted executable extensions.
+- `/extensions [reload]` — inspect discovery or reload running UnsafeHost extensions.
 - `/help [command]` — show local command help and Ygg self-documentation.
 - `/status`, `/quit` — product status and lifecycle controls.
 

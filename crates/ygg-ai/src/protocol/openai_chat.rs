@@ -3,7 +3,7 @@
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{AiError, ConfigError, DecodeError};
+use crate::error::{AiError, ConfigError, DecodeError, ProviderError};
 use crate::protocol::sse::SseEvent;
 use crate::protocol::{
     cache_control, cache_session_id, prompt_cache_key, Base64Bytes, CacheControl, HttpRequestParts,
@@ -1187,6 +1187,52 @@ fn emit_event(
     Ok(())
 }
 
+fn provider_error_from_stream_event(data: &str) -> Option<ProviderError> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let error = value.get("error").and_then(|value| value.as_object())?;
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))?
+        .to_string();
+    let code = error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            error
+                .get("code")
+                .and_then(|value| value.as_u64().map(|value| value.to_string()))
+        })
+        .or_else(|| {
+            value
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        });
+    let kind = error
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let request_id = value
+        .get("request_id")
+        .or_else(|| error.get("request_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Some(ProviderError {
+        code,
+        kind,
+        message,
+        request_id,
+    })
+}
+
 /// Decodes a streaming SSE event from OpenAI Chat Completions, emitting StreamEvents.
 pub(crate) fn decode_stream_event(
     model: &crate::catalog::Model,
@@ -1197,6 +1243,10 @@ pub(crate) fn decode_stream_event(
     // intentionally withheld and would otherwise evade the canonical event
     // cap until EOF.
     builder.observe_provider_stream_event()?;
+
+    if let Some(provider_error) = provider_error_from_stream_event(&sse_event.data) {
+        return Err(AiError::Provider(provider_error));
+    }
 
     if sse_event.data == "[DONE]" {
         let mut events = Vec::new();
@@ -3599,6 +3649,22 @@ mod fixture_tests {
             call.arguments_value().unwrap(),
             serde_json::json!({"path": "src/main.rs"})
         );
+    }
+
+    #[test]
+    fn top_level_error_event_becomes_provider_error() {
+        let model = harness::model(Protocol::OpenAiChat, None);
+        let data = b"data: {\"error\": {\"message\": \"Quota exceeded\", \"type\": \"rate_limit_error\", \"code\": \"429\"}}\n\n";
+        let (_events, error) = harness::drive_raw(&model, decode_stream_event, data, 1);
+        let error = error.expect("error payload should fail this stream");
+        match error {
+            AiError::Provider(provider) => {
+                assert_eq!(provider.code.as_deref(), Some("429"));
+                assert_eq!(provider.kind.as_deref(), Some("rate_limit_error"));
+                assert_eq!(provider.message, "Quota exceeded");
+            }
+            other => panic!("expected provider error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1379,6 +1379,7 @@ mod tests {
             reasoning_mode: ygg_ai::ReasoningMode::Standard,
             reasoning_mode_explicit: false,
             cache_retention: ygg_ai::CacheRetention::Short,
+            effect_policy: ygg_agent::EffectPolicy::Controlled,
             sandbox: SandboxPolicy::default(),
             theme: None,
             system_prompt: None,

@@ -41,11 +41,13 @@ pub trait EventObserver: Send + Sync {
     }
 }
 
-/// Typed interception point around every successfully resolved tool call.
-/// Hooks receive semantic values only and cannot reach private agent state.
+/// Typed interception point around every broker-admitted, successfully resolved
+/// tool call. Hooks receive semantic values only and cannot reach private agent
+/// state. They are observers and secondary deny inputs, not the authority
+/// boundary: the deterministic effect broker always runs first.
 #[async_trait::async_trait]
 pub trait ToolCallHook: Send + Sync {
-    /// Runs after argument validation and before the tool receives control.
+    /// Runs after argument validation and effect admission, before the tool receives control.
     /// Returning an error denies the call and produces a normal tool error for
     /// the model; no side effect has occurred at this boundary.
     async fn before_tool_call(
@@ -564,6 +566,7 @@ impl ExtensionHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effect::ToolEffect;
     use crate::tool::{ToolContext, ToolError, ToolOutput};
     use ygg_ai::ToolDef;
 
@@ -577,6 +580,14 @@ mod tests {
                 description: String::new(),
                 parameters: serde_json::json!({"type": "object"}),
             }
+        }
+
+        fn effect(
+            &self,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext<'_>,
+        ) -> Result<ToolEffect, ToolError> {
+            Ok(ToolEffect::Pure)
         }
 
         async fn execute(

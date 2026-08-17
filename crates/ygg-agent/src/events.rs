@@ -98,7 +98,9 @@ pub enum AgentEvent {
         result: Result<CompactionInfo, String>,
     },
 
-    /// A tool call was emitted by the model and its execution begins now.
+    /// A tool call was emitted by the model and host-side admission begins now.
+    /// A matching [`ToolFinished`](Self::ToolFinished) is emitted even when
+    /// argument validation or the effect broker denies execution.
     ToolStarted {
         /// The provider-assigned tool call ID.
         id: ToolCallId,

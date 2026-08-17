@@ -550,14 +550,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
         .permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(&script, permissions).expect("extension script permissions");
-    let args = vec![
-        "--extension-dir".to_owned(),
-        extension_root.display().to_string(),
-        "--enable-extension".to_owned(),
-        "shutdown-probe".to_owned(),
-        "--trust-extension".to_owned(),
-        "shutdown-probe".to_owned(),
-    ];
+    let args = extension_args(&extension_root, "shutdown-probe");
     let started_marker = root.join("workspace/extension-started.marker");
     let marker = root.join("workspace/extension-shutdown.marker");
     (args, started_marker, marker)
@@ -647,6 +640,7 @@ done
 
 fn extension_args(extension_root: &Path, name: &str) -> Vec<String> {
     vec![
+        "--unsafe-host-effects".to_owned(),
         "--extension-dir".to_owned(),
         extension_root.display().to_string(),
         "--enable-extension".to_owned(),

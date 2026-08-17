@@ -30,6 +30,7 @@ use crate::delegation::{
     enable_root_delegation, DelegationBinding, DelegationConfig, DelegationError,
     DelegationRuntimeSettings, DelegationTemplate,
 };
+use crate::effect::{EffectBroker, EffectIntent, EffectReservation, ToolEffect};
 use crate::events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
     OutputChannel, QueueDeliveryMode,
@@ -209,6 +210,8 @@ pub struct AgentConfig {
     pub system: String,
     /// Capability gates and limits for tool execution.
     pub sandbox: SandboxConfig,
+    /// Mandatory deterministic broker for every model-requested tool effect.
+    pub effect_broker: EffectBroker,
     /// Registered tools and event observers. Register [`CoreTools`](crate::tools::CoreTools)
     /// here for the built-in `read`/`edit`/`write`/`bash`/`search` tools.
     pub extensions: ExtensionHost,
@@ -280,6 +283,7 @@ pub struct Agent {
     session: Session,
     extensions: ExtensionHost,
     sandbox: SandboxConfig,
+    effect_broker: EffectBroker,
     system: String,
     max_turns: Option<u64>,
     reasoning: ReasoningConfig,
@@ -599,9 +603,48 @@ struct CompletedToolExecution {
     cancellation_won: bool,
 }
 
+fn effect_is_repeatable_observation(effect: ToolEffect) -> bool {
+    matches!(effect, ToolEffect::Pure | ToolEffect::WorkspaceRead)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reserve_tool_effect(
+    broker: &EffectBroker,
+    tool: &dyn Tool,
+    name: &str,
+    arguments: &serde_json::Value,
+    context: &ToolContext<'_>,
+    principal: &str,
+    run_id: &str,
+    generation: u64,
+    request_id: &ygg_ai::ToolCallId,
+    interactive: bool,
+) -> Result<(EffectIntent, EffectReservation), ToolError> {
+    let effect = tool.effect(arguments, context)?;
+    let intent = EffectIntent::new(
+        principal,
+        run_id,
+        generation,
+        request_id.0.clone(),
+        name,
+        effect,
+        arguments,
+    )
+    .map_err(|error| ToolError::new(error.to_string()))?;
+    let reservation = broker
+        .reserve(&intent, interactive.then_some(&context.progress))
+        .await
+        .map_err(|error| ToolError::new(error.to_string()))?;
+    Ok((intent, reservation))
+}
+
 async fn execute_parallel_tool_call(
     tool: Arc<dyn Tool>,
     hooks: &[Arc<dyn ToolCallHook>],
+    broker: &EffectBroker,
+    run_id: &str,
+    generation: u64,
+    request_id: &ygg_ai::ToolCallId,
     name: &str,
     arguments: serde_json::Value,
     sandbox: &SandboxConfig,
@@ -624,40 +667,94 @@ async fn execute_parallel_tool_call(
         cancellation: cancellation.clone(),
     };
 
-    let mut hook_denial = None;
-    for hook in hooks {
-        if let Err(error) = hook.before_tool_call(name, &arguments, &tool_ctx).await {
-            hook_denial = Some(error);
-            break;
+    let admission = reserve_tool_effect(
+        broker,
+        tool.as_ref(),
+        name,
+        &arguments,
+        &tool_ctx,
+        resource_owner,
+        run_id,
+        generation,
+        request_id,
+        false,
+    )
+    .await;
+    let mut reservation = None;
+    let mut hook_denial = match admission {
+        Ok(admission) => {
+            reservation = Some(admission);
+            None
+        }
+        Err(error) => Some(error),
+    };
+    if reservation.is_some() {
+        for hook in hooks {
+            if let Err(error) = hook.before_tool_call(name, &arguments, &tool_ctx).await {
+                hook_denial = Some(error);
+                break;
+            }
         }
     }
 
+    let mut committed = false;
     let mut cancellation_won = false;
     let result = if let Some(error) = hook_denial {
-        Err(error)
+        if cancellation.is_cancelled() {
+            cancellation_won = true;
+            Err(cancelled_tool_error())
+        } else {
+            Err(error)
+        }
     } else if cancellation.is_cancelled() {
         cancellation_won = true;
         Err(cancelled_tool_error())
     } else {
-        let execute = tool.execute(arguments.clone(), &tool_ctx);
-        tokio::pin!(execute);
-        tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                cancellation_won = true;
-                Err(cancelled_tool_error())
+        // Preserve the original arguments for after-call hooks, but complete
+        // this potentially large allocation before consuming admission.
+        let execute_arguments = arguments.clone();
+        if cancellation.is_cancelled() {
+            cancellation_won = true;
+            return CompletedToolExecution {
+                result: Err(cancelled_tool_error()),
+                progress_rx,
+                progress_sink,
+                cancellation_won,
+            };
+        }
+        let (intent, effect_reservation) = reservation
+            .take()
+            .expect("successful admission retains its exact reservation");
+        match effect_reservation.commit(&intent) {
+            Err(error) => Err(ToolError::new(error.to_string())),
+            Ok(_receipt) => {
+                committed = true;
+                let execute = tool.execute(execute_arguments, &tool_ctx);
+                tokio::pin!(execute);
+                let execution_result = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(cancelled_tool_error()),
+                    result = &mut execute => result,
+                };
+                if cancellation.is_cancelled() {
+                    cancellation_won = true;
+                    Err(cancelled_tool_error())
+                } else {
+                    execution_result
+                }
             }
-            result = &mut execute => result,
         }
     };
 
-    let (output, is_error) = match &result {
-        Ok(output) => (output.text.as_str(), output.is_error()),
-        Err(error) => (error.message.as_str(), true),
-    };
-    for hook in hooks {
-        hook.after_tool_call(name, &arguments, output, is_error, &tool_ctx)
-            .await;
+    if committed {
+        let (output, is_error) = match &result {
+            Ok(output) => (output.text.as_str(), output.is_error()),
+            Err(error) => (error.message.as_str(), true),
+        };
+        for hook in hooks {
+            hook.after_tool_call(name, &arguments, output, is_error, &tool_ctx)
+                .await;
+        }
     }
 
     CompletedToolExecution {
@@ -1426,6 +1523,9 @@ fn provider_failure(error: AiError, retries: usize) -> AgentError {
 async fn execute_recovery_call(
     tool: Arc<dyn Tool>,
     hooks: &[Arc<dyn ToolCallHook>],
+    broker: &EffectBroker,
+    generation: u64,
+    run_id: &str,
     call: &ToolCall,
     sandbox: &SandboxConfig,
     tool_scope: &str,
@@ -1457,12 +1557,46 @@ async fn execute_recovery_call(
                 progress: progress_sink,
                 cancellation: CancellationToken::default(),
             };
+            let effect = match tool.effect(&args, &context) {
+                Ok(effect) => effect,
+                Err(error) => return Ok(Err(error)),
+            };
+            if !effect_is_repeatable_observation(effect) {
+                return Ok(Err(ToolError::new(format!(
+                    "indeterminate after restart: `{}` may have completed before its result was persisted; Ygg did not replay this host-classified effect. Inspect external state and retry explicitly if needed",
+                    call.name
+                ))));
+            }
+            // Bind admission to the same exact classification used by the
+            // replay gate. A second classification could otherwise authorize
+            // an effect different from the one that passed replay admission.
+            let intent = match EffectIntent::new(
+                resource_owner,
+                run_id,
+                generation,
+                call.id.0.clone(),
+                &call.name,
+                effect,
+                &args,
+            ) {
+                Ok(intent) => intent,
+                Err(error) => return Ok(Err(ToolError::new(error.to_string()))),
+            };
+            let effect_reservation = match broker.reserve(&intent, None).await {
+                Ok(reservation) => reservation,
+                Err(error) => return Ok(Err(ToolError::new(error.to_string()))),
+            };
+            // Retain hook arguments before the execution admission point so no
+            // payload-sized allocation separates commit from dispatch.
+            let hook_arguments = args.clone();
             for hook in hooks {
                 if let Err(error) = hook.before_tool_call(&call.name, &args, &context).await {
                     return Ok(Err(error));
                 }
             }
-            let hook_arguments = args.clone();
+            if let Err(error) = effect_reservation.commit(&intent) {
+                return Ok(Err(ToolError::new(error.to_string())));
+            }
             let execute = tool.execute(args, &context);
             tokio::pin!(execute);
             let result = loop {
@@ -2780,6 +2914,7 @@ impl Agent {
             session: config.session,
             extensions: config.extensions,
             sandbox: config.sandbox,
+            effect_broker: config.effect_broker,
             system: config.system,
             max_turns: config.max_turns,
             reasoning: config.reasoning,
@@ -2888,6 +3023,7 @@ impl Agent {
             model: self.model.clone(),
             base_system: std::sync::RwLock::new(self.system.clone()),
             sandbox: self.sandbox.clone(),
+            effect_broker: self.effect_broker.clone(),
             extensions: self.extensions.clone(),
             max_turns: self.max_turns,
             reasoning: self.reasoning.clone(),
@@ -3392,7 +3528,7 @@ impl Agent {
             return Ok(());
         }
 
-        let (_, tools) = self.extensions.tool_snapshot();
+        let (tool_generation, tools) = self.extensions.tool_snapshot();
         let mut tool_map: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         for tool in &tools {
             let definition = tool.definition();
@@ -3403,6 +3539,8 @@ impl Agent {
         let sandbox = self.sandbox.clone();
         let tool_scope = self.tool_scope.clone();
         let resource_owner = self.resource_owner.clone();
+        let recovery_run_id = format!("{tool_scope}:recovery");
+        let effect_broker = self.effect_broker.clone();
         let tool_call_hooks = self.extensions.tool_call_hooks.clone();
         for (call_index, call) in unresolved {
             let result = if call_index >= MAX_TOOL_CALLS_PER_TURN {
@@ -3416,6 +3554,9 @@ impl Agent {
                         execute_recovery_call(
                             Arc::clone(tool),
                             &tool_call_hooks,
+                            &effect_broker,
+                            tool_generation,
+                            &recovery_run_id,
                             &call,
                             &sandbox,
                             &tool_scope,
@@ -3531,6 +3672,8 @@ impl Agent {
         let session_id = self.session_id.clone();
         let resource_owner = self.resource_owner.clone();
         let tool_scope = self.tool_scope.clone();
+        let effect_broker = self.effect_broker.clone();
+        let effect_run_id = format!("run:{}", first_entry.0);
         let completion_policy = self.completion_policy;
         let output_modalities = self.output_modalities.clone();
         let max_output_tokens = self.max_output_tokens;
@@ -4413,26 +4556,42 @@ impl Agent {
                     break 'run FinishReason::Completed;
                 }
 
-                // A model can emit several independent reads/searches in one
-                // turn. Start every explicitly parallel-safe call before
-                // awaiting any of them, but retain model order for persistence
-                // and ToolFinished events. Any mutation, process, unknown tool,
-                // invalid argument payload, or excess call keeps the whole turn
-                // on the established sequential path.
+                // A model can emit several independent reads in one turn.
+                // Start every explicitly parallel-safe call before awaiting
+                // any of them, but retain model order for persistence and
+                // ToolFinished events. The static tool promise is intersected
+                // with the host-owned classification for the exact arguments:
+                // network, host, process, mutation, and unknown effects always
+                // remain on the sequential path.
+                let parallel_active_skills = session
+                    .head()
+                    .and_then(|head| session.resolve_active_skills(&head).ok())
+                    .map(|state| state.active_skills)
+                    .unwrap_or_default();
+                let classification_context = ToolContext {
+                    workspace: &sandbox.workspace,
+                    sandbox: &sandbox,
+                    execution_scope: &tool_scope,
+                    resource_owner: &resource_owner,
+                    active_skills: &parallel_active_skills,
+                    registered_tools: &registered_tools,
+                    progress: ToolProgressSink::null(),
+                    cancellation: CancellationToken::default(),
+                };
                 let parallel_batch = calls.len() > 1
                     && calls.len() <= MAX_TOOL_CALLS_PER_TURN
                     && calls.iter().all(|call| {
-                        call.arguments_value().is_ok()
-                            && tool_map.get(&call.name).is_some_and(|tool| {
+                        call.arguments_value().is_ok_and(|arguments| {
+                            tool_map.get(&call.name).is_some_and(|tool| {
                                 tool.concurrency() == ToolConcurrency::Parallel
+                                    && tool
+                                        .effect(&arguments, &classification_context)
+                                        .is_ok_and(effect_is_repeatable_observation)
                             })
+                        })
                     });
                 let mut parallel_results = if parallel_batch {
-                    let active_skills = session
-                        .head()
-                        .and_then(|head| session.resolve_active_skills(&head).ok())
-                        .map(|state| state.active_skills)
-                        .unwrap_or_default();
+                    let active_skills = parallel_active_skills;
                     for call in &calls {
                         let parsed = call
                             .arguments_value()
@@ -4455,6 +4614,10 @@ impl Agent {
                                     .expect("parallel batch validates registered tools"),
                             ),
                             &tool_call_hooks,
+                            &effect_broker,
+                            &effect_run_id,
+                            tool_revision,
+                            &call.id,
                             &call.name,
                             call.arguments_value()
                                 .expect("parallel batch validates arguments before execution"),
@@ -4558,31 +4721,47 @@ impl Agent {
                                     cancellation: abort.cancellation.clone(),
                                 };
                                 let hook_arguments = args.clone();
-                                let mut hook_denial = None;
-                                for hook in &tool_call_hooks {
-                                    if let Err(error) = hook
-                                        .before_tool_call(&call.name, &hook_arguments, &tool_ctx)
-                                        .await
-                                    {
-                                        hook_denial = Some(error);
-                                        break;
+                                let effect_committed = Arc::new(AtomicBool::new(false));
+                                let committed_marker = Arc::clone(&effect_committed);
+                                let operation = async {
+                                    let (intent, effect_reservation) = reserve_tool_effect(
+                                        &effect_broker,
+                                        tool.as_ref(),
+                                        &call.name,
+                                        &args,
+                                        &tool_ctx,
+                                        &resource_owner,
+                                        &effect_run_id,
+                                        tool_revision,
+                                        &call.id,
+                                        true,
+                                    )
+                                    .await?;
+                                    for hook in &tool_call_hooks {
+                                        hook.before_tool_call(
+                                            &call.name,
+                                            &hook_arguments,
+                                            &tool_ctx,
+                                        )
+                                        .await?;
                                     }
-                                }
-                                if let Some(error) = hook_denial {
-                                    Err(error)
-                                } else if abort.is_set() {
-                                    cancellation_won = true;
-                                    Err(cancelled_tool_error())
-                                } else {
-                                let execute = tool.execute(args, &tool_ctx);
-                                tokio::pin!(execute);
+                                    if tool_ctx.cancellation.is_cancelled() {
+                                        return Err(cancelled_tool_error());
+                                    }
+                                    effect_reservation
+                                        .commit(&intent)
+                                        .map_err(|error| ToolError::new(error.to_string()))?;
+                                    committed_marker.store(true, Ordering::Release);
+                                    tool.execute(args, &tool_ctx).await
+                                };
+                                tokio::pin!(operation);
                                 // Cancellation drops the pinned future, which
                                 // kills any child process tree it spawned.
                                 let outcome = loop {
                                     tokio::select! {
                                         biased;
                                         _ = abort.wait() => break None,
-                                        r = &mut execute => break Some(r),
+                                        r = &mut operation => break Some(r),
                                         c = control_rx.recv(), if control_open => match c {
                                             Some(Control::Steer(input)) => pending_steer.push(input),
                                             Some(Control::FollowUp(input)) => followups.push_back(input),
@@ -4596,7 +4775,7 @@ impl Agent {
                                         },
                                         progress = progress_rx.recv() => {
                                             if let Some(p) = progress {
-                                                // `execute` can enqueue progress and synchronously
+                                                // `operation` can enqueue progress and synchronously
                                                 // trigger cancellation during the same select poll,
                                                 // after the biased abort branch was already checked.
                                                 // Recheck before accepting semantic state.
@@ -4632,28 +4811,33 @@ impl Agent {
                                     }
                                 };
                                 let result = match outcome {
-                                    Some(r) => r,
+                                    Some(_) if abort.is_set() => {
+                                        cancellation_won = true;
+                                        Err(cancelled_tool_error())
+                                    }
+                                    Some(result) => result,
                                     None => {
                                         cancellation_won = true;
                                         Err(cancelled_tool_error())
                                     }
                                 };
-                                let (output, is_error) = match &result {
-                                    Ok(output) => (output.text.as_str(), output.is_error()),
-                                    Err(error) => (error.message.as_str(), true),
-                                };
-                                for hook in &tool_call_hooks {
-                                    hook.after_tool_call(
-                                        &call.name,
-                                        &hook_arguments,
-                                        output,
-                                        is_error,
-                                        &tool_ctx,
-                                    )
-                                    .await;
+                                if effect_committed.load(Ordering::Acquire) {
+                                    let (output, is_error) = match &result {
+                                        Ok(output) => (output.text.as_str(), output.is_error()),
+                                        Err(error) => (error.message.as_str(), true),
+                                    };
+                                    for hook in &tool_call_hooks {
+                                        hook.after_tool_call(
+                                            &call.name,
+                                            &hook_arguments,
+                                            output,
+                                            is_error,
+                                            &tool_ctx,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 result
-                                }
                             }
                         }
                         };
@@ -5645,6 +5829,7 @@ mod tests {
             session,
             system: "system".into(),
             sandbox: SandboxConfig::new(directory.path()),
+            effect_broker: EffectBroker::default(),
             extensions: ExtensionHost::new(),
             max_turns: Some(1),
             reasoning: ReasoningConfig::Off,

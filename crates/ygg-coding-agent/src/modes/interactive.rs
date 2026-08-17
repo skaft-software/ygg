@@ -3637,7 +3637,9 @@ mod tests {
     ) -> (wiremock::MockServer, tempfile::TempDir, ygg_agent::Agent) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use ygg_agent::{Agent, AgentConfig, CoreTools, ExtensionHost, SandboxConfig, Session};
+        use ygg_agent::{
+            Agent, AgentConfig, CoreTools, EffectBroker, ExtensionHost, SandboxConfig, Session,
+        };
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3664,6 +3666,7 @@ mod tests {
             session: Session::create(&session_path).unwrap(),
             system: "test".into(),
             sandbox,
+            effect_broker: EffectBroker::default(),
             extensions,
             max_turns: Some(4),
             reasoning: ReasoningConfig::Off,

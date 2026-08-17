@@ -22,12 +22,14 @@ deterministic.
 Workspace resources are ignored until `--workspace-trusted` is present.
 Explicit paths are an intentional user choice for that invocation. Executable
 extensions add a second boundary: discovery and workspace trust still do not
-launch code. The manifest name must be both enabled and independently trusted.
-A project config cannot grant itself executable trust. Bare persistent trust
-names apply only to the global extension directory; project and explicit
-extensions require an exact absolute `name@.../extension.toml` grant or a
-one-invocation `--trust-extension name` decision. The extension directory name
-must match the manifest name.
+launch code. Process startup requires the manifest name to be both enabled and
+independently trusted, plus the explicit UnsafeHost authority opt-in. Controlled
+reports discovery without starting extension processes. A project config cannot
+grant itself executable trust or UnsafeHost. Bare persistent trust names apply
+only to the global extension directory; project and explicit extensions require
+an exact absolute `name@.../extension.toml` grant or a one-invocation
+`--trust-extension name` decision. The extension directory name must match the
+manifest name.
 
 If Ygg cannot resolve an absolute user home directory, global configuration and
 global resources are disabled with a diagnostic. It never falls back to the
@@ -64,6 +66,7 @@ so an in-flight prompt never observes half of a reload.
 
 - `/theme reload` reloads the selected theme safely.
 - `/skills reload` refreshes the shared prompt/skill resource boundary.
-- `/extensions reload` handshakes replacement processes before swapping them.
+- `/extensions reload` handshakes replacement processes only when UnsafeHost and
+  the independent process gate permit startup.
 - `/reload` performs full product resource discovery and rebuilds the active
   customization boundary.

@@ -18,10 +18,12 @@ python3 -m pip install ./sdk/python
 ```
 
 Copy the directory to `.ygg/extensions/local-model-workflow/`, explicitly
-enable and trust it, then restart Ygg or use `/extensions reload`. The existing
-frontend integration exposes its typed hook, context, status, and event
-contributions. It reads no files, launches no subprocesses, accesses no
-network, and uses no terminal escape sequences.
+enable and trust it, and opt into UnsafeHost (`--unsafe-host-effects`) before
+restarting Ygg or using `/extensions reload`. Controlled discovers the manifest
+but never starts its process. The existing frontend integration exposes its
+typed hook, context, status, and event contributions. The extension itself
+reads no files, launches no child subprocesses, accesses no network, and uses no
+terminal escape sequences.
 
 The workflow context is intentionally short for small context windows. It is
 deterministic for the same host state and exposes its label and placement so a

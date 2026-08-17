@@ -63,6 +63,7 @@ const CONFIRMATION_DENIAL_QUEUE_CAPACITY: usize = 64;
 const CONFIRMATION_DENIAL_CONCURRENCY: usize = 8;
 const INPUT_CANCELLATION_QUEUE_CAPACITY: usize = 64;
 const INPUT_CANCELLATION_CONCURRENCY: usize = 8;
+const CONTROLLED_EXTENSION_START_DIAGNOSTIC: &str = "executable extensions were not started: the Controlled effect policy denies extension process startup; opt into UnsafeHost (for example with --unsafe-host-effects) only inside OS-level isolation";
 static NEXT_EXTENSION_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(serde::Serialize)]
@@ -735,15 +736,18 @@ impl ExecutableExtensions {
             }
         }
         let host_state = host_state(session, model, reasoning, sessions);
-        // Executable extensions are child processes, not merely optional
-        // tools. Do not start even trusted extensions when process authority
-        // is disabled; discovery remains available for actionable diagnostics.
-        if !config.sandbox.process_execution_allowed()
-            && descriptors.iter().any(|descriptor| {
-                descriptor.activation.enabled
-                    && descriptor.activation.trust == ExtensionTrust::Trusted
-            })
-        {
+        let has_enabled_trusted = descriptors.iter().any(|descriptor| {
+            descriptor.activation.enabled && descriptor.activation.trust == ExtensionTrust::Trusted
+        });
+        // Executable extensions are ambient-authority child processes, not
+        // merely optional tools. Controlled must prevent startup itself; later
+        // broker checks cannot contain an already-running process.
+        if config.effect_policy != ygg_agent::EffectPolicy::UnsafeHost && has_enabled_trusted {
+            diagnostics.push(CONTROLLED_EXTENSION_START_DIAGNOSTIC.to_owned());
+        }
+        // Keep the independent product process gate as an additional
+        // prerequisite. Discovery remains available for actionable diagnostics.
+        if !config.sandbox.process_execution_allowed() && has_enabled_trusted {
             diagnostics.push(
                 "executable extensions were not started: process execution is disabled by --no-process/--no-shell".to_owned(),
             );
@@ -751,7 +755,8 @@ impl ExecutableExtensions {
         let startable = descriptors
             .iter()
             .filter(|descriptor| {
-                config.sandbox.process_execution_allowed()
+                config.effect_policy == ygg_agent::EffectPolicy::UnsafeHost
+                    && config.sandbox.process_execution_allowed()
                     && descriptor.activation.enabled
                     && descriptor.activation.trust == ExtensionTrust::Trusted
             })
@@ -2416,6 +2421,119 @@ command = "does-not-exist"
     }
 
     #[cfg(unix)]
+    fn executable_extension_config(workspace: &Path, extension_root: &Path, name: &str) -> Config {
+        Config {
+            workspace: workspace.to_owned(),
+            invocation_cwd: workspace.to_owned(),
+            model: Some(ygg_ai::ModelId("gpt-4o-mini".into())),
+            model_explicit: false,
+            reasoning: ReasoningConfig::Off,
+            reasoning_explicit: false,
+            reasoning_mode: ygg_ai::ReasoningMode::Standard,
+            reasoning_mode_explicit: false,
+            cache_retention: ygg_ai::CacheRetention::Short,
+            effect_policy: ygg_agent::EffectPolicy::Controlled,
+            sandbox: crate::config::SandboxPolicy {
+                allow_external_paths: false,
+                ..crate::config::SandboxPolicy::default()
+            },
+            theme: None,
+            system_prompt: None,
+            theme_paths: vec![],
+            color: crate::config::ColorMode::Auto,
+            mouse: crate::config::MouseMode::Auto,
+            plain: false,
+            session_dir: workspace.join("sessions"),
+            compaction: crate::config::CompactionPolicy::default(),
+            max_cost_microdollars: None,
+            cost_warning_microdollars: None,
+            show_turn_cost: false,
+            max_turns: Some(1),
+            show_reasoning_in_print: false,
+            initial_prompt: None,
+            prompt_template: None,
+            debug_prompt: false,
+            prompt_paths: vec![],
+            mode: crate::config::Mode::Interactive,
+            resume: crate::config::ResumeSelector::New,
+            skill_paths: vec![],
+            extension_paths: vec![extension_root.to_owned()],
+            enabled_extensions: vec![name.to_owned()],
+            trusted_extensions: vec![],
+            invocation_trusted_extensions: vec![name.to_owned()],
+            tools: crate::config::ToolPolicy::default(),
+            context_files: false,
+            offline: true,
+            workspace_trusted: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn controlled_policy_never_launches_enabled_trusted_executable_extension() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let extension_root = temp.path().join("extensions");
+        let extension_dir = extension_root.join("controlled-launch-probe");
+        std::fs::create_dir_all(&extension_dir).unwrap();
+        std::fs::write(
+            extension_dir.join(EXTENSION_MANIFEST_FILENAME),
+            r#"name = "controlled-launch-probe"
+version = "0.1.0"
+api_version = "0.1"
+
+[entrypoint]
+command = "launch-probe.sh"
+"#,
+        )
+        .unwrap();
+        let executable = extension_dir.join("launch-probe.sh");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf launched > \"$YGG_WORKSPACE/controlled-extension-launched\"\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let config =
+            executable_extension_config(temp.path(), &extension_root, "controlled-launch-probe");
+        assert!(config.sandbox.allow_process);
+        assert!(config.sandbox.allow_shell);
+        let session = Session::create(temp.path().join("session.jsonl")).unwrap();
+        let model = ygg_ai::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let sessions = SessionStore::new(&config.session_dir, temp.path());
+        let mut host = ExtensionHost::new();
+
+        let extensions = ExecutableExtensions::discover_and_start(
+            &config,
+            &session,
+            &model,
+            &ReasoningConfig::Off,
+            &sessions,
+            &mut host,
+        );
+
+        assert!(!temp.path().join("controlled-extension-launched").exists());
+        assert!(extensions.processes.is_empty());
+        assert!(extensions.summaries.iter().any(|extension| {
+            extension.name == "controlled-launch-probe"
+                && extension.enabled
+                && extension.trusted
+                && !extension.running
+        }));
+        assert!(extensions
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic == CONTROLLED_EXTENSION_START_DIAGNOSTIC));
+    }
+
+    #[cfg(unix)]
     async fn lifecycle_fixture(temp: &tempfile::TempDir) -> (ExecutableExtensions, PathBuf) {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -3469,7 +3587,7 @@ context = true
     async fn pending_context_is_committed_only_after_the_prompt_append_succeeds() {
         use std::io::Write as _;
 
-        use ygg_agent::{Agent, AgentConfig, ExtensionHost, SandboxConfig};
+        use ygg_agent::{Agent, AgentConfig, EffectBroker, ExtensionHost, SandboxConfig};
         use ygg_ai::{AiClient, CacheRetention, ModelCatalog, ModelId};
 
         let temp = tempfile::tempdir().unwrap();
@@ -3485,6 +3603,7 @@ context = true
             session,
             system: "base system".into(),
             sandbox: SandboxConfig::new(temp.path()),
+            effect_broker: EffectBroker::default(),
             extensions: ExtensionHost::new(),
             max_turns: None,
             reasoning: ReasoningConfig::Off,

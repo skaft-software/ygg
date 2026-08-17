@@ -67,8 +67,14 @@ domain capability into the host.
 
 Executable extensions are intentionally a local tinkerer feature. Capability
 declarations are visible consent metadata, not an operating-system sandbox.
-An enabled extension runs as the current user and must also receive a separate
-trust grant before Ygg launches it.
+Discovery remains available under every effect policy, but process startup
+requires all three independent gates: enablement, an exact trust grant, and the
+explicit `UnsafeHost` opt-in (`--unsafe-host-effects`,
+`unsafe_host_effects = true`, or `YGG_UNSAFE_HOST_EFFECTS=true`). `Controlled`
+never starts an executable extension, even when the process/shell sandbox flags
+are enabled, and reports that blocked startup in `/extensions`. An admitted
+extension runs as the current user, so use UnsafeHost only inside separate
+OS-level isolation.
 
 ## Layout and discovery
 
@@ -92,7 +98,8 @@ discovery and trust; aliases are rejected with a diagnostic.
 Use repeatable command-line options for one-off tinkering:
 
 ```console
-ygg --extension-dir ./my-extensions \
+ygg --unsafe-host-effects \
+    --extension-dir ./my-extensions \
     --enable-extension hello-world \
     --trust-extension hello-world
 ```
@@ -100,6 +107,8 @@ ygg --extension-dir ./my-extensions \
 Or persist activation in the user config:
 
 ```toml
+# Unsafe: use only inside separate OS-level isolation.
+unsafe_host_effects = true
 enabled_extensions = ["hello-world"]
 trusted_extensions = ["hello-world"]
 ```
@@ -121,8 +130,8 @@ currently selected `git-tools` source for this process invocation only and is
 never written back as a persistent name grant.
 
 A trusted project config may suggest `enabled_extensions`, but it cannot grant
-itself executable trust. Persistent trust must come from the user config or
-environment (`YGG_TRUSTED_EXTENSIONS`); one-shot trust comes from
+itself executable trust or UnsafeHost. Persistent trust must come from the user
+config or environment (`YGG_TRUSTED_EXTENSIONS`); one-shot trust comes from
 `--trust-extension`.
 
 The agent crate exposes both pieces of the boundary:
@@ -545,10 +554,11 @@ shared interactive/plain/print/RPC/native-host/Serve terminal boundary settles
 each admitted turn. Notifications are best effort; host cleanup and persistence
 remain authoritative. Frozen API `0.1` keeps `after_response` success-only.
 
-Reload starts and fully initializes a replacement while the existing process
-remains ready. Launch, handshake, or contribution mismatch leaves the existing
-process active. A process negotiating `dynamic_tools` may replace its tool
-catalog during reload; static tool catalogs and all command/hook/UI
+For an admitted, running UnsafeHost extension, reload starts and fully
+initializes a replacement while the existing process remains ready. Launch,
+handshake, or contribution mismatch leaves the existing process active. A
+process negotiating `dynamic_tools` may replace its tool catalog during reload;
+static tool catalogs and all command/hook/UI
 contributions must remain compatible or return a clear "re-registration
 required" error so the frontend can rebuild intentionally.
 On an accepted reload, the old generation stops admission, drains to a bounded

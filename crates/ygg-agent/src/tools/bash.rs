@@ -23,14 +23,19 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use ygg_ai::ToolDef;
 
+use crate::effect::ToolEffect;
 #[cfg(unix)]
 use crate::extension_process::ProcessGroupGuard;
 use crate::tool::{OutputStream, Tool, ToolContext, ToolError, ToolOutput, ToolProgressSink};
 #[cfg(unix)]
 use crate::tools::parse_args;
+use crate::tools::validate_effect_path;
+
+const MAX_BASH_COMMAND_BYTES: usize = 128 * 1024;
 
 /// One Bash-compatible shell request.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BashArgs {
     /// The complete command string passed to the selected shell with `-c`.
     command: String,
@@ -84,6 +89,64 @@ impl Tool for BashTool {
         }
     }
 
+    fn effect(
+        &self,
+        arguments: &serde_json::Value,
+        ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        if !(ctx.sandbox.allow_process && ctx.sandbox.allow_shell) {
+            return Err(ToolError::new(
+                "error not_permitted\ncommand execution is disabled by sandbox policy; \
+                 arbitrary process execution has shell-equivalent authority and requires \
+                 both allow_process=true and allow_shell=true",
+            ));
+        }
+        let object = arguments
+            .as_object()
+            .ok_or_else(|| ToolError::new("invalid arguments: expected an object"))?;
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "command" | "cwd" | "timeout_ms"))
+        {
+            return Err(ToolError::new("invalid arguments: unknown field"));
+        }
+        let command = object
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ToolError::new("invalid arguments: `command` must be a string"))?;
+        if command.is_empty() {
+            return Err(ToolError::new(
+                "invalid arguments: command must be non-empty",
+            ));
+        }
+        if command.len() > MAX_BASH_COMMAND_BYTES {
+            return Err(ToolError::new(format!(
+                "invalid arguments: command is {} bytes (limit {MAX_BASH_COMMAND_BYTES})",
+                command.len()
+            )));
+        }
+        if command.contains('\0') {
+            return Err(ToolError::new(
+                "invalid arguments: command must not contain NUL",
+            ));
+        }
+        if let Some(cwd) = object.get("cwd") {
+            let cwd = cwd
+                .as_str()
+                .ok_or_else(|| ToolError::new("invalid arguments: `cwd` must be a string"))?;
+            validate_effect_path(cwd, ctx.sandbox.allow_external_paths)?;
+        }
+        if object
+            .get("timeout_ms")
+            .is_some_and(|value| value.as_u64().is_none_or(|timeout| timeout == 0))
+        {
+            return Err(ToolError::new(
+                "invalid arguments: `timeout_ms` must be a positive integer",
+            ));
+        }
+        Ok(ToolEffect::HostProcess)
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,
@@ -111,20 +174,8 @@ impl BashTool {
         args: serde_json::Value,
         ctx: &ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        self.effect(&args, ctx)?;
         let args: BashArgs = parse_args(args)?;
-        if args.command.is_empty() {
-            return Err(ToolError::new(
-                "error invalid_arguments\ncommand must be non-empty",
-            ));
-        }
-
-        if !(ctx.sandbox.allow_process && ctx.sandbox.allow_shell) {
-            return Err(ToolError::new(
-                "error not_permitted\ncommand execution is disabled by sandbox policy; \
-                 arbitrary process execution has shell-equivalent authority and requires \
-                 both allow_process=true and allow_shell=true",
-            ));
-        }
 
         let shell = resolve_shell(ctx.sandbox.shell_path.as_deref());
         let mut command = tokio::process::Command::new(&shell);
@@ -542,6 +593,44 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         !process_is_alive(pid)
+    }
+
+    #[test]
+    fn effect_validates_capabilities_and_arguments_before_approval() {
+        let f = fixture();
+        assert_eq!(
+            BashTool
+                .effect(&json!({"command": "printf ok"}), &f.ctx())
+                .unwrap(),
+            ToolEffect::HostProcess
+        );
+        for arguments in [
+            json!({"command": ""}),
+            json!({"command": "echo ok", "cwd": "../outside"}),
+            json!({"command": "echo ok", "cwd": "/tmp"}),
+            json!({"command": "echo ok", "unknown": true}),
+            json!({"command": "echo ok", "timeout_ms": 0}),
+            json!({"command": "bad\0command"}),
+        ] {
+            assert!(
+                BashTool.effect(&arguments, &f.ctx()).is_err(),
+                "{arguments}"
+            );
+        }
+        assert!(BashTool
+            .effect(
+                &json!({"command": "x".repeat(MAX_BASH_COMMAND_BYTES + 1)}),
+                &f.ctx(),
+            )
+            .is_err());
+
+        let mut disabled = fixture();
+        disabled.sandbox.allow_shell = false;
+        assert!(BashTool
+            .effect(&json!({"command": "printf ok"}), &disabled.ctx())
+            .unwrap_err()
+            .message
+            .contains("allow_shell=true"));
     }
 
     #[tokio::test]

@@ -13,7 +13,8 @@ use sha2::{Digest as _, Sha256};
 use ygg_agent::secure_fs::{create_regular_file_for_append, open_regular_file_for_append};
 use ygg_agent::{
     Agent, AgentCompactionMode, AgentConfig, CoreTools, DelegationConfig, DurableGoalStore,
-    EntryValue, ExtensionHost, GoalDriver, Session, SkillRegistry, COLLABORATION_TOOL_NAMES,
+    EffectBroker, EntryValue, ExtensionHost, GoalDriver, Session, SkillRegistry,
+    COLLABORATION_TOOL_NAMES,
 };
 use ygg_ai::{
     AgentDelegation, AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model,
@@ -3940,6 +3941,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         session,
         system: system.clone(),
         sandbox: config.sandbox.to_sandbox_config(&config.workspace),
+        effect_broker: EffectBroker::new(config.effect_policy),
         extensions,
         max_turns: config.max_turns,
         reasoning: reasoning.clone(),
@@ -4127,6 +4129,7 @@ pub fn rebuild_app(
         session,
         system: system.clone(),
         sandbox: config.sandbox.to_sandbox_config(&config.workspace),
+        effect_broker: EffectBroker::new(config.effect_policy),
         extensions,
         max_turns: config.max_turns,
         reasoning: reasoning.clone(),

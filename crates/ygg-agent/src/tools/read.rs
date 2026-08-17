@@ -9,11 +9,14 @@ use bytes::Bytes;
 use serde::Deserialize;
 use ygg_ai::{AudioFormat, Media, Mime, ToolDef};
 
+use crate::effect::ToolEffect;
 use crate::secure_fs::{read_regular_file_bounded_by, SecureFileError};
 use crate::tool::{
     content_hash, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
 };
-use crate::tools::{clip_line, parse_args, MAX_FILE_BYTES};
+use crate::tools::{
+    clip_line, parse_args, validate_effect_path, MAX_FILE_BYTES, MAX_TOOL_PATH_BYTES,
+};
 /// Display cap for a single line.
 const MAX_LINE_CHARS: usize = 2000;
 /// Default number of lines returned when `limit` is omitted.
@@ -65,6 +68,7 @@ impl MediaKind {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadArgs {
     path: String,
     offset: Option<usize>,
@@ -113,11 +117,118 @@ impl Tool for ReadTool {
         }
     }
 
+    fn effect(
+        &self,
+        arguments: &serde_json::Value,
+        ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        let arguments = arguments
+            .as_object()
+            .ok_or_else(|| ToolError::new("invalid arguments: expected an object"))?;
+        if arguments.len() > 3
+            || arguments
+                .keys()
+                .any(|key| !matches!(key.as_str(), "path" | "offset" | "limit"))
+        {
+            return Err(ToolError::new("invalid arguments: unknown property"));
+        }
+        let path = arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ToolError::new("invalid arguments: `path` must be a string"))?;
+        if path.is_empty() {
+            return Err(ToolError::new(
+                "invalid arguments: `path` must be non-empty",
+            ));
+        }
+        if path.len() > MAX_TOOL_PATH_BYTES {
+            return Err(ToolError::new(format!(
+                "invalid arguments: `path` is {} bytes (limit {MAX_TOOL_PATH_BYTES})",
+                path.len()
+            )));
+        }
+        if path.contains('\0') {
+            return Err(ToolError::new(
+                "invalid arguments: `path` must not contain NUL",
+            ));
+        }
+        for name in ["offset", "limit"] {
+            if arguments.get(name).is_some_and(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .is_none_or(|value| value == 0)
+            }) {
+                return Err(ToolError::new(format!(
+                    "invalid arguments: `{name}` must be a positive integer"
+                )));
+            }
+        }
+        if let Some(url) = parse_url_source(path)? {
+            let test_loopback_http = cfg!(test)
+                && url.scheme() == "http"
+                && url.host().is_some_and(|host| match host {
+                    url::Host::Ipv4(address) => address.is_loopback(),
+                    url::Host::Ipv6(address) => address.is_loopback(),
+                    url::Host::Domain(_) => false,
+                });
+            match url.scheme() {
+                "http" if test_loopback_http && !ctx.sandbox.allow_remote_read => {
+                    return Err(ToolError::new(
+                        "remote URL reads are disabled; enable `allow_remote_read` \
+                         (or pass `--allow-remote-read`) to permit public HTTPS image/audio fetches",
+                    ));
+                }
+                "http" if test_loopback_http => return Ok(ToolEffect::Network),
+                "http" => {
+                    return Err(ToolError::new("remote media URLs must use HTTPS"));
+                }
+                "https" if !ctx.sandbox.allow_remote_read => {
+                    return Err(ToolError::new(
+                        "remote URL reads are disabled; enable `allow_remote_read` \
+                         (or pass `--allow-remote-read`) to permit public HTTPS image/audio fetches",
+                    ));
+                }
+                "https" => return Ok(ToolEffect::Network),
+                "file" => {
+                    // Convert URL syntax lexically without resolving or probing
+                    // the model-selected host path before policy admission.
+                    let local = local_path_from_url(&url)?;
+                    let local = workspace_relative_file_url_path(local, ctx);
+                    validate_effect_path(&local, ctx.sandbox.allow_external_paths)?;
+                    return Ok(if ctx.sandbox.allow_external_paths {
+                        ToolEffect::HostRead
+                    } else {
+                        ToolEffect::WorkspaceRead
+                    });
+                }
+                scheme => {
+                    return Err(ToolError::new(format!(
+                        "unsupported read URL scheme `{scheme}`; use file or https"
+                    )))
+                }
+            }
+        }
+        validate_effect_path(path, ctx.sandbox.allow_external_paths)?;
+        Ok(if ctx.sandbox.allow_external_paths {
+            // Resolution follows symlinks and can disclose host-path existence.
+            // Classify every local request by maximum ambient authority before
+            // touching the filesystem.
+            ToolEffect::HostRead
+        } else {
+            ToolEffect::WorkspaceRead
+        })
+    }
+
     fn replay_safety(&self) -> ReplaySafety {
+        // The agent's reference monitor additionally requires the exact call to
+        // classify as WorkspaceRead before honoring this static capability.
         ReplaySafety::Safe
     }
 
     fn concurrency(&self) -> ToolConcurrency {
+        // Likewise, HostRead and Network calls are forced back to sequential
+        // execution after per-call effect classification.
         ToolConcurrency::Parallel
     }
 
@@ -126,6 +237,7 @@ impl Tool for ReadTool {
         args: serde_json::Value,
         ctx: &ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        self.effect(&args, ctx)?;
         let args: ReadArgs = parse_args(args)?;
         if let Some(url) = parse_url_source(&args.path)? {
             return match url.scheme() {
@@ -821,6 +933,39 @@ mod tests {
                 cancellation: Default::default(),
             }
         }
+    }
+
+    #[test]
+    fn effect_classification_is_conservative_and_does_not_resolve_local_paths() {
+        let mut fixture = fixture();
+        assert_eq!(
+            ReadTool
+                .effect(&json!({"path": "missing.txt"}), &fixture.ctx())
+                .unwrap(),
+            ToolEffect::WorkspaceRead
+        );
+        assert_eq!(ReadTool.replay_safety(), ReplaySafety::Safe);
+        assert_eq!(ReadTool.concurrency(), ToolConcurrency::Parallel);
+
+        fixture.sandbox.allow_external_paths = true;
+        for path in ["missing.txt", "/definitely/not/a/real/ygg-effect-path"] {
+            assert_eq!(
+                ReadTool
+                    .effect(&json!({"path": path}), &fixture.ctx())
+                    .unwrap(),
+                ToolEffect::HostRead
+            );
+        }
+        fixture.sandbox.allow_remote_read = true;
+        assert_eq!(
+            ReadTool
+                .effect(
+                    &json!({"path": "https://example.com/media.png"}),
+                    &fixture.ctx(),
+                )
+                .unwrap(),
+            ToolEffect::Network
+        );
     }
 
     #[tokio::test]

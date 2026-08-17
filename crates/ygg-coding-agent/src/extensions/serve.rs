@@ -8464,6 +8464,15 @@ async fn retract_attempt(
     Ok(())
 }
 
+fn approval_action(prompt: &str, detail: Option<&str>) -> String {
+    let mut action = prompt.to_owned();
+    if let Some(detail) = detail {
+        action.push_str("\n\n");
+        action.push_str(detail);
+    }
+    action
+}
+
 async fn project_tool_progress(
     id: ToolCallId,
     progress: ToolProgress,
@@ -8493,11 +8502,7 @@ async fn project_tool_progress(
                 projection.request_counter
             ))
             .map_err(|_| ServiceError::Internal)?;
-            let action = projection
-                .tool_calls
-                .get(&id.0)
-                .map(|tool| format!("Approve {}?", tool.activity.title))
-                .unwrap_or_else(|| "Approve this tool action?".into());
+            let action = approval_action(&request.prompt, request.detail.as_deref());
             let pending = PendingRequest {
                 id: request_id.clone(),
                 actor_generation: projection_actor_generation(run_id),
@@ -10524,6 +10529,7 @@ mod tests {
             reasoning_mode: ygg_ai::ReasoningMode::Standard,
             reasoning_mode_explicit: false,
             cache_retention: ygg_ai::CacheRetention::Short,
+            effect_policy: ygg_agent::EffectPolicy::Controlled,
             sandbox: crate::config::SandboxPolicy::default(),
             theme: None,
             theme_paths: Vec::new(),
@@ -15138,6 +15144,20 @@ mod tests {
                 .is_err(),
             "raw status text unexpectedly produced a public event"
         );
+    }
+
+    #[test]
+    fn approval_progress_forwards_the_trusted_prompt_and_bounded_intent_detail() {
+        let action = approval_action(
+            "Approve exact workspace mutation?",
+            Some("path: src/lib.rs\ncontent: bounded-preview\nintent SHA-256: digest-canary"),
+        );
+
+        assert!(action.contains("Approve exact workspace mutation?"));
+        assert!(action.contains("path: src/lib.rs"));
+        assert!(action.contains("content: bounded-preview"));
+        assert!(action.contains("intent SHA-256: digest-canary"));
+        assert!(!action.contains("Approve this tool action?"));
     }
 
     #[test]

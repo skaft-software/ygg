@@ -8,10 +8,22 @@
 
 1. Streaming deltas are provisional and never enter the session.
 2. A complete assistant message is persisted before any emitted tool is executed.
-3. Each tool result is persisted immediately after its execution commit point.
-4. Read-only tools may opt into crash replay with `ReplaySafety::Safe`. Every other unresolved call becomes an indeterminate error and is not executed.
+3. Each tool result is persisted immediately after its execution outcome is committed.
+4. Crash replay requires both `ReplaySafety::Safe` and an exact host classification of `Pure` or `WorkspaceRead`. Every other unresolved call becomes an indeterminate error and is not executed.
 5. One level-triggered abort signal is selected against provider open/body consumption, retries, tools, and autonomous compaction. Cancellation wins same-poll races. A cancelled compaction persists neither usage nor summary.
 6. Every driven run emits exactly one `RunFinished` and one durable checkpoint.
+
+## Effect admission boundary
+
+Every registered `Tool` classifies the exact parsed call through host-owned code. The model cannot provide or lower this classification, and the trait default is `Unknown`. Unknown effects fail closed under every policy, including `UnsafeHost`. Before any hook or tool implementation receives a call, the agent constructs a bounded canonical `EffectIntent` over the principal, run, tool-catalog generation, provider call ID, tool name, effect, arguments, and policy version.
+
+The default `Controlled` policy admits `Pure` and `WorkspaceRead`, requests interactive confirmation for one exact `WorkspaceMutation`, and denies host reads/mutations, native processes, network, delegation, executable extensions, and unknown effects. `UnsafeHost` admits classified effects but is an explicit compatibility policy, not containment. Product code must additionally prevent executable-extension process startup under Controlled because a broker check at later tool invocation cannot contain an already-running executable.
+
+Workspace-mutation approval creates a random, short-lived capability bound to the canonical intent digest. Tokens are atomically single-use, stored by one-way verifier, redacted in debug output, and never supplied to tools. Dispatch reserves admission before `before_tool_call`, then commits and consumes the exact grant only after all hooks pass and immediately before calling `Tool::execute`. Hook denial or cancellation drops and revokes an uncommitted reservation; cancellation after commit cannot restore it. `after_tool_call` runs only for a committed effect.
+
+Sequential, parallel, and crash-recovery dispatch all use this boundary. Static `ToolConcurrency::Parallel` and `ReplaySafety::Safe` declarations are intersected with the exact host classification: only `Pure` and `WorkspaceRead` calls may run in a parallel batch or be replayed after a crash. A denied call is returned to the provider as a paired tool error without invoking hooks or executable code.
+
+The broker is a deterministic admission reference monitor, not an OS sandbox. Controlled intentionally denies effect classes that still lack isolation or dedicated brokers. UnsafeHost commands and executable extensions retain the Ygg process's ambient user authority.
 
 ## Sessions
 
@@ -32,7 +44,11 @@ Each child has a stable ID and ancestry path, an isolated append-only `Session`,
 and its own agent loop. It inherits the effective root system prompt at spawn
 time, approved extension host/tool set, sandbox, model, reasoning and cache
 settings, compaction model/policy, completion policy, output modalities, resolved
-output-token limit, retry policy, turn limit, and session cost ceiling. Children
+output-token limit, retry policy, turn limit, session cost ceiling, and the root's
+cloned effect broker. That clone preserves a shared policy/grant store; it is not
+yet child-specific authority attenuation. Controlled therefore denies the
+`Delegation` effect entirely, while UnsafeHost delegation must be treated as
+ambient-authority compatibility mode. Children
 can message peers, steer active work, queue messages for an idle worker, receive
 follow-up runs, wait without lost notifications, and spawn within the remaining
 depth and concurrency bounds.
@@ -87,7 +103,7 @@ descendants are stopped with their parent.
 
 Workspace-only path shapes reject absolute roots and parent components. On Unix, file operations canonicalize the accepted target and then walk every component using directory descriptors and `O_NOFOLLOW`. Reads open the final object nonblocking, require a regular file from descriptor metadata, and stream at most limit+1 bytes. Mutations retain the open parent descriptor, write a sibling `create_new` temporary, re-read and compare the target immediately before commit, and rename relative to the same descriptor. Parent symlink replacement therefore cannot redirect the operation.
 
-The path guard applies to explicit built-in paths. It is not process containment: enabled commands have the current user's authority.
+The path guard applies to explicit built-in paths. It is not process containment: commands admitted by UnsafeHost have the current user's authority. When external paths are enabled, local file tools conservatively classify every call as a host effect so a path-resolution race cannot lower admission authority; the coding product forces external paths off under Controlled.
 
 ## Resource limits
 
@@ -101,4 +117,4 @@ The path guard applies to explicit built-in paths. It is not process containment
 
 ## Extension boundary
 
-All tools implement `Tool` and register through `ExtensionHost`; core tools are not privileged inside the run loop. A product policy filters the host before `Agent::new`, ensuring provider definitions and executable implementations are the same set. Extension tools are non-replayable by default.
+All tools implement `Tool` and register through `ExtensionHost`; core tools are not privileged inside the run loop. A product policy filters the host before `Agent::new`, ensuring provider definitions and executable implementations are the same set. Tool implementations own effect metadata and default to `Unknown`; provider schemas and model arguments cannot select authority. Executable extension tools classify as `Extension`, remain non-replayable and sequential, and the coding product prevents their process from starting under Controlled.

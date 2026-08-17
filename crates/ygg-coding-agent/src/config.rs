@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ygg_agent::{SandboxConfig, DEFAULT_KEEP_RECENT_TOKENS};
+use ygg_agent::{EffectPolicy, SandboxConfig, DEFAULT_KEEP_RECENT_TOKENS};
 
 pub use crate::tui::terminal::ColorMode;
 use ygg_ai::{
@@ -92,9 +92,9 @@ pub struct SandboxPolicy {
 impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
-            // Ygg is a trusted local agent: explicit absolute, `~/`, and
-            // parent-relative paths work by default. Users can opt into the
-            // workspace-only accidental-path guard in configuration.
+            // Preserve the legacy ambient-host baseline only for an explicit
+            // UnsafeHost profile. Final configuration resolution forces this
+            // false whenever the effect policy remains Controlled.
             allow_external_paths: true,
             allow_edit: true,
             allow_write: true,
@@ -401,6 +401,8 @@ pub struct Config {
     /// True when the reasoning mode came from an explicit command-line override.
     pub reasoning_mode_explicit: bool,
     pub cache_retention: CacheRetention,
+    /// Host-owned admission policy for model-requested tool effects.
+    pub effect_policy: EffectPolicy,
     pub sandbox: SandboxPolicy,
     pub theme: Option<String>,
     /// Explicit system prompt override. `None` uses composed built-in

@@ -544,7 +544,7 @@ fn ordered_image_and_audio_cross_the_process_and_provider_boundaries() {
 }
 
 #[test]
-fn coordinated_signal_cleanup_cancels_run_and_separate_extension_group() {
+fn coordinated_signal_cleanup_cancels_run_without_starting_controlled_extension() {
     let (_root, home, workspace) = fixture();
     let sessions = workspace.join("sessions");
     let extension_root = workspace.join("extensions");
@@ -629,28 +629,13 @@ done
     accepted_receiver
         .recv_timeout(MESSAGE_TIMEOUT)
         .expect("provider request was not started");
-    let extension_pid = std::fs::read_to_string(&extension_pid_file)
-        .expect("extension pid file")
-        .trim()
-        .parse::<i32>()
-        .expect("extension pid");
-    assert!(process_is_alive(extension_pid));
+    assert!(
+        !extension_pid_file.exists(),
+        "Controlled ygg-host launched an executable extension"
+    );
 
     host.terminate_group();
     let status = host.wait();
     assert_eq!(status.code(), Some(128 + libc::SIGTERM));
-    let deadline = Instant::now() + EXIT_TIMEOUT;
-    while process_is_alive(extension_pid) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        !process_is_alive(extension_pid),
-        "extension process group survived host signal cleanup"
-    );
     provider.join().expect("hanging provider fixture");
-}
-
-fn process_is_alive(pid: i32) -> bool {
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }

@@ -12,8 +12,10 @@ python3 -m pip install ./sdk/python
 ```
 
 Copy this directory to `.ygg/extensions/hello-world/`, explicitly enable and
-trust `hello-world`, then restart or reload extensions. Ygg resolves the bare
-`extension.py` entrypoint beside `extension.toml` and launches it directly;
-Python 3 must be available through the shebang environment.
+trust `hello-world`, and opt into UnsafeHost (`--unsafe-host-effects`) before
+restarting or reloading extensions. Controlled discovers the manifest but never
+starts its process. Ygg resolves the bare `extension.py` entrypoint beside
+`extension.toml` and launches it directly; Python 3 must be available through
+the shebang environment.
 
 Stdout stays protocol-only. The SDK sends structured diagnostics to stderr.

@@ -10,8 +10,8 @@ use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 use ygg_agent::{
-    Agent, AgentConfig, AgentEvent, CoreTools, DelegationConfig, DelegationLimits, EntryValue,
-    ExtensionHost, FinishReason, SandboxConfig, Session,
+    Agent, AgentConfig, AgentEvent, CoreTools, DelegationConfig, DelegationLimits, EffectBroker,
+    EffectPolicy, EntryValue, ExtensionHost, FinishReason, SandboxConfig, Session,
 };
 use ygg_ai::{
     AiClient, Auth, Capabilities, Endpoint, EndpointId, Message, ModalitySet, Model, ModelId,
@@ -567,6 +567,7 @@ fn build_enabled_agent(server: &MockServer, limits: DelegationLimits) -> Enabled
         session: Session::create(session_dir.path().join("root.jsonl")).unwrap(),
         system: "You are a delegation integration test agent.".into(),
         sandbox,
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
         extensions,
         max_turns: Some(40),
         reasoning: ReasoningConfig::Off,

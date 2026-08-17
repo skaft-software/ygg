@@ -37,6 +37,7 @@ url = "2"
 fs2 = "0.4"
 getrandom = "0.3"
 sha2 = "0.10"
+subtle = "2"
 tempfile = "3"
 base64 = "0.22"
 
