@@ -824,7 +824,7 @@ impl RunTracker {
                             run.changed_files.insert(path.to_owned());
                         }
                     }
-                } else if result.is_err() {
+                } else if result.is_err() || result.as_ref().is_ok_and(ToolOutput::is_error) {
                     run.warnings = run.warnings.saturating_add(1);
                 }
                 if run.pending_tools.is_empty() {
@@ -1125,6 +1125,7 @@ pub fn compact_path(path: &str) -> String {
 pub fn tool_result_is_failure(name: &str, result: &Result<ToolOutput, ToolError>) -> bool {
     match result {
         Err(_) => true,
+        Ok(output) if output.is_error() => true,
         Ok(output) if matches!(name, "bash" | "exec") => bash_exit_reason(&output.text).is_some(),
         Ok(_) => false,
     }
@@ -1133,6 +1134,7 @@ pub fn tool_result_is_failure(name: &str, result: &Result<ToolOutput, ToolError>
 pub fn tool_failure_reason(name: &str, result: &Result<ToolOutput, ToolError>) -> Option<String> {
     match result {
         Err(error) => Some(error_reason(&error.message)),
+        Ok(output) if output.is_error() => Some(error_reason(&output.text)),
         Ok(output) if matches!(name, "bash" | "exec") => bash_exit_reason(&output.text),
         Ok(_) => None,
     }

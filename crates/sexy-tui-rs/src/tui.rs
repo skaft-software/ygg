@@ -81,9 +81,9 @@ pub struct FrameUpdate {
     /// from the top of the terminal so later fixed-height chrome remains
     /// anchored to the physical bottom row.
     pub reanchor_viewport: bool,
-    /// The presentation of committed rows changed. Destructively replace
-    /// terminal-owned history with the complete retained frame, including for
-    /// pinned semantic transcripts.
+    /// The presentation of committed rows changed. Generic inline frames may
+    /// rebuild retained history; pinned frames preserve terminal-owned history
+    /// and re-anchor only their live suffix.
     pub rebuild_scrollback: bool,
 }
 
@@ -1027,12 +1027,9 @@ impl<'a> TUI<'a> {
             }
             return;
         }
-        if rebuild_scrollback && !self.first_render {
-            // Disclosure changes can alter rows that already entered native
-            // history. Replaying only a pinned live suffix leaves those rows
-            // stale, and a later shrink can retain an impossible physical seam
-            // beyond the shorter frame. Replace the complete presentation and
-            // renegotiate its semantic commit cursor on the next frame.
+        if rebuild_scrollback && !self.first_render && pinned.is_none() {
+            // Generic inline frames have no semantic commit boundary, so a
+            // disclosure rebuild must replace their complete presentation.
             self.reset_inline_scrollback(new_lines, rows, previous_frame_has_image);
             return;
         }
@@ -1041,7 +1038,7 @@ impl<'a> TUI<'a> {
                 new_lines,
                 rows,
                 pinned,
-                reanchor_viewport,
+                reanchor_viewport || rebuild_scrollback,
                 pinned_previous_window,
             );
             return;
@@ -3331,7 +3328,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_presentation_rebuild_replays_history_and_resets_a_shrinking_seam() {
+    fn pinned_presentation_rebuild_preserves_committed_native_history() {
         let size = Rc::new(Cell::new((30, 4)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
@@ -3339,6 +3336,8 @@ mod tests {
         );
         let (terminal, clears, _, _, _, writes) = recording_terminal(size, capabilities);
         let lines = Rc::new(RefCell::new(vec![
+            "committed history 0".to_owned(),
+            "committed history 1".to_owned(),
             "expanded summary 0".to_owned(),
             "expanded summary 1".to_owned(),
             "expanded summary 2".to_owned(),
@@ -3348,15 +3347,16 @@ mod tests {
             format!("composer {CURSOR_MARKER}"),
             "footer".to_owned(),
         ]));
-        let rebuild_scrollback = Rc::new(Cell::new(true));
         let mut tui = TUI::new(Box::new(terminal));
         tui.set_inline_scrollback(true);
         tui.add_child(Box::new(LazyPinnedLines {
-            lines: lines.clone(),
-            commit_boundary: Rc::new(Cell::new(3)),
-            rebuild_scrollback: rebuild_scrollback.clone(),
+            lines,
+            commit_boundary: Rc::new(Cell::new(5)),
+            rebuild_scrollback: Rc::new(Cell::new(true)),
         }));
         tui.previous_frame = [
+            "committed history 0",
+            "committed history 1",
             "collapsed summary",
             "later event 3",
             "later event 4",
@@ -3373,44 +3373,25 @@ mod tests {
         tui.inline_committed_rows = 2;
         tui.inline_commit_cursor = Some(test_commit_position(2).cursor);
         tui.inline_generation = Some(0);
-        tui.inline_window_top = 2;
+        tui.inline_window_top = 4;
         tui.inline_bottom_row = 3;
         tui.running = true;
 
         tui.request_render();
 
         let expanded = writes.borrow().join("");
-        assert!(expanded.contains("\x1b[3J"), "{expanded:?}");
+        assert!(!expanded.contains("\x1b[2J"), "{expanded:?}");
+        assert!(!expanded.contains("\x1b[3J"), "{expanded:?}");
+        assert!(!expanded.contains("committed history"), "{expanded:?}");
         for row in 0..=2 {
             assert!(
                 expanded.contains(&format!("expanded summary {row}")),
                 "{expanded:?}"
             );
         }
-        assert_eq!(clears.get(), 1);
-        assert_eq!(tui.inline_history_rows, 4);
-        assert_eq!(tui.inline_window_top, 4);
-        assert_eq!(tui.inline_commit_cursor, None);
-
-        writes.borrow_mut().clear();
-        *lines.borrow_mut() = vec![
-            "collapsed summary".to_owned(),
-            "later event 5".to_owned(),
-            "composer".to_owned(),
-            "footer".to_owned(),
-        ];
-        rebuild_scrollback.set(true);
-        tui.request_render();
-
-        let collapsed = writes.borrow().join("");
-        assert!(collapsed.contains("\x1b[3J"), "{collapsed:?}");
-        for row in ["collapsed summary", "later event 5", "composer", "footer"] {
-            assert_eq!(collapsed.matches(row).count(), 1, "{collapsed:?}");
-        }
-        assert_eq!(clears.get(), 2);
-        assert_eq!(tui.inline_history_rows, 0);
-        assert_eq!(tui.inline_window_top, 0);
-        assert_eq!(tui.inline_bottom_row, 3);
+        assert_eq!(clears.get(), 0);
+        assert_eq!(tui.inline_history_rows, 5);
+        assert_eq!(tui.inline_window_top, 6);
     }
 
     #[test]

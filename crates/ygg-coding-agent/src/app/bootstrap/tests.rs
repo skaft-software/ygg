@@ -739,7 +739,7 @@ fn codex_models_require_a_usable_credential_and_include_luna_fallback() {
 }
 
 #[test]
-fn offline_codex_registration_uses_account_cache_or_fallback_without_discovery() {
+fn offline_codex_registration_uses_cached_inventory_without_dynamic_capabilities() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("cached-codex.json");
     write_codex_credential(&path, false, "plus");
@@ -773,11 +773,8 @@ fn offline_codex_registration_uses_account_cache_or_fallback_without_discovery()
         .unwrap();
     assert_eq!(model.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
     assert_eq!(model.spec.limits.context_window, 196_000);
-    assert!(model.spec.capabilities.responses_lite);
-    assert_eq!(
-        model.spec.capabilities.agent_delegation,
-        Some(ygg_ai::AgentDelegation::V2)
-    );
+    assert!(!model.spec.capabilities.responses_lite);
+    assert_eq!(model.spec.capabilities.agent_delegation, None);
     assert_eq!(
         model
             .spec
@@ -786,7 +783,7 @@ fn offline_codex_registration_uses_account_cache_or_fallback_without_discovery()
             .as_ref()
             .unwrap()
             .max_effort,
-        ygg_ai::ReasoningEffort::Ultra
+        ygg_ai::ReasoningEffort::Max
     );
 
     let fallback_path = directory.path().join("fallback-codex.json");
@@ -907,6 +904,58 @@ fn codex_discovery_accepts_account_catalog_and_uses_live_metadata() {
 }
 
 #[test]
+fn codex_discovery_never_exposes_ultra_without_complete_v2_metadata() {
+    let models = codex_models_from_response(
+        &serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-no-v2",
+                    "supported_reasoning_levels": ["high", "ultra"]
+                },
+                {
+                    "slug": "gpt-5.6-malformed-levels",
+                    "supported_reasoning_levels": ["ultra", {"effort": 42}],
+                    "use_responses_lite": "true",
+                    "multi_agent_version": "v2"
+                },
+                {
+                    "slug": "gpt-5.6-malformed-v2",
+                    "supported_reasoning_levels": ["ultra"],
+                    "multi_agent_version": 2
+                }
+            ]
+        }),
+        None,
+    )
+    .unwrap();
+
+    let no_v2 = models
+        .iter()
+        .find(|model| model.id == "gpt-5.6-no-v2")
+        .unwrap();
+    assert_eq!(no_v2.max_effort, ygg_ai::ReasoningEffort::Max);
+    assert_eq!(no_v2.agent_delegation, None);
+
+    let malformed_levels = models
+        .iter()
+        .find(|model| model.id == "gpt-5.6-malformed-levels")
+        .unwrap();
+    assert_eq!(malformed_levels.max_effort, ygg_ai::ReasoningEffort::Max);
+    assert!(!malformed_levels.responses_lite);
+    assert_eq!(
+        malformed_levels.agent_delegation,
+        Some(ygg_ai::AgentDelegation::V2)
+    );
+
+    let malformed_v2 = models
+        .iter()
+        .find(|model| model.id == "gpt-5.6-malformed-v2")
+        .unwrap();
+    assert_eq!(malformed_v2.max_effort, ygg_ai::ReasoningEffort::Max);
+    assert_eq!(malformed_v2.agent_delegation, None);
+}
+
+#[test]
 fn codex_discovery_selects_default_or_max_window_from_oauth_plan() {
     let body = serde_json::json!({
         "models": [{
@@ -967,6 +1016,124 @@ fn codex_model_cache_is_scoped_to_account_and_plan() {
     assert!(load_codex_model_cache(&store, &other_account)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn codex_model_cache_fails_closed_when_stale_future_dated_or_incomplete() {
+    let directory = tempfile::tempdir().unwrap();
+    let plus = crate::auth::codex::ChatGptPlan::Plus;
+    let claims = crate::auth::codex::SubscriptionClaims {
+        account_id: "acct-a".into(),
+        plan: Some(plus.clone()),
+    };
+    let models = codex_models_from_response(
+        &serde_json::json!({
+            "models": [{
+                "slug": "gpt-5.6-sol",
+                "context_window": 272_000,
+                "max_output_tokens": 128_000,
+                "supported_reasoning_levels": ["high", "ultra"],
+                "use_responses_lite": true,
+                "multi_agent_version": "v2"
+            }]
+        }),
+        Some(&plus),
+    )
+    .unwrap();
+    let valid = serde_json::to_vec(&CodexModelCache {
+        version: CODEX_MODEL_CACHE_VERSION,
+        account_id: claims.account_id.clone(),
+        plan: codex_plan_cache_key(&claims).map(str::to_owned),
+        models,
+    })
+    .unwrap();
+    let cache_path = |credential_path: &std::path::Path| {
+        let stem = credential_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap();
+        credential_path.with_file_name(format!("{stem}-models.json"))
+    };
+
+    for (name, modified) in [
+        (
+            "stale",
+            std::time::SystemTime::now()
+                .checked_sub(CODEX_MODEL_CACHE_REFRESH_INTERVAL + Duration::from_secs(1))
+                .unwrap(),
+        ),
+        (
+            "future",
+            std::time::SystemTime::now() + Duration::from_secs(60),
+        ),
+    ] {
+        let credential_path = directory.path().join(format!("{name}.json"));
+        let store = crate::auth::codex::CredentialStore::new(&credential_path);
+        store.save_model_cache(&valid).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(cache_path(&credential_path))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(load_codex_model_cache(&store, &claims).unwrap().is_none());
+    }
+
+    let malformed_path = directory.path().join("malformed.json");
+    let malformed = crate::auth::codex::CredentialStore::new(&malformed_path);
+    malformed.save_model_cache(b"{").unwrap();
+    assert!(load_codex_model_cache(&malformed, &claims).is_err());
+
+    let valid_value: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+    let mut cases = Vec::new();
+
+    let mut missing_delegation = valid_value.clone();
+    missing_delegation["models"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("agent_delegation");
+    cases.push(("missing-delegation", missing_delegation));
+
+    let mut missing_responses_lite = valid_value.clone();
+    missing_responses_lite["models"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("responses_lite");
+    cases.push(("missing-responses-lite", missing_responses_lite));
+
+    let mut duplicate = valid_value.clone();
+    let duplicate_model = duplicate["models"][0].clone();
+    duplicate["models"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate_model);
+    cases.push(("duplicate", duplicate));
+
+    let mut empty_id = valid_value.clone();
+    empty_id["models"][0]["id"] = serde_json::json!("");
+    cases.push(("empty-id", empty_id));
+
+    let mut inconsistent_limits = valid_value.clone();
+    inconsistent_limits["models"][0]["max_output_tokens"] = serde_json::json!(300_000);
+    cases.push(("inconsistent-limits", inconsistent_limits));
+
+    let mut ultra_without_delegation = valid_value.clone();
+    ultra_without_delegation["models"][0]["agent_delegation"] = serde_json::Value::Null;
+    cases.push(("ultra-without-delegation", ultra_without_delegation));
+
+    let mut invalid_effort_range = valid_value;
+    invalid_effort_range["models"][0]["min_effort"] = serde_json::json!("ultra");
+    invalid_effort_range["models"][0]["max_effort"] = serde_json::json!("high");
+    cases.push(("invalid-effort-range", invalid_effort_range));
+
+    for (name, contents) in cases {
+        let path = directory.path().join(format!("{name}.json"));
+        let store = crate::auth::codex::CredentialStore::new(path);
+        store
+            .save_model_cache(&serde_json::to_vec(&contents).unwrap())
+            .unwrap();
+        assert!(load_codex_model_cache(&store, &claims).is_err(), "{name}");
+    }
 }
 
 #[test]
@@ -1926,7 +2093,7 @@ fn explicit_unavailable_tools_report_final_available_names_and_policy_gates() {
         .resolve(config.model.as_ref().unwrap())
         .unwrap();
 
-    let error = validate_explicit_tool_policy(&config, &extensions, &model).unwrap_err();
+    let error = validate_explicit_tool_policy(&config, &extensions, &model, false).unwrap_err();
     let message = error.to_string();
     assert!(message.contains("edit, missing-extension"), "{message}");
     assert!(
@@ -1934,6 +2101,12 @@ fn explicit_unavailable_tools_report_final_available_names_and_policy_gates() {
         "{message}"
     );
     assert!(message.contains("available tools: read"), "{message}");
+    let mut dynamic_config = config.clone();
+    dynamic_config.tools =
+        crate::config::ToolPolicy::only(["read".to_owned(), "missing-extension".to_owned()])
+            .unwrap();
+    validate_explicit_tool_policy(&dynamic_config, &extensions, &model, true)
+        .expect("a negotiated live catalog may publish explicitly allowed names later");
 }
 
 #[test]
@@ -1961,7 +2134,7 @@ fn model_without_tool_capability_gets_no_default_surface_and_rejects_explicit_to
         &boot.sessions,
     );
     assert!(extensions.tool_definitions().is_empty());
-    validate_explicit_tool_policy(&default_config, &extensions, &model).unwrap();
+    validate_explicit_tool_policy(&default_config, &extensions, &model, false).unwrap();
 
     default_config.tools = crate::config::ToolPolicy::only(["read".to_owned()]).unwrap();
     let explicit_session =
@@ -1973,7 +2146,8 @@ fn model_without_tool_capability_gets_no_default_surface_and_rejects_explicit_to
         &default_config.reasoning,
         &boot.sessions,
     );
-    let error = validate_explicit_tool_policy(&default_config, &extensions, &model).unwrap_err();
+    let error =
+        validate_explicit_tool_policy(&default_config, &extensions, &model, false).unwrap_err();
     let message = error.to_string();
     assert!(
         message.contains("gpt-4o-mini does not support tools"),
@@ -2040,6 +2214,49 @@ fn fresh_app(directory: &std::path::Path) -> App {
     let boot = bootstrap(config(directory, Some("gpt-4o-mini"))).unwrap();
     let launch = resolve_launch_print(&boot, "test-session").unwrap();
     build_app(boot, launch, "system".into()).unwrap()
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn explicit_rebuild_reasoning_clears_a_persisted_legacy_pro_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut app = fresh_app(directory.path());
+    let base = app
+        .catalog
+        .resolve(&ModelId("gpt-5.4-mini-responses".into()))
+        .unwrap();
+    let mut spec = (*base.spec).clone();
+    spec.id = ModelId("rebuild-ultra-test".into());
+    let capability = spec.capabilities.reasoning.as_mut().unwrap();
+    capability.max_effort = ygg_ai::ReasoningEffort::Ultra;
+    spec.capabilities.responses_lite = true;
+    spec.capabilities.agent_delegation = Some(ygg_ai::AgentDelegation::V2);
+    app.catalog.register_model(spec).unwrap();
+
+    let target = directory.path().join("legacy-pro-target.jsonl");
+    let mut session = Session::create(&target).unwrap();
+    session
+        .append(EntryValue::Config {
+            model: Some("rebuild-ultra-test".into()),
+            reasoning: Some("max".into()),
+            reasoning_mode: Some("pro".into()),
+        })
+        .unwrap();
+    drop(session);
+
+    let rebuilt = rebuild_app(
+        app,
+        None,
+        Some(ReasoningConfig::Effort(ygg_ai::ReasoningEffort::High)),
+        None,
+        Some(SessionSelection::OpenExisting(target)),
+    )
+    .unwrap();
+    assert_eq!(
+        rebuilt.reasoning,
+        ReasoningConfig::Effort(ygg_ai::ReasoningEffort::High)
+    );
+    assert_eq!(rebuilt.reasoning_mode, ReasoningMode::Standard);
 }
 
 #[test]

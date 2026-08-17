@@ -13,7 +13,7 @@ use sha2::{Digest as _, Sha256};
 use ygg_agent::secure_fs::{create_regular_file_for_append, open_regular_file_for_append};
 use ygg_agent::{
     Agent, AgentCompactionMode, AgentConfig, CoreTools, DelegationConfig, DurableGoalStore,
-    EntryValue, ExtensionHost, GoalDriver, Session, SkillRegistry,
+    EntryValue, ExtensionHost, GoalDriver, Session, SkillRegistry, COLLABORATION_TOOL_NAMES,
 };
 use ygg_ai::{
     AgentDelegation, AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model,
@@ -2771,10 +2771,20 @@ struct DiscoveredCodexModel {
     max_output_tokens: u64,
     min_effort: ygg_ai::ReasoningEffort,
     max_effort: ygg_ai::ReasoningEffort,
-    #[serde(default)]
     responses_lite: bool,
-    #[serde(default)]
+    // `Option<T>` normally treats a missing key as `None`; the custom decoder
+    // keeps explicit null valid while making incomplete dynamic metadata fail.
+    #[serde(deserialize_with = "deserialize_required_agent_delegation")]
     agent_delegation: Option<AgentDelegation>,
+}
+
+fn deserialize_required_agent_delegation<'de, D>(
+    deserializer: D,
+) -> Result<Option<AgentDelegation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<AgentDelegation> as serde::Deserialize>::deserialize(deserializer)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -2816,33 +2826,43 @@ fn codex_reasoning_range(
     entry: &serde_json::Value,
     model_id: &str,
 ) -> (ygg_ai::ReasoningEffort, ygg_ai::ReasoningEffort) {
-    let efforts = entry
+    let fallback = (ygg_ai::ReasoningEffort::Minimal, codex_max_effort(model_id));
+    let Some(levels) = entry
         .get("supported_reasoning_levels")
         .or_else(|| entry.get("supported_reasoning_efforts"))
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|level| {
-            level.as_str().or_else(|| {
-                level
-                    .get("effort")
-                    .or_else(|| level.get("value"))
-                    .and_then(serde_json::Value::as_str)
-            })
-        })
-        .filter_map(reasoning_effort)
-        .collect::<Vec<_>>();
-    let min = efforts
-        .iter()
-        .copied()
-        .min()
-        .unwrap_or(ygg_ai::ReasoningEffort::Minimal);
-    let max = efforts
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or_else(|| codex_max_effort(model_id));
-    (min, max)
+    else {
+        return fallback;
+    };
+    let Some(levels) = levels.as_array().filter(|levels| !levels.is_empty()) else {
+        return fallback;
+    };
+    let mut efforts = Vec::with_capacity(levels.len());
+    for level in levels {
+        let Some(value) = level.as_str().or_else(|| {
+            level
+                .get("effort")
+                .or_else(|| level.get("value"))
+                .and_then(serde_json::Value::as_str)
+        }) else {
+            return fallback;
+        };
+        let Some(effort) = reasoning_effort(value) else {
+            return fallback;
+        };
+        efforts.push(effort);
+    }
+    (
+        efforts
+            .iter()
+            .copied()
+            .min()
+            .expect("non-empty validated reasoning levels"),
+        efforts
+            .iter()
+            .copied()
+            .max()
+            .expect("non-empty validated reasoning levels"),
+    )
 }
 
 fn codex_models_from_response(
@@ -2891,16 +2911,20 @@ fn codex_models_from_response(
             positive_u64(entry, &["max_output_tokens", "max_completion_tokens"])
                 .unwrap_or(CODEX_MAX_OUTPUT_TOKENS)
                 .min(context_window);
-        let (min_effort, max_effort) = codex_reasoning_range(entry, id);
-        let responses_lite = entry
-            .get("use_responses_lite")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
         let agent_delegation = entry
             .get("multi_agent_version")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|version| version.eq_ignore_ascii_case("v2"))
             .then_some(AgentDelegation::V2);
+        let (mut min_effort, mut max_effort) = codex_reasoning_range(entry, id);
+        if agent_delegation != Some(AgentDelegation::V2) {
+            max_effort = max_effort.min(ygg_ai::ReasoningEffort::Max);
+            min_effort = min_effort.min(max_effort);
+        }
+        let responses_lite = entry
+            .get("use_responses_lite")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         models.push(DiscoveredCodexModel {
             id: id.to_owned(),
             context_window,
@@ -3070,7 +3094,7 @@ fn load_codex_model_cache(
     store: &crate::auth::codex::CredentialStore,
     claims: &crate::auth::codex::SubscriptionClaims,
 ) -> anyhow::Result<Option<Vec<DiscoveredCodexModel>>> {
-    let Some(bytes) = store.load_model_cache()? else {
+    let Some(bytes) = store.load_fresh_model_cache(CODEX_MODEL_CACHE_REFRESH_INTERVAL)? else {
         return Ok(None);
     };
     let cache: CodexModelCache =
@@ -3082,7 +3106,35 @@ fn load_codex_model_cache(
     {
         return Ok(None);
     }
+    let mut ids = std::collections::BTreeSet::new();
+    for model in &cache.models {
+        if model.id.trim() != model.id
+            || model.id.is_empty()
+            || !ids.insert(model.id.as_str())
+            || model.context_window == 0
+            || model.max_context_window < model.context_window
+            || model.max_output_tokens == 0
+            || model.max_output_tokens > model.context_window
+            || model.min_effort > model.max_effort
+            || (model.max_effort == ygg_ai::ReasoningEffort::Ultra
+                && model.agent_delegation != Some(AgentDelegation::V2))
+        {
+            anyhow::bail!("invalid Codex model cache: incomplete or inconsistent model metadata");
+        }
+    }
     Ok(Some(cache.models))
+}
+
+fn conservative_offline_codex_models(
+    mut models: Vec<DiscoveredCodexModel>,
+) -> Vec<DiscoveredCodexModel> {
+    for model in &mut models {
+        model.responses_lite = false;
+        model.agent_delegation = None;
+        model.max_effort = model.max_effort.min(ygg_ai::ReasoningEffort::Max);
+        model.min_effort = model.min_effort.min(model.max_effort);
+    }
+    models
 }
 
 fn fallback_codex_models(
@@ -3154,33 +3206,6 @@ fn discover_codex_models(
     .map_err(|_| anyhow::anyhow!("Codex model discovery thread panicked"))?
 }
 
-/// Refresh stale Codex inventory after startup has already selected the cached
-/// catalog. Only a comfortably unexpired token is used here, so the background
-/// refresh cannot race the request resolver's refresh-token rotation.
-fn schedule_codex_model_cache_refresh(store: crate::auth::codex::CredentialStore) {
-    if cfg!(test)
-        || !store
-            .model_cache_is_stale(CODEX_MODEL_CACHE_REFRESH_INTERVAL)
-            .unwrap_or(true)
-    {
-        return;
-    }
-    let token_is_fresh = store.load().ok().flatten().is_some_and(|credential| {
-        crate::auth::codex::now_unix().saturating_add(crate::auth::codex::REFRESH_SKEW_SECS)
-            < credential.expires_at
-    });
-    if !token_is_fresh {
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name("ygg-codex-catalog-refresh".to_owned())
-        .spawn(move || {
-            if let Ok(discovery) = discover_codex_models(store.clone()) {
-                let _ = save_codex_model_cache(&store, &discovery);
-            }
-        });
-}
-
 fn codex_user_agent() -> String {
     format!(
         "ygg/{} ({})",
@@ -3205,14 +3230,14 @@ fn register_openai_codex(
     };
 
     // Tests use synthetic JWTs and must not contact the production catalog.
-    // At runtime an account-and-plan-matched cache is authoritative for this
-    // launch and stale metadata refreshes after startup. This keeps a 10-second
-    // network timeout off the launch/resume critical path without widening the
-    // cache across accounts. A first launch still performs one bounded discovery
-    // to seed the cache, with the conservative built-in catalog as its fallback.
+    // At runtime only a fresh, account-and-plan-matched cache is authoritative
+    // for a launch. Stale or future-dated metadata is synchronously refreshed
+    // online and reduced to the conservative fallback offline, so dynamic
+    // capabilities can never survive past the freshness boundary. A first
+    // launch performs one bounded discovery to seed the cache.
     let models = if offline {
         match load_codex_model_cache(&store, &initial_claims) {
-            Ok(Some(models)) => models,
+            Ok(Some(models)) => conservative_offline_codex_models(models),
             Ok(None) => fallback_codex_models(initial_claims.plan.as_ref()),
             Err(error) => {
                 crate::output::stderr!(
@@ -3225,10 +3250,7 @@ fn register_openai_codex(
         fallback_codex_models(initial_claims.plan.as_ref())
     } else {
         match load_codex_model_cache(&store, &initial_claims) {
-            Ok(Some(models)) => {
-                schedule_codex_model_cache_refresh(store.clone());
-                models
-            }
+            Ok(Some(models)) => models,
             cache_result => match discover_codex_models(store.clone()) {
                 Ok(discovery) => {
                     if let Err(error) = save_codex_model_cache(&store, &discovery) {
@@ -3715,6 +3737,7 @@ fn validate_explicit_tool_policy(
     config: &Config,
     extensions: &ExtensionHost,
     model: &Model,
+    has_dynamic_tool_provider: bool,
 ) -> anyhow::Result<()> {
     let Some(requested) = config.tools.explicit_names() else {
         return Ok(());
@@ -3734,7 +3757,10 @@ fn validate_explicit_tool_policy(
         .collect::<std::collections::BTreeSet<_>>();
     let missing = requested
         .into_iter()
-        .filter(|name| !registered.contains(*name))
+        .filter(|name| {
+            !registered.contains(*name)
+                && (!has_dynamic_tool_provider || !config.tool_available(name))
+        })
         .collect::<Vec<_>>();
     if missing.is_empty() {
         Ok(())
@@ -3760,6 +3786,18 @@ fn configured_extensions(
 ) -> (ExtensionHost, ExecutableExtensions) {
     let mut extensions = ExtensionHost::new();
     extensions.load(&CoreTools);
+    let tool_config = config.clone();
+    let model_supports_tools = model.spec.capabilities.tools;
+    extensions
+        .set_tool_policy(move |name| model_supports_tools && tool_config.tool_available(name));
+    if matches!(
+        reasoning,
+        ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
+    ) && model_supports_ultra(model)
+    {
+        extensions.reserve_tool_names(COLLABORATION_TOOL_NAMES);
+    }
+    extensions.finalize_tool_surface();
     let executable_extensions = ExecutableExtensions::discover_and_start(
         config,
         session,
@@ -3768,7 +3806,6 @@ fn configured_extensions(
         sessions,
         &mut extensions,
     );
-    extensions.retain_tools(|name| model.spec.capabilities.tools && config.tool_available(name));
     (extensions, executable_extensions)
 }
 
@@ -3888,7 +3925,12 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     ));
     let (extensions, executable_extensions) =
         configured_extensions(&config, &session, &model, &reasoning, &sessions);
-    validate_explicit_tool_policy(&config, &extensions, &model)?;
+    validate_explicit_tool_policy(
+        &config,
+        &extensions,
+        &model,
+        executable_extensions.has_dynamic_tool_provider(),
+    )?;
     let goal_store = terminal_goal_store(&config)?;
     let goal_session_id = terminal_goal_session_id(&session)?;
     let goal_driver = GoalDriver::new(goal_store.clone(), goal_session_id.clone());
@@ -3915,8 +3957,9 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
     configure_v2_delegation(&mut agent, &model, &reasoning)?;
+    executable_extensions.bind_agent_sessions(&agent)?;
+    agent.finalize_tool_surface();
     let system_tokens = estimate_text_tokens(agent.system_prompt());
-    let tool_schema_tokens = tool_schema_reserve(&agent.registered_tool_definitions());
 
     Ok(App {
         agent,
@@ -3929,7 +3972,6 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         reasoning_mode,
         system,
         system_tokens,
-        tool_schema_tokens,
         skills,
         prompts,
         executable_extensions,
@@ -3988,6 +4030,7 @@ pub fn rebuild_app(
         .map(|id| catalog.resolve(id))
         .transpose()?;
     let changing_model = new_model.is_some() || restored_model.is_some();
+    let explicit_reasoning = new_reasoning.is_some();
     let old_model = model;
     let model = new_model
         .or(restored_model)
@@ -4002,9 +4045,15 @@ pub fn rebuild_app(
         }
         (None, None) => normalize_reasoning_for_model(&reasoning, &model)?,
     };
-    let requested_reasoning_mode = new_reasoning_mode
-        .or(persisted.reasoning_mode)
-        .unwrap_or(reasoning_mode);
+    let requested_reasoning_mode = if let Some(mode) = new_reasoning_mode {
+        mode
+    } else if explicit_reasoning {
+        // Rebuilds use the same precedence as startup: an explicit current
+        // effort supersedes the obsolete Pro bit persisted in a session.
+        ReasoningMode::Standard
+    } else {
+        persisted.reasoning_mode.unwrap_or(reasoning_mode)
+    };
     let (reasoning, reasoning_mode, migration_diagnostic) =
         normalize_reasoning_selection_for_model(&reasoning, requested_reasoning_mode, &model)?;
     if let Some(diagnostic) = migration_diagnostic {
@@ -4066,7 +4115,12 @@ pub fn rebuild_app(
     ));
     let (extensions, executable_extensions) =
         configured_extensions(&config, &session, &model, &reasoning, &sessions);
-    validate_explicit_tool_policy(&config, &extensions, &model)?;
+    validate_explicit_tool_policy(
+        &config,
+        &extensions,
+        &model,
+        executable_extensions.has_dynamic_tool_provider(),
+    )?;
     let mut agent = Agent::new(AgentConfig {
         client: client.clone(),
         model: model.clone(),
@@ -4090,8 +4144,9 @@ pub fn rebuild_app(
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
     configure_v2_delegation(&mut agent, &model, &reasoning)?;
+    executable_extensions.bind_agent_sessions(&agent)?;
+    agent.finalize_tool_surface();
     let system_tokens = estimate_text_tokens(agent.system_prompt());
-    let tool_schema_tokens = tool_schema_reserve(&agent.registered_tool_definitions());
 
     Ok(App {
         agent,
@@ -4104,7 +4159,6 @@ pub fn rebuild_app(
         reasoning_mode,
         system,
         system_tokens,
-        tool_schema_tokens,
         skills,
         prompts,
         executable_extensions,

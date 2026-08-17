@@ -262,6 +262,7 @@ async fn run_prompt(
             return Ok(PromptExit::Finished(HostRunOutcome::Failed(reason)));
         }
     };
+    let extension_turn = app.executable_extensions.begin_turn().await;
     app.executable_extensions
         .commit_prompt_context(pending_context_count);
     tracker.awaiting_provider(run_id);
@@ -508,6 +509,9 @@ async fn run_prompt(
         }
     };
     drop(run);
+    app.executable_extensions
+        .settle_turn(extension_turn, &outcome)
+        .await;
     app.agent.set_system_prompt(app.system.clone());
     if outcome.shutdown_requested() {
         let _ = tokio::time::timeout(

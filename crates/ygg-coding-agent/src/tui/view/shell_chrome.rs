@@ -152,7 +152,10 @@ pub(super) fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> Shel
     }
     remaining = remaining.saturating_sub(suggestions.len());
 
-    let pending_limit = remaining.min(4);
+    // Queued steering may expand enough to show wrapped prompts, but remains
+    // bounded to roughly one quarter of the viewport so transcript activity
+    // stays visible on constrained terminals.
+    let pending_limit = remaining.min((rows / 4).clamp(4, 8));
     let pending = render_pending_steering(state, width, pending_limit);
     remaining = remaining.saturating_sub(pending.len());
 

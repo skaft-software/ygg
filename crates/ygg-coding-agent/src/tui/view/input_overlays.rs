@@ -1,6 +1,6 @@
 //! Composer-adjacent slash, mention, and queued-steering overlays.
 
-use sexy_tui_rs::visible_width;
+use sexy_tui_rs::{truncate_to_width, visible_width, wrap_text_with_ansi};
 
 use super::{activity_elbow, fit_line, semantic_separator, ShellState, ACTIVITY_DETAIL_INDENT};
 use crate::commands;
@@ -342,6 +342,30 @@ pub(super) fn render_input_suggestions(
     }
 }
 
+fn steering_message_rows(state: &ShellState, message: &str, content_width: usize) -> Vec<String> {
+    let safe = super::sanitize_for_terminal(message);
+    let newline_marker = if state.theme.unicode() {
+        " ↵\n"
+    } else {
+        " /\n"
+    };
+    wrap_text_with_ansi(&safe.replace('\n', newline_marker), content_width.max(1))
+}
+
+fn clipped_steering_content(state: &ShellState, content: &str, width: usize) -> String {
+    let suffix = if state.theme.unicode() {
+        " …"
+    } else {
+        " ..."
+    };
+    let suffix_width = visible_width(suffix);
+    if width <= suffix_width {
+        return truncate_to_width(suffix.trim_start(), width, Some(""));
+    }
+    let body = truncate_to_width(content, width - suffix_width, Some(""));
+    format!("{}{suffix}", body.trim_end())
+}
+
 pub(super) fn render_pending_steering(
     state: &ShellState,
     width: u16,
@@ -361,40 +385,108 @@ pub(super) fn render_pending_steering(
             count
         )
     };
-    let mut lines = vec![format!(
-        "{ACTIVITY_DETAIL_INDENT}{}",
-        state.theme.bold(&state.theme.fg("model_accent", &heading))
+    let mut lines = vec![fit_line(
+        &format!(
+            "{ACTIVITY_DETAIL_INDENT}{}",
+            state.theme.bold(&state.theme.fg("model_accent", &heading))
+        ),
+        width,
     )];
     let item_rows = max_rows.saturating_sub(1);
     if item_rows == 0 {
         return lines;
     }
 
-    let visible = state.steering_queue.len().min(item_rows);
-    for message in state.steering_queue.iter().take(visible) {
-        // Keep each queued message on one predictable row so a burst of
-        // steering prompts cannot consume the whole transcript viewport.
-        let line_separator = if state.theme.unicode() {
-            " ↵ "
-        } else {
-            " / "
-        };
-        let compact =
-            super::sanitize_for_terminal(&message.display).replace(['\r', '\n'], line_separator);
-        let prefix = format!(
-            "{ACTIVITY_DETAIL_INDENT}{} ",
-            state.theme.fg("model_accent", activity_elbow(&state.theme))
-        );
-        let line = format!("{prefix}{}", state.theme.fg("muted", &compact));
-        lines.push(fit_line(&line, width));
+    let elbow = activity_elbow(&state.theme);
+    let plain_prefix = format!("{ACTIVITY_DETAIL_INDENT}{elbow} ");
+    let prefix_width = visible_width(&plain_prefix);
+    let content_width = usize::from(width).saturating_sub(prefix_width).max(1);
+    let first_prefix = format!(
+        "{ACTIVITY_DETAIL_INDENT}{} ",
+        state.theme.fg("model_accent", elbow)
+    );
+    let continuation = " ".repeat(prefix_width);
+    let wrapped = state
+        .steering_queue
+        .iter()
+        .map(|message| steering_message_rows(state, &message.display, content_width))
+        .collect::<Vec<_>>();
+    let total_message_rows = wrapped.iter().map(Vec::len).sum::<usize>();
+
+    let needs_overflow = total_message_rows > item_rows;
+    // On a severely constrained viewport, showing one useful preview is better
+    // than spending the only item row restating the count already in the heading.
+    let summary_rows = usize::from(needs_overflow && item_rows > 1);
+    let content_budget = item_rows.saturating_sub(summary_rows);
+    let visible_messages = wrapped.len().min(content_budget);
+    let mut allocations = vec![0usize; visible_messages];
+
+    // Every visible prompt gets a preview before any one prompt claims a second
+    // row. Extra rows are then shared round-robin in queue order.
+    allocations.fill(1);
+    let mut unallocated = content_budget.saturating_sub(visible_messages);
+    while unallocated > 0 {
+        let mut made_progress = false;
+        for (index, allocation) in allocations.iter_mut().enumerate() {
+            if *allocation < wrapped[index].len() {
+                *allocation += 1;
+                unallocated -= 1;
+                made_progress = true;
+                if unallocated == 0 {
+                    break;
+                }
+            }
+        }
+        if !made_progress {
+            break;
+        }
     }
-    let hidden = state.steering_queue.len().saturating_sub(visible);
-    if hidden > 0 {
-        lines.push(state.theme.dim(&format!(
-            "{ACTIVITY_DETAIL_INDENT}{} {hidden} more steering prompts",
-            if state.theme.unicode() { "…" } else { "..." }
-        )));
+
+    let mut clipped_messages = 0usize;
+    for (message_index, allocation) in allocations.iter().copied().enumerate() {
+        let message_rows = &wrapped[message_index];
+        let clipped = allocation < message_rows.len();
+        clipped_messages += usize::from(clipped);
+        for (row_index, content) in message_rows.iter().take(allocation).enumerate() {
+            let content = if clipped && row_index + 1 == allocation {
+                clipped_steering_content(state, content, content_width)
+            } else {
+                content.clone()
+            };
+            let prefix = if row_index == 0 {
+                first_prefix.as_str()
+            } else {
+                continuation.as_str()
+            };
+            lines.push(fit_line(
+                &format!("{prefix}{}", state.theme.fg("muted", &content)),
+                width,
+            ));
+        }
     }
-    lines.truncate(max_rows);
+
+    let hidden_messages = wrapped.len().saturating_sub(visible_messages);
+    if summary_rows > 0 {
+        let mut details = Vec::with_capacity(2);
+        if clipped_messages > 0 {
+            details.push(format!(
+                "{clipped_messages} prompt{} clipped",
+                if clipped_messages == 1 { "" } else { "s" }
+            ));
+        }
+        if hidden_messages > 0 {
+            details.push(format!("{hidden_messages} more queued"));
+        }
+        let ellipsis = if state.theme.unicode() { "…" } else { "..." };
+        lines.push(fit_line(
+            &state.theme.dim(&format!(
+                "{ACTIVITY_DETAIL_INDENT}{ellipsis} {}",
+                details.join(semantic_separator(&state.theme))
+            )),
+            width,
+        ));
+    }
+
+    debug_assert!(lines.len() <= max_rows);
     lines
 }

@@ -1325,10 +1325,10 @@ fn steering_messages_are_queued_above_prompt_and_delivered_as_a_batch() {
     assert!(queue < prompt);
     assert!(plain
         .iter()
-        .any(|line| line.starts_with("  ⎿ check the docs")));
+        .any(|line| line.starts_with("  └ check the docs")));
     assert!(plain
         .iter()
-        .any(|line| line.starts_with("  ⎿ then run the tests")));
+        .any(|line| line.starts_with("  └ then run the tests")));
 
     shell.on_agent_event(&AgentEvent::SteeringDelivered {
         messages: vec!["check the docs".into(), "then run the tests".into()],
@@ -1339,6 +1339,87 @@ fn steering_messages_are_queued_above_prompt_and_delivered_as_a_batch() {
     assert!(!render_shell(&shell.state.borrow(), 120)
         .iter()
         .any(|line| line.contains("Steering prompts")));
+}
+
+#[test]
+fn steering_messages_wrap_with_hanging_indents_when_space_permits() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.queue_steering(&ComposedInput::from_text(
+        "i'm sending you a longer steering prompt just because i want to see how ygg's tui handles showing this in the queued prompts area".into(),
+    ));
+
+    let rendered = input_overlays::render_pending_steering(&shell.state.borrow(), 71, 8)
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>();
+
+    assert_eq!(rendered.len(), 3, "{rendered:?}");
+    assert!(rendered[1].starts_with("  └ i'm sending"), "{rendered:?}");
+    assert!(rendered[2].starts_with("    "), "{rendered:?}");
+    assert!(rendered[2].contains("ygg's tui"), "{rendered:?}");
+    assert!(!rendered.join("\n").contains("clipped"), "{rendered:?}");
+}
+
+#[test]
+fn steering_messages_preserve_explicit_newlines() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.queue_steering(&ComposedInput::from_text(
+        "first line\nsecond 👩‍💻 line".into(),
+    ));
+
+    let rendered = input_overlays::render_pending_steering(&shell.state.borrow(), 40, 8)
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>();
+
+    assert!(rendered[1].contains("first line ↵"), "{rendered:?}");
+    assert!(
+        rendered[2].starts_with("    second 👩‍💻 line"),
+        "{rendered:?}"
+    );
+    assert!(rendered.iter().all(|line| visible_width(line) <= 40));
+}
+
+#[test]
+fn steering_overflow_is_fair_and_explicit() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.queue_steering(&ComposedInput::from_text(
+        "first prompt has enough words to require several wrapped display rows".into(),
+    ));
+    shell.queue_steering(&ComposedInput::from_text(
+        "second prompt also has enough words to require several wrapped rows".into(),
+    ));
+
+    let rendered = input_overlays::render_pending_steering(&shell.state.borrow(), 30, 5)
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>();
+    let joined = rendered.join("\n");
+
+    assert_eq!(rendered.len(), 5, "{rendered:?}");
+    assert!(joined.contains("└ first prompt"), "{rendered:?}");
+    assert!(joined.contains("└ second prompt"), "{rendered:?}");
+    assert!(joined.contains("2 prompts clipped"), "{rendered:?}");
+    assert!(rendered.iter().all(|line| visible_width(line) <= 30));
+}
+
+#[test]
+fn steering_overflow_reports_entirely_hidden_prompts() {
+    let mut shell = InteractiveShell::test_shell();
+    for index in 1..=5 {
+        shell.queue_steering(&ComposedInput::from_text(format!("prompt {index}")));
+    }
+
+    let rendered = input_overlays::render_pending_steering(&shell.state.borrow(), 40, 4)
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>();
+    let joined = rendered.join("\n");
+
+    assert_eq!(rendered.len(), 4, "{rendered:?}");
+    assert!(joined.contains("└ prompt 1"), "{rendered:?}");
+    assert!(joined.contains("└ prompt 2"), "{rendered:?}");
+    assert!(joined.contains("3 more queued"), "{rendered:?}");
 }
 
 #[test]
@@ -3308,7 +3389,7 @@ fn short_transcript_chrome_follows_content_without_viewport_padding() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(steering_plain.contains("Steering prompt · queued"));
-    assert!(steering_plain.contains("  ⎿ also inspect tests"));
+    assert!(steering_plain.contains("  └ also inspect tests"));
 
     // The native-scrollback renderer retains committed transcript rows and
     // returns only the mutable suffix after the first frame.
@@ -4638,7 +4719,7 @@ fn collapsed_reasoning_uses_a_margin_dot_without_an_expanded_content_bullet() {
     );
     assert_eq!(
             visual_column(reasoning_line, "Thinking"),
-            visual_column(disclosure_line, "⎿"),
+            visual_column(disclosure_line, "└"),
             "the disclosure elbow must descend from the first label character: {reasoning_line:?} vs {disclosure_line:?}"
         );
 }

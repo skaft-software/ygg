@@ -276,6 +276,7 @@ async fn run_sandboxed_bash(
         workspace: &workspace,
         sandbox: &sandbox,
         execution_scope: "rpc-bash",
+        resource_owner: "rpc-bash",
         active_skills: &active_skills,
         registered_tools: &registered_tools,
         progress: ToolProgressSink::null(),
@@ -1517,7 +1518,10 @@ impl EventTranslator {
                     .remove(&id.0)
                     .unwrap_or_else(|| (String::new(), Value::Null, String::new()));
                 let (text, is_error) = match result {
-                    Ok(output_value) => (output_value.text, false),
+                    Ok(output_value) => {
+                        let is_error = output_value.is_error();
+                        (output_value.text, is_error)
+                    }
                     Err(error) => (error.to_string(), true),
                 };
                 let result = json!({"content": [{"type": "text", "text": text}]});
@@ -2528,6 +2532,7 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
                 continue;
             }
         };
+        let extension_turn = app.executable_extensions.begin_turn().await;
         app.executable_extensions
             .commit_prompt_context(pending_context_count);
         output.success(id.as_deref(), "prompt", None)?;
@@ -2551,6 +2556,9 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
         )
         .await?;
         drop(run);
+        app.executable_extensions
+            .settle_turn(extension_turn, &finish)
+            .await;
         app.agent.set_system_prompt(app.system.clone());
         if finish.shutdown_requested() {
             app.executable_extensions.shutdown().await;

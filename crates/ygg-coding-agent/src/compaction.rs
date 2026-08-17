@@ -134,7 +134,7 @@ pub fn estimate_next_request_tokens(app: &App, pending: &[InputPart]) -> u64 {
                 .map(|messages| estimate_messages_tokens(&messages))
                 .unwrap_or_default()
                 .saturating_add(app.system_tokens)
-                .saturating_add(app.tool_schema_tokens)
+                .saturating_add(app.current_tool_schema_tokens())
                 .saturating_add(FRAMING_OVERHEAD_TOKENS)
         });
     current_request

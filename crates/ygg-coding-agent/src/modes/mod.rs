@@ -78,6 +78,32 @@ impl HostRunOutcome {
             Self::Shutdown => Some(RUN_SHUTDOWN_MESSAGE),
         }
     }
+
+    /// Maps the shared host terminal boundary onto API 0.2's observational
+    /// lifecycle outcome without changing frontend exit semantics.
+    pub fn extension_lifecycle_outcome(&self) -> ygg_agent::ExtensionLifecycleOutcome {
+        match self {
+            Self::Completed => ygg_agent::ExtensionLifecycleOutcome::Completed,
+            Self::Aborted => ygg_agent::ExtensionLifecycleOutcome::Cancelled,
+            Self::MaxTurns => ygg_agent::ExtensionLifecycleOutcome::LimitReached,
+            Self::Failed(_) => ygg_agent::ExtensionLifecycleOutcome::Failed,
+            Self::StreamLost => ygg_agent::ExtensionLifecycleOutcome::FrontendDisconnected,
+            Self::Shutdown => ygg_agent::ExtensionLifecycleOutcome::Shutdown,
+        }
+    }
+}
+
+/// Filesystem-safe timestamp seed for new session filenames.
+pub fn timestamp() -> String {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!(
+        "{}-{:09}-{}",
+        elapsed.as_secs(),
+        elapsed.subsec_nanos(),
+        std::process::id()
+    )
 }
 
 #[cfg(test)]
@@ -145,6 +171,23 @@ mod tests {
     }
 
     #[test]
+    fn every_host_terminal_outcome_has_an_api_0_2_lifecycle_outcome() {
+        use ygg_agent::ExtensionLifecycleOutcome as Lifecycle;
+
+        let cases = [
+            (HostRunOutcome::Completed, Lifecycle::Completed),
+            (HostRunOutcome::Aborted, Lifecycle::Cancelled),
+            (HostRunOutcome::MaxTurns, Lifecycle::LimitReached),
+            (HostRunOutcome::Failed("failed".into()), Lifecycle::Failed),
+            (HostRunOutcome::StreamLost, Lifecycle::FrontendDisconnected),
+            (HostRunOutcome::Shutdown, Lifecycle::Shutdown),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(outcome.extension_lifecycle_outcome(), expected);
+        }
+    }
+
+    #[test]
     fn nonterminal_events_do_not_settle_the_host_boundary() {
         let event = AgentEvent::OutputDelta {
             channel: ygg_agent::OutputChannel::Text,
@@ -171,17 +214,4 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(outcomes, vec![HostRunOutcome::Completed]);
     }
-}
-
-/// Filesystem-safe timestamp seed for new session filenames.
-pub fn timestamp() -> String {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!(
-        "{}-{:09}-{}",
-        elapsed.as_secs(),
-        elapsed.subsec_nanos(),
-        std::process::id()
-    )
 }

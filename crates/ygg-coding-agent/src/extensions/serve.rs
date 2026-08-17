@@ -5627,6 +5627,7 @@ async fn start_and_drive_run(
             });
         }
     };
+    let extension_turn = app.executable_extensions.begin_turn().await;
     let mut context_projection = RunContextProjection::new(
         project_instruction_tokens,
         document_context_tokens,
@@ -5767,6 +5768,9 @@ async fn start_and_drive_run(
         }
     }
     let final_context_snapshot = run.into_context_snapshot();
+    app.executable_extensions
+        .settle_turn(extension_turn, &outcome)
+        .await;
     publish_context_snapshot(
         final_context_snapshot,
         &run_id,

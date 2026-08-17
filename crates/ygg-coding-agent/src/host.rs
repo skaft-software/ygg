@@ -843,6 +843,7 @@ async fn run_request(
                 "resolved_model": app.model.spec.id.0,
                 "session_file": session_path,
                 "registered_tools": app.agent.registered_tool_names(),
+                "extensions": app.executable_extensions.summaries(),
             }),
         )
         .await?;
@@ -885,6 +886,7 @@ async fn run_request(
             )
         ),
     };
+    let extension_turn = app.executable_extensions.begin_turn().await;
     let control = run.control();
     app.executable_extensions
         .commit_prompt_context(pending_context_count);
@@ -1023,7 +1025,7 @@ async fn run_request(
                     .await?;
             }
             AgentEvent::ToolFinished { id, result } => {
-                if result.is_ok() {
+                if result.as_ref().is_ok_and(|output| !output.is_error()) {
                     if let Some((name, args)) = active_tools.get(&id.0) {
                         if matches!(name.as_str(), "edit" | "write") {
                             if let Some(path) = args.get("path").and_then(serde_json::Value::as_str)
@@ -1034,6 +1036,9 @@ async fn run_request(
                     }
                 }
                 let (ok, output, error) = match result {
+                    Ok(output) if output.is_error() => {
+                        (false, String::new(), clip_text(&output.text, 64 * 1024))
+                    }
                     Ok(output) => (true, clip_text(&output.text, 64 * 1024), String::new()),
                     Err(error) => (
                         false,
@@ -1105,6 +1110,9 @@ async fn run_request(
         }
     };
     drop(run);
+    app.executable_extensions
+        .settle_turn(extension_turn, &outcome)
+        .await;
     app.agent.set_system_prompt(app.system.clone());
     let (status, terminal_error) = match &outcome {
         HostRunOutcome::Completed => ("completed", String::new()),

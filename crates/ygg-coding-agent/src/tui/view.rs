@@ -952,7 +952,7 @@ pub(crate) const ACTIVITY_DETAIL_INDENT: &str = "  ";
 /// and collapsed thinking visually aligned without repurposing tree glyphs.
 pub(crate) fn activity_elbow(theme: &YggTheme) -> &'static str {
     if theme.unicode() {
-        "⎿"
+        "└"
     } else {
         "`-"
     }

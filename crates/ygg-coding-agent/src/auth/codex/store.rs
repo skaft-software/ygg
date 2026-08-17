@@ -3,6 +3,7 @@
 //! File-backed credential store at `~/.ygg/credentials/codex.json` (mode 0600).
 
 use std::fmt;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -138,6 +139,19 @@ impl CredentialStore {
         self.path.with_file_name(format!("{stem}-models.json"))
     }
 
+    fn open_model_cache(&self) -> Result<Option<std::fs::File>> {
+        let path = self.model_cache_path();
+        match ygg_agent::secure_fs::open_private_file_for_read(&path) {
+            Ok(file) => Ok(Some(file)),
+            Err(ygg_agent::secure_fs::SecureFileError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(anyhow::anyhow!("refusing {}: {error}", path.display())),
+        }
+    }
+
     fn migration_marker_path(&self) -> PathBuf {
         let stem = self
             .path
@@ -246,13 +260,6 @@ impl CredentialStore {
             .with_context(|| format!("writing migration marker {}", path.display()))
     }
 
-    /// Load the account-scoped model cache, if present.
-    pub(crate) fn load_model_cache(&self) -> Result<Option<Vec<u8>>> {
-        let path = self.model_cache_path();
-        crate::auth::read_bounded_private(&path, MAX_MODEL_CACHE_BYTES)
-            .with_context(|| format!("reading {}", path.display()))
-    }
-
     /// Persist account-scoped model metadata with owner-only permissions.
     pub(crate) fn save_model_cache(&self, bytes: &[u8]) -> Result<()> {
         let path = self.model_cache_path();
@@ -260,16 +267,44 @@ impl CredentialStore {
         write_private(&path, bytes).with_context(|| format!("writing {}", path.display()))
     }
 
-    /// Whether cached model metadata should be refreshed in the background.
-    /// Future-dated cache entries are stale so a clock error cannot pin data.
-    pub(crate) fn model_cache_is_stale(&self, max_age: std::time::Duration) -> Result<bool> {
+    /// Load model metadata only when the exact descriptor being read is fresh.
+    pub(crate) fn load_fresh_model_cache(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<Option<Vec<u8>>> {
         let path = self.model_cache_path();
-        let modified = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata.modified()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        let Some(mut file) = self.open_model_cache()? else {
+            return Ok(None);
         };
-        Ok(cache_modified_is_stale(modified, max_age))
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("reading {}", path.display()))?;
+        let modified = metadata
+            .modified()
+            .with_context(|| format!("reading modification time for {}", path.display()))?;
+        if cache_modified_is_stale(modified, max_age) {
+            return Ok(None);
+        }
+        if metadata.len() > MAX_MODEL_CACHE_BYTES as u64 {
+            anyhow::bail!(
+                "model cache {} exceeds the {}-byte limit",
+                path.display(),
+                MAX_MODEL_CACHE_BYTES
+            );
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        (&mut file)
+            .take(MAX_MODEL_CACHE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if bytes.len() > MAX_MODEL_CACHE_BYTES {
+            anyhow::bail!(
+                "model cache {} exceeds the {}-byte limit",
+                path.display(),
+                MAX_MODEL_CACHE_BYTES
+            );
+        }
+        Ok(Some(bytes))
     }
 
     /// Persist a credential with owner-only permissions. The file is created
@@ -505,6 +540,26 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn model_cache_freshness_refuses_symlinked_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(directory.path().join("credentials/codex.json"));
+        let cache = store.model_cache_path();
+        prepare_private_parent(&cache).unwrap();
+        let target = directory.path().join("unrelated-model-cache");
+        std::fs::write(&target, b"unchanged").unwrap();
+        symlink(&target, &cache).unwrap();
+
+        let error = store
+            .load_fresh_model_cache(std::time::Duration::from_secs(60))
+            .unwrap_err();
+        assert!(error.to_string().contains("refusing"), "{error:#}");
+        assert_eq!(std::fs::read(target).unwrap(), b"unchanged");
+    }
+
     #[test]
     fn debug_output_redacts_tokens_and_account_identity() {
         let debug = format!("{:?}", sample());
@@ -539,7 +594,10 @@ mod tests {
 
         store.save_model_cache(br#"{"version":1}"#).unwrap();
         assert_eq!(
-            store.load_model_cache().unwrap().unwrap(),
+            store
+                .load_fresh_model_cache(std::time::Duration::from_secs(60))
+                .unwrap()
+                .unwrap(),
             br#"{"version":1}"#
         );
         assert!(store.model_cache_path().exists());

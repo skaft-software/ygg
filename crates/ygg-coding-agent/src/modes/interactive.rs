@@ -1382,7 +1382,7 @@ where
                     if let AgentEvent::ToolFinished { id, result } = &event {
                         if let Some((name, arguments)) = extension_tool_calls.remove(id) {
                             let (output, is_error) = match result {
-                                Ok(output) => (Some(output.text.clone()), false),
+                                Ok(output) => (Some(output.text.clone()), output.is_error()),
                                 Err(error) => (Some(error.message.clone()), true),
                             };
                             executable_extensions.request_tool_render(
@@ -3169,6 +3169,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         continue;
                     }
                 };
+                let extension_turn = app.executable_extensions.begin_turn().await;
                 app.executable_extensions
                     .commit_prompt_context(pending_context_count);
                 prepare_prompt(&mut shell);
@@ -3196,6 +3197,9 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 )
                 .await?;
                 drop(run);
+                app.executable_extensions
+                    .settle_turn(extension_turn, &ended)
+                    .await;
                 app.agent.set_system_prompt(app.system.clone());
                 if crate::tui::terminal::received_shutdown_signal().is_some() {
                     shutdown_for_exit(&mut app).await;

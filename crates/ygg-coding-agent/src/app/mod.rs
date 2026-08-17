@@ -96,13 +96,8 @@ pub fn thinking_to_reasoning(
     } else {
         level.to_effort()
     };
-    let effort = raise_effort(
-        clamp_effort(
-            requested,
-            reasoning_effort_ceiling(model, capability.max_effort),
-        ),
-        capability.min_effort,
-    );
+    let ceiling = reasoning_effort_ceiling(model, capability.max_effort);
+    let effort = clamp_effort(raise_effort(requested, capability.min_effort), ceiling);
     let effort = match &capability.openai_chat_mode {
         OpenAiChatReasoningMode::ProviderValues { values, .. }
             if capability.control == ReasoningControl::Effort =>
@@ -119,6 +114,7 @@ pub fn thinking_to_reasoning(
                     "ultra" => Some(ReasoningEffort::Ultra),
                     _ => None,
                 })
+                .filter(|supported| *supported <= ceiling)
                 .collect::<Vec<_>>();
             supported
                 .iter()
@@ -410,13 +406,20 @@ pub struct App {
     pub reasoning_mode: ReasoningMode,
     pub system: String,
     pub system_tokens: u64,
-    pub tool_schema_tokens: u64,
     pub skills: Arc<dyn ygg_agent::skills::SkillRegistry>,
     pub prompts: Arc<PromptRegistry>,
     pub executable_extensions: crate::extensions::ExecutableExtensions,
     pub goal_store: Arc<DurableGoalStore>,
     pub goal_driver: GoalDriver,
     pub goal_session_id: String,
+}
+
+impl App {
+    /// Current provider-visible tool schema reserve, including live extension
+    /// catalog changes published after application bootstrap.
+    pub fn current_tool_schema_tokens(&self) -> u64 {
+        crate::app::bootstrap::tool_schema_reserve(&self.agent.registered_tool_definitions())
+    }
 }
 
 impl Drop for App {
@@ -487,6 +490,42 @@ mod tests {
         assert_eq!(reasoning, ReasoningConfig::Effort(ReasoningEffort::Ultra));
         assert_eq!(mode, ReasoningMode::Standard);
         assert!(diagnostic.unwrap().contains("migrated"));
+    }
+
+    #[test]
+    fn ultra_floor_cannot_override_the_effective_runtime_ceiling() {
+        let model = model_with(Some(ReasoningCapability {
+            control: ReasoningControl::Effort,
+            exposes_text: true,
+            preserves_state: true,
+            effort_budgets: None,
+            openai_chat_mode: ygg_ai::OpenAiChatReasoningMode::Standard,
+            min_effort: ReasoningEffort::Ultra,
+            max_effort: ReasoningEffort::Ultra,
+        }));
+
+        assert_eq!(
+            thinking_to_reasoning(ThinkingLevel::Ultra, &model).unwrap(),
+            ReasoningConfig::Effort(ReasoningEffort::Max)
+        );
+
+        let provider_values = model_with(Some(ReasoningCapability {
+            control: ReasoningControl::Effort,
+            exposes_text: true,
+            preserves_state: true,
+            effort_budgets: None,
+            openai_chat_mode: OpenAiChatReasoningMode::ProviderValues {
+                values: vec!["ultra".into()],
+                default: Some("ultra".into()),
+                system_message: true,
+            },
+            min_effort: ReasoningEffort::Ultra,
+            max_effort: ReasoningEffort::Ultra,
+        }));
+        assert_eq!(
+            thinking_to_reasoning(ThinkingLevel::Ultra, &provider_values).unwrap(),
+            ReasoningConfig::Effort(ReasoningEffort::Max)
+        );
     }
 
     #[test]

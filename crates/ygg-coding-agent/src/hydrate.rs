@@ -620,6 +620,7 @@ mod tests {
                     display_text: None,
                     run_outcome: None,
                     local_synthetic_assistant: false,
+                    tool_output: None,
                 }),
             )
             .unwrap();
@@ -640,6 +641,7 @@ mod tests {
                     display_text: None,
                     run_outcome: None,
                     local_synthetic_assistant: false,
+                    tool_output: None,
                 }),
             )
             .unwrap();

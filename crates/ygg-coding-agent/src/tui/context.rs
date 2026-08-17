@@ -94,7 +94,7 @@ impl ContextReport {
         let known_input = app
             .system_tokens
             .saturating_add(skills)
-            .saturating_add(app.tool_schema_tokens)
+            .saturating_add(app.current_tool_schema_tokens())
             .saturating_add(messages)
             .saturating_add(pending_tokens);
         let framing = structural_input.saturating_sub(known_input);
@@ -138,7 +138,7 @@ impl ContextReport {
             ContextSlice {
                 kind: ContextKind::Tools,
                 label: "Tool schemas".into(),
-                tokens: app.tool_schema_tokens,
+                tokens: app.current_tool_schema_tokens(),
             },
             ContextSlice {
                 kind: ContextKind::Messages,

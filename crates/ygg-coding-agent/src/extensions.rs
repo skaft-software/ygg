@@ -15,22 +15,28 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use tokio::runtime::{Handle, RuntimeFlavor};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use ygg_agent::extension_process::{
     ConfirmationRequest, ConfirmationResponse, ContextContribution, ContextPlacement,
-    DiscoveredExtension, ExtensionEvent, ExtensionHook, ExtensionHookDisposition,
-    ExtensionHostState, ExtensionManifest, ExtensionPolicy, ExtensionProcess, ExtensionRequestId,
+    DiscoveredExtension, ExtensionEvent, ExtensionHealthSnapshot, ExtensionHealthState,
+    ExtensionHook, ExtensionHookDisposition, ExtensionHostState, ExtensionInputResponse,
+    ExtensionLifecycleEvent, ExtensionLifecycleOutcome, ExtensionManifest, ExtensionPolicy,
+    ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
     ExtensionRuntimeConfig, ExtensionSource, ExtensionTrust, ExtensionUiSurface, ToolRenderRequest,
-    ToolRenderSegment, EXTENSION_MANIFEST_FILENAME,
+    ToolRenderSegment, EXTENSION_API_VERSION_0_1, EXTENSION_FEATURE_DYNAMIC_TOOLS,
+    EXTENSION_MANIFEST_FILENAME,
 };
-use ygg_agent::{ExtensionHost, Session};
+use ygg_agent::{Agent, ExtensionHost, ExtensionPolicyDecision, Session};
 use ygg_ai::{AssistantMessage, AssistantPart, Message, Model, ReasoningConfig, ToolCallId};
 
+use crate::app::model_supports_ultra;
 use crate::config::Config;
 use crate::resource_resolver::{
     ResolvedResource, ResourceDiagnosticLevel, ResourceKind, ResourceResolver, ResourceScope,
@@ -48,12 +54,16 @@ const PROMPT_RPC_DEADLINE: Duration = Duration::from_secs(5);
 const AFTER_RESPONSE_RPC_DEADLINE: Duration = Duration::from_secs(2);
 const STATUS_RPC_DEADLINE: Duration = Duration::from_millis(250);
 const RENDERER_RPC_DEADLINE: Duration = Duration::from_millis(500);
+const LIFECYCLE_NOTIFY_DEADLINE: Duration = Duration::from_millis(250);
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 const BACKGROUND_UPDATE_CAPACITY: usize = 64;
 const EVENT_DRAIN_BUDGET: usize = 64;
 const EVENT_DRAIN_PER_RECEIVER_BUDGET: usize = 8;
 const CONFIRMATION_DENIAL_QUEUE_CAPACITY: usize = 64;
 const CONFIRMATION_DENIAL_CONCURRENCY: usize = 8;
+const INPUT_CANCELLATION_QUEUE_CAPACITY: usize = 64;
+const INPUT_CANCELLATION_CONCURRENCY: usize = 8;
+static NEXT_EXTENSION_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(serde::Serialize)]
 struct BeforePromptHookPayload<'a> {
@@ -71,6 +81,13 @@ fn before_prompt_hook_payload(prompt: &str) -> serde_json::Value {
 
 fn after_response_hook_payload(response: &str) -> serde_json::Value {
     serde_json::json!(AfterResponseHookPayload { response })
+}
+
+fn denied_policy_response() -> ExtensionPolicyEvaluationResponse {
+    ExtensionPolicyEvaluationResponse {
+        decision: ExtensionPolicyDecision::Deny,
+        approval_token: None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,7 +235,7 @@ pub trait ExtensionConfirmationHandler {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<bool>> + 'a>>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ExtensionSummary {
     pub name: String,
     pub version: String,
@@ -227,6 +244,9 @@ pub struct ExtensionSummary {
     pub enabled: bool,
     pub trusted: bool,
     pub running: bool,
+    pub api_version: String,
+    pub negotiated_features: Vec<String>,
+    pub health: Option<ExtensionHealthSnapshot>,
     pub tools: Vec<String>,
     pub commands: Vec<String>,
     pub hooks: Vec<ExtensionHook>,
@@ -386,9 +406,179 @@ pub struct ExecutableExtensions {
     event_drain_cursor: usize,
     confirmation_denials: VecDeque<PendingConfirmationDenial>,
     confirmation_tasks: Vec<JoinHandle<()>>,
+    input_cancellations: VecDeque<PendingInputCancellation>,
+    input_tasks: Vec<JoinHandle<()>>,
+    policy_supervisors: Vec<JoinHandle<()>>,
+    session_id: Option<String>,
+    resource_owner: Option<String>,
+    session_started_at: Instant,
+    session_lifecycle_started: bool,
+    last_lifecycle_outcome: Option<ExtensionLifecycleOutcome>,
+    #[cfg(test)]
+    lifecycle_delivery_test_control: Option<std::sync::Arc<LifecycleDeliveryTestControl>>,
+}
+
+pub struct ExtensionTurnLifecycle {
+    processes: Vec<ExtensionProcess>,
+    resource_owner: String,
+    session_id: String,
+    run_id: String,
+    turn_id: String,
+    started_at: Instant,
+    started_delivery: watch::Receiver<bool>,
+    settled: bool,
+    #[cfg(test)]
+    lifecycle_delivery_test_control: Option<std::sync::Arc<LifecycleDeliveryTestControl>>,
+}
+
+/// Per-instance cancellation barrier used only by lifecycle ownership tests.
+/// Keeping this on the owning `ExecutableExtensions` avoids global hooks and
+/// lets the rest of the test suite continue to run in parallel.
+#[cfg(test)]
+#[derive(Default)]
+struct LifecycleDeliveryTestControl {
+    gate_turn_started: std::sync::atomic::AtomicBool,
+    turn_started_entered: tokio::sync::Notify,
+    turn_started_release: tokio::sync::Notify,
+    gate_turn_settled: std::sync::atomic::AtomicBool,
+    turn_settled_entered: tokio::sync::Notify,
+    turn_settled_release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl LifecycleDeliveryTestControl {
+    fn gate_turn_started(&self) {
+        self.gate_turn_started.store(true, Ordering::Release);
+    }
+
+    fn release_turn_started(&self) {
+        self.turn_started_release.notify_one();
+    }
+
+    async fn turn_started_entered(&self) {
+        self.turn_started_entered.notified().await;
+    }
+
+    fn gate_turn_settled(&self) {
+        self.gate_turn_settled.store(true, Ordering::Release);
+    }
+
+    fn release_turn_settled(&self) {
+        self.turn_settled_release.notify_one();
+    }
+
+    async fn turn_settled_entered(&self) {
+        self.turn_settled_entered.notified().await;
+    }
+
+    async fn wait_before_delivery(&self, event: &ExtensionLifecycleEvent) {
+        match event {
+            ExtensionLifecycleEvent::TurnStarted { .. }
+                if self.gate_turn_started.load(Ordering::Acquire) =>
+            {
+                self.turn_started_entered.notify_one();
+                self.turn_started_release.notified().await;
+            }
+            ExtensionLifecycleEvent::TurnSettled { .. }
+                if self.gate_turn_settled.load(Ordering::Acquire) =>
+            {
+                self.turn_settled_entered.notify_one();
+                self.turn_settled_release.notified().await;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ExtensionTurnLifecycle {
+    async fn settle(
+        mut self,
+        outcome: ExtensionLifecycleOutcome,
+        reason: Option<String>,
+    ) -> Vec<String> {
+        let processes = self.processes.clone();
+        let resource_owner = self.resource_owner.clone();
+        let turn_id = self.turn_id.clone();
+        let event = ExtensionLifecycleEvent::TurnSettled {
+            session_id: self.session_id.clone(),
+            run_id: self.run_id.clone(),
+            turn_id: self.turn_id.clone(),
+            outcome,
+            duration_ms: duration_millis(self.started_at.elapsed()),
+            reason,
+        };
+        #[cfg(test)]
+        let lifecycle_delivery_test_control = self.lifecycle_delivery_test_control.clone();
+        // Transfer terminal delivery to an owned task before this future can
+        // be cancelled. Dropping the JoinHandle detaches rather than aborts
+        // the task, so every admitted turn retains one terminal owner.
+        let delivery = tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(control) = lifecycle_delivery_test_control {
+                control.wait_before_delivery(&event).await;
+            }
+            let diagnostics = notify_lifecycle_all(&processes, event).await;
+            for process in &processes {
+                process.clear_active_lifecycle_turn(&resource_owner, &turn_id);
+            }
+            diagnostics
+        });
+        self.settled = true;
+        match delivery.await {
+            Ok(diagnostics) => diagnostics,
+            Err(error) => vec![format!(
+                "warning: extension turn lifecycle task failed: {error}"
+            )],
+        }
+    }
+}
+
+impl Drop for ExtensionTurnLifecycle {
+    fn drop(&mut self) {
+        if self.settled || self.processes.is_empty() {
+            return;
+        }
+        let Ok(handle) = Handle::try_current() else {
+            for process in &self.processes {
+                process.clear_active_lifecycle_turn(&self.resource_owner, &self.turn_id);
+            }
+            return;
+        };
+        let processes = self.processes.clone();
+        let resource_owner = self.resource_owner.clone();
+        let turn_id = self.turn_id.clone();
+        let mut started_delivery = self.started_delivery.clone();
+        let event = ExtensionLifecycleEvent::TurnSettled {
+            session_id: self.session_id.clone(),
+            run_id: self.run_id.clone(),
+            turn_id: self.turn_id.clone(),
+            outcome: ExtensionLifecycleOutcome::FrontendDisconnected,
+            duration_ms: duration_millis(self.started_at.elapsed()),
+            reason: Some("turn owner dropped before explicit settlement".into()),
+        };
+        #[cfg(test)]
+        let lifecycle_delivery_test_control = self.lifecycle_delivery_test_control.clone();
+        handle.spawn(async move {
+            let _ = started_delivery.wait_for(|started| *started).await;
+            #[cfg(test)]
+            if let Some(control) = lifecycle_delivery_test_control {
+                control.wait_before_delivery(&event).await;
+            }
+            let _ = notify_lifecycle_all(&processes, event).await;
+            for process in &processes {
+                process.clear_active_lifecycle_turn(&resource_owner, &turn_id);
+            }
+        });
+    }
 }
 
 struct PendingConfirmationDenial {
+    process: ExtensionProcess,
+    request_id: ExtensionRequestId,
+    generation: u64,
+}
+
+struct PendingInputCancellation {
     process: ExtensionProcess,
     request_id: ExtensionRequestId,
     generation: u64,
@@ -411,6 +601,16 @@ impl Default for ExecutableExtensions {
             event_drain_cursor: 0,
             confirmation_denials: VecDeque::new(),
             confirmation_tasks: Vec::new(),
+            input_cancellations: VecDeque::new(),
+            input_tasks: Vec::new(),
+            policy_supervisors: Vec::new(),
+            session_id: None,
+            resource_owner: None,
+            session_started_at: Instant::now(),
+            session_lifecycle_started: false,
+            last_lifecycle_outcome: None,
+            #[cfg(test)]
+            lifecycle_delivery_test_control: None,
         }
     }
 }
@@ -563,13 +763,47 @@ impl ExecutableExtensions {
         } else {
             let workspace = config.workspace.clone();
             let state = host_state.clone();
+            let agent_sessions = matches!(
+                reasoning,
+                ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
+            ) && model_supports_ultra(model);
             match block_on_runtime(async move {
-                futures_util::future::join_all(startable.into_iter().map(|descriptor| {
+                let starts = FuturesUnordered::new();
+                for (index, descriptor) in startable.into_iter().enumerate() {
+                    let name = descriptor.manifest.name.clone();
                     let mut runtime = ExtensionRuntimeConfig::new(workspace.clone());
                     runtime.host_state = state.clone();
-                    ExtensionProcess::start(descriptor, runtime)
-                }))
-                .await
+                    runtime.agent_sessions = agent_sessions;
+                    starts.push(async move {
+                        (
+                            index,
+                            name,
+                            ExtensionProcess::start(descriptor, runtime).await,
+                        )
+                    });
+                }
+                let mut completed = Vec::new();
+                tokio::pin!(starts);
+                while let Some((index, name, start)) = starts.next().await {
+                    if let Ok(process) = &start {
+                        // Attach only the live catalog immediately. A fast
+                        // dynamic child must not wait behind a slow sibling's
+                        // independent initialization deadline, while observer
+                        // and hook registration still follows discovery order.
+                        process.register_dynamic_tool_catalog(host);
+                    }
+                    completed.push((index, name, start));
+                }
+                completed.sort_by_key(|(index, _, _)| *index);
+                for (_, _, start) in &completed {
+                    if let Ok(process) = start {
+                        host.load(process);
+                    }
+                }
+                completed
+                    .into_iter()
+                    .map(|(_, name, start)| (name, start))
+                    .collect::<Vec<_>>()
             }) {
                 Ok(starts) => starts,
                 Err(error) => {
@@ -584,16 +818,19 @@ impl ExecutableExtensions {
         let mut processes = Vec::new();
         let mut receivers = Vec::new();
         let mut running = BTreeSet::new();
-        for start in starts {
+        let mut start_failures = BTreeMap::new();
+        for (name, start) in starts {
             match start {
                 Ok(process) => {
-                    let name = process.descriptor().manifest.name.clone();
                     receivers.push(process.subscribe());
-                    host.load(&process);
                     running.insert(name);
                     processes.push(process);
                 }
-                Err(error) => diagnostics.push(format!("error: extension launch failed: {error}")),
+                Err(error) => {
+                    let error = error.to_string();
+                    diagnostics.push(format!("error: extension {name:?} launch failed: {error}"));
+                    start_failures.insert(name, clip_lifecycle_reason(&error, 4 * 1024));
+                }
             }
         }
 
@@ -612,6 +849,22 @@ impl ExecutableExtensions {
                     enabled: descriptor.activation.enabled,
                     trusted: descriptor.activation.trust == ExtensionTrust::Trusted,
                     running: running.contains(&descriptor.manifest.name),
+                    api_version: process
+                        .map(|process| process.api_version().to_owned())
+                        .unwrap_or_else(|| descriptor.manifest.api_version.clone()),
+                    negotiated_features: process
+                        .map(|process| process.negotiated_features().iter().cloned().collect())
+                        .unwrap_or_default(),
+                    health: process.map(ExtensionProcess::health_snapshot).or_else(|| {
+                        start_failures.get(&descriptor.manifest.name).map(|error| {
+                            ExtensionHealthSnapshot {
+                                state: ExtensionHealthState::Parked,
+                                generation: 0,
+                                pending_requests: 0,
+                                last_error: Some(error.clone()),
+                            }
+                        })
+                    }),
                     tools: contributions
                         .map(|value| value.tools.iter().map(|tool| tool.name.clone()).collect())
                         .unwrap_or_else(|| descriptor.manifest.contributes.tools.clone()),
@@ -635,7 +888,165 @@ impl ExecutableExtensions {
         extensions.receivers = receivers;
         extensions.summaries = summaries;
         extensions.diagnostics.extend(diagnostics);
+        extensions.session_id = host_state.session_id.clone();
+        extensions.resource_owner = Some(session.resource_owner_key());
+        extensions.start_policy_supervisors();
+        extensions.start_session_lifecycle();
         extensions
+    }
+
+    pub fn bind_agent_sessions(&self, agent: &Agent) -> anyhow::Result<usize> {
+        let mut bound = 0;
+        for process in &self.processes {
+            if agent
+                .bind_extension_agent_sessions(process)
+                .with_context(|| {
+                    format!(
+                        "could not bind agent_sessions for extension {:?}",
+                        process.descriptor().manifest.name
+                    )
+                })?
+            {
+                bound += 1;
+            }
+        }
+        Ok(bound)
+    }
+
+    pub fn has_dynamic_tool_provider(&self) -> bool {
+        self.processes.iter().any(|process| {
+            process
+                .negotiated_features()
+                .contains(EXTENSION_FEATURE_DYNAMIC_TOOLS)
+        })
+    }
+
+    fn start_policy_supervisors(&mut self) {
+        let Ok(handle) = Handle::try_current() else {
+            if !self.processes.is_empty() {
+                self.diagnostics
+                    .push("warning: extension policy supervision requires the Ygg Tokio runtime");
+            }
+            return;
+        };
+        self.policy_supervisors
+            .extend(self.processes.iter().cloned().map(|process| {
+                let mut events = process.subscribe();
+                handle.spawn(async move {
+                    loop {
+                        match events.recv().await {
+                            Ok(ExtensionEvent::PolicyEvaluationRequested {
+                                request_id,
+                                generation,
+                                ..
+                            }) => {
+                                let _ = process
+                                    .respond_to_policy_evaluation(
+                                        request_id,
+                                        generation,
+                                        denied_policy_response(),
+                                    )
+                                    .await;
+                            }
+                            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                })
+            }));
+    }
+
+    fn start_session_lifecycle(&mut self) {
+        let Some(session_id) = self.session_id.clone() else {
+            return;
+        };
+        if self.processes.is_empty() || self.session_lifecycle_started {
+            return;
+        }
+        let processes = self.processes.clone();
+        let event = ExtensionLifecycleEvent::SessionStarted {
+            session_id,
+            run_id: None,
+        };
+        match block_on_runtime(async move { notify_lifecycle_all(&processes, event).await }) {
+            Ok(messages) => self.diagnostics.extend(messages),
+            Err(error) => self.diagnostics.push(format!(
+                "warning: extension session lifecycle could not start: {error}"
+            )),
+        }
+        self.session_lifecycle_started = true;
+        self.session_started_at = Instant::now();
+    }
+
+    pub async fn begin_turn(&self) -> ExtensionTurnLifecycle {
+        let sequence = NEXT_EXTENSION_RUN_ID.fetch_add(1, Ordering::Relaxed);
+        let session_id = self
+            .processes
+            .first()
+            .and_then(|process| process.current_context().host.session_id)
+            .or_else(|| self.session_id.clone())
+            .unwrap_or_else(|| "unknown-session".into());
+        let run_id = format!("extension-run-{sequence}");
+        let turn_id = format!("extension-turn-{sequence}");
+        let resource_owner = self
+            .resource_owner
+            .clone()
+            .unwrap_or_else(|| session_id.clone());
+        let started_at = Instant::now();
+        let processes = self.processes.clone();
+        for process in &processes {
+            process.set_active_lifecycle_turn(
+                resource_owner.clone(),
+                session_id.clone(),
+                run_id.clone(),
+                turn_id.clone(),
+            );
+        }
+        let (started_tx, started_delivery) = watch::channel(false);
+        let start_processes = processes.clone();
+        let start_event = ExtensionLifecycleEvent::TurnStarted {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+        };
+        #[cfg(test)]
+        let lifecycle_delivery_test_control = self.lifecycle_delivery_test_control.clone();
+        tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(control) = lifecycle_delivery_test_control {
+                control.wait_before_delivery(&start_event).await;
+            }
+            let _ = notify_lifecycle_all(&start_processes, start_event).await;
+            let _ = started_tx.send(true);
+        });
+        let mut turn = ExtensionTurnLifecycle {
+            processes,
+            resource_owner,
+            session_id,
+            run_id,
+            turn_id,
+            started_at,
+            started_delivery,
+            settled: false,
+            #[cfg(test)]
+            lifecycle_delivery_test_control: self.lifecycle_delivery_test_control.clone(),
+        };
+        let _ = turn.started_delivery.wait_for(|started| *started).await;
+        turn
+    }
+
+    pub async fn settle_turn(
+        &mut self,
+        turn: ExtensionTurnLifecycle,
+        outcome: &crate::modes::HostRunOutcome,
+    ) {
+        let lifecycle_outcome = outcome.extension_lifecycle_outcome();
+        let reason = outcome
+            .failure_message()
+            .map(|reason| clip_lifecycle_reason(reason, 4 * 1024));
+        let diagnostics = turn.settle(lifecycle_outcome, reason).await;
+        self.diagnostics.extend(diagnostics);
+        self.last_lifecycle_outcome = Some(lifecycle_outcome);
     }
 
     pub fn command_suggestions(&self) -> Vec<(String, String)> {
@@ -662,24 +1073,54 @@ impl ExecutableExtensions {
     }
 
     pub fn status_summary(&self) -> String {
-        let running = self
-            .summaries
-            .iter()
-            .filter(|extension| extension.running)
-            .map(|extension| extension.name.as_str())
+        let ready = self
+            .summaries()
+            .into_iter()
+            .filter(|extension| {
+                extension
+                    .health
+                    .as_ref()
+                    .is_some_and(|health| health.state == ExtensionHealthState::Ready)
+            })
+            .map(|extension| extension.name.clone())
             .collect::<Vec<_>>();
         if self.summaries.is_empty() {
-            "0 running / 0 discovered".to_owned()
-        } else if running.is_empty() {
-            format!("0 running / {} discovered", self.summaries.len())
+            "0 ready / 0 discovered".to_owned()
+        } else if ready.is_empty() {
+            format!("0 ready / {} discovered", self.summaries.len())
         } else {
             format!(
-                "{} running / {} discovered ({})",
-                running.len(),
+                "{} ready / {} discovered ({})",
+                ready.len(),
                 self.summaries.len(),
-                running.join(", ")
+                ready.join(", ")
             )
         }
+    }
+
+    /// Returns discovery metadata with live protocol-health snapshots overlaid.
+    pub fn summaries(&self) -> Vec<ExtensionSummary> {
+        let mut summaries = self.summaries.clone();
+        for summary in &mut summaries {
+            let Some(process) = self
+                .processes
+                .iter()
+                .find(|process| process.descriptor().manifest.name == summary.name)
+            else {
+                continue;
+            };
+            let health = process.health_snapshot();
+            summary.running = process.is_running();
+            summary.health = Some(health);
+            summary.api_version = process.api_version().to_owned();
+            summary.negotiated_features = process.negotiated_features().iter().cloned().collect();
+            summary.tools = process
+                .tool_definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect();
+        }
+        summaries
     }
 
     pub fn inspect_text(&mut self) -> String {
@@ -689,7 +1130,7 @@ impl ExecutableExtensions {
             lines.push("No executable extensions discovered.".to_owned());
         } else {
             lines.push("Executable extensions".to_owned());
-            for extension in &self.summaries {
+            for extension in self.summaries() {
                 let state = match (extension.enabled, extension.trusted, extension.running) {
                     (_, _, true) => "running",
                     (true, false, false) => "enabled, untrusted",
@@ -698,13 +1139,33 @@ impl ExecutableExtensions {
                     (false, false, false) => "disabled, untrusted",
                 };
                 lines.push(format!(
-                    "- {} {} · {} · {:?} · {}",
+                    "- {} {} · API {} · {} · {:?} · {}",
                     extension.name,
                     extension.version,
+                    extension.api_version,
                     state,
                     extension.source,
                     extension.manifest_path.display()
                 ));
+                if let Some(health) = &extension.health {
+                    lines.push(format!(
+                        "  health: {:?} · generation {} · {} pending{}",
+                        health.state,
+                        health.generation,
+                        health.pending_requests,
+                        health
+                            .last_error
+                            .as_ref()
+                            .map(|error| format!(" · last error: {error}"))
+                            .unwrap_or_default()
+                    ));
+                }
+                if !extension.negotiated_features.is_empty() {
+                    lines.push(format!(
+                        "  features: {}",
+                        extension.negotiated_features.join(", ")
+                    ));
+                }
                 if !extension.tools.is_empty() {
                     lines.push(format!("  tools: {}", extension.tools.join(", ")));
                 }
@@ -913,10 +1374,11 @@ impl ExecutableExtensions {
         let mut messages = Vec::new();
         let mut queued_context = Vec::new();
         for process in &self.processes {
-            if !process
-                .contributions()
-                .hooks
-                .contains(&ExtensionHook::AfterResponse)
+            if process.api_version() != EXTENSION_API_VERSION_0_1
+                || !process
+                    .contributions()
+                    .hooks
+                    .contains(&ExtensionHook::AfterResponse)
             {
                 continue;
             }
@@ -988,10 +1450,15 @@ impl ExecutableExtensions {
         let extension_name = process.descriptor().manifest.name.clone();
         let mut events = process.subscribe();
         let output = {
-            let mut execution = Box::pin(process.execute_command(
+            let legacy_uncorrelated = process.api_version() == EXTENSION_API_VERSION_0_1;
+            let (request_started, started) = tokio::sync::oneshot::channel();
+            let mut started = Box::pin(started);
+            let mut operation = None;
+            let mut execution = Box::pin(process.execute_command_controlled(
                 name.to_owned(),
                 arguments,
                 process.current_context(),
+                request_started,
             ));
             let mut events_open = true;
             loop {
@@ -1003,7 +1470,14 @@ impl ExecutableExtensions {
                     tokio::pin!(cancellation);
                     tokio::select! {
                         result = &mut execution => break result?,
-                        event = events.recv(), if events_open => Some(event),
+                        started = &mut started, if operation.is_none() => match started {
+                            Ok(started) => {
+                                operation = Some(started);
+                                None
+                            }
+                            Err(_) => break execution.await?,
+                        },
+                        event = events.recv(), if events_open && operation.is_some() => Some(event),
                         cancelled = &mut cancellation => {
                             cancelled.with_context(|| format!(
                                 "cancellation UI failed for extension {extension_name:?}"
@@ -1019,8 +1493,15 @@ impl ExecutableExtensions {
                     Ok(ExtensionEvent::ConfirmationRequested {
                         request_id,
                         generation,
+                        parent_request_id,
                         request,
-                    }) => {
+                    }) if parent_request_id.is_some_and(|parent| {
+                        operation.is_some_and(|operation| operation.owns(generation, parent))
+                    }) || (legacy_uncorrelated
+                        && parent_request_id.is_none()
+                        && operation
+                            .is_some_and(|operation| operation.generation == generation)) =>
+                    {
                         if process.confirmation_answered(&request_id, generation) {
                             continue;
                         }
@@ -1035,6 +1516,23 @@ impl ExecutableExtensions {
                                 request_id,
                                 generation,
                                 ConfirmationResponse { confirmed },
+                            )
+                            .await?;
+                    }
+                    Ok(ExtensionEvent::PolicyEvaluationRequested { .. }) => {}
+                    Ok(ExtensionEvent::InputRequested {
+                        request_id,
+                        generation,
+                        parent_request_id,
+                        ..
+                    }) if operation
+                        .is_some_and(|operation| operation.owns(generation, parent_request_id)) =>
+                    {
+                        process
+                            .respond_to_input(
+                                request_id,
+                                generation,
+                                ExtensionInputResponse { value: None },
                             )
                             .await?;
                     }
@@ -1097,21 +1595,35 @@ impl ExecutableExtensions {
         let (output, confirmation_denied) = {
             let mut confirmation_denied = false;
             let output = {
-                let mut execution = Box::pin(process.execute_command(
+                let legacy_uncorrelated = process.api_version() == EXTENSION_API_VERSION_0_1;
+                let (request_started, started) = tokio::sync::oneshot::channel();
+                let mut started = Box::pin(started);
+                let mut operation = None;
+                let mut execution = Box::pin(process.execute_command_controlled(
                     name.to_owned(),
                     arguments,
                     process.current_context(),
+                    request_started,
                 ));
                 let mut events_open = true;
                 loop {
                     tokio::select! {
                         result = &mut execution => break result?,
-                        event = events.recv(), if events_open => match event {
+                        started = &mut started, if operation.is_none() => match started {
+                            Ok(started) => operation = Some(started),
+                            Err(_) => break execution.await?,
+                        },
+                        event = events.recv(), if events_open && operation.is_some() => match event {
                             Ok(ExtensionEvent::ConfirmationRequested {
                                 request_id,
                                 generation,
+                                parent_request_id,
                                 ..
-                            }) => {
+                            }) if parent_request_id.is_some_and(|parent| {
+                                operation.is_some_and(|operation| operation.owns(generation, parent))
+                            }) || (legacy_uncorrelated
+                                && parent_request_id.is_none()
+                                && operation.is_some_and(|operation| operation.generation == generation)) => {
                                 if !process.confirmation_answered(&request_id, generation) {
                                     confirmation_denied = true;
                                     process
@@ -1122,6 +1634,23 @@ impl ExecutableExtensions {
                                         )
                                         .await?;
                                 }
+                            }
+                            Ok(ExtensionEvent::PolicyEvaluationRequested { .. }) => {}
+                            Ok(ExtensionEvent::InputRequested {
+                                request_id,
+                                generation,
+                                parent_request_id,
+                                ..
+                            }) if operation.is_some_and(|operation| {
+                                operation.owns(generation, parent_request_id)
+                            }) => {
+                                process
+                                    .respond_to_input(
+                                        request_id,
+                                        generation,
+                                        ExtensionInputResponse { value: None },
+                                    )
+                                    .await?;
                             }
                             Ok(_) => {
                                 // The persistent receiver owns ordinary notifications,
@@ -1281,7 +1810,14 @@ impl ExecutableExtensions {
         for task in self.confirmation_tasks.drain(..) {
             task.abort();
         }
+        for task in self.input_tasks.drain(..) {
+            task.abort();
+        }
+        for task in self.policy_supervisors.drain(..) {
+            task.abort();
+        }
         self.confirmation_denials.clear();
+        self.input_cancellations.clear();
         while self.background_rx.try_recv().is_ok() {}
     }
 
@@ -1290,6 +1826,25 @@ impl ExecutableExtensions {
     /// broken extension from delaying terminal restoration indefinitely.
     pub async fn shutdown(&mut self) {
         self.cancel_background_work();
+        if self.session_lifecycle_started {
+            if let Some(session_id) = self.session_id.clone() {
+                let diagnostics = notify_lifecycle_all(
+                    &self.processes,
+                    ExtensionLifecycleEvent::SessionSettled {
+                        session_id,
+                        run_id: None,
+                        outcome: self
+                            .last_lifecycle_outcome
+                            .unwrap_or(ExtensionLifecycleOutcome::Shutdown),
+                        duration_ms: duration_millis(self.session_started_at.elapsed()),
+                        reason: None,
+                    },
+                )
+                .await;
+                self.diagnostics.extend(diagnostics);
+            }
+            self.session_lifecycle_started = false;
+        }
         let processes = self.processes.clone();
         let shutdowns =
             futures_util::future::join_all(processes.iter().map(ExtensionProcess::shutdown));
@@ -1317,22 +1872,25 @@ impl ExecutableExtensions {
         // `join_all` polls every reload concurrently and preserves the input
         // order in its output, so one hung child cannot serialize every
         // extension and completion timing cannot reorder user-visible lines.
-        let mut messages = futures_util::future::join_all(reloads)
-            .await
-            .into_iter()
-            .map(|(name, result)| match result {
-                Ok(report) => format!(
-                    "reloaded {name} (generation {}, previous shutdown {})",
-                    report.generation,
-                    if report.previous_shutdown_graceful {
-                        "clean"
-                    } else {
-                        "forced"
-                    }
-                ),
-                Err(error) => format!("unable to reload {name}: {error}"),
-            })
-            .collect::<Vec<_>>();
+        let results = futures_util::future::join_all(reloads).await;
+        let mut messages = Vec::with_capacity(results.len());
+        for (name, result) in results {
+            match result {
+                Ok(report) => {
+                    messages.push(format!(
+                        "reloaded {name} (generation {}, previous shutdown {})",
+                        report.generation,
+                        if report.previous_shutdown_graceful {
+                            "clean"
+                        } else {
+                            "forced"
+                        }
+                    ));
+                }
+                Err(error) => messages.push(format!("unable to reload {name}: {error}")),
+            }
+        }
+        self.start_policy_supervisors();
         messages.extend(self.drain_events());
         messages
     }
@@ -1363,6 +1921,32 @@ impl ExecutableExtensions {
         }
     }
 
+    fn schedule_input_cancellations(&mut self) {
+        self.input_tasks.retain(|task| !task.is_finished());
+        if tokio::runtime::Handle::try_current().is_err() {
+            if !self.input_cancellations.is_empty() {
+                self.diagnostics
+                    .push("warning: extension input cancellation requires the Ygg Tokio runtime");
+            }
+            return;
+        }
+        while self.input_tasks.len() < INPUT_CANCELLATION_CONCURRENCY {
+            let Some(pending) = self.input_cancellations.pop_front() else {
+                break;
+            };
+            self.input_tasks.push(tokio::spawn(async move {
+                let _ = pending
+                    .process
+                    .respond_to_input(
+                        pending.request_id,
+                        pending.generation,
+                        ExtensionInputResponse { value: None },
+                    )
+                    .await;
+            }));
+        }
+    }
+
     fn queue_confirmation_denial(&mut self, pending: PendingConfirmationDenial) {
         if self.confirmation_denials.len() >= CONFIRMATION_DENIAL_QUEUE_CAPACITY {
             self.diagnostics.push(format!(
@@ -1374,11 +1958,23 @@ impl ExecutableExtensions {
         self.schedule_confirmation_denials();
     }
 
+    fn queue_input_cancellation(&mut self, pending: PendingInputCancellation) {
+        if self.input_cancellations.len() >= INPUT_CANCELLATION_QUEUE_CAPACITY {
+            self.diagnostics.push(format!(
+                "warning: extension input cancellation queue reached its {INPUT_CANCELLATION_QUEUE_CAPACITY}-request limit; newest request was dropped"
+            ));
+            return;
+        }
+        self.input_cancellations.push_back(pending);
+        self.schedule_input_cancellations();
+    }
+
     /// Drain a fixed amount of extension work without letting a continuously
     /// ready process monopolize the input/render task. The start receiver
     /// rotates between calls and each receiver has a smaller per-call quota.
     pub fn drain_events(&mut self) -> Vec<String> {
         self.schedule_confirmation_denials();
+        self.schedule_input_cancellations();
         let receiver_count = self.receivers.len();
         if receiver_count == 0 {
             return Vec::new();
@@ -1421,6 +2017,7 @@ impl ExecutableExtensions {
                         request_id,
                         generation,
                         request,
+                        ..
                     }) => {
                         if process.as_ref().is_some_and(|process| {
                             process.confirmation_answered(&request_id, generation)
@@ -1447,6 +2044,34 @@ impl ExecutableExtensions {
                             ));
                         }
                     }
+                    Ok(ExtensionEvent::PolicyEvaluationRequested { intent, .. }) => {
+                        messages.push(format!(
+                            "[{name}] policy intent denied (no host-managed adapter): {}",
+                            intent.operation
+                        ));
+                    }
+                    Ok(ExtensionEvent::InputRequested {
+                        request_id,
+                        generation,
+                        request,
+                        ..
+                    }) => {
+                        messages.push(format!(
+                            "[{name}] input cancelled (no active input owner): {}",
+                            request.prompt
+                        ));
+                        if let Some(process) = process.clone() {
+                            self.queue_input_cancellation(PendingInputCancellation {
+                                process,
+                                request_id,
+                                generation,
+                            });
+                        } else {
+                            self.diagnostics.push(format!(
+                                "warning: {name}: input could not be cancelled because its process is unavailable"
+                            ));
+                        }
+                    }
                     Err(broadcast::error::TryRecvError::Empty)
                     | Err(broadcast::error::TryRecvError::Closed) => break,
                     Err(broadcast::error::TryRecvError::Lagged(count)) => {
@@ -1462,6 +2087,7 @@ impl ExecutableExtensions {
         }
         self.event_drain_cursor = (start + visited.max(1)) % receiver_count;
         self.schedule_confirmation_denials();
+        self.schedule_input_cancellations();
         messages
     }
 }
@@ -1476,6 +2102,54 @@ impl Drop for ExecutableExtensions {
             self.shutdown_blocking();
         }
     }
+}
+
+async fn notify_lifecycle_all(
+    processes: &[ExtensionProcess],
+    event: ExtensionLifecycleEvent,
+) -> Vec<String> {
+    futures_util::future::join_all(processes.iter().map(|process| {
+        let process = process.clone();
+        let event = event.clone();
+        async move {
+            match tokio::time::timeout(
+                LIFECYCLE_NOTIFY_DEADLINE,
+                process.notify_lifecycle(&event),
+            )
+            .await
+            {
+                Err(_) => Some(format!(
+                    "warning: extension {:?} lifecycle notification exceeded {LIFECYCLE_NOTIFY_DEADLINE:?}",
+                    process.descriptor().manifest.name
+                )),
+                Ok(Err(error)) => Some(format!(
+                    "warning: extension {:?} lifecycle notification failed: {error}",
+                    process.descriptor().manifest.name
+                )),
+                Ok(Ok(())) => None,
+            }
+        }
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn clip_lifecycle_reason(reason: &str, limit: usize) -> String {
+    if reason.len() <= limit {
+        return reason.to_owned();
+    }
+    let marker = "[… truncated …]";
+    let mut end = limit.saturating_sub(marker.len());
+    while !reason.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}{marker}", &reason[..end])
 }
 
 async fn collect_ui_snapshot(
@@ -1739,6 +2413,180 @@ command = "does-not-exist"
             ),
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn lifecycle_fixture(temp: &tempfile::TempDir) -> (ExecutableExtensions, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = temp.path().join("lifecycle-fixture.sh");
+        let wire_log = temp.path().join("lifecycle-wire.jsonl");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+IFS= read -r initialize
+id=$(printf '%s\n' "$initialize" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{"api_version":"0.2","tools":[],"commands":[],"protocol":{"version":"0.2","features":["request_cancellation","content_parts","lifecycle_events"],"limits":{"max_concurrent_requests":1},"lifecycle_events":["turn/started","turn/settled"]}}}\n' "$id"
+while IFS= read -r request; do
+  printf '%s\n' "$request" >> "$YGG_WORKSPACE/lifecycle-wire.jsonl"
+  case "$request" in
+    *'"method":"shutdown"'*)
+      id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+
+        let manifest = ExtensionManifest::parse(
+            r#"
+name = "lifecycle-fixture"
+version = "0.2.0"
+api_version = "0.2"
+
+[entrypoint]
+command = "lifecycle-fixture.sh"
+"#,
+        )
+        .unwrap();
+        let mut runtime = ExtensionRuntimeConfig::new(temp.path());
+        runtime.host_state.session_id = Some("lifecycle-test-session".into());
+        runtime.request_timeout = Duration::from_secs(2);
+        let process = ExtensionProcess::start(
+            DiscoveredExtension {
+                manifest,
+                manifest_path: temp.path().join("extension.toml"),
+                source: ExtensionSource::Explicit,
+                activation: ygg_agent::extension_process::ExtensionActivation {
+                    enabled: true,
+                    trust: ExtensionTrust::Trusted,
+                },
+            },
+            runtime,
+        )
+        .await
+        .unwrap();
+
+        let mut extensions = ExecutableExtensions::default();
+        extensions.receivers.push(process.subscribe());
+        extensions.processes.push(process);
+        extensions.session_id = Some("lifecycle-test-session".into());
+        (extensions, wire_log)
+    }
+
+    #[cfg(unix)]
+    fn recorded_turn_lifecycle(path: &Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|message| {
+                matches!(
+                    message.get("method").and_then(serde_json::Value::as_str),
+                    Some("turn/started" | "turn/settled")
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_recorded_turn_lifecycle(
+        path: &Path,
+        minimum: usize,
+    ) -> Vec<serde_json::Value> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let events = recorded_turn_lifecycle(path);
+                if events.len() >= minimum {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("lifecycle fixture did not receive its terminal boundary")
+    }
+
+    #[cfg(unix)]
+    fn assert_one_ordered_turn(events: &[serde_json::Value], outcome: &str) {
+        assert_eq!(events.len(), 2, "unexpected lifecycle wire: {events:#?}");
+        assert_eq!(events[0]["method"], "turn/started");
+        assert_eq!(events[1]["method"], "turn/settled");
+        assert_eq!(events[1]["params"]["outcome"], outcome);
+        for id in ["session_id", "run_id", "turn_id"] {
+            assert_eq!(
+                events[0]["params"][id], events[1]["params"][id],
+                "{id} changed across the lifecycle pair"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_begin_turn_during_started_delivery_preserves_ordered_terminal_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut extensions, wire_log) = lifecycle_fixture(&temp).await;
+        let control = std::sync::Arc::new(LifecycleDeliveryTestControl::default());
+        control.gate_turn_started();
+        extensions.lifecycle_delivery_test_control = Some(control.clone());
+
+        let mut beginning = Box::pin(extensions.begin_turn());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                () = control.turn_started_entered() => {}
+                _ = &mut beginning => panic!("begin_turn completed while start delivery was gated"),
+            }
+        })
+        .await
+        .expect("begin_turn never transferred start delivery to its owned task");
+
+        // Cancelling the caller here drops the already-constructed guard. Its
+        // Drop owner must wait for TurnStarted and then emit one TurnSettled.
+        drop(beginning);
+        control.release_turn_started();
+        let events = wait_for_recorded_turn_lifecycle(&wire_log, 2).await;
+        assert_one_ordered_turn(&events, "frontend_disconnected");
+
+        extensions.shutdown().await;
+        assert_one_ordered_turn(&recorded_turn_lifecycle(&wire_log), "frontend_disconnected");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_settle_future_keeps_owned_terminal_delivery_alive() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut extensions, wire_log) = lifecycle_fixture(&temp).await;
+        let control = std::sync::Arc::new(LifecycleDeliveryTestControl::default());
+        extensions.lifecycle_delivery_test_control = Some(control.clone());
+        let turn = extensions.begin_turn().await;
+
+        control.gate_turn_settled();
+        let outcome = crate::modes::HostRunOutcome::Failed("fixture failure".into());
+        let mut settling = Box::pin(extensions.settle_turn(turn, &outcome));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                () = control.turn_settled_entered() => {}
+                () = &mut settling => panic!("settle_turn completed while terminal delivery was gated"),
+            }
+        })
+        .await
+        .expect("settle_turn never transferred terminal delivery to its owned task");
+
+        // The detached notification task, not this cancellable caller future,
+        // owns terminal delivery after the boundary above.
+        drop(settling);
+        control.release_turn_settled();
+        let events = wait_for_recorded_turn_lifecycle(&wire_log, 2).await;
+        assert_one_ordered_turn(&events, "failed");
+
+        extensions.shutdown().await;
+        assert_one_ordered_turn(&recorded_turn_lifecycle(&wire_log), "failed");
     }
 
     #[test]

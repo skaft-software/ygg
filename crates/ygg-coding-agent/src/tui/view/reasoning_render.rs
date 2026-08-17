@@ -175,7 +175,7 @@ mod tests {
         let live = render_reasoning(&reasoning, &renderer, &theme, 80, false);
         assert_eq!(live.len(), 2, "{live:?}");
         assert_eq!(strip_terminal_sequences(&live[0]), "Thinking");
-        assert!(strip_terminal_sequences(&live[1]).contains("⎿ (ctrl+o to expand)"));
+        assert!(strip_terminal_sequences(&live[1]).contains("└ (ctrl+o to expand)"));
         assert!(!live[0].contains("\x1b[1m"), "{live:?}");
         let accent = theme
             .model_rgb(Some(ModelLab::Alibaba))
