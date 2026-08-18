@@ -27,6 +27,12 @@ pub enum TopLevelCommand {
         #[command(subcommand)]
         command: ExtensionCommand,
     },
+    /// Check for, and install, a newer Ygg release.
+    Update {
+        /// Only report whether a newer release is available.
+        #[arg(long)]
+        check: bool,
+    },
     /// Launch the loopback-only Ygg Serve application.
     ///
     /// Default builds dispatch to the installed extension runtime; builds with

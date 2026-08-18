@@ -112,6 +112,27 @@ cd ygg
 cargo install --locked --path crates/ygg-coding-agent --bins
 ```
 
+### Updating
+
+Ygg updates through the channel that installed it and never replaces
+itself in process: the installer or Cargo swaps the installed files, and
+you restart Ygg to pick up the new version.
+
+- Installer: `ygg update` re-runs the version-pinned installer for the
+  latest release, so it verifies the release the same way a fresh install
+  does.
+- Cargo: `ygg update` reinstalls the latest tagged release from the
+  repository with a locked, tag-pinned `cargo install`.
+
+```sh
+ygg update --check   # report the latest release and the command that would run
+ygg update           # run the update for the detected install method
+```
+
+In the TUI, `/update` checks for a newer release and tells you to run
+`ygg update`. Ygg Serve is not updated by `ygg update`; after updating
+Ygg, run `ygg extension update ygg-serve` to match the new release.
+
 ### Graphical Serve extension
 
 The optional first-party Serve package provides a loopback-only web interface.
@@ -538,6 +559,7 @@ Type `/` in the composer to open live command discovery.
 | `/status` | Show active model, context, capabilities, and diagnostics. |
 | `/cost` | Show turn and session usage/cost accounting. |
 | `/cache` | Show prompt-cache diagnostics reported by the provider. |
+| `/update` | Check for a newer release; run `ygg update` to install. |
 | `/name [name]` | Show or rename the current session. |
 | `/export [path]` | Export the current session with redaction. |
 | `/prompt [name] [arguments]` | List or expand named prompt templates. |

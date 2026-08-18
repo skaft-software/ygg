@@ -189,7 +189,12 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
     ),
     slash!("cost", "/cost", "show turn and session cost", false),
     slash!("cache", "/cache", "show prompt-cache diagnostics", false),
-    slash!("update", "/update", "check for a newer Ygg release", false),
+    slash!(
+        "update",
+        "/update",
+        "check for a newer Ygg release; run `ygg update` to install",
+        false
+    ),
     slash!("name", "/name [name]", "show or rename this session", true),
     slash!(
         "export",

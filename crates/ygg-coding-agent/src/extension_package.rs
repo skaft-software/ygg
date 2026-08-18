@@ -597,6 +597,16 @@ fn load_installed(root: &Path) -> anyhow::Result<PackageManifest> {
     Ok(manifest)
 }
 
+/// The version of the installed Ygg Serve extension, if any, read without
+/// validating it against this binary. A fresh update can leave the
+/// extension stale, and validation would fail in exactly that case.
+pub(crate) fn installed_version() -> Option<Version> {
+    let root = extensions_root().ok()?;
+    let package = ensure_package_directory(&root).ok()?;
+    let manifest = load_manifest(&package.join(PACKAGE_MANIFEST)).ok()?;
+    Version::parse(&manifest.version).ok()
+}
+
 fn load_manifest(path: &Path) -> anyhow::Result<PackageManifest> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("cannot inspect package manifest {}", path.display()))?;

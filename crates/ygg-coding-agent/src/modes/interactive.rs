@@ -2213,7 +2213,12 @@ async fn run_idle_command(
             })
             .await
             {
-                Ok(status) => shell.show_overlay_text(status.to_string()),
+                Ok(status) => shell.show_overlay_text(match status {
+                    crate::update::UpdateStatus::Available { .. } => {
+                        format!("{}\n\nRun `ygg update` to install.", status)
+                    }
+                    status => status.to_string(),
+                }),
                 Err(error) => shell.error(format!("update check failed: {error}")),
             }
         }

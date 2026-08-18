@@ -65,6 +65,9 @@ async fn run() -> anyhow::Result<()> {
     if let Some(cli::TopLevelCommand::Extension { command }) = top_level_command.clone() {
         return extension_package::run(command).await;
     }
+    if let Some(cli::TopLevelCommand::Update { check }) = top_level_command.clone() {
+        return update::run(check).await;
+    }
     #[cfg(not(feature = "serve"))]
     if let Some(cli::TopLevelCommand::Serve {
         no_open,
