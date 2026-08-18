@@ -12,8 +12,8 @@ python3 -m pip install ./sdk/python
 ```
 
 Copy this directory to `.ygg/extensions/hello-world/`, explicitly enable and
-trust `hello-world`, and opt into UnsafeHost (`--yolo`) before restarting or
-reloading extensions. `--safe` discovers manifests but does not start it. Ygg
+trust `hello-world` before restarting or reloading extensions. `--safe-mode`
+discovers manifests but does not start it. Ygg
 resolves the bare `extension.py` entrypoint beside
 `extension.toml` and launches it directly; Python 3 must be available through
 the shebang environment.

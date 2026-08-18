@@ -122,18 +122,13 @@ recomputes the reserve from `agent.system_prompt()` and
 `agent.registered_tool_definitions()` so its instructions and schemas count.
 A consuming rebuild drops the old Agent before reopening its session, so only
 one append handle owns a session file. Every Agent also receives a product-owned
-`EffectBroker`. Its safer default uses `--safe`/`ControlledBashApproval`, where
-workspace mutation and every `bash` process call are approved interactively, while
-other ambient host/process, network, delegation, and extension effects remain
-denied. `--yolo` mode resolves to `UnsafeHost` and requires explicit opt-in. It leaves
-classified effects and path access in the current-user class; `yolo = true` (or the
-corresponding `yolo` config/env forms) enables ambient authority.
+`EffectBroker`. Its default uses `UnsafeHost`, where authoritatively classified
+effects use the current user's host authority subject to the remaining tool and
+sandbox gates. `--safe-mode` selects `ControlledBashApproval`, where workspace
+mutation and every `bash` process call are approved interactively while other
+ambient host/process, network, delegation, and extension effects remain denied.
 Executable-extension startup is gated separately at the product boundary: even
-enabled, trusted extensions are discovered but never launched unless the
-resolved policy is `UnsafeHost` and the existing process/shell gates also permit
-startup. `yolo = true` / `--yolo` / `YGG_YOLO=true` is the explicit OS
-isolation opt-in; legacy `unsafe_host_effects`, `--unsafe-host-effects`, and
-`YGG_UNSAFE_HOST_EFFECTS=true` are still accepted as compatibility aliases.
+enabled, trusted extensions are discovered but never launched under `--safe-mode`.
 Delegated children inherit the same broker policy through the root's delegation
 template.
 
@@ -203,7 +198,7 @@ need Agent/session ownership.
 - `/name [name]`, `/export [path]` — name and safely export the current session.
 - `/prompt [name] [arguments]` — inspect or expand prompt templates.
 - `/skills search|load|reload|off ...` — inspect and explicitly activate skills.
-- `/extensions [reload]` — inspect discovery or reload running UnsafeHost extensions.
+- `/extensions [reload]` — inspect discovery or reload running full-access extensions; safe mode keeps executable extensions stopped.
 - `/help [command]` — show local command help and Ygg self-documentation.
 - `/status`, `/quit` — product status and lifecycle controls.
 

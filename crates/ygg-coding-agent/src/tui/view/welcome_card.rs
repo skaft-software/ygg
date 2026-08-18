@@ -98,7 +98,19 @@ pub(super) fn render_welcome_card(
             .theme
             .fg("foreground", &format!("{model} / {}", state.reasoning)),
         state.theme.dim(&welcome_workspace(state)),
-        String::new(),
+        if state.safe_mode {
+            format!(
+                "{} {}",
+                state.theme.dim("permissions:"),
+                state.theme.bold(&state.theme.fg("accent", "safe mode"))
+            )
+        } else {
+            format!(
+                "{} {}",
+                state.theme.dim("permissions:"),
+                state.theme.bold(&state.theme.fg("error", "full access"))
+            )
+        },
         format!(
             "{} {}",
             state.theme.bold("Ctrl+D"),
@@ -122,15 +134,24 @@ mod tests {
     use sexy_tui_rs::strip_terminal_sequences;
 
     #[test]
-    fn welcome_card_shows_the_current_package_version() {
+    fn welcome_card_shows_access_mode_and_safe_mode_hint() {
         let shell = InteractiveShell::test_shell();
         shell.state.borrow_mut().startup_card_started_at = Some(Instant::now());
         let rendered =
             render_welcome_card(&shell.state.borrow(), 80, 10, Instant::now()).join("\n");
         let rendered = strip_terminal_sequences(&rendered);
+        assert!(rendered.contains("permissions: full access"), "{rendered}");
         assert!(
             rendered.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
             "{rendered}"
         );
+
+        let safe_shell = InteractiveShell::test_shell();
+        safe_shell.state.borrow_mut().startup_card_started_at = Some(Instant::now());
+        safe_shell.state.borrow_mut().safe_mode = true;
+        let rendered =
+            render_welcome_card(&safe_shell.state.borrow(), 80, 10, Instant::now()).join("\n");
+        let rendered = strip_terminal_sequences(&rendered);
+        assert!(rendered.contains("permissions: safe mode"), "{rendered}");
     }
 }

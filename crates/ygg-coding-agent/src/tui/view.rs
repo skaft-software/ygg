@@ -288,6 +288,8 @@ pub(crate) struct ShellState {
     /// Active interactive panel, if any.
     pub(crate) panel: Option<Panel>,
     pub(crate) theme: YggTheme,
+    /// Whether this session uses explicit approval gates instead of full host access.
+    pub(crate) safe_mode: bool,
     /// Theme swap revision. The retained terminal renderer uses this
     /// to repaint the complete visible viewport even when some logical rows
     /// (notably blank separators) are byte-identical across themes.
@@ -2393,6 +2395,7 @@ impl InteractiveShell {
 
     pub fn set_theme_config(&mut self, config: Config) {
         let mut state = self.state.borrow_mut();
+        state.safe_mode = config.effect_policy != ygg_agent::EffectPolicy::UnsafeHost;
         state.max_session_cost_microdollars = config.max_cost_microdollars;
         state.show_turn_cost = config.show_turn_cost;
         drop(state);

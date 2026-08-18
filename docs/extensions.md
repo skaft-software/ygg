@@ -71,13 +71,10 @@ Executable extensions are intentionally a local tinkerer feature. Capability
 declarations are visible consent metadata, not an operating-system sandbox.
 Discovery remains available under every effect policy, but process startup
 requires all three independent gates: enablement, an exact trust grant, and the
-explicit `UnsafeHost` opt-in (`--yolo`, `yolo = true`, or `YGG_YOLO=true`).
-Legacy `--unsafe-host-effects` / `unsafe_host_effects = true` /
-`YGG_UNSAFE_HOST_EFFECTS=true` are still accepted for compatibility.
-`Controlled` never starts an executable extension, even when the process/shell
-sandbox flags are enabled, and reports that blocked startup in `/extensions`. An
-admitted extension runs as the current user, so use UnsafeHost only inside
-separate OS-level isolation.
+default full-access policy. `--safe-mode` never starts an executable extension,
+even when the process/shell sandbox flags are enabled, and reports that blocked
+startup in `/extensions`. An admitted extension runs as the current user, so use
+full-access mode only inside separate OS-level isolation.
 
 ## Layout and discovery
 
@@ -101,7 +98,7 @@ discovery and trust; aliases are rejected with a diagnostic.
 Use repeatable command-line options for one-off tinkering:
 
 ```console
-ygg --yolo \
+ygg \
     --extension-dir ./my-extensions \
     --enable-extension hello-world \
     --trust-extension hello-world
@@ -110,8 +107,8 @@ ygg --yolo \
 Or persist activation in the user config:
 
 ```toml
-# Unsafe: use only inside separate OS-level isolation.
-yolo = true
+# Unsafe: the default full-access mode is intended only inside separate
+# OS-level isolation. Use --safe-mode when approval is required.
 enabled_extensions = ["hello-world"]
 trusted_extensions = ["hello-world"]
 ```
@@ -133,9 +130,10 @@ currently selected `git-tools` source for this process invocation only and is
 never written back as a persistent name grant.
 
 A trusted project config may suggest `enabled_extensions`, but it cannot grant
-itself executable trust or UnsafeHost. Persistent trust must come from the user
-config or environment (`YGG_TRUSTED_EXTENSIONS`); one-shot trust comes from
-`--trust-extension`.
+itself executable trust. The default full-access policy permits a fully enabled
+and trusted extension to start; `--safe-mode` keeps it stopped. Persistent trust
+must come from the user config or environment (`YGG_TRUSTED_EXTENSIONS`);
+one-shot trust comes from `--trust-extension`.
 
 The agent crate exposes both pieces of the boundary:
 
@@ -557,7 +555,7 @@ shared interactive/plain/print/RPC/native-host/Serve terminal boundary settles
 each admitted turn. Notifications are best effort; host cleanup and persistence
 remain authoritative. Frozen API `0.1` keeps `after_response` success-only.
 
-For an admitted, running UnsafeHost extension, reload starts and fully
+For an admitted, running full-access extension, reload starts and fully
 initializes a replacement while the existing process remains ready. Launch,
 handshake, or contribution mismatch leaves the existing process active. A
 process negotiating `dynamic_tools` may replace its tool catalog during reload;

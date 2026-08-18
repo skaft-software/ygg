@@ -17,13 +17,17 @@
 
 Every registered `Tool` classifies the exact parsed call through host-owned code. The model cannot provide or lower this classification, and the trait default is `Unknown`. Unknown effects fail closed under every policy, including `UnsafeHost`. Before any hook or tool implementation receives a call, the agent constructs a bounded canonical `EffectIntent` over the principal, run, tool-catalog generation, provider call ID, tool name, effect, arguments, and policy version.
 
-The default `Controlled` policy admits `Pure` and `WorkspaceRead`, requests interactive confirmation for workspace mutation and non-whitelisted `HostProcess` calls, auto-approves a conservative set of known-safe read-only `bash` commands, and otherwise denies host reads/mutations, native processes, network, delegation, executable extensions, and unknown effects. `UnsafeHost` admits classified effects but is an explicit compatibility policy, not containment. Product code must additionally prevent executable-extension process startup under Controlled because a broker check at later tool invocation cannot contain an already-running executable.
+The default `Controlled` policy admits `Pure` and `WorkspaceRead`, requests interactive confirmation for workspace mutation and non-whitelisted `HostProcess` calls, auto-approves a conservative set of known-safe read-only `bash` commands, and otherwise denies host reads/mutations, native processes, network, delegation, executable extensions, and unknown effects. `UnsafeHost` admits classified effects but is not containment. The coding product
+selects it by default; `--safe-mode` selects `ControlledBashApproval`. Product code
+must additionally prevent executable-extension process startup under controlled
+policies because a broker check at later tool invocation cannot contain an
+already-running executable.
 
 Workspace-mutation approval creates a random, short-lived capability bound to the canonical intent digest. Tokens are atomically single-use, stored by one-way verifier, redacted in debug output, and never supplied to tools. Dispatch reserves admission before `before_tool_call`, then commits and consumes the exact grant only after all hooks pass and immediately before calling `Tool::execute`. Hook denial or cancellation drops and revokes an uncommitted reservation; cancellation after commit cannot restore it. `after_tool_call` runs only for a committed effect.
 
 Sequential, parallel, and crash-recovery dispatch all use this boundary. Static `ToolConcurrency::Parallel` and `ReplaySafety::Safe` declarations are intersected with the exact host classification: only `Pure` and `WorkspaceRead` calls may run in a parallel batch or be replayed after a crash. A denied call is returned to the provider as a paired tool error without invoking hooks or executable code.
 
-The broker is a deterministic admission reference monitor, not an OS sandbox. Controlled intentionally denies effect classes that still lack isolation or dedicated brokers, while allowing safe read-only `bash` commands through the `Controlled` process channel; `--safe` is the stricter controlled profile that confirms every `bash` call. `yolo` mode (`--yolo`) maps to `UnsafeHost`, where classified command and process effects use ambient host authority.
+The broker is a deterministic admission reference monitor, not an OS sandbox. Controlled intentionally denies effect classes that still lack isolation or dedicated brokers, while allowing safe read-only `bash` commands through the `Controlled` process channel; `ControlledBashApproval` (selected by `--safe-mode`) confirms every `bash` call. The default `UnsafeHost` policy lets classified command and process effects use ambient host authority.
 
 ## Sessions
 
@@ -105,7 +109,7 @@ descendants are stopped with their parent.
 
 Workspace-only path shapes reject absolute roots and parent components. On Unix, file operations canonicalize the accepted target and then walk every component using directory descriptors and `O_NOFOLLOW`. Reads open the final object nonblocking, require a regular file from descriptor metadata, and stream at most limit+1 bytes. Mutations retain the open parent descriptor, write a sibling `create_new` temporary, re-read and compare the target immediately before commit, and rename relative to the same descriptor. Parent symlink replacement therefore cannot redirect the operation.
 
-The path guard applies to explicit built-in paths. It is not process containment: commands admitted by UnsafeHost have the current user's authority. When external paths are enabled, local file tools conservatively classify every call as a host effect so a path-resolution race cannot lower admission authority; the coding product forces external paths off under Controlled.
+The path guard applies to explicit built-in paths. It is not process containment: commands admitted by UnsafeHost have the current user's authority. When external paths are enabled, local file tools conservatively classify every call as a host effect so a path-resolution race cannot lower admission authority; the coding product forces external paths off under controlled policies, including `--safe-mode`.
 
 ## Resource limits
 

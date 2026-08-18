@@ -640,7 +640,6 @@ done
 
 fn extension_args(extension_root: &Path, name: &str) -> Vec<String> {
     vec![
-        "--yolo".to_owned(),
         "--extension-dir".to_owned(),
         extension_root.display().to_string(),
         "--enable-extension".to_owned(),

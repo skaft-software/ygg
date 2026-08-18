@@ -24,6 +24,6 @@ extension into a project.
   deterministic prompt/context shaping for smaller local context windows.
 
 Copy an example into the matching `.ygg/` directory in a project. Executable
-extensions must also be explicitly enabled, independently trusted, and started
-with the UnsafeHost authority opt-in; see
-[`docs/extensions.md`](../docs/extensions.md).
+extensions must also be explicitly enabled and independently trusted. They run
+under Ygg's default full-access policy and remain stopped under `--safe-mode`;
+see [`docs/extensions.md`](../docs/extensions.md).

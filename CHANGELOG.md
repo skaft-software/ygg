@@ -72,14 +72,10 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   explicit `parallel_tool_calls: false`, developer-message instructions,
   input-item `additional_tools`, `reasoning.context: "all_turns"`, and narrow
   removal of image-detail hints.
-- Renamed the safety flags: `--unsafe-host-effects` is now `--yolo` and
-  `--unsafe` / `--unsafe-bash` is now `--safe`. The legacy `unsafe_host_effects`
-  config key and `YGG_UNSAFE_HOST_EFFECTS` environment variable remain
-  compatibility aliases alongside `yolo` and `YGG_YOLO`. The CLI default is now
-  the explicit `ControlledBashApproval` profile: every `bash` call requires
-  one-shot approval, workspace reads and mutations remain controlled, and all
-  other ambient host effects stay denied. `--safe` additionally forces
-  workspace-relative path admission.
+- Swapped the safety default to full host access (`UnsafeHost`) and replaced
+  `--safe` with canonical `--safe-mode` for approval-required execution. The
+  obsolete `--yolo` flag and its configuration/environment aliases are no longer
+  accepted; `--safe` remains a hidden compatibility alias for `--safe-mode`.
 - Rewrote bash safety classification with tree-sitter parsing: a strict
   word-only command allowlist joined by `&&`, `||`, `;`, and `|`, with bounded
   recursion through shell wrapper invocations, decides which `bash` commands

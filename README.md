@@ -315,6 +315,11 @@ model discovery during startup; inference still reaches the selected endpoint.
 
 All three frontends use the same agent loop, provider layer, session format, safety policy, and cancellation behavior.
 
+The interactive TUI startup card reports `permissions:` followed by **full access**
+by default, with the access value shown in bold red. Launching with
+`--safe-mode` changes the value to **safe mode**, shown in bold accent color
+(blue in the default theme), and enables approval gates for each bash call and workspace mutation.
+
 ### Built-in tools
 
 | Tool | Purpose | Registered by default |
@@ -327,21 +332,22 @@ All three frontends use the same agent loop, provider layer, session format, saf
 
 The model-visible schema and executable registry are built from the same final
 allowlist. A disabled tool cannot remain advertised to the model. Registration
-does not itself authorize an effect: the default `--safe` policy (`ControlledBashApproval`)
-requires workspace-mutation approval and one-shot approval for every `bash` process
-call while denying other ambient host effects. `bash` is the one process-capable tool
-still exposed in all modes, with only `--yolo` lifting to ambient host authority.
-Unknown effects always fail closed.
+does not itself authorize an effect: the default policy (`UnsafeHost`) gives
+authoritatively classified effects the Ygg process's ambient host authority, subject
+to the existing tool and sandbox gates. `--safe-mode` selects
+`ControlledBashApproval`, requiring workspace-mutation approval and one-shot approval
+for every `bash` process call while denying other ambient host effects. Unknown
+effects always fail closed.
 
-`--safe` requires confirmation for every `bash` host process call and keeps workspace
-reads/mutations as controlled. `--yolo` explicitly allows every authoritatively
-classified effect that survives the existing tool and sandbox gates and is also
-required before an enabled, trusted executable extension process may start. `--safe`
-also forces `allow_external_paths = false`, regardless of the legacy broad path
-default, so file admission and execution remain workspace-relative. `--yolo` uses
-the Ygg process's ambient OS authority
-and is intended only inside a separately isolated account, container, VM, or
-platform sandbox.
+`--safe-mode` requires confirmation for every `bash` host process call and keeps
+workspace reads/mutations controlled. Without it, an enabled, trusted executable
+extension may start and classified effects use the current user's authority. Safe
+mode also forces `allow_external_paths = false`, regardless of the broad path
+default, so file admission and execution remain workspace-relative. Full-access mode
+is intended only inside a separately isolated account, container, VM, or platform
+sandbox. `--safe-mode` is canonical; `--safe` remains a hidden compatibility alias.
+The former `--yolo` flag and its configuration/environment forms are no longer
+accepted.
 
 ```sh
 # Read-only review
@@ -357,11 +363,12 @@ ygg --no-process
 ygg --no-tools
 ```
 
-When `--yolo` is explicitly enabled, `bash` runs with the authority of the
+In the default full-access mode, `bash` runs with the authority of the
 current operating-system user. Like Pi, it passes every complete command to one
 selected shell with `-c`; on Unix Ygg uses an explicit `shell_path` first, then
 `/bin/bash`, `bash` on `PATH`, and finally `sh`. It does not consult `$SHELL`.
-`--no-process` and `--no-shell` remain equivalent authority gates.
+`--no-process` and `--no-shell` remain equivalent authority gates. Use
+`--safe-mode` to require approval for each action.
 For untrusted repositories, use a container, VM, or restricted account; see
 [SECURITY.md](SECURITY.md).
 
@@ -418,9 +425,8 @@ when the model advertises Ultra effort and a V2 collaboration protocol that this
 Ygg build can execute. Selecting it installs six collaboration tools
 (`spawn_agent`, `followup_task`, `send_message`, `wait_agent`, `list_agents`, and
 `interrupt_agent`) and tells the root agent to delegate when parallel work would
-materially improve speed or quality. The default safe policy does not grant
-`delegation`; executing those tools requires explicit opt-in to host authority via
-`--yolo` or equivalent config.
+materially improve speed or quality. Safe mode does not grant `delegation`;
+executing those tools requires the default full-access policy.
 
 One Ultra team defaults to four concurrent agents including the root, depth two,
 and sixteen total agents during each owning run. Children use isolated durable
@@ -606,11 +612,8 @@ color = "auto"
 mouse = "auto"
 plain = false
 
-# Default to the safer --safe policy; opt in with yolo for ambient authority
-# only in isolated hosts.
-yolo = false
-# --safe resolves to workspace-only path semantics. UnsafeHost may retain a
-# configured true value.
+# ygg defaults to full host access. Pass --safe-mode to require approval
+# for each action. This capability setting independently keeps paths local.
 allow_external_paths = false
 allow_edit = true
 allow_write = true
@@ -634,7 +637,7 @@ keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_YOLO`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls (legacy `YGG_UNSAFE_HOST_EFFECTS` and `unsafe_host_effects` remain accepted as compatibility aliases). Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Unsafe host effects require `yolo = true` or `YGG_YOLO=true`; `--safe` is the approval-only mode. A trusted project config cannot grant this opt-in. `--safe` resolves `allow_external_paths` to false; only `--yolo` can retain a configured true value. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
 `reasoning_mode = "pro"`, `YGG_REASONING_MODE=pro`, and
 `--reasoning-mode pro` are accepted only to load legacy configuration and
@@ -652,7 +655,7 @@ warning. New configuration should use `reasoning` alone.
 | Session | `--continue`, `--resume`, `--session-dir`, `sessions ...` |
 | Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
-| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--safe`, `--yolo`, `--shell-path` |
+| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--safe-mode`, `--shell-path` |
 | Limits | `--bash-timeout-secs`, `--max-output-bytes` |
 | Customization | `--theme`, `--theme-dir`, `--system-prompt`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
 
@@ -701,12 +704,12 @@ successfully before cutover. Python extensions can use the dependency-free
 [`ygg-extension-sdk`](sdk/python/README.md) instead of reimplementing the
 protocol loop.
 
-Discovery does not execute code. An extension must be enabled, its exact source
-independently trusted, and UnsafeHost explicitly selected; a project
-configuration cannot grant trust or UnsafeHost to itself. Controlled still
-reports discovered extensions but never starts their processes, even when the
-process/shell gates are enabled. Admitted extensions run with the launching
-user's OS authority. Initial handshake failures and hung-but-open processes are
+Discovery does not execute code. An extension must be enabled and its exact
+source independently trusted; the default full-access policy permits startup,
+while `--safe-mode` reports discovered extensions but never starts their
+processes, even when the process/shell gates are enabled. A project configuration
+cannot grant trust to itself. Admitted extensions run with the launching user's
+OS authority. Initial handshake failures and hung-but-open processes are
 not yet supervised, and a full application rebuild currently recreates extension
 processes.
 

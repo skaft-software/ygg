@@ -63,7 +63,7 @@ const CONFIRMATION_DENIAL_QUEUE_CAPACITY: usize = 64;
 const CONFIRMATION_DENIAL_CONCURRENCY: usize = 8;
 const INPUT_CANCELLATION_QUEUE_CAPACITY: usize = 64;
 const INPUT_CANCELLATION_CONCURRENCY: usize = 8;
-const CONTROLLED_EXTENSION_START_DIAGNOSTIC: &str = "executable extensions were not started: the Controlled effect policy denies extension process startup; opt into UnsafeHost (for example with --yolo) only inside OS-level isolation";
+const CONTROLLED_EXTENSION_START_DIAGNOSTIC: &str = "executable extensions were not started: safe mode denies extension process startup; rerun without --safe-mode only inside OS-level isolation";
 static NEXT_EXTENSION_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(serde::Serialize)]

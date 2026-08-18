@@ -490,7 +490,7 @@ fn effect_policy(policy: ygg_agent::EffectPolicy) -> &'static str {
             "controlled (all bash calls need approval; other ambient host effects denied)"
         }
         ygg_agent::EffectPolicy::UnsafeHost => {
-            "UNSAFE host (classified effects use ambient OS authority)"
+            "full access (classified effects use ambient OS authority)"
         }
     }
 }

@@ -92,9 +92,8 @@ pub struct SandboxPolicy {
 impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
-            // Preserve the legacy ambient-host baseline only for an explicit
-            // UnsafeHost profile. Final configuration resolution forces this
-            // false whenever the effect policy remains non-UnsafeHost.
+            // Full-access mode retains current-user path access. Final
+            // configuration resolution forces this false in safe mode.
             allow_external_paths: true,
             allow_edit: true,
             allow_write: true,

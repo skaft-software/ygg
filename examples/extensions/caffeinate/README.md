@@ -22,18 +22,17 @@ python3 -m pip install ./sdk/python
 ```
 
 Copy the directory to `.ygg/extensions/caffeinate/`, then explicitly enable and
-trust it. Executable-extension startup also requires the UnsafeHost authority
-opt-in. For a project extension, one invocation is:
+trust it. Executable-extension startup requires the default full-access policy.
+For a project extension, one invocation is:
 
 ```console
 ygg --workspace-trusted \
-    --yolo \
     --enable-extension caffeinate \
     --trust-extension caffeinate
 ```
 
-UnsafeHost uses the Ygg process's ambient operating-system authority; run this
-example only from an appropriately isolated, trusted environment.
+Full-access mode uses the Ygg process's ambient operating-system authority; run
+this example only from an appropriately isolated, trusted environment.
 
 The extension requires macOS and `/usr/bin/caffeinate`. It reads no files and
 uses no network. Its declared `process = true` capability is visible consent
