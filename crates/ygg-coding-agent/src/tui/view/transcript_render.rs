@@ -147,16 +147,12 @@ pub(super) fn render_block_planned(
         }
         TranscriptBlock::Outcome(outcome) => render_outcome(outcome, theme, width),
         TranscriptBlock::Notice(text) => {
-            let marker = theme.glyph("note");
-            let marker = if theme.has_semantic_role("notification") {
-                theme.apply_semantic_role("notification", marker)
-            } else {
-                theme.fg("model_accent", marker)
-            };
-            let prefix = format!("{marker} ");
-            let continuation = " ".repeat(visible_width(&prefix));
-            let lines = wrap_hanging(&sanitize_for_terminal(text), &prefix, &continuation, width);
-            finish_transcript_block(lines)
+            let text = theme.fg("muted", &sanitize_for_terminal(text));
+            finish_transcript_block(wrap_hanging(&text, "", "", width))
+        }
+        TranscriptBlock::NoticeStatus { text, .. } => {
+            let text = theme.fg("muted", &sanitize_for_terminal(text));
+            finish_transcript_block(wrap_hanging(&text, "", "", width))
         }
         TranscriptBlock::Compaction(compaction) => {
             let marker = theme.glyph("note");

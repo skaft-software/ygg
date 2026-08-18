@@ -28,7 +28,7 @@ fn transcript_surface_kind(block: &TranscriptBlock) -> &'static str {
         TranscriptBlock::Tool(_) => "tool",
         TranscriptBlock::Shell(_) => "shell",
         TranscriptBlock::Outcome(_) => "outcome",
-        TranscriptBlock::Notice(_) => "notice",
+        TranscriptBlock::Notice(_) | TranscriptBlock::NoticeStatus { .. } => "notice",
         TranscriptBlock::Compaction(_) => "compaction",
     }
 }
@@ -85,10 +85,9 @@ fn natural_surface_width(block: &TranscriptBlock, theme: &YggTheme) -> u16 {
     let inner_prefix = match block {
         TranscriptBlock::User { .. } => 2,
         TranscriptBlock::Tool(_) => 8,
-        TranscriptBlock::Notice(_) | TranscriptBlock::Compaction(_) => {
-            visible_width(theme.glyph("note")).saturating_add(1)
-        }
+        TranscriptBlock::Notice(_) | TranscriptBlock::NoticeStatus { .. } => 0,
         TranscriptBlock::Shell(_) => visible_width(theme.glyph("shell")).saturating_add(1),
+        TranscriptBlock::Compaction(_) => visible_width(theme.glyph("note")).saturating_add(1),
         TranscriptBlock::Assistant(_)
         | TranscriptBlock::Reasoning(_)
         | TranscriptBlock::Outcome(_) => 0,

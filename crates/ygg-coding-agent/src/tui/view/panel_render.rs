@@ -42,11 +42,16 @@ fn panel_cell(text: &str) -> String {
     super::sanitize_for_terminal(text).replace('\n', " ")
 }
 
+fn is_confirmation_panel(action: &super::PanelAction) -> bool {
+    matches!(action, super::PanelAction::ExtensionConfirmation)
+}
+
 fn panel_header(
     theme: &YggTheme,
     title: &str,
     selected: usize,
     matches: usize,
+    show_position: bool,
     width: u16,
 ) -> String {
     let terminal_width = width;
@@ -60,22 +65,35 @@ fn panel_header(
             title
         },
     );
-    let position = if matches == 0 {
-        "0/0".to_owned()
+    let position = if show_position {
+        if matches == 0 {
+            "0/0".to_owned()
+        } else {
+            format!("{}/{}", selected.min(matches - 1) + 1, matches)
+        }
     } else {
-        format!("{}/{}", selected.min(matches - 1) + 1, matches)
+        String::new()
     };
     let gap = available
         .saturating_sub(visible_width(&title))
         .saturating_sub(visible_width(&position));
-    let line = format!(
-        "{}{}{}{}{}",
-        " ".repeat(inset),
-        theme.bold(&title),
-        " ".repeat(gap.max(1)),
-        subdued_text(theme, &position),
-        " ".repeat(inset)
-    );
+    let line = if show_position {
+        format!(
+            "{}{}{}{}{}",
+            " ".repeat(inset),
+            theme.bold(&title),
+            " ".repeat(gap.max(1)),
+            subdued_text(theme, &position),
+            " ".repeat(inset)
+        )
+    } else {
+        format!(
+            "{}{}{}",
+            " ".repeat(inset),
+            theme.bold(&title),
+            " ".repeat(inset)
+        )
+    };
     fit_line(&line, terminal_width)
 }
 
@@ -226,16 +244,21 @@ fn panel_rows(state: &ShellState, width: u16) -> usize {
             items,
             descriptions,
             filter,
+            action,
             ..
         } => {
-            // `(no matches)` still occupies one body row.
+            let confirmation = is_confirmation_panel(action);
+            // `(no matches)` still occupies one body row. Confirmation panels
+            // have exactly two actions, so they do not need filter chrome or a
+            // count in their heading.
             let body = filtered_indices(items, descriptions, filter).len().max(1);
             let border_rows = usize::from(
-                state.theme.layout_for_width(width).show_panel_borders && max_panel >= 4,
+                !confirmation
+                    && state.theme.layout_for_width(width).show_panel_borders
+                    && max_panel >= 4,
             ) * 2;
-            // title + stable filter row + items (capped), optionally framed by
-            // top/bottom semantic rules.
-            (body + 2 + border_rows).min(max_panel)
+            let chrome_rows = if confirmation { 1 } else { 2 };
+            (body + chrome_rows + border_rows).min(max_panel)
         }
     }
 }
@@ -267,28 +290,48 @@ pub(super) fn render_panel_with_limit(
             descriptions,
             selected,
             filter,
-            ..
+            action,
         } => {
+            let confirmation = is_confirmation_panel(action);
             let filtered = filtered_indices(items, descriptions, filter);
-            let header = panel_header(&state.theme, title, *selected, filtered.len(), width);
-            let filter_line = panel_filter_line(&state.theme, filter, width);
+            let header = panel_header(
+                &state.theme,
+                title,
+                *selected,
+                filtered.len(),
+                !confirmation,
+                width,
+            );
+            let filter_line =
+                (!confirmation).then(|| panel_filter_line(&state.theme, filter, width));
             if max_rows == 1 {
-                return vec![filter_line];
+                return vec![if confirmation {
+                    header
+                } else {
+                    filter_line.expect("filter row")
+                }];
             }
-            if max_rows == 2 {
-                return vec![header, filter_line];
+            if max_rows == 2 && !confirmation {
+                return vec![header, filter_line.expect("filter row")];
             }
 
-            let show_borders =
-                state.theme.layout_for_width(width).show_panel_borders && max_rows >= 4;
+            // Permission prompts are intentionally lightweight: the prompt and
+            // two choices are enough context. In particular, do not surface
+            // effect hashes or duplicate details beside both choices.
+            let show_borders = !confirmation
+                && state.theme.layout_for_width(width).show_panel_borders
+                && max_rows >= 4;
             let border_rows = usize::from(show_borders) * 2;
+            let chrome_rows = usize::from(!confirmation) + 1;
             let mut lines = Vec::with_capacity(max_rows);
             if show_borders {
                 lines.push(dim(&rule));
             }
             lines.push(header);
-            lines.push(filter_line);
-            let max_body = max_rows.saturating_sub(2 + border_rows);
+            if let Some(filter_line) = filter_line {
+                lines.push(filter_line);
+            }
+            let max_body = max_rows.saturating_sub(chrome_rows + border_rows);
             if filtered.is_empty() && max_body > 0 {
                 let message = if filter.is_empty() {
                     "  No matches".to_owned()
@@ -301,13 +344,17 @@ pub(super) fn render_panel_with_limit(
             } else if !filtered.is_empty() {
                 let visible = filtered.len().min(max_body);
                 let window = panel_window(*selected, filtered.len(), visible);
-                let label_width = panel_label_width(items, descriptions, &filtered, width);
+                let label_width = (!confirmation)
+                    .then(|| panel_label_width(items, descriptions, &filtered, width))
+                    .flatten();
                 for position in window {
                     let index = filtered[position];
                     lines.push(render_panel_item(
                         state,
                         &items[index],
-                        descriptions.get(index).and_then(|value| value.as_deref()),
+                        (!confirmation)
+                            .then(|| descriptions.get(index).and_then(|value| value.as_deref()))
+                            .flatten(),
                         position == *selected,
                         label_width,
                         width,

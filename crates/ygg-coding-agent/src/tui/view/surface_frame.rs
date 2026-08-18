@@ -182,9 +182,16 @@ pub(super) fn event_margin_marker(
         } else {
             theme.settled_event_dot("error", event_dot)
         }),
+        TranscriptBlock::Notice(_) => Some(theme.settled_event_dot("neutral", event_dot)),
+        TranscriptBlock::NoticeStatus { tone, .. } => Some(theme.settled_event_dot(
+            match tone {
+                super::NoticeTone::Success => "success",
+                super::NoticeTone::Error => "error",
+            },
+            event_dot,
+        )),
         TranscriptBlock::User { .. }
         | TranscriptBlock::Outcome(_)
-        | TranscriptBlock::Notice(_)
         | TranscriptBlock::Compaction(_) => None,
     }
 }

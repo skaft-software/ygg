@@ -1350,11 +1350,11 @@ where
                                 quit_requested,
                             );
                         }
-                        shell.notice(if confirmed {
-                            "extension action confirmed"
+                        if confirmed {
+                            shell.notice_success("extension action approved");
                         } else {
-                            "extension action denied"
-                        });
+                            shell.notice_error("extension action denied");
+                        }
                     }
                     if let AgentEvent::ToolProgress {
                         progress: ygg_agent::ToolProgress::Input(request),

@@ -350,7 +350,7 @@ async fn confirmation_prompt_picker<S>(
     shell: &mut InteractiveShell,
     input: &mut S,
     prompt: &str,
-    detail: Option<&str>,
+    _detail: Option<&str>,
     destructive: bool,
     default: bool,
 ) -> anyhow::Result<bool>
@@ -358,18 +358,18 @@ where
     S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
 {
     let (items, decisions) = if default {
-        (vec!["Allow".to_owned(), "Deny".to_owned()], [true, false])
+        (vec!["Approve".to_owned(), "Deny".to_owned()], [true, false])
     } else {
-        (vec!["Deny".to_owned(), "Allow".to_owned()], [false, true])
+        (vec!["Deny".to_owned(), "Approve".to_owned()], [false, true])
     };
-    let consequence = detail.map(str::to_owned).or_else(|| {
-        destructive.then(|| "The extension marked this action as destructive.".to_owned())
-    });
-    let descriptions = vec![consequence.clone(), consequence];
+    // The prompt already explains the requested effect. Keep hashes and other
+    // wire-level detail out of the two-choice picker; they belong in logs and
+    // diagnostics, not beside both answers.
+    let descriptions = vec![None, None];
     let title = if destructive {
-        format!("Confirm destructive action · {prompt}")
+        format!("Action requires approval · {prompt}")
     } else {
-        format!("Confirm extension action · {prompt}")
+        prompt.to_owned()
     };
     let selected = pick_list(
         shell,

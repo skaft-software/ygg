@@ -387,6 +387,39 @@ fn plain_footer(shell: &InteractiveShell, width: u16, now: Instant) -> String {
 }
 
 #[test]
+fn confirmation_panel_keeps_two_choices_plain_and_unfiltered() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(100, 24);
+    shell.open_panel(Panel::SelectList {
+        title: "Approve one exact `bash` tool effect?".into(),
+        items: vec!["Deny".into(), "Approve".into()],
+        descriptions: vec![
+            Some("effect: host_process sha256: 85bc9fe8cfaf7c550880d65882f7c4142c8374875c976c58d1dd724a7f16e609".into()),
+            Some("effect: host_process sha256: 85bc9fe8cfaf7c550880d65882f7c4142c8374875c976c58d1dd724a7f16e609".into()),
+        ],
+        selected: 0,
+        filter: String::new(),
+        action: PanelAction::ExtensionConfirmation,
+    });
+
+    let lines = render_panel(&shell.state.borrow(), 100)
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>();
+    let rendered = lines.join("\n");
+    assert_eq!(lines.len(), 3);
+    assert!(rendered.contains("Approve one exact `bash` tool effect?"));
+    assert!(rendered.contains("Deny"));
+    assert!(rendered.contains("Approve"));
+    assert!(!rendered.contains("Filter"));
+    assert!(!rendered.contains("1/2"));
+    assert!(!rendered.contains("85bc9fe8"));
+
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Char('x')));
+    assert!(panel_state(&shell).2.is_empty());
+}
+
+#[test]
 fn select_list_filter_narrows_items_and_confirm_returns_original_index() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(80, 24);
@@ -5638,6 +5671,33 @@ fn tool_lifecycle_styles_are_visible_in_terminal_cells() {
 }
 
 #[test]
+fn notice_markers_use_neutral_success_and_error_lifecycle_tones() {
+    let theme = crate::tui::theme::test_theme();
+    let neutral = TranscriptBlock::Notice("model changed".into());
+    let approved = TranscriptBlock::NoticeStatus {
+        text: "action approved".into(),
+        tone: NoticeTone::Success,
+    };
+    let denied = TranscriptBlock::NoticeStatus {
+        text: "action denied".into(),
+        tone: NoticeTone::Error,
+    };
+
+    assert_eq!(
+        event_margin_marker(&neutral, &theme, false, false),
+        Some(theme.settled_event_dot("neutral", "•"))
+    );
+    assert_eq!(
+        event_margin_marker(&approved, &theme, false, false),
+        Some(theme.settled_event_dot("success", "•"))
+    );
+    assert_eq!(
+        event_margin_marker(&denied, &theme, false, false),
+        Some(theme.settled_event_dot("error", "•"))
+    );
+}
+
+#[test]
 fn event_margin_markers_cover_responses_tools_and_collapsed_reasoning() {
     let theme = crate::tui::theme::test_theme();
     let args = serde_json::json!({"path":"src/lib.rs"});
@@ -7401,10 +7461,14 @@ fn theme_density_and_transcript_inset_change_semantic_block_geometry() {
         1
     );
     assert_eq!(airy.iter().take_while(|line| line.is_empty()).count(), 2);
-    let note = theme_with_layout("").glyph("note").to_owned();
-    assert!(compact[0].starts_with(&format!(" {note} ")));
-    assert!(comfortable[1].starts_with(&format!("  {note} ")));
-    assert!(airy[2].starts_with(&format!("    {note} ")));
+    let dot = if theme_with_layout("").unicode() {
+        "•"
+    } else {
+        "*"
+    };
+    assert!(compact[0].starts_with(&format!("{dot}current")));
+    assert!(comfortable[1].starts_with(&format!("{dot} current")));
+    assert!(airy[2].starts_with(&format!("  {dot} current")));
 
     let hidden_theme = theme_with_layout(
         "density = \"airy\"\nshow_reasoning = false\nnarrow_show_reasoning = false",

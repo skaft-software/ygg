@@ -19,7 +19,8 @@ fn transcript_block_is_final(block: &TranscriptBlock) -> bool {
         TranscriptBlock::Compaction(_)
         | TranscriptBlock::User { .. }
         | TranscriptBlock::Outcome(_)
-        | TranscriptBlock::Notice(_) => true,
+        | TranscriptBlock::Notice(_)
+        | TranscriptBlock::NoticeStatus { .. } => true,
     }
 }
 
@@ -122,7 +123,9 @@ fn finalized_block_rows_are_stable(block: &TranscriptBlock) -> bool {
             .filter(|line| !line.trim().is_empty())
             .nth(COMPACT_EXEC_OUTPUT_LINES)
             .is_none(),
-        TranscriptBlock::Outcome(_) | TranscriptBlock::Notice(_) => true,
+        TranscriptBlock::Outcome(_)
+        | TranscriptBlock::Notice(_)
+        | TranscriptBlock::NoticeStatus { .. } => true,
         // These presentations can shrink when Ctrl+O changes disclosure. They
         // may still cross history atomically through a semantic target, but no
         // partial physical prefix is safe to pin.

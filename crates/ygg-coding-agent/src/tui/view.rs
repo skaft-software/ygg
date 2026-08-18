@@ -129,6 +129,12 @@ impl OutcomeBlock {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoticeTone {
+    Success,
+    Error,
+}
+
 enum TranscriptBlock {
     User {
         text: String,
@@ -146,7 +152,14 @@ enum TranscriptBlock {
     Tool(Box<ToolPanel>),
     Shell(Box<ShellOutput>),
     Outcome(OutcomeBlock),
+    /// A neutral notice retained for compatibility with the many ordinary
+    /// informational events. Approval/denial notices use `NoticeStatus` so
+    /// their margin marker can carry the outcome without colouring the text.
     Notice(String),
+    NoticeStatus {
+        text: String,
+        tone: NoticeTone,
+    },
     Compaction(Box<CompactionBlock>),
 }
 
@@ -2948,6 +2961,7 @@ impl InteractiveShell {
         let action = match panel {
             Panel::SelectList { action, .. } => action.clone(),
         };
+        let confirmation = matches!(&action, PanelAction::ExtensionConfirmation);
         match panel {
             Panel::SelectList {
                 items,
@@ -3014,15 +3028,18 @@ impl InteractiveShell {
                                 }
                             }
                             KeyCode::Char(c)
-                                if !key.modifiers.intersects(
-                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                                ) =>
+                                if !confirmation
+                                    && !key.modifiers.intersects(
+                                        KeyModifiers::CONTROL
+                                            | KeyModifiers::ALT
+                                            | KeyModifiers::SUPER,
+                                    ) =>
                             {
                                 filter.push(c);
                                 // The match set changed; restart at the top.
                                 *selected = 0;
                             }
-                            KeyCode::Backspace if key.modifiers.is_empty() => {
+                            KeyCode::Backspace if !confirmation && key.modifiers.is_empty() => {
                                 filter.pop();
                                 *selected = 0;
                             }
@@ -3051,6 +3068,25 @@ impl InteractiveShell {
     pub fn notice(&mut self, message: impl Into<String>) {
         let mut state = self.state.borrow_mut();
         state.push_block(TranscriptBlock::Notice(message.into()));
+    }
+
+    /// Add an informational event whose margin marker communicates success.
+    pub fn notice_success(&mut self, message: impl Into<String>) {
+        let mut state = self.state.borrow_mut();
+        state.push_block(TranscriptBlock::NoticeStatus {
+            text: message.into(),
+            tone: NoticeTone::Success,
+        });
+    }
+
+    /// Add an informational event whose margin marker communicates denial or
+    /// failure. The message itself remains neutral, like a tool event.
+    pub fn notice_error(&mut self, message: impl Into<String>) {
+        let mut state = self.state.borrow_mut();
+        state.push_block(TranscriptBlock::NoticeStatus {
+            text: message.into(),
+            tone: NoticeTone::Error,
+        });
     }
 
     /// Append a running shell command placeholder. The shared transcript
@@ -3253,6 +3289,10 @@ impl InteractiveShell {
         for block in &state.transcript {
             match block {
                 TranscriptBlock::User { text, .. } | TranscriptBlock::Notice(text) => {
+                    result.push('\n');
+                    result.push_str(text);
+                }
+                TranscriptBlock::NoticeStatus { text, .. } => {
                     result.push('\n');
                     result.push_str(text);
                 }

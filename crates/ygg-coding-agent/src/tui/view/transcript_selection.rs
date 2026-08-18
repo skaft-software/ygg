@@ -33,6 +33,7 @@ pub(super) fn block_copy_text(block: &TranscriptBlock) -> String {
         TranscriptBlock::User { text, .. } | TranscriptBlock::Notice(text) => {
             sanitize_for_terminal(text)
         }
+        TranscriptBlock::NoticeStatus { text, .. } => sanitize_for_terminal(text),
         TranscriptBlock::Compaction(compaction) => format!(
             "{}\n{}",
             sanitize_for_terminal(&compaction.label),
@@ -183,7 +184,9 @@ fn visual_cell_to_copy_offset(
             let col_in_text = col.saturating_sub(2);
             wrapped_line_col_offset(copy_text, local_row, col_in_text, inner_width)
         }
-        TranscriptBlock::Notice(_) | TranscriptBlock::Compaction(_) => {
+        TranscriptBlock::Notice(_)
+        | TranscriptBlock::NoticeStatus { .. }
+        | TranscriptBlock::Compaction(_) => {
             wrapped_line_col_offset(copy_text, local_row, col, usize::from(width).max(1))
         }
         TranscriptBlock::Outcome(_) => visual_col_to_offset(copy_text, usize::from(col)),

@@ -474,6 +474,7 @@ impl YggTheme {
         self.semantic_styles.keys().map(String::as_str)
     }
 
+    #[allow(dead_code)]
     pub fn has_semantic_role(&self, role: &str) -> bool {
         self.semantic_styles.contains_key(role)
     }
