@@ -49,6 +49,9 @@ pub struct Bootstrap {
     /// Session opened while resolving resume provenance. Keeping it here
     /// avoids replaying the same JSONL file a second time in `build_app`.
     prepared_session: RefCell<Option<Session>>,
+    /// Interactive startup can remain useful as a read-only session viewer
+    /// when no configured model exists.
+    modeless: std::cell::Cell<bool>,
 }
 
 impl Bootstrap {
@@ -58,6 +61,18 @@ impl Bootstrap {
     /// descriptor instead of reopening the session by pathname in `build_app`.
     pub(crate) fn set_prepared_session(&mut self, session: Session) {
         *self.prepared_session.get_mut() = Some(session);
+    }
+
+    pub(crate) fn take_prepared_session(&self) -> Option<Session> {
+        self.prepared_session.borrow_mut().take()
+    }
+
+    fn enter_modeless_mode(&self) {
+        self.modeless.set(true);
+    }
+
+    pub(crate) fn is_modeless(&self) -> bool {
+        self.modeless.get()
     }
 }
 
@@ -3444,6 +3459,7 @@ pub fn bootstrap(config: Config) -> anyhow::Result<Bootstrap> {
         sessions,
         client,
         prepared_session: RefCell::new(None),
+        modeless: std::cell::Cell::new(false),
     })
 }
 
@@ -3593,6 +3609,24 @@ fn launch_configuration_parts(
     Ok((prepared, model, reasoning, reasoning_mode))
 }
 
+fn should_pick_interactive_model(
+    config: &Config,
+    catalog: &ModelCatalog,
+    model: Option<&ModelId>,
+) -> bool {
+    match model {
+        None => true,
+        // Keep an explicit CLI selection authoritative so invalid values still
+        // produce the usual configuration error rather than silently changing
+        // the requested model.
+        Some(_) if config.model_explicit => false,
+        // A session may outlive the credential that made its model available.
+        // Do not carry that stale model into build_app; let the user choose a
+        // currently configured route instead.
+        Some(model) => catalog.resolve(model).is_err(),
+    }
+}
+
 fn launch_configuration(
     boot: &Bootstrap,
     session: &SessionSelection,
@@ -3652,9 +3686,23 @@ pub async fn resolve_launch_interactive(
         })
         .await?;
     *boot.prepared_session.borrow_mut() = prepared;
-    let model = match model {
-        Some(model) => model,
-        None => model_picker(shell, input, &boot.catalog).await?,
+    let no_configured_model = !boot.config.model_explicit && boot.catalog.models().next().is_none();
+    let pick_model = should_pick_interactive_model(&boot.config, &boot.catalog, model.as_ref());
+    let model = if no_configured_model {
+        boot.enter_modeless_mode();
+        shell.notice("no configured model; opening session read-only");
+        shell.render();
+        model.unwrap_or_else(|| ModelId(String::new()))
+    } else {
+        match model {
+            Some(model) if !pick_model => model,
+            Some(_) => {
+                shell.notice("selected model is unavailable; select a configured model");
+                shell.render();
+                model_picker(shell, input, &boot.catalog).await?
+            }
+            None => model_picker(shell, input, &boot.catalog).await?,
+        }
     };
     Ok(LaunchSelection {
         model,
@@ -3863,6 +3911,30 @@ fn configure_v2_delegation(
     Ok(())
 }
 
+pub(crate) fn open_launch_session(
+    prepared_session: &mut Option<Session>,
+    selection: SessionSelection,
+) -> anyhow::Result<Session> {
+    match selection {
+        SessionSelection::CreateNew(path) => {
+            if let Some(parent) = path.parent() {
+                create_private_session_dir(parent)?;
+            }
+            let descriptor_path = descriptor_session_path(&path)?;
+            let file = create_regular_file_for_append(&descriptor_path)?;
+            Ok(Session::create_with_file(path, file)?)
+        }
+        SessionSelection::OpenExisting(path) => match prepared_session.take() {
+            Some(session) if session.path() == path => Ok(session),
+            _ => {
+                let descriptor_path = descriptor_session_path(&path)?;
+                let file = open_regular_file_for_append(&descriptor_path)?;
+                Ok(Session::open_with_file(path, file)?)
+            }
+        },
+    }
+}
+
 pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> anyhow::Result<App> {
     let Bootstrap {
         mut config,
@@ -3870,6 +3942,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         sessions,
         client,
         prepared_session,
+        modeless: _,
     } = boot;
     let mut system = system;
     let model = catalog.resolve(&launch.model)?;
@@ -3882,24 +3955,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         .with_context(|| "configured compaction model could not be resolved")?;
     validate_compaction_route(config.compaction.mode, &model, compact_model.as_ref())?;
     let mut prepared_session = prepared_session.into_inner();
-    let mut session = match launch.session {
-        SessionSelection::CreateNew(path) => {
-            if let Some(parent) = path.parent() {
-                create_private_session_dir(parent)?;
-            }
-            let descriptor_path = descriptor_session_path(&path)?;
-            let file = create_regular_file_for_append(&descriptor_path)?;
-            Session::create_with_file(path, file)?
-        }
-        SessionSelection::OpenExisting(path) => match prepared_session.take() {
-            Some(session) if session.path() == path => session,
-            _ => {
-                let descriptor_path = descriptor_session_path(&path)?;
-                let file = open_regular_file_for_append(&descriptor_path)?;
-                Session::open_with_file(path, file)?
-            }
-        },
-    };
+    let mut session = open_launch_session(&mut prepared_session, launch.session)?;
 
     let (reasoning, reasoning_mode, migration_diagnostic) =
         normalize_reasoning_selection_for_model(&launch.reasoning, launch.reasoning_mode, &model)?;

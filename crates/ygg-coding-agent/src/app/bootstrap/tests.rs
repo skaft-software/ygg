@@ -1867,6 +1867,34 @@ fn print_launch_errors_without_model() {
 }
 
 #[test]
+fn interactive_launch_replaces_an_unavailable_persisted_model() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = config(directory.path(), None);
+    config.model_explicit = false;
+    let boot = bootstrap(config).unwrap();
+    let unavailable = ModelId("provider-model-without-a-credential".into());
+
+    assert!(should_pick_interactive_model(
+        &boot.config,
+        &boot.catalog,
+        Some(&unavailable),
+    ));
+    assert!(!should_pick_interactive_model(
+        &boot.config,
+        &boot.catalog,
+        Some(&ModelId("gpt-4o-mini".into())),
+    ));
+
+    let mut explicit = boot.config.clone();
+    explicit.model_explicit = true;
+    assert!(!should_pick_interactive_model(
+        &explicit,
+        &boot.catalog,
+        Some(&unavailable),
+    ));
+}
+
+#[test]
 fn print_launch_creates_new_session_path_with_model() {
     let directory = tempfile::tempdir().unwrap();
     let boot = bootstrap(config(directory.path(), Some("gpt-4o-mini"))).unwrap();

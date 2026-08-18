@@ -694,9 +694,12 @@ fn validate_provider(provider: Option<&str>) -> anyhow::Result<&str> {
     }
 }
 
-/// Run device-code login outside raw/alternate-screen mode, then make the new
-/// models available immediately without restarting the current Agent.
-async fn login_codex(app: &mut App, shell: &mut InteractiveShell) -> anyhow::Result<()> {
+/// Run device-code login outside raw/alternate-screen mode and return the
+/// refreshed catalog. The caller decides whether it can install the catalog
+/// into a live Agent or must ask the user to restart from a model-less shell.
+async fn login_codex_catalog(
+    shell: &mut InteractiveShell,
+) -> anyhow::Result<Option<ygg_ai::ModelCatalog>> {
     shell.set_run_label("signing in to ChatGPT…");
     shell.render();
     shell.suspend();
@@ -709,7 +712,7 @@ async fn login_codex(app: &mut App, shell: &mut InteractiveShell) -> anyhow::Res
     if let Err(error) = login_result {
         shell.error(format!("ChatGPT login failed: {error:#}"));
         shell.render();
-        return Ok(());
+        return Ok(None);
     }
 
     let catalog = match crate::app::bootstrap::model_catalog() {
@@ -719,7 +722,7 @@ async fn login_codex(app: &mut App, shell: &mut InteractiveShell) -> anyhow::Res
                 "ChatGPT login succeeded, but reloading models failed: {error:#}"
             ));
             shell.render();
-            return Ok(());
+            return Ok(None);
         }
     };
     if !catalog
@@ -728,12 +731,20 @@ async fn login_codex(app: &mut App, shell: &mut InteractiveShell) -> anyhow::Res
     {
         shell.error("ChatGPT login completed, but no Codex models could be registered".into());
         shell.render();
-        return Ok(());
+        return Ok(None);
     }
-    app.catalog = catalog;
-    shell.clear_error();
-    shell.notice("signed in to ChatGPT; use /model to select a Codex model");
-    shell.render();
+    Ok(Some(catalog))
+}
+
+/// Run device-code login outside raw/alternate-screen mode, then make the new
+/// models available immediately without restarting the current Agent.
+async fn login_codex(app: &mut App, shell: &mut InteractiveShell) -> anyhow::Result<()> {
+    if let Some(catalog) = login_codex_catalog(shell).await? {
+        app.catalog = catalog;
+        shell.clear_error();
+        shell.notice("signed in to ChatGPT; use /model to select a Codex model");
+        shell.render();
+    }
     Ok(())
 }
 
@@ -2702,6 +2713,156 @@ fn startup_launch_outcome<T>(
     }
 }
 
+async fn run_interactive_without_model(
+    boot: Bootstrap,
+    launch: crate::app::bootstrap::LaunchSelection,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<()> {
+    let mut boot = boot;
+    let workspace = boot.config.workspace.clone();
+    let mut prepared = boot.take_prepared_session();
+    let selection = launch.session;
+    let session = run_blocking_lifecycle(shell, input, "opening session…", move || {
+        crate::app::bootstrap::open_launch_session(&mut prepared, selection)
+    })
+    .await?;
+
+    shell.set_identity("", "", "");
+    shell.set_status_detail("no configured model · read-only session".to_owned());
+    shell.set_workspace(workspace.clone());
+    shell.set_input_modalities(ygg_ai::ModalitySet::none());
+    shell.set_session_telemetry(&session, None);
+    shell.hydrate(&session)?;
+    shell.notice(
+        "No configured model. Use /login, /model, or /reload to configure one; prompts are disabled until then.",
+    );
+    shell.render();
+
+    let mut scroll_tick = tokio::time::interval(Duration::from_millis(16));
+    scroll_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut extension_tick = tokio::time::interval(Duration::from_millis(50));
+    extension_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut extensions = crate::extensions::ExecutableExtensions::default();
+
+    loop {
+        match wait_for_prompt(
+            shell,
+            input,
+            &mut scroll_tick,
+            &mut extension_tick,
+            &mut extensions,
+            None,
+        )
+        .await?
+        {
+            Idle::Quit => return Ok(()),
+            Idle::CycleThinking => {
+                shell.notice("thinking is unavailable until a model is configured");
+                shell.render();
+            }
+            Idle::GoalContinuation => unreachable!("model-less mode has no goal deadline"),
+            Idle::Submit(_) => {
+                shell.error(
+                    "no configured model; set an API key and restart before submitting prompts"
+                        .to_owned(),
+                );
+                shell.render();
+            }
+            Idle::Command(raw) => match commands::parse(&raw) {
+                Command::Quit => return Ok(()),
+                Command::Help(topic) => {
+                    shell.show_overlay_text(commands::help_text(&workspace, topic.as_deref()));
+                    shell.render();
+                }
+                Command::Status => {
+                    shell.show_overlay_text(
+                        "No model is configured. The session can be read, but prompts are disabled."
+                            .to_owned(),
+                    );
+                    shell.render();
+                }
+                Command::Login(provider) => match validate_provider(provider.as_deref()) {
+                    Ok("codex") => {
+                        if let Some(catalog) = login_codex_catalog(shell).await? {
+                            boot.catalog = catalog;
+                            shell.clear_error();
+                            shell.notice(
+                                "signed in to ChatGPT; use /model to select a model, then restart Ygg to chat",
+                            );
+                            shell.render();
+                        }
+                    }
+                    Ok("custom") => {
+                        login_custom(shell)?;
+                        shell.render();
+                    }
+                    Ok(_) => unreachable!(),
+                    Err(error) => {
+                        shell.error(error.to_string());
+                        shell.render();
+                    }
+                },
+                Command::Model(model) => {
+                    if boot.catalog.models().next().is_none() {
+                        shell.notice(
+                            "no configured models are available; use /login or edit the custom provider, then /reload",
+                        );
+                    } else {
+                        let selected = match model {
+                            Some(id) => {
+                                let id = ModelId(id);
+                                if boot.catalog.resolve(&id).is_err() {
+                                    shell.error(format!("model {} is not available", id.0));
+                                    None
+                                } else {
+                                    if let Err(error) = crate::cli::persist_model(&id.0) {
+                                        shell.error(format!(
+                                            "failed to save model preference: {error}"
+                                        ));
+                                    }
+                                    Some(id)
+                                }
+                            }
+                            None => optional_model_picker(shell, input, &boot.catalog).await?,
+                        };
+                        if let Some(model) = selected {
+                            shell.notice(format!(
+                                "model {} selected; restart Ygg to start chatting",
+                                model.0
+                            ));
+                        }
+                    }
+                    shell.render();
+                }
+                Command::Reload => {
+                    let catalog = run_blocking_lifecycle(
+                        shell,
+                        input,
+                        "reloading models…",
+                        crate::app::bootstrap::model_catalog,
+                    )
+                    .await?;
+                    let has_models = catalog.models().next().is_some();
+                    boot.catalog = catalog;
+                    if has_models {
+                        shell.notice(
+                            "models reloaded; use /model to select one, then restart Ygg to chat",
+                        );
+                    } else {
+                        shell.notice("model reload completed, but no configured models were found");
+                    }
+                    shell.render();
+                }
+                _ => {
+                    shell.notice("this command is unavailable until a model is configured");
+                    shell.render();
+                }
+            },
+        }
+    }
+}
+
 /// Run the interactive frontend with explicit idle and active borrow phases.
 pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let initial_prompt = boot.config.initial_prompt.clone();
@@ -2725,6 +2886,11 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
         shell.leave();
         return Ok(());
     };
+    if boot.is_modeless() {
+        let result = run_interactive_without_model(boot, launch, &mut shell, &mut input).await;
+        shell.leave();
+        return result;
+    }
     let mut app = run_blocking_lifecycle(
         &mut shell,
         &mut input,
