@@ -37,6 +37,20 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Migrated the Caffeinate example to a supervised API `0.2` lifecycle
   extension that reference-counts active turns. Sleep inhibition is no longer
   native agent-kernel behavior.
+- Added durable, provider-neutral session goals: a per-session objective with a
+  bounded turn budget, stored owner-only in the session's private `.serve/goals`
+  directory, that the agent continues toward after each settled turn until it
+  reports explicit completion or becomes blocked. `/goal <objective>`, `/goal
+  status`, `/goal pause`, `/goal resume`, and `/goal clear` manage the goal in
+  the terminal, and the graphical Serve shows the same goal with a badge and a
+  composer command.
+- Added metadata-gated Ultra reasoning with automatic bounded V2 task
+  delegation, including spawn, follow-up, peer messaging, race-free waiting,
+  interruption, descendant cancellation, and inheritance of the root's approved
+  tools and execution policies.
+- Added isolated child sessions and descriptor-relative private team storage
+  with synced `provenance.jsonl`; delegation fails closed if provenance cannot be
+  persisted.
 
 ### Changed
 
@@ -46,6 +60,74 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Superseded the earlier host-owned capability design with a tiny agent kernel:
   JSON-RPC subprocess extensions own MCP, browser, web-search, computer-use,
   memory, LSP, subagent-orchestration, and caffeinate domain behavior.
+- Replaced the obsolete OpenAI Codex Pro wire mode with provider-advertised
+  `ultra` effort. Persisted Pro selections remain readable and migrate only when
+  the route advertises Ultra plus V2 collaboration and the host can execute it;
+  no codec emits `reasoning.mode`.
+- Updated authenticated Codex discovery to parse advertised reasoning levels,
+  `use_responses_lite`, and `multi_agent_version: "v2"` using cache schema 2 and
+  client version `0.147.0`. Offline or incomplete metadata does not infer those
+  capabilities from model names or OAuth plans.
+- Matched current Responses Lite ordinary and compact requests, including
+  explicit `parallel_tool_calls: false`, developer-message instructions,
+  input-item `additional_tools`, `reasoning.context: "all_turns"`, and narrow
+  removal of image-detail hints.
+- Renamed the safety flags: `--unsafe-host-effects` is now `--yolo` and
+  `--unsafe` / `--unsafe-bash` is now `--safe`. The legacy `unsafe_host_effects`
+  config key and `YGG_UNSAFE_HOST_EFFECTS` environment variable remain
+  compatibility aliases alongside `yolo` and `YGG_YOLO`. The CLI default is now
+  the explicit `ControlledBashApproval` profile: every `bash` call requires
+  one-shot approval, workspace reads and mutations remain controlled, and all
+  other ambient host effects stay denied. `--safe` additionally forces
+  workspace-relative path admission.
+- Rewrote bash safety classification with tree-sitter parsing: a strict
+  word-only command allowlist joined by `&&`, `||`, `;`, and `|`, with bounded
+  recursion through shell wrapper invocations, decides which `bash` commands
+  the `Controlled` profile auto-approves as read-only; anything else still
+  requires one-shot approval.
+- Reworked local compaction around Pi-style token retention: the most recent
+  20,000 tokens of conversation are kept verbatim
+  (`compaction.keep_recent_tokens`), a turn that crosses the retention boundary
+  is split so its older prefix is summarized with its own bounded output budget
+  while its recent suffix is retained, and the checkpoint summary uses a
+  bounded output budget. Legacy compaction mode and policy settings remain
+  accepted.
+- Moved TUI liveness out of the composer: the composer now sits in a static
+  model-accent frame while the transcript owns animation, inline slash, file,
+  and `@` completions render below the composer, and reasoning presentation
+  uses compact `Working` and `Compacting context` labels instead of animated
+  shimmer.
+
+### Performance
+
+- Session discovery now keeps JSONL transcripts authoritative while caching
+  bounded title projections in a disposable workspace SQLite catalog, and
+  streams transcript replay and metadata scans so large sessions no longer need
+  a second whole-file buffer.
+- Reduced per-frame rendering work in long TUI sessions.
+
+### Fixed
+
+- Made delegated mailbox delivery transactional: bounded UTF-8 pages remain
+  leased until an untruncated tool result is durably appended, and failed or
+  truncated persistence restores the page.
+- Preserved accepted steering, queued prompt messages, and follow-ups across
+  interruption, backpressure, and failed runs, retaining queue reservations until
+  durable prompt delivery; rejected oversize or overflowing durable tasks and
+  messages instead of truncating, evicting, or silently releasing them.
+- Rejected stale, future-dated, malformed, incomplete, and inconsistent Codex
+  cache metadata before capability activation, stripped dynamic capabilities
+  offline, and applied legacy-Pro migration precedence consistently at rebuilds.
+- Propagated the effective current root prompt to newly spawned children and
+  securely rolled failed delegation activation back to its exact empty private
+  team directory.
+- Omitted `tool_choice` from OpenAI Chat requests when no tools are enabled so
+  the field is no longer sent without a tool list.
+- Surfaced terminal provider failures in the Serve web UI and retained
+  failed-provider diagnostics after later work.
+- Bounded the Caffeinate example's sleep inhibition: if Ygg cannot report a
+  terminal outcome, such as an interrupted run, the inhibitor now expires after
+  30 minutes.
 
 The `0.2` foundation does not yet ship first-party MCP, browser, web-search,
 computer-use, memory, LSP, or subagent-orchestration packages. Supervision
@@ -70,13 +152,6 @@ secret provider. OS-level CPU/RSS/FD/PID quotas also remain future kernel work.
   configured providers, typed media, seeded history, and durable sessions.
 - Added first-use, owner-only Codex credential migration from legacy Codex and
   Hamr stores without modifying the source credentials.
-- Added metadata-gated Ultra reasoning with automatic bounded V2 task
-  delegation, including spawn, follow-up, peer messaging, race-free waiting,
-  interruption, descendant cancellation, and inheritance of the root's approved
-  tools and execution policies.
-- Added isolated child sessions and descriptor-relative private team storage
-  with synced `provenance.jsonl`; delegation fails closed if provenance cannot be
-  persisted.
 - Added both Ygg binaries to deterministic, Git-tracked release archives,
   binary/source installers, containers, and release smoke tests.
 - Added credential-free configured-provider acceptance for Serve covering
@@ -97,18 +172,6 @@ secret provider. OS-level CPU/RSS/FD/PID quotas also remain future kernel work.
 - Made headless native-host interactions fail closed: tool confirmations are
   denied, typed input requests are cancelled, protocol frames are bounded, and
   session/image/provider inputs are validated at their system boundaries.
-- Replaced the obsolete OpenAI Codex Pro wire mode with provider-advertised
-  `ultra` effort. Persisted Pro selections remain readable and migrate only when
-  the route advertises Ultra plus V2 collaboration and the host can execute it;
-  no codec emits `reasoning.mode`.
-- Updated authenticated Codex discovery to parse advertised reasoning levels,
-  `use_responses_lite`, and `multi_agent_version: "v2"` using cache schema 2 and
-  client version `0.147.0`. Offline or incomplete metadata does not infer those
-  capabilities from model names or OAuth plans.
-- Matched current Responses Lite ordinary and compact requests, including
-  explicit `parallel_tool_calls: false`, developer-message instructions,
-  input-item `additional_tools`, `reasoning.context: "all_turns"`, and narrow
-  removal of image-detail hints.
 - Enforced dependency review, high-severity npm audit, plus `cargo audit` and
   `cargo deny` for both lockfiles on pull-request and release paths.
 
@@ -122,19 +185,6 @@ secret provider. OS-level CPU/RSS/FD/PID quotas also remain future kernel work.
 
 ### Fixed
 
-- Made delegated mailbox delivery transactional: bounded UTF-8 pages remain
-  leased until an untruncated tool result is durably appended, and failed or
-  truncated persistence restores the page.
-- Preserved accepted steering, queued prompt messages, and follow-ups across
-  interruption, backpressure, and failed runs, retaining queue reservations until
-  durable prompt delivery; rejected oversize or overflowing durable tasks and
-  messages instead of truncating, evicting, or silently releasing them.
-- Rejected stale, future-dated, malformed, incomplete, and inconsistent Codex
-  cache metadata before capability activation, stripped dynamic capabilities
-  offline, and applied legacy-Pro migration precedence consistently at rebuilds.
-- Propagated the effective current root prompt to newly spawned children and
-  securely rolled failed delegation activation back to its exact empty private
-  team directory.
 - Made `/overview` bootstrap from session inventory without creating or opening
   a provisional task, including anchorless reconnect refresh and cancellation of
   stale session-selection navigation.
