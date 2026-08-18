@@ -22,6 +22,8 @@ an extension must already have in order to exist safely:
 - owning resource-limit policy for memory, messages, concurrent work,
   artifacts, and child processes.
 
+For explicit capability ownership (search vs browser vs computer use, hosted vs in-harness delegated execution, trust propagation, and non-goals), see [`docs/design/extension-capability-and-orchestration-boundaries.md`](design/extension-capability-and-orchestration-boundaries.md).
+
 Product capabilities are subprocess extensions. MCP bridging, web search,
 browser use, computer use, memory, LSP, subagent orchestration, and caffeinate
 do not belong in the host. A host service such as artifact ingestion or child

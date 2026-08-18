@@ -137,6 +137,8 @@ isolation opt-in; legacy `unsafe_host_effects`, `--unsafe-host-effects`, and
 Delegated children inherit the same broker policy through the root's delegation
 template.
 
+For explicit capability/orchestration boundaries (search vs browser vs computer use, hosted vs in-harness delegation, trust/cwd/approval/sandbox inheritance, and scope non-goals), see [`docs/design/extension-capability-and-orchestration-boundaries.md`](extension-capability-and-orchestration-boundaries.md).
+
 When the normalized effort is Ultra, bootstrap enables proactive V2 delegation
 under a private random team directory inside the session's `.delegation`
 storage. Lower reasoning efforts never install those tools. The coding host

@@ -2632,11 +2632,20 @@ command = "lifecycle-fixture.sh"
     }
 
     #[cfg(unix)]
-    fn assert_one_ordered_turn(events: &[serde_json::Value], outcome: &str) {
+    fn assert_one_ordered_turn_with_reason(
+        events: &[serde_json::Value],
+        outcome: &str,
+        reason: Option<&str>,
+    ) {
         assert_eq!(events.len(), 2, "unexpected lifecycle wire: {events:#?}");
         assert_eq!(events[0]["method"], "turn/started");
         assert_eq!(events[1]["method"], "turn/settled");
         assert_eq!(events[1]["params"]["outcome"], outcome);
+        if let Some(reason) = reason {
+            assert_eq!(events[1]["params"]["reason"], reason);
+        } else {
+            assert!(events[1]["params"]["reason"].is_null());
+        }
         for id in ["session_id", "run_id", "turn_id"] {
             assert_eq!(
                 events[0]["params"][id], events[1]["params"][id],
@@ -2669,10 +2678,18 @@ command = "lifecycle-fixture.sh"
         drop(beginning);
         control.release_turn_started();
         let events = wait_for_recorded_turn_lifecycle(&wire_log, 2).await;
-        assert_one_ordered_turn(&events, "frontend_disconnected");
+        assert_one_ordered_turn_with_reason(
+            &events,
+            "frontend_disconnected",
+            Some("turn owner dropped before explicit settlement"),
+        );
 
         extensions.shutdown().await;
-        assert_one_ordered_turn(&recorded_turn_lifecycle(&wire_log), "frontend_disconnected");
+        assert_one_ordered_turn_with_reason(
+            &recorded_turn_lifecycle(&wire_log),
+            "frontend_disconnected",
+            Some("turn owner dropped before explicit settlement"),
+        );
     }
 
     #[cfg(unix)]
@@ -2701,10 +2718,64 @@ command = "lifecycle-fixture.sh"
         drop(settling);
         control.release_turn_settled();
         let events = wait_for_recorded_turn_lifecycle(&wire_log, 2).await;
-        assert_one_ordered_turn(&events, "failed");
+        assert_one_ordered_turn_with_reason(&events, "failed", Some("fixture failure"));
 
         extensions.shutdown().await;
-        assert_one_ordered_turn(&recorded_turn_lifecycle(&wire_log), "failed");
+        assert_one_ordered_turn_with_reason(
+            &recorded_turn_lifecycle(&wire_log),
+            "failed",
+            Some("fixture failure"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn settle_turn_reports_non_completion_outcomes_with_matching_extension_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut extensions, wire_log) = lifecycle_fixture(&temp).await;
+
+        let cases = [
+            (
+                crate::modes::HostRunOutcome::Aborted,
+                "cancelled",
+                Some("run aborted before completing"),
+            ),
+            (
+                crate::modes::HostRunOutcome::Failed("fixture failure".into()),
+                "failed",
+                Some("fixture failure"),
+            ),
+            (
+                crate::modes::HostRunOutcome::MaxTurns,
+                "limit_reached",
+                Some("run hit max turns before completing"),
+            ),
+            (
+                crate::modes::HostRunOutcome::stream_lost(),
+                "frontend_disconnected",
+                Some(crate::modes::RUN_STREAM_LOST_MESSAGE),
+            ),
+            (
+                crate::modes::HostRunOutcome::Shutdown,
+                "shutdown",
+                Some(crate::modes::RUN_SHUTDOWN_MESSAGE),
+            ),
+        ];
+
+        for case in cases.iter() {
+            let (outcome, expected_outcome, expected_reason) = case;
+            let before = recorded_turn_lifecycle(&wire_log).len();
+            let turn = extensions.begin_turn().await;
+            extensions.settle_turn(turn, outcome).await;
+            let events = wait_for_recorded_turn_lifecycle(&wire_log, before + 2).await;
+            assert_one_ordered_turn_with_reason(
+                &events[before..],
+                expected_outcome,
+                *expected_reason,
+            );
+        }
+
+        extensions.shutdown().await;
     }
 
     #[test]

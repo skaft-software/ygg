@@ -33,6 +33,8 @@ Writes use an advisory exclusive lock, compare the observed file length under th
 
 ## V2 task delegation
 
+For explicit orchestration boundaries (hosted delegation vs local delegated children, sandbox/approval/env/cwd inheritance, extension trust propagation, and explicit non-goals), see [`docs/design/extension-capability-and-orchestration-boundaries.md`](extension-capability-and-orchestration-boundaries.md).
+
 `ygg-agent` owns host execution for `AgentDelegation::V2`; the model capability in
 `ygg-ai` is metadata only. `Agent::enable_v2_delegation` installs
 `spawn_agent`, `followup_task`, `send_message`, `wait_agent`, `list_agents`, and
