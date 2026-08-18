@@ -3651,10 +3651,16 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
       `hostBootstrap.authorityProfiles[${index}]`,
     ),
   );
-  projectAuthority(
+  const authorityCeiling = projectAuthority(
     wire.authorityCeiling,
     "hostBootstrap.authorityCeiling",
   );
+  if (!authorityProfiles.includes(authorityCeiling)) {
+    throw new WireContractError(
+      "hostBootstrap.authorityCeiling",
+      "must be included in authorityProfiles",
+    );
+  }
   const themes = array(wire.themes, "hostBootstrap.themes").map(
     (theme, index) =>
       projectThemeOption(theme, `hostBootstrap.themes[${index}]`),
@@ -3685,6 +3691,7 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
     sessions,
     models,
     authorityProfiles,
+    authorityCeiling,
     themes,
     selectedThemeId,
     devices: [],

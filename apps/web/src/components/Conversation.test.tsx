@@ -1022,7 +1022,7 @@ describe("conversation composer", () => {
     );
 
     const authority = screen.getByRole("button", {
-      name: "Authority: Full access",
+      name: "Authority: Workspace",
     });
     expect(screen.queryByRole("combobox", { name: "Authority" })).toBeNull();
     await user.click(authority);

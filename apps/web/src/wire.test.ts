@@ -109,8 +109,8 @@ describe("authoritative Rust wire contract", () => {
     expect(bootstrap.authorityProfiles).toEqual([
       "readOnly",
       "workspace",
-      "fullAccess",
     ]);
+    expect(bootstrap.authorityCeiling).toBe("workspace");
     expect(bootstrap.themes[0]?.theme.typography).toEqual({
       body_family: "system-sans",
       mono_family: "system-mono",
@@ -123,7 +123,7 @@ describe("authoritative Rust wire contract", () => {
       sequence: 42,
       modelId: "gpt-5.6",
       reasoning: "high",
-      authority: "fullAccess",
+      authority: "workspace",
       status: "idle",
     });
     expect(selectedSession.items[0]).toMatchObject({

@@ -86,7 +86,7 @@ fn snapshot() -> SessionSnapshot {
         live_state: SessionLiveState::Idle,
         active_run_id: None,
         model: model_selection(),
-        authority: AuthorityProfile::FullAccess,
+        authority: AuthorityProfile::Workspace,
         context: ContextUsage {
             usage: UsageSnapshot {
                 input_tokens: 120,
@@ -206,12 +206,8 @@ fn bootstrap() -> HostBootstrap {
             }),
             input_modalities: vec![InputModality::Text, InputModality::Image],
         }],
-        authority_profiles: vec![
-            AuthorityProfile::ReadOnly,
-            AuthorityProfile::Workspace,
-            AuthorityProfile::FullAccess,
-        ],
-        authority_ceiling: AuthorityProfile::FullAccess,
+        authority_profiles: vec![AuthorityProfile::ReadOnly, AuthorityProfile::Workspace],
+        authority_ceiling: AuthorityProfile::Workspace,
         themes: vec![theme()],
         selected_theme_id: ThemeId::new("tidepool").unwrap(),
         projects: vec![ProjectSummary {

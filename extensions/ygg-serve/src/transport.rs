@@ -2630,7 +2630,7 @@ mod tests {
 
         fn insert_existing(&self, id: &str) -> SessionId {
             let id = SessionId::new(id).unwrap();
-            let seed = seed(id.clone(), false, 1);
+            let seed = seed(id.clone(), AuthorityProfile::Workspace, false, 1);
             self.seeds.lock().unwrap().insert(id.clone(), seed);
             id
         }
@@ -2938,8 +2938,12 @@ mod tests {
             })
         }
 
+        fn authority_ceiling(&self) -> AuthorityProfile {
+            AuthorityProfile::Workspace
+        }
+
         fn authority_profiles(&self) -> Vec<AuthorityProfile> {
-            vec![AuthorityProfile::FullAccess]
+            vec![AuthorityProfile::ReadOnly, AuthorityProfile::Workspace]
         }
 
         fn model_catalog(&self) -> Vec<ModelSummary> {
@@ -3003,7 +3007,12 @@ mod tests {
             self.creates.fetch_add(1, Ordering::Relaxed);
             let number = self.next_session.fetch_add(1, Ordering::Relaxed);
             let id = SessionId::new(format!("fresh-{number}")).unwrap();
-            let seed = seed(id.clone(), request.provisional, number as u64 + 1);
+            let seed = seed(
+                id.clone(),
+                request.authority,
+                request.provisional,
+                number as u64 + 1,
+            );
             self.seeds.lock().unwrap().insert(id, seed.clone());
             Ok(MockDriver(seed, self.goals.clone()))
         }
@@ -3028,7 +3037,12 @@ mod tests {
         }
     }
 
-    fn seed(id: SessionId, provisional: bool, generation: u64) -> SessionSeed {
+    fn seed(
+        id: SessionId,
+        authority: AuthorityProfile,
+        provisional: bool,
+        generation: u64,
+    ) -> SessionSeed {
         let model = model_selection();
         SessionSeed {
             summary: SessionSummary {
@@ -3059,7 +3073,7 @@ mod tests {
                 live_state: SessionLiveState::Idle,
                 active_run_id: None,
                 model,
-                authority: AuthorityProfile::FullAccess,
+                authority,
                 context: ContextUsage::default(),
                 items: Vec::new(),
                 pending_requests: Vec::new(),

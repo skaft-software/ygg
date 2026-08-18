@@ -1187,6 +1187,24 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("falls back to host authority ceiling when opening from no selected session", async () => {
+    const transport = new TestTransport();
+    transport.connect = async () => ({
+      ...clone(fixtureBootstrap),
+      selectedSessionId: null,
+    });
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    await store.createSession();
+
+    expect(transport.commands.at(-1)).toMatchObject({
+      type: "session.create",
+      authority: fixtureBootstrap.authorityCeiling,
+    });
+    store.dispose();
+  });
+
   it("answers a typed user-input request through its owning session", async () => {
     const transport = new TestTransport();
     const store = new YggStore(transport);

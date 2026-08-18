@@ -374,6 +374,7 @@ export interface HostBootstrap {
   sessions: SessionSummary[];
   models: ModelSummary[];
   authorityProfiles: AuthorityProfile[];
+  authorityCeiling: AuthorityProfile;
   themes: ThemeOption[];
   selectedThemeId: string;
   devices: ConnectedDevice[];

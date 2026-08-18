@@ -52,8 +52,8 @@
       "inputModalities": ["text", "image"]
     }
   ],
-  "authorityProfiles": ["readOnly", "workspace", "fullAccess"],
-  "authorityCeiling": "fullAccess",
+  "authorityProfiles": ["readOnly", "workspace"],
+  "authorityCeiling": "workspace",
   "themes": [
     {
       "id": "tidepool",
@@ -159,7 +159,7 @@
       "model": "gpt-5.6",
       "reasoning": "high"
     },
-    "authority": "fullAccess",
+    "authority": "workspace",
     "context": {
       "usage": {
         "inputTokens": 120,

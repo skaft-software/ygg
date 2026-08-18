@@ -90,6 +90,19 @@ function acceptsGoalProjection(
   );
 }
 
+function sessionAuthorityDefaults(
+  bootstrap: HostBootstrap,
+  selectedAuthority: AuthorityProfile | null,
+): AuthorityProfile {
+  if (
+    selectedAuthority !== null &&
+    bootstrap.authorityProfiles.includes(selectedAuthority)
+  ) {
+    return selectedAuthority;
+  }
+  return bootstrap.authorityCeiling;
+}
+
 export type SessionRouteMode = "push" | "replace" | "none";
 
 export function sessionIdFromPathname(pathname: string): string | null {
@@ -1010,7 +1023,10 @@ export class YggStore {
         bootstrap.models[0]?.defaultReasoning ??
         bootstrap.models[0]?.reasoning[0] ??
         "off",
-      authority: selected?.authority ?? "fullAccess",
+      authority: sessionAuthorityDefaults(
+        bootstrap,
+        selected?.authority ?? null,
+      ),
     };
     const ack = await this.sendCommand(command);
     if (!ack.accepted || !ack.createdSessionId) return;

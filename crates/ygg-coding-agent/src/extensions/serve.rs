@@ -264,7 +264,10 @@ pub async fn run(
     let goal_store_root = host.serve_state_dir.join("goals");
     let supervisor = Arc::new(SessionSupervisor::new(
         Arc::clone(&host),
-        SupervisorConfig::default(),
+        SupervisorConfig {
+            fresh_session_authority: host.authority_ceiling(),
+            ..SupervisorConfig::default()
+        },
     ));
     let server = LoopbackServer::start(
         Arc::clone(&supervisor),
@@ -365,6 +368,25 @@ fn open_browser(url: &str) -> std::io::Result<()> {
         std::process::Command::new("xdg-open").arg(url).spawn()?;
     }
     Ok(())
+}
+
+fn authority_profiles_from_sandbox(
+    sandbox: &crate::config::SandboxPolicy,
+) -> Vec<AuthorityProfile> {
+    let mut profiles = vec![AuthorityProfile::ReadOnly];
+    if sandbox.allow_write {
+        profiles.push(AuthorityProfile::Workspace);
+    }
+    if sandbox.process_execution_allowed() {
+        profiles.push(AuthorityProfile::FullAccess);
+    }
+    profiles
+}
+
+fn authority_ceiling_from_sandbox(sandbox: &crate::config::SandboxPolicy) -> AuthorityProfile {
+    authority_profiles_from_sandbox(sandbox)
+        .pop()
+        .unwrap_or(AuthorityProfile::ReadOnly)
 }
 
 #[derive(Clone)]
@@ -1290,6 +1312,7 @@ impl YggHost {
             advertised_selection_from_session(&session, &self.catalog, &self.config, &self.models)
                 .map_or_else(|| self.default_selection(), Ok)?;
         let generation = next_actor_generation();
+        let authority = self.authority_ceiling();
         let mut seed = seed_from_session(
             &session,
             session_id.clone(),
@@ -1297,7 +1320,7 @@ impl YggHost {
                 workspace: &context.config.workspace,
                 project_id: Some(context.project_id.clone()),
                 model: selection.clone(),
-                authority: AuthorityProfile::FullAccess,
+                authority,
                 generation,
                 meta: meta.clone(),
                 attachment_store: self.attachments.as_ref(),
@@ -1322,7 +1345,7 @@ impl YggHost {
                 reasoning_mode: self.config.reasoning_mode,
             },
             prepared_session: Mutex::new(Some(session)),
-            authority: AuthorityProfile::FullAccess,
+            authority,
             available_models: self.models.clone(),
             actor_generation: generation,
             session_id: session_id.clone(),
@@ -2125,6 +2148,7 @@ impl HostService for YggHost {
         let attachments = self.attachments.clone();
         let resources = self.resources.clone();
         let request = request.clone();
+        let authority = self.authority_ceiling();
         tokio::task::spawn_blocking(move || {
             let projects = projects.lock().map_err(|_| ServiceError::Internal)?;
             let mut rebuilt = TranscriptSearchIndex::new();
@@ -2165,7 +2189,7 @@ impl HostService for YggHost {
                             workspace: &project_config.workspace,
                             project_id: Some(public_project_id.clone()),
                             model: selection,
-                            authority: AuthorityProfile::FullAccess,
+                            authority,
                             generation: 1,
                             meta: Some(meta),
                             attachment_store: attachments.as_ref(),
@@ -2259,14 +2283,11 @@ impl HostService for YggHost {
     }
 
     fn authority_ceiling(&self) -> AuthorityProfile {
-        AuthorityProfile::FullAccess
+        authority_ceiling_from_sandbox(&self.config.sandbox)
     }
 
     fn authority_profiles(&self) -> Vec<AuthorityProfile> {
-        // The first slice preserves Ygg's current authority exactly. A later
-        // adapter can expose narrower profiles after it can rebuild the real
-        // sandbox without changing their meaning.
-        vec![AuthorityProfile::FullAccess]
+        authority_profiles_from_sandbox(&self.config.sandbox)
     }
 
     fn model_catalog(&self) -> Vec<ModelSummary> {
@@ -4255,9 +4276,8 @@ async fn run_worker(
                 };
                 let _ = message.response.send(outcome);
             }
-            SessionCommand::SetAuthority { authority }
-                if authority == AuthorityProfile::FullAccess =>
-            {
+            SessionCommand::SetAuthority { authority } => {
+                plan.authority = authority;
                 let selection = current_selection(&plan);
                 let _ = message
                     .response
