@@ -899,7 +899,7 @@ jobs:
           HOME="$test_home" "$binary" --help >/dev/null
           printf '%s\n' '{"protocol_version":1,"request_id":"portable-installer-smoke","command":"hello"}' \
             | HOME="$test_home" "$host_binary" \
-            | grep -F '"sdk_version":"0.4.0"' >/dev/null
+            | grep -F '"sdk_version":"0.5.0"' >/dev/null
           HOME="$test_home" "$binary" extension install ygg-serve
           HOME="$test_home" "$binary" extension list | grep -F "ygg-serve"
           HOME="$test_home" "$binary" extension remove ygg-serve

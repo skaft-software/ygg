@@ -1124,7 +1124,7 @@ mod tests {
     #[test]
     fn official_downloads_only_trust_github_https_hosts() {
         for accepted in [
-            "https://github.com/skaft-software/ygg/releases/download/v0.4.0/SHA256SUMS",
+            "https://github.com/skaft-software/ygg/releases/download/v0.5.0/SHA256SUMS",
             "https://release-assets.githubusercontent.com/github-production-release-asset/file?token=signed",
         ] {
             assert!(is_trusted_release_url(

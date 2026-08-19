@@ -1,6 +1,26 @@
 use super::*;
 
 #[test]
+fn discovered_reasoning_supports_chat_and_responses_models() {
+    assert!(discovered_model_supports_reasoning(
+        Protocol::OpenAiChat,
+        "gemma-4-31b-it"
+    ));
+    assert!(discovered_model_supports_reasoning(
+        Protocol::OpenAiResponses,
+        "gpt-5.4"
+    ));
+    assert!(!discovered_model_supports_reasoning(
+        Protocol::OpenAiChat,
+        "gemma-3-27b-it"
+    ));
+    assert!(!discovered_model_supports_reasoning(
+        Protocol::AnthropicMessages,
+        "claude-sonnet-4"
+    ));
+}
+
+#[test]
 fn custom_endpoint_startup_timeout_is_cold_start_safe_and_configurable() {
     assert_eq!(
         resolve_custom_startup_timeout(None, None).unwrap(),

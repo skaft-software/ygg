@@ -348,10 +348,6 @@ fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<V
             if kind == "command" {
                 command_nodes.push(node);
             }
-        } else if kind.chars().any(|character| "&;|".contains(character))
-            && !ALLOWED_PUNCT_TOKENS.contains(&kind)
-        {
-            return None;
         } else if !(ALLOWED_PUNCT_TOKENS.contains(&kind) || kind.trim().is_empty()) {
             return None;
         }
@@ -365,11 +361,8 @@ fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<V
 
     let mut commands = Vec::new();
     for node in command_nodes {
-        if let Some(words) = parse_plain_command_from_node(node, src) {
-            commands.push(words);
-        } else {
-            return None;
-        }
+        let words = parse_plain_command_from_node(node, src)?;
+        commands.push(words);
     }
     Some(commands)
 }

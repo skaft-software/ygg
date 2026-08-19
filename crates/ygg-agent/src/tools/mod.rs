@@ -285,15 +285,25 @@ pub(crate) fn format_unified_creation_diff(path: &str, content: &str) -> String 
         }
     }
     if total > shown {
-        write!(
+        writeln!(
             diff,
-            "… {} more line{}\n",
+            "… {} more line{}",
             total - shown,
             if total - shown == 1 { "" } else { "s" }
         )
         .expect("bounded unified-diff formatting cannot fail");
     }
     diff.finish()
+}
+
+/// Truncates a display line to `max` characters, appending an ellipsis when cut.
+pub(crate) fn clip_line(line: &str, max: usize) -> String {
+    if line.chars().count() <= max {
+        line.to_string()
+    } else {
+        let clipped: String = line.chars().take(max).collect();
+        format!("{clipped}…")
+    }
 }
 
 #[cfg(test)]
@@ -340,15 +350,5 @@ mod unified_diff_tests {
                 "{diff}"
             );
         }
-    }
-}
-
-/// Truncates a display line to `max` characters, appending an ellipsis when cut.
-pub(crate) fn clip_line(line: &str, max: usize) -> String {
-    if line.chars().count() <= max {
-        line.to_string()
-    } else {
-        let clipped: String = line.chars().take(max).collect();
-        format!("{clipped}…")
     }
 }

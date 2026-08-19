@@ -2,7 +2,7 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## Unreleased
+## 0.5.0 — 2026-08-19
 
 ### Added
 

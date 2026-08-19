@@ -638,6 +638,7 @@ async fn reserve_tool_effect(
     Ok((intent, reservation))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_parallel_tool_call(
     tool: Arc<dyn Tool>,
     hooks: &[Arc<dyn ToolCallHook>],

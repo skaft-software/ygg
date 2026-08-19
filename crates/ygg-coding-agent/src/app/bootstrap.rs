@@ -871,13 +871,29 @@ fn has_model_id(catalog: &ModelCatalog, id: &str) -> bool {
     catalog.resolve(&ModelId(id.to_owned())).is_ok()
 }
 
-fn openai_responses_model_supports_reasoning(id: &str) -> bool {
-    id.starts_with("gpt-5")
-        || id.starts_with("codex-")
-        || id
-            .strip_prefix('o')
-            .and_then(|rest| rest.as_bytes().first())
-            .is_some_and(u8::is_ascii_digit)
+fn discovered_model_supports_reasoning(protocol: Protocol, id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    match protocol {
+        Protocol::OpenAiResponses => {
+            id.starts_with("gpt-5")
+                || id.starts_with("codex-")
+                || id
+                    .strip_prefix('o')
+                    .and_then(|rest| rest.as_bytes().first())
+                    .is_some_and(u8::is_ascii_digit)
+        }
+        // OpenAI-compatible providers also expose reasoning models through
+        // Chat Completions.  This must not be gated on the Responses codec:
+        // Cerebras Gemma 4, for example, accepts reasoning_effort on Chat.
+        Protocol::OpenAiChat => {
+            id.contains("gemma-4")
+                || id.contains("qwen3")
+                || id.contains("deepseek")
+                || id.contains("reason")
+                || id.contains("r1")
+        }
+        Protocol::AnthropicMessages => false,
+    }
 }
 
 fn discovered_preset_binding(
@@ -932,8 +948,7 @@ fn register_openai_compatible_models(
         {
             continue;
         }
-        let reasoning = protocol == Protocol::OpenAiResponses
-            && openai_responses_model_supports_reasoning(&model.id);
+        let reasoning = discovered_model_supports_reasoning(protocol, &model.id);
         let context_window = model.context_window.unwrap_or(128_000);
         let max_output_tokens = model
             .max_output_tokens

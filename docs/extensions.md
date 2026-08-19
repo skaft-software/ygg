@@ -631,7 +631,7 @@ failure policy, or user-facing tool semantics.
 Application packages are separate from the executable-extension protocol above.
 They distribute a complete first-party application runtime rather than JSON-RPC
 tools or hooks, use `package.toml` instead of `extension.toml`, and are never
-loaded during ordinary agent startup. The `0.4.0` package manager supports
+loaded during ordinary agent startup. The `0.5.0` package manager supports
 only the official `ygg-serve` package and local copies of that release archive.
 It is intentionally not a general package registry.
 
@@ -657,7 +657,7 @@ and loopback/process/workspace capabilities. Official installs download the
 matching release archive and `SHA256SUMS` over HTTPS. Local archives use:
 
 ```console
-ygg extension install --path ./ygg-serve-0.4.0-TARGET.tar.gz
+ygg extension install --path ./ygg-serve-0.5.0-TARGET.tar.gz
 ```
 
 Installation validates the bounded archive and embedded executable checksum,

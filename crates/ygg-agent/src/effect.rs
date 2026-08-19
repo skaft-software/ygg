@@ -1235,7 +1235,7 @@ mod tests {
             "call-1",
             "edit",
             ToolEffect::WorkspaceMutation,
-            &serde_json::json!({
+            serde_json::json!({
                 "path": "a",
                 "old": "o".repeat(FILE_BYTES),
                 "new": "n".repeat(FILE_BYTES),
@@ -1251,7 +1251,7 @@ mod tests {
             "call-1",
             "write",
             ToolEffect::WorkspaceMutation,
-            &serde_json::Value::String("x".repeat(MAX_EFFECT_INTENT_BYTES)),
+            serde_json::Value::String("x".repeat(MAX_EFFECT_INTENT_BYTES)),
         );
         assert!(matches!(
             oversized,
@@ -1270,7 +1270,7 @@ mod tests {
             "c",
             "read",
             ToolEffect::WorkspaceRead,
-            &nested_arrays(MAX_CANONICAL_DEPTH),
+            nested_arrays(MAX_CANONICAL_DEPTH),
         )
         .is_ok());
         let too_deep = EffectIntent::new(
@@ -1280,7 +1280,7 @@ mod tests {
             "c",
             "read",
             ToolEffect::WorkspaceRead,
-            &nested_arrays(MAX_CANONICAL_DEPTH + 1),
+            nested_arrays(MAX_CANONICAL_DEPTH + 1),
         )
         .unwrap_err();
         assert!(matches!(&too_deep, EffectBrokerError::InvalidIntent(_)));
