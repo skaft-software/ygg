@@ -53,6 +53,10 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   persisted.
 - Added `ygg update` with install-method detection, release checks, and pinned
   installer or Cargo execution outside the running process.
+- Added a zero-token `ygg migrate pi --dry-run` inventory that resolves bounded
+  Pi user/project packages and resources, hashes source and lock inputs, parses
+  JavaScript/TypeScript API use without executing package code, and emits human
+  or schema-versioned JSON compatibility classifications.
 
 ### Changed
 
