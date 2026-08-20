@@ -663,9 +663,10 @@ warning. New configuration should use `reasoning` alone.
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
 | Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--safe-mode`, `--shell-path` |
 | Limits | `--bash-timeout-secs`, `--max-output-bytes` |
+| Migration inventory | `migrate pi --dry-run`, `--json`, `--pi-home`, `--project`, `--npm-root` |
 | Customization | `--theme`, `--theme-dir`, `--system-prompt`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
 
-Run `ygg --help` and `ygg sessions --help` for the authoritative generated reference.
+Run `ygg --help`, `ygg sessions --help`, and `ygg migrate pi --help` for the authoritative generated reference.
 
 ## Filesystem-native customization
 
@@ -679,6 +680,19 @@ Themes, prompts, skills, and extensions use one deterministic resolver:
 | Extensions | `~/.ygg/extensions/*/extension.toml` | `.ygg/extensions/*/extension.toml` | `--extension-dir` |
 
 Roots are resolved global → trusted project → explicit. Inputs must be bounded regular files; symlinked roots, candidates, and entrypoints are rejected. Reload builds a complete immutable generation before swapping it into the running product.
+
+### Pi migration inventory
+
+`ygg migrate pi --dry-run` reads bounded Pi user/project settings and package
+manifests, resolves installed local/npm/git packages without installing them,
+and parses JavaScript, TypeScript, and TSX with tree-sitter to classify
+portable resources and extension API dependencies. It executes no package
+code, starts no provider or model, changes no files, and reports an estimated
+model use of zero tokens.
+Use `--json` for the versioned machine-readable inventory. This release does not
+yet copy resources, apply known-package recipes, or ship a Pi compatibility
+process; see [docs/pi-migration.md](docs/pi-migration.md) for classifications,
+bounds, and the staged compatibility architecture.
 
 ### Prompt templates
 
@@ -838,6 +852,7 @@ third_party/              upstream license texts
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
 | [Release notes](docs/releases/v0.5.0.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
+| [Pi migration](docs/pi-migration.md) | Zero-token setup inventory, AST classification, safety bounds, and staged compatibility architecture. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |
 | [Native SDK host](docs/sdk.md) | Versioned NDJSON application protocol, sessions, providers, safety, and cancellation. |

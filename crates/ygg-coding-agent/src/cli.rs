@@ -13,6 +13,7 @@ use crate::config::{
     ToolPolicy,
 };
 use crate::extension_package::ExtensionCommand;
+use crate::migrate::MigrationCommand;
 use crate::session_commands::SessionCommand;
 
 #[derive(Clone, Debug, Subcommand)]
@@ -26,6 +27,11 @@ pub enum TopLevelCommand {
     Extension {
         #[command(subcommand)]
         command: ExtensionCommand,
+    },
+    /// Inspect another coding-agent setup and plan a bounded migration.
+    Migrate {
+        #[command(subcommand)]
+        command: MigrationCommand,
     },
     /// Check for, and install, a newer Ygg release.
     Update {
@@ -2045,6 +2051,32 @@ mod tests {
                 command: ExtensionCommand::Install {
                     name: None,
                     path: Some(_),
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn pi_migration_dry_run_parses_without_a_prompt() {
+        let cli = Cli::try_parse_from([
+            "ygg",
+            "migrate",
+            "pi",
+            "--dry-run",
+            "--json",
+            "--project",
+            "./workspace",
+        ])
+        .unwrap();
+        assert!(cli.message.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Migrate {
+                command: MigrationCommand::Pi {
+                    dry_run: true,
+                    json: true,
+                    project: Some(_),
+                    ..
                 }
             })
         ));

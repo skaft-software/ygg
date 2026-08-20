@@ -16,6 +16,17 @@ The workspace MSRV is Rust 1.86. `sexy-tui-rs` is vendored as
 `crates/sexy-tui-rs`; builds must not depend on a sibling checkout. Its import
 provenance is recorded in `crates/sexy-tui-rs/VENDORED.md`.
 
+## Offline migration inventory
+
+The `migrate pi` top-level command is dispatched before normal product
+configuration and bootstrap. It reads bounded Pi settings/package resources,
+parses extension source with a real TypeScript syntax tree, and emits a
+versioned dry-run report. It never constructs an `Agent`, discovers a provider,
+executes package code, writes either setup, or invokes a model. A malformed
+package becomes a local diagnostic rather than preventing independent packages
+from being inventoried. The user contract and future compatibility boundary are
+documented in [`../pi-migration.md`](../pi-migration.md).
+
 ## Startup and resume
 
 Startup resolves the persistent session before final model selection:

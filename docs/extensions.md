@@ -67,6 +67,13 @@ API `0.2` supplies the stateful transport foundation for trusted daily use
 within those boundaries. It does not add an operating-system sandbox or move a
 domain capability into the host.
 
+Pi migration is capability-oriented rather than a promise to reproduce Pi's
+in-process ABI. `ygg migrate pi --dry-run` inventories package resources and
+extension surfaces without executing them; the current command does not yet
+ship or start a compatibility process. See [Migrating from
+Pi](pi-migration.md) for the scanner contract, classifications, and staged
+bridge architecture.
+
 Executable extensions are intentionally a local tinkerer feature. Capability
 declarations are visible consent metadata, not an operating-system sandbox.
 Discovery remains available under every effect policy, but process startup
