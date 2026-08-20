@@ -349,7 +349,7 @@ version = "0.1.0"
 api_version = "0.1"
 
 [entrypoint]
-command = "python-sdk-extension.py"
+command = "python3"
 
 [contributes]
 tools = ["sdk_echo"]
@@ -358,6 +358,7 @@ hooks = ["before_prompt"]
 "#,
     )
     .expect("manifest");
+    manifest.entrypoint.args = vec![child_path.to_string_lossy().into_owned()];
     manifest.entrypoint.env.insert(
         "PYTHONPATH".into(),
         python_sdk.to_string_lossy().into_owned(),
@@ -506,13 +507,14 @@ version = "0.2.0"
 api_version = "0.2"
 
 [entrypoint]
-command = "python-sdk-v02-extension.py"
+command = "python3"
 
 [contributes]
 tools = ["sdk_v02_echo"]
 "#,
     )
     .expect("manifest");
+    manifest.entrypoint.args = vec![child_path.to_string_lossy().into_owned()];
     manifest.entrypoint.env.insert(
         "PYTHONPATH".into(),
         python_sdk.to_string_lossy().into_owned(),
