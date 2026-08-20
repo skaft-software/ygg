@@ -51,6 +51,8 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Added isolated child sessions and descriptor-relative private team storage
   with synced `provenance.jsonl`; delegation fails closed if provenance cannot be
   persisted.
+- Added `ygg update` with install-method detection, release checks, and pinned
+  installer or Cargo execution outside the running process.
 
 ### Changed
 
@@ -119,6 +121,9 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   team directory.
 - Omitted `tool_choice` from OpenAI Chat requests when no tools are enabled so
   the field is no longer sent without a tool list.
+- Made the signed binary installer portable across supported macOS and Linux
+  targets, and added replacement coverage proving a v0.4.0 installation upgrades
+  both binaries and packaged documentation without touching user data.
 - Surfaced terminal provider failures in the Serve web UI and retained
   failed-provider diagnostics after later work.
 - Bounded the Caffeinate example's sleep inhibition: if Ygg cannot report a

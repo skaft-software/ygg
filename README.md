@@ -114,9 +114,15 @@ cargo install --locked --path crates/ygg-coding-agent --bins
 
 ### Updating
 
-Ygg updates through the channel that installed it and never replaces
-itself in process: the installer or Cargo swaps the installed files, and
-you restart Ygg to pick up the new version.
+Releases through v0.4.0 do not include `ygg update`. Upgrade those installations
+by re-running the v0.5.0 installer above with the same `YGG_INSTALL_DIR`, or by
+re-running the pinned Cargo command when Ygg was installed through Cargo. The
+installer replaces `ygg`, `ygg-host`, and packaged documentation without
+removing `~/.ygg` configuration, credentials, or sessions.
+
+Starting with v0.5.0, Ygg updates through the channel that installed it and
+never replaces itself in process: the installer or Cargo swaps the installed
+files, and you restart Ygg to pick up the new version.
 
 - Installer: `ygg update` re-runs the version-pinned installer for the
   latest release, so it verifies the release the same way a fresh install

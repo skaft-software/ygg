@@ -670,15 +670,11 @@ jobs:
               '        "$release_workflow_commit" \\\n',
           )
 
-          darwin_incompatible = '''    bundle_reference = f"/dev/fd/{bundle}"
-              if not os.path.exists(manifest_reference) or not os.path.exists(bundle_reference):
-                  raise RuntimeError("descriptor-relative verification is unavailable")'''
           portable = '''    bundle_reference = bundle_path
               if not os.path.exists(manifest_reference):
                   raise RuntimeError("descriptor-relative verification is unavailable")'''
-          if generated.count(darwin_incompatible) != 1:
-              raise SystemExit("installer bundle-reference block is missing or ambiguous")
-          generated = generated.replace(darwin_incompatible, portable)
+          if generated.count(portable) != 1:
+              raise SystemExit("installer does not contain the portable bundle-reference block")
 
           pathlib.Path(destination_path).write_text(generated, encoding="utf-8")
           PY

@@ -42,6 +42,9 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --bundle)
             [ -f "$2" ] || exit 2
+            case "$2" in
+                /dev/fd/*) exit 2 ;;
+            esac
             saw_bundle=true
             shift 2
             ;;
@@ -345,6 +348,35 @@ test -f "$positive_home/share/ygg/docs/index.md"
 test -f "$positive_home/share/ygg/examples/README.md"
 test -f "$positive_home/share/ygg/sdk/README.md"
 grep -Fx verified "$work_directory/cosign.log" >/dev/null
+
+upgrade_home="$work_directory/upgrade-home"
+mkdir -p \
+    "$upgrade_home/bin" \
+    "$upgrade_home/.ygg/sessions" \
+    "$upgrade_home/share/ygg/docs"
+cat > "$upgrade_home/bin/ygg" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'ygg 0.4.0'
+EOF
+cat > "$upgrade_home/bin/ygg-host" <<'EOF'
+#!/bin/sh
+printf '%s\n' 'legacy ygg-host 0.4.0'
+EOF
+chmod 0755 "$upgrade_home/bin/ygg" "$upgrade_home/bin/ygg-host"
+printf '%s\n' 'keep helper' > "$upgrade_home/bin/unrelated-helper"
+printf '%s\n' 'keep config' > "$upgrade_home/.ygg/config.toml"
+printf '%s\n' 'keep session' > "$upgrade_home/.ygg/sessions/session.jsonl"
+printf '%s\n' 'remove old docs' > "$upgrade_home/share/ygg/docs/old.md"
+run_installer "$upgrade_home" > "$work_directory/upgrade.out"
+test "$("$upgrade_home/bin/ygg" --version)" = 'ygg 0.5.0'
+printf '%s\n' '{"protocol_version":1,"request_id":"installer-probe","command":"hello"}' \
+    | "$upgrade_home/bin/ygg-host" \
+    | grep -F '"sdk_version":"0.5.0"' >/dev/null
+grep -Fx 'keep helper' "$upgrade_home/bin/unrelated-helper" >/dev/null
+grep -Fx 'keep config' "$upgrade_home/.ygg/config.toml" >/dev/null
+grep -Fx 'keep session' "$upgrade_home/.ygg/sessions/session.jsonl" >/dev/null
+test ! -e "$upgrade_home/share/ygg/docs/old.md"
+test -f "$upgrade_home/share/ygg/docs/index.md"
 
 override_home="$work_directory/override-home"
 override_data="$work_directory/override-data"

@@ -282,8 +282,13 @@ try:
     manifest = open_private_regular(manifest_path, 1024 * 1024)
     bundle = open_private_regular(bundle_path, 1024 * 1024)
     manifest_reference = f"/dev/fd/{manifest}"
-    bundle_reference = f"/dev/fd/{bundle}"
-    if not os.path.exists(manifest_reference) or not os.path.exists(bundle_reference):
+    # Cosign's Darwin build cannot reliably reopen a Sigstore bundle through a
+    # shared /dev/fd descriptor. The bundle lives in the installer's private
+    # work directory and was opened above with O_NOFOLLOW and a single-link
+    # regular-file check, so pass that private path while retaining the validated
+    # descriptor until verification completes.
+    bundle_reference = bundle_path
+    if not os.path.exists(manifest_reference):
         raise RuntimeError("descriptor-relative verification is unavailable")
     command = [
         cosign_path,
