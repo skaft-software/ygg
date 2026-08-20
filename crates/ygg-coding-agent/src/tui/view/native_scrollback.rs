@@ -19,6 +19,19 @@ fn native_overlay_prefix_len(transcript_len: usize, chrome: &ShellChrome) -> usi
     normal_rows.saturating_sub(overlay_rows)
 }
 
+/// Chrome that can disappear independently of transcript chronology is a
+/// physical viewport surface. Letting its temporary height advance native
+/// history makes the later contraction retreat behind an immutable row seam.
+fn native_viewport_surface(state: &ShellState, chrome: &ShellChrome) -> bool {
+    state.overlay.is_some()
+        || state.panel.is_some()
+        || !state.editor.is_empty()
+        || state.tool_input_prompt.is_some()
+        || !chrome.pending.is_empty()
+        || !chrome.suggestions.is_empty()
+        || !chrome.error.is_empty()
+}
+
 /// Build the native overlay as a screen-sized surface over the visible tail of
 /// the normal transcript frame. Rows above that surface remain part of the
 /// logical frame, so a destructive resize can replay terminal-owned history
@@ -103,6 +116,7 @@ pub(super) fn render_shell_update_with_cursor(
     let entering_overlay = frame.initialized && !frame.overlay_active && state.overlay.is_some();
     let leaving_overlay = frame.initialized && frame.overlay_active && state.overlay.is_none();
     let chrome = shell_chrome(state, width, now);
+    let viewport_surface = native_viewport_surface(state, &chrome);
 
     let transcript_len = {
         let transcript = transcript_lines(state, width);
@@ -148,7 +162,7 @@ pub(super) fn render_shell_update_with_cursor(
                 &cache.lines,
                 requested_stable_prefix,
             );
-        let pinned = transcript_pinned_frame(state, total_rows, acknowledged);
+        let pinned = transcript_pinned_frame(state, total_rows, acknowledged, viewport_surface);
         drop(cache);
 
         frame.initialized = true;
@@ -181,6 +195,7 @@ pub(super) fn render_shell_update_with_cursor(
         state,
         stable_prefix.saturating_add(replacement.len()),
         acknowledged,
+        viewport_surface,
     );
 
     frame.initialized = true;

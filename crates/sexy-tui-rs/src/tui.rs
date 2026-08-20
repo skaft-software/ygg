@@ -58,6 +58,11 @@ pub struct PinnedFrame {
     /// may enter terminal history up to this seam before a coarser semantic
     /// `target` can be acknowledged.
     pub stable_rows: usize,
+    /// The visible tail is a temporary, screen-relative surface rather than an
+    /// extension of the append-only transcript tape. While this is set, repaint
+    /// the surface in place without advancing native history; the retained
+    /// transcript ledger is reconciled when the surface closes.
+    pub viewport_surface: bool,
 }
 
 /// A lazy replacement for the mutable tail of a retained frame. Lines before
@@ -486,6 +491,12 @@ pub struct TUI<'a> {
     inline_generation: Option<u64>,
     /// First logical row represented by grid row zero in pinned mode.
     inline_window_top: usize,
+    /// Temporary screen-relative tails (pickers, completion menus, reports, or
+    /// a retreating streamed layout) repaint the grid without advancing the
+    /// append-only transcript ledger. The physical rows are retained here for
+    /// bounded differential updates until the semantic tape is re-anchored.
+    inline_surface_active: bool,
+    inline_surface_window: Vec<String>,
     /// Nested renderer helpers share one synchronized-output transaction so
     /// cursor placement becomes visible atomically with the frame.
     synchronized_output_depth: usize,
@@ -512,6 +523,8 @@ impl<'a> TUI<'a> {
             inline_commit_cursor: None,
             inline_generation: None,
             inline_window_top: 0,
+            inline_surface_active: false,
+            inline_surface_window: Vec::new(),
             synchronized_output_depth: 0,
         }
     }
@@ -1000,6 +1013,7 @@ impl<'a> TUI<'a> {
                         .chain(new_lines)
                         .any(|line| is_image_line(line))
             });
+            let pinned_surface = pinned.is_some_and(|frame| frame.viewport_surface);
             self.reset_inline_scrollback(
                 replay.unwrap_or(new_lines),
                 rows,
@@ -1025,6 +1039,13 @@ impl<'a> TUI<'a> {
                 self.inline_window_top = displayed_window_top;
                 self.inline_bottom_row = visible.len().saturating_sub(1);
             }
+            if pinned_surface {
+                let visible = &new_lines[displayed_window_top..];
+                self.inline_surface_window = visible.to_vec();
+                self.inline_surface_window.resize(rows, String::new());
+                self.inline_surface_active = true;
+                self.inline_bottom_row = visible.len().saturating_sub(1);
+            }
             return;
         }
         if rebuild_scrollback && !self.first_render && pinned.is_none() {
@@ -1039,6 +1060,7 @@ impl<'a> TUI<'a> {
                 rows,
                 pinned,
                 reanchor_viewport || rebuild_scrollback,
+                rebuild_scrollback,
                 pinned_previous_window,
             );
             return;
@@ -1276,6 +1298,7 @@ impl<'a> TUI<'a> {
         rows: usize,
         pinned: PinnedFrame,
         mut reanchor: bool,
+        atomic_presentation_rebuild: bool,
         previous_window: &[String],
     ) {
         let desired_window_top = new_lines.len().saturating_sub(rows);
@@ -1290,6 +1313,8 @@ impl<'a> TUI<'a> {
             self.inline_commit_cursor = None;
             self.inline_history_rows = 0;
             self.inline_committed_rows = 0;
+            self.inline_surface_active = false;
+            self.inline_surface_window.clear();
             reanchor = true;
         }
 
@@ -1309,6 +1334,24 @@ impl<'a> TUI<'a> {
         let prior_history_rows = self
             .inline_history_rows
             .max(acknowledged.map_or(0, |position| position.row.min(new_lines.len())));
+
+        // Temporary chrome and reports are physical-screen surfaces, not new
+        // transcript tape. An ordinary streaming frame can also contract after
+        // Markdown reparses. In either case, advancing or repainting before the
+        // monotonic history seam would either commit chrome, duplicate history,
+        // or punch blank rows into the live grid. Keep the append ledger frozen
+        // and repaint the complete visible tail in place. Explicit presentation
+        // rebuilds still honor their atomic semantic commit boundary below.
+        if pinned.viewport_surface
+            || (!atomic_presentation_rebuild && desired_window_top < prior_history_rows)
+        {
+            self.write_inline_viewport_surface(new_lines, rows, previous_window);
+            self.inline_generation = Some(pinned.generation);
+            return;
+        }
+        if self.inline_surface_active {
+            reanchor = true;
+        }
 
         let mut commit_row = acknowledged
             .map(|position| position.row.min(new_lines.len()))
@@ -1355,10 +1398,10 @@ impl<'a> TUI<'a> {
             commit_cursor = Some(target.cursor);
         }
 
-        // A shrinking frame can move its bottom-aligned viewport above the
-        // immutable seam. Keep that physical alignment, but represent rows
-        // before the seam as empty cells instead of repainting terminal-owned
-        // content back into the grid.
+        // Ordinary streaming retreats use the temporary-surface path above.
+        // An explicit semantic presentation rebuild may still contract behind
+        // its atomic history boundary; those terminal-owned rows stay blank in
+        // the live grid rather than being duplicated.
         let window_top = desired_window_top;
         let window_line = |screen_row: usize| {
             let logical_row = window_top.saturating_add(screen_row);
@@ -1447,11 +1490,66 @@ impl<'a> TUI<'a> {
         self.inline_commit_cursor = commit_cursor;
         self.inline_generation = Some(pinned.generation);
         self.inline_window_top = window_top;
+        self.inline_surface_active = false;
+        self.inline_surface_window.clear();
         self.inline_bottom_row = new_lines
             .len()
             .saturating_sub(window_top)
             .saturating_sub(1)
             .min(rows.saturating_sub(1));
+    }
+
+    fn write_inline_viewport_surface(
+        &mut self,
+        new_lines: &[String],
+        rows: usize,
+        previous_window: &[String],
+    ) {
+        let visible = &new_lines[new_lines.len().saturating_sub(rows)..];
+        let visible_len = visible.len();
+        let mut next_window = visible.to_vec();
+        next_window.resize(rows, String::new());
+
+        let previous = if self.inline_surface_active {
+            self.inline_surface_window.clone()
+        } else {
+            previous_window.to_vec()
+        };
+        let delete_images = previous
+            .iter()
+            .zip(&next_window)
+            .any(|(old, new)| old != new && (is_image_line(old) || is_image_line(new)))
+            || previous
+                .get(next_window.len()..)
+                .is_some_and(|tail| tail.iter().any(|line| is_image_line(line)));
+        let repaint_all = self.first_render || !self.inline_surface_active || delete_images;
+
+        self.begin_synchronized_output();
+        if self.first_render {
+            // Preserve content that preceded the application, then establish a
+            // clean primary-screen grid without committing any surface rows.
+            self.terminal.write(&"\n".repeat(rows));
+            self.terminal.write("\x1b[H");
+            self.terminal.clear_screen();
+            self.terminal.write("\x1b[H");
+        }
+        if delete_images {
+            self.terminal.write(&delete_all_kitty_images());
+        }
+        for (screen_row, next) in next_window.iter().enumerate() {
+            if !repaint_all && previous.get(screen_row) == Some(next) {
+                continue;
+            }
+            self.terminal
+                .write(&format!("\x1b[{};1H", screen_row.saturating_add(1)));
+            self.terminal.clear_line();
+            self.terminal.write(next);
+        }
+        self.end_synchronized_output();
+
+        self.inline_surface_active = true;
+        self.inline_surface_window = next_window;
+        self.inline_bottom_row = visible_len.saturating_sub(1).min(rows.saturating_sub(1));
     }
 
     fn repaint_inline_visible_rows(&mut self, new_lines: &[String], rows: usize) {
@@ -1522,6 +1620,8 @@ impl<'a> TUI<'a> {
         self.inline_commit_cursor = None;
         self.inline_generation = None;
         self.inline_window_top = window_top;
+        self.inline_surface_active = false;
+        self.inline_surface_window.clear();
         self.inline_bottom_row = new_lines
             .len()
             .saturating_sub(window_top)
@@ -1948,6 +2048,7 @@ mod tests {
             }),
             target: target.map(test_commit_position),
             stable_rows,
+            viewport_surface: false,
         }
     }
 
@@ -2146,6 +2247,7 @@ mod tests {
             3,
             test_pinned_frame(None, None),
             false,
+            false,
             &previous_window,
         );
 
@@ -2192,6 +2294,7 @@ mod tests {
             &grown,
             4,
             test_pinned_frame_with_stable(None, None, 4),
+            false,
             false,
             &previous_window,
         );
@@ -2240,6 +2343,7 @@ mod tests {
             4,
             test_pinned_frame_with_stable(None, Some(2), 3),
             false,
+            false,
             &previous_window,
         );
 
@@ -2259,6 +2363,7 @@ mod tests {
             &next,
             4,
             test_pinned_frame_with_stable(Some(cursor), None, 4),
+            false,
             false,
             &previous_window,
         );
@@ -2295,6 +2400,7 @@ mod tests {
             3,
             test_pinned_frame_with_stable(tui.inline_commit_cursor, Some(3), 1),
             true,
+            false,
             &[],
         );
 
@@ -2322,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_window_shrink_never_repaints_before_committed_seam() {
+    fn pinned_window_shrink_repaints_a_temporary_surface_before_the_history_seam() {
         let size = Rc::new(Cell::new((40, 4)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
@@ -2344,6 +2450,7 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect();
+        tui.inline_history_rows = 4;
         tui.inline_committed_rows = 4;
         tui.inline_commit_cursor = Some(test_commit_position(4).cursor);
         tui.inline_window_top = 4;
@@ -2351,8 +2458,10 @@ mod tests {
 
         // Finalizing streamed Markdown can reduce the logical row count after
         // rows above the old viewport have already entered native scrollback.
-        // The new bottom-aligned top would retreat to row three, but that row
-        // is already terminal-owned and must never be painted into the grid.
+        // The new bottom-aligned top retreats to row three, which is already
+        // terminal-owned. Paint the complete semantic tail as a temporary
+        // cursor-addressed surface instead of committing it or punching a blank
+        // row into the live grid.
         let shrunk = [
             "settled 0",
             "settled 1",
@@ -2372,14 +2481,23 @@ mod tests {
             4,
             test_pinned_frame(cursor, Some(7)),
             false,
+            false,
             &previous_window,
         );
 
         let output = writes.borrow().join("");
-        assert!(!output.contains("new visible 3"), "{output:?}");
+        assert!(output.contains("new visible 3"), "{output:?}");
         assert!(output.contains("new visible 4"), "{output:?}");
+        assert!(output.contains("typed composer"), "{output:?}");
+        assert!(output.contains("footer"), "{output:?}");
+        assert!(
+            !output.contains('\n'),
+            "surface repaint scrolled: {output:?}"
+        );
+        assert_eq!(tui.inline_history_rows, 4);
         assert_eq!(tui.inline_committed_rows, 4);
-        assert_eq!(tui.inline_window_top, 3);
+        assert_eq!(tui.inline_window_top, 4);
+        assert!(tui.inline_surface_active);
         assert_eq!(tui.inline_bottom_row, 3);
     }
 
@@ -2418,7 +2536,9 @@ mod tests {
                 acknowledged: None,
                 target: None,
                 stable_rows: 0,
+                viewport_surface: false,
             },
+            false,
             false,
             &previous_window,
         );
@@ -2456,6 +2576,7 @@ mod tests {
             &shorter,
             3,
             test_pinned_frame(None, None),
+            false,
             false,
             &previous_window,
         );
@@ -2495,6 +2616,7 @@ mod tests {
             3,
             test_pinned_frame(None, None),
             true,
+            false,
             &previous_window,
         );
 
@@ -2538,7 +2660,14 @@ mod tests {
         .collect::<Vec<_>>();
         let cursor = tui.inline_commit_cursor;
 
-        tui.write_inline_pinned(&replacement, 4, test_pinned_frame(cursor, None), true, &[]);
+        tui.write_inline_pinned(
+            &replacement,
+            4,
+            test_pinned_frame(cursor, None),
+            true,
+            false,
+            &[],
+        );
 
         let output = writes.borrow().join("");
         assert!(!output.contains("\x1b[3J"), "{output:?}");

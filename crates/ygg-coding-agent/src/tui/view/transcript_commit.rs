@@ -277,6 +277,7 @@ pub(super) fn transcript_pinned_frame(
     state: &ShellState,
     total_rows: usize,
     acknowledged: Option<CommitCursor>,
+    viewport_surface: bool,
 ) -> PinnedFrame {
     let maximum_row = total_rows.saturating_sub(usize::from(state.size.1.max(1)));
     let target = transcript_commit_target(state, maximum_row, acknowledged);
@@ -286,6 +287,7 @@ pub(super) fn transcript_pinned_frame(
         acknowledged: acknowledged.and_then(|cursor| transcript_commit_position(state, cursor)),
         target,
         stable_rows,
+        viewport_surface,
     }
 }
 

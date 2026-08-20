@@ -39,10 +39,16 @@ blocks. The default terminal-owned renderer reuses the retained stable prefix;
 ordinary frames lay out and paint only the mutable or newly appended suffix. It
 separately tracks immutable physical rows and width-independent semantic commit
 cursors: stable rows enter history through bottom-row newlines, while finalized
-Ctrl+O-sensitive blocks cross only at complete semantic boundaries. Ordinary
-streaming therefore avoids repainting a shifted grid while a terminal user reads
-scrollback. Chrome follows logical content height rather than occupying a fixed
-full-screen viewport, and committed rows naturally enter terminal history.
+Ctrl+O-sensitive blocks cross only at complete semantic boundaries. Composer
+completions, panels, reports, and other temporary chrome paint as bounded
+screen-relative surfaces without advancing that history seam. If a streaming
+Markdown layout contracts behind rows already owned by the terminal, the
+renderer similarly freezes the ledger and repaints a temporary surface until
+the semantic viewport catches up, then stages newly stable rows exactly once.
+Ordinary streaming therefore avoids replaying a shifted grid while a terminal
+user reads scrollback. Chrome follows logical content height rather than
+occupying a fixed full-screen viewport, and committed rows naturally enter
+terminal history.
 
 A resize reflows the retained semantic transcript at the new width, resets the
 terminal's saved-line presentation, and replays Ygg's transcript once. Deferred

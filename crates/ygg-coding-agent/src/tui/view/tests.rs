@@ -3008,6 +3008,94 @@ fn resize_while_overlayed_replays_owned_transcript_before_repainting_overlay() {
 }
 
 #[test]
+fn slash_popup_then_context_overlay_repaints_the_complete_native_viewport() {
+    const WIDTH: u16 = 80;
+    const HEIGHT: u16 = 16;
+
+    for synchronized_output in [false, true] {
+        let (mut shell, bytes) = emulated_shell_with_sync(
+            crate::tui::theme::test_theme(),
+            WIDTH,
+            HEIGHT,
+            synchronized_output,
+        );
+        let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+            std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+        };
+        let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+        terminal.process(&drain(&bytes));
+
+        for index in 0..40 {
+            shell.notice(format!("CONTEXT-OVERLAY-HISTORY-{index:02}"));
+        }
+        shell.render();
+        terminal.process(&drain(&bytes));
+
+        // Paint the tallest slash-command surface before completing the
+        // command. This is the transition that used to advance the native
+        // history seam by nine rows in a 16-row terminal.
+        shell.apply_edit(EditAction::Char('/'));
+        shell.render();
+        terminal.process(&drain(&bytes));
+        assert!(terminal.screen().contents().contains("commands 1–9/"));
+
+        let (_directory, app) = crate::compaction::tests::app_for_estimate();
+        shell.clear_editor();
+        shell.show_context_report(crate::tui::context::ContextReport::capture(&app, &[]));
+        shell.render();
+        let context_frame = drain(&bytes);
+        assert!(
+            !context_frame.contains(&b'\n'),
+            "viewport surface scrolled into native history"
+        );
+        terminal.process(&context_frame);
+        terminal.set_scrollback(0);
+
+        let visible = terminal.screen().contents();
+        assert!(
+            visible.lines().next().is_some_and(|line| line.contains("Context ·")),
+            "context heading was clipped with synchronized_output={synchronized_output}:\n{visible}"
+        );
+        assert!(visible.contains(" input + "), "{visible}");
+        assert!(visible.contains("auto-compact"), "{visible}");
+        assert!(visible.contains('━'), "context bar was clipped:\n{visible}");
+        assert!(visible.contains("System prompt"), "{visible}");
+        assert!(
+            visible
+                .lines()
+                .any(|line| line == "─".repeat(WIDTH as usize)),
+            "composer disappeared:\n{visible}"
+        );
+
+        shell.close_overlay();
+        shell.render();
+        let close = drain(&bytes);
+        assert!(
+            !close
+                .windows(b"\x1b[3J".len())
+                .any(|bytes| bytes == b"\x1b[3J"),
+            "closing the context report cleared native history"
+        );
+        terminal.process(&close);
+        terminal.set_size(512, WIDTH);
+        terminal.set_scrollback(usize::MAX);
+        let physical = terminal.screen().contents();
+        assert!(
+            !physical.contains("Context ·"),
+            "overlay entered history:\n{physical}"
+        );
+        for index in 0..40 {
+            let sentinel = format!("CONTEXT-OVERLAY-HISTORY-{index:02}");
+            assert_eq!(
+                physical.matches(&sentinel).count(),
+                1,
+                "{sentinel} was lost or duplicated with synchronized_output={synchronized_output}:\n{physical}"
+            );
+        }
+    }
+}
+
+#[test]
 fn native_scrollback_keeps_finalized_tool_stable_while_streaming_scrolled_away() {
     use ygg_agent::ToolOutput;
 

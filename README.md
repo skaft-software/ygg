@@ -504,6 +504,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 
 - Native scrollback and drag selection are the default (`mouse = "auto"`); Ygg leaves mouse reporting disabled and lets committed transcript rows flow into terminal history.
 - The default renderer follows logical content height instead of pinning the composer and footer inside a fixed full-screen viewport. Ordinary frames reuse the retained stable prefix and render only the mutable/new suffix.
+- Slash/path completions, panels, reports, and other temporary chrome repaint a bounded screen surface without entering native history. If streamed Markdown contracts across the committed seam, the renderer holds that ledger until it can reconcile stable rows exactly once.
 - A terminal resize reflows the retained semantic transcript at the new width, resets terminal saved lines, and replays Ygg's retained transcript once.
 - `--mouse app` explicitly captures the mouse and uses a bounded semantic viewport. In that mode, scrolling above the tail stays anchored while streamed Markdown grows, reports new output, and lets PageDown return to live output.
 - Stable-prefix differential rendering, synchronized atomic frames, and bounded repaint regions.

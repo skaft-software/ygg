@@ -106,6 +106,11 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Fixed
 
+- Kept slash/path completion, panel, and report surfaces out of
+  terminal-owned history, and reconciled streamed-layout contractions without
+  punching blank rows into the live grid. `/context` now repaints completely
+  after a tall slash popup while finalized transcript rows remain exactly once
+  in native scrollback.
 - Made delegated mailbox delivery transactional: bounded UTF-8 pages remain
   leased until an untruncated tool result is durably appended, and failed or
   truncated persistence restores the page.
