@@ -17,7 +17,10 @@ byte-compatible at initialization, for trusted text-oriented extensions. It
 does not gain API `0.2` cancellation, progress, structured/media retention,
 parent-correlation, or terminal lifecycle guarantees. API `0.2` adds those
 stateful guarantees through explicit initialization negotiation; support is
-never inferred from the extension package version.
+never inferred from the extension package version. Installable bundles also
+carry an exact `requires_ygg` requirement in `extension.toml`; it is validated
+before a process can start and is packaging metadata, not an initialization
+field or protocol-version substitute.
 
 This protocol is the bus of a deliberately small agent kernel. Ygg hosts model
 conversations, session/result persistence, permissions and approvals, process
@@ -154,10 +157,11 @@ The **first** host request, sent immediately after the child process starts.
 - `source` is one of `"project"`, `"global"`, or `"explicit"`.
 
 API `0.1` uses the request and response above and must omit `protocol` from
-both. A `0.1` tool definition cannot declare `output_schema`.
+both. A `0.1` tool definition cannot declare `output_schema`, and a `0.1`
+manifest cannot declare semantic `presentation`.
 
-API `0.2` retains every top-level initialization field and adds this request
-member:
+API `0.2` retains every top-level initialization field, may set
+`contributes.presentation` to `true`, and adds this request member:
 
 ```json
 {
@@ -235,6 +239,14 @@ omitted from the serialized `capabilities` object, preserving the literal API
 `0.1` initialize shape above. A non-empty current/API `0.2` manifest includes
 the exact `secrets` array in that object.
 
+API `0.2` may also include `[capabilities].environment`, an explicit ambient
+broker allowlist. The only current reviewed name is `SSH_AUTH_SOCK`. It remains
+absent from the default sanitized subprocess environment and is copied from the
+host only when declared and present; values are not included in initialize,
+diagnostics, or persistence. Unsupported names and any API `0.1` declaration
+are invalid. Access to an agent socket grants signing authority to the trusted
+extension and is not a sandbox.
+
 API `0.2` tool definitions may add `output_schema`, a bounded supported subset
 of JSON Schema used to validate `structured_content`. Schema nodes must be
 objects, nesting is capped at 32, property names at 256 bytes, and the accepted
@@ -291,15 +303,19 @@ An extension must dispatch against that historical schema-and-handler snapshot,
 not whatever catalog happens to be newest when the call arrives. API `0.1` and
 API `0.2` without `dynamic_tools` omit the field.
 
-`resource_owner` is present for API `0.2` model-tool and tool-hook contexts.
+`resource_owner` is present for API `0.2` model-tool/tool-hook contexts and,
+in the coding product, slash commands, `before_prompt`, `after_response`, and
+`context/collect`.
 Its host-derived `session_id` is the durable namespace for extension state.
 `extension_instance_id` changes across a complete process-host rebuild, even
 when generation numbering restarts, and `process_generation` rejects stale
 browser tabs, MCP/LSP connections, memory handles, and comparable resources
 after an extension reload or automatic restart within that host instance. Key
-state by all three fields. API `0.1` omits the field. Other contribution
-contexts currently omit it and must not allocate session-owned resource
-handles.
+state by all three fields. API `0.1` omits the field. Status, renderer, and
+unsolicited contribution contexts remain process-scoped and must not allocate
+session-owned handles. A context owner alone does not authorize reverse host
+services: model-tool and declared-command requests are active parents, while
+prompt/context handlers are not, and the negotiated service rules still apply.
 
 **API `0.1` response:**
 
@@ -447,9 +463,10 @@ Invoke a lifecycle hook (declared in `contributes.hooks`).
 - `before_tool_call`: `{ "name": string, "arguments": { ... } }`
 - `after_tool_call`: `{ "name": string, "arguments": { ... }, "output": string, "is_error": bool }`
 
-API `0.1` invokes `after_response` only after a successful, complete assistant
-response. It is not a terminal-run hook and is not invoked for failure,
-cancellation, interruption, frontend loss, or shutdown.
+Both API versions invoke `after_response` only after a successful, complete
+assistant response. API `0.2` uses it as a bounded content synchronization hook;
+it does not replace terminal lifecycle observations and is not invoked for
+failure, cancellation, interruption, frontend loss, or shutdown.
 
 **Response:**
 
@@ -716,8 +733,9 @@ carry `tool_call_id` and `tool_name`. Settled events add `outcome`,
 session/turn delivery uses a 250 ms deadline and tool observations use the
 bounded writer queue. Host finalizers remain authoritative if delivery fails.
 
-API `0.1` `after_response` remains success-only. It is not sent on failure,
-cancellation, interruption, frontend loss, shutdown, or a turn limit.
+`after_response` remains success-only in both API versions. It is not sent on
+failure, cancellation, interruption, frontend loss, shutdown, or a turn limit;
+API `0.2` lifecycle settlement covers those terminal outcomes.
 
 ---
 
@@ -727,9 +745,10 @@ Extensions send these after `initialize` completes. API `0.2` operation-scoped
 requests (`confirmation/request`, `input/request`, `artifact/publish`,
 `policy/evaluate`, and `secret/get`, plus every `agent/*` method) must include
 the active numeric host `parent_request_id`.
-Global notifications, context and status contributions, and process-scoped
-tool-catalog mutations do not include it. When the parent settles, the host
-cancels every unresolved operation-scoped child and ignores late child replies.
+Global notifications, context, status, and presentation contributions, plus
+process-scoped tool-catalog mutations, do not include it. When the parent
+settles, the host cancels every unresolved operation-scoped child and ignores
+late child replies.
 
 Every extension-originated request ID is either an unsigned 64-bit integer or
 a string of at most 256 UTF-8 bytes. IDs are unique among outstanding child
@@ -843,7 +862,98 @@ Notification (no `id`).
 
 ---
 
-### 2.5 `$/progress` (API `0.2`)
+### 2.5 `presentation/update` (API `0.2`)
+
+Requires `contributes.presentation = true`. Publish one complete semantic state
+snapshot as a JSON-RPC notification:
+
+```json
+{
+  "jsonrpc":"2.0",
+  "method":"presentation/update",
+  "params": {
+    "parent_request_id":2,
+    "snapshot": {
+      "revision":4,
+      "status":{"state":"active","label":"1 worker"},
+    "activities":[{
+      "id":"worker:1","kind":"delegation","state":"running",
+      "summary":"Reviewing tests","provenance":"local child",
+      "started_at_ms":1721000000000,
+      "references":[]
+    }],
+    "collection":{
+      "kind":"tree","title":"Workers",
+      "nodes":[{
+        "id":"worker:1","parent_id":null,"state":"running",
+        "label":"test-review","secondary":"running",
+        "action_ids":["stop"],"references":[]
+      }],
+      "selected_node_id":"worker:1",
+      "detail":{
+        "node_id":"worker:1","title":"test-review",
+        "body":"Running in a bounded child session.","references":[]
+      }
+    },
+    "actions":[{
+      "id":"stop","label":"Stop worker","command":"workers",
+      "arguments":["stop","worker:1"],"destructive":true
+    }]
+    }
+  }
+}
+```
+
+`parent_request_id` correlates a handler-time snapshot to the active host request;
+Ygg derives its owner rather than accepting a session name from the extension.
+A background publisher instead supplies the complete host-issued
+`resource_owner` triple it previously received; Ygg accepts it only if that exact
+triple was issued to this process generation. The fields are mutually
+exclusive. Omitting both declares process-scoped state, which must contain no
+session-owned data. Stale/foreign triples and snapshots for another active
+product owner are dropped.
+
+`revision` is an unsigned monotonic process-generation revision (zero is valid);
+a newer process generation may restart it. `status` is optional. `activities`
+and `actions` default to empty arrays; `collection` is optional. Collection kind
+is `list` or `tree`. IDs are stable extension-scoped identifiers. Nodes use
+optional `parent_id`; lists cannot have parents, trees cannot contain a missing
+parent, cycle, or depth over 16. A detail `node_id` must match the current
+`selected_node_id`. Generic states are `empty`, `loading`, `pending`, `active`,
+`running`, `succeeded`, `failed`, `cancelled`, `degraded`, `stopped`, and
+`unavailable`.
+
+References contain `{kind,id,label?}`. Kinds `session`, `artifact`, and
+`resource` carry opaque identifiers. A `session` reference is only a lookup key:
+frontends may open it read-only after the host separately verifies the issuing
+parent session, path-free extension principal, and resource owner; mutation
+continues through `agent_sessions`. Kind `url` carries a sanitized absolute
+HTTP(S) URL; credentials, localhost/`.local`, and private/loopback/link-local/
+unspecified/multicast literal IP targets are rejected and frontends expose it
+only after a user click. Each action must route to an existing command declared
+by this manifest. Labels and detail are plain data: ANSI/control sequences,
+HTML, scripts, CSS, and frontend layout coordinates are rejected or rendered as
+text.
+
+A snapshot is capped at 256 KiB encoded, 128 activities, 256 nodes, 64 actions,
+16 tree levels, 8 references per item, 1,024 bytes per compact label/ID, and
+64 KiB for detail body. Revisions and timestamps are capped at the largest
+exactly representable JSON integer. One generation emits at most 32 snapshots
+in a one-second window; excess valid notifications are coalesced last-wins and
+the newest complete snapshot is emitted when the next window opens. Throttling
+produces at most one diagnostic for that window. The host validates the complete
+snapshot atomically,
+attaches manifest identity, a non-repeating process-instance fence, generation,
+and active resource owner, ignores or diagnoses stale updates, and retains the
+latest accepted replacement for TUI, Serve, and bounded headless fallbacks. It
+clears stale state on owner/process replacement; Serve action identity includes
+the instance fence, generation, and revision before routing the selected
+manifest process's command. The notification never invokes an action, repeats
+work, mutates a tool result, or grants authority.
+
+---
+
+### 2.6 `$/progress` (API `0.2`)
 
 Requires `request_progress`. Progress is correlated to one active host request
 and sequences must increase strictly for that request:
@@ -878,7 +988,7 @@ model result and is not persisted in the conversation transcript.
 
 ---
 
-### 2.6 `input/request` (API `0.2`)
+### 2.7 `input/request` (API `0.2`)
 
 Request ephemeral text from the frontend while an operation is active:
 
@@ -906,7 +1016,7 @@ Parent settlement cancels the pending input request.
 
 ---
 
-### 2.7 `artifact/publish` (API `0.2`)
+### 2.8 `artifact/publish` (API `0.2`)
 
 Requires `artifacts`. Publish either small inline base64 data:
 
@@ -944,7 +1054,7 @@ generation settlement, or an owner mismatch makes the handle unavailable.
 
 ---
 
-### 2.8 `policy/evaluate` (API `0.2`)
+### 2.9 `policy/evaluate` (API `0.2`)
 
 Requires `policy_intents`:
 
@@ -1012,7 +1122,7 @@ settles.
 
 ---
 
-### 2.9 `secret/get` (API `0.2`)
+### 2.10 `secret/get` (API `0.2`)
 
 Requires the conditionally offered `secrets` feature and an exact name from the
 manifest's `[capabilities].secrets` allowlist:
@@ -1046,7 +1156,7 @@ therefore does not offer `secrets`.
 
 ---
 
-### 2.10 `tools/register` (API `0.2`)
+### 2.11 `tools/register` (API `0.2`)
 
 Requires `dynamic_tools`. Add new tools or replace complete definitions for
 existing extension-owned names:
@@ -1097,7 +1207,7 @@ catalogs.
 
 ---
 
-### 2.11 `tools/unregister` (API `0.2`)
+### 2.12 `tools/unregister` (API `0.2`)
 
 Requires `dynamic_tools`. Remove extension-owned names transactionally:
 
@@ -1133,10 +1243,11 @@ next-boundary rule.
 
 ---
 
-### 2.12 `agent/spawn` (API `0.2`, working tree)
+### 2.13 `agent/spawn` (API `0.2`, working tree)
 
 Requires the conditionally offered `agent_sessions` feature and an active
-host-tool parent. Create one bounded in-harness child model session:
+host model-tool or declared-command parent. Create one bounded in-harness child
+model session:
 
 ```json
 {
@@ -1146,24 +1257,47 @@ host-tool parent. Create one bounded in-harness child model session:
   "params": {
     "parent_request_id": 2,
     "task_name": "inspect-midi-tools",
+    "profile": "review",
+    "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "message": "Inspect the current Ableton MCP catalog.",
-    "idempotency_key": "catalog-audit-2026-08-16"
+    "idempotency_key": "catalog-audit-2026-08-16",
+    "policy": {
+      "tools": ["read", "search"],
+      "max_depth": 1,
+      "max_concurrent_children": 2,
+      "max_turns": 8,
+      "max_tokens": 32000,
+      "max_cost_microdollars": 200000,
+      "max_output_bytes": 8192,
+      "timeout_ms": 300000
+    }
   }
 }
 ```
 
 The host derives the resource owner from `parent_request_id`; the extension
-cannot submit an owner. The idempotency key is 1..=256 bytes and scoped to the
-extension principal plus that owner. Retrying identical `task_name`/`message`
-returns the same result. Reusing the key with different input fails with
-`-32002`. `task_name` is 1..=48 lowercase ASCII letters, digits, underscores,
-or hyphens. The message is capped at 128 KiB. Success includes `agent_id`,
-`agent_path`, caller-visible `task_name`, `status`, extension `principal`, and
-the durable session `resource_owner` string.
+cannot submit an owner. `policy` is mandatory. Its tools are a non-empty,
+duplicate-free subset of `read`/`search`; depth is exactly one; concurrency is
+1..=2; and turns, cumulative tokens/cost, returned UTF-8 bytes, and wall time
+are positive host-capped values. Ygg freezes a detached effective tool snapshot,
+installs no collaboration tools, applies lower inherited turn/cost ceilings,
+and owns limit settlement even when the extension is idle or restarted.
+
+The idempotency key is 1..=256 bytes and scoped to the extension principal plus
+that owner. Retrying identical `task_name`/`profile`/`fingerprint`/`message`/
+`policy` returns the same result. Reusing the key with different input fails
+with `-32002`. `task_name` and optional `profile` are 1..=48 lowercase ASCII
+letters, digits, underscores, or hyphens. Optional `fingerprint` is one
+lowercase SHA-256 digest used only as opaque recovery metadata. The message is
+capped at 128 KiB. Success includes `agent_id`, `agent_path`, caller-visible
+`task_name`, optional `profile`/`fingerprint`, `idempotency_key`, `status`,
+effective `policy`, host-owned `created_at_ms`/`started_at_ms`/
+`completed_at_ms`, and `deadline_at_ms`, plus the path-free extension
+`principal` and durable session `resource_owner` string.
 
 ---
 
-### 2.13 `agent/message` (API `0.2`, working tree)
+### 2.14 `agent/message` (API `0.2`, working tree)
 
 Send steering input to an owned child while preserving the child session:
 
@@ -1187,7 +1321,7 @@ message is capped at 128 KiB.
 
 ---
 
-### 2.14 `agent/follow_up` (API `0.2`, working tree)
+### 2.15 `agent/follow_up` (API `0.2`, working tree)
 
 Queue a subsequent run on an owned child:
 
@@ -1206,23 +1340,33 @@ Queue a subsequent run on an owned child:
 
 Success returns `agent_id`, `agent_path`, and `delivery` (`follow_up` when the
 child is running, otherwise `new_run`). Ownership checks match
-`agent/message`; the follow-up is capped at 128 KiB.
+`agent/message`; the follow-up is capped at 128 KiB. Host-bounded extension
+children reject follow-up runs so their turn/deadline contract cannot reset.
 
 ---
 
-### 2.15 `agent/list` (API `0.2`, working tree)
+### 2.16 `agent/list` (API `0.2`, working tree)
 
 Request `{ "parent_request_id": 2 }`. Success returns the extension
 `principal`, derived `resource_owner`, `persistence_error`, and `agents`. Each
-agent record contains `agent_id`, `agent_path`, `parent_id`, `task_name`,
-`depth`, durable `session` path, and tagged `status`. States are `pending`,
-`running`, `completed` (with bounded `output`), `interrupted`, `failed` (with
-bounded `error`), and `shutdown`. The list contains only roots spawned by this
-principal/owner and their descendants.
+agent record contains `agent_id`, `agent_path`, `parent_id`, public
+`task_name`, optional `profile`, durable `idempotency_key`/`fingerprint`,
+`depth`, opaque `agent-session:*` resource reference, tagged `status`, effective
+`policy`, host-owned `created_at_ms`/`started_at_ms`/`completed_at_ms`,
+`deadline_at_ms`, `turn_count`, cumulative `usage`, optional
+`cost_microdollars`, and principal/owner `provenance`. States are `pending`,
+`running`, `completed` (with host-byte-capped `output`), `interrupted`,
+`timed_out`, `failed` (with bounded `error`), and `shutdown`. Private delegation
+JSONL paths are never returned. A current owner-scoped presentation may route
+the opaque reference into Serve or `/extensions inspect` as a locked read-only
+transcript; the resolver separately verifies host-written parent-session,
+extension-principal, and resource-owner provenance. All mutation continues
+through the owner-bound `agent_sessions` methods. The list contains only roots
+spawned by this principal/owner and their descendants.
 
 ---
 
-### 2.16 `agent/wait` (API `0.2`, working tree)
+### 2.17 `agent/wait` (API `0.2`, working tree)
 
 Request `{ "parent_request_id": 2, "timeout_ms": 30000 }`. The timeout
 defaults to 30 seconds and is clamped to 1..=60,000 ms. The request returns
@@ -1233,7 +1377,7 @@ cancels the wait.
 
 ---
 
-### 2.17 `agent/interrupt` (API `0.2`, working tree)
+### 2.18 `agent/interrupt` (API `0.2`, working tree)
 
 Request `{ "parent_request_id": 2, "target": "agent-1" }`. Success returns
 `agent_id`, `agent_path`, `previous_status`, and `interrupt_requested`. The host
@@ -1243,13 +1387,15 @@ All six methods share the child-request and eight-worker bounds. After a
 parseable request ID, malformed parameters return `-32602`. Unavailable
 service/owner, invalid ownership, exhausted delegation limits, persistence
 failure, or an invalid operation return `-32002`. The extension's stable
-principal is derived from its manifest name and path; a different extension or
-resource owner cannot list, message, follow up, wait on, or interrupt its child
-trees. Ownership uses that principal plus the durable session-owner string, not
-the extension process generation, so supervised restart/reload can resume an
-existing tree. Process shutdown requests shutdown of the service's owned trees;
-a complete process-host rebuild creates a new service boundary. Hosted agents
-are a separate capability; these methods create Ygg child conversations.
+principal is derived from its manifest name plus a SHA-256 manifest-identity
+digest; the manifest path itself is never returned to the extension. A
+different extension or resource owner cannot list, message, follow up, wait on,
+or interrupt its child trees. Ownership uses that principal plus the durable
+session-owner string, not the extension process generation, so supervised
+restart/reload can resume an existing tree. Process shutdown requests shutdown
+of the service's owned trees; a complete process-host rebuild creates a new
+service boundary. Hosted agents are a separate capability; these methods
+create Ygg child conversations.
 Observe their state through `agent/list`/`agent/wait`. Delegated child turns do
 not currently emit extension `session/*` or `turn/*` lifecycle notifications;
 that notification stream covers the owning/root product session.
@@ -1309,7 +1455,7 @@ extension-specific server errors.
 |---|---|---|
 | `workspace` | string | Active workspace root |
 | `execution_scope` | string \| null | Tool execution scope ID |
-| `resource_owner` | object \| null | API `0.2` host-derived `{session_id, extension_instance_id, process_generation}` for model-tool and tool-hook resource ownership; omitted elsewhere and in `0.1` |
+| `resource_owner` | object \| null | API `0.2` host-derived `{session_id, extension_instance_id, process_generation}` on every session-owned tool, hook, command, context, status, or renderer boundary; omitted only for process-scoped/unsolicited contributions and in `0.1` |
 | `host` | object | Current `ExtensionHostState` |
 
 ### `ExtensionResourceOwner` (API `0.2`)
@@ -1401,6 +1547,19 @@ result.
 | `style_role` | string \| null | Semantic theme role |
 | `priority` | int | Higher = retained first when constrained |
 
+### `ExtensionPresentationSnapshot` (API `0.2`)
+
+| Field | Type | Description |
+|---|---|---|
+| `revision` | unsigned integer | Monotonic within one process generation |
+| `status` | object \| null | Generic `state`, compact `label`, optional `detail` |
+| `activities` | array | Stable ID, kind, state, summary, provenance/timing/references |
+| `collection` | object \| null | `list`/`tree`, stable nodes, selection, selected detail |
+| `actions` | array | Stable ID/label routed to a manifest-declared command and literal arguments |
+
+See [`presentation/update`](#25-presentationupdate-api-02) for exact state,
+reference, safety, parentage, and bound rules.
+
 ### API `0.2` protocol features
 
 | Feature | Required | Enables |
@@ -1445,9 +1604,9 @@ cancels the remainder, emits remaining lifecycle terminals, and waits for
 shutdown acknowledgement or timeout. It then seeds lifecycle state and
 atomically routes new calls to `N+1`. If candidate launch or negotiation fails,
 the old process remains active. Stale progress, child requests, confirmation
-IDs, approvals, secret lookups, artifacts, catalog epochs, and resource handles
-cannot cross the generation boundary. Unresolved unsafe calls are never
-replayed.
+IDs, approvals, secret lookups, artifacts, presentation snapshots, catalog
+epochs, and resource handles cannot cross the generation boundary. Unresolved
+unsafe calls are never replayed.
 `/extensions reload` replaces running children; general `/reload` rebuilds
 discovery and the product boundary.
 
@@ -1501,3 +1660,4 @@ Every extension child receives:
 | `YGG_EXTENSION_MANIFEST` | Absolute path to `extension.toml` |
 | `YGG_WORKSPACE` | Active workspace root |
 | `YGG_EXTENSION_SCRATCH` | Host-owned scratch directory for the active process generation |
+| `SSH_AUTH_SOCK` | Forwarded only for an API `0.2` manifest that explicitly declares it in `[capabilities].environment` and only when present in the host |

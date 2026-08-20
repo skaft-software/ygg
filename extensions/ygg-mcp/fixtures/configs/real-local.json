@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "limits": {
+    "maxServers": 2,
+    "maxToolsPerServer": 16,
+    "maxTotalTools": 32,
+    "maxConcurrentCalls": 4,
+    "startupTimeoutMs": 3000,
+    "requestTimeoutMs": 3000
+  },
+  "servers": {
+    "real-fixture": {
+      "transport": "stdio",
+      "label": "Real local fixture",
+      "command": "python3",
+      "args": ["fixtures/real_mcp_server.py"],
+      "cwd": "../..",
+      "env": {},
+      "enabled": true,
+      "required": true
+    }
+  }
+}

@@ -136,8 +136,38 @@ ygg update           # run the update for the detected install method
 ```
 
 In the TUI, `/update` checks for a newer release and tells you to run
-`ygg update`. Ygg Serve is not updated by `ygg update`; after updating
-Ygg, run `ygg extension update ygg-serve` to match the new release.
+`ygg update`. Extension packages are not updated by `ygg update`; after updating
+Ygg, run `ygg extension update <name>` for each installed official package so
+its exact compatibility matches the new release.
+
+### Executable extension bundles
+
+The optional first-party executable extensions are separate, inert packages.
+For example:
+
+```sh
+ygg extension install ygg-web-search
+ygg extension list
+```
+
+Published bundles are checksum-verified and installed atomically under
+`~/.ygg/extensions/<id>`. Installation does **not** enable, trust, or start the
+process. Explicitly opt in when launching Ygg:
+
+```sh
+ygg --enable-extension ygg-web-search --trust-extension ygg-web-search
+```
+
+The small release catalog contains `ygg-browse`, `ygg-hermes-memory`, `ygg-mcp`,
+`ygg-ssh`, `ygg-subagents`, and `ygg-web-search`. Use
+`ygg extension update <name>` or `ygg extension remove <name>` to manage one.
+Offline and third-party archives can be installed with
+`ygg extension install --path ./bundle.tar.gz`. Replace one atomically with
+`ygg extension update --path ./new-bundle.tar.gz`. Ygg runs no
+install hook or dependency provisioner. Packaged skills are discovered but
+still require explicit activation. See the
+[executable-extension documentation](docs/extensions.md) for setup, trust, and
+local-install details.
 
 ### Graphical Serve extension
 
@@ -155,9 +185,10 @@ For a headless launch on an operating-system-selected port:
 ygg serve --no-open --port 0
 ```
 
-Use `ygg extension list`, `update ygg-serve`, or `remove ygg-serve` to manage
-the package. A downloaded release archive can be installed with
-`ygg extension install --path ./ygg-serve-0.5.0-TARGET.tar.gz`.
+Use `ygg extension list` to inspect packages. Run `ygg extension update ygg-serve`
+or `ygg extension remove ygg-serve` to manage Serve. A downloaded release
+archive can be installed with `ygg extension install --path ARCHIVE` or updated
+atomically with `ygg extension update --path ARCHIVE`.
 Removing the package leaves sessions and other Serve data intact.
 
 ### Container

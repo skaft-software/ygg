@@ -31,6 +31,7 @@ const MAX_AUTHORITY_PROFILES: usize = 8;
 const MAX_COMMAND_SUGGESTIONS: usize = 512;
 const MAX_SKILL_SUGGESTIONS: usize = 512;
 const MAX_COMMAND_DISCOVERY_BYTES: usize = 256 * 1024;
+const MAX_EXTENSION_PRESENTATIONS: usize = 32;
 
 /// Monotonic host-catalog revision.
 #[derive(
@@ -1340,12 +1341,33 @@ pub struct PendingRequest {
     pub state: RequestState,
 }
 
+/// Latest accepted frontend-neutral state from one executable extension.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExtensionPresentation {
+    /// Manifest-bound extension name.
+    pub extension: String,
+    /// Executable process generation that owns the state.
+    pub generation: u64,
+    /// Host-created process-instance fence that remains unique across complete
+    /// extension host rebuilds.
+    pub extension_instance_id: String,
+    /// Host-derived durable session owner used for reconnect isolation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_owner: Option<String>,
+    /// Complete monotonic semantic snapshot from the shared extension API.
+    pub snapshot: ygg_agent::ExtensionPresentationSnapshot,
+}
+
 /// Complete selected-session projection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionSnapshot {
     /// Session identity.
     pub session_id: SessionId,
+    /// Source parent for a locked delegated transcript inspector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_parent_session_id: Option<SessionId>,
     /// Mutable owner generation.
     pub actor_generation: u64,
     /// Latest session cursor.
@@ -1368,6 +1390,9 @@ pub struct SessionSnapshot {
     pub context: ContextUsage,
     /// Durable tail plus current provisional items.
     pub items: Vec<SessionItem>,
+    /// Current executable-extension semantic state, replaced atomically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_presentations: Vec<ExtensionPresentation>,
     /// Active public requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_requests: Vec<PendingRequest>,
@@ -2335,12 +2360,71 @@ impl ProtocolValidation for SessionBranchGraph {
     }
 }
 
+impl ProtocolValidation for ExtensionPresentation {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_discovery_name(
+            "snapshot.extension_presentations.extension",
+            &self.extension,
+        )?;
+        if self.generation == 0 {
+            return Err(ValidationError::new(
+                "snapshot.extension_presentations.generation",
+                "must be non-zero",
+            ));
+        }
+        validate_public_text(
+            "snapshot.extension_presentations.extension_instance_id",
+            &self.extension_instance_id,
+            128,
+            false,
+        )?;
+        if self.extension_instance_id.chars().any(char::is_whitespace) {
+            return Err(ValidationError::new(
+                "snapshot.extension_presentations.extension_instance_id",
+                "must be a whitespace-free stable identifier",
+            ));
+        }
+        if let Some(owner) = &self.resource_owner {
+            validate_public_text(
+                "snapshot.extension_presentations.resource_owner",
+                owner,
+                256,
+                false,
+            )?;
+        }
+        let declared_commands = self
+            .snapshot
+            .actions
+            .iter()
+            .map(|action| action.command.clone())
+            .collect::<Vec<_>>();
+        self.snapshot.validate(&declared_commands).map_err(|error| {
+            ValidationError::new("snapshot.extension_presentations.snapshot", error)
+        })
+    }
+}
+
 impl ProtocolValidation for SessionSnapshot {
     fn validate(&self) -> Result<(), ValidationError> {
         if self.actor_generation == 0 {
             return Err(ValidationError::new(
                 "snapshot.actor_generation",
                 "must be non-zero",
+            ));
+        }
+        if self.delegated_parent_session_id.as_ref() == Some(&self.session_id) {
+            return Err(ValidationError::new(
+                "snapshot.delegated_parent_session_id",
+                "must identify a different source parent",
+            ));
+        }
+        if self.delegated_parent_session_id.is_some()
+            && (self.authority != AuthorityProfile::ReadOnly
+                || self.live_state != SessionLiveState::Locked)
+        {
+            return Err(ValidationError::new(
+                "snapshot.delegated_parent_session_id",
+                "is valid only for a locked read-only delegated inspector",
             ));
         }
         if self.cursor.actor_generation != self.actor_generation {
@@ -2364,6 +2448,12 @@ impl ProtocolValidation for SessionSnapshot {
                 format!("exceeds the {MAX_SESSION_ITEMS}-item limit"),
             ));
         }
+        if self.extension_presentations.len() > MAX_EXTENSION_PRESENTATIONS {
+            return Err(ValidationError::new(
+                "snapshot.extension_presentations",
+                format!("exceeds the {MAX_EXTENSION_PRESENTATIONS}-extension limit"),
+            ));
+        }
         if self.pending_requests.len() > MAX_PENDING_REQUESTS {
             return Err(ValidationError::new(
                 "snapshot.pending_requests",
@@ -2384,6 +2474,16 @@ impl ProtocolValidation for SessionSnapshot {
                 return Err(ValidationError::new(
                     "snapshot.items",
                     "contains a duplicate item ID",
+                ));
+            }
+        }
+        let mut extension_names = BTreeSet::new();
+        for presentation in &self.extension_presentations {
+            presentation.validate()?;
+            if !extension_names.insert(presentation.extension.as_str()) {
+                return Err(ValidationError::new(
+                    "snapshot.extension_presentations",
+                    "contains a duplicate extension name",
                 ));
             }
         }
@@ -2621,6 +2721,26 @@ fn authority_rank(authority: AuthorityProfile) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_extension_presentation_fixture_is_serve_safe() {
+        let snapshot: ygg_agent::ExtensionPresentationSnapshot = serde_json::from_str(
+            include_str!("../../../crates/ygg-coding-agent/fixtures/extension-presentation.json"),
+        )
+        .unwrap();
+        let presentation = ExtensionPresentation {
+            extension: "fixture-extension".into(),
+            generation: 2,
+            extension_instance_id: "instance-a".into(),
+            resource_owner: Some("owner-1".into()),
+            snapshot,
+        };
+        presentation.validate().unwrap();
+
+        let mut unsafe_link = presentation;
+        unsafe_link.snapshot.activities[0].references[0].id = "http://127.0.0.1/private".into();
+        assert!(unsafe_link.validate().is_err());
+    }
 
     fn run_telemetry() -> AgentRunTelemetry {
         AgentRunTelemetry {

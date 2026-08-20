@@ -1,0 +1,70 @@
+{
+  "revision": 0,
+  "status": {
+    "state": "active",
+    "label": "Browse · ready",
+    "detail": "Replacement process started with no retained tabs."
+  },
+  "activities": [],
+  "collection": {
+    "kind": "list",
+    "title": "Browse",
+    "nodes": [
+      {
+        "id": "browse-runtime",
+        "state": "succeeded",
+        "label": "Browser setup",
+        "secondary": "ready after restart",
+        "action_ids": [
+          "open"
+        ],
+        "references": []
+      }
+    ],
+    "selected_node_id": "browse-runtime",
+    "detail": {
+      "node_id": "browse-runtime",
+      "title": "Ygg Browse",
+      "body": "Process generation replaced. Old tab IDs, refs, artifacts, and presentation state are unavailable.",
+      "references": []
+    }
+  },
+  "actions": [
+    {
+      "id": "setup",
+      "label": "Set up browser",
+      "command": "browse",
+      "arguments": [
+        "setup"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "open",
+      "label": "Open visible browser",
+      "command": "browse",
+      "arguments": [
+        "open"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "close",
+      "label": "Close browser",
+      "command": "browse",
+      "arguments": [
+        "close"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "reset-profile",
+      "label": "Reset isolated profile",
+      "command": "browse",
+      "arguments": [
+        "reset-profile"
+      ],
+      "destructive": true
+    }
+  ]
+}

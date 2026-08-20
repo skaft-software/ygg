@@ -862,8 +862,18 @@ class AgentSessionTests(unittest.TestCase):
         def orchestrate(_args):
             child = extension.spawn_agent(
                 task_name="research",
+                profile="review",
+                fingerprint="f" * 64,
                 message="Find the answer",
                 idempotency_key="request-42-research",
+                tools=["read", "search"],
+                max_depth=1,
+                max_concurrent_children=2,
+                max_turns=8,
+                max_tokens=32_000,
+                max_cost_microdollars=200_000,
+                max_output_bytes=8_192,
+                timeout_ms=300_000,
             )
             extension.send_agent_message(child["agent_id"], "More context")
             extension.follow_up_agent(child["agent_id"], "Check the result")
@@ -901,6 +911,21 @@ class AgentSessionTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(message["params"]["parent_request_id"] == 42 for message in calls))
+        self.assertEqual(calls[0]["params"]["profile"], "review")
+        self.assertEqual(calls[0]["params"]["fingerprint"], "f" * 64)
+        self.assertEqual(
+            calls[0]["params"]["policy"],
+            {
+                "tools": ["read", "search"],
+                "max_depth": 1,
+                "max_concurrent_children": 2,
+                "max_turns": 8,
+                "max_tokens": 32_000,
+                "max_cost_microdollars": 200_000,
+                "max_output_bytes": 8_192,
+                "timeout_ms": 300_000,
+            },
+        )
         host.shutdown()
 
     def test_agent_session_helpers_require_negotiation(self):
@@ -1488,6 +1513,132 @@ class LifecycleAndDrainTests(unittest.TestCase):
         self.assertLess(messages.index(cancelled), messages.index(shutdown))
         host.reader.close()
         host.thread.join(timeout=2.0)
+
+
+class PresentationTests(unittest.TestCase):
+    def test_publishes_bounded_monotonic_semantic_snapshot(self):
+        extension = Extension(api_version="0.2")
+
+        @extension.command(name="workers", description="Manage workers")
+        def workers(arguments):
+            return {"text": "ok"}
+
+        host = RunningExtension(extension)
+        host.start(initialize_v02(commands=["workers"], presentation=True))
+        snapshot = {
+            "revision": 0,
+            "status": {"state": "active", "label": "1 worker"},
+            "activities": [
+                {
+                    "id": "worker:1",
+                    "kind": "delegation",
+                    "state": "running",
+                    "summary": "Reviewing tests",
+                }
+            ],
+            "collection": {
+                "kind": "tree",
+                "title": "Workers",
+                "nodes": [
+                    {
+                        "id": "worker:1",
+                        "state": "running",
+                        "label": "test-review",
+                        "action_ids": ["stop"],
+                    }
+                ],
+                "selected_node_id": "worker:1",
+                "detail": {
+                    "node_id": "worker:1",
+                    "title": "test-review",
+                    "body": "Running in a bounded child session.",
+                },
+            },
+            "actions": [
+                {
+                    "id": "stop",
+                    "label": "Stop worker",
+                    "command": "workers",
+                    "arguments": ["stop", "worker:1"],
+                    "destructive": True,
+                }
+            ],
+        }
+        extension.publish_presentation(snapshot)
+        update = host.writer.wait_for(
+            lambda message: message.get("method") == "presentation/update"
+        )
+        self.assertEqual(update["params"], {"snapshot": snapshot})
+        with self.assertRaises(ValueError):
+            extension.publish_presentation(snapshot)
+        snapshot["revision"] = 2**53
+        with self.assertRaisesRegex(ValueError, "portable"):
+            extension.publish_presentation(snapshot)
+        snapshot["revision"] = 1
+        extension.presentation(snapshot)
+        host.shutdown()
+
+    def test_handler_presentation_is_correlated_to_its_host_parent(self):
+        extension = Extension(api_version="0.2")
+
+        @extension.tool(name="publish", description="Publish owner state")
+        def publish(_arguments):
+            extension.publish_presentation({"revision": 0})
+            return "ok"
+
+        host = RunningExtension(extension)
+        host.start(initialize_v02(tools=["publish"], presentation=True))
+        host.reader.feed(
+            rpc_request(
+                42,
+                "tool/call",
+                {"name": "publish", "arguments": {}, "context": {}},
+            )
+        )
+        update = host.writer.wait_for(
+            lambda message: message.get("method") == "presentation/update"
+        )
+        self.assertEqual(
+            update["params"],
+            {"snapshot": {"revision": 0}, "parent_request_id": 42},
+        )
+        host.writer.wait_for(lambda message: message.get("id") == 42)
+        host.shutdown()
+
+    def test_background_presentation_carries_the_exact_host_owner_triple(self):
+        extension = Extension(api_version="0.2")
+        host = RunningExtension(extension)
+        host.start(initialize_v02(presentation=True))
+        owner = {
+            "session_id": "session-owner",
+            "extension_instance_id": "instance-owner",
+            "process_generation": 2,
+        }
+        extension.publish_presentation({"revision": 0}, resource_owner=owner)
+        update = host.writer.wait_for(
+            lambda message: message.get("method") == "presentation/update"
+        )
+        self.assertEqual(
+            update["params"],
+            {"snapshot": {"revision": 0}, "resource_owner": owner},
+        )
+        with self.assertRaisesRegex(ValueError, "exact owner triple"):
+            extension.publish_presentation(
+                {"revision": 1}, resource_owner={"session_id": "session-owner"}
+            )
+        host.shutdown()
+
+    def test_requires_api_and_manifest_declaration(self):
+        extension = Extension(api_version="0.2")
+        host = RunningExtension(extension)
+        host.start(initialize_v02())
+        with self.assertRaises(RpcError):
+            extension.publish_presentation({"revision": 0})
+        host.shutdown()
+
+        extension = Extension(api_version="0.1")
+        with self.assertRaises(RpcError):
+            extension.publish_presentation({"revision": 0})
 
 
 class HelperValidationTests(unittest.TestCase):

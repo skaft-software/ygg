@@ -240,6 +240,13 @@ export function reduceSessionEvent(
         sequence: event.sequence,
       };
 
+    case "extension.presentationsChanged":
+      return {
+        ...snapshot,
+        sequence: event.sequence,
+        extensionPresentations: event.presentations,
+      };
+
     case "session.goalChanged":
       return {
         ...snapshot,

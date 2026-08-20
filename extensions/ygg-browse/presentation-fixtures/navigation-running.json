@@ -1,0 +1,77 @@
+{
+  "revision": 5,
+  "status": {
+    "state": "running",
+    "label": "Browse · open · 1 tab · https://example.test",
+    "detail": "Navigation in progress."
+  },
+  "activities": [
+    {
+      "id": "browse:navigation",
+      "kind": "navigation",
+      "state": "running",
+      "summary": "Navigating an explicit HTTP(S) target",
+      "provenance": "visible isolated browser",
+      "references": []
+    }
+  ],
+  "collection": {
+    "kind": "list",
+    "title": "Browse tabs",
+    "nodes": [
+      {
+        "id": "tab_a1b2",
+        "state": "active",
+        "label": "Tab tab_a1b2",
+        "secondary": "https://example.test",
+        "action_ids": [],
+        "references": []
+      }
+    ],
+    "selected_node_id": "tab_a1b2",
+    "detail": {
+      "node_id": "tab_a1b2",
+      "title": "Tab tab_a1b2",
+      "body": "Sanitized untrusted title: Example fixture\nSanitized URL: https://example.test/page\nSnapshot generation: 4",
+      "references": []
+    }
+  },
+  "actions": [
+    {
+      "id": "setup",
+      "label": "Set up browser",
+      "command": "browse",
+      "arguments": [
+        "setup"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "open",
+      "label": "Open visible browser",
+      "command": "browse",
+      "arguments": [
+        "open"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "close",
+      "label": "Close browser",
+      "command": "browse",
+      "arguments": [
+        "close"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "reset-profile",
+      "label": "Reset isolated profile",
+      "command": "browse",
+      "arguments": [
+        "reset-profile"
+      ],
+      "destructive": true
+    }
+  ]
+}

@@ -100,6 +100,8 @@ const MarkdownMessage = lazy(() => import("./MarkdownMessage"));
 interface ConversationProps {
   session: SessionSnapshot;
   bootstrap: HostBootstrap;
+  readOnly?: boolean;
+  onReturnToParent?: () => void;
   goal?: GoalState | null;
   onGoalCommand?: (command: GoalCommand) => Promise<string>;
   onSubmit: (
@@ -4564,6 +4566,8 @@ const MemoizedComposer = memo(Composer, (previous, next) => {
 export function Conversation({
   session,
   bootstrap,
+  readOnly = false,
+  onReturnToParent,
   goal,
   onGoalCommand,
   onSubmit,
@@ -4689,6 +4693,7 @@ export function Conversation({
     (model) => model.id === session.modelId,
   );
   const conversationBranching =
+    !readOnly &&
     bootstrap.capabilities.conversationBranching &&
     Boolean(onEditUserTurn && onRetryResponse && onForkConversation);
 
@@ -4885,28 +4890,39 @@ export function Conversation({
           Jump to latest
         </button>
       ) : null}
-      <MemoizedComposer
-        key={session.sessionId}
-        session={session}
-        bootstrap={bootstrap}
-        goal={goal}
-        onGoalCommand={onGoalCommand}
-        onSubmit={onSubmit}
-        onInterrupt={onInterrupt}
-        onConfigure={onConfigure}
-        onIngestAttachment={onIngestAttachment}
-        onIngestDocument={onIngestDocument}
-        onListProjectFiles={onListProjectFiles}
-        onSearchProjectFiles={onSearchProjectFiles}
-        onReadProjectFile={onReadProjectFile}
-        onGetCommandDiscovery={onGetCommandDiscovery}
-        onInvokeSlashCommand={onInvokeSlashCommand}
-        onExportSession={onExportSession}
-        onForkSession={onForkSession}
-        onOpenRuntimeStatus={onOpenRuntimeStatus}
-        attachmentContentUrl={attachmentContentUrl}
-        onPreviewAttachment={previewAttachment}
-      />
+      {readOnly ? (
+        <div className="conversation-read-only" role="status">
+          <span>Read-only delegated session · steer or stop this worker from its parent.</span>
+          {onReturnToParent ? (
+            <button type="button" onClick={onReturnToParent}>
+              Return to parent
+            </button>
+          ) : null}
+        </div>
+      ) : (
+        <MemoizedComposer
+          key={session.sessionId}
+          session={session}
+          bootstrap={bootstrap}
+          goal={goal}
+          onGoalCommand={onGoalCommand}
+          onSubmit={onSubmit}
+          onInterrupt={onInterrupt}
+          onConfigure={onConfigure}
+          onIngestAttachment={onIngestAttachment}
+          onIngestDocument={onIngestDocument}
+          onListProjectFiles={onListProjectFiles}
+          onSearchProjectFiles={onSearchProjectFiles}
+          onReadProjectFile={onReadProjectFile}
+          onGetCommandDiscovery={onGetCommandDiscovery}
+          onInvokeSlashCommand={onInvokeSlashCommand}
+          onExportSession={onExportSession}
+          onForkSession={onForkSession}
+          onOpenRuntimeStatus={onOpenRuntimeStatus}
+          attachmentContentUrl={attachmentContentUrl}
+          onPreviewAttachment={previewAttachment}
+        />
+      )}
       {attachmentPreview ? (
         <AttachmentPreviewDialog
           key={attachmentPreview.source}

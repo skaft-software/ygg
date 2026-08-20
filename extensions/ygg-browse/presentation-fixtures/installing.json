@@ -1,0 +1,77 @@
+{
+  "revision": 2,
+  "status": {
+    "state": "loading",
+    "label": "Browse · installing",
+    "detail": "Pinned browser setup is running in the background."
+  },
+  "activities": [
+    {
+      "id": "browse:setup",
+      "kind": "setup",
+      "state": "running",
+      "summary": "Installing pinned browser runtime",
+      "provenance": "local background installer",
+      "references": []
+    }
+  ],
+  "collection": {
+    "kind": "list",
+    "title": "Browse",
+    "nodes": [
+      {
+        "id": "browse-runtime",
+        "state": "loading",
+        "label": "Browser setup",
+        "secondary": "installing",
+        "action_ids": [],
+        "references": []
+      }
+    ],
+    "selected_node_id": "browse-runtime",
+    "detail": {
+      "node_id": "browse-runtime",
+      "title": "Ygg Browse",
+      "body": "Background setup is in progress.\nInstall log: ~/.ygg/browse/install.log",
+      "references": []
+    }
+  },
+  "actions": [
+    {
+      "id": "setup",
+      "label": "Set up browser",
+      "command": "browse",
+      "arguments": [
+        "setup"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "open",
+      "label": "Open visible browser",
+      "command": "browse",
+      "arguments": [
+        "open"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "close",
+      "label": "Close browser",
+      "command": "browse",
+      "arguments": [
+        "close"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "reset-profile",
+      "label": "Reset isolated profile",
+      "command": "browse",
+      "arguments": [
+        "reset-profile"
+      ],
+      "destructive": true
+    }
+  ]
+}

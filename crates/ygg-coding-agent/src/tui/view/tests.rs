@@ -7987,6 +7987,33 @@ fn theme_header_footer_status_and_composer_padding_have_narrow_fallbacks() {
 }
 
 #[test]
+fn extension_activity_is_bounded_sanitized_and_coexists_with_the_composer() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 20);
+    shell.set_extension_activity(vec![
+        "Subagents  1 running".into(),
+        "├─ inspect-tests  running".into(),
+        "\x1b[31munsafe\nrow".into(),
+        "four".into(),
+        "five".into(),
+        "six".into(),
+        "must be dropped".into(),
+    ]);
+    let chrome = shell_chrome(&shell.state.borrow(), 80, Instant::now());
+    assert_eq!(chrome.activity.len(), 5.min((20_usize / 4).clamp(2, 6)));
+    let visible = chrome
+        .activity
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(visible.contains("Subagents"));
+    assert!(visible.contains("unsafe row"));
+    assert!(!visible.contains("must be dropped"));
+    assert!(!chrome.composer.is_empty());
+}
+
+#[test]
 fn panel_border_layout_degrades_to_unframed_narrow_picker() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(80, 20);

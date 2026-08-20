@@ -51,7 +51,11 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
         None => prompt,
     };
     let display_prompt = prompt.clone();
-    let prompt = match expand_skill_command(app.skills.as_ref(), &prompt) {
+    let prompt = match expand_skill_command(
+        app.skills.as_ref(),
+        &prompt,
+        &app.agent.registered_tool_names(),
+    ) {
         Ok(Some(expanded)) => expanded,
         Ok(None) => prompt,
         Err(error) => {
@@ -196,6 +200,19 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
         .settle_turn(extension_turn, &outcome)
         .await;
     app.agent.set_system_prompt(app.system.clone());
+    if outcome.allows_after_response() && !limit_reached {
+        for notification in app
+            .executable_extensions
+            .after_response(&response_text)
+            .await
+        {
+            crate::output::stderr!("extension: {notification}");
+        }
+    }
+    let presentation = app.executable_extensions.presentation_text();
+    if !presentation.is_empty() {
+        crate::output::stderr!("extension state:\n{presentation}");
+    }
     if outcome.shutdown_requested() {
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(1400),
@@ -205,15 +222,6 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
         ygg_agent::extension_process::force_kill_registered_process_groups();
         output.flush()?;
         return Ok(());
-    }
-    if outcome.allows_after_response() && !limit_reached {
-        for notification in app
-            .executable_extensions
-            .after_response(&response_text)
-            .await
-        {
-            crate::output::stderr!("extension: {notification}");
-        }
     }
     output.flush()?;
     let result = if limit_reached {

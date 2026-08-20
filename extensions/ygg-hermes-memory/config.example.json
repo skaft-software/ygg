@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "contract": {
+    "hermesVersion": "0.20.1",
+    "commit": "7095e23eb2066fe9a2f93b99cdbfe0e2b5ece397"
+  },
+  "environment": {
+    "id": "hermes-0.20.1-local",
+    "python": "/absolute/path/to/hermes-0.20.1/bin/python",
+    "hermesHome": "/absolute/path/to/provider-owned/hermes-home",
+    "providerEnvFile": "/absolute/path/to/provider-owned/hermes-home/.env",
+    "includeEntryPoints": true
+  },
+  "directories": [],
+  "providerMetadata": {
+    "entrypoint:my-provider": {
+      "label": "My provider",
+      "network": "unknown",
+      "storage": "unknown",
+      "setup": "required",
+      "readTools": [],
+      "writeTools": []
+    }
+  },
+  "trustedProviders": {},
+  "defaultProvider": null,
+  "limits": {
+    "maxProviders": 32,
+    "maxTools": 32,
+    "maxQueryBytes": 16384,
+    "maxContextBytes": 32768,
+    "maxToolResultBytes": 32768,
+    "maxOwners": 8,
+    "maxQueueDepth": 16,
+    "availabilityTimeoutMs": 1000,
+    "initializeTimeoutMs": 5000,
+    "prefetchTimeoutMs": 3000,
+    "toolTimeoutMs": 30000,
+    "syncTimeoutMs": 5000,
+    "shutdownTimeoutMs": 1000
+  }
+}

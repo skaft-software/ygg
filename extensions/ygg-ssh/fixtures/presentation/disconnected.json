@@ -1,0 +1,64 @@
+{
+  "actions": [
+    {
+      "arguments": [
+        "connect",
+        "build"
+      ],
+      "command": "ssh",
+      "destructive": false,
+      "id": "connect:build",
+      "label": "Connect"
+    },
+    {
+      "arguments": [
+        "connect",
+        "docs"
+      ],
+      "command": "ssh",
+      "destructive": false,
+      "id": "connect:docs",
+      "label": "Connect"
+    }
+  ],
+  "activities": [],
+  "collection": {
+    "detail": {
+      "body": "Configured alias: build-host\nAuthority: read-write\nRemote cwd: /srv/build\nConfiguration scope: user\nState: disconnected\nConnection generation: none\nAuthentication: existing OpenSSH config/agent/key selection (no credential prompts)\nSafety: remote paths and output are bounded untrusted data; no filesystem sandbox is claimed.",
+      "node_id": "target:build",
+      "references": [],
+      "title": "SSH target \u00b7 Build host"
+    },
+    "kind": "tree",
+    "nodes": [
+      {
+        "action_ids": [
+          "connect:build"
+        ],
+        "id": "target:build",
+        "label": "Build host",
+        "references": [],
+        "secondary": "build-host \u00b7 read-write \u00b7 /srv/build",
+        "state": "empty"
+      },
+      {
+        "action_ids": [
+          "connect:docs"
+        ],
+        "id": "target:docs",
+        "label": "Docs host",
+        "references": [],
+        "secondary": "docs-host \u00b7 read-only \u00b7 /srv/docs",
+        "state": "empty"
+      }
+    ],
+    "selected_node_id": "target:build",
+    "title": "Configured SSH targets"
+  },
+  "revision": 0,
+  "status": {
+    "detail": "Choose an explicit configured target through /ssh connect.",
+    "label": "ssh disconnected \u00b7 2 configured",
+    "state": "stopped"
+  }
+}

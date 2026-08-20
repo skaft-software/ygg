@@ -1,7 +1,11 @@
 #![allow(missing_docs)]
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -14,20 +18,20 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const PACKAGE_ID: &str = "ygg-serve";
+pub(super) const PACKAGE_ID: &str = "ygg-serve";
 const PACKAGE_MANIFEST: &str = "package.toml";
 const INSTALL_RECORD: &str = "install.json";
 const ENTRYPOINT: &str = "bin/ygg-serve-runtime";
 const RELEASE_REPOSITORY: &str = "https://github.com/skaft-software/ygg";
-const MAX_CHECKSUM_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_CHECKSUM_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
-const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+pub(super) const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ENTRYPOINT_BYTES: u64 = 384 * 1024 * 1024;
 const MAX_EXPANDED_ARCHIVE_BYTES: u64 = MAX_ENTRYPOINT_BYTES + MAX_MANIFEST_BYTES;
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum ExtensionCommand {
-    /// Install an official application extension or a local package archive.
+    /// Install an official extension package or a local release archive.
     Install {
         /// Official extension package name.
         #[arg(
@@ -40,11 +44,22 @@ pub enum ExtensionCommand {
         #[arg(long, value_name = "ARCHIVE")]
         path: Option<PathBuf>,
     },
-    /// List installed application extensions.
+    /// List installed extension packages.
     List,
-    /// Reinstall the release compatible with this Ygg version.
-    Update { name: String },
-    /// Remove an installed application extension without deleting its data.
+    /// Install the matching official release or a local replacement atomically.
+    Update {
+        /// Official extension package name.
+        #[arg(
+            value_name = "NAME",
+            required_unless_present = "path",
+            conflicts_with = "path"
+        )]
+        name: Option<String>,
+        /// Update from a local release archive instead of downloading one.
+        #[arg(long, value_name = "ARCHIVE")]
+        path: Option<PathBuf>,
+    },
+    /// Remove an installed package without deleting external data.
     Remove { name: String },
 }
 
@@ -88,7 +103,7 @@ struct InstallRecord<'a> {
     installed_by_ygg: &'a str,
 }
 
-struct PackageLock(File);
+pub(super) struct PackageLock(File);
 
 impl Drop for PackageLock {
     fn drop(&mut self) {
@@ -100,42 +115,119 @@ pub async fn run(command: ExtensionCommand) -> anyhow::Result<()> {
     match command {
         ExtensionCommand::Install { name, path } => {
             let root = extensions_root()?;
-            let manifest = if let Some(path) = path {
-                install_local(&root, &path, false)?
+            if let Some(path) = path {
+                let path = resolve_local_archive_path(&path)?;
+                match classify_local_archive(&path)? {
+                    LocalArchiveKind::Application => {
+                        let manifest = install_local(&root, &path, false)?;
+                        crate::output::stdout_line(format!(
+                            "Installed {} {} for {}.",
+                            manifest.id, manifest.version, manifest.target
+                        ));
+                    }
+                    LocalArchiveKind::ExecutableBundle => {
+                        let manifest = crate::extension_bundle::install_local(&root, &path, false)?;
+                        print_bundle_installed("Installed", &manifest);
+                    }
+                }
             } else {
                 let name = name.expect("clap requires a name unless --path is present");
-                validate_supported_name(&name)?;
-                install_official(&root, false).await?
-            };
-            crate::output::stdout_line(format!(
-                "Installed {} {} for {}.",
-                manifest.id, manifest.version, manifest.target
-            ));
+                if name == PACKAGE_ID {
+                    let manifest = install_official(&root, false).await?;
+                    crate::output::stdout_line(format!(
+                        "Installed {} {} for {}.",
+                        manifest.id, manifest.version, manifest.target
+                    ));
+                } else {
+                    let manifest =
+                        crate::extension_bundle::install_official(&root, &name, false).await?;
+                    print_bundle_installed("Installed", &manifest);
+                }
+            }
             Ok(())
         }
-        ExtensionCommand::List => list_installed(&extensions_root()?),
-        ExtensionCommand::Update { name } => {
-            validate_supported_name(&name)?;
+        ExtensionCommand::List => list_all_installed(&extensions_root()?),
+        ExtensionCommand::Update { name, path } => {
             let root = extensions_root()?;
-            ensure_package_directory(&root).with_context(|| {
-                format!("{PACKAGE_ID} is not installed; run 'ygg extension install {PACKAGE_ID}'")
-            })?;
-            let manifest = install_official(&root, true).await?;
-            crate::output::stdout_line(format!(
-                "Updated {} to {} for {}.",
-                manifest.id, manifest.version, manifest.target
-            ));
+            if let Some(path) = path {
+                let path = resolve_local_archive_path(&path)?;
+                match classify_local_archive(&path)? {
+                    LocalArchiveKind::Application => {
+                        ensure_package_directory(&root).with_context(|| {
+                            format!(
+                                "{PACKAGE_ID} is not installed; run 'ygg extension install --path {}'",
+                                path.display()
+                            )
+                        })?;
+                        let manifest = install_local(&root, &path, true)?;
+                        crate::output::stdout_line(format!(
+                            "Updated {} to {} for {}.",
+                            manifest.id, manifest.version, manifest.target
+                        ));
+                    }
+                    LocalArchiveKind::ExecutableBundle => {
+                        let manifest = crate::extension_bundle::install_local(&root, &path, true)?;
+                        print_bundle_installed("Updated", &manifest);
+                    }
+                }
+            } else {
+                let name = name.expect("clap requires a name unless --path is present");
+                if name == PACKAGE_ID {
+                    ensure_package_directory(&root).with_context(|| {
+                        format!(
+                            "{PACKAGE_ID} is not installed; run 'ygg extension install {PACKAGE_ID}'"
+                        )
+                    })?;
+                    let manifest = install_official(&root, true).await?;
+                    crate::output::stdout_line(format!(
+                        "Updated {} to {} for {}.",
+                        manifest.id, manifest.version, manifest.target
+                    ));
+                } else {
+                    if !crate::extension_bundle::is_official_bundle(&name) {
+                        anyhow::bail!(
+                            "{name:?} has no official update source; use 'ygg extension update --path ARCHIVE'"
+                        );
+                    }
+                    crate::extension_bundle::ensure_installed(&root, &name).with_context(|| {
+                        format!("{name} is not installed; run 'ygg extension install {name}'")
+                    })?;
+                    let manifest =
+                        crate::extension_bundle::install_official(&root, &name, true).await?;
+                    print_bundle_installed("Updated", &manifest);
+                }
+            }
             Ok(())
         }
         ExtensionCommand::Remove { name } => {
-            validate_supported_name(&name)?;
-            remove_installed(&extensions_root()?)?;
-            crate::output::stdout_line(format!(
-                "Removed {PACKAGE_ID}. Serve sessions and other user data were preserved."
-            ));
+            let root = extensions_root()?;
+            if name == PACKAGE_ID {
+                remove_installed(&root)?;
+                crate::output::stdout_line(format!(
+                    "Removed {PACKAGE_ID}. Serve sessions and other user data were preserved."
+                ));
+            } else {
+                crate::extension_bundle::remove_installed(&root, &name)?;
+                crate::output::stdout_line(format!(
+                    "Removed {name}. Configuration and other data outside the bundle were preserved."
+                ));
+            }
             Ok(())
         }
     }
+}
+
+fn print_bundle_installed(
+    action: &str,
+    manifest: &crate::extension_bundle::InstalledBundleManifest,
+) {
+    crate::output::stdout_line(format!(
+        "{action} {} {} (API {}, requires Ygg {}).",
+        manifest.id, manifest.version, manifest.api_version, manifest.requires_ygg
+    ));
+    crate::output::stdout_line(
+        "The extension remains disabled and untrusted until you explicitly enable and trust it.",
+    );
 }
 
 #[allow(dead_code)]
@@ -200,14 +292,142 @@ fn validate_supported_name(name: &str) -> anyhow::Result<()> {
     }
 }
 
-fn extensions_root() -> anyhow::Result<PathBuf> {
+pub(super) fn extensions_root() -> anyhow::Result<PathBuf> {
     let home = dirs::home_dir()
         .filter(|path| path.is_absolute())
         .ok_or_else(|| anyhow::anyhow!("cannot manage extensions: user home is unavailable"))?;
+    let home = home
+        .canonicalize()
+        .with_context(|| format!("cannot resolve user home {}", home.display()))?;
     Ok(home.join(".ygg").join("extensions"))
 }
 
-fn acquire_lock(root: &Path) -> anyhow::Result<PackageLock> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalArchiveKind {
+    Application,
+    ExecutableBundle,
+}
+
+fn resolve_local_archive_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("cannot resolve the current directory")?;
+    resolve_local_archive_path_from(path, &cwd)
+}
+
+fn resolve_local_archive_path_from(path: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
+    let unresolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    unresolved
+        .canonicalize()
+        .with_context(|| format!("cannot resolve package archive {}", path.display()))
+}
+
+fn classify_local_archive(path: &Path) -> anyhow::Result<LocalArchiveKind> {
+    const MAX_CLASSIFICATION_ENTRIES: usize = 4096;
+
+    let file = open_archive_snapshot(path)?;
+    let decoder = GzDecoder::new(BufReader::new(file));
+    let mut archive = tar::Archive::new(decoder);
+    let mut root = None::<String>;
+    let mut application_manifest = false;
+    let mut bundle_manifest = false;
+    let mut entries = 0usize;
+    let mut expanded_bytes = 0u64;
+
+    for entry in archive
+        .entries()
+        .context("cannot read local extension archive")?
+    {
+        entries = entries.saturating_add(1);
+        if entries > MAX_CLASSIFICATION_ENTRIES {
+            anyhow::bail!(
+                "local extension archive exceeds the {MAX_CLASSIFICATION_ENTRIES}-entry limit"
+            );
+        }
+        let entry = entry.context("cannot read local extension archive entry")?;
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_dir() && !entry_type.is_file() {
+            anyhow::bail!("local extension archive contains a link or special entry");
+        }
+        let size = entry.header().size()?;
+        expanded_bytes = expanded_bytes
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("local extension archive size overflow"))?;
+        if expanded_bytes > MAX_ARCHIVE_BYTES {
+            anyhow::bail!(
+                "local extension archive expands beyond the {MAX_ARCHIVE_BYTES}-byte classification limit"
+            );
+        }
+
+        let path = entry
+            .path()
+            .context("local extension archive contains an invalid path")?
+            .into_owned();
+        let components = path.components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components.len() > 64
+            || components
+                .iter()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            anyhow::bail!(
+                "local extension archive path is not portable: {}",
+                path.display()
+            );
+        }
+        let archive_root = match components[0] {
+            Component::Normal(value) => value
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("local extension archive root is not UTF-8"))?
+                .to_owned(),
+            _ => unreachable!("non-normal components were rejected"),
+        };
+        match &root {
+            Some(expected) if expected != &archive_root => {
+                anyhow::bail!("local extension archive contains multiple root directories")
+            }
+            None => root = Some(archive_root),
+            _ => {}
+        }
+        if components.len() != 2 || !entry_type.is_file() {
+            continue;
+        }
+        let Component::Normal(name) = components[1] else {
+            unreachable!("non-normal components were rejected")
+        };
+        if name == PACKAGE_MANIFEST {
+            if application_manifest {
+                anyhow::bail!("local extension archive contains duplicate {PACKAGE_MANIFEST}");
+            }
+            application_manifest = true;
+        } else if name == crate::extension_bundle::BUNDLE_MANIFEST {
+            if bundle_manifest {
+                anyhow::bail!(
+                    "local extension archive contains duplicate {}",
+                    crate::extension_bundle::BUNDLE_MANIFEST
+                );
+            }
+            bundle_manifest = true;
+        }
+    }
+
+    match (application_manifest, bundle_manifest) {
+        (true, false) => Ok(LocalArchiveKind::Application),
+        (false, true) => Ok(LocalArchiveKind::ExecutableBundle),
+        (true, true) => anyhow::bail!(
+            "local extension archive cannot contain both {PACKAGE_MANIFEST} and {}",
+            crate::extension_bundle::BUNDLE_MANIFEST
+        ),
+        (false, false) => anyhow::bail!(
+            "local extension archive must contain either {PACKAGE_MANIFEST} or {}",
+            crate::extension_bundle::BUNDLE_MANIFEST
+        ),
+    }
+}
+
+pub(super) fn acquire_lock(root: &Path) -> anyhow::Result<PackageLock> {
     fs::create_dir_all(root)
         .with_context(|| format!("cannot create extension directory {}", root.display()))?;
     let path = root.join(".package.lock");
@@ -317,15 +537,16 @@ fn install_archive(
     validate_entrypoint(&entrypoint, &manifest.entrypoint.sha256)?;
     write_install_record(staging.path(), &manifest, source, archive_sha256)?;
 
-    publish_staging(root, staging.path(), &destination, replace)?;
+    publish_staging(root, staging.path(), &destination, replace, PACKAGE_ID)?;
     Ok(manifest)
 }
 
-fn publish_staging(
+pub(super) fn publish_staging(
     root: &Path,
     staging: &Path,
     destination: &Path,
     replace: bool,
+    _package_id: &str,
 ) -> anyhow::Result<()> {
     if !replace {
         fs::rename(staging, destination).with_context(|| {
@@ -339,38 +560,71 @@ fn publish_staging(
         return Ok(());
     }
 
-    let backup = root.join(format!(
-        ".{PACKAGE_ID}.previous-{}-{}",
-        std::process::id(),
-        unique_suffix()
-    ));
-    fs::rename(destination, &backup).with_context(|| {
+    atomic_exchange_directories(staging, destination).with_context(|| {
         format!(
-            "cannot stage installed extension {} for replacement",
+            "cannot atomically publish extension update from {} to {}; previous install remains active",
+            staging.display(),
             destination.display()
         )
     })?;
-    if let Err(error) = fs::rename(staging, destination) {
-        let restore = fs::rename(&backup, destination);
-        return match restore {
-            Ok(()) => Err(error).context("cannot publish extension update; previous install restored"),
-            Err(restore_error) => anyhow::bail!(
-                "cannot publish extension update ({error}); cannot restore previous install ({restore_error}); previous files remain at {}",
-                backup.display()
-            ),
-        };
-    }
     sync_directory(root);
-    if let Err(error) = fs::remove_dir_all(&backup) {
+    if let Err(error) = fs::remove_dir_all(staging) {
         crate::output::stderr_line(format!(
             "warning: extension updated, but previous package cleanup failed at {}: {error}",
-            backup.display()
+            staging.display()
         ));
     }
     Ok(())
 }
 
-fn open_archive_snapshot(path: &Path) -> anyhow::Result<File> {
+#[cfg(target_os = "macos")]
+fn atomic_exchange_directories(left: &Path, right: &Path) -> io::Result<()> {
+    let left = CString::new(left.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let right = CString::new(right.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    // SAFETY: both C strings live through the call and point to NUL-terminated paths.
+    let result = unsafe { libc::renamex_np(left.as_ptr(), right.as_ptr(), libc::RENAME_SWAP) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_exchange_directories(left: &Path, right: &Path) -> io::Result<()> {
+    let left = CString::new(left.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let right = CString::new(right.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    // SAFETY: both C strings live through the call and renameat2 reads only those paths.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn atomic_exchange_directories(_left: &Path, _right: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic directory exchange is unavailable on this platform",
+    ))
+}
+
+pub(super) fn open_archive_snapshot(path: &Path) -> anyhow::Result<File> {
     let file = ygg_agent::secure_fs::open_regular_file_for_read(path)
         .with_context(|| format!("cannot open package archive {}", path.display()))?;
     let metadata = file.metadata()?;
@@ -383,7 +637,7 @@ fn open_archive_snapshot(path: &Path) -> anyhow::Result<File> {
     Ok(file)
 }
 
-fn sha256_open_file_bounded(file: &mut File, maximum: u64) -> anyhow::Result<String> {
+pub(super) fn sha256_open_file_bounded(file: &mut File, maximum: u64) -> anyhow::Result<String> {
     file.rewind()?;
     let mut hasher = Sha256::new();
     let copied = io::copy(&mut Read::by_ref(file).take(maximum + 1), &mut hasher)?;
@@ -607,6 +861,19 @@ pub(crate) fn installed_version() -> Option<Version> {
     Version::parse(&manifest.version).ok()
 }
 
+/// Managed executable bundles that can be refreshed from the official catalog.
+pub(crate) fn installed_official_bundle_ids() -> Vec<String> {
+    let Ok(root) = extensions_root() else {
+        return Vec::new();
+    };
+    crate::extension_bundle::list_installed(&root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|bundle| crate::extension_bundle::is_official_bundle(&bundle.id))
+        .map(|bundle| bundle.id)
+        .collect()
+}
+
 fn load_manifest(path: &Path) -> anyhow::Result<PackageManifest> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("cannot inspect package manifest {}", path.display()))?;
@@ -801,25 +1068,47 @@ fn write_install_record(
         .with_context(|| format!("cannot create install record {}", path.display()))?;
     file.write_all(&encoded)?;
     file.sync_all()?;
+    sync_directory(package);
     Ok(())
 }
 
-fn list_installed(root: &Path) -> anyhow::Result<()> {
+fn list_all_installed(root: &Path) -> anyhow::Result<()> {
+    let mut rows = Vec::<(String, String, String, String, String, String)>::new();
     match load_installed(root) {
-        Ok(manifest) => {
-            crate::output::stdout_table_line("ID\tVERSION\tTARGET");
-            crate::output::stdout_table_line(format!(
-                "{}\t{}\t{}",
-                manifest.id, manifest.version, manifest.target
-            ));
-            Ok(())
-        }
-        Err(error) if error_chain_has_io_kind(&error, io::ErrorKind::NotFound) => {
-            crate::output::stdout_line("No application extensions installed.");
-            Ok(())
-        }
-        Err(error) => Err(error),
+        Ok(manifest) => rows.push((
+            manifest.id,
+            manifest.version,
+            "application".to_owned(),
+            "-".to_owned(),
+            manifest.requires_ygg,
+            manifest.target,
+        )),
+        Err(error) if error_chain_has_io_kind(&error, io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error),
     }
+    for bundle in crate::extension_bundle::list_installed(root)? {
+        rows.push((
+            bundle.id,
+            bundle.version,
+            "executable".to_owned(),
+            bundle.api_version,
+            bundle.requires_ygg,
+            "any".to_owned(),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+
+    if rows.is_empty() {
+        crate::output::stdout_line("No extension packages installed.");
+        return Ok(());
+    }
+    crate::output::stdout_table_line("ID\tVERSION\tKIND\tAPI\tYGG\tTARGET");
+    for (id, version, kind, api, ygg, target) in rows {
+        crate::output::stdout_table_line(format!(
+            "{id}\t{version}\t{kind}\t{api}\t{ygg}\t{target}"
+        ));
+    }
+    Ok(())
 }
 
 fn remove_installed(root: &Path) -> anyhow::Result<()> {
@@ -866,7 +1155,7 @@ fn target_triple() -> anyhow::Result<&'static str> {
     }
 }
 
-async fn download_bytes(url: &str, maximum: usize) -> anyhow::Result<Vec<u8>> {
+pub(super) async fn download_bytes(url: &str, maximum: usize) -> anyhow::Result<Vec<u8>> {
     let response = send_download(url).await?;
     if response
         .content_length()
@@ -886,7 +1175,7 @@ async fn download_bytes(url: &str, maximum: usize) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn download_file(url: &str, path: &Path, maximum: u64) -> anyhow::Result<String> {
+pub(super) async fn download_file(url: &str, path: &Path, maximum: u64) -> anyhow::Result<String> {
     let response = send_download(url).await?;
     if response
         .content_length()
@@ -958,7 +1247,7 @@ async fn send_download(url: &str) -> anyhow::Result<reqwest::Response> {
         .with_context(|| format!("release download failed: {url}"))
 }
 
-fn checksum_for_asset(checksums: &str, asset: &str) -> anyhow::Result<String> {
+pub(super) fn checksum_for_asset(checksums: &str, asset: &str) -> anyhow::Result<String> {
     let mut found = None;
     for line in checksums.lines().filter(|line| !line.trim().is_empty()) {
         let fields = line.split_whitespace().collect::<Vec<_>>();
@@ -979,7 +1268,7 @@ fn checksum_for_asset(checksums: &str, asset: &str) -> anyhow::Result<String> {
     found.ok_or_else(|| anyhow::anyhow!("SHA256SUMS does not contain {asset}"))
 }
 
-fn validate_sha256(digest: &str) -> anyhow::Result<()> {
+pub(super) fn validate_sha256(digest: &str) -> anyhow::Result<()> {
     if digest.len() == 64
         && digest
             .bytes()
@@ -1019,7 +1308,7 @@ fn sha256_file_bounded(path: &Path, maximum: u64) -> anyhow::Result<String> {
     Ok(digest_hex(hasher.finalize().as_slice()))
 }
 
-fn digest_hex(bytes: &[u8]) -> String {
+pub(super) fn digest_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1029,14 +1318,14 @@ fn digest_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn unique_suffix() -> u128 {
+pub(super) fn unique_suffix() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
 }
 
-fn sync_directory(path: &Path) {
+pub(super) fn sync_directory(path: &Path) {
     if let Ok(directory) = File::open(path) {
         let _ = directory.sync_all();
     }
@@ -1142,6 +1431,51 @@ mod tests {
                 &reqwest::Url::parse(rejected).unwrap()
             ));
         }
+    }
+
+    #[test]
+    fn local_archive_classifier_keeps_application_and_bundle_formats_distinct() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = create_package(directory.path(), b"runtime");
+        assert_eq!(
+            resolve_local_archive_path_from(Path::new("package.tar.gz"), directory.path()).unwrap(),
+            application.canonicalize().unwrap()
+        );
+        #[cfg(unix)]
+        {
+            let linked_parent = directory.path().join("linked-parent");
+            std::os::unix::fs::symlink(directory.path(), &linked_parent).unwrap();
+            assert_eq!(
+                resolve_local_archive_path_from(
+                    &linked_parent.join("package.tar.gz"),
+                    directory.path()
+                )
+                .unwrap(),
+                application.canonicalize().unwrap()
+            );
+        }
+        assert_eq!(
+            classify_local_archive(&application).unwrap(),
+            LocalArchiveKind::Application
+        );
+
+        let bundle = directory.path().join("bundle.tar.gz");
+        let encoder = GzEncoder::new(File::create(&bundle).unwrap(), Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        append_directory(&mut archive, "example");
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(0);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "example/extension.toml", std::io::empty())
+            .unwrap();
+        let encoder = archive.into_inner().unwrap();
+        encoder.finish().unwrap();
+        assert_eq!(
+            classify_local_archive(&bundle).unwrap(),
+            LocalArchiveKind::ExecutableBundle
+        );
     }
 
     #[test]

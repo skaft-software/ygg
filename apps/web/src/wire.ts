@@ -14,6 +14,9 @@ import type {
   ContextUsage,
   CompletionReview,
   DocumentReference,
+  ExtensionPresentation,
+  ExtensionPresentationDetail,
+  ExtensionPresentationState,
   GoalState,
   HostBootstrap,
   HostEvent,
@@ -2732,12 +2735,420 @@ function projectBranchGraph(
   return { head, entries, truncated };
 }
 
+const extensionPresentationStates = [
+  "empty",
+  "loading",
+  "pending",
+  "active",
+  "running",
+  "succeeded",
+  "failed",
+  "cancelled",
+  "degraded",
+  "stopped",
+  "unavailable",
+] as const;
+
+function projectExtensionPresentationState(
+  value: unknown,
+  path: string,
+): ExtensionPresentationState {
+  return enumeration(value, path, extensionPresentationStates);
+}
+
+function projectExtensionReference(value: unknown, path: string) {
+  const reference = object(value, path, ["kind", "id", "label"]);
+  const kind = enumeration(reference.kind, `${path}.kind`, [
+    "session",
+    "artifact",
+    "resource",
+    "url",
+  ] as const);
+  const id = boundedString(reference.id, `${path}.id`, 1_024);
+  if (kind === "url") {
+    let url: URL;
+    try {
+      url = new URL(id);
+    } catch {
+      throw new WireContractError(`${path}.id`, "must be an absolute URL");
+    }
+    const host = url.hostname.toLowerCase().replace(/\.$/u, "");
+    const addressHost = host.startsWith("[") && host.endsWith("]")
+      ? host.slice(1, -1)
+      : host;
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      /^(?:127\.|10\.|192\.168\.|169\.254\.)/u.test(addressHost) ||
+      /^172\.(?:1[6-9]|2\d|3[01])\./u.test(addressHost) ||
+      addressHost === "::1" ||
+      addressHost.startsWith("fc") ||
+      addressHost.startsWith("fd") ||
+      addressHost.startsWith("fe80:")
+    ) {
+      throw new WireContractError(`${path}.id`, "must be a public HTTP(S) URL");
+    }
+  }
+  return {
+    kind,
+    id,
+    label:
+      reference.label === undefined
+        ? undefined
+        : boundedString(reference.label, `${path}.label`, 1_024),
+  };
+}
+
+function projectExtensionReferences(value: unknown, path: string) {
+  const references = array(value ?? [], path);
+  if (references.length > 8) {
+    throw new WireContractError(path, "has more than 8 references");
+  }
+  return references.map((reference, index) =>
+    projectExtensionReference(reference, `${path}[${index}]`),
+  );
+}
+
+function projectExtensionPresentation(
+  value: unknown,
+  path: string,
+): ExtensionPresentation {
+  const presentation = object(value, path, [
+    "extension",
+    "extensionInstanceId",
+    "generation",
+    "resourceOwner",
+    "snapshot",
+  ]);
+  const snapshotPath = `${path}.snapshot`;
+  const snapshot = object(presentation.snapshot, snapshotPath, [
+    "revision",
+    "status",
+    "activities",
+    "collection",
+    "actions",
+  ]);
+  const rawActivities = array(
+    snapshot.activities ?? [],
+    `${snapshotPath}.activities`,
+  );
+  if (rawActivities.length > 128) {
+    throw new WireContractError(
+      `${snapshotPath}.activities`,
+      "has more than 128 items",
+    );
+  }
+  const activities = rawActivities.map((value, index) => {
+    const activityPath = `${snapshotPath}.activities[${index}]`;
+    const activity = object(value, activityPath, [
+      "id",
+      "kind",
+      "state",
+      "summary",
+      "provenance",
+      "started_at_ms",
+      "completed_at_ms",
+      "references",
+    ]);
+    return {
+      id: boundedString(activity.id, `${activityPath}.id`, 1_024),
+      kind: boundedString(activity.kind, `${activityPath}.kind`, 1_024),
+      state: projectExtensionPresentationState(
+        activity.state,
+        `${activityPath}.state`,
+      ),
+      summary: boundedString(
+        activity.summary,
+        `${activityPath}.summary`,
+        1_024,
+      ),
+      provenance:
+        activity.provenance === undefined
+          ? undefined
+          : boundedString(
+              activity.provenance,
+              `${activityPath}.provenance`,
+              1_024,
+            ),
+      startedAtMs:
+        activity.started_at_ms === undefined
+          ? undefined
+          : number(activity.started_at_ms, `${activityPath}.started_at_ms`),
+      completedAtMs:
+        activity.completed_at_ms === undefined
+          ? undefined
+          : number(activity.completed_at_ms, `${activityPath}.completed_at_ms`),
+      references: projectExtensionReferences(
+        activity.references,
+        `${activityPath}.references`,
+      ),
+    };
+  });
+
+  const rawActions = array(snapshot.actions ?? [], `${snapshotPath}.actions`);
+  if (rawActions.length > 64) {
+    throw new WireContractError(
+      `${snapshotPath}.actions`,
+      "has more than 64 items",
+    );
+  }
+  const actions = rawActions.map((value, index) => {
+    const actionPath = `${snapshotPath}.actions[${index}]`;
+    const action = object(value, actionPath, [
+      "id",
+      "label",
+      "command",
+      "arguments",
+      "destructive",
+    ]);
+    const args = array(action.arguments ?? [], `${actionPath}.arguments`);
+    if (args.length > 32) {
+      throw new WireContractError(
+        `${actionPath}.arguments`,
+        "has more than 32 items",
+      );
+    }
+    return {
+      id: boundedString(action.id, `${actionPath}.id`, 1_024),
+      label: boundedString(action.label, `${actionPath}.label`, 1_024),
+      command: boundedString(action.command, `${actionPath}.command`, 1_024),
+      arguments: args.map((argument, argumentIndex) =>
+        boundedString(
+          argument,
+          `${actionPath}.arguments[${argumentIndex}]`,
+          1_024,
+          true,
+        ),
+      ),
+      destructive: boolean(
+        action.destructive ?? false,
+        `${actionPath}.destructive`,
+      ),
+    };
+  });
+  const actionIds = new Set(actions.map((action) => action.id));
+  if (actionIds.size !== actions.length) {
+    throw new WireContractError(
+      `${snapshotPath}.actions`,
+      "contains duplicate IDs",
+    );
+  }
+
+  let collection: ExtensionPresentation["snapshot"]["collection"];
+  if (snapshot.collection !== undefined) {
+    const collectionPath = `${snapshotPath}.collection`;
+    const rawCollection = object(snapshot.collection, collectionPath, [
+      "kind",
+      "title",
+      "nodes",
+      "selected_node_id",
+      "detail",
+    ]);
+    const rawNodes = array(
+      rawCollection.nodes ?? [],
+      `${collectionPath}.nodes`,
+    );
+    if (rawNodes.length > 256) {
+      throw new WireContractError(
+        `${collectionPath}.nodes`,
+        "has more than 256 items",
+      );
+    }
+    const nodes = rawNodes.map((value, index) => {
+      const nodePath = `${collectionPath}.nodes[${index}]`;
+      const node = object(value, nodePath, [
+        "id",
+        "parent_id",
+        "state",
+        "label",
+        "secondary",
+        "action_ids",
+        "references",
+      ]);
+      const actionIdsForNode = array(
+        node.action_ids ?? [],
+        `${nodePath}.action_ids`,
+      ).map((actionId, actionIndex) =>
+        boundedString(
+          actionId,
+          `${nodePath}.action_ids[${actionIndex}]`,
+          1_024,
+        ),
+      );
+      if (actionIdsForNode.some((actionId) => !actionIds.has(actionId))) {
+        throw new WireContractError(
+          `${nodePath}.action_ids`,
+          "references an unknown action",
+        );
+      }
+      return {
+        id: boundedString(node.id, `${nodePath}.id`, 1_024),
+        parentId:
+          node.parent_id === undefined
+            ? undefined
+            : boundedString(node.parent_id, `${nodePath}.parent_id`, 1_024),
+        state: projectExtensionPresentationState(
+          node.state,
+          `${nodePath}.state`,
+        ),
+        label: boundedString(node.label, `${nodePath}.label`, 1_024),
+        secondary:
+          node.secondary === undefined
+            ? undefined
+            : boundedString(node.secondary, `${nodePath}.secondary`, 1_024),
+        actionIds: actionIdsForNode,
+        references: projectExtensionReferences(
+          node.references,
+          `${nodePath}.references`,
+        ),
+      };
+    });
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    if (nodeIds.size !== nodes.length) {
+      throw new WireContractError(
+        `${collectionPath}.nodes`,
+        "contains duplicate IDs",
+      );
+    }
+    for (const node of nodes) {
+      if (node.parentId !== undefined && !nodeIds.has(node.parentId)) {
+        throw new WireContractError(
+          `${collectionPath}.nodes`,
+          "contains a missing parent",
+        );
+      }
+    }
+    const selectedNodeId =
+      rawCollection.selected_node_id === undefined
+        ? undefined
+        : boundedString(
+            rawCollection.selected_node_id,
+            `${collectionPath}.selected_node_id`,
+            1_024,
+          );
+    if (selectedNodeId !== undefined && !nodeIds.has(selectedNodeId)) {
+      throw new WireContractError(
+        `${collectionPath}.selected_node_id`,
+        "references a missing node",
+      );
+    }
+    let detail: ExtensionPresentationDetail | undefined;
+    if (rawCollection.detail !== undefined) {
+      const detailPath = `${collectionPath}.detail`;
+      const rawDetail = object(rawCollection.detail, detailPath, [
+        "node_id",
+        "title",
+        "body",
+        "references",
+      ]);
+      detail = {
+        nodeId:
+          rawDetail.node_id === undefined
+            ? undefined
+            : boundedString(rawDetail.node_id, `${detailPath}.node_id`, 1_024),
+        title: boundedString(rawDetail.title, `${detailPath}.title`, 1_024),
+        body: boundedString(rawDetail.body, `${detailPath}.body`, 65_536),
+        references: projectExtensionReferences(
+          rawDetail.references,
+          `${detailPath}.references`,
+        ),
+      };
+      if (detail.nodeId !== undefined && detail.nodeId !== selectedNodeId) {
+        throw new WireContractError(
+          `${detailPath}.node_id`,
+          "must describe the selected node",
+        );
+      }
+    }
+    collection = {
+      kind: enumeration(rawCollection.kind, `${collectionPath}.kind`, [
+        "list",
+        "tree",
+      ] as const),
+      title: boundedString(
+        rawCollection.title,
+        `${collectionPath}.title`,
+        1_024,
+      ),
+      nodes,
+      selectedNodeId,
+      detail,
+    };
+  }
+
+  let status: ExtensionPresentation["snapshot"]["status"];
+  if (snapshot.status !== undefined) {
+    const statusPath = `${snapshotPath}.status`;
+    const rawStatus = object(snapshot.status, statusPath, [
+      "state",
+      "label",
+      "detail",
+    ]);
+    status = {
+      state: projectExtensionPresentationState(
+        rawStatus.state,
+        `${statusPath}.state`,
+      ),
+      label: boundedString(rawStatus.label, `${statusPath}.label`, 1_024),
+      detail:
+        rawStatus.detail === undefined
+          ? undefined
+          : boundedString(rawStatus.detail, `${statusPath}.detail`, 1_024),
+    };
+  }
+  return {
+    extension: boundedString(presentation.extension, `${path}.extension`, 128),
+    extensionInstanceId: boundedString(
+      presentation.extensionInstanceId,
+      `${path}.extensionInstanceId`,
+      128,
+    ),
+    generation: number(presentation.generation, `${path}.generation`),
+    resourceOwner:
+      presentation.resourceOwner === undefined
+        ? undefined
+        : boundedString(
+            presentation.resourceOwner,
+            `${path}.resourceOwner`,
+            256,
+          ),
+    snapshot: {
+      revision: number(snapshot.revision, `${snapshotPath}.revision`),
+      status,
+      activities,
+      collection,
+      actions,
+    },
+  };
+}
+
+function projectExtensionPresentations(value: unknown, path: string) {
+  const presentations = array(value ?? [], path);
+  if (presentations.length > 32) {
+    throw new WireContractError(path, "has more than 32 extensions");
+  }
+  const projected = presentations.map((presentation, index) =>
+    projectExtensionPresentation(presentation, `${path}[${index}]`),
+  );
+  if (
+    new Set(projected.map((entry) => entry.extension)).size !== projected.length
+  ) {
+    throw new WireContractError(path, "contains duplicate extension names");
+  }
+  return projected;
+}
+
 export function projectSessionSnapshot(
   value: unknown,
   context: SnapshotContext = {},
 ): SessionSnapshot {
   const snapshot = object(value, "sessionSnapshot", [
     "sessionId",
+    "delegatedParentSessionId",
     "actorGeneration",
     "cursor",
     "durableHead",
@@ -2748,11 +3159,22 @@ export function projectSessionSnapshot(
     "authority",
     "context",
     "items",
+    "extensionPresentations",
     "pendingRequests",
     "sources",
     "artifacts",
   ]);
   const sessionId = string(snapshot.sessionId, "sessionSnapshot.sessionId");
+  const delegatedParentSessionId = optionalString(
+    snapshot.delegatedParentSessionId,
+    "sessionSnapshot.delegatedParentSessionId",
+  );
+  if (delegatedParentSessionId === sessionId) {
+    throw new WireContractError(
+      "sessionSnapshot.delegatedParentSessionId",
+      "must identify a different source parent",
+    );
+  }
   const actorGeneration = number(
     snapshot.actorGeneration,
     "sessionSnapshot.actorGeneration",
@@ -2838,6 +3260,10 @@ export function projectSessionSnapshot(
     const projected = projectItem(item, path, { timestampMs });
     if (projected) items.push(projected);
   });
+  const extensionPresentations = projectExtensionPresentations(
+    snapshot.extensionPresentations,
+    "sessionSnapshot.extensionPresentations",
+  );
   const requests = array(
     snapshot.pendingRequests ?? [],
     "sessionSnapshot.pendingRequests",
@@ -2851,6 +3277,23 @@ export function projectSessionSnapshot(
     )
     .filter((item): item is TranscriptItem => item !== null);
   const title = context.summary?.title ?? "Session";
+  const status = projectStatus(
+    snapshot.liveState,
+    "sessionSnapshot.liveState",
+  );
+  const authority = projectAuthority(
+    snapshot.authority,
+    "sessionSnapshot.authority",
+  );
+  if (
+    delegatedParentSessionId !== undefined &&
+    (snapshot.liveState !== "locked" || authority !== "readOnly")
+  ) {
+    throw new WireContractError(
+      "sessionSnapshot.delegatedParentSessionId",
+      "is valid only for a locked read-only delegated inspector",
+    );
+  }
 
   const itemSources = rawItems.flatMap((item, index) => {
     const wireItem = object(item, `sessionSnapshot.items[${index}]`);
@@ -2927,28 +3370,24 @@ export function projectSessionSnapshot(
 
   return {
     sessionId,
+    delegatedParentSessionId,
     actorGeneration,
     sequence: number(cursor.sequence, "sessionSnapshot.cursor.sequence"),
     title,
-    status: projectStatus(
-      snapshot.liveState,
-      "sessionSnapshot.liveState",
-    ),
+    status,
     activeRunId,
     projectId:
       context.summary?.projectId ?? context.projectIdFallback ?? "",
     modelId: model.model,
     reasoning: model.reasoning,
-    authority: projectAuthority(
-      snapshot.authority,
-      "sessionSnapshot.authority",
-    ),
+    authority,
     context: contextUsage,
     contextTokens,
     contextPercent: contextPercent(contextUsage.usage),
     startedAt: context.summary?.updatedAt ?? iso(timestampMs),
     branches,
     items: [...items, ...requests],
+    extensionPresentations,
     progress,
     sources,
     outputs,
@@ -3938,6 +4377,19 @@ export function projectEventEnvelope(
         },
       };
     }
+    case "extension.presentationsChanged": {
+      const data = object(event.data, "event.event.data", ["presentations"]);
+      return {
+        type: "extension.presentationsChanged",
+        sessionId,
+        actorGeneration,
+        sequence,
+        presentations: projectExtensionPresentations(
+          data.presentations,
+          "event.event.data.presentations",
+        ),
+      };
+    }
     case "session.metadataChanged": {
       const data = object(event.data, "event.event.data", [
         "title",
@@ -4709,6 +5161,46 @@ export function encodeClientCommand(
       {
         type: "session.invokeSlashCommand",
         data: { invocation: { invocation } },
+      },
+      context,
+    );
+  }
+  if (command.type === "extension.invokeAction") {
+    for (const [field, value] of [
+      ["extension", command.extension],
+      ["extensionInstanceId", command.extensionInstanceId],
+      ["action", command.action],
+    ] as const) {
+      if (!value || value.length > 128 || /\s/u.test(value)) {
+        throw new UnsupportedWireCommandError(
+          command.type,
+          `${field} must be a bounded whitespace-free identifier`,
+        );
+      }
+    }
+    if (
+      !Number.isSafeInteger(command.generation) ||
+      command.generation <= 0 ||
+      !Number.isSafeInteger(command.revision) ||
+      command.revision < 0
+    ) {
+      throw new UnsupportedWireCommandError(
+        command.type,
+        "generation and revision must identify the displayed presentation",
+      );
+    }
+    return sessionEnvelope(
+      command,
+      {
+        type: "extension.invokeAction",
+        data: {
+          extension: command.extension,
+          extensionInstanceId: command.extensionInstanceId,
+          generation: command.generation,
+          revision: command.revision,
+          action: command.action,
+          confirmed: command.confirmed,
+        },
       },
       context,
     );

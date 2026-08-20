@@ -393,6 +393,11 @@ async fn run_update(
             ));
         }
     }
+    for extension in crate::extension_package::installed_official_bundle_ids() {
+        crate::output::stdout_line(format!(
+            "Run `ygg extension update {extension}` to install the bundle matching Ygg {latest}."
+        ));
+    }
     Ok(())
 }
 

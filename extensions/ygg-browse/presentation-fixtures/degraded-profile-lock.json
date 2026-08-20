@@ -1,0 +1,80 @@
+{
+  "revision": 8,
+  "status": {
+    "state": "degraded",
+    "label": "Browse · degraded",
+    "detail": "Another Ygg Browse process owns the isolated profile."
+  },
+  "activities": [
+    {
+      "id": "browse:launch",
+      "kind": "browser",
+      "state": "failed",
+      "summary": "Visible isolated browser launch failed",
+      "provenance": "visible isolated browser",
+      "references": []
+    }
+  ],
+  "collection": {
+    "kind": "list",
+    "title": "Browse",
+    "nodes": [
+      {
+        "id": "browse-runtime",
+        "state": "degraded",
+        "label": "Browser setup",
+        "secondary": "profile lock unavailable",
+        "action_ids": [
+          "open",
+          "reset-profile"
+        ],
+        "references": []
+      }
+    ],
+    "selected_node_id": "browse-runtime",
+    "detail": {
+      "node_id": "browse-runtime",
+      "title": "Ygg Browse",
+      "body": "Launch was refused because exclusive profile ownership could not be acquired.",
+      "references": []
+    }
+  },
+  "actions": [
+    {
+      "id": "setup",
+      "label": "Set up browser",
+      "command": "browse",
+      "arguments": [
+        "setup"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "open",
+      "label": "Open visible browser",
+      "command": "browse",
+      "arguments": [
+        "open"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "close",
+      "label": "Close browser",
+      "command": "browse",
+      "arguments": [
+        "close"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "reset-profile",
+      "label": "Reset isolated profile",
+      "command": "browse",
+      "arguments": [
+        "reset-profile"
+      ],
+      "destructive": true
+    }
+  ]
+}

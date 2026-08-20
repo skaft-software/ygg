@@ -1807,6 +1807,7 @@ mod tests {
                 },
                 snapshot: crate::SessionSnapshot {
                     session_id: id,
+                    delegated_parent_session_id: None,
                     actor_generation: 1,
                     cursor: SessionCursor::zero(1),
                     durable_head: None,
@@ -1817,6 +1818,7 @@ mod tests {
                     authority: request.authority,
                     context: ContextUsage::default(),
                     items: Vec::new(),
+                    extension_presentations: Vec::new(),
                     pending_requests: Vec::new(),
                     sources: Vec::new(),
                     artifacts: Vec::new(),

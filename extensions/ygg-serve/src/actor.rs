@@ -368,9 +368,14 @@ impl SessionActorCore {
         }
         let slash_invocation =
             matches!(&command.command, SessionCommand::InvokeSlashCommand { .. });
+        let extension_action = matches!(
+            &command.command,
+            SessionCommand::InvokeExtensionAction { .. }
+        );
         if matches!(
             command.command,
             SessionCommand::InvokeSlashCommand { .. }
+                | SessionCommand::InvokeExtensionAction { .. }
                 | SessionCommand::Checkout { .. }
                 | SessionCommand::EditUserTurn { .. }
                 | SessionCommand::RetryResponse { .. }
@@ -389,10 +394,58 @@ impl SessionActorCore {
                 ErrorCode::InvalidBoundary,
                 if slash_invocation {
                     "A slash command can only run after current work finishes."
+                } else if extension_action {
+                    "An extension action can only run after current work finishes."
                 } else {
                     "A session branch can only be checked out after current work finishes."
                 },
             ));
+        }
+        if let SessionCommand::InvokeExtensionAction {
+            extension,
+            extension_instance_id,
+            generation,
+            revision,
+            action,
+            confirmed,
+        } = &command.command
+        {
+            let available = self
+                .view
+                .snapshot
+                .extension_presentations
+                .iter()
+                .find(|presentation| {
+                    &presentation.extension == extension
+                        && &presentation.extension_instance_id == extension_instance_id
+                        && presentation.generation == *generation
+                        && presentation.snapshot.revision == *revision
+                })
+                .and_then(|presentation| {
+                    presentation
+                        .snapshot
+                        .actions
+                        .iter()
+                        .find(|candidate| &candidate.id == action)
+                });
+            let Some(action) = available else {
+                return Err(SanitizedError::public(
+                    ErrorCode::InvalidBoundary,
+                    "That extension action is unavailable or stale.",
+                ));
+            };
+            if *confirmed && !action.destructive {
+                return Err(SanitizedError::public(
+                    ErrorCode::InvalidBoundary,
+                    "A non-destructive extension action cannot carry approval.",
+                ));
+            }
+            if action.destructive && !*confirmed {
+                return Err(SanitizedError::public(
+                    ErrorCode::Unauthorized,
+                    "That extension action requires an interactive approval boundary.",
+                ));
+            }
         }
         if let SessionCommand::Checkout { entry_id } = &command.command {
             let checkoutable = self
@@ -731,6 +784,9 @@ fn reduce_snapshot(snapshot: &mut SessionSnapshot, event: &EventPayload) -> Resu
         EventPayload::SessionSettingsChanged { model, authority } => {
             snapshot.model = model.clone();
             snapshot.authority = *authority;
+        }
+        EventPayload::ExtensionPresentationsChanged { presentations } => {
+            snapshot.extension_presentations = presentations.clone();
         }
         EventPayload::SessionMetadataChanged { .. }
         | EventPayload::SessionPullRequestChanged { .. }
@@ -1194,6 +1250,7 @@ mod tests {
             },
             snapshot: SessionSnapshot {
                 session_id: id,
+                delegated_parent_session_id: None,
                 actor_generation: 1,
                 cursor: SessionCursor::zero(1),
                 durable_head: None,
@@ -1204,6 +1261,7 @@ mod tests {
                 authority: AuthorityProfile::FullAccess,
                 context: ContextUsage::default(),
                 items: Vec::new(),
+                extension_presentations: Vec::new(),
                 pending_requests: Vec::new(),
                 sources: Vec::new(),
                 artifacts: Vec::new(),
@@ -1841,6 +1899,88 @@ mod tests {
         core.view.summary.live_state = SessionLiveState::Idle;
         core.view.snapshot.live_state = SessionLiveState::Idle;
         core.preflight_command(&command()).unwrap();
+    }
+
+    #[test]
+    fn extension_actions_require_current_state_and_exact_destructive_confirmation() {
+        let mut seed = checkout_seed();
+        seed.snapshot.extension_presentations = vec![crate::ExtensionPresentation {
+            extension: "fixture-extension".into(),
+            generation: 2,
+            extension_instance_id: "instance-a".into(),
+            resource_owner: Some("owner-1".into()),
+            snapshot: serde_json::from_str(include_str!(
+                "../../../crates/ygg-coding-agent/fixtures/extension-presentation.json"
+            ))
+            .unwrap(),
+        }];
+        let core = SessionActorCore::new(
+            HostId::new("host-test").unwrap(),
+            seed,
+            ActorConfig::default(),
+        )
+        .unwrap();
+        let command = |confirmed| {
+            SessionCommandEnvelope::new(
+                HostId::new("host-test").unwrap(),
+                DeviceId::new("device-test").unwrap(),
+                SessionId::new("session-actor").unwrap(),
+                CommandId::new(if confirmed {
+                    "command-extension-confirmed"
+                } else {
+                    "command-extension-unconfirmed"
+                })
+                .unwrap(),
+                1,
+                Some(1),
+                SessionCommand::InvokeExtensionAction {
+                    extension: "fixture-extension".into(),
+                    extension_instance_id: "instance-a".into(),
+                    generation: 2,
+                    revision: 4,
+                    action: "stop".into(),
+                    confirmed,
+                },
+            )
+        };
+
+        assert_eq!(
+            core.preflight_command(&command(false)).unwrap_err().code,
+            ErrorCode::Unauthorized
+        );
+        core.preflight_command(&command(true)).unwrap();
+
+        let mut stale = command(true);
+        if let SessionCommand::InvokeExtensionAction { action, .. } = &mut stale.command {
+            *action = "missing".into();
+        }
+        assert_eq!(
+            core.preflight_command(&stale).unwrap_err().code,
+            ErrorCode::InvalidBoundary
+        );
+
+        let mut stale_revision = command(true);
+        if let SessionCommand::InvokeExtensionAction { revision, .. } = &mut stale_revision.command
+        {
+            *revision = 3;
+        }
+        assert_eq!(
+            core.preflight_command(&stale_revision).unwrap_err().code,
+            ErrorCode::InvalidBoundary
+        );
+
+        let mut stale_instance = command(true);
+        if let SessionCommand::InvokeExtensionAction {
+            extension_instance_id,
+            ..
+        } = &mut stale_instance.command
+        {
+            *extension_instance_id = "instance-replaced".into();
+        }
+        assert_eq!(
+            core.preflight_command(&stale_instance).unwrap_err().code,
+            ErrorCode::InvalidBoundary
+        );
     }
 
     #[test]

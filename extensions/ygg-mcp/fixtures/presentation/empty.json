@@ -1,0 +1,15 @@
+{
+  "actions": [],
+  "activities": [],
+  "collection": {
+    "kind": "tree",
+    "nodes": [],
+    "title": "MCP servers"
+  },
+  "revision": 1,
+  "status": {
+    "detail": "0 of 0 configured MCP servers connected; 0 tools published",
+    "label": "mcp 0/0 \u00b7 0 tools",
+    "state": "empty"
+  }
+}

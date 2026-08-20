@@ -19,13 +19,16 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify, Semaphore};
 use ygg_ai::{Media, ToolDef};
 
 use crate::artifact::{ArtifactId, ArtifactPublication, ArtifactSource, ArtifactStore};
-use crate::delegation::ExtensionDelegationService;
+use crate::delegation::{
+    ExtensionAgentSessionPolicy, ExtensionDelegationService, ExtensionDelegationSpawnRequest,
+};
 use crate::effect::ToolEffect;
 use crate::events::AgentEvent;
 use crate::extension::{
@@ -34,6 +37,7 @@ use crate::extension::{
 use crate::extension_policy::{
     ExtensionActionIntent, ExtensionApprovalStore, ExtensionApprovalToken, ExtensionPolicyDecision,
 };
+use crate::extension_presentation::ExtensionPresentationSnapshot;
 use crate::extension_secret::{ExtensionSecretBroker, ExtensionSecretRequest};
 use crate::tool::{
     CancellationToken, OutputStream, ReplaySafety, Tool, ToolContext, ToolError, ToolOutput,
@@ -84,6 +88,11 @@ const API_0_2_OPTIONAL_FEATURES: &[&str] = &[
 
 const MAX_EXTENSION_AGENT_WAIT_MS: u64 = 60_000;
 const MAX_EXTENSION_SECRET_NAME_BYTES: usize = 64;
+const BROKERED_EXTENSION_ENVIRONMENT: &[&str] = &["SSH_AUTH_SOCK"];
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 /// The manifest filename inside every extension directory.
 pub const EXTENSION_MANIFEST_FILENAME: &str = "extension.toml";
@@ -129,6 +138,7 @@ pub const MAX_EXTENSION_RESULT_CONTENT_PARTS: usize = 256;
 pub const MAX_EXTENSION_RESULT_MEDIA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SCHEMA_VALIDATION_STEPS: usize = 65_536;
 const EXTENSION_EVENT_CAPACITY: usize = 128;
+const MAX_PRESENTATION_UPDATES_PER_SECOND: usize = 32;
 // Retain every answered confirmation that can still be buffered for another
 // event subscriber. Once this many newer confirmations have been answered, an
 // older event has necessarily fallen outside the broadcast channel's window.
@@ -166,6 +176,24 @@ pub fn sanitized_subprocess_environment() -> BTreeMap<std::ffi::OsString, std::f
     ALLOWED
         .iter()
         .filter_map(|name| std::env::var_os(name).map(|value| ((*name).into(), value)))
+        .collect()
+}
+
+fn brokered_extension_environment(
+    names: &[String],
+) -> BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    names
+        .iter()
+        .filter(|name| BROKERED_EXTENSION_ENVIRONMENT.contains(&name.as_str()))
+        .filter_map(|name| {
+            std::env::var_os(name).and_then(|value| {
+                if value.is_empty() {
+                    None
+                } else {
+                    Some((std::ffi::OsString::from(name), value))
+                }
+            })
+        })
         .collect()
 }
 
@@ -1072,6 +1100,13 @@ pub struct ExtensionManifest {
     pub version: String,
     /// Ygg extension API required by the extension.
     pub api_version: String,
+    /// Optional Ygg version requirement carried by installable bundles.
+    ///
+    /// Locally authored, unpackaged extensions may omit this field. When it is
+    /// present, discovery rejects a manifest that does not match this Ygg
+    /// binary; the bundle installer applies the stricter exact-version rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_ygg: Option<String>,
     /// Optional human-readable summary.
     #[serde(default)]
     pub description: Option<String>,
@@ -1161,6 +1196,28 @@ impl ExtensionManifest {
                 host: format!("{EXTENSION_API_VERSION_0_1} or {EXTENSION_API_VERSION_0_2}"),
             });
         }
+        if let Some(requires_ygg) = &self.requires_ygg {
+            let requirement = semver::VersionReq::parse(requires_ygg).map_err(|error| {
+                ExtensionRuntimeError::InvalidManifest(format!(
+                    "requires_ygg `{requires_ygg}` is not a semantic version requirement: {error}"
+                ))
+            })?;
+            let host = semver::Version::parse(env!("CARGO_PKG_VERSION")).map_err(|error| {
+                ExtensionRuntimeError::InvalidManifest(format!(
+                    "host version is not semantic versioning: {error}"
+                ))
+            })?;
+            if !requirement.matches(&host) {
+                return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                    "extension requires Ygg `{requires_ygg}`, but this binary is {host}"
+                )));
+            }
+        }
+        if self.api_version == EXTENSION_API_VERSION_0_1 && self.contributes.presentation {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "semantic presentation requires extension API 0.2".into(),
+            ));
+        }
         if self.entrypoint.command.trim().is_empty()
             || self.entrypoint.command.chars().any(char::is_control)
         {
@@ -1186,6 +1243,25 @@ impl ExtensionManifest {
         validate_identifiers("command", &self.contributes.commands, true)?;
         validate_identifiers("tool renderer", &self.contributes.tool_renderers, true)?;
         validate_identifiers("secret", &self.capabilities.secrets, true)?;
+        validate_identifiers(
+            "brokered environment variable",
+            &self.capabilities.environment,
+            true,
+        )?;
+        for name in &self.capabilities.environment {
+            if !BROKERED_EXTENSION_ENVIRONMENT.contains(&name.as_str()) {
+                return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                    "unsupported brokered environment variable `{name}`"
+                )));
+            }
+        }
+        if self.api_version == EXTENSION_API_VERSION_0_1
+            && !self.capabilities.environment.is_empty()
+        {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "brokered environment variables require extension API 0.2".into(),
+            ));
+        }
         validate_unique("hook", &self.contributes.hooks)?;
         validate_unique("UI contribution", &self.contributes.ui)?;
         Ok(())
@@ -1224,6 +1300,10 @@ pub struct ExtensionCapabilities {
     /// host broker. An empty list disables secret negotiation for the process.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// Narrow ambient variables explicitly brokered from the host environment.
+    /// Only host-reviewed non-value names such as `SSH_AUTH_SOCK` are accepted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment: Vec<String>,
 }
 
 /// Filesystem access declared by an extension.
@@ -1267,6 +1347,9 @@ pub struct ManifestContributions {
     /// Whether the process may request interactive confirmation.
     #[serde(default)]
     pub confirmations: bool,
+    /// Whether API `0.2` semantic presentation snapshots may arrive.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub presentation: bool,
 }
 
 /// Supported extension lifecycle hooks.
@@ -1642,6 +1725,43 @@ pub struct ToolCatalogUpdateResponse {
     pub tools: Vec<String>,
 }
 
+/// Host-enforced policy for one bounded extension-owned child session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionPolicy {
+    /// Requested upper-bound tool allowlist. V1 accepts only `read`/`search`.
+    pub tools: Vec<String>,
+    /// Maximum absolute delegation depth. V1 requires one.
+    pub max_depth: usize,
+    /// Maximum active children for this principal/owner. V1 caps this at two.
+    pub max_concurrent_children: usize,
+    /// Maximum model turns in the child run.
+    pub max_turns: u64,
+    /// Maximum cumulative provider-reported tokens.
+    pub max_tokens: u64,
+    /// Maximum cumulative priced session cost.
+    pub max_cost_microdollars: u64,
+    /// Maximum UTF-8 bytes returned as the child summary.
+    pub max_output_bytes: usize,
+    /// Absolute wall duration from successful spawn admission.
+    pub timeout_ms: u64,
+}
+
+impl From<AgentSessionPolicy> for ExtensionAgentSessionPolicy {
+    fn from(policy: AgentSessionPolicy) -> Self {
+        Self {
+            tools: policy.tools,
+            max_depth: policy.max_depth,
+            max_concurrent_children: policy.max_concurrent_children,
+            max_turns: policy.max_turns,
+            max_tokens: policy.max_tokens,
+            max_cost_microdollars: policy.max_cost_microdollars,
+            max_output_bytes: policy.max_output_bytes,
+            timeout_ms: policy.timeout_ms,
+        }
+    }
+}
+
 /// API `0.2` request to create an isolated child model session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1650,10 +1770,20 @@ pub struct AgentSessionSpawnRequest {
     pub parent_request_id: u64,
     /// Unique task label under the calling owner.
     pub task_name: String,
+    /// Optional bounded presentation profile retained by the host for restart
+    /// recovery. It never changes child authority or policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Optional extension-calculated canonical request fingerprint retained for
+    /// idempotent recovery. The host treats it only as bounded opaque metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
     /// Initial task delivered to the child model session.
     pub message: String,
     /// Retry key scoped to this extension and resource owner.
     pub idempotency_key: String,
+    /// Complete host-enforced child execution policy.
+    pub policy: AgentSessionPolicy,
 }
 
 /// API `0.2` request carrying a child-session target and message.
@@ -1729,6 +1859,8 @@ pub struct ExtensionContributions {
     pub notifications: bool,
     /// Whether confirmation requests may arrive from the process.
     pub confirmations: bool,
+    /// Whether semantic presentation snapshots may arrive from the process.
+    pub presentation: bool,
 }
 
 /// Session and model facts exposed to an extension through typed requests.
@@ -1764,7 +1896,7 @@ pub struct ExtensionActiveSkill {
 }
 
 /// Ambient metadata supplied with commands, hooks, tools, and contributions.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionResourceOwner {
     /// Durable host-derived session identity. Extensions must treat this as
@@ -2387,6 +2519,16 @@ struct ExtensionSecretGetRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PresentationUpdateRequest {
+    snapshot: ExtensionPresentationSnapshot,
+    #[serde(default)]
+    parent_request_id: Option<u64>,
+    #[serde(default)]
+    resource_owner: Option<ExtensionResourceOwner>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArtifactPublishRequest {
     parent_request_id: u64,
     mime_type: String,
@@ -2511,6 +2653,15 @@ pub enum ExtensionEvent {
     StatusContributed {
         /// Status/header/footer content.
         contribution: ExtensionStatusContribution,
+    },
+    /// Frontend-neutral semantic state for activity and detail inspectors.
+    PresentationUpdated {
+        /// Process generation that owns the complete snapshot.
+        generation: u64,
+        /// Host-derived resource owner, or process scope when absent.
+        resource_owner: Option<ExtensionResourceOwner>,
+        /// Monotonic extension-owned state snapshot.
+        snapshot: ExtensionPresentationSnapshot,
     },
     /// Bounded stderr or protocol diagnostic.
     Diagnostic {
@@ -2764,6 +2915,8 @@ pub mod methods {
     pub const CONTEXT_CONTRIBUTION: &str = "context/contribution";
     /// Extension-to-host unsolicited semantic UI contribution.
     pub const STATUS_CONTRIBUTION: &str = "status/contribution";
+    /// Extension-to-host complete frontend-neutral presentation snapshot.
+    pub const PRESENTATION_UPDATE: &str = "presentation/update";
     /// Extension-to-host structured policy intent.
     pub const POLICY_EVALUATE: &str = "policy/evaluate";
     /// Extension-to-host ephemeral input request.
@@ -3215,11 +3368,13 @@ impl ExtensionProcess {
         let (catalog_updates, catalog_update_rx) = mpsc::channel(DYNAMIC_CATALOG_QUEUE_CAPACITY);
         let delegation_service = Arc::new(StdRwLock::new(None));
         let generation = 1;
+        let instance_id = new_extension_instance_id();
         let (connection, contributions) = spawn_connection(
             &descriptor,
             &config,
             config.host_state.clone(),
             generation,
+            &instance_id,
             events.clone(),
             artifact_store.clone(),
             catalog_updates.clone(),
@@ -3239,7 +3394,7 @@ impl ExtensionProcess {
                 answered_confirmations: StdMutex::new(AnsweredConfirmations::default()),
                 generation: AtomicU64::new(generation),
                 next_generation: AtomicU64::new(generation.saturating_add(1)),
-                instance_id: new_extension_instance_id(),
+                instance_id,
                 generation_changed: Arc::new(Notify::new()),
                 reload_guard: Mutex::new(()),
                 supervisor_cancelled: AtomicBool::new(false),
@@ -3263,6 +3418,12 @@ impl ExtensionProcess {
     /// Returns the discovered manifest and activation metadata.
     pub fn descriptor(&self) -> &DiscoveredExtension {
         &self.inner.descriptor
+    }
+
+    /// Returns the host-created process-instance fence. Unlike process
+    /// generation, this identity does not repeat across complete host rebuilds.
+    pub fn extension_instance_id(&self) -> &str {
+        &self.inner.instance_id
     }
 
     /// Returns the contributions negotiated during initialization.
@@ -3313,12 +3474,17 @@ impl ExtensionProcess {
         Ok(())
     }
 
-    pub(crate) fn agent_session_principal(&self) -> String {
-        format!(
-            "{}@{}",
-            self.inner.descriptor.manifest.name,
-            self.inner.descriptor.manifest_path.display()
-        )
+    /// Returns the stable path-free principal used to isolate host-owned child
+    /// sessions across supervised process restarts.
+    pub fn agent_session_principal(&self) -> String {
+        let manifest_identity = self
+            .inner
+            .descriptor
+            .manifest_path
+            .canonicalize()
+            .unwrap_or_else(|_| self.inner.descriptor.manifest_path.clone());
+        let digest = Sha256::digest(manifest_identity.to_string_lossy().as_bytes());
+        format!("{}@sha256:{digest:x}", self.inner.descriptor.manifest.name)
     }
 
     /// Returns an inspectable bounded health snapshot for the active process.
@@ -3361,6 +3527,26 @@ impl ExtensionProcess {
     /// context, status, and renderer calls.
     pub fn current_context(&self) -> ExtensionExecutionContext {
         self.execution_context()
+    }
+
+    /// Builds a session-owned API `0.2` context for product boundaries such as
+    /// commands, prompt hooks, and context collection. The host supplies only
+    /// the durable owner key; this method attaches the unforgeable instance and
+    /// active process-generation fences. Frozen API `0.1` remains ownerless.
+    pub fn current_context_for_resource_owner(
+        &self,
+        session_id: impl Into<String>,
+    ) -> ExtensionExecutionContext {
+        let mut context = self.execution_context();
+        if self.api_version() == EXTENSION_API_VERSION_0_2 {
+            let generation = read_std_lock(&self.inner.connection).generation;
+            context.resource_owner = Some(ExtensionResourceOwner {
+                session_id: session_id.into(),
+                extension_instance_id: self.inner.instance_id.clone(),
+                process_generation: generation,
+            });
+        }
+        context
     }
 
     /// Invokes a manifest-declared model tool.
@@ -3492,16 +3678,50 @@ impl ExtensionProcess {
         {
             return Err(self.undeclared("command", name));
         }
-        self.request_typed_controlled(
-            methods::COMMAND_EXECUTE,
-            &CommandRequest {
-                name,
-                arguments,
-                context,
-            },
-            request_started,
-        )
-        .await
+        let connection = read_std_lock(&self.inner.connection).clone();
+        let mut context = context;
+        context.resource_owner = context.resource_owner.map(|owner| ExtensionResourceOwner {
+            session_id: owner.session_id,
+            extension_instance_id: self.inner.instance_id.clone(),
+            process_generation: connection.generation,
+        });
+        let resource_owner = context.resource_owner.clone();
+        let params = serde_json::to_value(CommandRequest {
+            name,
+            arguments,
+            context,
+        })
+        .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+        let result = match request_started {
+            Some(request_started) => {
+                connection
+                    .request_with_operation(
+                        methods::COMMAND_EXECUTE,
+                        params,
+                        self.inner.config.request_timeout,
+                        resource_owner,
+                        request_started,
+                    )
+                    .await?
+            }
+            None => {
+                connection
+                    .request_with_resource_owner(
+                        methods::COMMAND_EXECUTE,
+                        params,
+                        self.inner.config.request_timeout,
+                        resource_owner,
+                    )
+                    .await?
+            }
+        };
+        serde_json::from_value(result).map_err(|error| {
+            ExtensionRuntimeError::Protocol(format!(
+                "invalid `{}` response from `{}`: {error}",
+                methods::COMMAND_EXECUTE,
+                self.inner.descriptor.manifest.name
+            ))
+        })
     }
 
     /// Runs a manifest-declared lifecycle hook. Product code decides where an
@@ -3515,13 +3735,23 @@ impl ExtensionProcess {
         if !self.inner.contributions.hooks.contains(&hook) {
             return Err(self.undeclared("hook", format!("{hook:?}").to_ascii_lowercase()));
         }
-        self.request_typed(
+        let connection = read_std_lock(&self.inner.connection).clone();
+        let mut context = context;
+        context.resource_owner = context.resource_owner.map(|owner| ExtensionResourceOwner {
+            session_id: owner.session_id,
+            extension_instance_id: self.inner.instance_id.clone(),
+            process_generation: connection.generation,
+        });
+        let resource_owner = context.resource_owner.clone();
+        self.request_typed_on_connection(
+            connection,
             methods::HOOK_RUN,
             &HookRequest {
                 hook,
                 payload,
                 context,
             },
+            resource_owner,
         )
         .await
     }
@@ -3535,9 +3765,19 @@ impl ExtensionProcess {
         if !self.inner.contributions.context {
             return Err(self.undeclared("context contribution", "context".into()));
         }
-        self.request_typed(
+        let connection = read_std_lock(&self.inner.connection).clone();
+        let mut context = context;
+        context.resource_owner = context.resource_owner.map(|owner| ExtensionResourceOwner {
+            session_id: owner.session_id,
+            extension_instance_id: self.inner.instance_id.clone(),
+            process_generation: connection.generation,
+        });
+        let resource_owner = context.resource_owner.clone();
+        self.request_typed_on_connection(
+            connection,
             methods::CONTEXT_COLLECT,
             &ContextRequest { prompt, context },
+            resource_owner,
         )
         .await
     }
@@ -3551,14 +3791,27 @@ impl ExtensionProcess {
         if !self.inner.contributions.ui.contains(&surface) {
             return Err(self.undeclared("UI surface", format!("{surface:?}").to_ascii_lowercase()));
         }
-        self.request_typed(methods::STATUS_COLLECT, &StatusRequest { surface, context })
-            .await
+        let connection = read_std_lock(&self.inner.connection).clone();
+        let mut context = context;
+        context.resource_owner = context.resource_owner.map(|owner| ExtensionResourceOwner {
+            session_id: owner.session_id,
+            extension_instance_id: self.inner.instance_id.clone(),
+            process_generation: connection.generation,
+        });
+        let resource_owner = context.resource_owner.clone();
+        self.request_typed_on_connection(
+            connection,
+            methods::STATUS_COLLECT,
+            &StatusRequest { surface, context },
+            resource_owner,
+        )
+        .await
     }
 
     /// Asks an extension to semantically render a declared tool lifecycle.
     pub async fn render_tool(
         &self,
-        request: ToolRenderRequest,
+        mut request: ToolRenderRequest,
     ) -> Result<RenderedToolCall, ExtensionRuntimeError> {
         if !self
             .inner
@@ -3569,7 +3822,19 @@ impl ExtensionProcess {
         {
             return Err(self.undeclared("tool renderer", request.name));
         }
-        self.request_typed(methods::TOOL_RENDER, &request).await
+        let connection = read_std_lock(&self.inner.connection).clone();
+        request.context.resource_owner =
+            request
+                .context
+                .resource_owner
+                .map(|owner| ExtensionResourceOwner {
+                    session_id: owner.session_id,
+                    extension_instance_id: self.inner.instance_id.clone(),
+                    process_generation: connection.generation,
+                });
+        let resource_owner = request.context.resource_owner.clone();
+        self.request_typed_on_connection(connection, methods::TOOL_RENDER, &request, resource_owner)
+            .await
     }
 
     /// Answers a process-originated confirmation request. Requests from a
@@ -4003,6 +4268,7 @@ impl ExtensionProcess {
             &self.inner.config,
             host_state,
             generation,
+            &self.inner.instance_id,
             candidate_events,
             self.inner.artifact_store.clone(),
             self.inner.catalog_updates.clone(),
@@ -4327,23 +4593,12 @@ impl ExtensionProcess {
         }
     }
 
-    async fn request_typed<P, R>(
+    async fn request_typed_on_connection<P, R>(
         &self,
+        connection: Arc<ProcessConnection>,
         method: &'static str,
         params: &P,
-    ) -> Result<R, ExtensionRuntimeError>
-    where
-        P: Serialize + ?Sized,
-        R: DeserializeOwned,
-    {
-        self.request_typed_controlled(method, params, None).await
-    }
-
-    async fn request_typed_controlled<P, R>(
-        &self,
-        method: &'static str,
-        params: &P,
-        request_started: Option<oneshot::Sender<ExtensionOperationToken>>,
+        resource_owner: Option<ExtensionResourceOwner>,
     ) -> Result<R, ExtensionRuntimeError>
     where
         P: Serialize + ?Sized,
@@ -4351,24 +4606,14 @@ impl ExtensionProcess {
     {
         let params = serde_json::to_value(params)
             .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
-        let connection = read_std_lock(&self.inner.connection).clone();
-        let result = match request_started {
-            Some(request_started) => {
-                connection
-                    .request_with_operation(
-                        method,
-                        params,
-                        self.inner.config.request_timeout,
-                        request_started,
-                    )
-                    .await?
-            }
-            None => {
-                connection
-                    .request(method, params, self.inner.config.request_timeout)
-                    .await?
-            }
-        };
+        let result = connection
+            .request_with_resource_owner(
+                method,
+                params,
+                self.inner.config.request_timeout,
+                resource_owner,
+            )
+            .await?;
         serde_json::from_value(result).map_err(|error| {
             ExtensionRuntimeError::Protocol(format!(
                 "invalid `{method}` response from `{}`: {error}",
@@ -5118,6 +5363,7 @@ impl Tool for ProcessTool {
                     Ok(ExtensionEvent::StatusContributed { contribution }) => {
                         ctx.progress.status(contribution.text);
                     }
+                    Ok(ExtensionEvent::PresentationUpdated { .. }) => {}
                     Ok(ExtensionEvent::ContextContributed { .. }) => {}
                     Ok(ExtensionEvent::PolicyEvaluationRequested {
                         ..
@@ -5200,6 +5446,7 @@ struct ProcessConnection {
     writer: mpsc::Sender<WriterFrame>,
     child: Arc<Mutex<Child>>,
     pending: PendingRequests,
+    issued_resource_owners: IssuedResourceOwners,
     pending_changed: Arc<Notify>,
     child_requests: ChildRequests,
     next_id: AtomicU64,
@@ -5262,6 +5509,7 @@ struct PendingRequest {
 }
 
 type PendingRequests = Arc<StdMutex<HashMap<u64, PendingRequest>>>;
+type IssuedResourceOwners = Arc<StdMutex<HashSet<ExtensionResourceOwner>>>;
 const CHILD_ACTIVE: u8 = 0;
 const CHILD_RESPONDING: u8 = 1;
 const CHILD_SETTLED: u8 = 2;
@@ -5662,6 +5910,7 @@ impl ProcessConnection {
         method: &str,
         params: serde_json::Value,
         timeout: Duration,
+        resource_owner: Option<ExtensionResourceOwner>,
         request_started: oneshot::Sender<ExtensionOperationToken>,
     ) -> Result<serde_json::Value, ExtensionRuntimeError> {
         self.request_inner(
@@ -5672,7 +5921,7 @@ impl ProcessConnection {
             true,
             None,
             None,
-            None,
+            resource_owner,
             Some(request_started),
         )
         .await
@@ -5772,6 +6021,9 @@ impl ProcessConnection {
             let terminal = Arc::new(AtomicU8::new(REQUEST_ACTIVE));
             let frame_state = Arc::new(AtomicU8::new(FRAME_QUEUED));
             let cancellation_sent = Arc::new(AtomicBool::new(false));
+            if let Some(owner) = &resource_owner {
+                lock_std_mutex(&connection.issued_resource_owners).insert(owner.clone());
+            }
             lock_std_mutex(&connection.pending).insert(
                 id,
                 PendingRequest {
@@ -6286,6 +6538,7 @@ async fn spawn_connection(
     config: &ExtensionRuntimeConfig,
     host_state: ExtensionHostState,
     generation: u64,
+    instance_id: &str,
     events: broadcast::Sender<ExtensionEvent>,
     artifact_store: ArtifactStore,
     catalog_updates: mpsc::Sender<CatalogUpdateRequest>,
@@ -6329,6 +6582,9 @@ async fn spawn_connection(
         .env_clear()
         .envs(sanitized_subprocess_environment())
         .envs(&descriptor.manifest.entrypoint.env)
+        .envs(brokered_extension_environment(
+            &descriptor.manifest.capabilities.environment,
+        ))
         .env(
             "YGG_EXTENSION_API_VERSION",
             &descriptor.manifest.api_version,
@@ -6374,6 +6630,7 @@ async fn spawn_connection(
     let child = Arc::new(Mutex::new(child));
 
     let pending = Arc::new(StdMutex::new(HashMap::new()));
+    let issued_resource_owners = Arc::new(StdMutex::new(HashSet::new()));
     let pending_changed = Arc::new(Notify::new());
     let child_requests = Arc::new(StdMutex::new(HashMap::new()));
     let child_work_slots = Arc::new(Semaphore::new(MAX_CHILD_WORKERS));
@@ -6406,14 +6663,23 @@ async fn spawn_connection(
         Arc::clone(&child),
         termination,
     ));
+    let (presentation_updates, presentation_update_rx) = watch::channel(None);
+    tokio::spawn(dispatch_presentation_updates(
+        presentation_update_rx,
+        events.clone(),
+        generation,
+    ));
     tokio::spawn(read_protocol_stdout(
         stdout,
         Arc::clone(&pending),
+        Arc::clone(&issued_resource_owners),
         Arc::clone(&pending_changed),
         Arc::clone(&closed),
         Arc::clone(&draining),
         events.clone(),
+        presentation_updates,
         generation,
+        instance_id.to_owned(),
         config.max_message_bytes,
         descriptor.manifest.contributes.clone(),
         writer.clone(),
@@ -6458,6 +6724,7 @@ async fn spawn_connection(
         writer,
         child,
         pending,
+        issued_resource_owners,
         pending_changed,
         child_requests,
         next_id: AtomicU64::new(1),
@@ -6860,6 +7127,7 @@ fn negotiate_contributions_with_host_services(
             tool_renderers: manifest.contributes.tool_renderers.clone(),
             notifications: manifest.contributes.notifications,
             confirmations: manifest.contributes.confirmations,
+            presentation: manifest.contributes.presentation,
         },
         protocol,
     ))
@@ -7607,13 +7875,117 @@ fn require_artifact_feature(
     }
 }
 
+struct PresentationUpdateRate {
+    window_started: Instant,
+    accepted: usize,
+    warned: bool,
+}
+
+impl Default for PresentationUpdateRate {
+    fn default() -> Self {
+        Self {
+            window_started: Instant::now(),
+            accepted: 0,
+            warned: false,
+        }
+    }
+}
+
+impl PresentationUpdateRate {
+    fn admit(&mut self) -> (bool, bool) {
+        if self.window_started.elapsed() >= Duration::from_secs(1) {
+            *self = Self::default();
+        }
+        if self.accepted < MAX_PRESENTATION_UPDATES_PER_SECOND {
+            self.accepted += 1;
+            return (true, false);
+        }
+        let first_rejection = !self.warned;
+        self.warned = true;
+        (false, first_rejection)
+    }
+}
+
+type PresentationDispatch = (
+    u64,
+    Option<ExtensionResourceOwner>,
+    ExtensionPresentationSnapshot,
+);
+
+async fn dispatch_presentation_updates(
+    mut updates: watch::Receiver<Option<PresentationDispatch>>,
+    events: broadcast::Sender<ExtensionEvent>,
+    generation: u64,
+) {
+    let mut emitted_sequence = 0_u64;
+    let mut window_started = tokio::time::Instant::now();
+    let mut accepted = 0_usize;
+    let mut warned = false;
+    loop {
+        if updates.changed().await.is_err() {
+            return;
+        }
+        loop {
+            let latest = updates.borrow_and_update().clone();
+            let Some((sequence, resource_owner, snapshot)) = latest else {
+                break;
+            };
+            if sequence <= emitted_sequence {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if now.duration_since(window_started) >= Duration::from_secs(1) {
+                window_started = now;
+                accepted = 0;
+                warned = false;
+            }
+            if accepted < MAX_PRESENTATION_UPDATES_PER_SECOND {
+                accepted += 1;
+                emitted_sequence = sequence;
+                let _ = events.send(ExtensionEvent::PresentationUpdated {
+                    generation,
+                    resource_owner,
+                    snapshot,
+                });
+                break;
+            }
+            if !warned {
+                warned = true;
+                let _ = events.send(ExtensionEvent::Diagnostic {
+                    message: format!(
+                        "semantic presentation update rate exceeded {MAX_PRESENTATION_UPDATES_PER_SECOND}/s; coalescing to the latest complete snapshot"
+                    ),
+                });
+            }
+            let deadline = window_started + Duration::from_secs(1);
+            tokio::select! {
+                changed = updates.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    window_started = tokio::time::Instant::now();
+                    accepted = 0;
+                    warned = false;
+                }
+            }
+        }
+    }
+}
+
 struct ProtocolReadState {
     pending: PendingRequests,
+    issued_resource_owners: IssuedResourceOwners,
     pending_changed: Arc<Notify>,
     closed: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     events: broadcast::Sender<ExtensionEvent>,
+    presentation_rate: StdMutex<PresentationUpdateRate>,
+    presentation_updates: Option<watch::Sender<Option<PresentationDispatch>>>,
+    presentation_sequence: AtomicU64,
     generation: u64,
+    instance_id: String,
     max_message_bytes: usize,
     declared: ManifestContributions,
     writer: mpsc::Sender<WriterFrame>,
@@ -7638,8 +8010,11 @@ struct ProtocolReadState {
 enum AgentSessionOperation {
     Spawn {
         task_name: String,
+        profile: Option<String>,
+        fingerprint: Option<String>,
         message: String,
         idempotency_key: String,
+        policy: ExtensionAgentSessionPolicy,
     },
     Message {
         target: String,
@@ -7667,9 +8042,22 @@ async fn execute_agent_session_operation(
     match operation {
         AgentSessionOperation::Spawn {
             task_name,
+            profile,
+            fingerprint,
             message,
             idempotency_key,
-        } => service.spawn(&resource_owner, task_name, message, idempotency_key),
+            policy,
+        } => service.spawn(
+            &resource_owner,
+            ExtensionDelegationSpawnRequest {
+                task_name,
+                profile,
+                fingerprint,
+                message,
+                idempotency_key,
+                policy,
+            },
+        ),
         AgentSessionOperation::Message { target, message } => {
             service
                 .send_message(&resource_owner, &target, message)
@@ -7958,11 +8346,14 @@ fn queue_secret_lookup(
 async fn read_protocol_stdout<R>(
     mut stdout: R,
     pending: PendingRequests,
+    issued_resource_owners: IssuedResourceOwners,
     pending_changed: Arc<Notify>,
     closed: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     events: broadcast::Sender<ExtensionEvent>,
+    presentation_updates: watch::Sender<Option<PresentationDispatch>>,
     generation: u64,
+    instance_id: String,
     max_message_bytes: usize,
     declared: ManifestContributions,
     writer: mpsc::Sender<WriterFrame>,
@@ -7988,11 +8379,16 @@ async fn read_protocol_stdout<R>(
 {
     let state = ProtocolReadState {
         pending,
+        issued_resource_owners,
         pending_changed,
         closed,
         draining,
         events,
+        presentation_rate: StdMutex::new(PresentationUpdateRate::default()),
+        presentation_updates: Some(presentation_updates),
+        presentation_sequence: AtomicU64::new(0),
         generation,
+        instance_id,
         max_message_bytes,
         declared,
         writer,
@@ -8089,6 +8485,41 @@ async fn read_protocol_stdout<R>(
         if let (Some(child), Some(termination)) = (state.child, state.termination) {
             reap_failed_extension(child, termination).await;
         }
+    }
+}
+
+fn presentation_update_owner(
+    state: &ProtocolReadState,
+    request: &PresentationUpdateRequest,
+) -> Result<Option<ExtensionResourceOwner>, String> {
+    match (&request.parent_request_id, &request.resource_owner) {
+        (Some(_), Some(_)) => {
+            Err("presentation update cannot combine parent_request_id and resource_owner".into())
+        }
+        (Some(parent_request_id), None) => lock_std_mutex(&state.pending)
+            .get(parent_request_id)
+            .map(|pending| pending.resource_owner.clone())
+            .ok_or_else(|| {
+                "presentation update references a stale or unknown host request".to_owned()
+            }),
+        (None, Some(owner)) => {
+            if owner.extension_instance_id != state.instance_id
+                || owner.process_generation != state.generation
+            {
+                return Err("presentation update resource owner is stale or foreign".into());
+            }
+            if owner.session_id.trim().is_empty()
+                || owner.session_id.len() > 512
+                || owner.session_id.chars().any(char::is_control)
+            {
+                return Err("presentation update resource owner is invalid".into());
+            }
+            if !lock_std_mutex(&state.issued_resource_owners).contains(owner) {
+                return Err("presentation update resource owner is stale or foreign".into());
+            }
+            Ok(Some(owner.clone()))
+        }
+        (None, None) => Ok(None),
     }
 }
 
@@ -8229,6 +8660,40 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                 let _ = state
                     .events
                     .send(ExtensionEvent::StatusContributed { contribution });
+            }
+            methods::PRESENTATION_UPDATE => {
+                require_declared(state.declared.presentation, "semantic presentation")?;
+                if read_std_lock(&state.protocol).version != EXTENSION_API_VERSION_0_2 {
+                    return Err("semantic presentation requires extension API 0.2".into());
+                }
+                let request: PresentationUpdateRequest = serde_json::from_value(params)
+                    .map_err(|error| format!("invalid presentation update: {error}"))?;
+                request
+                    .snapshot
+                    .validate(&state.declared.commands)
+                    .map_err(|error| format!("invalid presentation snapshot: {error}"))?;
+                let resource_owner = presentation_update_owner(state, &request)?;
+                if let Some(updates) = &state.presentation_updates {
+                    let sequence = state.presentation_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                    updates.send_replace(Some((sequence, resource_owner, request.snapshot)));
+                    return Ok(());
+                }
+                let (admitted, first_rejection) = lock_std_mutex(&state.presentation_rate).admit();
+                if !admitted {
+                    if first_rejection {
+                        let _ = state.events.send(ExtensionEvent::Diagnostic {
+                            message: format!(
+                                "semantic presentation update rate exceeded {MAX_PRESENTATION_UPDATES_PER_SECOND} snapshots per second; excess updates were dropped"
+                            ),
+                        });
+                    }
+                    return Ok(());
+                }
+                let _ = state.events.send(ExtensionEvent::PresentationUpdated {
+                    generation: state.generation,
+                    resource_owner,
+                    snapshot: request.snapshot,
+                });
             }
             methods::PROGRESS => {
                 require_feature(state, EXTENSION_FEATURE_REQUEST_PROGRESS)?;
@@ -8485,6 +8950,14 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                         )
                     }
                 };
+                let policy: ExtensionAgentSessionPolicy = request.policy.into();
+                if let Err(error) = policy.validate() {
+                    return reject_unparented_child_request(
+                        state,
+                        id,
+                        format!("invalid agent spawn policy: {error}"),
+                    );
+                }
                 queue_agent_session_operation(
                     state,
                     id,
@@ -8492,8 +8965,11 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                     methods::AGENT_SPAWN,
                     AgentSessionOperation::Spawn {
                         task_name: request.task_name,
+                        profile: request.profile,
+                        fingerprint: request.fingerprint,
                         message: request.message,
                         idempotency_key: request.idempotency_key,
+                        policy,
                     },
                 )?;
             }
@@ -9545,11 +10021,16 @@ confirmations = true
         (
             ProtocolReadState {
                 pending: Arc::new(StdMutex::new(HashMap::new())),
+                issued_resource_owners: Arc::new(StdMutex::new(HashSet::new())),
                 pending_changed: Arc::new(Notify::new()),
                 closed: Arc::new(AtomicBool::new(false)),
                 draining: Arc::new(AtomicBool::new(false)),
                 events,
+                presentation_rate: StdMutex::new(PresentationUpdateRate::default()),
+                presentation_updates: None,
+                presentation_sequence: AtomicU64::new(0),
                 generation: 1,
+                instance_id: "instance-test".into(),
                 max_message_bytes: DEFAULT_EXTENSION_MESSAGE_BYTES,
                 declared,
                 writer,
@@ -9590,6 +10071,9 @@ confirmations = true
         resource_owner: Option<ExtensionResourceOwner>,
     ) {
         let (reply, _reply_rx) = oneshot::channel();
+        if let Some(owner) = &resource_owner {
+            lock_std_mutex(&state.issued_resource_owners).insert(owner.clone());
+        }
         lock_std_mutex(&state.pending).insert(
             id,
             PendingRequest {
@@ -9654,6 +10138,198 @@ confirmations = true
                 "host-secret",
             )?))
         }
+    }
+
+    #[test]
+    fn semantic_presentation_is_api_0_2_only_bounded_and_declared() {
+        let (events, mut receiver) = broadcast::channel(8);
+        let mut declared = ManifestContributions {
+            presentation: true,
+            commands: vec!["workers".into()],
+            ..ManifestContributions::default()
+        };
+        let (mut state, _frames) = protocol_read_state_for_test(declared.clone(), events);
+        *write_std_lock(&state.protocol) = ExtensionNegotiatedProtocol {
+            version: EXTENSION_API_VERSION_0_2.into(),
+            features: BTreeSet::from([
+                EXTENSION_FEATURE_REQUEST_CANCELLATION.into(),
+                EXTENSION_FEATURE_CONTENT_PARTS.into(),
+            ]),
+            max_concurrent_requests: 1,
+            lifecycle_events: BTreeSet::new(),
+        };
+        let update = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "presentation/update",
+            "params": {
+                "snapshot": {
+                    "revision": 4,
+                    "status": {"state": "active", "label": "1 worker"},
+                    "activities": [{
+                        "id": "worker:1",
+                        "kind": "delegation",
+                        "state": "running",
+                        "summary": "Reviewing tests"
+                    }],
+                    "actions": [{
+                        "id": "stop",
+                        "label": "Stop worker",
+                        "command": "workers",
+                        "arguments": ["stop", "worker:1"],
+                        "destructive": true
+                    }]
+                }
+            }
+        });
+        handle_protocol_line(&serde_json::to_vec(&update).unwrap(), &state).unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ExtensionEvent::PresentationUpdated {
+                generation: 1,
+                resource_owner: None,
+                snapshot: ExtensionPresentationSnapshot { revision: 4, .. }
+            }
+        ));
+
+        let owner = test_resource_owner("owner-a");
+        insert_test_parent(&state, 7, Some(owner.clone()));
+        let mut owner_update = update.clone();
+        owner_update["params"]["parent_request_id"] = serde_json::json!(7);
+        owner_update["params"]["snapshot"]["revision"] = serde_json::json!(5);
+        handle_protocol_line(&serde_json::to_vec(&owner_update).unwrap(), &state).unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ExtensionEvent::PresentationUpdated {
+                generation: 1,
+                resource_owner: Some(observed),
+                snapshot: ExtensionPresentationSnapshot { revision: 5, .. }
+            } if observed == owner
+        ));
+
+        let mut background_update = update.clone();
+        background_update["params"]["resource_owner"] = serde_json::to_value(&owner).unwrap();
+        background_update["params"]["snapshot"]["revision"] = serde_json::json!(6);
+        handle_protocol_line(&serde_json::to_vec(&background_update).unwrap(), &state).unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ExtensionEvent::PresentationUpdated {
+                resource_owner: Some(observed),
+                snapshot: ExtensionPresentationSnapshot { revision: 6, .. },
+                ..
+            } if observed == owner
+        ));
+        let forged_owner = test_resource_owner("never-issued-owner");
+        background_update["params"]["resource_owner"] =
+            serde_json::to_value(&forged_owner).unwrap();
+        assert_eq!(
+            handle_protocol_line(&serde_json::to_vec(&background_update).unwrap(), &state)
+                .unwrap_err(),
+            "presentation update resource owner is stale or foreign"
+        );
+        background_update["params"]["resource_owner"] = serde_json::to_value(&owner).unwrap();
+        background_update["params"]["resource_owner"]["process_generation"] = serde_json::json!(2);
+        assert!(
+            handle_protocol_line(&serde_json::to_vec(&background_update).unwrap(), &state)
+                .unwrap_err()
+                .contains("stale or foreign")
+        );
+
+        declared.commands.clear();
+        state.declared = declared;
+        let error = handle_protocol_line(&serde_json::to_vec(&update).unwrap(), &state)
+            .expect_err("actions cannot route to undeclared commands");
+        assert!(error.contains("undeclared command"));
+
+        state.declared.commands = vec!["workers".into()];
+        write_std_lock(&state.protocol).version = EXTENSION_API_VERSION_0_1.into();
+        let error = handle_protocol_line(&serde_json::to_vec(&update).unwrap(), &state)
+            .expect_err("presentation is not backported to API 0.1");
+        assert!(error.contains("requires extension API 0.2"));
+    }
+
+    #[tokio::test]
+    async fn semantic_presentation_dispatch_coalesces_bursts_without_losing_terminal_snapshot() {
+        let (events, mut receiver) = broadcast::channel(128);
+        let (updates, update_rx) = watch::channel(None);
+        let snapshot = |revision| ExtensionPresentationSnapshot {
+            revision,
+            status: None,
+            activities: Vec::new(),
+            collection: None,
+            actions: Vec::new(),
+        };
+        let dispatch = tokio::spawn(dispatch_presentation_updates(update_rx, events, 9));
+        for revision in 0..MAX_PRESENTATION_UPDATES_PER_SECOND {
+            updates.send_replace(Some((revision as u64 + 1, None, snapshot(revision as u64))));
+            loop {
+                if matches!(
+                    receiver.recv().await.unwrap(),
+                    ExtensionEvent::PresentationUpdated { .. }
+                ) {
+                    break;
+                }
+            }
+        }
+        for revision in MAX_PRESENTATION_UPDATES_PER_SECOND..=40 {
+            updates.send_replace(Some((revision as u64 + 1, None, snapshot(revision as u64))));
+        }
+
+        let terminal = tokio::time::timeout(Duration::from_millis(1_500), async {
+            loop {
+                if let ExtensionEvent::PresentationUpdated { snapshot, .. } =
+                    receiver.recv().await.unwrap()
+                {
+                    if snapshot.revision == 40 {
+                        return snapshot.revision;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("coalesced terminal snapshot");
+        assert_eq!(terminal, 40);
+        drop(updates);
+        dispatch.await.unwrap();
+    }
+
+    #[test]
+    fn semantic_presentation_update_rate_is_bounded_per_generation() {
+        let (events, mut receiver) = broadcast::channel(128);
+        let declared = ManifestContributions {
+            presentation: true,
+            ..ManifestContributions::default()
+        };
+        let (state, _frames) = protocol_read_state_for_test(declared, events);
+        write_std_lock(&state.protocol).version = EXTENSION_API_VERSION_0_2.into();
+        for revision in 0..(MAX_PRESENTATION_UPDATES_PER_SECOND + 5) {
+            let update = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "presentation/update",
+                "params": {
+                    "snapshot": {
+                        "revision": revision,
+                        "activities": [],
+                        "actions": [],
+                    }
+                }
+            });
+            handle_protocol_line(&serde_json::to_vec(&update).unwrap(), &state).unwrap();
+        }
+
+        let mut accepted = 0;
+        let mut diagnostics = 0;
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                ExtensionEvent::PresentationUpdated { .. } => accepted += 1,
+                ExtensionEvent::Diagnostic { message } => {
+                    diagnostics += 1;
+                    assert!(message.contains("update rate exceeded"));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(accepted, MAX_PRESENTATION_UPDATES_PER_SECOND);
+        assert_eq!(diagnostics, 1);
     }
 
     #[test]
@@ -10394,6 +11070,62 @@ confirmations = true
     }
 
     #[test]
+    fn manifest_accepts_matching_optional_ygg_requirement_and_rejects_mismatch() {
+        let matching = VALID_MANIFEST.replace(
+            "api_version = \"0.1\"",
+            &format!(
+                "api_version = \"0.1\"\nrequires_ygg = \"={}\"",
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+        let manifest = ExtensionManifest::parse(&matching).expect("matching Ygg requirement");
+        assert_eq!(
+            manifest.requires_ygg.as_deref(),
+            Some(concat!("=", env!("CARGO_PKG_VERSION")))
+        );
+
+        let mismatch = matching.replace(
+            &format!("requires_ygg = \"={}\"", env!("CARGO_PKG_VERSION")),
+            "requires_ygg = \"=99.0.0\"",
+        );
+        assert!(matches!(
+            ExtensionManifest::parse(&mismatch),
+            Err(ExtensionRuntimeError::InvalidManifest(message))
+                if message.contains("requires Ygg")
+        ));
+    }
+
+    #[test]
+    fn brokered_environment_is_explicit_narrow_and_not_in_default_subprocesses() {
+        let declared = VALID_MANIFEST
+            .replace("api_version = \"0.1\"", "api_version = \"0.2\"")
+            .replace(
+                "network = false",
+                "network = false\nenvironment = [\"SSH_AUTH_SOCK\"]",
+            );
+        let manifest = ExtensionManifest::parse(&declared).expect("reviewed environment name");
+        assert_eq!(manifest.capabilities.environment, ["SSH_AUTH_SOCK"]);
+        let key = std::ffi::OsStr::new("SSH_AUTH_SOCK");
+        assert!(!sanitized_subprocess_environment().contains_key(key));
+        let brokered = brokered_extension_environment(&manifest.capabilities.environment);
+        let expected = std::env::var_os("SSH_AUTH_SOCK").filter(|value| !value.is_empty());
+        assert_eq!(brokered.get(key), expected.as_ref());
+
+        let unsupported = declared.replace("SSH_AUTH_SOCK", "AWS_SECRET_ACCESS_KEY");
+        assert!(matches!(
+            ExtensionManifest::parse(&unsupported),
+            Err(ExtensionRuntimeError::InvalidManifest(message))
+                if message.contains("unsupported brokered environment variable")
+        ));
+        let legacy = declared.replace("api_version = \"0.2\"", "api_version = \"0.1\"");
+        assert!(matches!(
+            ExtensionManifest::parse(&legacy),
+            Err(ExtensionRuntimeError::InvalidManifest(message))
+                if message.contains("require extension API 0.2")
+        ));
+    }
+
+    #[test]
     fn bounded_manifest_load_rejects_oversized_files() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join(EXTENSION_MANIFEST_FILENAME);
@@ -10600,6 +11332,41 @@ command = "agent-service"
         )
         .unwrap();
         assert!(protocol.supports(EXTENSION_FEATURE_AGENT_SESSIONS));
+    }
+
+    #[test]
+    fn agent_spawn_requires_a_complete_host_enforced_policy() {
+        let missing = serde_json::json!({
+            "parent_request_id": 7,
+            "task_name": "inspect",
+            "message": "inspect safely",
+            "idempotency_key": "inspect-1",
+        });
+        assert!(serde_json::from_value::<AgentSessionSpawnRequest>(missing).is_err());
+
+        let valid = serde_json::json!({
+            "parent_request_id": 7,
+            "task_name": "inspect",
+            "message": "inspect safely",
+            "idempotency_key": "inspect-1",
+            "policy": {
+                "tools": ["read", "search"],
+                "max_depth": 1,
+                "max_concurrent_children": 2,
+                "max_turns": 8,
+                "max_tokens": 32000,
+                "max_cost_microdollars": 200000,
+                "max_output_bytes": 8192,
+                "timeout_ms": 300000
+            }
+        });
+        let request: AgentSessionSpawnRequest = serde_json::from_value(valid).unwrap();
+        let policy: ExtensionAgentSessionPolicy = request.policy.into();
+        assert!(policy.validate().is_ok());
+
+        let mut invalid = policy;
+        invalid.tools.push("write".into());
+        assert!(invalid.validate().unwrap_err().contains("read and search"));
     }
 
     #[test]

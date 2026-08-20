@@ -353,6 +353,23 @@ pub enum SessionCommand {
         /// Exact slash-prefixed invocation.
         invocation: SlashCommandInvocation,
     },
+    /// Invoke one current semantic action by stable extension/action identity.
+    #[serde(rename = "extension.invokeAction")]
+    InvokeExtensionAction {
+        /// Manifest-bound extension name.
+        extension: String,
+        /// Host-created process-instance fence shown to the user.
+        extension_instance_id: String,
+        /// Active extension process generation shown to the user.
+        generation: u64,
+        /// Presentation revision shown to the user.
+        revision: u64,
+        /// Stable action ID from that presentation revision.
+        action: String,
+        /// User-approved destructive action, bound to this authenticated command.
+        #[serde(default)]
+        confirmed: bool,
+    },
     /// Replace or create the durable session goal.
     #[serde(rename = "session.goal.set")]
     SetGoal {
@@ -778,6 +795,36 @@ impl ProtocolValidation for SessionCommandEnvelope {
             | SessionCommand::FollowUp { input }
             | SessionCommand::EditUserTurn { input, .. } => input.validate()?,
             SessionCommand::InvokeSlashCommand { invocation } => invocation.validate()?,
+            SessionCommand::InvokeExtensionAction {
+                extension,
+                extension_instance_id,
+                generation,
+                action,
+                ..
+            } => {
+                if *generation == 0 {
+                    return Err(ValidationError::new(
+                        "command.extension.generation",
+                        "must identify an active extension generation",
+                    ));
+                }
+                for (field, value) in [
+                    ("command.extension.extension", extension),
+                    (
+                        "command.extension.extension_instance_id",
+                        extension_instance_id,
+                    ),
+                    ("command.extension.action", action),
+                ] {
+                    validate_public_text(field, value, 128, false)?;
+                    if value.chars().any(char::is_whitespace) {
+                        return Err(ValidationError::new(
+                            field,
+                            "must be a whitespace-free stable identifier",
+                        ));
+                    }
+                }
+            }
             SessionCommand::SetGoal {
                 objective,
                 turn_budget,

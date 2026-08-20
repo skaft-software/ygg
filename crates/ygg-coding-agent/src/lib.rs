@@ -8,6 +8,7 @@ mod cli;
 mod commands;
 mod compaction;
 mod config;
+mod extension_bundle;
 mod extension_package;
 mod extensions;
 /// Versioned NDJSON process boundary for non-Rust consumers.

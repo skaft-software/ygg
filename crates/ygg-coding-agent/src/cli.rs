@@ -22,7 +22,7 @@ pub enum TopLevelCommand {
         #[command(subcommand)]
         command: SessionCommand,
     },
-    /// Install and manage application extension packages.
+    /// Install and manage extension packages.
     Extension {
         #[command(subcommand)]
         command: ExtensionCommand,
@@ -2024,7 +2024,7 @@ mod tests {
     }
 
     #[test]
-    fn application_extension_commands_parse_without_a_prompt() {
+    fn extension_package_commands_parse_without_a_prompt() {
         let cli = Cli::try_parse_from(["ygg", "extension", "install", "ygg-serve"]).unwrap();
         assert!(cli.message.is_none());
         assert!(matches!(
@@ -2043,6 +2043,28 @@ mod tests {
             cli.command,
             Some(TopLevelCommand::Extension {
                 command: ExtensionCommand::Install {
+                    name: None,
+                    path: Some(_),
+                }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["ygg", "extension", "update", "ygg-web-search"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Extension {
+                command: ExtensionCommand::Update {
+                    name: Some(ref name),
+                    path: None,
+                }
+            }) if name == "ygg-web-search"
+        ));
+        let cli = Cli::try_parse_from(["ygg", "extension", "update", "--path", "./bundle.tar.gz"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Extension {
+                command: ExtensionCommand::Update {
                     name: None,
                     path: Some(_),
                 }

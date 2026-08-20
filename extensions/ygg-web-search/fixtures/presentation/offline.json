@@ -1,0 +1,58 @@
+{
+  "schema": "ygg.web-search.presentation-fixture.v1",
+  "extension": "ygg-web-search",
+  "case": "offline",
+  "notifications": [
+    {
+      "jsonrpc": "2.0",
+      "method": "presentation/update",
+      "params": {
+        "parent_request_id": 2,
+        "snapshot": {
+          "revision": 3,
+          "status": {
+            "state": "unavailable",
+            "label": "web · SearXNG",
+            "detail": "Latest web_search outcome: offline."
+          },
+          "activities": [
+            {
+              "id": "web:web_search:42",
+              "kind": "web_retrieval",
+              "state": "failed",
+              "summary": "web_search · SearXNG · 0 results · 0 bytes · cache none · 80 ms · offline",
+              "provenance": "SearXNG",
+              "started_at_ms": 1000,
+              "completed_at_ms": 1124,
+              "references": []
+            }
+          ],
+          "collection": null,
+          "actions": []
+        }
+      }
+    }
+  ],
+  "expected_snapshot": {
+    "revision": 3,
+    "status": {
+      "state": "unavailable",
+      "label": "web · SearXNG",
+      "detail": "Latest web_search outcome: offline."
+    },
+    "activities": [
+      {
+        "id": "web:web_search:42",
+        "kind": "web_retrieval",
+        "state": "failed",
+        "summary": "web_search · SearXNG · 0 results · 0 bytes · cache none · 80 ms · offline",
+        "provenance": "SearXNG",
+        "started_at_ms": 1000,
+        "completed_at_ms": 1124,
+        "references": []
+      }
+    ],
+    "collection": null,
+    "actions": []
+  }
+}

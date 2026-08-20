@@ -2,6 +2,24 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## Unreleased
+
+### Added
+
+- Added checksum-verified, bounded, atomic executable-extension bundles for the
+  small first-party release catalog and offline/local archives. `ygg extension
+  install`, `list`, `update`, and `remove` now manage API `0.2` bundles without
+  enabling or trusting them; managed nested skills are discoverable but remain
+  inactive until explicitly loaded.
+- Added deterministic release packaging, complete tracked-file inclusion checks,
+  local install/remove smoke coverage, and post-publication install/update smoke
+  coverage for every catalog bundle.
+
+### Changed
+
+- Kept the target-specific Ygg Serve `package.toml` application archive distinct
+  from generic executable-extension `extension.toml` bundles.
+
 ## 0.5.0 — 2026-08-19
 
 ### Added

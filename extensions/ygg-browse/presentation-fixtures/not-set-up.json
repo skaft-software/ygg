@@ -1,0 +1,70 @@
+{
+  "revision": 0,
+  "status": {
+    "state": "empty",
+    "label": "Browse · not set up",
+    "detail": "Pinned browser dependencies are not installed."
+  },
+  "activities": [],
+  "collection": {
+    "kind": "list",
+    "title": "Browse",
+    "nodes": [
+      {
+        "id": "browse-runtime",
+        "state": "empty",
+        "label": "Browser setup",
+        "secondary": "not set up",
+        "action_ids": [
+          "setup"
+        ],
+        "references": []
+      }
+    ],
+    "selected_node_id": "browse-runtime",
+    "detail": {
+      "node_id": "browse-runtime",
+      "title": "Ygg Browse",
+      "body": "Pinned browser dependencies are not installed.\nInstall log: ~/.ygg/browse/install.log",
+      "references": []
+    }
+  },
+  "actions": [
+    {
+      "id": "setup",
+      "label": "Set up browser",
+      "command": "browse",
+      "arguments": [
+        "setup"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "open",
+      "label": "Open visible browser",
+      "command": "browse",
+      "arguments": [
+        "open"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "close",
+      "label": "Close browser",
+      "command": "browse",
+      "arguments": [
+        "close"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "reset-profile",
+      "label": "Reset isolated profile",
+      "command": "browse",
+      "arguments": [
+        "reset-profile"
+      ],
+      "destructive": true
+    }
+  ]
+}

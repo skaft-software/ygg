@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import extensionPresentationGolden from "../../../crates/ygg-coding-agent/fixtures/extension-presentation.json";
 import eventEnvelopeGolden from "../../../extensions/ygg-serve/fixtures/event-envelope.json";
 import hostBootstrapGolden from "../../../extensions/ygg-serve/fixtures/host-bootstrap.json";
 import hostCommandAckGolden from "../../../extensions/ygg-serve/fixtures/host-command-ack.json";
@@ -251,6 +252,74 @@ describe("authoritative Rust wire contract", () => {
     expect(snapshot.contextPercent).toBe(0);
     expect(snapshot.title).toBe("New session");
     expect(snapshot.items).toHaveLength(1);
+  });
+
+  it("projects locked delegated parent navigation and rejects mutable variants", () => {
+    const wire = clone(sessionSnapshotGolden) as Record<string, unknown>;
+    wire.sessionId = `agent-session:${"a".repeat(64)}`;
+    wire.delegatedParentSessionId = "session-demo";
+    wire.liveState = "locked";
+    wire.authority = "readOnly";
+    expect(projectSessionSnapshot(wire).delegatedParentSessionId).toBe(
+      "session-demo",
+    );
+
+    wire.authority = "workspace";
+    expect(() => projectSessionSnapshot(wire)).toThrow(WireContractError);
+  });
+
+  it("projects the shared bounded extension fixture and vetted links", () => {
+    const wire = clone(sessionSnapshotGolden) as Record<string, unknown>;
+    wire.extensionPresentations = [
+      {
+        extension: "fixture-extension",
+        extensionInstanceId: "instance-a",
+        generation: 2,
+        resourceOwner: "owner-1",
+        snapshot: clone(extensionPresentationGolden),
+      },
+    ];
+    const projected = projectSessionSnapshot(wire);
+    expect(projected.extensionPresentations?.[0]).toMatchObject({
+      extension: "fixture-extension",
+      extensionInstanceId: "instance-a",
+      generation: 2,
+      snapshot: {
+        revision: 4,
+        activities: [
+          {
+            summary: "Reviewing tests",
+            references: [
+              { kind: "url", id: "https://example.com/docs/extensions" },
+            ],
+          },
+        ],
+      },
+    });
+
+    const missingInstance = clone(wire) as {
+      extensionPresentations: Array<Record<string, unknown>>;
+    };
+    delete missingInstance.extensionPresentations[0]!.extensionInstanceId;
+    expect(() => projectSessionSnapshot(missingInstance)).toThrow(WireContractError);
+
+    const privateLink = clone(wire);
+    const privatePresentations = privateLink.extensionPresentations as Array<{
+      snapshot: {
+        activities: Array<{ references: Array<{ id: string }> }>;
+      };
+    }>;
+    privatePresentations[0]!.snapshot.activities[0]!.references[0]!.id =
+      "http://127.0.0.1/private";
+    expect(() => projectSessionSnapshot(privateLink)).toThrow(
+      WireContractError,
+    );
+
+    privatePresentations[0]!.snapshot.activities[0]!.references[0]!.id =
+      "http://[::1]/private";
+    expect(() => projectSessionSnapshot(privateLink)).toThrow(
+      WireContractError,
+    );
   });
 
   it("strictly projects replayable context lifecycle and compaction updates", () => {
@@ -1981,6 +2050,41 @@ describe("authoritative Rust wire contract", () => {
       command: {
         type: "session.invokeSlashCommand",
         data: { invocation: { invocation: "/compact" } },
+      },
+    });
+    expect(
+      encodeClientCommand(
+        {
+          id: "command-extension-action",
+          type: "extension.invokeAction",
+          sessionId: "session-demo",
+          extension: "ygg-web-search",
+          extensionInstanceId: "instance-search",
+          generation: 3,
+          revision: 7,
+          action: "select-citation",
+          confirmed: false,
+        },
+        {
+          hostId: "host-demo",
+          deviceId: "device-browser",
+          issuedAtMs: 1_721_000_000_062,
+          actorGenerationBySession: { "session-demo": 3 },
+          modelIdBySession: {},
+          models: [],
+        },
+      ),
+    ).toMatchObject({
+      command: {
+        type: "extension.invokeAction",
+        data: {
+          extension: "ygg-web-search",
+          extensionInstanceId: "instance-search",
+          generation: 3,
+          revision: 7,
+          action: "select-citation",
+          confirmed: false,
+        },
       },
     });
     expect(() =>

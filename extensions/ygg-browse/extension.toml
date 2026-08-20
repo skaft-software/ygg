@@ -1,0 +1,39 @@
+name = "ygg-browse"
+version = "0.1.0"
+api_version = "0.2"
+requires_ygg = "=0.5.0"
+description = "Always-headful semantic browser automation with an isolated persistent profile and manual-auth boundary"
+
+[entrypoint]
+command = "extension.py"
+
+[capabilities]
+# Setup and browser launch create only ~/.ygg/browse state, but that fixed user
+# path is outside the active workspace. The extension also launches pinned pip,
+# Playwright, Chromium, and network requests after explicit setup/operations.
+filesystem = "unrestricted"
+process = true
+network = true
+secrets = []
+environment = []
+
+[contributes]
+tools = [
+  "browser_status",
+  "browser_launch",
+  "browser_tabs",
+  "browser_open_url",
+  "browser_snapshot",
+  "browser_click",
+  "browser_type",
+  "browser_press",
+  "browser_scroll",
+  "browser_wait",
+  "browser_screenshot",
+  "browser_tab_close",
+  "browser_close",
+]
+commands = ["browse"]
+ui = ["status"]
+confirmations = true
+presentation = true

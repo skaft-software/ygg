@@ -60,6 +60,8 @@ pub enum AutoCompactSetting {
 pub enum ExtensionsSubcommand {
     List,
     Reload,
+    Inspect { reference: String },
+    Action { extension: String, action: String },
 }
 
 /// Subcommands for the `/goal` slash command.
@@ -216,8 +218,8 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
     ),
     slash!(
         "extensions",
-        "/extensions [reload]",
-        "inspect or reload executable extensions",
+        "/extensions [reload|inspect <agent-session:…>|action <extension> <action-id>]",
+        "inspect, reload, or invoke a declared executable-extension action",
         true
     ),
     slash!(
@@ -384,6 +386,13 @@ pub fn parse(input: &str) -> Command {
         return match args.as_slice() {
             [] => Command::Extensions(ExtensionsSubcommand::List),
             ["reload"] => Command::Extensions(ExtensionsSubcommand::Reload),
+            ["inspect", reference] => Command::Extensions(ExtensionsSubcommand::Inspect {
+                reference: (*reference).to_owned(),
+            }),
+            ["action", extension, action] => Command::Extensions(ExtensionsSubcommand::Action {
+                extension: (*extension).to_owned(),
+                action: (*action).to_owned(),
+            }),
             _ => Command::Unknown(input.to_owned()),
         };
     }
@@ -1003,6 +1012,19 @@ mod tests {
         assert_eq!(
             parse("/skills off audit"),
             Command::Skills(SkillsSubcommand::Off("audit".into()))
+        );
+        assert_eq!(
+            parse("/extensions inspect agent-session:abc"),
+            Command::Extensions(ExtensionsSubcommand::Inspect {
+                reference: "agent-session:abc".into(),
+            })
+        );
+        assert_eq!(
+            parse("/extensions action ygg-subagents stop-worker"),
+            Command::Extensions(ExtensionsSubcommand::Action {
+                extension: "ygg-subagents".into(),
+                action: "stop-worker".into(),
+            })
         );
     }
 

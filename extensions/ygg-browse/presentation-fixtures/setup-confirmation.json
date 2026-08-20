@@ -1,0 +1,79 @@
+{
+  "revision": 1,
+  "status": {
+    "state": "pending",
+    "label": "Browse · not set up",
+    "detail": "Waiting for explicit setup confirmation."
+  },
+  "activities": [
+    {
+      "id": "browse:setup",
+      "kind": "setup",
+      "state": "pending",
+      "summary": "Waiting for browser setup confirmation",
+      "provenance": "visible isolated browser",
+      "references": []
+    }
+  ],
+  "collection": {
+    "kind": "list",
+    "title": "Browse",
+    "nodes": [
+      {
+        "id": "browse-runtime",
+        "state": "pending",
+        "label": "Browser setup",
+        "secondary": "confirmation required",
+        "action_ids": [
+          "setup"
+        ],
+        "references": []
+      }
+    ],
+    "selected_node_id": "browse-runtime",
+    "detail": {
+      "node_id": "browse-runtime",
+      "title": "Ygg Browse",
+      "body": "Setup downloads pinned Playwright 1.57.0 and Chromium only after confirmation.",
+      "references": []
+    }
+  },
+  "actions": [
+    {
+      "id": "setup",
+      "label": "Set up browser",
+      "command": "browse",
+      "arguments": [
+        "setup"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "open",
+      "label": "Open visible browser",
+      "command": "browse",
+      "arguments": [
+        "open"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "close",
+      "label": "Close browser",
+      "command": "browse",
+      "arguments": [
+        "close"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "reset-profile",
+      "label": "Reset isolated profile",
+      "command": "browse",
+      "arguments": [
+        "reset-profile"
+      ],
+      "destructive": true
+    }
+  ]
+}

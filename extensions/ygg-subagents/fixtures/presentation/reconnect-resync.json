@@ -1,0 +1,20 @@
+{
+  "schema": "ygg.subagents.reconnect-fixture.v1",
+  "extension": "ygg-subagents",
+  "old_generation": 3,
+  "new_generation": 4,
+  "stale_update": {"generation": 3, "revision": 18, "accepted": false},
+  "resync_update": {"generation": 4, "revision": 0, "accepted": true},
+  "owned_agents": ["agent-7", "agent-8"],
+  "spawn_idempotency_key": "spawn:explore-auth:fixture",
+  "spawn_count_before": 2,
+  "spawn_count_after": 2,
+  "completion_delivery": {
+    "delivery_id": "delivery-9",
+    "claims": 2,
+    "failed_ack_releases_claim": true,
+    "committed_acks": 1,
+    "parent_turns": 1,
+    "duplicate_parent_turns": 0
+  }
+}

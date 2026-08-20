@@ -1,0 +1,34 @@
+{
+  "schema": "ygg.web-search.presentation-fixture.v1",
+  "extension": "ygg-web-search",
+  "case": "disabled",
+  "notifications": [
+    {
+      "jsonrpc": "2.0",
+      "method": "presentation/update",
+      "params": {
+        "parent_request_id": 2,
+        "snapshot": {
+          "revision": 1,
+          "status": {
+            "state": "stopped",
+            "label": "web · Off"
+          },
+          "activities": [],
+          "collection": null,
+          "actions": []
+        }
+      }
+    }
+  ],
+  "expected_snapshot": {
+    "revision": 1,
+    "status": {
+      "state": "stopped",
+      "label": "web · Off"
+    },
+    "activities": [],
+    "collection": null,
+    "actions": []
+  }
+}

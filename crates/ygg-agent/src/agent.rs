@@ -88,6 +88,17 @@ pub enum AgentError {
         /// Provider termination reason.
         stop_reason: String,
     },
+    /// The next billable request's conservative token reservation would cross
+    /// the configured session token ceiling.
+    #[error("session token limit would be exceeded: current {current} + reserved {reserved} tokens > limit {limit}")]
+    TokenLimit {
+        /// Durable session token usage before the request.
+        current: u64,
+        /// Conservative input plus maximum-output reservation.
+        reserved: u64,
+        /// Configured ceiling.
+        limit: u64,
+    },
     /// The next billable request's conservative reservation would cross the
     /// configured session spend ceiling.
     #[error("session cost limit would be exceeded: current {current} µUSD + reserved {reserved} µUSD > limit {limit} µUSD")]
@@ -97,6 +108,13 @@ pub enum AgentError {
         /// Conservative worst-case request reservation.
         reserved: u64,
         /// Configured ceiling.
+        limit: u64,
+    },
+    /// A spend ceiling was requested but the selected model has no trusted
+    /// pricing from which the host can reserve the next request.
+    #[error("session cost limit cannot be enforced because model pricing is unavailable (limit {limit} µUSD)")]
+    CostUnavailable {
+        /// Configured ceiling that cannot be enforced.
         limit: u64,
     },
     /// The request would exceed the model's context budget after compaction.
@@ -140,7 +158,9 @@ fn provider_failure_phase(error: &AgentError) -> Option<&'static str> {
         | AgentError::DuplicateTool(_)
         | AgentError::Delegation(_)
         | AgentError::Workspace(_)
+        | AgentError::TokenLimit { .. }
         | AgentError::CostLimit { .. }
+        | AgentError::CostUnavailable { .. }
         | AgentError::ContextExceeded { .. }
         | AgentError::InvalidCompactionPolicy(_)
         | AgentError::Cancelled
@@ -307,6 +327,7 @@ pub struct Agent {
     /// One-shot user-visible text for the next prompt. Model-only context is
     /// persisted in the message body for exact replay instead.
     prompt_display_text: Option<String>,
+    max_session_tokens: Option<u64>,
     max_session_cost_microdollars: Option<u64>,
     provider_retries_enabled: bool,
     delegation: Option<DelegationBinding>,
@@ -2236,6 +2257,45 @@ fn worst_case_request_cost(model: &Model, input_tokens: u64, output_tokens: u64)
     u64::try_from(numerator.div_ceil(denominator)).ok()
 }
 
+fn usage_total_tokens(usage: &Usage) -> u64 {
+    if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        usage
+            .input_tokens
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens)
+            .saturating_add(usage.output_tokens)
+    }
+}
+
+fn session_total_tokens(session: &Session) -> u64 {
+    session.usage_records().iter().fold(0u64, |total, record| {
+        total.saturating_add(usage_total_tokens(&record.usage))
+    })
+}
+
+fn reserve_request_tokens(
+    session: &Session,
+    input_tokens: u64,
+    output_tokens: u64,
+    limit: Option<u64>,
+) -> Result<(), AgentError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let current = session_total_tokens(session);
+    let reserved = input_tokens.saturating_add(output_tokens);
+    if current >= limit || current.saturating_add(reserved) > limit {
+        return Err(AgentError::TokenLimit {
+            current,
+            reserved,
+            limit,
+        });
+    }
+    Ok(())
+}
+
 fn reserve_request_cost(
     session: &Session,
     model: &Model,
@@ -2247,7 +2307,8 @@ fn reserve_request_cost(
         return Ok(());
     };
     let current = session.total_cost_microdollars();
-    let reserved = worst_case_request_cost(model, input_tokens, output_tokens).unwrap_or_default();
+    let reserved = worst_case_request_cost(model, input_tokens, output_tokens)
+        .ok_or(AgentError::CostUnavailable { limit })?;
     if current >= limit || current.saturating_add(reserved) > limit {
         return Err(AgentError::CostLimit {
             current,
@@ -2284,6 +2345,7 @@ struct CompactionContext<'a> {
     reasoning: &'a ReasoningConfig,
     reasoning_mode: ReasoningMode,
     session_id: &'a str,
+    max_session_tokens: Option<u64>,
     max_session_cost_microdollars: Option<u64>,
     abort: &'a AbortFlag,
     mode: AgentCompactionMode,
@@ -2311,6 +2373,7 @@ impl<'a> CompactionContext<'a> {
         reasoning: &'a ReasoningConfig,
         reasoning_mode: ReasoningMode,
         session_id: &'a str,
+        max_session_tokens: Option<u64>,
         max_session_cost_microdollars: Option<u64>,
         abort: &'a AbortFlag,
         mode: AgentCompactionMode,
@@ -2330,6 +2393,7 @@ impl<'a> CompactionContext<'a> {
             reasoning,
             reasoning_mode,
             session_id,
+            max_session_tokens,
             max_session_cost_microdollars,
             abort,
             mode,
@@ -2389,11 +2453,18 @@ impl<'a> CompactionContext<'a> {
                 budget: input_budget,
             });
         }
+        let reserved_output_tokens = request.max_output_tokens.unwrap_or(output_tokens);
+        reserve_request_tokens(
+            self.session,
+            input_tokens,
+            reserved_output_tokens,
+            self.max_session_tokens,
+        )?;
         reserve_request_cost(
             self.session,
             self.compaction_model,
             input_tokens,
-            request.max_output_tokens.unwrap_or(output_tokens),
+            reserved_output_tokens,
             self.max_session_cost_microdollars,
         )?;
         let response = tokio::select! {
@@ -2576,6 +2647,12 @@ impl<'a> CompactionContext<'a> {
                 Some(self.session_id),
             );
             let input_tokens = estimate_compact_request_tokens(&request, &replay);
+            reserve_request_tokens(
+                self.session,
+                input_tokens,
+                self.model.spec.limits.max_output_tokens,
+                self.max_session_tokens,
+            )?;
             reserve_request_cost(
                 self.session,
                 self.model,
@@ -2801,6 +2878,7 @@ struct TerminalGateContext<'a> {
     run_cost: &'a mut CostAccumulator,
     cache_retention: CacheRetention,
     session_id: &'a str,
+    max_session_tokens: Option<u64>,
     max_session_cost_microdollars: Option<u64>,
     abort: &'a AbortFlag,
 }
@@ -2839,6 +2917,7 @@ impl TerminalGateContext<'_> {
                     budget,
                 });
             }
+            reserve_request_tokens(self.session, input_tokens, 1, self.max_session_tokens)?;
             reserve_request_cost(
                 self.session,
                 self.model,
@@ -2934,6 +3013,7 @@ impl Agent {
             prompt_model_source: None,
             prompt_color: None,
             prompt_display_text: None,
+            max_session_tokens: None,
             max_session_cost_microdollars: None,
             provider_retries_enabled: true,
             delegation: None,
@@ -3045,6 +3125,20 @@ impl Agent {
             .map(DelegationBinding::team_directory)
     }
 
+    /// Opens one exact child transcript from this agent's current delegation
+    /// team as a read-only session. Opaque references from another parent are
+    /// never resolved.
+    pub fn open_delegated_session_reference(
+        &self,
+        extension_principal: &str,
+        reference: &str,
+    ) -> Result<Option<Session>, AgentError> {
+        let Some(binding) = self.delegation.as_ref() else {
+            return Ok(None);
+        };
+        binding.open_session_reference(extension_principal, reference)
+    }
+
     /// Binds an executable extension's negotiated child-session service to
     /// this root agent's V2 delegation manager.
     pub fn bind_extension_agent_sessions(
@@ -3065,6 +3159,7 @@ impl Agent {
         let service = binding
             .extension_service(
                 process.agent_session_principal(),
+                self.session_id.clone(),
                 self.resource_owner.clone(),
             )
             .map_err(AgentError::Delegation)?;
@@ -3167,6 +3262,13 @@ impl Agent {
             output_tokens,
             self.max_session_cost_microdollars,
         )
+    }
+
+    /// Configure a conservative hard ceiling for total provider-reported
+    /// tokens across this session. Every provider operation reserves its
+    /// estimated input plus maximum output before network I/O.
+    pub(crate) fn set_max_session_tokens(&mut self, limit: Option<u64>) {
+        self.max_session_tokens = limit;
     }
 
     /// Configure a conservative hard ceiling for billable session requests.
@@ -3425,6 +3527,12 @@ impl Agent {
             Some(&self.session_id),
         );
         let input_tokens = estimate_compact_request_tokens(&request, &replay);
+        reserve_request_tokens(
+            &self.session,
+            input_tokens,
+            self.model.spec.limits.max_output_tokens,
+            self.max_session_tokens,
+        )?;
         reserve_request_cost(
             &self.session,
             &self.model,
@@ -3678,6 +3786,7 @@ impl Agent {
         let completion_policy = self.completion_policy;
         let output_modalities = self.output_modalities.clone();
         let max_output_tokens = self.max_output_tokens;
+        let max_session_tokens = self.max_session_tokens;
         let max_session_cost_microdollars = self.max_session_cost_microdollars;
         let auto_compaction_mode = self.auto_compaction_mode;
         let compaction_threshold_fraction = self.compaction_threshold_fraction;
@@ -3838,6 +3947,7 @@ impl Agent {
                         &reasoning,
                         reasoning_mode,
                         &session_id,
+                        max_session_tokens,
                         max_session_cost_microdollars,
                         &abort,
                         auto_compaction_mode,
@@ -3909,6 +4019,14 @@ impl Agent {
                     session_id: Some(session_id.clone()),
                 };
 
+                if let Err(error) = reserve_request_tokens(
+                    session,
+                    input_tokens,
+                    max_output_tokens,
+                    max_session_tokens,
+                ) {
+                    break 'run FinishReason::Failed(error);
+                }
                 if let Err(error) = reserve_request_cost(
                     session,
                     &model,
@@ -3974,6 +4092,7 @@ impl Agent {
                                 &reasoning,
                                 reasoning_mode,
                                 &session_id,
+                                max_session_tokens,
                                 max_session_cost_microdollars,
                                 &abort,
                                 auto_compaction_mode,
@@ -4108,6 +4227,7 @@ impl Agent {
                                         &reasoning,
                                         reasoning_mode,
                                         &session_id,
+                                        max_session_tokens,
                                         max_session_cost_microdollars,
                                         &abort,
                                         auto_compaction_mode,
@@ -4498,6 +4618,7 @@ impl Agent {
                             run_cost: &mut run_cost,
                             cache_retention,
                             session_id: &session_id,
+                            max_session_tokens,
                             max_session_cost_microdollars,
                             abort: &abort,
                         }
@@ -5813,6 +5934,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn configured_cost_limit_fails_closed_without_trusted_model_pricing() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::create(directory.path().join("unpriced.jsonl")).unwrap();
+        let mut model = ygg_ai::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        std::sync::Arc::make_mut(&mut model.spec).pricing = None;
+
+        assert!(matches!(
+            reserve_request_cost(&session, &model, 1, 1, Some(10)),
+            Err(AgentError::CostUnavailable { limit: 10 })
+        ));
+    }
+
     #[tokio::test]
     async fn native_compaction_honors_the_session_cost_limit_before_network() {
         let directory = tempfile::tempdir().unwrap();
@@ -6057,6 +6194,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(turn_starts(&session).len(), 2);
+    }
+
+    #[test]
+    fn hard_token_reservation_rejects_before_a_request_can_cross_the_ceiling() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::create(directory.path().join("token-limit.jsonl")).unwrap();
+        let error = reserve_request_tokens(&session, 700, 400, Some(1_000)).unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::TokenLimit {
+                current: 0,
+                reserved: 1_100,
+                limit: 1_000
+            }
+        ));
     }
 
     #[tokio::test]

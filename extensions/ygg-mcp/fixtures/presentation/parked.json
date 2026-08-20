@@ -1,0 +1,55 @@
+{
+  "actions": [
+    {
+      "arguments": [
+        "restart",
+        "fixture"
+      ],
+      "command": "mcp",
+      "destructive": false,
+      "id": "restart:fixture",
+      "label": "Restart"
+    },
+    {
+      "arguments": [
+        "stop",
+        "fixture"
+      ],
+      "command": "mcp",
+      "destructive": false,
+      "id": "stop:fixture",
+      "label": "Stop"
+    }
+  ],
+  "activities": [],
+  "collection": {
+    "detail": {
+      "body": "Lifecycle: parked\nTransport: stdio\nCatalog revision: 0\nHost catalog revision: 0\nPublished tools: 0\nRestart/backoff: 5/5\nLast error: executable_not_found \u00b7 MCP server failed a bounded health check",
+      "node_id": "server:fixture",
+      "references": [],
+      "title": "Fixture server"
+    },
+    "kind": "tree",
+    "nodes": [
+      {
+        "action_ids": [
+          "restart:fixture",
+          "stop:fixture"
+        ],
+        "id": "server:fixture",
+        "label": "Fixture server",
+        "references": [],
+        "secondary": "stdio \u00b7 catalog 0 \u00b7 0 tools",
+        "state": "unavailable"
+      }
+    ],
+    "selected_node_id": "server:fixture",
+    "title": "MCP servers"
+  },
+  "revision": 1,
+  "status": {
+    "detail": "0 of 1 configured MCP servers connected; 0 tools published",
+    "label": "mcp 0/1 \u00b7 0 tools \u00b7 degraded",
+    "state": "degraded"
+  }
+}

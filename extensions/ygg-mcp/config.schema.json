@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skaft.org/ygg/extensions/ygg-mcp/config.schema.json",
+  "title": "ygg-mcp configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "servers"],
+  "properties": {
+    "version": {"const": 1},
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxServers": {"type": "integer", "minimum": 1, "maximum": 32},
+        "maxToolsPerServer": {"type": "integer", "minimum": 1, "maximum": 128},
+        "maxTotalTools": {"type": "integer", "minimum": 1, "maximum": 256},
+        "maxCatalogPages": {"type": "integer", "minimum": 1, "maximum": 32},
+        "maxFrameBytes": {"type": "integer", "minimum": 1024, "maximum": 16777216},
+        "maxResultBytes": {"type": "integer", "minimum": 1024, "maximum": 16777216},
+        "maxLogEntries": {"type": "integer", "minimum": 1, "maximum": 1024},
+        "maxLogLineBytes": {"type": "integer", "minimum": 128, "maximum": 16384},
+        "maxPendingRequestsPerServer": {"type": "integer", "minimum": 1, "maximum": 64},
+        "maxConcurrentCalls": {"type": "integer", "minimum": 1, "maximum": 32},
+        "startupTimeoutMs": {"type": "integer", "minimum": 10, "maximum": 30000},
+        "requestTimeoutMs": {"type": "integer", "minimum": 10, "maximum": 120000},
+        "shutdownTimeoutMs": {"type": "integer", "minimum": 10, "maximum": 5000},
+        "cancellationGraceMs": {"type": "integer", "minimum": 1, "maximum": 2000},
+        "maxRestarts": {"type": "integer", "minimum": 0, "maximum": 8},
+        "backoffInitialMs": {"type": "integer", "minimum": 1, "maximum": 5000},
+        "backoffMaxMs": {"type": "integer", "minimum": 1, "maximum": 60000}
+      }
+    },
+    "servers": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[a-z][a-z0-9-]{0,31}$"},
+      "additionalProperties": {"$ref": "#/$defs/server"}
+    },
+    "trustedProjects": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command"],
+      "properties": {
+        "transport": {"const": "stdio"},
+        "label": {"type": "string", "minLength": 1, "maxLength": 64},
+        "command": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "args": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"type": "string", "maxLength": 16384}
+        },
+        "cwd": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "env": {
+          "type": "object",
+          "maxProperties": 32,
+          "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+          "additionalProperties": {"type": "string"}
+        },
+        "enabled": {"type": "boolean"},
+        "required": {"type": "boolean"},
+        "startupTimeoutMs": {"type": "integer", "minimum": 10, "maximum": 30000},
+        "requestTimeoutMs": {"type": "integer", "minimum": 10, "maximum": 120000},
+        "maxRestarts": {"type": "integer", "minimum": 0, "maximum": 8}
+      }
+    }
+  }
+}

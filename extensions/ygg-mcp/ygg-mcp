@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Self-contained launcher for the bundled ygg-mcp extension."""
+
+from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parent
+# Release bundles carry the exact dependency-free SDK wire implementation they
+# were tested with. No install-time pip invocation or ambient site package is
+# required.
+sys.path.insert(0, str(ROOT / "vendor"))
+sys.path.insert(0, str(ROOT))
+
+from ygg_mcp.runtime import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

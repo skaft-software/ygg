@@ -33,7 +33,9 @@ use ygg_agent::extension_process::{
     ToolRenderSegment, EXTENSION_API_VERSION_0_1, EXTENSION_FEATURE_DYNAMIC_TOOLS,
     EXTENSION_MANIFEST_FILENAME,
 };
-use ygg_agent::{Agent, ExtensionHost, ExtensionPolicyDecision, Session};
+use ygg_agent::{
+    Agent, ExtensionHost, ExtensionPolicyDecision, ExtensionPresentationSnapshot, Session,
+};
 use ygg_ai::{AssistantMessage, AssistantPart, Message, Model, ReasoningConfig, ToolCallId};
 
 use crate::app::model_supports_ultra;
@@ -254,6 +256,21 @@ pub struct ExtensionSummary {
     pub ui: Vec<ExtensionUiSurface>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ExtensionPresentationView {
+    /// Manifest-bound extension that owns this state.
+    pub extension: String,
+    /// Active process generation; stale generations are discarded.
+    pub generation: u64,
+    /// Host-created process-instance fence. This prevents a replacement
+    /// process whose generation counter restarted from accepting stale actions.
+    pub extension_instance_id: String,
+    /// Host-derived durable session owner for frontend isolation.
+    pub resource_owner: Option<String>,
+    /// Complete monotonic semantic snapshot.
+    pub snapshot: ExtensionPresentationSnapshot,
+}
+
 #[derive(Default)]
 struct BoundedDiagnostics {
     entries: VecDeque<String>,
@@ -393,12 +410,92 @@ fn admit_context(
     }
 }
 
+fn admit_presentation_owner(
+    published: Option<ygg_agent::extension_process::ExtensionResourceOwner>,
+    active_owner: Option<&str>,
+) -> Result<Option<String>, String> {
+    let published = published.map(|owner| owner.session_id);
+    if published.is_some() && published.as_deref() != active_owner {
+        return Err("discarded semantic presentation for another resource owner".into());
+    }
+    Ok(published)
+}
+
+fn reduce_presentation_update(
+    presentations: &mut BTreeMap<String, ExtensionPresentationView>,
+    extension: String,
+    active_generation: Option<u64>,
+    extension_instance_id: String,
+    resource_owner: Option<String>,
+    generation: u64,
+    snapshot: ExtensionPresentationSnapshot,
+) -> Result<String, String> {
+    if active_generation != Some(generation) {
+        return Err(format!(
+            "discarded semantic presentation from stale generation {generation}"
+        ));
+    }
+    if presentations
+        .get(&extension)
+        .is_some_and(|view| view.extension_instance_id != extension_instance_id)
+    {
+        presentations.remove(&extension);
+    }
+    if presentations.get(&extension).is_some_and(|view| {
+        view.generation == generation && view.resource_owner.is_some() && resource_owner.is_none()
+    }) {
+        return Err(
+            "discarded process-scoped semantic presentation while owner-scoped state is active"
+                .into(),
+        );
+    }
+    if presentations
+        .get(&extension)
+        .is_some_and(|view| view.resource_owner != resource_owner)
+    {
+        presentations.remove(&extension);
+    }
+    if presentations.get(&extension).is_some_and(|view| {
+        view.generation > generation
+            || (view.generation == generation && view.snapshot.revision >= snapshot.revision)
+    }) {
+        return Err(format!(
+            "discarded stale semantic presentation revision {} for generation {generation}",
+            snapshot.revision
+        ));
+    }
+    let compact = snapshot
+        .status
+        .as_ref()
+        .map(|status| status.label.clone())
+        .or_else(|| {
+            snapshot
+                .activities
+                .last()
+                .map(|activity| activity.summary.clone())
+        })
+        .unwrap_or_else(|| "presentation updated".to_owned());
+    presentations.insert(
+        extension.clone(),
+        ExtensionPresentationView {
+            extension,
+            generation,
+            extension_instance_id,
+            resource_owner,
+            snapshot,
+        },
+    );
+    Ok(compact)
+}
+
 pub struct ExecutableExtensions {
     processes: Vec<ExtensionProcess>,
     receivers: Vec<broadcast::Receiver<ExtensionEvent>>,
     summaries: Vec<ExtensionSummary>,
     diagnostics: BoundedDiagnostics,
     pending_context: PendingContext,
+    presentations: BTreeMap<String, ExtensionPresentationView>,
+    presentation_dirty: bool,
     background_tx: mpsc::Sender<ExtensionBackgroundUpdate>,
     background_rx: mpsc::Receiver<ExtensionBackgroundUpdate>,
     status_generation: u64,
@@ -594,6 +691,8 @@ impl Default for ExecutableExtensions {
             summaries: Vec::new(),
             diagnostics: BoundedDiagnostics::default(),
             pending_context: PendingContext::default(),
+            presentations: BTreeMap::new(),
+            presentation_dirty: false,
             background_tx,
             background_rx,
             status_generation: 0,
@@ -1077,6 +1176,28 @@ impl ExecutableExtensions {
             .collect()
     }
 
+    /// Returns the manifest identity that owns one registered slash command.
+    pub fn command_owner(&self, command: &str) -> Option<String> {
+        self.processes.iter().find_map(|process| {
+            process
+                .contributions()
+                .commands
+                .iter()
+                .any(|definition| definition.name == command)
+                .then(|| process.descriptor().manifest.name.clone())
+        })
+    }
+
+    /// Renders one extension's latest host-owned presentation fallback.
+    pub fn presentation_text_for(&mut self, extension: &str) -> Option<String> {
+        let _ = self.drain_events();
+        let view = self
+            .presentation_views()
+            .into_iter()
+            .find(|view| view.extension == extension)?;
+        Some(format_presentation_views(&[view]))
+    }
+
     pub fn status_summary(&self) -> String {
         let ready = self
             .summaries()
@@ -1126,6 +1247,76 @@ impl ExecutableExtensions {
                 .collect();
         }
         summaries
+    }
+
+    /// Returns and clears the live-presentation repaint marker.
+    pub fn take_presentation_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.presentation_dirty)
+    }
+
+    /// Compact live activity/tree rows for the interactive shell chrome.
+    pub fn presentation_activity_lines(&self) -> Vec<String> {
+        compact_presentation_activity_lines(&self.presentation_views())
+    }
+
+    /// Returns the latest accepted semantic state for each running extension.
+    pub fn presentation_views(&self) -> Vec<ExtensionPresentationView> {
+        self.presentations
+            .values()
+            .filter(|view| {
+                (view.resource_owner.is_none()
+                    || view.resource_owner.as_deref() == self.resource_owner.as_deref())
+                    && self.processes.iter().any(|process| {
+                        process.descriptor().manifest.name == view.extension
+                            && process.is_running()
+                            && process.health_snapshot().generation == view.generation
+                            && process.extension_instance_id() == view.extension_instance_id
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Returns the exact path-free extension principal that issued a current
+    /// owner-scoped delegated-session reference. Resolution remains separately
+    /// parent- and principal-bound in `Agent`.
+    pub fn presentation_session_reference_principal(&self, reference: &str) -> Option<String> {
+        let matches = |references: &[ygg_agent::ExtensionPresentationReference]| {
+            references.iter().any(|candidate| {
+                candidate.kind == ygg_agent::ExtensionPresentationReferenceKind::Session
+                    && candidate.id == reference
+            })
+        };
+        let view = self.presentation_views().into_iter().find(|view| {
+            view.snapshot
+                .activities
+                .iter()
+                .any(|activity| matches(&activity.references))
+                || view.snapshot.collection.as_ref().is_some_and(|collection| {
+                    collection
+                        .nodes
+                        .iter()
+                        .any(|node| matches(&node.references))
+                        || collection
+                            .detail
+                            .as_ref()
+                            .is_some_and(|detail| matches(&detail.references))
+                })
+        })?;
+        self.processes
+            .iter()
+            .find(|process| {
+                process.descriptor().manifest.name == view.extension
+                    && process.extension_instance_id() == view.extension_instance_id
+                    && process.health_snapshot().generation == view.generation
+            })
+            .map(ExtensionProcess::agent_session_principal)
+    }
+
+    /// Drains pending extension events and renders the generic headless fallback.
+    pub fn presentation_text(&mut self) -> String {
+        let _ = self.drain_events();
+        format_presentation_views(&self.presentation_views())
     }
 
     pub fn inspect_text(&mut self) -> String {
@@ -1184,6 +1375,12 @@ impl ExecutableExtensions {
                     lines.push(format!("  ui: {:?}", extension.ui));
                 }
             }
+        }
+        let presentation = self.presentation_text();
+        if !presentation.is_empty() {
+            lines.push(String::new());
+            lines.push("Extension activity".to_owned());
+            lines.push(presentation);
         }
         if !self.diagnostics.is_empty() {
             lines.push(String::new());
@@ -1265,7 +1462,7 @@ impl ExecutableExtensions {
         let mut rejected_context = Vec::new();
 
         for process in &self.processes {
-            let execution = process.current_context();
+            let execution = extension_execution_context(process, self.resource_owner.as_deref());
             if process
                 .contributions()
                 .hooks
@@ -1379,20 +1576,20 @@ impl ExecutableExtensions {
         let mut messages = Vec::new();
         let mut queued_context = Vec::new();
         for process in &self.processes {
-            if process.api_version() != EXTENSION_API_VERSION_0_1
-                || !process
-                    .contributions()
-                    .hooks
-                    .contains(&ExtensionHook::AfterResponse)
+            if !process
+                .contributions()
+                .hooks
+                .contains(&ExtensionHook::AfterResponse)
             {
                 continue;
             }
+            let execution = extension_execution_context(process, self.resource_owner.as_deref());
             match tokio::time::timeout(
                 AFTER_RESPONSE_RPC_DEADLINE,
                 process.run_hook(
                     ExtensionHook::AfterResponse,
                     after_response_hook_payload(response),
-                    process.current_context(),
+                    execution,
                 ),
             )
             .await
@@ -1429,8 +1626,119 @@ impl ExecutableExtensions {
         messages
     }
 
+    pub async fn execute_presentation_action_with_confirmation<H>(
+        &mut self,
+        extension: &str,
+        action_id: &str,
+        confirmations: &mut H,
+    ) -> anyhow::Result<String>
+    where
+        H: ExtensionConfirmationHandler + ?Sized,
+    {
+        let action = self
+            .presentation_views()
+            .into_iter()
+            .find(|view| view.extension == extension)
+            .and_then(|view| {
+                view.snapshot
+                    .actions
+                    .into_iter()
+                    .find(|action| action.id == action_id)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                "extension presentation action {extension:?}/{action_id:?} is unavailable or stale"
+            )
+            })?;
+        if action.destructive {
+            let request = ConfirmationRequest {
+                parent_request_id: None,
+                prompt: format!("Run {}?", action.label),
+                detail: Some(format!("Declared by extension {extension:?}")),
+                destructive: true,
+                default: false,
+            };
+            if !confirmations.confirm(extension, &request).await? {
+                anyhow::bail!("extension presentation action was denied");
+            }
+        }
+        self.execute_command_with_confirmation_scoped(
+            Some(extension),
+            &action.command,
+            action.arguments,
+            confirmations,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("extension presentation action routed to an unavailable command")
+        })
+    }
+
+    /// Executes an authenticated Serve action with one command-scoped approval.
+    #[cfg(feature = "serve")]
+    pub async fn execute_presentation_action_for_serve(
+        &mut self,
+        extension: &str,
+        expected_extension_instance_id: &str,
+        expected_generation: u64,
+        expected_revision: u64,
+        action_id: &str,
+        confirmed: bool,
+    ) -> anyhow::Result<String> {
+        let action = self
+            .presentation_views()
+            .into_iter()
+            .find(|view| {
+                view.extension == extension
+                    && view.extension_instance_id == expected_extension_instance_id
+                    && view.generation == expected_generation
+                    && view.snapshot.revision == expected_revision
+            })
+            .and_then(|view| {
+                view.snapshot
+                    .actions
+                    .into_iter()
+                    .find(|action| action.id == action_id)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                "extension presentation action {extension:?}/{action_id:?} is unavailable or stale"
+            )
+            })?;
+        if confirmed && !action.destructive {
+            anyhow::bail!("non-destructive extension action cannot carry approval");
+        }
+        if action.destructive && !confirmed {
+            anyhow::bail!("extension presentation action requires explicit confirmation");
+        }
+        self.execute_command_headless_scoped(
+            Some(extension),
+            &action.command,
+            action.arguments,
+            usize::from(action.destructive && confirmed),
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("extension presentation action routed to an unavailable command")
+        })
+    }
+
     pub async fn execute_command_with_confirmation<H>(
         &mut self,
+        name: &str,
+        arguments: Vec<String>,
+        confirmations: &mut H,
+    ) -> anyhow::Result<Option<String>>
+    where
+        H: ExtensionConfirmationHandler + ?Sized,
+    {
+        self.execute_command_with_confirmation_scoped(None, name, arguments, confirmations)
+            .await
+    }
+
+    async fn execute_command_with_confirmation_scoped<H>(
+        &mut self,
+        extension: Option<&str>,
         name: &str,
         arguments: Vec<String>,
         confirmations: &mut H,
@@ -1442,17 +1750,20 @@ impl ExecutableExtensions {
             .processes
             .iter()
             .find(|process| {
-                process
-                    .contributions()
-                    .commands
-                    .iter()
-                    .any(|command| command.name == name)
+                extension.is_none_or(|extension| process.descriptor().manifest.name == extension)
+                    && process
+                        .contributions()
+                        .commands
+                        .iter()
+                        .any(|command| command.name == name)
             })
             .cloned()
         else {
             return Ok(None);
         };
         let extension_name = process.descriptor().manifest.name.clone();
+        let execution_context =
+            extension_execution_context(&process, self.resource_owner.as_deref());
         let mut events = process.subscribe();
         let output = {
             let legacy_uncorrelated = process.api_version() == EXTENSION_API_VERSION_0_1;
@@ -1462,7 +1773,7 @@ impl ExecutableExtensions {
             let mut execution = Box::pin(process.execute_command_controlled(
                 name.to_owned(),
                 arguments,
-                process.current_context(),
+                execution_context,
                 request_started,
             ));
             let mut events_open = true;
@@ -1581,21 +1892,36 @@ impl ExecutableExtensions {
         name: &str,
         arguments: Vec<String>,
     ) -> anyhow::Result<Option<String>> {
+        self.execute_command_headless_scoped(None, name, arguments, 0)
+            .await
+    }
+
+    #[cfg(any(feature = "serve", test))]
+    async fn execute_command_headless_scoped(
+        &mut self,
+        extension: Option<&str>,
+        name: &str,
+        arguments: Vec<String>,
+        mut approval_budget: usize,
+    ) -> anyhow::Result<Option<String>> {
         let Some(process) = self
             .processes
             .iter()
             .find(|process| {
-                process
-                    .contributions()
-                    .commands
-                    .iter()
-                    .any(|command| command.name == name)
+                extension.is_none_or(|extension| process.descriptor().manifest.name == extension)
+                    && process
+                        .contributions()
+                        .commands
+                        .iter()
+                        .any(|command| command.name == name)
             })
             .cloned()
         else {
             return Ok(None);
         };
         let extension_name = process.descriptor().manifest.name.clone();
+        let execution_context =
+            extension_execution_context(&process, self.resource_owner.as_deref());
         let mut events = process.subscribe();
         let (output, confirmation_denied) = {
             let mut confirmation_denied = false;
@@ -1607,7 +1933,7 @@ impl ExecutableExtensions {
                 let mut execution = Box::pin(process.execute_command_controlled(
                     name.to_owned(),
                     arguments,
-                    process.current_context(),
+                    execution_context,
                     request_started,
                 ));
                 let mut events_open = true;
@@ -1630,12 +1956,17 @@ impl ExecutableExtensions {
                                 && parent_request_id.is_none()
                                 && operation.is_some_and(|operation| operation.generation == generation)) => {
                                 if !process.confirmation_answered(&request_id, generation) {
-                                    confirmation_denied = true;
+                                    let confirmed = approval_budget > 0;
+                                    if confirmed {
+                                        approval_budget -= 1;
+                                    } else {
+                                        confirmation_denied = true;
+                                    }
                                     process
                                         .respond_to_confirmation(
                                             request_id,
                                             generation,
-                                            ConfirmationResponse { confirmed: false },
+                                            ConfirmationResponse { confirmed },
                                         )
                                         .await?;
                                 }
@@ -1800,6 +2131,25 @@ impl ExecutableExtensions {
                 Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
                     break;
                 }
+            }
+        }
+        if let Some((extension, status)) =
+            self.presentations.iter().find_map(|(extension, view)| {
+                view.snapshot
+                    .status
+                    .as_ref()
+                    .map(|status| (extension, status))
+            })
+        {
+            let ui = updates.ui.get_or_insert_with(ExtensionUiSnapshot::default);
+            if ui.status.is_none() {
+                ui.status = Some((
+                    format!("{extension} · {}", status.label),
+                    Some(format!(
+                        "extension.presentation.{}",
+                        format!("{:?}", status.state).to_lowercase()
+                    )),
+                ));
             }
         }
         updates
@@ -2015,6 +2365,47 @@ impl ExecutableExtensions {
                     Ok(ExtensionEvent::StatusContributed { contribution }) => {
                         messages.push(format!("[{name}] {}", contribution.text));
                     }
+                    Ok(ExtensionEvent::PresentationUpdated {
+                        generation,
+                        resource_owner,
+                        snapshot,
+                    }) => {
+                        let published_owner = match admit_presentation_owner(
+                            resource_owner,
+                            self.resource_owner.as_deref(),
+                        ) {
+                            Ok(owner) => owner,
+                            Err(error) => {
+                                self.diagnostics.push(format!("warning: {name}: {error}"));
+                                remaining -= 1;
+                                receiver_budget -= 1;
+                                continue;
+                            }
+                        };
+                        let active_generation = process
+                            .as_ref()
+                            .map(ExtensionProcess::health_snapshot)
+                            .map(|health| health.generation);
+                        let extension_instance_id = process
+                            .as_ref()
+                            .expect("extension event receivers align with processes")
+                            .extension_instance_id()
+                            .to_owned();
+                        match reduce_presentation_update(
+                            &mut self.presentations,
+                            name.clone(),
+                            active_generation,
+                            extension_instance_id,
+                            published_owner,
+                            generation,
+                            snapshot,
+                        ) {
+                            Ok(_compact) => self.presentation_dirty = true,
+                            Err(error) => {
+                                self.diagnostics.push(format!("warning: {name}: {error}"))
+                            }
+                        }
+                    }
                     Ok(ExtensionEvent::Diagnostic { message }) => {
                         self.diagnostics.push(format!("warning: {name}: {message}"));
                     }
@@ -2091,6 +2482,19 @@ impl ExecutableExtensions {
             visited += 1;
         }
         self.event_drain_cursor = (start + visited.max(1)) % receiver_count;
+        let active_owner = self.resource_owner.as_deref();
+        let presentation_count = self.presentations.len();
+        self.presentations.retain(|name, view| {
+            (view.resource_owner.is_none() || view.resource_owner.as_deref() == active_owner)
+                && self.processes.iter().any(|process| {
+                    process.descriptor().manifest.name == *name
+                        && process.is_running()
+                        && process.health_snapshot().generation == view.generation
+                })
+        });
+        if self.presentations.len() != presentation_count {
+            self.presentation_dirty = true;
+        }
         self.schedule_confirmation_denials();
         self.schedule_input_cancellations();
         messages
@@ -2331,6 +2735,169 @@ fn join_around(prefix: Vec<String>, center: String, suffix: Vec<String>) -> Stri
         .join("\n\n")
 }
 
+fn compact_presentation_activity_lines(views: &[ExtensionPresentationView]) -> Vec<String> {
+    const MAX_ROWS: usize = 6;
+    let mut lines = Vec::new();
+    for view in views {
+        if lines.len() >= MAX_ROWS {
+            break;
+        }
+        let label = view
+            .snapshot
+            .status
+            .as_ref()
+            .map(|status| status.label.as_str())
+            .unwrap_or("activity");
+        lines.push(format!("{}  {label}", view.extension));
+        if let Some(collection) = &view.snapshot.collection {
+            let parents = collection
+                .nodes
+                .iter()
+                .map(|node| (node.id.as_str(), node.parent_id.as_deref()))
+                .collect::<BTreeMap<_, _>>();
+            for node in &collection.nodes {
+                if lines.len() >= MAX_ROWS {
+                    break;
+                }
+                let mut depth = 0usize;
+                let mut parent = node.parent_id.as_deref();
+                while let Some(id) = parent {
+                    depth = depth.saturating_add(1);
+                    parent = parents.get(id).copied().flatten();
+                }
+                let state = format!("{:?}", node.state).to_lowercase();
+                let branch = if depth == 0 { "├─" } else { "└─" };
+                lines.push(format!(
+                    "{}{} {}  {state}",
+                    "  ".repeat(depth),
+                    branch,
+                    node.label
+                ));
+            }
+        } else if let Some(activity) = view.snapshot.activities.last() {
+            let state = format!("{:?}", activity.state).to_lowercase();
+            lines.push(format!("├─ {}  {state}", activity.summary));
+        }
+    }
+    if !lines.is_empty() && lines.len() < MAX_ROWS {
+        lines.push("Enter /extensions to inspect details or invoke an action".into());
+    }
+    lines
+}
+
+fn format_presentation_views(views: &[ExtensionPresentationView]) -> String {
+    let mut lines = Vec::new();
+    for view in views {
+        lines.push(format!(
+            "[{}] generation {} · revision {}",
+            view.extension, view.generation, view.snapshot.revision
+        ));
+        if let Some(status) = &view.snapshot.status {
+            let state = format!("{:?}", status.state).to_lowercase();
+            lines.push(format!("  status: {state} · {}", status.label));
+            if let Some(detail) = &status.detail {
+                lines.push(format!("    {detail}"));
+            }
+        }
+        for activity in &view.snapshot.activities {
+            let state = format!("{:?}", activity.state).to_lowercase();
+            let provenance = activity
+                .provenance
+                .as_deref()
+                .map(|value| format!(" · {value}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  activity {}: {state} · {}{provenance}",
+                activity.kind, activity.summary
+            ));
+            lines.extend(
+                activity
+                    .references
+                    .iter()
+                    .map(|reference| format_presentation_reference("    ", reference)),
+            );
+        }
+        if let Some(collection) = &view.snapshot.collection {
+            lines.push(format!("  {}:", collection.title));
+            let parents = collection
+                .nodes
+                .iter()
+                .map(|node| (node.id.as_str(), node.parent_id.as_deref()))
+                .collect::<BTreeMap<_, _>>();
+            for node in &collection.nodes {
+                let mut depth = 0usize;
+                let mut parent = node.parent_id.as_deref();
+                while let Some(id) = parent {
+                    depth = depth.saturating_add(1);
+                    parent = parents.get(id).copied().flatten();
+                }
+                let state = format!("{:?}", node.state).to_lowercase();
+                let secondary = node
+                    .secondary
+                    .as_deref()
+                    .map(|value| format!(" · {value}"))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "    {}- {} · {state}{secondary}",
+                    "  ".repeat(depth),
+                    node.label
+                ));
+                lines.extend(
+                    node.references
+                        .iter()
+                        .map(|reference| format_presentation_reference("      ", reference)),
+                );
+            }
+            if let Some(detail) = &collection.detail {
+                lines.push(format!("  detail: {}", detail.title));
+                lines.extend(detail.body.lines().map(|line| format!("    {line}")));
+                lines.extend(
+                    detail
+                        .references
+                        .iter()
+                        .map(|reference| format_presentation_reference("    ", reference)),
+                );
+            }
+        }
+        for action in &view.snapshot.actions {
+            lines.push(format!(
+                "  action {}: /{}{}{}",
+                action.label,
+                action.command,
+                if action.arguments.is_empty() { "" } else { " " },
+                action.arguments.join(" ")
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_presentation_reference(
+    indent: &str,
+    reference: &ygg_agent::ExtensionPresentationReference,
+) -> String {
+    let kind = match reference.kind {
+        ygg_agent::ExtensionPresentationReferenceKind::Session => "session",
+        ygg_agent::ExtensionPresentationReferenceKind::Artifact => "artifact",
+        ygg_agent::ExtensionPresentationReferenceKind::Resource => "resource",
+        ygg_agent::ExtensionPresentationReferenceKind::Url => "source",
+    };
+    let label = reference
+        .label
+        .as_deref()
+        .map(|label| format!("{label} · "))
+        .unwrap_or_default();
+    let value = format!("{indent}{kind}: {label}{}", reference.id);
+    if reference.kind == ygg_agent::ExtensionPresentationReferenceKind::Session {
+        format!(
+            "{value}\n{indent}  inspect: /extensions inspect {}",
+            reference.id
+        )
+    } else {
+        value
+    }
+}
+
 fn format_notification(
     extension: &str,
     notification: &ygg_agent::extension_process::ExtensionNotification,
@@ -2343,6 +2910,16 @@ fn format_notification(
     format!(
         "[{extension} {:?}]{title} {}",
         notification.level, notification.message
+    )
+}
+
+fn extension_execution_context(
+    process: &ExtensionProcess,
+    resource_owner: Option<&str>,
+) -> ygg_agent::extension_process::ExtensionExecutionContext {
+    resource_owner.map_or_else(
+        || process.current_context(),
+        |owner| process.current_context_for_resource_owner(owner.to_owned()),
     )
 }
 
@@ -2401,6 +2978,149 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_presentation_reducer_fences_revision_generation_and_owner() {
+        let owner = ygg_agent::extension_process::ExtensionResourceOwner {
+            session_id: "owner-a".into(),
+            extension_instance_id: "instance-a".into(),
+            process_generation: 3,
+        };
+        assert_eq!(
+            admit_presentation_owner(Some(owner.clone()), Some("owner-a")).unwrap(),
+            Some("owner-a".into())
+        );
+        assert!(admit_presentation_owner(Some(owner), Some("owner-b"))
+            .unwrap_err()
+            .contains("another resource owner"));
+        assert_eq!(
+            admit_presentation_owner(None, Some("owner-a")).unwrap(),
+            None
+        );
+
+        let snapshot: ExtensionPresentationSnapshot =
+            serde_json::from_str(include_str!("../fixtures/extension-presentation.json")).unwrap();
+        snapshot.validate(&["workers".into()]).unwrap();
+        let mut presentations = BTreeMap::new();
+        assert_eq!(
+            reduce_presentation_update(
+                &mut presentations,
+                "fixture-extension".into(),
+                Some(3),
+                "instance-a".into(),
+                Some("owner-a".into()),
+                3,
+                snapshot.clone(),
+            )
+            .unwrap(),
+            "1 worker"
+        );
+        let activity_lines = compact_presentation_activity_lines(
+            &presentations.values().cloned().collect::<Vec<_>>(),
+        );
+        assert!(activity_lines
+            .iter()
+            .any(|line| line.contains("test-review")));
+        assert!(activity_lines.len() <= 6);
+        let rendered =
+            format_presentation_views(&presentations.values().cloned().collect::<Vec<_>>());
+        assert!(rendered.contains("Reviewing tests"));
+        assert!(rendered.contains("https://example.com/docs/extensions"));
+        assert!(rendered.contains("session: Worker transcript · session-worker-1"));
+
+        let mut process_scoped = snapshot.clone();
+        process_scoped.revision += 1;
+        assert!(reduce_presentation_update(
+            &mut presentations,
+            "fixture-extension".into(),
+            Some(3),
+            "instance-a".into(),
+            None,
+            3,
+            process_scoped,
+        )
+        .unwrap_err()
+        .contains("owner-scoped state is active"));
+        assert_eq!(
+            presentations["fixture-extension"].resource_owner.as_deref(),
+            Some("owner-a")
+        );
+
+        assert!(reduce_presentation_update(
+            &mut presentations,
+            "fixture-extension".into(),
+            Some(3),
+            "instance-a".into(),
+            Some("owner-a".into()),
+            3,
+            snapshot.clone(),
+        )
+        .unwrap_err()
+        .contains("stale semantic presentation revision"));
+
+        let mut restarted = snapshot;
+        restarted.revision = 0;
+        reduce_presentation_update(
+            &mut presentations,
+            "fixture-extension".into(),
+            Some(4),
+            "instance-a".into(),
+            Some("owner-a".into()),
+            4,
+            restarted,
+        )
+        .unwrap();
+        assert_eq!(presentations["fixture-extension"].generation, 4);
+        assert_eq!(presentations["fixture-extension"].snapshot.revision, 0);
+
+        let owner_reset: ExtensionPresentationSnapshot =
+            serde_json::from_str(include_str!("../fixtures/extension-presentation.json")).unwrap();
+        reduce_presentation_update(
+            &mut presentations,
+            "fixture-extension".into(),
+            Some(4),
+            "instance-a".into(),
+            Some("owner-b".into()),
+            4,
+            owner_reset,
+        )
+        .unwrap();
+        assert_eq!(
+            presentations["fixture-extension"].resource_owner.as_deref(),
+            Some("owner-b")
+        );
+
+        let error = reduce_presentation_update(
+            &mut presentations,
+            "fixture-extension".into(),
+            Some(4),
+            "instance-a".into(),
+            Some("owner-b".into()),
+            3,
+            serde_json::from_str(include_str!("../fixtures/extension-presentation.json")).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("stale generation"));
+
+        let mut replacement: ExtensionPresentationSnapshot =
+            serde_json::from_str(include_str!("../fixtures/extension-presentation.json")).unwrap();
+        replacement.revision = 0;
+        reduce_presentation_update(
+            &mut presentations,
+            "fixture-extension".into(),
+            Some(4),
+            "instance-b".into(),
+            Some("owner-b".into()),
+            4,
+            replacement,
+        )
+        .unwrap();
+        assert_eq!(
+            presentations["fixture-extension"].extension_instance_id,
+            "instance-b"
+        );
+        assert_eq!(presentations["fixture-extension"].snapshot.revision, 0);
+    }
 
     fn write_extension_manifest(directory: &Path, name: &str, description: &str) {
         std::fs::create_dir_all(directory).unwrap();
@@ -3115,6 +3835,268 @@ hooks = ["before_prompt", "after_response"]
                 "params": {},
             })
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_0_2_prompt_hooks_receive_owner_and_success_response_content() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("hook-v02.jsonl");
+        let fixture = temp.path().join("hook-v02.sh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+log=$1
+request_id() { sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'; }
+read_request() { IFS= read -r line || exit 91; printf '%s\n' "$line" >> "$log"; }
+read_request
+id=$(printf '%s' "$line" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{"api_version":"0.2","tools":[],"commands":[],"protocol":{"version":"0.2","features":["request_cancellation","content_parts"],"limits":{"max_concurrent_requests":1}}}}\n' "$id"
+read_request
+id=$(printf '%s' "$line" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{"disposition":{"action":"continue"},"context":[],"notifications":[]}}\n' "$id"
+read_request
+id=$(printf '%s' "$line" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{"disposition":{"action":"continue"},"context":[],"notifications":[]}}\n' "$id"
+read_request
+id=$(printf '%s' "$line" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+        let mut manifest = ExtensionManifest::parse(
+            r#"
+name = "hook-v02"
+version = "0.1.0"
+api_version = "0.2"
+[entrypoint]
+command = "hook-v02.sh"
+[contributes]
+hooks = ["before_prompt", "after_response"]
+"#,
+        )
+        .unwrap();
+        manifest.entrypoint.args = vec![log_path.to_string_lossy().into_owned()];
+        let process = ExtensionProcess::start(
+            DiscoveredExtension {
+                manifest,
+                manifest_path: temp.path().join(EXTENSION_MANIFEST_FILENAME),
+                source: ExtensionSource::Explicit,
+                activation: ygg_agent::extension_process::ExtensionActivation {
+                    enabled: true,
+                    trust: ExtensionTrust::Trusted,
+                },
+            },
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .unwrap();
+        let mut extensions = ExecutableExtensions::default();
+        extensions.resource_owner = Some("owner-v02".into());
+        extensions.receivers.push(process.subscribe());
+        extensions.processes.push(process.clone());
+        extensions
+            .compose_prompt("system", "user text".into())
+            .await
+            .unwrap();
+        extensions.after_response("assistant text").await;
+        extensions.shutdown().await;
+
+        let frames = std::fs::read_to_string(log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(frames[1]["params"]["hook"], "before_prompt");
+        assert_eq!(frames[1]["params"]["payload"]["prompt"], "user text");
+        assert_eq!(frames[2]["params"]["hook"], "after_response");
+        assert_eq!(frames[2]["params"]["payload"]["response"], "assistant text");
+        for frame in &frames[1..=2] {
+            let owner = &frame["params"]["context"]["resource_owner"];
+            assert_eq!(owner["session_id"], "owner-v02");
+            assert_eq!(owner["process_generation"], 1);
+            assert!(owner["extension_instance_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_0_2_command_parent_binds_owner_for_reverse_services() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("command-owner-v02.sh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+request_id() { sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'; }
+IFS= read -r initialize
+id=$(printf '%s' "$initialize" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{"api_version":"0.2","tools":[],"commands":[{"name":"owned","description":"Exercise an owner-bound reverse service","usage":"/owned"}],"protocol":{"version":"0.2","features":["request_cancellation","content_parts","artifacts"],"limits":{"max_concurrent_requests":1}}}}\n' "$id"
+IFS= read -r command
+parent=$(printf '%s' "$command" | request_id)
+printf '{"jsonrpc":"2.0","id":"artifact-child","method":"artifact/publish","params":{"parent_request_id":%s,"mime_type":"image/png","size":21,"sha256":"8c423f0980ff76637fe84cd6f9f8c63922b665c90e5608f37d995dca965f5fee","data":{"encoding":"base64","data":"iVBORw0KGgpvd25lci1maXh0dXJl"}}}\n' "$parent"
+IFS= read -r artifact
+case "$artifact" in
+  *'"id":"artifact-child"'*'"artifact_id"'*) ;;
+  *) exit 42 ;;
+esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"owner-bound artifact published","notifications":[],"context":[]}}\n' "$parent"
+IFS= read -r shutdown
+id=$(printf '%s' "$shutdown" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+        let manifest = ExtensionManifest::parse(
+            r#"
+name = "command-owner-v02"
+version = "0.1.0"
+api_version = "0.2"
+[entrypoint]
+command = "command-owner-v02.sh"
+[contributes]
+commands = ["owned"]
+"#,
+        )
+        .unwrap();
+        let process = ExtensionProcess::start(
+            DiscoveredExtension {
+                manifest,
+                manifest_path: temp.path().join(EXTENSION_MANIFEST_FILENAME),
+                source: ExtensionSource::Explicit,
+                activation: ygg_agent::extension_process::ExtensionActivation {
+                    enabled: true,
+                    trust: ExtensionTrust::Trusted,
+                },
+            },
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .unwrap();
+        let mut extensions = ExecutableExtensions::default();
+        extensions.resource_owner = Some("owner-command-v02".into());
+        extensions.receivers.push(process.subscribe());
+        extensions.processes.push(process.clone());
+        let mut confirmations = RecordingConfirmationHandler::default();
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            extensions.execute_command_with_confirmation("owned", Vec::new(), &mut confirmations),
+        )
+        .await
+        .expect("owner-bound artifact publication timed out")
+        .unwrap()
+        .unwrap();
+        assert_eq!(output, "owner-bound artifact published");
+        assert!(confirmations.calls.is_empty());
+        assert!(process.shutdown().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn presentation_action_routes_duplicate_command_name_to_owning_process() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("duplicate-command.sh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+label=$1
+request_id() { sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'; }
+IFS= read -r initialize
+id=$(printf '%s' "$initialize" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{"api_version":"0.1","tools":[],"commands":[{"name":"shared","description":"Shared fixture command","usage":"/shared"}]}}\n' "$id"
+IFS= read -r command
+id=$(printf '%s' "$command" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"%s","notifications":[],"context":[]}}\n' "$id" "$label"
+IFS= read -r shutdown
+id=$(printf '%s' "$shutdown" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+
+        let mut processes = Vec::new();
+        for name in ["first-owner", "second-owner"] {
+            let mut manifest = ExtensionManifest::parse(&format!(
+                r#"
+name = {name:?}
+version = "0.1.0"
+api_version = "0.1"
+[entrypoint]
+command = "duplicate-command.sh"
+[contributes]
+commands = ["shared"]
+"#
+            ))
+            .unwrap();
+            manifest.entrypoint.args = vec![name.into()];
+            processes.push(
+                ExtensionProcess::start(
+                    DiscoveredExtension {
+                        manifest,
+                        manifest_path: temp.path().join(format!("{name}.toml")),
+                        source: ExtensionSource::Explicit,
+                        activation: ygg_agent::extension_process::ExtensionActivation {
+                            enabled: true,
+                            trust: ExtensionTrust::Trusted,
+                        },
+                    },
+                    ExtensionRuntimeConfig::new(temp.path()),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        let mut snapshot: ExtensionPresentationSnapshot =
+            serde_json::from_str(include_str!("../fixtures/extension-presentation.json")).unwrap();
+        snapshot.actions.truncate(1);
+        snapshot.actions[0].id = "route".into();
+        snapshot.actions[0].command = "shared".into();
+        snapshot.actions[0].arguments.clear();
+        snapshot.actions[0].destructive = false;
+        let generation = processes[1].health_snapshot().generation;
+        let extension_instance_id = processes[1].extension_instance_id().to_owned();
+        let mut extensions = ExecutableExtensions::default();
+        extensions.processes = processes;
+        extensions.presentations.insert(
+            "second-owner".into(),
+            ExtensionPresentationView {
+                extension: "second-owner".into(),
+                generation,
+                extension_instance_id,
+                resource_owner: None,
+                snapshot,
+            },
+        );
+        let mut confirmations = RecordingConfirmationHandler::default();
+        let output = extensions
+            .execute_presentation_action_with_confirmation(
+                "second-owner",
+                "route",
+                &mut confirmations,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, "second-owner");
+        assert!(confirmations.calls.is_empty());
+        extensions.shutdown().await;
     }
 
     #[tokio::test]

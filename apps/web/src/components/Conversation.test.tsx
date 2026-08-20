@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionDraftStore } from "../drafts";
@@ -576,6 +576,32 @@ describe("conversation composer", () => {
     expect(context).toHaveAttribute("data-compaction-active", "true");
     expect(context).toHaveAccessibleName(/documents 20,000/);
     expect(context).toHaveAccessibleName(/project files 30,000/);
+  });
+
+  it("renders delegated transcripts without a mutable composer", () => {
+    const session = structuredClone(fixtureSessions["session-live"]!);
+    const returnToParent = vi.fn();
+    session.sessionId = `agent-session:${"a".repeat(64)}`;
+    render(
+      <Conversation
+        session={session}
+        bootstrap={structuredClone(fixtureBootstrap)}
+        readOnly
+        onReturnToParent={returnToParent}
+        onSubmit={noOp}
+        onInterrupt={noOp}
+        onConfigure={noOp}
+        onResolveApproval={noOp}
+        onResolveUserInput={noOp}
+        onOpenOutput={vi.fn()}
+        onOpenSource={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("textbox", { name: "Message ygg" })).toBeNull();
+    expect(screen.getByText(/Read-only delegated session/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Return to parent" }));
+    expect(returnToParent).toHaveBeenCalledTimes(1);
   });
 
   it("replaces active retrying state with the terminal provider failure", () => {

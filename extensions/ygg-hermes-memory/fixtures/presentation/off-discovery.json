@@ -1,0 +1,53 @@
+{
+  "actions": [
+    {
+      "arguments": [
+        "trust",
+        "directory:offline",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "command": "memory",
+      "destructive": true,
+      "id": "trust:directory:offline",
+      "label": "Trust provider for this run"
+    }
+  ],
+  "activities": [],
+  "collection": {
+    "detail": {
+      "body": "Memory is off for this Ygg resource owner.\nEnvironment: fixture-env\nEnvironment state: compatible\nHermes contract: hermes-agent.MemoryProvider@0.20.1+7095e23eb2066fe9a2f93b99cdbfe0e2b5ece397\nDiscovery is metadata-only. Selecting a trusted provider is the first import/initialization boundary.",
+      "node_id": "off",
+      "references": [],
+      "title": "Memory off"
+    },
+    "kind": "list",
+    "nodes": [
+      {
+        "action_ids": [],
+        "id": "off",
+        "label": "Off",
+        "references": [],
+        "secondary": "No provider context, tools, or writes",
+        "state": "active"
+      },
+      {
+        "action_ids": [
+          "trust:directory:offline"
+        ],
+        "id": "directory:offline",
+        "label": "Offline recall",
+        "references": [],
+        "secondary": "1.0.0 \u00b7 directory \u00b7 network none \u00b7 storage local \u00b7 not trusted",
+        "state": "pending"
+      }
+    ],
+    "selected_node_id": "off",
+    "title": "Memory providers"
+  },
+  "revision": 1,
+  "status": {
+    "detail": "queue 0; prefetch none; sync none; contract hermes-agent.MemoryProvider@0.20.1+7095e23eb2066fe9a2f93b99cdbfe0e2b5ece397",
+    "label": "memory off",
+    "state": "empty"
+  }
+}

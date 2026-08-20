@@ -3066,6 +3066,7 @@ mod tests {
             },
             snapshot: SessionSnapshot {
                 session_id: id,
+                delegated_parent_session_id: None,
                 actor_generation: generation.max(1),
                 cursor: SessionCursor::zero(generation.max(1)),
                 durable_head: None,
@@ -3076,6 +3077,7 @@ mod tests {
                 authority,
                 context: ContextUsage::default(),
                 items: Vec::new(),
+                extension_presentations: Vec::new(),
                 pending_requests: Vec::new(),
                 sources: Vec::new(),
                 artifacts: Vec::new(),

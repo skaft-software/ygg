@@ -1,0 +1,16 @@
+{
+  "schema": "ygg.subagents.smoke-input.v1",
+  "run_label": "two-read-only-workers",
+  "findings": [
+    {"id": "owner-scope-gap", "accepted": true},
+    {"id": "restart-idempotency-gap", "accepted": true},
+    {"id": "restart-idempotency-gap", "accepted": true},
+    {"id": "shutdown-cleanup-gap", "accepted": true}
+  ],
+  "input_tokens": 9400,
+  "output_tokens": 1800,
+  "wall_time_ms": 39000,
+  "cpu_time_ms": 17100,
+  "peak_rss_bytes": 283115520,
+  "failure_classes": ["one_duplicate_finding"]
+}

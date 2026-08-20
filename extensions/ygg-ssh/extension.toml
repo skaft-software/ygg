@@ -1,0 +1,21 @@
+name = "ygg-ssh"
+version = "0.1.0"
+api_version = "0.2"
+requires_ygg = "=0.5.0"
+description = "Owner-fenced adapter for explicit authenticated OpenSSH aliases"
+
+[entrypoint]
+command = "ygg-ssh"
+
+[capabilities]
+filesystem = "unrestricted"
+process = true
+network = true
+environment = ["SSH_AUTH_SOCK"]
+
+[contributes]
+tools = ["ssh_status", "ssh_exec", "ssh_read", "ssh_write"]
+commands = ["ssh"]
+ui = ["status"]
+confirmations = true
+presentation = true

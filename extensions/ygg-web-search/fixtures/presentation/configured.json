@@ -1,0 +1,34 @@
+{
+  "schema": "ygg.web-search.presentation-fixture.v1",
+  "extension": "ygg-web-search",
+  "case": "configured_idle",
+  "notifications": [
+    {
+      "jsonrpc": "2.0",
+      "method": "presentation/update",
+      "params": {
+        "parent_request_id": 2,
+        "snapshot": {
+          "revision": 1,
+          "status": {
+            "state": "active",
+            "label": "web · SearXNG"
+          },
+          "activities": [],
+          "collection": null,
+          "actions": []
+        }
+      }
+    }
+  ],
+  "expected_snapshot": {
+    "revision": 1,
+    "status": {
+      "state": "active",
+      "label": "web · SearXNG"
+    },
+    "activities": [],
+    "collection": null,
+    "actions": []
+  }
+}

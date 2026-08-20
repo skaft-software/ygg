@@ -1,0 +1,23 @@
+name = "ygg-subagents"
+version = "0.1.0"
+api_version = "0.2"
+requires_ygg = "=0.5.0"
+description = "Bounded Claude Code-like background workers over host-owned Ygg agent sessions"
+
+[entrypoint]
+command = "ygg-subagents"
+
+[capabilities]
+# The extension process itself does not read the workspace, launch processes, or
+# use the network. Child permissions are inherited and enforced by Ygg's
+# agent_sessions service; this declaration does not pretend the shared cwd is an
+# isolation boundary.
+filesystem = "none"
+process = false
+network = false
+
+[contributes]
+tools = ["subagent_spawn", "subagent_status", "subagent_wait", "subagent_stop"]
+commands = ["subagents"]
+ui = ["status"]
+presentation = true

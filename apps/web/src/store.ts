@@ -769,6 +769,36 @@ export class YggStore {
     }
   }
 
+  async invokeExtensionAction(
+    extension: string,
+    extensionInstanceId: string,
+    generation: number,
+    revision: number,
+    action: string,
+    confirmed: boolean,
+    idempotencyKey: string = commandId(),
+  ): Promise<void> {
+    const session = this.selectedSession;
+    if (!session) throw new Error("No task is selected.");
+    const ack = await this.sendCommand({
+      id: idempotencyKey,
+      type: "extension.invokeAction",
+      sessionId: session.sessionId,
+      extension,
+      extensionInstanceId,
+      generation,
+      revision,
+      action,
+      confirmed,
+    });
+    if (!ack.accepted) {
+      throw rejectedCommandError(
+        ack,
+        "The ygg host rejected this extension action.",
+      );
+    }
+  }
+
   getRepositoryContext(projectId: string): Promise<RepositoryContextSnapshot> {
     return this.transport.getRepositoryContext(projectId);
   }

@@ -1406,6 +1406,11 @@ where
                             for message in executable_extensions.drain_events() {
                                 shell.notice(message);
                             }
+                            if executable_extensions.take_presentation_dirty() {
+                                shell.set_extension_activity(
+                                    executable_extensions.presentation_activity_lines(),
+                                );
+                            }
                         }
                     }
                     if let AgentEvent::TurnFinished {
@@ -1546,6 +1551,9 @@ fn request_extension_ui(shell: &mut InteractiveShell, app: &mut App) {
     for message in app.executable_extensions.drain_events() {
         shell.notice(message);
     }
+    if app.executable_extensions.take_presentation_dirty() {
+        shell.set_extension_activity(app.executable_extensions.presentation_activity_lines());
+    }
 }
 
 fn apply_extension_background(
@@ -1566,6 +1574,10 @@ fn apply_extension_background(
     }
     for message in executable_extensions.drain_events() {
         shell.notice(message);
+        changed = true;
+    }
+    if executable_extensions.take_presentation_dirty() {
+        shell.set_extension_activity(executable_extensions.presentation_activity_lines());
         changed = true;
     }
     changed
@@ -1747,6 +1759,94 @@ async fn thinking_configuration_picker(
         return Ok(None);
     };
     Ok(Some((ReasoningMode::Standard, level)))
+}
+
+fn delegated_session_text(session: &Session) -> anyhow::Result<String> {
+    const MAX_MESSAGES: usize = 64;
+    const MAX_BLOCK_BYTES: usize = 16 * 1024;
+    const MAX_TOTAL_BYTES: usize = 128 * 1024;
+
+    fn bounded(value: &str, limit: usize) -> &str {
+        let mut end = value.len().min(limit);
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        &value[..end]
+    }
+
+    let context = session.context()?;
+    let mut output = String::from(
+        "Delegated worker transcript · read-only\nMutation remains owner-bound to agent_sessions.\n",
+    );
+    for message in context
+        .iter()
+        .skip(context.len().saturating_sub(MAX_MESSAGES))
+    {
+        let mut block = String::new();
+        match message {
+            ygg_ai::Message::User(user) => {
+                let mut texts = user.content.iter().filter_map(|part| match part {
+                    ygg_ai::UserPart::Text(text) => Some(text.as_str()),
+                    _ => None,
+                });
+                if let Some(first) = texts.next() {
+                    block.push_str("\nParent / tool\n");
+                    block.push_str(bounded(first, MAX_BLOCK_BYTES));
+                    for text in texts {
+                        if block.len() >= MAX_BLOCK_BYTES {
+                            break;
+                        }
+                        block.push('\n');
+                        block.push_str(bounded(text, MAX_BLOCK_BYTES.saturating_sub(block.len())));
+                    }
+                }
+            }
+            ygg_ai::Message::Assistant(assistant) => {
+                for part in &assistant.content {
+                    match part {
+                        ygg_ai::AssistantPart::Text(text) => {
+                            if block.is_empty() {
+                                block.push_str("\nWorker\n");
+                            }
+                            block.push_str(bounded(
+                                text,
+                                MAX_BLOCK_BYTES.saturating_sub(block.len()),
+                            ));
+                        }
+                        ygg_ai::AssistantPart::ToolCall(call) => {
+                            if block.is_empty() {
+                                block.push_str("\nWorker\n");
+                            }
+                            if block.len() < MAX_BLOCK_BYTES {
+                                block.push_str("\n[tool: ");
+                                block.push_str(bounded(
+                                    &call.name,
+                                    MAX_BLOCK_BYTES.saturating_sub(block.len() + 2),
+                                ));
+                                block.push(']');
+                            }
+                        }
+                        ygg_ai::AssistantPart::Reasoning(_) | ygg_ai::AssistantPart::Media(_) => {}
+                    }
+                    if block.len() >= MAX_BLOCK_BYTES {
+                        break;
+                    }
+                }
+            }
+        }
+        if block.is_empty() {
+            continue;
+        }
+        let remaining = MAX_TOTAL_BYTES.saturating_sub(output.len());
+        if remaining == 0 {
+            break;
+        }
+        output.push_str(bounded(&block, remaining));
+    }
+    if context.len() > MAX_MESSAGES {
+        output.push_str("\n\n[older transcript entries omitted]");
+    }
+    Ok(output)
 }
 
 fn session_tree_text(session: &Session) -> String {
@@ -2323,6 +2423,55 @@ async fn run_idle_command(
             }
             request_extension_ui(shell, &mut app);
         }
+        Command::Extensions(commands::ExtensionsSubcommand::Inspect { reference }) => {
+            let _ = app.executable_extensions.drain_events();
+            let principal = app
+                .executable_extensions
+                .presentation_session_reference_principal(&reference);
+            if let Some(principal) = principal {
+                match app
+                    .agent
+                    .open_delegated_session_reference(&principal, &reference)
+                {
+                    Ok(Some(session)) => match delegated_session_text(&session) {
+                        Ok(text) => shell.show_overlay_text(text),
+                        Err(error) => {
+                            shell.error(format!("failed to inspect delegated session: {error}"))
+                        }
+                    },
+                    Ok(None) => shell
+                        .error("delegated session reference is unavailable for this parent".into()),
+                    Err(error) => {
+                        shell.error(format!("failed to inspect delegated session: {error}"))
+                    }
+                }
+            } else {
+                shell.error(
+                    "delegated session reference is unavailable, stale, or owned by another extension"
+                        .into(),
+                );
+            }
+        }
+        Command::Extensions(commands::ExtensionsSubcommand::Action { extension, action }) => {
+            let result = {
+                let mut confirmations = InteractiveExtensionConfirmations { shell, input };
+                app.executable_extensions
+                    .execute_presentation_action_with_confirmation(
+                        &extension,
+                        &action,
+                        &mut confirmations,
+                    )
+                    .await
+            };
+            match result {
+                Ok(output) if output.trim().is_empty() => {
+                    shell.notice(format!("{extension} action {action} completed"));
+                }
+                Ok(output) => shell.show_overlay_text(output),
+                Err(error) => shell.error(format!("extension action failed: {error}")),
+            }
+            request_extension_ui(shell, &mut app);
+        }
         Command::Quit => return Ok(IdleCommandOutcome::Quit(Box::new(app))),
         Command::Login(provider) => match validate_provider(provider.as_deref()) {
             Ok("codex") => login_codex(&mut app, shell).await?,
@@ -2501,6 +2650,7 @@ async fn run_idle_command(
                     )
                 })
                 .unwrap_or_default();
+            let presentation_owner = app.executable_extensions.command_owner(&extension_name);
             let result = {
                 let mut confirmations = InteractiveExtensionConfirmations { shell, input };
                 app.executable_extensions
@@ -2513,10 +2663,19 @@ async fn run_idle_command(
             };
             match result {
                 Ok(Some(output)) => {
-                    if output.trim().is_empty() {
+                    let presentation = presentation_owner
+                        .as_deref()
+                        .and_then(|owner| app.executable_extensions.presentation_text_for(owner));
+                    let mut visible_blocks = Vec::new();
+                    if !output.trim().is_empty() {
+                        visible_blocks.push(output);
+                    }
+                    visible_blocks.extend(presentation);
+                    let visible = visible_blocks.join("\n\n");
+                    if visible.trim().is_empty() {
                         shell.notice(format!("/{extension_name} completed"));
                     } else {
-                        shell.show_overlay_text(output);
+                        shell.show_overlay_text(visible);
                     }
                 }
                 Ok(None) => {
@@ -3255,17 +3414,20 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     shell.render();
                     continue;
                 }
-                let model_prompt =
-                    match expand_skill_command(app.skills.as_ref(), &composed.transcript_text) {
-                        Ok(Some(expanded)) => expanded,
-                        Ok(None) => composed.transcript_text.clone(),
-                        Err(error) => {
-                            shell.restore_composed(composed);
-                            shell.error(format!("skill invocation failed: {error}"));
-                            shell.render();
-                            continue;
-                        }
-                    };
+                let model_prompt = match expand_skill_command(
+                    app.skills.as_ref(),
+                    &composed.transcript_text,
+                    &app.agent.registered_tool_names(),
+                ) {
+                    Ok(Some(expanded)) => expanded,
+                    Ok(None) => composed.transcript_text.clone(),
+                    Err(error) => {
+                        shell.restore_composed(composed);
+                        shell.error(format!("skill invocation failed: {error}"));
+                        shell.render();
+                        continue;
+                    }
+                };
                 app.executable_extensions.refresh_host_state(
                     app.agent.session(),
                     &app.model,
@@ -3462,6 +3624,25 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use ygg_agent::EntryValue;
+
+    #[test]
+    fn delegated_session_overlay_is_bounded_path_free_and_read_only_labeled() {
+        let directory = tempfile::tempdir().unwrap();
+        let private_path = directory.path().join("private-child.jsonl");
+        let mut session = Session::create(&private_path).unwrap();
+        session
+            .append(EntryValue::Message(ygg_ai::Message::User(
+                ygg_ai::UserMessage {
+                    content: vec![ygg_ai::UserPart::Text("Inspect the worker result.".into())],
+                },
+            )))
+            .unwrap();
+        let text = delegated_session_text(&session).unwrap();
+        assert!(text.contains("Delegated worker transcript · read-only"));
+        assert!(text.contains("Inspect the worker result."));
+        assert!(!text.contains(private_path.to_str().unwrap()));
+        assert!(text.len() <= 128 * 1024);
+    }
 
     #[tokio::test]
     async fn cancellable_wait_returns_none_on_ctrl_c() {

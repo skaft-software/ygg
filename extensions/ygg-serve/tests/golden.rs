@@ -66,6 +66,7 @@ fn live_control_item() -> SessionItem {
 fn snapshot() -> SessionSnapshot {
     SessionSnapshot {
         session_id: SessionId::new("session-demo").unwrap(),
+        delegated_parent_session_id: None,
         actor_generation: 3,
         cursor: SessionCursor {
             actor_generation: 3,
@@ -111,6 +112,7 @@ fn snapshot() -> SessionSnapshot {
             run: None,
         },
         items: vec![session_item()],
+        extension_presentations: Vec::new(),
         pending_requests: Vec::new(),
         sources: Vec::new(),
         artifacts: Vec::new(),

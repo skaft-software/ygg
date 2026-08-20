@@ -1,0 +1,79 @@
+{
+  "revision": 10,
+  "status": {
+    "state": "stopped",
+    "label": "Browse · ready",
+    "detail": "Browser context is closed."
+  },
+  "activities": [
+    {
+      "id": "browse:close",
+      "kind": "browser",
+      "state": "succeeded",
+      "summary": "Isolated browser closed",
+      "provenance": "visible isolated browser",
+      "references": []
+    }
+  ],
+  "collection": {
+    "kind": "list",
+    "title": "Browse",
+    "nodes": [
+      {
+        "id": "browse-runtime",
+        "state": "succeeded",
+        "label": "Browser setup",
+        "secondary": "ready",
+        "action_ids": [
+          "open"
+        ],
+        "references": []
+      }
+    ],
+    "selected_node_id": "browse-runtime",
+    "detail": {
+      "node_id": "browse-runtime",
+      "title": "Ygg Browse",
+      "body": "Browser context is closed. Pinned runtime and isolated profile remain available.",
+      "references": []
+    }
+  },
+  "actions": [
+    {
+      "id": "setup",
+      "label": "Set up browser",
+      "command": "browse",
+      "arguments": [
+        "setup"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "open",
+      "label": "Open visible browser",
+      "command": "browse",
+      "arguments": [
+        "open"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "close",
+      "label": "Close browser",
+      "command": "browse",
+      "arguments": [
+        "close"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "reset-profile",
+      "label": "Reset isolated profile",
+      "command": "browse",
+      "arguments": [
+        "reset-profile"
+      ],
+      "destructive": true
+    }
+  ]
+}

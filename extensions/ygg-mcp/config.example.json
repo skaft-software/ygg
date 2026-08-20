@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "limits": {
+    "maxServers": 8,
+    "maxToolsPerServer": 64,
+    "maxConcurrentCalls": 8,
+    "startupTimeoutMs": 5000,
+    "requestTimeoutMs": 30000
+  },
+  "servers": {
+    "example-local": {
+      "transport": "stdio",
+      "label": "Example local MCP",
+      "command": "/absolute/path/to/an-installed-mcp-server",
+      "args": [],
+      "env": {},
+      "enabled": false,
+      "required": false
+    }
+  },
+  "trustedProjects": []
+}

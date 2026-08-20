@@ -1,0 +1,14 @@
+{
+  "schema": "ygg.subagents.smoke-input.v1",
+  "run_label": "direct",
+  "findings": [
+    {"id": "owner-scope-gap", "accepted": true},
+    {"id": "cosmetic-note", "accepted": false}
+  ],
+  "input_tokens": 5200,
+  "output_tokens": 900,
+  "wall_time_ms": 48000,
+  "cpu_time_ms": 9300,
+  "peak_rss_bytes": 188743680,
+  "failure_classes": []
+}

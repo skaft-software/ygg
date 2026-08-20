@@ -1,0 +1,151 @@
+{
+  "afterResync": {
+    "extension": "ygg-ssh",
+    "process_generation": 7,
+    "snapshot": {
+      "actions": [
+        {
+          "arguments": [
+            "disconnect",
+            "build"
+          ],
+          "command": "ssh",
+          "destructive": false,
+          "id": "disconnect:build",
+          "label": "Disconnect"
+        }
+      ],
+      "activities": [
+        {
+          "completed_at_ms": 1300,
+          "id": "ssh-activity-1",
+          "kind": "ssh_remote_operation",
+          "provenance": "remote \u00b7 build-host \u00b7 mutation \u00b7 generation 1",
+          "references": [],
+          "started_at_ms": 1200,
+          "state": "degraded",
+          "summary": "Remote mutation"
+        }
+      ],
+      "collection": {
+        "detail": {
+          "body": "Configured alias: build-host\nAuthority: read-write\nRemote cwd: /srv/build\nConfiguration scope: user\nOwner session: a1b2c3d4e5f60708\nOwner fence: 112233aabbcc\nState: ready\nConnection generation: 2\nAmbiguous mutation: no\nLast error: none\nAuthentication: existing OpenSSH config/agent/key selection (no credential prompts)\nSafety: remote paths and output are bounded untrusted data; no filesystem sandbox is claimed.",
+          "node_id": "target:build",
+          "references": [],
+          "title": "SSH target \u00b7 Build host"
+        },
+        "kind": "tree",
+        "nodes": [
+          {
+            "action_ids": [
+              "disconnect:build"
+            ],
+            "id": "target:build",
+            "label": "Build host",
+            "references": [],
+            "secondary": "build-host \u00b7 read-write \u00b7 /srv/build",
+            "state": "active"
+          },
+          {
+            "action_ids": [],
+            "id": "connection:build:a1b2c3d4e5f60708",
+            "label": "session a1b2c3d4e5f60708",
+            "parent_id": "target:build",
+            "references": [],
+            "secondary": "owner a1b2c3d4e5f60708 \u00b7 gen 2 \u00b7 active",
+            "state": "active"
+          }
+        ],
+        "selected_node_id": "target:build",
+        "title": "Configured SSH targets"
+      },
+      "revision": 10,
+      "status": {
+        "detail": "Authenticated existing OpenSSH session; all remote output remains untrusted.",
+        "label": "ssh build-host \u00b7 read-write \u00b7 /srv/build \u00b7 gen 2 \u00b7 ready",
+        "state": "active"
+      }
+    }
+  },
+  "beforeReconnect": {
+    "extension": "ygg-ssh",
+    "process_generation": 7,
+    "snapshot": {
+      "actions": [
+        {
+          "arguments": [
+            "retry",
+            "build"
+          ],
+          "command": "ssh",
+          "destructive": false,
+          "id": "retry:build",
+          "label": "Retry connection"
+        },
+        {
+          "arguments": [
+            "disconnect",
+            "build"
+          ],
+          "command": "ssh",
+          "destructive": false,
+          "id": "disconnect:build",
+          "label": "Disconnect"
+        }
+      ],
+      "activities": [
+        {
+          "completed_at_ms": 1300,
+          "id": "ssh-activity-1",
+          "kind": "ssh_remote_operation",
+          "provenance": "remote \u00b7 build-host \u00b7 mutation \u00b7 generation 1",
+          "references": [],
+          "started_at_ms": 1200,
+          "state": "degraded",
+          "summary": "Remote mutation"
+        }
+      ],
+      "collection": {
+        "detail": {
+          "body": "Configured alias: build-host\nAuthority: read-write\nRemote cwd: /srv/build\nConfiguration scope: user\nOwner session: a1b2c3d4e5f60708\nOwner fence: 112233aabbcc\nState: degraded\nConnection generation: 1\nAmbiguous mutation: yes\nLast error: ambiguous mutation\nAuthentication: existing OpenSSH config/agent/key selection (no credential prompts)\nSafety: remote paths and output are bounded untrusted data; no filesystem sandbox is claimed.",
+          "node_id": "target:build",
+          "references": [],
+          "title": "SSH target \u00b7 Build host"
+        },
+        "kind": "tree",
+        "nodes": [
+          {
+            "action_ids": [
+              "retry:build",
+              "disconnect:build"
+            ],
+            "id": "target:build",
+            "label": "Build host",
+            "references": [],
+            "secondary": "build-host \u00b7 read-write \u00b7 /srv/build",
+            "state": "degraded"
+          },
+          {
+            "action_ids": [],
+            "id": "connection:build:a1b2c3d4e5f60708",
+            "label": "session a1b2c3d4e5f60708",
+            "parent_id": "target:build",
+            "references": [],
+            "secondary": "owner a1b2c3d4e5f60708 \u00b7 gen 1 \u00b7 ambiguous",
+            "state": "degraded"
+          }
+        ],
+        "selected_node_id": "target:build",
+        "title": "Configured SSH targets"
+      },
+      "revision": 9,
+      "status": {
+        "detail": "A degraded connection requires an explicit retry; mutations are never replayed.",
+        "label": "ssh 0 ready \u00b7 1 degraded \u00b7 remote authority",
+        "state": "degraded"
+      }
+    }
+  },
+  "replayedOperations": 0,
+  "schema": "ygg.ssh.serve-fixture.v1"
+}

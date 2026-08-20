@@ -1,0 +1,28 @@
+{
+  "schema": "ygg.subagents.session-inspection-fixture.v1",
+  "breadcrumb": ["parent", "inspect-tests"],
+  "worker": {
+    "agent_id": "agent-2",
+    "session": "agent-session:4df83bda92de75071694f7610cef32d18c26f3906bce364d8ddb043c0f909e39",
+    "export_reference": "export:agent-2",
+    "read_only": true,
+    "effective_policy": {
+      "requested_tools": ["read", "search"],
+      "cwd": "inherited",
+      "sandbox": "inherited_host_enforced",
+      "approvals": "inherited_host_enforced",
+      "environment": "inherited",
+      "extensions": "inherited"
+    },
+    "budget": {
+      "turns": {"used": 3, "limit": 8},
+      "tokens": {"used": 1450, "limit": 32000},
+      "cost_microdollars": {"used": 1800, "limit": 200000}
+    },
+    "artifacts": [
+      {"artifact_id": "artifact-test-report", "label": "Test report"}
+    ],
+    "summary": "Tests cover the owner boundary."
+  },
+  "parent_head_changed_by_inspection": false
+}

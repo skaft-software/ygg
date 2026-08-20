@@ -1,0 +1,61 @@
+{
+  "revision": 4,
+  "status": {
+    "state": "active",
+    "label": "1 worker",
+    "detail": "Bounded background work"
+  },
+  "activities": [
+    {
+      "id": "worker:1",
+      "kind": "delegation",
+      "state": "running",
+      "summary": "Reviewing tests",
+      "provenance": "local child",
+      "started_at_ms": 1721000000000,
+      "references": [
+        {
+          "kind": "url",
+          "id": "https://example.com/docs/extensions",
+          "label": "example.com"
+        }
+      ]
+    }
+  ],
+  "collection": {
+    "kind": "tree",
+    "title": "Workers",
+    "nodes": [
+      {
+        "id": "worker:1",
+        "state": "running",
+        "label": "test-review",
+        "secondary": "running",
+        "action_ids": ["stop"],
+        "references": []
+      }
+    ],
+    "selected_node_id": "worker:1",
+    "detail": {
+      "node_id": "worker:1",
+      "title": "test-review",
+      "body": "Running in a bounded child session.",
+      "references": [
+        {
+          "kind": "session",
+          "id": "session-worker-1",
+          "label": "Worker transcript"
+        }
+      ]
+    }
+  },
+  "actions": [
+    {
+      "id": "stop",
+      "label": "Stop worker",
+      "command": "workers",
+      "arguments": ["stop", "worker:1"],
+      "destructive": true
+    }
+  ]
+}

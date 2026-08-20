@@ -1,0 +1,21 @@
+{
+  "schema": "ygg.subagents.lifecycle-fixture.v1",
+  "states": [
+    {"host": "pending", "extension": "queued", "terminal": false},
+    {"host": "running", "extension": "running", "terminal": false},
+    {"host": "completed", "extension": "done", "terminal": true},
+    {"host": "failed", "extension": "failed", "terminal": true},
+    {"host": "interrupted", "extension": "cancelled", "terminal": true},
+    {"host": "interrupted_after_stop", "extension": "stopped", "terminal": true},
+    {"host": "interrupted_after_deadline", "extension": "timed_out", "terminal": true},
+    {"host": "shutdown", "extension": "orphaned", "terminal": true},
+    {"host": "recovered_generation", "extension": "restarted", "terminal": false}
+  ],
+  "tree_policy": {
+    "prompts_visible": false,
+    "tool_arguments_visible": false,
+    "tool_results_visible": false,
+    "child_prose_visible_while_running": false,
+    "terminal_summary_in_detail_only": true
+  }
+}

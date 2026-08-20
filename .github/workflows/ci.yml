@@ -46,10 +46,22 @@ jobs:
           sh -n scripts/install.sh
           bash -n \
             scripts/build-ygg-image.sh \
+            scripts/package-ygg-extension-release.sh \
             scripts/package-ygg-release.sh \
             scripts/package-ygg-serve-release.sh \
             scripts/test-binary-installer.sh
           python3 -m py_compile scripts/provider-acceptance.py
+          version="v$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          while IFS= read -r extension; do
+            [[ -n "$extension" ]] || continue
+            scripts/package-ygg-extension-release.sh \
+              "$extension" "$RUNNER_TEMP/extension-bundles" "$version"
+            scripts/package-ygg-extension-release.sh \
+              "$extension" "$RUNNER_TEMP/extension-bundles-repeat" "$version"
+            cmp \
+              "$RUNNER_TEMP/extension-bundles/$extension-${version#v}.tar.gz" \
+              "$RUNNER_TEMP/extension-bundles-repeat/$extension-${version#v}.tar.gz"
+          done < <(grep -Ev '^[[:space:]]*(#|$)' extensions/release-catalog.txt)
           scripts/test-binary-installer.sh
           scripts/build-ygg-image.sh --context "$RUNNER_TEMP/ygg-container-context"
           test "$(cat "$RUNNER_TEMP/ygg-container-context/.ygg-container-source")" = "$(git rev-parse HEAD)"
@@ -68,6 +80,28 @@ jobs:
         with:
           toolchain: 1.90.0
       - run: cargo +1.90.0 package --workspace --exclude ygg-coding-agent --locked --no-verify
+
+  first-party-extension-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Test the shared Python SDK and every official extension adapter
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          python3 --version
+          PYTHONPATH=sdk/python python3 -m unittest discover -s sdk/python/tests
+          while IFS= read -r extension; do
+            [[ -n "$extension" ]] || continue
+            root="extensions/$extension"
+            test -d "$root/tests"
+            if [[ -f "$root/tests/__init__.py" ]]; then
+              (cd "$root" && python3 -m unittest discover -s tests -t .)
+            else
+              (cd "$root" && python3 -m unittest discover -s tests)
+            fi
+          done < <(grep -Ev '^[[:space:]]*(#|$)' extensions/release-catalog.txt)
 
   test:
     strategy:

@@ -3,7 +3,7 @@
 //! Default-off adapter from the graphical host contracts to the real Ygg App.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -39,28 +39,29 @@ use ygg_serve_backend::{
     ContextCategoryTotal, ContextCompactionReason, ContextStatus, ContextTotals, ContextUsage,
     ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
     DocumentReference, DocumentStore, DocumentStoreError, DriverCommandOutcome, DurableEntryId,
-    EventPayload, EvidenceCoverage, FileChange, FileEntryId, FinalizeCompletion, FinalizeDecision,
-    GoalAction, GoalState as ServeGoalState, GoalStore, GoalStoreError, HostCapabilities,
-    HostDescriptor, HostId, HostService, InferenceRequest, InferenceRequestStore, InputModality,
-    ItemDelta, ItemId, ItemLifecycle, ItemPayload, LifetimeUsage, LoopbackConfig, LoopbackServer,
-    ModelInputPricing, ModelInputPricingTier, ModelSelection, ModelSummary, PendingRequest,
-    PermanentDeleteConfirmation, ProjectFileRead, ProjectFileSearchResult, ProjectFileSystem,
-    ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ProjectId, ProjectRegistry,
-    ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation, PullRequestState,
-    PullRequestSummary, RegistryProjectId, RegistryProjectState, RepositoryContextError,
-    RepositoryContextSnapshot, RequestAnswer, RequestId, RequestKind, RequestState, RunId,
-    RuntimeId, SearchDocument, SearchDocumentKind, SearchError, SemanticRole, ServiceError,
-    SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState,
-    SessionCommand, SessionCursor, SessionDriver, SessionId, SessionItem, SessionLiveState,
-    SessionRetention, SessionSeed, SessionSnapshot, SessionSummary, SessionSupervisor,
-    SkillSuggestion, SlashCommandInvocation, SourceId, SourceKind, SourceRef, StoredAttachment,
-    StoredResource, StructuredTestResults, SupervisorConfig, TestCommandOutcome, TestCommandStatus,
-    TestFramework, TestOutputInput, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion,
-    ThemeOption, ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity,
-    ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
-    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
-    TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
-    UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
+    EventPayload, EvidenceCoverage, ExtensionPresentation, FileChange, FileEntryId,
+    FinalizeCompletion, FinalizeDecision, GoalAction, GoalState as ServeGoalState, GoalStore,
+    GoalStoreError, HostCapabilities, HostDescriptor, HostId, HostService, InferenceRequest,
+    InferenceRequestStore, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
+    LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing, ModelInputPricingTier,
+    ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProjectFileRead,
+    ProjectFileSearchResult, ProjectFileSystem, ProjectFileSystemError, ProjectFileTree,
+    ProjectFileWrite, ProjectId, ProjectRegistry, ProjectRegistryError, ProjectSummary,
+    PromptInput, ProtocolValidation, PullRequestState, PullRequestSummary, RegistryProjectId,
+    RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer,
+    RequestId, RequestKind, RequestState, RunId, RuntimeId, SearchDocument, SearchDocumentKind,
+    SearchError, SemanticRole, ServiceError, SessionBranchEntry, SessionBranchEntryKind,
+    SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor, SessionDriver,
+    SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot,
+    SessionSummary, SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId,
+    SourceKind, SourceRef, StoredAttachment, StoredResource, StructuredTestResults,
+    SupervisorConfig, TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput,
+    ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle,
+    ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity, ToolActivityStatus,
+    ToolKind, ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest,
+    TranscriptSearchResult, TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary,
+    TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId, UsageActivity,
+    UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
     MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES,
     PROTOCOL_VERSION,
 };
@@ -86,6 +87,11 @@ const MAX_PROJECTED_BRANCH_ENTRIES: usize = 2_048;
 const MAX_BRANCH_DELTA_ENTRIES: usize = 128;
 const MAX_GRAPHICAL_SESSION_EXPORT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OPAQUE_RESOURCE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_DELEGATION_TEAM_DIRECTORIES: usize = 2_048;
+const MAX_DELEGATED_SESSIONS_PER_TEAM: usize = 256;
+const MAX_DELEGATION_PROVENANCE_RECORDS: usize = 1_024;
+const MAX_DELEGATION_PROVENANCE_LINE_BYTES: usize = 256 * 1024;
+const DELEGATED_SESSION_PREFIX: &str = "agent-session:";
 const EXTERNAL_EFFECTS_WARNING: &str = "Conversation branching changes only Ygg's transcript. Filesystem, command, network, and other external effects from later work are not rolled back.";
 
 static NEXT_ACTOR_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -419,6 +425,182 @@ struct ProjectContext {
     project_id: ProjectId,
     config: Config,
     sessions: SessionStore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DelegatedSessionFingerprint {
+    len: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl DelegatedSessionFingerprint {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self, ServiceError> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified().map_err(|_| ServiceError::InvalidSeed)?,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+
+    fn same_file_as(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = other;
+            false
+        }
+    }
+}
+
+#[derive(Default)]
+struct DelegatedSessionProvenance {
+    display_task_name: Option<String>,
+    parent_session_id: Option<String>,
+    extension_principal: Option<String>,
+    extension_resource_owner: Option<String>,
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_extension_delegation_principal(value: &str) -> bool {
+    let Some((name, digest)) = value.split_once("@sha256:") else {
+        return false;
+    };
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        && is_lower_hex_digest(digest)
+}
+
+fn is_extension_resource_owner(value: &str) -> bool {
+    value
+        .strip_prefix("session-")
+        .is_some_and(is_lower_hex_digest)
+}
+
+fn extension_principal_owns_child(principal: &str, child: &Path) -> bool {
+    let digest = Sha256::digest(principal.as_bytes());
+    let prefix = format!(
+        "ext-{}-task-",
+        digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    child
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once('-').map(|(_, task)| task))
+        .is_some_and(|task| task.starts_with(&prefix))
+}
+
+fn delegated_session_provenance(team: &Path, child: &Path) -> DelegatedSessionProvenance {
+    let Ok(file) = ygg_agent::secure_fs::open_private_file_for_read(&team.join("provenance.jsonl"))
+    else {
+        return DelegatedSessionProvenance::default();
+    };
+    let mut reader = BufReader::new(file);
+    let Some(expected_reference) = ygg_agent::delegated_session_reference(child) else {
+        return DelegatedSessionProvenance::default();
+    };
+    let mut result = DelegatedSessionProvenance::default();
+    for _ in 0..MAX_DELEGATION_PROVENANCE_RECORDS {
+        let mut line = Vec::new();
+        loop {
+            let Ok(available) = reader.fill_buf() else {
+                return DelegatedSessionProvenance::default();
+            };
+            if available.is_empty() {
+                break;
+            }
+            let take = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(take) > MAX_DELEGATION_PROVENANCE_LINE_BYTES {
+                return DelegatedSessionProvenance::default();
+            }
+            line.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            if line.last() == Some(&b'\n') {
+                break;
+            }
+        }
+        if line.is_empty() {
+            break;
+        }
+        let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            return DelegatedSessionProvenance::default();
+        };
+        if record.get("event").and_then(serde_json::Value::as_str) != Some("agent_spawned") {
+            continue;
+        }
+        let matches_child = record
+            .get("session_reference")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reference| reference == expected_reference);
+        if matches_child {
+            result.display_task_name = record
+                .get("display_task_name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| {
+                    !name.is_empty()
+                        && name.len() <= 48
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'_' | b'-')
+                        })
+                })
+                .map(str::to_owned);
+            result.parent_session_id = record
+                .get("extension_parent_session_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| SessionId::new(*id).is_ok())
+                .map(str::to_owned);
+            result.extension_principal = record
+                .get("extension_principal")
+                .and_then(serde_json::Value::as_str)
+                .filter(|principal| is_extension_delegation_principal(principal))
+                .map(str::to_owned);
+            result.extension_resource_owner = record
+                .get("extension_resource_owner")
+                .and_then(serde_json::Value::as_str)
+                .filter(|owner| is_extension_resource_owner(owner))
+                .map(str::to_owned);
+            break;
+        }
+    }
+    result
+}
+
+struct DelegatedSessionContext {
+    project_id: ProjectId,
+    parent_session_id: SessionId,
+    config: Config,
+    session: Session,
+    meta: SessionMeta,
+    fingerprint: DelegatedSessionFingerprint,
 }
 
 const SESSION_DELETION_VERSION: u16 = 1;
@@ -1203,6 +1385,254 @@ impl YggHost {
         })
     }
 
+    fn authorize_delegated_session(
+        &self,
+        provenance: &DelegatedSessionProvenance,
+        child: &Path,
+        project_id: &ProjectId,
+        sessions: &SessionStore,
+    ) -> Result<SessionId, ServiceError> {
+        let parent_session_id = provenance
+            .parent_session_id
+            .as_deref()
+            .ok_or(ServiceError::NotFound)?;
+        let principal = provenance
+            .extension_principal
+            .as_deref()
+            .ok_or(ServiceError::NotFound)?;
+        let resource_owner = provenance
+            .extension_resource_owner
+            .as_deref()
+            .ok_or(ServiceError::NotFound)?;
+        if !extension_principal_owns_child(principal, child) {
+            return Err(ServiceError::NotFound);
+        }
+        let parent_is_bound = self
+            .projects
+            .lock()
+            .map_err(|_| ServiceError::Internal)?
+            .project_for_session(parent_session_id)
+            .is_some_and(|bound| bound.as_str() == project_id.as_str());
+        if !parent_is_bound {
+            return Err(ServiceError::NotFound);
+        }
+        let parent_path = sessions
+            .path_by_id(parent_session_id)
+            .map_err(|_| ServiceError::NotFound)?;
+        let parent_file = ygg_agent::secure_fs::open_private_file_for_read(&parent_path)
+            .map_err(|_| ServiceError::NotFound)?;
+        let parent = Session::open_read_only_with_file(parent_path, parent_file)
+            .map_err(|_| ServiceError::NotFound)?;
+        if parent.resource_owner_key() != resource_owner {
+            return Err(ServiceError::NotFound);
+        }
+        SessionId::new(parent_session_id).map_err(|_| ServiceError::NotFound)
+    }
+
+    fn delegated_session_context(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<DelegatedSessionContext, ServiceError> {
+        // The opaque digest is only a lookup key. Authorization is separate:
+        // the matched child must carry host-written extension provenance that
+        // binds its parent session, path-free extension principal, and exact
+        // parent resource owner. Native delegation children and forged or
+        // incomplete retained records therefore remain undiscoverable here.
+        let digest = session_id
+            .as_str()
+            .strip_prefix(DELEGATED_SESSION_PREFIX)
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or(ServiceError::NotFound)?;
+        let expected_reference = format!("{DELEGATED_SESSION_PREFIX}{digest}");
+        let project_roots = {
+            let projects = self.projects.lock().map_err(|_| ServiceError::Internal)?;
+            projects
+                .list()
+                .into_iter()
+                .filter_map(|project| {
+                    let root = projects.resolve_root(&project.id).ok()?;
+                    let project_id = ProjectId::new(project.id.as_str()).ok()?;
+                    Some((
+                        project_id,
+                        root.as_path().to_owned(),
+                        project.state == RegistryProjectState::Trusted,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut matched = None;
+        for (project_id, root, trusted) in project_roots {
+            let mut config = self.config.clone();
+            config.workspace = root.clone();
+            config.invocation_cwd = root.clone();
+            config.workspace_trusted = trusted;
+            let sessions = SessionStore::new(&config.session_dir, &root);
+            let delegation_root = sessions.dir().join(".delegation");
+            let Ok(metadata) = delegation_root.symlink_metadata() else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
+            let mut teams = std::fs::read_dir(&delegation_root)
+                .map_err(|_| ServiceError::Unavailable)?
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_type()
+                        .is_ok_and(|file_type| file_type.is_dir() && !file_type.is_symlink())
+                })
+                .collect::<Vec<_>>();
+            if teams.len() > MAX_DELEGATION_TEAM_DIRECTORIES {
+                return Err(ServiceError::PayloadTooLarge);
+            }
+            teams.sort_by_key(std::fs::DirEntry::file_name);
+            for team in teams {
+                let team_name = team.file_name();
+                let Some(team_name) = team_name.to_str() else {
+                    continue;
+                };
+                if !team_name.starts_with("team-")
+                    || team_name.len() > 128
+                    || !team_name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                {
+                    continue;
+                }
+                let team_path = team.path();
+                let mut children = std::fs::read_dir(&team_path)
+                    .map_err(|_| ServiceError::Unavailable)?
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry
+                            .file_type()
+                            .is_ok_and(|file_type| file_type.is_file() && !file_type.is_symlink())
+                            && entry.path().extension().and_then(|value| value.to_str())
+                                == Some("jsonl")
+                            && entry.file_name() != "provenance.jsonl"
+                    })
+                    .collect::<Vec<_>>();
+                if children.len() > MAX_DELEGATED_SESSIONS_PER_TEAM {
+                    return Err(ServiceError::PayloadTooLarge);
+                }
+                children.sort_by_key(std::fs::DirEntry::file_name);
+                for child in children {
+                    let path = child.path();
+                    if ygg_agent::delegated_session_reference(&path).as_deref()
+                        != Some(expected_reference.as_str())
+                    {
+                        continue;
+                    }
+                    if matched.is_some() {
+                        return Err(ServiceError::CorruptResource);
+                    }
+                    let provenance = delegated_session_provenance(&team_path, &path);
+                    let parent_session_id = self.authorize_delegated_session(
+                        &provenance,
+                        &path,
+                        &project_id,
+                        &sessions,
+                    )?;
+                    let file = ygg_agent::secure_fs::open_private_file_for_read(&path)
+                        .map_err(|_| ServiceError::NotFound)?;
+                    let file_metadata = file.metadata().map_err(|_| ServiceError::InvalidSeed)?;
+                    let fingerprint = DelegatedSessionFingerprint::from_metadata(&file_metadata)?;
+                    let modified = fingerprint.modified;
+                    let session = Session::open_read_only_with_file(path.clone(), file)
+                        .map_err(|_| ServiceError::InvalidSeed)?;
+                    let fallback_task_name = path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.split_once('-').map(|(_, task)| task))
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or("worker");
+                    let task_name = provenance
+                        .display_task_name
+                        .as_deref()
+                        .unwrap_or(fallback_task_name);
+                    let title = ygg_serve_backend::sanitize_public_text(
+                        &format!("parent > {task_name}"),
+                        512,
+                        false,
+                    );
+                    matched = Some(DelegatedSessionContext {
+                        project_id: project_id.clone(),
+                        parent_session_id,
+                        config: config.clone(),
+                        session,
+                        meta: SessionMeta {
+                            id: session_id.as_str().to_owned(),
+                            path,
+                            title,
+                            name: None,
+                            tags: vec!["subagent".into(), "read-only".into()],
+                            pinned: false,
+                            archived: false,
+                            trashed_at_ms: None,
+                            purge_after_ms: None,
+                            forked_from_session_id: None,
+                            forked_from_entry_id: None,
+                            modified,
+                        },
+                        fingerprint,
+                    });
+                }
+            }
+        }
+        matched.ok_or(ServiceError::NotFound)
+    }
+
+    fn driver_for_delegated_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<YggSessionDriver, ServiceError> {
+        let context = self.delegated_session_context(session_id)?;
+        let selection = advertised_selection_from_session(
+            &context.session,
+            &self.catalog,
+            &context.config,
+            &self.models,
+        )
+        .map_or_else(|| self.default_selection(), Ok)?;
+        let generation = next_actor_generation();
+        let refresh = DelegatedInspectionRefresh {
+            path: context.meta.path.clone(),
+            workspace: context.config.workspace.clone(),
+            project_id: context.project_id.clone(),
+            model: selection.clone(),
+            generation,
+            meta: context.meta.clone(),
+        };
+        let fingerprint = context.fingerprint;
+        let parent_session_id = context.parent_session_id.clone();
+        let mut seed = seed_from_session(
+            &context.session,
+            session_id.clone(),
+            SessionSeedOptions {
+                workspace: &context.config.workspace,
+                project_id: Some(context.project_id),
+                model: selection,
+                authority: AuthorityProfile::ReadOnly,
+                generation,
+                meta: Some(context.meta),
+                attachment_store: None,
+                resource_store: None,
+            },
+        )?;
+        seed.summary.live_state = SessionLiveState::Locked;
+        seed.summary.owner = ActorOwnerState::ExternallyLocked;
+        seed.snapshot.live_state = SessionLiveState::Locked;
+        seed.snapshot.delegated_parent_session_id = Some(parent_session_id);
+        Ok(YggSessionDriver::inspect(seed, refresh, fingerprint))
+    }
+
     fn driver_for_new(
         &self,
         request: CreateSessionRequest,
@@ -1851,6 +2281,76 @@ fn export_session_bytes(
     Ok(bytes::Bytes::from(bytes))
 }
 
+fn export_delegated_session_bytes(
+    path: &Path,
+    fingerprint: DelegatedSessionFingerprint,
+    session_id: &SessionId,
+    workspace: &Path,
+    serve_state_dir: &Path,
+    max_bytes: usize,
+) -> Result<bytes::Bytes, ServiceError> {
+    let source = ygg_agent::secure_fs::open_private_file_for_read(path)
+        .map_err(|_| ServiceError::CorruptResource)?;
+    fs2::FileExt::lock_shared(&source).map_err(|_| ServiceError::CorruptResource)?;
+    let snapshot = (|| {
+        let current = DelegatedSessionFingerprint::from_metadata(
+            &source
+                .metadata()
+                .map_err(|_| ServiceError::CorruptResource)?,
+        )?;
+        if !fingerprint.same_file_as(&current) {
+            return Err(ServiceError::CorruptResource);
+        }
+        if current.len > max_bytes as u64 {
+            return Err(ServiceError::PayloadTooLarge);
+        }
+        let mut transcript = Vec::with_capacity(current.len as usize);
+        let mut reader = (&source).take(max_bytes as u64 + 1);
+        reader
+            .read_to_end(&mut transcript)
+            .map_err(|_| ServiceError::CorruptResource)?;
+        let after = DelegatedSessionFingerprint::from_metadata(
+            &source
+                .metadata()
+                .map_err(|_| ServiceError::CorruptResource)?,
+        )?;
+        if !current.same_file_as(&after)
+            || current.len != after.len
+            || transcript.len() as u64 != current.len
+        {
+            return Err(ServiceError::CorruptResource);
+        }
+        if transcript.len() > max_bytes {
+            return Err(ServiceError::PayloadTooLarge);
+        }
+        Ok(transcript)
+    })();
+    let unlocked = fs2::FileExt::unlock(&source);
+    if unlocked.is_err() {
+        return Err(ServiceError::CorruptResource);
+    }
+    let transcript = snapshot?;
+
+    let temporary = tempfile::Builder::new()
+        .prefix(".delegated-session-export-")
+        .tempdir_in(serve_state_dir)
+        .map_err(|_| ServiceError::Internal)?;
+    let sessions = SessionStore::new(temporary.path(), workspace);
+    ygg_agent::secure_fs::create_private_directory_all(sessions.dir())
+        .map_err(|_| ServiceError::Internal)?;
+    let copied_path = sessions
+        .dir()
+        .join(format!("{}.jsonl", session_id.as_str()));
+    let mut copied = ygg_agent::secure_fs::create_regular_file_for_append(&copied_path)
+        .map_err(|_| ServiceError::Internal)?;
+    copied
+        .write_all(&transcript)
+        .and_then(|()| copied.sync_all())
+        .map_err(|_| ServiceError::Internal)?;
+    drop(copied);
+    export_session_bytes(&sessions, session_id, serve_state_dir, max_bytes)
+}
+
 #[async_trait]
 impl HostService for YggHost {
     type Driver = YggSessionDriver;
@@ -2243,6 +2743,26 @@ impl HostService for YggHost {
     }
 
     async fn session_export(&self, session_id: &SessionId) -> Result<bytes::Bytes, ServiceError> {
+        if session_id.as_str().starts_with(DELEGATED_SESSION_PREFIX) {
+            let context = self.delegated_session_context(session_id)?;
+            let path = context.meta.path;
+            let fingerprint = context.fingerprint;
+            let workspace = context.config.workspace;
+            let session_id = session_id.clone();
+            let serve_state_dir = self.serve_state_dir.clone();
+            return tokio::task::spawn_blocking(move || {
+                export_delegated_session_bytes(
+                    &path,
+                    fingerprint,
+                    &session_id,
+                    &workspace,
+                    &serve_state_dir,
+                    MAX_GRAPHICAL_SESSION_EXPORT_BYTES,
+                )
+            })
+            .await
+            .map_err(|_| ServiceError::Internal)?;
+        }
         let sessions = self.project_context_for_session(session_id)?.sessions;
         let session_id = session_id.clone();
         let serve_state_dir = self.serve_state_dir.clone();
@@ -2617,8 +3137,160 @@ impl HostService for YggHost {
     }
 
     async fn open_session(&self, session_id: &SessionId) -> Result<Self::Driver, ServiceError> {
-        self.driver_for_existing(session_id)
+        if session_id.as_str().starts_with(DELEGATED_SESSION_PREFIX) {
+            self.driver_for_delegated_session(session_id)
+        } else {
+            self.driver_for_existing(session_id)
+        }
     }
+}
+
+#[derive(Clone)]
+struct DelegatedInspectionRefresh {
+    path: PathBuf,
+    workspace: PathBuf,
+    project_id: ProjectId,
+    model: ModelSelection,
+    generation: u64,
+    meta: SessionMeta,
+}
+
+impl DelegatedInspectionRefresh {
+    fn load(
+        &self,
+        previous: DelegatedSessionFingerprint,
+    ) -> Result<Option<(DelegatedSessionFingerprint, SessionSeed)>, ServiceError> {
+        let file = ygg_agent::secure_fs::open_private_file_for_read(&self.path)
+            .map_err(|_| ServiceError::CorruptResource)?;
+        let metadata = file.metadata().map_err(|_| ServiceError::CorruptResource)?;
+        let fingerprint = DelegatedSessionFingerprint::from_metadata(&metadata)?;
+        if !previous.same_file_as(&fingerprint) {
+            return Err(ServiceError::CorruptResource);
+        }
+        if previous == fingerprint {
+            return Ok(None);
+        }
+        let session = Session::open_read_only_with_file(self.path.clone(), file)
+            .map_err(|_| ServiceError::CorruptResource)?;
+        let mut meta = self.meta.clone();
+        meta.modified = fingerprint.modified;
+        let session_id = SessionId::new(meta.id.clone()).map_err(|_| ServiceError::InvalidSeed)?;
+        let mut seed = seed_from_session(
+            &session,
+            session_id,
+            SessionSeedOptions {
+                workspace: &self.workspace,
+                project_id: Some(self.project_id.clone()),
+                model: self.model.clone(),
+                authority: AuthorityProfile::ReadOnly,
+                generation: self.generation,
+                meta: Some(meta),
+                attachment_store: None,
+                resource_store: None,
+            },
+        )?;
+        seed.summary.live_state = SessionLiveState::Locked;
+        seed.summary.owner = ActorOwnerState::ExternallyLocked;
+        seed.snapshot.live_state = SessionLiveState::Locked;
+        Ok(Some((fingerprint, seed)))
+    }
+}
+
+const MAX_DELEGATED_INSPECTION_EVENTS: usize = 256;
+
+fn delegated_inspection_events(
+    previous: &SessionSeed,
+    next: &SessionSeed,
+) -> Option<VecDeque<TimestampedEvent>> {
+    let timestamp = now_ms();
+    let mut payloads = Vec::new();
+    let known_branches = previous
+        .snapshot
+        .branches
+        .entries
+        .iter()
+        .map(|entry| entry.entry_id.clone())
+        .collect::<BTreeSet<_>>();
+    let appended = next
+        .snapshot
+        .branches
+        .entries
+        .iter()
+        .filter(|entry| !known_branches.contains(&entry.entry_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for entries in appended.chunks(MAX_BRANCH_DELTA_ENTRIES) {
+        payloads.push(EventPayload::SessionBranchEntriesAppended {
+            entries: entries.to_vec(),
+        });
+    }
+    if previous.snapshot.durable_head != next.snapshot.durable_head {
+        payloads.push(EventPayload::SessionDurableHeadChanged {
+            durable_entry_id: next.snapshot.durable_head.clone(),
+        });
+    }
+
+    let previous_items = previous
+        .snapshot
+        .items
+        .iter()
+        .map(|item| (&item.id, item))
+        .collect::<BTreeMap<_, _>>();
+    for item in &next.snapshot.items {
+        if previous_items
+            .get(&item.id)
+            .is_none_or(|previous| *previous != item)
+        {
+            payloads.push(EventPayload::ItemCommitted { item: item.clone() });
+        }
+    }
+    let previous_sources = previous
+        .snapshot
+        .sources
+        .iter()
+        .map(|source| (&source.id, source))
+        .collect::<BTreeMap<_, _>>();
+    for source in &next.snapshot.sources {
+        if previous_sources
+            .get(&source.id)
+            .is_none_or(|previous| *previous != source)
+        {
+            payloads.push(EventPayload::SourceUpserted {
+                source: source.clone(),
+            });
+        }
+    }
+    let previous_artifacts = previous
+        .snapshot
+        .artifacts
+        .iter()
+        .map(|artifact| (&artifact.id, artifact))
+        .collect::<BTreeMap<_, _>>();
+    for artifact in &next.snapshot.artifacts {
+        if previous_artifacts
+            .get(&artifact.id)
+            .is_none_or(|previous| *previous != artifact)
+        {
+            payloads.push(EventPayload::ArtifactUpserted {
+                artifact: artifact.clone(),
+            });
+        }
+    }
+    if payloads.len() > MAX_DELEGATED_INSPECTION_EVENTS {
+        return None;
+    }
+    Some(
+        payloads
+            .into_iter()
+            .map(|payload| TimestampedEvent::new(timestamp, payload))
+            .collect(),
+    )
+}
+
+struct DelegatedInspection {
+    refresh: DelegatedInspectionRefresh,
+    fingerprint: DelegatedSessionFingerprint,
+    projection: SessionSeed,
 }
 
 struct YggSessionDriver {
@@ -2627,6 +3299,8 @@ struct YggSessionDriver {
     events: mpsc::Receiver<TimestampedEvent>,
     buffered_events: VecDeque<TimestampedEvent>,
     worker: Option<tokio::task::JoinHandle<()>>,
+    inspect_only: bool,
+    inspection: Option<DelegatedInspection>,
 }
 
 impl YggSessionDriver {
@@ -2645,6 +3319,31 @@ impl YggSessionDriver {
             events,
             buffered_events: VecDeque::new(),
             worker: Some(worker),
+            inspect_only: false,
+            inspection: None,
+        }
+    }
+
+    fn inspect(
+        seed: SessionSeed,
+        refresh: DelegatedInspectionRefresh,
+        fingerprint: DelegatedSessionFingerprint,
+    ) -> Self {
+        let (sender, events) = mpsc::channel(1);
+        drop(sender);
+        let projection = seed.clone();
+        Self {
+            seed,
+            commands: None,
+            events,
+            buffered_events: VecDeque::new(),
+            worker: None,
+            inspect_only: true,
+            inspection: Some(DelegatedInspection {
+                refresh,
+                fingerprint,
+                projection,
+            }),
         }
     }
 }
@@ -2659,6 +3358,9 @@ impl SessionDriver for YggSessionDriver {
         &mut self,
         command: SessionCommand,
     ) -> Result<DriverCommandOutcome, ServiceError> {
+        if self.inspect_only {
+            return Err(ServiceError::Unauthorized);
+        }
         let (response, receiver) = oneshot::channel();
         self.commands
             .as_ref()
@@ -2670,6 +3372,13 @@ impl SessionDriver for YggSessionDriver {
     }
 
     async fn command_discovery(&mut self) -> Result<CommandDiscovery, ServiceError> {
+        if self.inspect_only {
+            return Ok(CommandDiscovery {
+                protocol: PROTOCOL_VERSION,
+                commands: Vec::new(),
+                skills: Vec::new(),
+            });
+        }
         let (response, mut receiver) = oneshot::channel();
         self.commands
             .as_ref()
@@ -2704,6 +3413,50 @@ impl SessionDriver for YggSessionDriver {
     }
 
     async fn next_event(&mut self) -> Option<TimestampedEvent> {
+        if self.inspect_only {
+            loop {
+                if let Some(event) = self.buffered_events.pop_front() {
+                    return Some(event);
+                }
+                let inspection = self.inspection.as_ref()?;
+                let refresh = inspection.refresh.clone();
+                let fingerprint = inspection.fingerprint;
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let loaded = tokio::task::spawn_blocking(move || refresh.load(fingerprint)).await;
+                match loaded {
+                    Ok(Ok(None)) => {}
+                    Ok(Ok(Some((next_fingerprint, next)))) => {
+                        let inspection = self.inspection.as_mut()?;
+                        let Some(events) =
+                            delegated_inspection_events(&inspection.projection, &next)
+                        else {
+                            self.inspection = None;
+                            return Some(TimestampedEvent::new(
+                                now_ms(),
+                                EventPayload::SessionStateChanged {
+                                    state: SessionLiveState::Offline,
+                                    active_run_id: None,
+                                },
+                            ));
+                        };
+                        inspection.fingerprint = next_fingerprint;
+                        inspection.projection = next;
+                        self.seed = inspection.projection.clone();
+                        self.buffered_events = events;
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        self.inspection = None;
+                        return Some(TimestampedEvent::new(
+                            now_ms(),
+                            EventPayload::SessionStateChanged {
+                                state: SessionLiveState::Offline,
+                                active_run_id: None,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
         match self.buffered_events.pop_front() {
             Some(event) => Some(event),
             None => self.events.recv().await,
@@ -3404,6 +4157,7 @@ struct ProjectionState {
     private_requests: HashMap<RequestId, PrivateRequest>,
     pending_attachments: VecDeque<Vec<AttachmentRef>>,
     pending_user_items: VecDeque<PendingUserItem>,
+    extension_presentations: Vec<ExtensionPresentation>,
 }
 
 impl ProjectionState {
@@ -3429,6 +4183,7 @@ impl ProjectionState {
             private_requests: HashMap::new(),
             pending_attachments: VecDeque::new(),
             pending_user_items: VecDeque::new(),
+            extension_presentations: Vec::new(),
         }
     }
 
@@ -3503,6 +4258,41 @@ impl ProjectionState {
     }
 }
 
+fn collect_extension_presentations(
+    extensions: &mut crate::extensions::ExecutableExtensions,
+) -> Vec<ExtensionPresentation> {
+    let _ = extensions.drain_events();
+    extensions
+        .presentation_views()
+        .into_iter()
+        .map(|view| ExtensionPresentation {
+            extension: view.extension,
+            generation: view.generation,
+            extension_instance_id: view.extension_instance_id,
+            resource_owner: view.resource_owner,
+            snapshot: view.snapshot,
+        })
+        .collect()
+}
+
+async fn publish_extension_presentations(
+    extensions: &mut crate::extensions::ExecutableExtensions,
+    projection: &mut ProjectionState,
+    events: &mpsc::Sender<TimestampedEvent>,
+) -> Result<(), ServiceError> {
+    let presentations = collect_extension_presentations(extensions);
+    if presentations == projection.extension_presentations {
+        return Ok(());
+    }
+    projection.extension_presentations = presentations.clone();
+    events
+        .send(event(EventPayload::ExtensionPresentationsChanged {
+            presentations,
+        }))
+        .await
+        .map_err(|_| ServiceError::Unavailable)
+}
+
 fn schedule_goal(decision: Option<GoalDecision>) -> Option<tokio::time::Instant> {
     match decision {
         Some(GoalDecision::Wait { delay, .. }) => Some(tokio::time::Instant::now() + delay),
@@ -3547,9 +4337,21 @@ async fn run_worker(
         }
         _ => None,
     };
+    let mut extension_refresh = tokio::time::interval(std::time::Duration::from_millis(250));
+    extension_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let message = tokio::select! {
             message = commands.recv() => message,
+            _ = extension_refresh.tick() => {
+                if let Some(owned_app) = app.as_mut() {
+                    let _ = publish_extension_presentations(
+                        &mut owned_app.executable_extensions,
+                        &mut projection,
+                        &events,
+                    ).await;
+                }
+                continue;
+            }
             _ = async {
                 if let Some(deadline) = goal_deadline {
                     tokio::time::sleep_until(deadline).await;
@@ -4071,6 +4873,48 @@ async fn run_worker(
                         }
                     }
                 }
+            }
+            SessionCommand::InvokeExtensionAction {
+                extension,
+                extension_instance_id,
+                generation,
+                revision,
+                action,
+                confirmed,
+            } => {
+                let mut owned_app = match app.take() {
+                    Some(app) => app,
+                    None => match build_worker_app(&mut plan) {
+                        Ok(app) => app,
+                        Err(_) => {
+                            let _ = message.response.send(Err(ServiceError::Internal));
+                            continue;
+                        }
+                    },
+                };
+                let result = owned_app
+                    .executable_extensions
+                    .execute_presentation_action_for_serve(
+                        &extension,
+                        &extension_instance_id,
+                        generation,
+                        revision,
+                        &action,
+                        confirmed,
+                    )
+                    .await
+                    .map(|_| DriverCommandOutcome::default())
+                    .map_err(|_| ServiceError::InvalidBoundary);
+                if result.is_ok() {
+                    let _ = publish_extension_presentations(
+                        &mut owned_app.executable_extensions,
+                        &mut projection,
+                        &events,
+                    )
+                    .await;
+                }
+                app = Some(owned_app);
+                let _ = message.response.send(result);
             }
             SessionCommand::InvokeSlashCommand { invocation } => {
                 let owned_app = match app.take() {
@@ -5731,9 +6575,18 @@ async fn start_and_drive_run(
     plan.pull_request_refresh_requested.notify_one();
 
     let mut response_text = String::new();
+    let mut extension_refresh = tokio::time::interval(std::time::Duration::from_millis(250));
+    extension_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let outcome;
     loop {
         tokio::select! {
+            _ = extension_refresh.tick() => {
+                publish_extension_presentations(
+                    &mut app.executable_extensions,
+                    projection,
+                    events,
+                ).await?;
+            }
             event = run.next() => {
                 let Some(agent_event) = event else {
                     outcome = HostRunOutcome::stream_lost();
@@ -5791,6 +6644,7 @@ async fn start_and_drive_run(
     app.executable_extensions
         .settle_turn(extension_turn, &outcome)
         .await;
+    publish_extension_presentations(&mut app.executable_extensions, projection, events).await?;
     publish_context_snapshot(
         final_context_snapshot,
         &run_id,
@@ -6016,6 +6870,7 @@ async fn start_and_drive_run(
             .executable_extensions
             .after_response(&response_text)
             .await;
+        publish_extension_presentations(&mut app.executable_extensions, projection, events).await?;
     }
     let goal = match goal_driver {
         Some(driver) if completed => match driver.turn_settled(
@@ -9568,6 +10423,7 @@ fn seed_from_session(
     let branches = branch_graph(session)?;
     let snapshot = SessionSnapshot {
         session_id,
+        delegated_parent_session_id: None,
         actor_generation: generation,
         cursor: SessionCursor::zero(generation),
         durable_head: branches.head.clone(),
@@ -9578,6 +10434,7 @@ fn seed_from_session(
         authority,
         context: ContextUsage::default(),
         items,
+        extension_presentations: Vec::new(),
         pending_requests: Vec::new(),
         sources,
         artifacts,
@@ -9617,6 +10474,7 @@ fn empty_seed(
         },
         snapshot: SessionSnapshot {
             session_id,
+            delegated_parent_session_id: None,
             actor_generation: generation,
             cursor: SessionCursor::zero(generation),
             durable_head: None,
@@ -9627,6 +10485,7 @@ fn empty_seed(
             authority,
             context: ContextUsage::default(),
             items: Vec::new(),
+            extension_presentations: Vec::new(),
             pending_requests: Vec::new(),
             sources: Vec::new(),
             artifacts: Vec::new(),
@@ -10673,6 +11532,162 @@ mod tests {
         let mut driver = host.open_session(&session_id).await.unwrap();
         assert_eq!(driver.seed().summary.model, terminal_selection);
         driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delegated_session_references_open_as_locked_path_free_inspectors() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        config.workspace = config.workspace.canonicalize().unwrap();
+        config.invocation_cwd = config.workspace.clone();
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let parent_session_id = "parent-auth";
+        let parent_path = sessions.dir().join(format!("{parent_session_id}.jsonl"));
+        let mut parent = Session::create(&parent_path).unwrap();
+        parent
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("parent session".into())],
+            })))
+            .unwrap();
+        let parent_resource_owner = parent.resource_owner_key();
+        drop(parent);
+        let principal = format!("ygg-subagents@sha256:{}", "a".repeat(64));
+        let principal_digest = Sha256::digest(principal.as_bytes());
+        let principal_prefix = principal_digest[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let team = sessions
+            .dir()
+            .join(".delegation")
+            .join("team-0123456789abcdef");
+        ygg_agent::secure_fs::create_private_directory_all(&team).unwrap();
+        let path = team.join(format!("0001-ext-{principal_prefix}-task-cafebabe.jsonl"));
+        let mut child = Session::create(&path).unwrap();
+        child
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("inspect authentication".into())],
+            })))
+            .unwrap();
+        drop(child);
+        let child_reference =
+            ygg_agent::delegated_session_reference(&path).expect("generated child reference");
+        let mut provenance = serde_json::to_vec(&serde_json::json!({
+            "event": "agent_spawned",
+            "session_reference": child_reference.clone(),
+            "display_task_name": "review-auth",
+            "extension_parent_session_id": parent_session_id,
+            "extension_principal": principal.clone(),
+            "extension_resource_owner": parent_resource_owner.clone(),
+        }))
+        .unwrap();
+        provenance.push(b'\n');
+        ygg_agent::secure_fs::write_private_atomic(
+            &team.join("provenance.jsonl"),
+            &provenance,
+            4 * 1024,
+        )
+        .unwrap();
+        let session_id = SessionId::new(child_reference.clone()).unwrap();
+        let host = YggHost::new(config).unwrap();
+
+        let mut driver = host.open_session(&session_id).await.unwrap();
+        let seed = driver.seed();
+        assert_eq!(seed.summary.title, "parent > review-auth");
+        assert_eq!(seed.summary.live_state, SessionLiveState::Locked);
+        assert_eq!(seed.snapshot.live_state, SessionLiveState::Locked);
+        assert_eq!(seed.snapshot.authority, AuthorityProfile::ReadOnly);
+        assert_eq!(
+            seed.snapshot
+                .delegated_parent_session_id
+                .as_ref()
+                .map(SessionId::as_str),
+            Some(parent_session_id)
+        );
+        assert_eq!(seed.snapshot.items.len(), 1);
+        assert!(!format!("{seed:?}").contains(path.to_str().unwrap()));
+
+        let mut child = Session::open(&path).unwrap();
+        child
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("new live child turn".into())],
+            })))
+            .unwrap();
+        drop(child);
+        let mut saw_live_item = false;
+        for _ in 0..4 {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(2), driver.next_event())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if matches!(event.payload, EventPayload::ItemCommitted { .. }) {
+                saw_live_item = true;
+                break;
+            }
+        }
+        assert!(
+            saw_live_item,
+            "delegated inspector did not stream the durable turn"
+        );
+        let exported = host.session_export(&session_id).await.unwrap();
+        let exported = String::from_utf8(exported.to_vec()).unwrap();
+        assert!(exported.contains("new live child turn"));
+        assert!(!exported.contains(path.to_str().unwrap()));
+
+        let discovery = driver.command_discovery().await.unwrap();
+        assert!(discovery.commands.is_empty());
+        assert!(discovery.skills.is_empty());
+        assert_eq!(
+            driver
+                .dispatch(SessionCommand::Abort { run_id: None })
+                .await
+                .unwrap_err(),
+            ServiceError::Unauthorized
+        );
+        driver.shutdown().await;
+
+        let mut foreign_owner = serde_json::to_vec(&serde_json::json!({
+            "event": "agent_spawned",
+            "session_reference": child_reference.clone(),
+            "display_task_name": "review-auth",
+            "extension_parent_session_id": parent_session_id,
+            "extension_principal": principal.clone(),
+            "extension_resource_owner": format!("session-{}", "b".repeat(64)),
+        }))
+        .unwrap();
+        foreign_owner.push(b'\n');
+        ygg_agent::secure_fs::write_private_atomic(
+            &team.join("provenance.jsonl"),
+            &foreign_owner,
+            4 * 1024,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.open_session(&session_id).await,
+            Err(ServiceError::NotFound)
+        ));
+
+        let mut missing_principal = serde_json::to_vec(&serde_json::json!({
+            "event": "agent_spawned",
+            "session_reference": child_reference.clone(),
+            "display_task_name": "review-auth",
+            "extension_parent_session_id": parent_session_id,
+            "extension_resource_owner": parent_resource_owner.clone(),
+        }))
+        .unwrap();
+        missing_principal.push(b'\n');
+        ygg_agent::secure_fs::write_private_atomic(
+            &team.join("provenance.jsonl"),
+            &missing_principal,
+            4 * 1024,
+        )
+        .unwrap();
+        assert!(matches!(
+            host.open_session(&session_id).await,
+            Err(ServiceError::NotFound)
+        ));
     }
 
     #[tokio::test]
@@ -12940,6 +13955,8 @@ mod tests {
             events,
             buffered_events: VecDeque::new(),
             worker: None,
+            inspect_only: false,
+            inspection: None,
         };
         let first = TimestampedEvent::new(
             1,
@@ -13024,6 +14041,8 @@ mod tests {
             events,
             buffered_events: VecDeque::new(),
             worker: None,
+            inspect_only: false,
+            inspection: None,
         };
         tokio::spawn(async move {
             let WorkerMessage::CommandDiscovery { response } =

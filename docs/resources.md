@@ -10,14 +10,18 @@ cross-cutting local safety and precedence contract.
 | --- | --- | --- | --- |
 | Theme | `~/.ygg/themes/*.toml` | `.ygg/themes/*.toml` | `--theme-dir` |
 | Prompt | `~/.ygg/prompts/*.{md,toml}` | `.ygg/prompts/*.{md,toml}` | `--prompt-template <file-or-dir>` |
-| Skill | `~/.ygg/skills/*/SKILL.md` | `.ygg/skills/*/SKILL.md` | `--skill-dir` |
+| Skill | `~/.ygg/skills/*/SKILL.md` plus managed `~/.ygg/extensions/*/skills/*/SKILL.md` | `.ygg/skills/*/SKILL.md` | `--skill-dir` |
 | Extension | `~/.ygg/extensions/*/extension.toml` | `.ygg/extensions/*/extension.toml` | `--extension-dir` |
 
 Roots are visited global, project, then explicit in option order. An explicit
 Pi-compatible prompt source may be one `.md`/`.toml` file or a directory.
 Later definitions with the same resource name win, and the shadowed path
 remains in the diagnostic snapshot. Scans and result ordering are
-deterministic.
+deterministic. A valid package-manager `install.json` admits an installed
+bundle's nested `skills/` root; merely copying an unmanaged extension directory
+does not. Bundle skills have lower precedence than `~/.ygg/skills`, remain
+inactive until explicitly loaded, and disappear from the next discovery
+snapshot after package removal.
 
 Workspace resources are ignored until `--workspace-trusted` is present.
 Explicit paths are an intentional user choice for that invocation. Executable

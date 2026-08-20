@@ -186,7 +186,11 @@ async fn run_prompt(
         None => prompt,
     };
     let display_prompt = prompt.clone();
-    let prompt = match expand_skill_command(app.skills.as_ref(), &prompt) {
+    let prompt = match expand_skill_command(
+        app.skills.as_ref(),
+        &prompt,
+        &app.agent.registered_tool_names(),
+    ) {
         Ok(Some(expanded)) => expanded,
         Ok(None) => prompt,
         Err(error) => {
@@ -513,16 +517,6 @@ async fn run_prompt(
         .settle_turn(extension_turn, &outcome)
         .await;
     app.agent.set_system_prompt(app.system.clone());
-    if outcome.shutdown_requested() {
-        let _ = tokio::time::timeout(
-            Duration::from_millis(1400),
-            app.executable_extensions.shutdown(),
-        )
-        .await;
-        ygg_agent::extension_process::force_kill_registered_process_groups();
-        output.flush()?;
-        return Ok(PromptExit::Finished(outcome));
-    }
     if outcome.allows_after_response() {
         for notification in app
             .executable_extensions
@@ -536,6 +530,25 @@ async fn run_prompt(
                 &format!("[extension] {notification}"),
             )?;
         }
+    }
+    let presentation = app.executable_extensions.presentation_text();
+    if !presentation.is_empty() {
+        write_log(
+            output,
+            &mut response_open,
+            theme,
+            &format!("[extension state]\n{presentation}"),
+        )?;
+    }
+    if outcome.shutdown_requested() {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(1400),
+            app.executable_extensions.shutdown(),
+        )
+        .await;
+        ygg_agent::extension_process::force_kill_registered_process_groups();
+        output.flush()?;
+        return Ok(PromptExit::Finished(outcome));
     }
     writeln!(output)?;
     output.flush()?;

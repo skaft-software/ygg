@@ -1,5 +1,7 @@
 //! Typed session events, deltas, and replay responses.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::bounds::{
@@ -7,10 +9,11 @@ use crate::bounds::{
     MAX_EVENT_BYTES, MAX_PUBLIC_TEXT_BYTES,
 };
 use crate::{
-    ArtifactRef, AuthorityProfile, CatalogCursor, ContextUsage, DurableEntryId, GoalState, ItemId,
-    ItemLifecycle, ModelSelection, PendingRequest, PullRequestSummary, RunId, SessionBranchEntry,
-    SessionCursor, SessionId, SessionItem, SessionLiveState, SessionSnapshot, SessionSummary,
-    SourceRef, ToolActivity, UsageSnapshot, PROTOCOL_VERSION,
+    ArtifactRef, AuthorityProfile, CatalogCursor, ContextUsage, DurableEntryId,
+    ExtensionPresentation, GoalState, ItemId, ItemLifecycle, ModelSelection, PendingRequest,
+    PullRequestSummary, RunId, SessionBranchEntry, SessionCursor, SessionId, SessionItem,
+    SessionLiveState, SessionSnapshot, SessionSummary, SourceRef, ToolActivity, UsageSnapshot,
+    PROTOCOL_VERSION,
 };
 
 const MAX_BRANCH_DELTA_ENTRIES: usize = 128;
@@ -64,6 +67,12 @@ pub enum EventPayload {
         model: ModelSelection,
         /// Effective authority after host clamping.
         authority: AuthorityProfile,
+    },
+    /// Complete executable-extension semantic presentation state changed.
+    #[serde(rename = "extension.presentationsChanged")]
+    ExtensionPresentationsChanged {
+        /// Atomic replacement; missing extensions are torn down.
+        presentations: Vec<ExtensionPresentation>,
     },
     /// Durable continuation goal state changed.
     #[serde(rename = "session.goalChanged")]
@@ -364,6 +373,24 @@ impl ProtocolValidation for EventPayload {
                 }
             }
             Self::SessionSettingsChanged { model, .. } => model.validate()?,
+            Self::ExtensionPresentationsChanged { presentations } => {
+                if presentations.len() > 32 {
+                    return Err(ValidationError::new(
+                        "event.extension_presentations",
+                        "exceeds the 32-extension limit",
+                    ));
+                }
+                let mut names = BTreeSet::new();
+                for presentation in presentations {
+                    presentation.validate()?;
+                    if !names.insert(presentation.extension.as_str()) {
+                        return Err(ValidationError::new(
+                            "event.extension_presentations",
+                            "contains a duplicate extension name",
+                        ));
+                    }
+                }
+            }
             Self::GoalChanged { goal, revision } => {
                 if let Some(goal) = goal {
                     goal.validate()?;

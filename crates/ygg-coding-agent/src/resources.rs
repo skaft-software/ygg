@@ -10,6 +10,8 @@ use crate::resource_resolver::{ResourceKind, ResourceResolver, ResourceSnapshot,
 /// Stable identity applied before the dynamic environment and tool contract.
 pub const BASE_PERSONA: &str = "You are Ygg, an expert coding assistant.";
 
+const TOOL_PREFERENCE: &str = "Tool preference:\n- For repository content search, prefer the dedicated `search` tool when it is available. When using `bash`, prefer `rg` (ripgrep) over `grep` for recursive or codebase searches; use `grep` only when compatibility with a specific command or pipeline requires it.";
+
 const MAX_CONTEXT_FILE_BYTES: usize = 256 * 1024;
 const MAX_CONTEXT_TOTAL_BYTES: usize = 512 * 1024;
 
@@ -232,6 +234,8 @@ fn xml_attribute(value: &str) -> String {
 fn base_prompt(config: &Config) -> String {
     let mut prompt = format!(
         r#"{BASE_PERSONA}
+
+{TOOL_PREFERENCE}
 
 Working style:
 - Match the user's requested mode. Answer, investigate, review, or plan without editing unless a change or implementation is requested. When implementation is requested, do not stop at analysis.
@@ -867,7 +871,6 @@ fn project_skill_directories(workspace: &Path, invocation_cwd: &Path) -> Vec<Pat
 
 /// Validates a skill's declared tool requirements against the tools available
 /// to the running agent.
-#[cfg(feature = "serve")]
 pub fn validate_skill_requirements(
     descriptor: &SkillDescriptor,
     registered_tools: &[String],
@@ -939,6 +942,11 @@ impl FileSystemSkillRegistry {
                     ..user_standard
                 },
             ));
+            for bundled_skills in
+                crate::extension_bundle::installed_skill_roots(&home.join(".ygg/extensions"))
+            {
+                roots.push((bundled_skills, user_standard));
+            }
             roots.push((
                 home.join(".ygg/skills"),
                 SkillRootPolicy {
@@ -1332,6 +1340,7 @@ pub fn format_skills_for_prompt(descriptors: &[SkillDescriptor]) -> String {
 pub fn expand_skill_command(
     registry: &dyn SkillRegistry,
     input: &str,
+    registered_tools: &[String],
 ) -> Result<Option<String>, SkillLoadError> {
     let Some(rest) = input.strip_prefix("/skill:") else {
         return Ok(None);
@@ -1343,6 +1352,7 @@ pub fn expand_skill_command(
     }
     let arguments = rest[name_end..].trim();
     let loaded = registry.load(&name.to_owned())?;
+    validate_skill_requirements(&loaded.descriptor, registered_tools)?;
     let location = skill_location(&loaded.descriptor)
         .ok_or_else(|| SkillLoadError::UnsupportedSource("built-in".into()))?;
     let base = location
@@ -1415,6 +1425,9 @@ mod tests {
     fn expected_base_prompt(config: &Config, tools: &str) -> String {
         format!(
             r#"You are Ygg, an expert coding assistant.
+
+Tool preference:
+- For repository content search, prefer the dedicated `search` tool when it is available. When using `bash`, prefer `rg` (ripgrep) over `grep` for recursive or codebase searches; use `grep` only when compatibility with a specific command or pipeline requires it.
 
 Working style:
 - Match the user's requested mode. Answer, investigate, review, or plan without editing unless a change or implementation is requested. When implementation is requested, do not stop at analysis.
@@ -1525,10 +1538,10 @@ Environment:
 
         let dynamic_bytes = prompt_path(root.path()).len() + prompt_path(&nested).len();
         let scaffold_bytes = prompt.len() - dynamic_bytes;
-        assert_eq!(scaffold_bytes, 2_471, "reviewed stable prompt byte budget");
+        assert_eq!(scaffold_bytes, 2_752, "reviewed stable prompt byte budget");
         assert_eq!(
             scaffold_bytes.div_ceil(4),
-            618,
+            688,
             "estimated stable token budget"
         );
     }
@@ -1808,6 +1821,80 @@ Environment:
     }
 
     #[test]
+    fn managed_extension_bundle_skills_are_discovered_but_unmanaged_copies_are_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        let managed = home.join(".ygg/extensions/example/skills/example");
+        let unmanaged = home.join(".ygg/extensions/unmanaged/skills/unmanaged");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::create_dir_all(&unmanaged).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            home.join(".ygg/extensions/example/install.json"),
+            format!(
+                "{{\n  \"schema_version\": 1,\n  \"id\": \"example\",\n  \"version\": \"0.1.0\",\n  \"api_version\": \"{}\",\n  \"requires_ygg\": \"={}\",\n  \"source_kind\": \"local\",\n  \"source\": \"fixture\",\n  \"archive_sha256\": \"{}\",\n  \"installed_by_ygg\": \"{}\"\n}}\n",
+                ygg_agent::EXTENSION_API_VERSION,
+                env!("CARGO_PKG_VERSION"),
+                "a".repeat(64),
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            managed.join("SKILL.md"),
+            "---\nid: example\nname: example\ndescription: Packaged skill.\n---\nPackaged instructions.",
+        )
+        .unwrap();
+        std::fs::write(
+            unmanaged.join("SKILL.md"),
+            "---\nid: unmanaged\nname: Unmanaged\ndescription: Not packaged.\n---\nIgnore.",
+        )
+        .unwrap();
+
+        let registry = FileSystemSkillRegistry::discover(
+            workspace.clone(),
+            workspace,
+            vec![],
+            false,
+            Some(home),
+        )
+        .unwrap();
+        let loaded = registry.load(&"example".to_owned()).unwrap();
+        assert_eq!(loaded.instructions.trim(), "Packaged instructions.");
+        assert!(matches!(
+            registry.load(&"unmanaged".to_owned()),
+            Err(SkillLoadError::NotFound(_))
+        ));
+
+        let user_override = temp.path().join("home/.ygg/skills/example");
+        std::fs::create_dir_all(&user_override).unwrap();
+        std::fs::write(
+            user_override.join("SKILL.md"),
+            "---\nid: example\nname: example\ndescription: User override.\n---\nUser instructions.",
+        )
+        .unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        let overridden = FileSystemSkillRegistry::discover(
+            workspace.clone(),
+            workspace,
+            vec![],
+            false,
+            Some(home),
+        )
+        .unwrap();
+        assert_eq!(
+            overridden
+                .load(&"example".to_owned())
+                .unwrap()
+                .instructions
+                .trim(),
+            "User instructions."
+        );
+    }
+
+    #[test]
     fn shared_resolver_skill_snapshot_accepts_standard_name_only_frontmatter() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
@@ -1893,6 +1980,35 @@ Environment:
         let registry2 =
             FileSystemSkillRegistry::new(temp.path().to_path_buf(), vec![], true).unwrap();
         assert!(registry2.load(&"large-frontmatter".to_string()).is_err());
+    }
+
+    #[test]
+    fn explicit_skill_invocation_enforces_required_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join(".ygg/skills/browser-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nid: browser-skill\nname: Browser\ndescription: Browse visibly\nrequired-tools:\n  - browser_status\n  - read\n---\nUse the browser safely.",
+        )
+        .unwrap();
+        let registry =
+            FileSystemSkillRegistry::new(temp.path().to_path_buf(), vec![], true).unwrap();
+
+        assert!(matches!(
+            expand_skill_command(&registry, "/skill:browser-skill", &["read".into()]),
+            Err(SkillLoadError::MissingRequiredTools(missing))
+                if missing == vec!["browser_status"]
+        ));
+        let expanded = expand_skill_command(
+            &registry,
+            "/skill:browser-skill inspect",
+            &["read".into(), "browser_status".into()],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(expanded.contains("Use the browser safely."));
+        assert!(expanded.ends_with("inspect"));
     }
 
     #[test]

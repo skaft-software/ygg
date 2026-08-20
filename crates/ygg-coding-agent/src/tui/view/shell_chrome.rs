@@ -11,6 +11,7 @@ use super::{fit_line, semantic_separator, wrap_hanging, ShellState};
 pub(super) struct ShellChrome {
     pub(super) header: Vec<String>,
     pub(super) composer: Vec<String>,
+    pub(super) activity: Vec<String>,
     pub(super) panel: Vec<String>,
     pub(super) pending: Vec<String>,
     pub(super) suggestions: Vec<String>,
@@ -88,6 +89,25 @@ fn render_shell_header(state: &ShellState, width: u16) -> Vec<String> {
     lines
 }
 
+fn render_extension_activity(state: &ShellState, width: u16, limit: usize) -> Vec<String> {
+    if state.panel.is_some() || limit == 0 {
+        return Vec::new();
+    }
+    let inset =
+        usize::from(state.theme.layout_for_width(width).transcript_inset).min(usize::from(width));
+    state
+        .extension_activity
+        .iter()
+        .take(limit.min(6))
+        .map(|line| {
+            let rendered = state
+                .theme
+                .apply_semantic_role("extension.activity", &sanitize_for_terminal(line));
+            fit_line(&format!("{}{rendered}", " ".repeat(inset)), width)
+        })
+        .collect()
+}
+
 pub(super) fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> ShellChrome {
     let rows = usize::from(state.size.1.max(5));
     let header = render_shell_header(state, width);
@@ -159,9 +179,14 @@ pub(super) fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> Shel
     let pending = render_pending_steering(state, width, pending_limit);
     remaining = remaining.saturating_sub(pending.len());
 
+    let activity_limit = remaining.min((rows / 4).clamp(2, 6));
+    let activity = render_extension_activity(state, width, activity_limit);
+    remaining = remaining.saturating_sub(activity.len());
+
     ShellChrome {
         header,
         composer,
+        activity,
         panel,
         pending,
         suggestions,
@@ -180,6 +205,7 @@ pub(super) fn append_viewport_chrome(lines: &mut Vec<String>, chrome: ShellChrom
     lines.extend(chrome.error);
     lines.extend(chrome.pending);
     lines.extend(chrome.panel);
+    lines.extend(chrome.activity);
     lines.extend(chrome.composer);
     // Input discovery expands downward from the composer and temporarily
     // occupies the status row, keeping model/token telemetry from competing
@@ -207,6 +233,7 @@ pub(super) fn append_chrome(
     lines.extend(chrome.error);
     lines.extend(chrome.pending);
     lines.extend(chrome.panel);
+    lines.extend(chrome.activity);
     lines.extend(chrome.composer);
     // Keep autocomplete adjacent to the composer in terminal-owned mode as
     // well as in the application-owned viewport above.
@@ -221,5 +248,6 @@ pub(super) fn shell_chrome_rows(chrome: &ShellChrome) -> usize {
         .saturating_add(chrome.pending.len())
         .saturating_add(chrome.suggestions.len())
         .saturating_add(chrome.panel.len())
+        .saturating_add(chrome.activity.len())
         .saturating_add(chrome.composer.len())
 }

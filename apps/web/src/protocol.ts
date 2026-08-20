@@ -891,8 +891,88 @@ export interface ConversationBranchProvenance {
   warning: string;
 }
 
+export type ExtensionPresentationState =
+  | "empty"
+  | "loading"
+  | "pending"
+  | "active"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "degraded"
+  | "stopped"
+  | "unavailable";
+
+export interface ExtensionPresentationReference {
+  kind: "session" | "artifact" | "resource" | "url";
+  id: string;
+  label?: string;
+}
+
+export interface ExtensionPresentationActivity {
+  id: string;
+  kind: string;
+  state: ExtensionPresentationState;
+  summary: string;
+  provenance?: string;
+  startedAtMs?: number;
+  completedAtMs?: number;
+  references: ExtensionPresentationReference[];
+}
+
+export interface ExtensionPresentationAction {
+  id: string;
+  label: string;
+  command: string;
+  arguments: string[];
+  destructive: boolean;
+}
+
+export interface ExtensionPresentationNode {
+  id: string;
+  parentId?: string;
+  state: ExtensionPresentationState;
+  label: string;
+  secondary?: string;
+  actionIds: string[];
+  references: ExtensionPresentationReference[];
+}
+
+export interface ExtensionPresentationDetail {
+  nodeId?: string;
+  title: string;
+  body: string;
+  references: ExtensionPresentationReference[];
+}
+
+export interface ExtensionPresentation {
+  extension: string;
+  extensionInstanceId: string;
+  generation: number;
+  resourceOwner?: string;
+  snapshot: {
+    revision: number;
+    status?: {
+      state: ExtensionPresentationState;
+      label: string;
+      detail?: string;
+    };
+    activities: ExtensionPresentationActivity[];
+    collection?: {
+      kind: "list" | "tree";
+      title: string;
+      nodes: ExtensionPresentationNode[];
+      selectedNodeId?: string;
+      detail?: ExtensionPresentationDetail;
+    };
+    actions: ExtensionPresentationAction[];
+  };
+}
+
 export interface SessionSnapshot {
   sessionId: string;
+  delegatedParentSessionId?: string;
   actorGeneration: number;
   sequence: number;
   title: string;
@@ -911,6 +991,7 @@ export interface SessionSnapshot {
   startedAt: string;
   branches: SessionBranchGraph;
   items: TranscriptItem[];
+  extensionPresentations?: ExtensionPresentation[];
   progress: ProgressStep[];
   sources: SourceRef[];
   outputs: OutputRef[];
@@ -943,6 +1024,13 @@ export type SessionEvent =
           | "contextPercent"
         >
       >;
+    }
+  | {
+      type: "extension.presentationsChanged";
+      sessionId: string;
+      actorGeneration?: number;
+      sequence: number;
+      presentations: ExtensionPresentation[];
     }
   | {
       type: "session.goalChanged";
@@ -1132,6 +1220,17 @@ export type ClientCommand =
       type: "session.invokeSlashCommand";
       sessionId: string;
       invocation: string;
+    }
+  | {
+      id: string;
+      type: "extension.invokeAction";
+      sessionId: string;
+      extension: string;
+      extensionInstanceId: string;
+      generation: number;
+      revision: number;
+      action: string;
+      confirmed: boolean;
     }
   | {
       id: string;

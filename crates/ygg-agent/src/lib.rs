@@ -76,6 +76,7 @@ pub mod effect;
 pub mod events;
 pub mod extension;
 pub mod extension_policy;
+pub mod extension_presentation;
 pub mod extension_process;
 pub mod extension_secret;
 pub mod goal_driver;
@@ -117,8 +118,8 @@ pub use context::{
     RunPhase, RunTerminalState,
 };
 pub use delegation::{
-    delegation_runtime_supports, DelegatedAgentStatus, DelegationConfig, DelegationError,
-    DelegationLimits, DelegationMode, COLLABORATION_TOOL_NAMES,
+    delegated_session_reference, delegation_runtime_supports, DelegatedAgentStatus,
+    DelegationConfig, DelegationError, DelegationLimits, DelegationMode, COLLABORATION_TOOL_NAMES,
 };
 pub use effect::{
     EffectAuthorization, EffectBroker, EffectBrokerError, EffectGrantToken, EffectIntent,
@@ -134,6 +135,16 @@ pub use extension_policy::{
     ExtensionActionIntent, ExtensionAdapterHints, ExtensionApprovalStore, ExtensionApprovalToken,
     ExtensionIntentPolicy, ExtensionPolicyDecision, ExtensionPolicyError, ExtensionPolicyFrontend,
     MAX_EXTENSION_ACTION_INTENT_BYTES, MAX_EXTENSION_APPROVALS, MAX_EXTENSION_APPROVAL_TTL,
+};
+pub use extension_presentation::{
+    ExtensionPresentationAction, ExtensionPresentationActivity, ExtensionPresentationCollection,
+    ExtensionPresentationCollectionKind, ExtensionPresentationDetail, ExtensionPresentationNode,
+    ExtensionPresentationReference, ExtensionPresentationReferenceKind,
+    ExtensionPresentationSnapshot, ExtensionPresentationState, ExtensionPresentationStatus,
+    MAX_EXTENSION_PRESENTATION_ACTIONS, MAX_EXTENSION_PRESENTATION_ACTIVITIES,
+    MAX_EXTENSION_PRESENTATION_BYTES, MAX_EXTENSION_PRESENTATION_DEPTH,
+    MAX_EXTENSION_PRESENTATION_DETAIL_BYTES, MAX_EXTENSION_PRESENTATION_LABEL_BYTES,
+    MAX_EXTENSION_PRESENTATION_NODES, MAX_EXTENSION_PRESENTATION_REFERENCES,
 };
 pub use extension_process::{
     default_extension_roots, discover_extension_manifests, load_extension_manifest_paths,

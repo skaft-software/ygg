@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "limits": {
+    "maxSessions": 8,
+    "connectTimeoutMs": 10000,
+    "operationTimeoutMs": 30000,
+    "maxOutputBytes": 131072,
+    "maxFileBytes": 131072
+  },
+  "targets": {
+    "example-read-only": {
+      "alias": "example-from-ssh-config",
+      "label": "Example (disabled)",
+      "remoteCwd": "/srv/example",
+      "authority": "read-only",
+      "enabled": false
+    }
+  },
+  "trustedProjects": []
+}

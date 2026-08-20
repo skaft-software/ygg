@@ -1,0 +1,272 @@
+{
+  "afterStaleGenerationRemoval": [
+    {
+      "extension": "ygg-mcp",
+      "generation": 7,
+      "snapshot": {
+        "actions": [
+          {
+            "arguments": [
+              "refresh",
+              "fixture"
+            ],
+            "command": "mcp",
+            "destructive": false,
+            "id": "refresh:fixture",
+            "label": "Refresh"
+          },
+          {
+            "arguments": [
+              "restart",
+              "fixture"
+            ],
+            "command": "mcp",
+            "destructive": false,
+            "id": "restart:fixture",
+            "label": "Restart"
+          },
+          {
+            "arguments": [
+              "stop",
+              "fixture"
+            ],
+            "command": "mcp",
+            "destructive": false,
+            "id": "stop:fixture",
+            "label": "Stop"
+          }
+        ],
+        "activities": [],
+        "collection": {
+          "detail": {
+            "body": "Lifecycle: ready\nTransport: stdio\nCatalog revision: 3\nHost catalog revision: 5\nPublished tools: 2\nRestart/backoff: 0/5",
+            "node_id": "server:fixture",
+            "references": [],
+            "title": "Fixture server"
+          },
+          "kind": "tree",
+          "nodes": [
+            {
+              "action_ids": [
+                "refresh:fixture",
+                "restart:fixture",
+                "stop:fixture"
+              ],
+              "id": "server:fixture",
+              "label": "Fixture server",
+              "references": [],
+              "secondary": "stdio \u00b7 catalog 3 \u00b7 2 tools",
+              "state": "active"
+            },
+            {
+              "action_ids": [],
+              "id": "tool:mcp_fixture_echo_0123456789",
+              "label": "mcp_fixture_echo_0123456789",
+              "parent_id": "server:fixture",
+              "references": [],
+              "secondary": "1 parameters \u00b7 readOnly",
+              "state": "active"
+            },
+            {
+              "action_ids": [],
+              "id": "tool:mcp_fixture_write_9876543210",
+              "label": "mcp_fixture_write_9876543210",
+              "parent_id": "server:fixture",
+              "references": [],
+              "secondary": "2 parameters \u00b7 unknown",
+              "state": "active"
+            }
+          ],
+          "selected_node_id": "server:fixture",
+          "title": "MCP servers"
+        },
+        "revision": 1,
+        "status": {
+          "detail": "1 of 1 configured MCP servers connected; 2 tools published",
+          "label": "mcp 1/1 \u00b7 2 tools",
+          "state": "active"
+        }
+      }
+    }
+  ],
+  "before": [
+    {
+      "extension": "ygg-mcp",
+      "generation": 6,
+      "snapshot": {
+        "actions": [
+          {
+            "arguments": [
+              "refresh",
+              "fixture"
+            ],
+            "command": "mcp",
+            "destructive": false,
+            "id": "refresh:fixture",
+            "label": "Refresh"
+          },
+          {
+            "arguments": [
+              "restart",
+              "fixture"
+            ],
+            "command": "mcp",
+            "destructive": false,
+            "id": "restart:fixture",
+            "label": "Restart"
+          },
+          {
+            "arguments": [
+              "stop",
+              "fixture"
+            ],
+            "command": "mcp",
+            "destructive": false,
+            "id": "stop:fixture",
+            "label": "Stop"
+          }
+        ],
+        "activities": [],
+        "collection": {
+          "detail": {
+            "body": "Lifecycle: degraded\nTransport: stdio\nCatalog revision: 3\nHost catalog revision: 5\nPublished tools: 2\nRestart/backoff: 0/5\nLast error: request_timeout \u00b7 MCP server failed a bounded health check",
+            "node_id": "server:fixture",
+            "references": [],
+            "title": "Fixture server"
+          },
+          "kind": "tree",
+          "nodes": [
+            {
+              "action_ids": [
+                "refresh:fixture",
+                "restart:fixture",
+                "stop:fixture"
+              ],
+              "id": "server:fixture",
+              "label": "Fixture server",
+              "references": [],
+              "secondary": "stdio \u00b7 catalog 3 \u00b7 2 tools",
+              "state": "degraded"
+            },
+            {
+              "action_ids": [],
+              "id": "tool:mcp_fixture_echo_0123456789",
+              "label": "mcp_fixture_echo_0123456789",
+              "parent_id": "server:fixture",
+              "references": [],
+              "secondary": "1 parameters \u00b7 readOnly",
+              "state": "active"
+            },
+            {
+              "action_ids": [],
+              "id": "tool:mcp_fixture_write_9876543210",
+              "label": "mcp_fixture_write_9876543210",
+              "parent_id": "server:fixture",
+              "references": [],
+              "secondary": "2 parameters \u00b7 unknown",
+              "state": "active"
+            }
+          ],
+          "selected_node_id": "server:fixture",
+          "title": "MCP servers"
+        },
+        "revision": 1,
+        "status": {
+          "detail": "1 of 1 configured MCP servers connected; 2 tools published",
+          "label": "mcp 1/1 \u00b7 2 tools \u00b7 degraded",
+          "state": "degraded"
+        }
+      }
+    }
+  ],
+  "replacement": [
+    {
+      "extension": "ygg-mcp",
+      "generation": 7,
+      "snapshot": {
+        "actions": [
+          {
+            "arguments": [
+              "refresh",
+              "fixture"
+            ],
+            "command": "mcp",
+            "destructive": false,
+            "id": "refresh:fixture",
+            "label": "Refresh"
+          },
+          {
+            "arguments": [
+              "restart",
+              "fixture"
+            ],
+            "command": "mcp",
+            "destructive": false,
+            "id": "restart:fixture",
+            "label": "Restart"
+          },
+          {
+            "arguments": [
+              "stop",
+              "fixture"
+            ],
+            "command": "mcp",
+            "destructive": false,
+            "id": "stop:fixture",
+            "label": "Stop"
+          }
+        ],
+        "activities": [],
+        "collection": {
+          "detail": {
+            "body": "Lifecycle: ready\nTransport: stdio\nCatalog revision: 3\nHost catalog revision: 5\nPublished tools: 2\nRestart/backoff: 0/5",
+            "node_id": "server:fixture",
+            "references": [],
+            "title": "Fixture server"
+          },
+          "kind": "tree",
+          "nodes": [
+            {
+              "action_ids": [
+                "refresh:fixture",
+                "restart:fixture",
+                "stop:fixture"
+              ],
+              "id": "server:fixture",
+              "label": "Fixture server",
+              "references": [],
+              "secondary": "stdio \u00b7 catalog 3 \u00b7 2 tools",
+              "state": "active"
+            },
+            {
+              "action_ids": [],
+              "id": "tool:mcp_fixture_echo_0123456789",
+              "label": "mcp_fixture_echo_0123456789",
+              "parent_id": "server:fixture",
+              "references": [],
+              "secondary": "1 parameters \u00b7 readOnly",
+              "state": "active"
+            },
+            {
+              "action_ids": [],
+              "id": "tool:mcp_fixture_write_9876543210",
+              "label": "mcp_fixture_write_9876543210",
+              "parent_id": "server:fixture",
+              "references": [],
+              "secondary": "2 parameters \u00b7 unknown",
+              "state": "active"
+            }
+          ],
+          "selected_node_id": "server:fixture",
+          "title": "MCP servers"
+        },
+        "revision": 1,
+        "status": {
+          "detail": "1 of 1 configured MCP servers connected; 2 tools published",
+          "label": "mcp 1/1 \u00b7 2 tools",
+          "state": "active"
+        }
+      }
+    }
+  ]
+}

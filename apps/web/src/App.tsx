@@ -721,6 +721,9 @@ export default function App() {
       storedBoolean(terminalPaneOpenStorageKey),
   );
   const [branchHistoryOpen, setBranchHistoryOpen] = useState(false);
+  const [delegatedParentSessionId, setDelegatedParentSessionId] = useState<
+    string | null
+  >(null);
   const [inspector, setInspector] = useState<InspectorSelection | null>(null);
   const [inspectorClosing, setInspectorClosing] = useState(false);
   const [activityPaneWidth, setActivityPaneWidth] = useState(() =>
@@ -892,7 +895,15 @@ export default function App() {
   const project = state.bootstrap?.projects.find(
     (candidate) => candidate.id === session?.projectId,
   );
-  const terminalAvailable = Boolean(state.bootstrap?.capabilities.terminal);
+  const delegatedSessionReadOnly = Boolean(
+    session?.sessionId.startsWith("agent-session:"),
+  );
+  const delegatedReturnParentSessionId = delegatedSessionReadOnly
+    ? (delegatedParentSessionId ?? session?.delegatedParentSessionId ?? null)
+    : null;
+  const terminalAvailable = Boolean(
+    !delegatedSessionReadOnly && state.bootstrap?.capabilities.terminal,
+  );
 
   const closeTerminal = useCallback(() => {
     setTerminalOpen(false);
@@ -905,6 +916,7 @@ export default function App() {
   const activityAvailable = Boolean(
     session &&
       (session.items.some((item) => item.kind === "run_outcome") ||
+        (session.extensionPresentations?.length ?? 0) > 0 ||
         session.progress.length ||
         (state.bootstrap?.capabilities.resources &&
           (session.outputs.length || session.sources.length))),
@@ -1170,6 +1182,16 @@ export default function App() {
   }, [selectedSummary?.lifecycle, session]);
   const selectSession = useCallback(
     (sessionId: string) => {
+      const delegatedTarget = sessionId.startsWith("agent-session:");
+      if (
+        delegatedTarget &&
+        session &&
+        !session.sessionId.startsWith("agent-session:")
+      ) {
+        setDelegatedParentSessionId(session.sessionId);
+      } else if (!delegatedTarget) {
+        setDelegatedParentSessionId(null);
+      }
       const revealAfterSelection = !session;
       if (!revealAfterSelection) setSurface("session");
       setInspector(null);
@@ -1481,6 +1503,25 @@ const getCommandDiscovery = useCallback(
       store.invokeSlashCommand(invocation, idempotencyKey),
     [],
   );
+  const invokeExtensionAction = useCallback(
+    (
+      extension: string,
+      extensionInstanceId: string,
+      generation: number,
+      revision: number,
+      action: string,
+      confirmed: boolean,
+    ) =>
+      store.invokeExtensionAction(
+        extension,
+        extensionInstanceId,
+        generation,
+        revision,
+        action,
+        confirmed,
+      ),
+    [],
+  );
   const exportSession = useCallback(() => {
     if (!session) throw new Error("No task is selected.");
     const link = document.createElement("a");
@@ -1639,14 +1680,17 @@ const getCommandDiscovery = useCallback(
             pinned={selectedSummary?.pinned ?? false}
             archived={selectedSummary?.archived ?? false}
             sessionActionsAvailable={
-              state.bootstrap.capabilities.sessionMetadata ||
-              state.bootstrap.capabilities.sessionBranches ||
+              (!delegatedSessionReadOnly &&
+                (state.bootstrap.capabilities.sessionMetadata ||
+                  state.bootstrap.capabilities.sessionBranches)) ||
               state.bootstrap.capabilities.sessionExport
             }
             metadataActionsAvailable={
+              !delegatedSessionReadOnly &&
               state.bootstrap.capabilities.sessionMetadata
             }
             branchHistoryAvailable={
+              !delegatedSessionReadOnly &&
               state.bootstrap.capabilities.sessionBranches &&
               session.branches.entries.some((entry) => entry.checkoutable)
             }
@@ -1682,6 +1726,12 @@ const getCommandDiscovery = useCallback(
             key={session.sessionId}
             session={session}
             bootstrap={state.bootstrap}
+            readOnly={delegatedSessionReadOnly}
+            onReturnToParent={
+              delegatedReturnParentSessionId
+                ? () => selectSession(delegatedReturnParentSessionId)
+                : undefined
+            }
             goal={state.goal}
             onGoalCommand={goalCommand}
             onSubmit={submitSession}
@@ -1884,6 +1934,8 @@ const getCommandDiscovery = useCallback(
             onClose={closeActivity}
             onOpenOutput={openOutput}
             onOpenSource={openSource}
+            onOpenSession={selectSession}
+            onInvokeExtensionAction={invokeExtensionAction}
             onOpenResource={
               state.bootstrap.capabilities.resources
                 ? openResource

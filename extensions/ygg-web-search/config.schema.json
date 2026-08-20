@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/skaft-software/ygg/extensions/ygg-web-search/config.schema.json",
+  "title": "ygg-web-search configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "provider"],
+  "properties": {
+    "version": {"const": 1},
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "endpoint"],
+      "properties": {
+        "kind": {"const": "searxng"},
+        "endpoint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "description": "Explicit non-secret SearXNG base or /search URL."
+        },
+        "label": {"type": "string", "minLength": 1, "maxLength": 48},
+        "allow_private_endpoint": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow only the explicitly configured provider endpoint to resolve privately. Direct web_open/web_find destinations remain public-only."
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowed_domains": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 253}
+        },
+        "default_results": {"type": "integer", "minimum": 1, "maximum": 10},
+        "default_timeout_seconds": {"type": "number", "minimum": 0.1, "maximum": 20},
+        "max_redirects": {"type": "integer", "minimum": 0, "maximum": 3},
+        "max_provider_bytes": {"type": "integer", "minimum": 1024, "maximum": 524288},
+        "max_download_bytes": {"type": "integer", "minimum": 1024, "maximum": 524288},
+        "default_content_bytes": {"type": "integer", "minimum": 1024, "maximum": 131072},
+        "max_content_bytes": {"type": "integer", "minimum": 1024, "maximum": 131072},
+        "cache_ttl_seconds": {"type": "integer", "minimum": 0, "maximum": 900},
+        "cache_entries": {"type": "integer", "minimum": 0, "maximum": 64},
+        "cache_bytes": {"type": "integer", "minimum": 0, "maximum": 2097152}
+      }
+    }
+  }
+}

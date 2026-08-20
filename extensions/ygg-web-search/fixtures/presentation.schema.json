@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ygg-web-search semantic presentation fixture",
+  "description": "Package-owned test envelopes whose notifications and snapshots use the generic API 0.2 presentation/update contract exactly.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "extension", "case", "expected_snapshot"],
+  "properties": {
+    "schema": {"const": "ygg.web-search.presentation-fixture.v1"},
+    "extension": {"const": "ygg-web-search"},
+    "case": {"type": "string", "minLength": 1, "maxLength": 64},
+    "notifications": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {"$ref": "#/$defs/notification"}
+    },
+    "deliveries": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["generation", "notification"],
+        "properties": {
+          "generation": {"type": "integer", "minimum": 0},
+          "notification": {"$ref": "#/$defs/notification"}
+        }
+      }
+    },
+    "retained_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generation", "snapshot"],
+      "properties": {
+        "generation": {"type": "integer", "minimum": 0},
+        "snapshot": {"$ref": "#/$defs/snapshot"}
+      }
+    },
+    "expected_generation": {"type": "integer", "minimum": 0},
+    "expected_ignored_deliveries": {"type": "integer", "minimum": 0},
+    "expected_network_requests": {"type": "integer", "minimum": 0},
+    "expected_snapshot": {"$ref": "#/$defs/snapshot"}
+  },
+  "$defs": {
+    "notification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jsonrpc", "method", "params"],
+      "properties": {
+        "jsonrpc": {"const": "2.0"},
+        "method": {"const": "presentation/update"},
+        "params": {"$ref": "#/$defs/snapshot"}
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "status", "activities", "collection", "actions"],
+      "properties": {
+        "revision": {"type": "integer", "minimum": 0},
+        "status": {"type": "object"},
+        "activities": {"type": "array", "maxItems": 128},
+        "collection": {"type": ["object", "null"]},
+        "actions": {"type": "array", "maxItems": 64}
+      }
+    }
+  }
+}

@@ -722,6 +722,7 @@ struct RpcSettings {
     steering_mode: String,
     follow_up_mode: String,
     auto_retry_enabled: bool,
+    registered_tools: Vec<String>,
 }
 
 impl Default for RpcSettings {
@@ -730,6 +731,7 @@ impl Default for RpcSettings {
             steering_mode: "one-at-a-time".into(),
             follow_up_mode: "one-at-a-time".into(),
             auto_retry_enabled: true,
+            registered_tools: Vec::new(),
         }
     }
 }
@@ -1078,8 +1080,12 @@ async fn prepare_prompt(
     command: &Value,
 ) -> anyhow::Result<(UserInput, usize, Value)> {
     let original = required_string(command, "message")?.to_owned();
-    let mut expanded =
-        expand_skill_command(app.skills.as_ref(), &original)?.unwrap_or(original.clone());
+    let mut expanded = expand_skill_command(
+        app.skills.as_ref(),
+        &original,
+        &app.agent.registered_tool_names(),
+    )?
+    .unwrap_or(original.clone());
     if let Some(invocation) = expanded.trim().strip_prefix('/') {
         let split = invocation
             .find(char::is_whitespace)
@@ -1690,9 +1696,11 @@ fn expand_queued_prompt(
     skills: &dyn SkillRegistry,
     prompts: &PromptRegistry,
     workspace: &Path,
+    registered_tools: &[String],
     raw: &str,
 ) -> anyhow::Result<String> {
-    let expanded = expand_skill_command(skills, raw)?.unwrap_or_else(|| raw.to_owned());
+    let expanded =
+        expand_skill_command(skills, raw, registered_tools)?.unwrap_or_else(|| raw.to_owned());
     let invocation = expanded.trim().strip_prefix('/');
     let Some(invocation) = invocation else {
         return Ok(expanded);
@@ -1724,8 +1732,9 @@ fn queued_input(
     skills: &dyn SkillRegistry,
     prompts: &PromptRegistry,
     workspace: &Path,
+    registered_tools: &[String],
 ) -> anyhow::Result<QueuedInput> {
-    let expanded = expand_queued_prompt(skills, prompts, workspace, raw)?;
+    let expanded = expand_queued_prompt(skills, prompts, workspace, registered_tools, raw)?;
     let input = input_from_command(command, expanded)?;
     let mut display_input = input.clone();
     if let Some(InputPart::Text(text)) = display_input.parts.first_mut() {
@@ -1771,7 +1780,14 @@ async fn active_input(
             }
             "steer" | "follow_up" => {
                 let raw = required_string(&command, "message")?;
-                let queued = queued_input(&command, raw, skills.as_ref(), prompts, workspace)?;
+                let queued = queued_input(
+                    &command,
+                    raw,
+                    skills.as_ref(),
+                    prompts,
+                    workspace,
+                    &settings.registered_tools,
+                )?;
                 if kind == "steer" {
                     control.steer(queued.input.clone()).await?;
                     queue.steering.push_back(queued);
@@ -1792,7 +1808,14 @@ async fn active_input(
                         )
                     })?;
                 let raw = required_string(&command, "message")?;
-                let queued = queued_input(&command, raw, skills.as_ref(), prompts, workspace)?;
+                let queued = queued_input(
+                    &command,
+                    raw,
+                    skills.as_ref(),
+                    prompts,
+                    workspace,
+                    &settings.registered_tools,
+                )?;
                 match behavior {
                     "steer" => {
                         control.steer(queued.input.clone()).await?;
@@ -2357,7 +2380,10 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
     let mut input = spawn_input_reader();
     let mut output = RpcOutput::new();
     let mut deferred = VecDeque::new();
-    let mut settings = RpcSettings::default();
+    let mut settings = RpcSettings {
+        registered_tools: app.agent.registered_tool_names(),
+        ..RpcSettings::default()
+    };
     let mut queue = QueueState::default();
     let mut eof = false;
 
@@ -2473,6 +2499,7 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
                 app.skills.as_ref(),
                 app.prompts.as_ref(),
                 &app.config.workspace,
+                &app.agent.registered_tool_names(),
             ) {
                 Ok(queued) => queued,
                 Err(error) => {
@@ -2519,6 +2546,7 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
         let commands = rpc_commands(&app);
         let state = state_value(&app, &settings, true, queue.len(), None);
         let mut translator = EventTranslator::new(&app, user_message.clone());
+        settings.registered_tools = app.agent.registered_tool_names();
         app.agent
             .set_provider_retries_enabled(settings.auto_retry_enabled);
         let mut run = match app.agent.prompt(prompt).await {
@@ -2561,6 +2589,12 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
             .await;
         app.agent.set_system_prompt(app.system.clone());
         if finish.shutdown_requested() {
+            let _ = app.executable_extensions.drain_events();
+            let extension_presentations = app.executable_extensions.presentation_views();
+            output.send(json!({
+                "type": "extension_presentations",
+                "presentations": extension_presentations,
+            }))?;
             app.executable_extensions.shutdown().await;
             return Ok(());
         }
@@ -2574,7 +2608,6 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
         if let Some(event) = translator.pending_retry_end.take() {
             output.send(event)?;
         }
-        output.send(json!({"type": "agent_settled"}))?;
         if finish.allows_after_response() {
             for notification in app
                 .executable_extensions
@@ -2584,6 +2617,13 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
                 crate::output::stderr_line(format!("extension: {notification}"));
             }
         }
+        let _ = app.executable_extensions.drain_events();
+        let extension_presentations = app.executable_extensions.presentation_views();
+        output.send(json!({
+            "type": "extension_presentations",
+            "presentations": extension_presentations,
+        }))?;
+        output.send(json!({"type": "agent_settled"}))?;
     }
 
     app.executable_extensions.shutdown().await;

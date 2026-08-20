@@ -1,0 +1,117 @@
+{
+  "revision": 7,
+  "status": {
+    "state": "active",
+    "label": "Subagents · 1 running · 1 done"
+  },
+  "activities": [
+    {
+      "id": "activity:agent-1",
+      "kind": "subagent",
+      "state": "running",
+      "summary": "explore-auth · searching",
+      "provenance": "Ygg agent_sessions · read-only",
+      "started_at_ms": 1700000000000,
+      "references": [
+        {
+          "kind": "session",
+          "id": "agent-session:c587878865cc17ec3b228dde461c7ca2676307626a4fcefbc54b32fd097057cc",
+          "label": "Open worker transcript"
+        }
+      ]
+    },
+    {
+      "id": "activity:agent-2",
+      "kind": "subagent",
+      "state": "succeeded",
+      "summary": "inspect-tests · completed",
+      "provenance": "Ygg agent_sessions · read-only",
+      "started_at_ms": 1700000001000,
+      "completed_at_ms": 1700000069000,
+      "references": [
+        {
+          "kind": "session",
+          "id": "agent-session:4df83bda92de75071694f7610cef32d18c26f3906bce364d8ddb043c0f909e39",
+          "label": "Open worker transcript"
+        }
+      ]
+    }
+  ],
+  "collection": {
+    "kind": "tree",
+    "title": "Subagents · 1 running · 1 done",
+    "nodes": [
+      {
+        "id": "worker:agent-1",
+        "state": "running",
+        "label": "explore-auth",
+        "secondary": "running · 00:42 · searching · explore/inherited · ?/8 turns · ?/32000 tok · ?/$0.2000",
+        "action_ids": ["inspect:agent-1", "stop:agent-1"],
+        "references": [
+          {
+            "kind": "session",
+            "id": "agent-session:c587878865cc17ec3b228dde461c7ca2676307626a4fcefbc54b32fd097057cc",
+            "label": "Open worker transcript"
+          }
+        ]
+      },
+      {
+        "id": "worker:agent-2",
+        "state": "succeeded",
+        "label": "inspect-tests",
+        "secondary": "done · 01:08 · completed · test-analysis/inherited · 3/8 turns · 1450/32000 tok · $0.0018/$0.2000",
+        "action_ids": ["inspect:agent-2"],
+        "references": [
+          {
+            "kind": "session",
+            "id": "agent-session:4df83bda92de75071694f7610cef32d18c26f3906bce364d8ddb043c0f909e39",
+            "label": "Open worker transcript"
+          }
+        ]
+      }
+    ],
+    "selected_node_id": "worker:agent-2",
+    "detail": {
+      "node_id": "worker:agent-2",
+      "title": "parent > inspect-tests",
+      "body": "State: done\nWorker: inspect-tests (agent-2)\nRequested tool policy: read-only [read, search]\nSandbox/approval/environment/extensions: inherited and host-enforced.\nExact host-observed final summary:\nTests cover the owner boundary.",
+      "references": [
+        {
+          "kind": "session",
+          "id": "agent-session:4df83bda92de75071694f7610cef32d18c26f3906bce364d8ddb043c0f909e39",
+          "label": "Open worker transcript"
+        }
+      ]
+    }
+  },
+  "actions": [
+    {
+      "id": "inspect:agent-1",
+      "label": "Inspect worker",
+      "command": "subagents",
+      "arguments": ["inspect", "agent-1"],
+      "destructive": false
+    },
+    {
+      "id": "stop:agent-1",
+      "label": "Stop worker",
+      "command": "subagents",
+      "arguments": ["stop", "agent-1"],
+      "destructive": true
+    },
+    {
+      "id": "inspect:agent-2",
+      "label": "Inspect worker",
+      "command": "subagents",
+      "arguments": ["inspect", "agent-2"],
+      "destructive": false
+    },
+    {
+      "id": "stop-all",
+      "label": "Stop all workers",
+      "command": "subagents",
+      "arguments": ["stop", "all"],
+      "destructive": true
+    }
+  ]
+}

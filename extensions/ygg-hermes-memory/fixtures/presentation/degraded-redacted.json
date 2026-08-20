@@ -1,0 +1,89 @@
+{
+  "actions": [
+    {
+      "arguments": [
+        "off"
+      ],
+      "command": "memory",
+      "destructive": false,
+      "id": "disable",
+      "label": "Turn memory off"
+    },
+    {
+      "arguments": [
+        "reload"
+      ],
+      "command": "memory",
+      "destructive": false,
+      "id": "reload:directory:offline",
+      "label": "Reload provider"
+    },
+    {
+      "arguments": [
+        "retry"
+      ],
+      "command": "memory",
+      "destructive": false,
+      "id": "retry:directory:offline",
+      "label": "Retry provider"
+    }
+  ],
+  "activities": [
+    {
+      "completed_at_ms": 1016,
+      "id": "memory:fixture:6",
+      "kind": "memory_read",
+      "provenance": "Offline recall \u00b7 provider_runtime_error \u00b7 credentials redacted",
+      "references": [
+        {
+          "id": "memory-owner:fixture",
+          "kind": "resource",
+          "label": "Ygg memory owner"
+        }
+      ],
+      "started_at_ms": 1006,
+      "state": "failed",
+      "summary": "Memory read failed"
+    }
+  ],
+  "collection": {
+    "detail": {
+      "body": "Provider id: directory:offline\nProvider version: 1.0.0\nHermes contract: hermes-agent.MemoryProvider@0.20.1+7095e23eb2066fe9a2f93b99cdbfe0e2b5ece397\nEnvironment: fixture-env\nSource: directory\nAvailability: discoverable\nTrust: trusted\nFingerprint: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSetup: configured\nNetwork behavior: none\nStorage behavior: local\nRuntime state: degraded\nQueue depth: 0\nTool count: 2\nContext limit: 32768 bytes\nCache: prompt-epoch frozen; last miss\nLast prefetch: success\nLast sync: accepted\nLast error: provider_runtime_error\nMapped optional hooks: prefetch, sync_turn, on_session_end\nUnsupported/no equivalent: on_pre_compress:no_api_boundary\nProvider tools: recall_offline, remember_offline\nProcess measurements: CPU 0.125s; RSS 24000 KiB",
+      "node_id": "directory:offline",
+      "references": [],
+      "title": "Offline recall"
+    },
+    "kind": "list",
+    "nodes": [
+      {
+        "action_ids": [
+          "disable"
+        ],
+        "id": "off",
+        "label": "Off",
+        "references": [],
+        "secondary": "No provider context, tools, or writes",
+        "state": "stopped"
+      },
+      {
+        "action_ids": [
+          "reload:directory:offline",
+          "retry:directory:offline"
+        ],
+        "id": "directory:offline",
+        "label": "Offline recall",
+        "references": [],
+        "secondary": "1.0.0 \u00b7 directory \u00b7 network none \u00b7 storage local \u00b7 trusted",
+        "state": "degraded"
+      }
+    ],
+    "selected_node_id": "directory:offline",
+    "title": "Memory providers"
+  },
+  "revision": 8,
+  "status": {
+    "detail": "queue 0; prefetch success; sync accepted; contract hermes-agent.MemoryProvider@0.20.1+7095e23eb2066fe9a2f93b99cdbfe0e2b5ece397",
+    "label": "memory Offline recall \u00b7 degraded",
+    "state": "degraded"
+  }
+}

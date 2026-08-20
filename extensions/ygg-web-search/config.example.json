@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "provider": {
+    "kind": "searxng",
+    "endpoint": "https://search.example.org/search",
+    "label": "SearXNG",
+    "allow_private_endpoint": false
+  },
+  "limits": {
+    "allowed_domains": [],
+    "default_results": 5,
+    "default_timeout_seconds": 8,
+    "max_redirects": 3,
+    "max_provider_bytes": 524288,
+    "max_download_bytes": 524288,
+    "default_content_bytes": 65536,
+    "max_content_bytes": 131072,
+    "cache_ttl_seconds": 300,
+    "cache_entries": 64,
+    "cache_bytes": 2097152
+  }
+}

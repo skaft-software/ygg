@@ -152,6 +152,8 @@ preventing the core binary from starting.
 name = "git-tools"
 version = "0.2.0"
 api_version = "0.2"
+# Required for an installable bundle; optional for an unpackaged local copy.
+requires_ygg = "=0.5.0"
 description = "Small local git helpers"
 
 [entrypoint]
@@ -163,6 +165,7 @@ filesystem = "workspace" # none, workspace, or unrestricted
 process = true
 network = false
 secrets = ["git.provider_token"] # exact logical names; empty by default
+environment = [] # API 0.2 reviewed broker names only; e.g. SSH_AUTH_SOCK
 
 [contributes]
 tools = ["git_status"]
@@ -173,6 +176,7 @@ context = true
 tool_renderers = ["git_status"]
 notifications = true
 confirmations = true
+presentation = true # API 0.2 frontend-neutral activity/list/tree/detail snapshots
 ```
 
 Bare entrypoint commands are first resolved beside the manifest, then through
@@ -181,7 +185,8 @@ directory is the active workspace. Ygg supplies `YGG_EXTENSION_API_VERSION`,
 `YGG_EXTENSION_NAME`, `YGG_EXTENSION_DIR`, `YGG_EXTENSION_MANIFEST`, and
 `YGG_WORKSPACE`. Every generation also receives `YGG_EXTENSION_SCRATCH` for
 host-verified artifact publication. To keep an existing extension on the
-frozen wire, leave `api_version = "0.1"` in its manifest.
+frozen wire, leave `api_version = "0.1"` in its manifest. Semantic
+`presentation` is API `0.2`-only and is rejected on a frozen `0.1` manifest.
 
 `[capabilities].secrets` is a duplicate-free allowlist, not a request to copy
 credentials into the launch environment. Each name is at most 64 ASCII bytes,
@@ -189,6 +194,16 @@ starts with a letter or underscore, and thereafter uses letters, digits,
 underscore, hyphen, or dot. A non-empty list makes `secrets` eligible for
 negotiation only when the host also configured a broker; it never makes an
 undeclared name readable.
+
+`[capabilities].environment` is a narrow API `0.2` ambient broker, not arbitrary
+environment inheritance. The current reviewed allowlist contains only
+`SSH_AUTH_SOCK`, for an extension that must use the user's already configured
+agent without collecting credentials. Ygg's default subprocess environment
+still excludes the socket. It is copied only when explicitly declared and
+present, is never persisted or logged by the host, and grants signing authority
+to the trusted extension process; enable it only under the same full-access and
+OS-isolation boundary as the extension itself. Unknown names and API `0.1`
+declarations are rejected.
 
 ## Transport contract
 
@@ -289,6 +304,7 @@ initialization:
 | `confirmation/request` | request with string or numeric `id`; Ygg answers that `id` |
 | `context/contribution` | unsolicited context notification |
 | `status/contribution` | unsolicited semantic TUI notification |
+| `presentation/update` | API `0.2` complete monotonic frontend-neutral presentation snapshot |
 | `$/progress` | API `0.2` notification with `{request_id, sequence, event}` |
 | `input/request` | API `0.2` correlated ephemeral text/secret input request |
 | `artifact/publish` | API `0.2` correlated request; inline base64 or relative scratch path |
@@ -350,26 +366,138 @@ saw even if the extension has since replaced or removed that tool. Extensions
 should retain bounded recent catalog snapshots; the Python SDK retains eight
 and rejects an unknown or retired revision with `-32602`.
 
+### Semantic presentation snapshots
+
+An API `0.2` extension whose manifest declares `presentation = true` may send a
+complete `presentation/update` notification. This is a frontend-neutral state
+snapshot, not rendering code and not a model result:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "presentation/update",
+  "params": {
+    "parent_request_id": 2,
+    "snapshot": {
+      "revision": 4,
+      "status": {"state":"active", "label":"1 worker"},
+      "activities": [{
+        "id":"worker:1", "kind":"delegation", "state":"running",
+        "summary":"Reviewing tests", "provenance":"local child"
+      }],
+      "collection": {
+        "kind":"tree", "title":"Workers",
+        "nodes":[{
+          "id":"worker:1", "state":"running", "label":"test-review",
+          "action_ids":["stop"]
+        }],
+        "selected_node_id":"worker:1",
+        "detail":{"node_id":"worker:1", "title":"test-review", "body":"Bounded child session."}
+      },
+      "actions":[{
+        "id":"stop", "label":"Stop worker", "command":"workers",
+        "arguments":["stop","worker:1"], "destructive":true
+      }]
+    }
+  }
+}
+```
+
+Snapshots are full atomic replacements. Handler-time updates carry their active
+`parent_request_id`, from which the host derives the resource owner. A background
+publisher must echo the complete host-issued owner triple, which the host accepts
+only if that exact triple was previously issued to the active process generation;
+omitting both fields is explicitly process-scoped and must contain no
+session-owned state. `revision` increases within one process generation; a
+replacement generation may restart at zero. The host attaches the manifest
+identity, non-repeating extension-process instance fence, and process generation;
+it rejects foreign owners and stale revisions/generations/instances and clears
+state when the process crashes, reloads, is disabled, or changes owner. One
+snapshot is limited to 128 activity
+items, 256 nodes, 64 actions, 16 tree levels, 256 KiB encoded, 64 KiB detail
+text, and short bounded labels/references. Revisions and timestamps stay within
+the portable JSON integer range. Each process generation emits at most 32
+snapshots per one-second window; excess valid updates are coalesced last-wins so
+the newest complete snapshot is emitted in the next window, with one bounded
+diagnostic per throttled window. Stable IDs are extension-scoped.
+States are `empty`, `loading`, `pending`, `active`, `running`, `succeeded`,
+`failed`, `cancelled`, `degraded`, `stopped`, and `unavailable`.
+
+References are typed as `session`, `artifact`, `resource`, or `url`. A `url`
+contains a sanitized absolute HTTP(S) URL in `id`; the host rejects credentials,
+localhost/`.local`, and private, loopback, link-local, unspecified, or multicast
+literal IP targets. Frontends expose it only as a user-clicked link. Secrets,
+queries, retrieved content, typed values, and other untrusted data do not belong
+in status labels, node titles, provenance, or reconnect state.
+
+Every action names an already manifest-declared extension command. The TUI pins
+a bounded live activity/tree block above the composer without interleaving child
+prose into the transcript, and uses `/extensions` as its keyboard-accessible
+detail fallback, `/extensions inspect <agent-session:…>` for a current
+parent-bound delegated transcript, and
+`/extensions action <extension> <action-id>` for validated interactive routing.
+Serve carries the same complete state through its authenticated snapshot/event
+reducer and uses
+`extension.invokeAction {extension, extensionInstanceId, generation, revision,
+action, confirmed}`; reconnect replaces state without replaying work. A
+destructive action requires a second host-owned confirmation step and an
+instance/generation/revision/action-bound authenticated command. The selected
+manifest process executes its own declared command even when another extension
+uses the same command name; at most one matching extension confirmation is
+preapproved during that command. Other command-requested confirmations fail
+closed when a trusted confirmation surface is unavailable. Plain/print/RPC
+retain bounded text/structured fallbacks and never choose an action or
+selection implicitly.
+Raw ANSI, HTML, JavaScript, CSS, frontend coordinates, and extension-supplied
+rendering code are invalid presentation data. Immutable tool results remain the
+authoritative evidence path.
+
 ### Child model-session service
 
 The working-tree `agent_sessions` feature is the narrow reverse service a
 subagent-orchestrator extension needs. Every request includes the active
-`parent_request_id`; Ygg derives the durable resource owner from that host tool
-call rather than accepting one from child parameters. Calls without a bound
-owner/service fail with `-32002`.
+`parent_request_id`; Ygg derives the durable resource owner from that host
+model-tool call or declared command invocation rather than accepting one from
+child parameters. Command ownership is what lets a validated presentation
+action inspect or stop an existing child without switching the parent session.
+Calls without a bound owner/service fail with `-32002`.
 
-`agent/spawn` takes `{parent_request_id, task_name, message,
-idempotency_key}`. The key is scoped to the extension principal and resource
-owner: retrying the same input returns the same child, while reuse with different
-input fails. Malformed parameters with a parseable request ID return `-32602`;
+`agent/spawn` takes `{parent_request_id, task_name, profile?, fingerprint?,
+message, idempotency_key, policy}`. `profile`, when present, is a bounded stable
+label; `fingerprint`, when present, is a lowercase SHA-256 digest retained only
+for recovery. `policy` is mandatory and contains `tools`,
+`max_depth`, `max_concurrent_children`, `max_turns`, `max_tokens`,
+`max_cost_microdollars`, `max_output_bytes`, and `timeout_ms`. The current
+bounded service accepts only a non-empty subset of `read`/`search`, depth one,
+and at most two active children (sixteen retained); it freezes a detached tool
+snapshot, applies the lower parent turn/cost ceiling, reserves aggregate token
+and cost capacity, caps returned UTF-8 output, and owns the absolute wall timer.
+A constrained child receives no collaboration tools and cannot run a follow-up.
+`agent/list` exposes the public task name, optional profile, idempotency key and
+fingerprint, effective policy, host-created/started/completed/deadline
+timestamps, turn/token/cost usage, terminal `timed_out` state, and
+owner/principal provenance. Its `session` value is an opaque `agent-session:*`
+resource reference, never the private delegation JSONL path. Serve resolves it
+only through a host-written parent-session/extension-principal/resource-owner
+binding and creates a locked read-only inspector. The TUI accepts the same
+current owner-scoped presentation reference through `/extensions inspect`; it
+opens only the current parent's delegation team. Mutation remains exclusively
+on owner-bound `agent_sessions`.
+
+The key is scoped to the extension principal and resource owner: retrying the
+same task/profile/fingerprint/input and policy returns the same child, while
+reuse with different input fails. The stable principal contains the manifest
+name plus a SHA-256 manifest-identity digest, never the manifest path.
+Malformed parameters with a parseable request ID return `-32602`;
 service, ownership, delegation-limit, persistence, and operation failures return
 `-32002`. Message, follow-up, list, wait, and interrupt accept only IDs or paths
-in that principal's owned child trees. `agent/wait` defaults to 30 seconds and
-is capped at 60 seconds. Parent settlement cancels outstanding reverse requests;
-extension shutdown stops its owned child trees. The service deliberately keys
-trees by extension principal plus the durable session owner, not by process
-generation: a supervised restart or reload can resume the same trees, while a
-full process-host rebuild creates a new service boundary.
+in that principal's owned child trees; follow-up is refused for bounded extension
+children. `agent/wait` defaults to 30 seconds and is capped at 60 seconds. Parent
+settlement cancels outstanding reverse requests; extension shutdown stops its
+owned child trees. The service deliberately keys trees by extension principal
+plus the durable session owner, not by process generation: a supervised restart
+or reload can resume the same trees, while a full process-host rebuild creates a
+new service boundary.
 
 The kernel owns the actual model conversations, persistence, permission
 inheritance, and team resource limits. The extension owns orchestration policy.
@@ -419,8 +547,9 @@ progress remains ephemeral. Artifact ingestion verifies size, SHA-256,
 supported MIME signature, path containment, owner, and generation before
 returning an opaque ID.
 
-API `0.2` model-tool and tool-hook contexts also carry a host-derived
-`resource_owner`:
+API `0.2` model-tool/tool-hook contexts and the coding product's slash-command,
+`before_prompt`, `after_response`, and `context/collect` boundaries also carry a
+host-derived `resource_owner`:
 
 ```json
 {
@@ -438,8 +567,13 @@ at the same canonical path. `extension_instance_id` changes when the process
 host is rebuilt, including when generation numbering starts over, while
 `process_generation` fences stale handles after an extension reload or
 automatic restart within one host instance. Frozen API `0.1` omits the field.
-Non-tool contribution requests do not currently carry an operation owner and
-must not create session-owned resource handles.
+Status/renderer and unsolicited contribution contexts remain process-scoped and
+must not allocate session-owned handles. Supplying an owner in a command or
+prompt contribution context does not make reverse host services available:
+`agent/*`, artifacts, approvals, secrets, input, and confirmation still require
+their documented active parent/service boundary. API `0.2` `after_response`
+remains a success-only hook for bounded response synchronization; lifecycle
+settled events remain authoritative for failure, cancellation, and cleanup.
 
 `input/request` sends `{parent_request_id, prompt, secret}` and receives
 `{value: string|null}`. Prompts are non-whitespace and at most 16 KiB UTF-8;
@@ -553,7 +687,9 @@ The optional lifecycle feature subscribes to exact `session/started`,
 cancellation, interruption, frontend disconnection, shutdown, and limits. The
 shared interactive/plain/print/RPC/native-host/Serve terminal boundary settles
 each admitted turn. Notifications are best effort; host cleanup and persistence
-remain authoritative. Frozen API `0.1` keeps `after_response` success-only.
+remain authoritative. Both API versions keep `after_response` success-only;
+API `0.2` uses it only for bounded response-content synchronization and relies
+on settled lifecycle events for terminal cleanup.
 
 For an admitted, running full-access extension, reload starts and fully
 initializes a replacement while the existing process remains ready. Launch,
@@ -626,46 +762,121 @@ MCP, LSP, memory, and caffeinate remain separate extension domains too. Sharing
 the JSON-RPC transport does not merge their permissions, resource ownership,
 failure policy, or user-facing tool semantics.
 
+## Installable extension bundles
+
+Executable-extension bundles use the same `extension.toml` that the runtime
+loads; they do not use the Ygg Serve application launcher manifest. An archive
+contains exactly one root directory named for the extension, all regular files
+needed by its declared runtime, and optional documentation, fixtures, and
+skills:
+
+```text
+ygg-web-search/
+├── extension.toml
+├── extension.py
+├── install.json             # written by Ygg, not shipped in the archive
+└── skills/
+    └── ygg-web-search/
+        └── SKILL.md
+```
+
+A packaged manifest must select current API `0.2` and add exact Ygg
+compatibility alongside its independent extension version:
+
+```toml
+name = "ygg-web-search"
+version = "0.1.0"
+api_version = "0.2"
+requires_ygg = "=0.5.0"
+```
+
+`requires_ygg` is optional for an unpackaged local extension, but when present
+it is enforced during discovery. It is mandatory and must be the exact running
+Ygg version for every installed bundle. The first-party release catalog is
+intentionally small: `ygg-browse`, `ygg-hermes-memory`, `ygg-mcp`, `ygg-ssh`,
+`ygg-subagents`, and `ygg-web-search`. Install, inspect, update, and remove a
+published package with:
+
+```console
+ygg extension install ygg-web-search
+ygg extension list
+ygg extension update ygg-web-search
+ygg extension remove ygg-web-search
+```
+
+A third-party or offline bundle is installed from a local archive, not an
+arbitrary URL or registry:
+
+```console
+ygg extension install --path ./my-extension-0.1.0.tar.gz
+ygg extension update --path ./my-extension-0.2.0.tar.gz
+```
+
+The local update archive must carry the same managed package ID; it is validated
+and swapped with the same rollback behavior as a published update.
+
+Official installs download the archive and the release `SHA256SUMS` over HTTPS,
+then verify the archive digest. Local installs compute and record the same
+SHA-256 digest. Ygg rejects oversized archives, entries, manifests, paths, file
+counts, and expanded data; non-UTF-8 or non-portable paths; multiple roots,
+duplicates, links, devices, and other special entries; a directory/manifest
+name mismatch; API or exact Ygg incompatibility; and an unsafe relative
+entrypoint. It extracts regular files into a same-filesystem private staging
+directory and publishes `~/.ygg/extensions/<id>/` with an atomic rename. An
+update validates the complete candidate before moving the current package and
+rolls that move back if publication fails, so a failed update leaves the prior
+bundle usable.
+
+`install.json` records schema, ID, extension version, API version, exact Ygg
+requirement, official URL or canonical local source, archive digest, and the Ygg
+version that installed it. `remove` accepts only a managed bundle and removes
+only that package directory. Configuration, provider state, sessions,
+artifacts, browser profiles, and other data must live outside it and are not
+removed.
+
+Installing or discovering a bundle never enables, trusts, or starts its
+process and never grants a capability. The normal independent
+`--enable-extension` and `--trust-extension` gates still apply. Packaged skills
+under `skills/*/SKILL.md` are discovered as user-installed skill candidates,
+but remain inactive until the user explicitly loads them. A user skill under
+`~/.ygg/skills` and an explicit `--skill-dir` retain higher precedence.
+
+There is no install hook: bundle installation never runs `pip`, downloads a
+browser, provisions a model, starts a server, or invokes extension code.
+Runtime dependencies and explicit post-install setup remain the extension's
+responsibility and must be documented. Local packages have no remembered
+remote update source; published catalog updates are the only downloads made by
+`ygg extension update`.
+
 ## First-party application packages
 
-Application packages are separate from the executable-extension protocol above.
-They distribute a complete first-party application runtime rather than JSON-RPC
-tools or hooks, use `package.toml` instead of `extension.toml`, and are never
-loaded during ordinary agent startup. The `0.5.0` package manager supports
-only the official `ygg-serve` package and local copies of that release archive.
-It is intentionally not a general package registry.
+The complete Ygg Serve application package remains separate from executable
+extension bundles. It uses `package.toml`, contains a target-specific
+`bin/ygg-serve-runtime`, and is never loaded by executable-extension discovery:
 
 ```console
 ygg extension install ygg-serve
-ygg extension list
 ygg extension update ygg-serve
 ygg extension remove ygg-serve
 ygg serve
 ```
 
-Packages are installed under `~/.ygg/extensions/ygg-serve/`:
-
-```text
-package.toml
-bin/ygg-serve-runtime
-install.json
-```
-
-The manifest is schema-versioned and declares the package ID and version, an
-exact required Ygg version, target triple, entrypoint arguments and SHA-256,
-and loopback/process/workspace capabilities. Official installs download the
-matching release archive and `SHA256SUMS` over HTTPS. Local archives use:
+It is installed under `~/.ygg/extensions/ygg-serve/` with its own
+`package.toml`, executable, and `install.json`. The application manifest
+declares the package ID/version, exact Ygg version, target triple, launcher
+arguments and executable SHA-256, plus loopback/process/workspace capabilities.
+Official installs download the matching target archive and shared release
+`SHA256SUMS`; local archives use:
 
 ```console
 ygg extension install --path ./ygg-serve-0.5.0-TARGET.tar.gz
 ```
 
-Installation validates the bounded archive and embedded executable checksum,
-rejects links and unexpected paths, and publishes the package with an atomic
-same-filesystem rename. `ygg serve` revalidates compatibility and the executable
-checksum before replacing the launcher process with the installed runtime. As a
-first-party replacement Ygg process, that runtime inherits the launcher's
-configuration and provider environment; the sanitized child environment used
-for model-controlled tools and executable extensions does not apply. Removal
-deletes only package files; sessions, project metadata, and other user data
-remain outside the package directory.
+The application archive keeps its existing strict two-file payload contract and
+atomic installation. `ygg serve` revalidates compatibility and the executable
+checksum before replacing the launcher process. As a first-party replacement
+Ygg process, that runtime inherits the launcher's configuration and provider
+environment; the sanitized child environment used for model-controlled tools
+and executable extensions does not apply. Removal deletes only application
+package files; sessions, project metadata, and other user data remain outside
+the package directory.

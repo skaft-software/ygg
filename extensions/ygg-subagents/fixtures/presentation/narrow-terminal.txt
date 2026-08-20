@@ -1,0 +1,5 @@
+Subagents · 1 running · 1 done
+├─ explore-auth         running    00:42  agent-1
+└─ inspect-tests        done       01:08  agent-2
+Use /subagents inspect <name-or-id> for cached detail.
+Use the model-callable subagent_stop tool for authoritative cancellation.

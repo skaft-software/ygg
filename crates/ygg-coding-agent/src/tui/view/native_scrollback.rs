@@ -28,6 +28,7 @@ fn native_viewport_surface(state: &ShellState, chrome: &ShellChrome) -> bool {
         || !state.editor.is_empty()
         || state.tool_input_prompt.is_some()
         || !chrome.pending.is_empty()
+        || !chrome.activity.is_empty()
         || !chrome.suggestions.is_empty()
         || !chrome.error.is_empty()
 }

@@ -519,6 +519,40 @@ impl ExtensionHost {
         dynamic.revision = dynamic.revision.saturating_add(1);
     }
 
+    /// Builds a detached child host whose provider and execution surfaces are
+    /// both restricted to the requested upper-bound allowlist.
+    ///
+    /// The dynamic registry is intentionally not shared with `self`: mutating a
+    /// cloned host through `retain_tools` would otherwise prune the root agent's
+    /// live registry as well. The child receives one frozen snapshot, while
+    /// observers and hooks keep the parent's inherited policy behavior.
+    pub(crate) fn scoped_tool_snapshot(
+        &self,
+        allowed: &BTreeSet<String>,
+    ) -> Result<(Self, Vec<String>), String> {
+        let (_, available) = self.tool_snapshot();
+        let mut scoped = Self::new();
+        scoped.observers = self.observers.clone();
+        scoped.tool_call_hooks = self.tool_call_hooks.clone();
+        let mut effective = Vec::new();
+        for tool in available {
+            let name = tool.definition().name;
+            if allowed.contains(&name) {
+                effective.push(name);
+                scoped.tool_arc(tool);
+            }
+        }
+        effective.sort();
+        effective.dedup();
+        if effective.is_empty() {
+            return Err(
+                "requested child tool scope has no tools available after parent policy".into(),
+            );
+        }
+        scoped.finalize_tool_surface();
+        Ok((scoped, effective))
+    }
+
     pub(crate) fn tool_snapshot(&self) -> (u64, Vec<Arc<dyn Tool>>) {
         let dynamic = self
             .dynamic_tools
@@ -607,6 +641,36 @@ mod tests {
         host.retain_tools(|name| name == "read");
         assert_eq!(host.tool_definitions().len(), 1);
         assert_eq!(host.tool_definitions()[0].name, "read");
+    }
+
+    #[test]
+    fn scoped_child_snapshot_is_exact_and_does_not_mutate_shared_dynamic_registry() {
+        let mut host = ExtensionHost::new();
+        host.tool(NamedTool("read"));
+        host.tool(NamedTool("write"));
+        host.dynamic_tools("search-provider", vec![named_tool("search")])
+            .unwrap();
+        let allowed = BTreeSet::from(["read".to_owned(), "search".to_owned()]);
+
+        let (mut child, effective) = host.scoped_tool_snapshot(&allowed).unwrap();
+        assert_eq!(effective, vec!["read", "search"]);
+        assert_eq!(
+            child
+                .tool_definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<BTreeSet<_>>(),
+            allowed
+        );
+        child.retain_tools(|name| name == "read");
+
+        assert_eq!(
+            host.tool_definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["read".to_owned(), "search".to_owned(), "write".to_owned()])
+        );
     }
 
     #[test]

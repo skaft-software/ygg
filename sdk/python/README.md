@@ -87,6 +87,16 @@ def status(params):
 @ext.renderer("hello_world")
 def render(params):
     return {"segments": [{"text": "hello", "style_role": None}]}
+
+# Call from a handler/background owner after initialize, with
+# `[contributes] presentation = true`.
+def publish_ready_after_initialize():
+    ext.publish_presentation({
+        "revision": 0,
+        "status": {"state": "active", "label": "ready"},
+        "activities": [],
+        "actions": [],
+    })
 ```
 
 Tool handlers receive `(arguments, context)` when they declare two parameters;
@@ -103,9 +113,11 @@ The API `0.1` hook payloads are:
 - `after_tool_call`: `{"name": string, "arguments": object, "output": string,
   "is_error": bool}`
 
-`after_response` is success-only in API `0.1`: Ygg invokes it after a complete
-assistant response, not after failed, cancelled, interrupted, disconnected, or
-shutdown runs. Do not use it as the sole cleanup boundary.
+`after_response` is success-only in both API versions: Ygg invokes it after a
+complete assistant response, not after failed, cancelled, interrupted,
+disconnected, or shutdown runs. API `0.2` extensions use terminal lifecycle
+observations for cleanup and may use this hook only for bounded response-content
+synchronization.
 
 Tool handlers may return `content`, `is_error`, and `metadata`. The current Ygg
 API `0.1` subprocess adapter uses `content` and `is_error` but discards
@@ -160,6 +172,34 @@ The negotiated values remain available after initialization:
 ext.negotiated_features       # frozenset[str]
 ext.negotiated_concurrency    # int
 ```
+
+## Semantic presentation snapshots
+
+API `0.2` packages may declare `presentation = true` in `[contributes]` and
+publish a complete frontend-neutral snapshot with `publish_presentation()` (or
+its `presentation` alias). The call is valid only after initialization. Calls
+inside a handler automatically include its `parent_request_id`, allowing Ygg to
+derive the exact owner. A background publisher passes the complete
+`resource_owner=` triple it received from the host; omitting both produces
+process-scoped state and must not expose session-owned data. Each revision must
+increase within the process; runtime reset/reload starts a new revision sequence.
+
+A snapshot contains optional compact `status`, bounded `activities`, an optional
+`list`/`tree` `collection` with stable nodes and selected detail, and `actions`.
+Actions route only to command names declared in the same manifest. Generic
+states are `empty`, `loading`, `pending`, `active`, `running`, `succeeded`,
+`failed`, `cancelled`, `degraded`, `stopped`, and `unavailable`. Typed
+references are `session`, `artifact`, `resource`, and a host-vetted, user-clicked
+HTTP(S) `url`.
+
+The SDK locally enforces the 256 KiB snapshot, 128-activity, 256-node, 64-action,
+portable-revision, and monotonic-revision bounds; Ygg remains authoritative for
+the complete schema, tree depth/parentage, stable IDs, URL safety, command
+routing, the 32-updates-per-second generation rate, generation/owner fencing,
+and frontend reduction. Presentation state is not a
+model result, must not contain rendering code or secrets, and must not copy
+queries, retrieved content, typed values, credentials, or other private data
+into labels/reconnect state. Tool results remain immutable evidence.
 
 ## Dynamic tool catalogs
 
@@ -224,8 +264,18 @@ from ygg_extension import text_content, tool_result
 def orchestrate(args):
     child = ext.spawn_agent(
         task_name="inspect-catalog",
+        profile="review",
+        fingerprint="0123456789abcdef" * 4,
         message="Inspect the current provider tool catalog.",
         idempotency_key=f"catalog:{ext.request_id}",
+        tools=["read", "search"],
+        max_depth=1,
+        max_concurrent_children=2,
+        max_turns=8,
+        max_tokens=32_000,
+        max_cost_microdollars=200_000,
+        max_output_bytes=8_192,
+        timeout_ms=300_000,
     )
     ext.send_agent_message(child["agent_id"], "Include resource tools.")
     ext.follow_up_agent(child["agent_id"], "Return a compact summary.")
@@ -240,7 +290,9 @@ def orchestrate(args):
 
 The exact helpers are:
 
-- `spawn_agent(*, task_name, message, idempotency_key,
+- `spawn_agent(*, task_name, message, idempotency_key, tools, max_depth,
+  max_concurrent_children, max_turns, max_tokens, max_cost_microdollars,
+  max_output_bytes, timeout_ms, profile=None, fingerprint=None,
   parent_request_id=...)`;
 - `send_agent_message(target, message, *, parent_request_id=...)`;
 - `follow_up_agent(target, message, *, parent_request_id=...)`;
@@ -248,14 +300,21 @@ The exact helpers are:
 - `wait_agents(*, timeout_ms=30_000, parent_request_id=...)`; and
 - `interrupt_agent(target, *, parent_request_id=...)`.
 
-Inside a model-tool handler, the SDK supplies the ambient parent automatically.
-Outside one, pass an explicit active model-tool `parent_request_id`. The current
-host derives ownership only from API `0.2` model-tool calls, so command/context/
-status handlers must not create child sessions. All methods require the
+Inside a model-tool or host-owned command handler, the SDK supplies the ambient
+parent automatically. Outside one, pass an explicit active model-tool/command
+`parent_request_id`. Command contexts carry `context["resource_owner"]`; the host
+binds that same owner to the command request so declared command actions can
+inspect or stop their owned children. Prompt/context handlers may also receive
+an owner for state namespacing, but they are not active `agent_sessions` parents
+and must not create child sessions. All methods require the
 negotiated feature and validate basic response shapes. `wait_agents` accepts
-1..=60,000 ms. Task names use 1..=48 lowercase ASCII letters, digits,
-underscores, or hyphens; task, steering, and follow-up text is capped at
-128 KiB. The SDK additionally rejects empty messages before sending them.
+1..=60,000 ms. Task names and optional profiles use 1..=48 lowercase ASCII
+letters, digits, underscores, or hyphens. Optional fingerprints are lowercase
+SHA-256 digests retained with the idempotency key, public task name, effective
+policy, and host-created timestamps so a supervised extension restart can
+rebuild its local view from `agent/list`. Task, steering, and follow-up text is
+capped at 128 KiB. The SDK additionally rejects empty messages before sending
+them.
 
 `spawn_agent` is retry-safe only through its required idempotency key. The key
 is scoped by the host to the extension principal and derived resource owner;
@@ -272,8 +331,8 @@ These helpers create local in-harness Ygg children, not hosted-agent jobs.
 Use `list_agents` and `wait_agents` for child state: delegated child turns do
 not currently arrive through the extension's `session/*` or `turn/*` lifecycle
 handlers, which observe the owning/root product session.
-The Python negotiation/helper tests are implemented; the Rust product's
-cross-process host-service gates remain pending in this working tree.
+The Python negotiation/helper tests and Rust cross-process host-service gates
+cover this boundary.
 
 ## Cancellation and progress
 
@@ -385,7 +444,8 @@ ambient `parent_request_id`. `confirm(...)`, `request_input(...)`,
 agent-session helpers require that correlation; callers outside a handler must
 pass `parent_request_id=` explicitly. API `0.1` frames remain unchanged.
 
-API `0.2` model-tool and tool-hook handler contexts include
+API `0.2` model-tool/tool-hook contexts and the coding product's command,
+`before_prompt`, `after_response`, and `context/collect` handler contexts include
 `context["resource_owner"]` with a durable host-derived `session_id`, an
 `extension_instance_id`, and a `process_generation` fence. Use the complete
 triple to namespace browser tabs, MCP/LSP connections, memory handles, and
@@ -393,8 +453,10 @@ other state. Never accept a model-supplied owner in place of it. The instance
 ID changes across a complete process-host rebuild even when generation numbers
 restart; the generation changes on extension reload or automatic restart
 within one host instance. An old handle must not be used when either fence
-changes. Other contribution contexts do not currently carry this field and
-should not allocate session-owned handles.
+changes. Status/renderer and unsolicited contribution contexts remain
+process-scoped and should not allocate session-owned handles. Receiving an
+owner does not make reverse host services available; their active-parent and
+feature gates still apply.
 
 Request typed, ephemeral frontend input from inside a handler:
 

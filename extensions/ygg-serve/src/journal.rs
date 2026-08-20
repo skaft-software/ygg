@@ -183,6 +183,7 @@ mod tests {
     fn snapshot(cursor: SessionCursor) -> SessionSnapshot {
         SessionSnapshot {
             session_id: SessionId::new("session-journal").unwrap(),
+            delegated_parent_session_id: None,
             actor_generation: cursor.actor_generation,
             cursor,
             durable_head: None,
@@ -197,6 +198,7 @@ mod tests {
             authority: AuthorityProfile::FullAccess,
             context: ContextUsage::default(),
             items: Vec::new(),
+            extension_presentations: Vec::new(),
             pending_requests: Vec::new(),
             sources: Vec::new(),
             artifacts: Vec::new(),

@@ -103,6 +103,49 @@ describe("reduceSessionEvent", () => {
     expect(next).toEqual({ ...base, sequence: 5 });
   });
 
+  it("atomically replaces extension presentation state", () => {
+    const presentations = [
+      {
+        extension: "ygg-subagents",
+        extensionInstanceId: "instance-subagents",
+        generation: 2,
+        resourceOwner: "owner-1",
+        snapshot: {
+          revision: 7,
+          status: { state: "active" as const, label: "2 workers" },
+          activities: [
+            {
+              id: "worker:1",
+              kind: "delegation",
+              state: "running" as const,
+              summary: "Reviewing tests",
+              references: [],
+            },
+          ],
+          actions: [],
+        },
+      },
+    ];
+    const next = reduceSessionEvent(base, {
+      type: "extension.presentationsChanged",
+      sessionId: base.sessionId,
+      actorGeneration: base.actorGeneration,
+      sequence: 5,
+      presentations,
+    });
+
+    expect(next.extensionPresentations).toEqual(presentations);
+    expect(next.sequence).toBe(5);
+    const stale = reduceSessionEvent(next, {
+      type: "extension.presentationsChanged",
+      sessionId: base.sessionId,
+      actorGeneration: base.actorGeneration,
+      sequence: 5,
+      presentations: [],
+    });
+    expect(stale).toBe(next);
+  });
+
   it("coalesces adjacent streaming deltas without changing sequence semantics", () => {
     const started = reduceSessionEvent(base, {
       type: "item.started",

@@ -3681,6 +3681,33 @@ kbd {
 
 /* Composer */
 
+.conversation-read-only {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 8px 14px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  color: var(--text-soft);
+  background: var(--surface-raised);
+  font-size: var(--font-meta);
+  text-align: center;
+}
+
+.conversation-read-only button {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-selected);
+  font-size: var(--font-meta);
+}
+
 .composer-wrap {
   position: relative;
   z-index: 3;
@@ -5925,6 +5952,237 @@ kbd {
 
 .progress-list li[data-status="in_progress"] .progress-glyph {
   color: var(--accent);
+}
+
+.extension-presentation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 2px 4px 8px;
+}
+
+.extension-presentation {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.extension-presentation > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.extension-presentation > header strong {
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--mono-family);
+  font-size: var(--font-body);
+  font-weight: 560;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.extension-presentation > header span,
+.extension-presentation > p,
+.extension-presentation-list > [role="alert"] {
+  color: var(--text-faint);
+  font-size: var(--font-meta);
+}
+
+.extension-presentation > header span[data-state="running"],
+.extension-presentation > header span[data-state="active"] {
+  color: var(--accent);
+}
+
+.extension-presentation > header span[data-state="failed"],
+.extension-presentation > header span[data-state="unavailable"] {
+  color: var(--danger);
+}
+
+.extension-activity-list,
+.extension-collection > ol {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.extension-activity-list li {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  gap: 6px;
+  color: var(--text-soft);
+}
+
+.extension-activity-list li > svg {
+  width: 10px;
+  height: 10px;
+  margin-top: 4px;
+  color: var(--text-faint);
+  fill: currentColor;
+}
+
+.extension-activity-list li[data-state="running"] > svg,
+.extension-activity-list li[data-state="active"] > svg {
+  color: var(--accent);
+}
+
+.extension-activity-list li[data-state="succeeded"] > svg {
+  color: var(--success);
+}
+
+.extension-activity-list li[data-state="failed"] > svg,
+.extension-activity-list li[data-state="unavailable"] > svg {
+  color: var(--danger);
+}
+
+.extension-activity-list li > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.extension-activity-list strong,
+.extension-activity-list small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.extension-activity-list small,
+.extension-collection small {
+  color: var(--text-faint);
+  font-size: var(--font-meta);
+}
+
+.extension-collection {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.extension-collection h4 {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: var(--font-meta);
+  font-weight: 560;
+}
+
+.extension-collection > ol li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 7px;
+  min-height: 23px;
+  padding-block: 3px;
+  padding-inline-end: 4px;
+  border-radius: 5px;
+  color: var(--text-soft);
+}
+
+.extension-collection > ol li[data-selected="true"] {
+  color: var(--text);
+  background: var(--surface-selected);
+}
+
+.extension-detail {
+  padding: 7px;
+  border-radius: 6px;
+  background: var(--surface-raised);
+}
+
+.extension-detail > strong {
+  font-size: var(--font-meta);
+  font-weight: 560;
+}
+
+.extension-detail > pre {
+  max-height: 180px;
+  margin: 5px 0 0;
+  overflow: auto;
+  color: var(--text-soft);
+  font: inherit;
+  font-size: var(--font-meta);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.extension-collection a,
+.extension-links a {
+  color: var(--accent-strong);
+  text-decoration: none;
+}
+
+.extension-collection a:hover,
+.extension-links a:hover,
+.extension-links button:hover {
+  text-decoration: underline;
+}
+
+.extension-links {
+  display: flex;
+  flex-basis: 100%;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: var(--font-meta);
+}
+
+.extension-links button {
+  padding: 0;
+  border: 0;
+  color: var(--accent-strong);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.extension-links code {
+  overflow-wrap: anywhere;
+  font-size: var(--font-meta);
+}
+
+.extension-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.extension-action {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.extension-actions button {
+  min-height: 27px;
+  padding: 0 8px;
+  border-radius: 6px;
+  color: var(--text-soft);
+  background: var(--surface-raised);
+  font-size: var(--font-meta);
+}
+
+.extension-actions button:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-selected);
+}
+
+.extension-actions button[data-destructive="true"] {
+  color: var(--danger);
+}
+
+.extension-actions button:disabled {
+  opacity: 0.55;
 }
 
 .command-history-list {

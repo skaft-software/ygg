@@ -1,0 +1,79 @@
+{
+  "revision": 3,
+  "status": {
+    "state": "active",
+    "label": "Browse · ready",
+    "detail": "Playwright 1.57.0 and Chromium are ready."
+  },
+  "activities": [
+    {
+      "id": "browse:setup",
+      "kind": "setup",
+      "state": "succeeded",
+      "summary": "Pinned browser runtime ready",
+      "provenance": "local background installer",
+      "references": []
+    }
+  ],
+  "collection": {
+    "kind": "list",
+    "title": "Browse",
+    "nodes": [
+      {
+        "id": "browse-runtime",
+        "state": "succeeded",
+        "label": "Browser setup",
+        "secondary": "ready",
+        "action_ids": [
+          "open"
+        ],
+        "references": []
+      }
+    ],
+    "selected_node_id": "browse-runtime",
+    "detail": {
+      "node_id": "browse-runtime",
+      "title": "Ygg Browse",
+      "body": "Pinned runtime is ready. Profile is isolated and not yet open.",
+      "references": []
+    }
+  },
+  "actions": [
+    {
+      "id": "setup",
+      "label": "Set up browser",
+      "command": "browse",
+      "arguments": [
+        "setup"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "open",
+      "label": "Open visible browser",
+      "command": "browse",
+      "arguments": [
+        "open"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "close",
+      "label": "Close browser",
+      "command": "browse",
+      "arguments": [
+        "close"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "reset-profile",
+      "label": "Reset isolated profile",
+      "command": "browse",
+      "arguments": [
+        "reset-profile"
+      ],
+      "destructive": true
+    }
+  ]
+}

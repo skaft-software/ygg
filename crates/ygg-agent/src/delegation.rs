@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
-use ygg_ai::{AssistantPart, ToolDef};
+use ygg_ai::{AssistantPart, ToolDef, Usage};
 
 use crate::agent::{Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy};
 use crate::effect::ToolEffect;
@@ -41,6 +41,9 @@ const MAX_QUEUED_FOLLOW_UPS: usize = COMMAND_CHANNEL_CAPACITY;
 const MAX_QUEUED_FOLLOW_UP_BYTES: usize =
     (COMMAND_CHANNEL_CAPACITY + 1) * MAX_PROVENANCE_TEXT_BYTES;
 const MAX_TOOL_TIMEOUT_MS: u64 = 3_600_000;
+const MAX_EXTENSION_ACTIVE_CHILDREN: usize = 2;
+const MAX_EXTENSION_TOTAL_TOKEN_RESERVATION: u64 = 96_000;
+const MAX_EXTENSION_TOTAL_COST_RESERVATION: u64 = 500_000;
 /// Host-reserved names installed by V2 collaboration overlays.
 pub const COLLABORATION_TOOL_NAMES: [&str; 6] = [
     "spawn_agent",
@@ -50,6 +53,42 @@ pub const COLLABORATION_TOOL_NAMES: [&str; 6] = [
     "list_agents",
     "interrupt_agent",
 ];
+
+/// Returns a path-free opaque reference for one host-owned delegated session.
+///
+/// The reference is derived only from the cryptographically random private team
+/// directory name and the host-generated child filename. It is safe to expose
+/// to extension presentation and can be resolved only by a host that can
+/// securely inventory its private delegation directory.
+pub fn delegated_session_reference(session_path: &Path) -> Option<String> {
+    let team = session_path.parent()?.file_name()?.to_str()?;
+    let child = session_path.file_name()?.to_str()?;
+    if !team.starts_with("team-")
+        || team.len() > 128
+        || !team
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || child.len() > 256
+        || !child.ends_with(".jsonl")
+        || !child
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(team.as_bytes());
+    hasher.update(b"/");
+    hasher.update(child.as_bytes());
+    let digest = hasher.finalize();
+    Some(format!(
+        "agent-session:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
 
 /// Returns whether this target build implements the advertised collaboration version.
 pub fn delegation_runtime_supports(version: ygg_ai::AgentDelegation) -> bool {
@@ -197,6 +236,8 @@ pub enum DelegatedAgentStatus {
         /// Bounded failure diagnostic.
         error: String,
     },
+    /// The worker exceeded its host-owned wall deadline.
+    TimedOut,
     /// The worker was shut down and cannot accept more work.
     Shutdown,
 }
@@ -213,6 +254,7 @@ impl DelegatedAgentStatus {
             Self::Completed { .. } => "completed",
             Self::Interrupted => "interrupted",
             Self::Failed { .. } => "failed",
+            Self::TimedOut => "timed_out",
             Self::Shutdown => "shutdown",
         }
     }
@@ -225,10 +267,75 @@ pub(crate) struct DelegationBinding {
     system_instructions: Arc<str>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ExtensionAgentSessionPolicy {
+    pub(crate) tools: Vec<String>,
+    pub(crate) max_depth: usize,
+    pub(crate) max_concurrent_children: usize,
+    pub(crate) max_turns: u64,
+    pub(crate) max_tokens: u64,
+    pub(crate) max_cost_microdollars: u64,
+    pub(crate) max_output_bytes: usize,
+    pub(crate) timeout_ms: u64,
+}
+
+impl ExtensionAgentSessionPolicy {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.tools.is_empty() || self.tools.len() > 2 {
+            return Err("child tools must be a non-empty subset of read and search".into());
+        }
+        let tools = self.tools.iter().collect::<BTreeSet<_>>();
+        if tools.len() != self.tools.len()
+            || self
+                .tools
+                .iter()
+                .any(|tool| !matches!(tool.as_str(), "read" | "search"))
+        {
+            return Err("child tools must be a duplicate-free subset of read and search".into());
+        }
+        if self.max_depth != 1 {
+            return Err("extension child max_depth must be exactly 1".into());
+        }
+        if self.max_concurrent_children == 0
+            || self.max_concurrent_children > MAX_EXTENSION_ACTIVE_CHILDREN
+        {
+            return Err("extension child concurrency must be between 1 and 2".into());
+        }
+        if !(1..=12).contains(&self.max_turns) {
+            return Err("extension child max_turns must be between 1 and 12".into());
+        }
+        if !(1_000..=64_000).contains(&self.max_tokens) {
+            return Err("extension child max_tokens must be between 1000 and 64000".into());
+        }
+        if !(1..=500_000).contains(&self.max_cost_microdollars) {
+            return Err(
+                "extension child max_cost_microdollars must be between 1 and 500000".into(),
+            );
+        }
+        if !(512..=16 * 1024).contains(&self.max_output_bytes) {
+            return Err("extension child max_output_bytes must be between 512 and 16384".into());
+        }
+        if !(5_000..=15 * 60 * 1_000).contains(&self.timeout_ms) {
+            return Err("extension child timeout_ms must be between 5000 and 900000".into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct ExtensionDelegationSpawnRequest {
+    pub(crate) task_name: String,
+    pub(crate) profile: Option<String>,
+    pub(crate) fingerprint: Option<String>,
+    pub(crate) message: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) policy: ExtensionAgentSessionPolicy,
+}
+
 #[derive(Clone)]
 pub(crate) struct ExtensionDelegationService {
     manager: Weak<DelegationManager>,
     principal: Arc<str>,
+    parent_session_id: Arc<str>,
     task_prefix: Arc<str>,
     state: Arc<Mutex<ExtensionDelegationState>>,
 }
@@ -246,13 +353,50 @@ struct ExtensionDelegationOwnerState {
 
 struct IdempotentExtensionSpawn {
     task_name: String,
+    profile: Option<String>,
+    fingerprint: Option<String>,
     message_sha256: String,
+    policy: ExtensionAgentSessionPolicy,
     result: Value,
 }
 
 impl DelegationBinding {
     pub(crate) fn team_directory(&self) -> &Path {
         &self.manager.team_directory
+    }
+
+    pub(crate) fn open_session_reference(
+        &self,
+        extension_principal: &str,
+        reference: &str,
+    ) -> Result<Option<Session>, AgentError> {
+        if !reference.starts_with("agent-session:") {
+            return Ok(None);
+        }
+        let path = {
+            let state = self
+                .manager
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state
+                .records
+                .values()
+                .find(|record| {
+                    record.extension_principal.as_deref() == Some(extension_principal)
+                        && delegated_session_reference(&record.session_path).as_deref()
+                            == Some(reference)
+                })
+                .map(|record| record.session_path.clone())
+        };
+        let Some(path) = path else {
+            return Ok(None);
+        };
+        let file = secure_fs::open_private_file_for_read(&path)
+            .map_err(|error| AgentError::Delegation(error.to_string()))?;
+        Session::open_read_only_with_file(path, file)
+            .map(Some)
+            .map_err(AgentError::Session)
     }
 
     pub(crate) fn system_instructions(&self) -> &str {
@@ -293,6 +437,7 @@ impl DelegationBinding {
     pub(crate) fn extension_service(
         &self,
         principal: impl Into<String>,
+        parent_session_id: impl Into<String>,
         root_resource_owner: impl Into<String>,
     ) -> Result<ExtensionDelegationService, String> {
         if self.identity.id != ROOT_AGENT_ID {
@@ -301,6 +446,15 @@ impl DelegationBinding {
         let principal = principal.into();
         if principal.trim().is_empty() || principal.len() > 256 {
             return Err("extension delegation principal must be 1..=256 bytes".into());
+        }
+        let parent_session_id = parent_session_id.into();
+        if parent_session_id.trim().is_empty()
+            || parent_session_id.len() > 256
+            || parent_session_id.chars().any(char::is_whitespace)
+        {
+            return Err(
+                "extension delegation parent session must be a bounded stable identifier".into(),
+            );
         }
         let root_resource_owner = root_resource_owner.into();
         ExtensionDelegationService::validate_resource_owner(&root_resource_owner)?;
@@ -320,6 +474,7 @@ impl DelegationBinding {
         Ok(ExtensionDelegationService {
             manager: Arc::downgrade(&self.manager),
             principal: Arc::from(principal),
+            parent_session_id: Arc::from(parent_session_id),
             task_prefix: Arc::from(task_prefix),
             state: Arc::new(Mutex::new(ExtensionDelegationState::default())),
         })
@@ -445,12 +600,31 @@ impl ExtensionDelegationService {
     pub(crate) fn spawn(
         &self,
         resource_owner: &str,
-        task_name: String,
-        message: String,
-        idempotency_key: String,
+        request: ExtensionDelegationSpawnRequest,
     ) -> Result<Value, String> {
+        let ExtensionDelegationSpawnRequest {
+            task_name,
+            profile,
+            fingerprint,
+            message,
+            idempotency_key,
+            policy,
+        } = request;
         Self::validate_resource_owner(resource_owner)?;
         validate_task_name(&task_name)?;
+        if let Some(profile) = profile.as_deref() {
+            validate_task_name(profile)
+                .map_err(|_| "profile must be a bounded lowercase stable identifier".to_owned())?;
+        }
+        if fingerprint.as_deref().is_some_and(|fingerprint| {
+            fingerprint.len() != 64
+                || !fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err("fingerprint must be a lowercase SHA-256 digest".into());
+        }
+        policy.validate()?;
         if idempotency_key.trim().is_empty() || idempotency_key.len() > 256 {
             return Err("spawn idempotency_key must be 1..=256 bytes".into());
         }
@@ -464,7 +638,12 @@ impl ExtensionDelegationService {
             .entry(resource_owner.to_owned())
             .or_default();
         if let Some(existing) = owner_state.idempotent_spawns.get(&idempotency_key) {
-            if existing.task_name != task_name || existing.message_sha256 != message_sha256 {
+            if existing.task_name != task_name
+                || existing.profile != profile
+                || existing.fingerprint != fingerprint
+                || existing.message_sha256 != message_sha256
+                || existing.policy != policy
+            {
                 return Err("spawn idempotency_key was reused with different input".into());
             }
             return Ok(existing.result.clone());
@@ -479,12 +658,81 @@ impl ExtensionDelegationService {
                 .collect::<String>()
         );
         let manager = self.manager()?;
+        if manager.template.model.spec.pricing.is_none() {
+            return Err(
+                "bounded extension child requires trusted model pricing for its hard cost ceiling"
+                    .into(),
+            );
+        }
         let owner = self.owner_identity(&manager, resource_owner)?;
+        {
+            let manager_state = manager
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let active = owner_state
+                .owned_agents
+                .iter()
+                .filter_map(|id| manager_state.records.get(id))
+                .filter(|record| record.status.is_running())
+                .collect::<Vec<_>>();
+            if active.len() >= policy.max_concurrent_children {
+                return Err(format!(
+                    "extension child concurrency limit reached ({})",
+                    policy.max_concurrent_children
+                ));
+            }
+            if owner_state.owned_agents.len() >= 16 {
+                return Err("extension child total limit reached (16)".into());
+            }
+            let reserved_tokens = active.iter().fold(0u64, |total, record| {
+                total.saturating_add(
+                    record
+                        .extension_policy
+                        .as_ref()
+                        .map(|policy| policy.max_tokens)
+                        .unwrap_or_default(),
+                )
+            });
+            if reserved_tokens.saturating_add(policy.max_tokens)
+                > MAX_EXTENSION_TOTAL_TOKEN_RESERVATION
+            {
+                return Err(format!(
+                    "extension child token reservation limit reached ({MAX_EXTENSION_TOTAL_TOKEN_RESERVATION})"
+                ));
+            }
+            let reserved_cost = active.iter().fold(0u64, |total, record| {
+                total.saturating_add(
+                    record
+                        .extension_policy
+                        .as_ref()
+                        .map(|policy| policy.max_cost_microdollars)
+                        .unwrap_or_default(),
+                )
+            });
+            if reserved_cost.saturating_add(policy.max_cost_microdollars)
+                > MAX_EXTENSION_TOTAL_COST_RESERVATION
+            {
+                return Err(format!(
+                    "extension child cost reservation limit reached ({MAX_EXTENSION_TOTAL_COST_RESERVATION} microdollars)"
+                ));
+            }
+        }
         let mut result = manager.spawn(
             &owner,
             SpawnRequest {
                 task_name: internal_task_name,
+                display_task_name: Some(task_name.clone()),
                 message,
+                extension_policy: Some(policy.clone()),
+                extension_provenance: Some(ExtensionSpawnProvenance {
+                    parent_session_id: self.parent_session_id.to_string(),
+                    principal: self.principal.to_string(),
+                    resource_owner: resource_owner.to_owned(),
+                    profile: profile.clone(),
+                    idempotency_key: idempotency_key.clone(),
+                    fingerprint: fingerprint.clone(),
+                }),
             },
         )?;
         let agent_id = result
@@ -500,7 +748,10 @@ impl ExtensionDelegationService {
             idempotency_key,
             IdempotentExtensionSpawn {
                 task_name,
+                profile,
+                fingerprint,
                 message_sha256,
+                policy,
                 result: result.clone(),
             },
         );
@@ -528,6 +779,19 @@ impl ExtensionDelegationService {
         let manager = self.manager()?;
         let owner = self.owner_identity(&manager, resource_owner)?;
         let target = self.resolve_owned_target(&manager, resource_owner, target)?;
+        {
+            let state = manager
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state
+                .records
+                .get(&target)
+                .is_some_and(|record| record.extension_policy.is_some())
+            {
+                return Err("follow-up runs are disabled for bounded extension children".into());
+            }
+        }
         manager
             .follow_up(&owner, FollowUpRequest { target, message })
             .await
@@ -579,7 +843,18 @@ impl ExtensionDelegationService {
                         .iter()
                         .any(|root| is_descendant_path(&record.identity.path, root))
             })
-            .map(agent_record_value)
+            .map(|record| {
+                let mut value = agent_record_value(record);
+                value["session"] = delegated_session_reference(&record.session_path)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null);
+                value["provenance"] = json!({
+                    "kind": "extension_agent_session",
+                    "principal": self.principal.as_ref(),
+                    "resource_owner": resource_owner,
+                });
+                value
+            })
             .collect::<Vec<_>>();
         Ok(json!({
             "principal": self.principal.as_ref(),
@@ -688,6 +963,7 @@ struct ManagerState {
 struct AgentRecord {
     identity: AgentIdentity,
     task_name: String,
+    display_task_name: Option<String>,
     parent_id: String,
     session_path: PathBuf,
     status: DelegatedAgentStatus,
@@ -700,6 +976,18 @@ struct AgentRecord {
     mailbox: VecDeque<MailboxMessage>,
     mailbox_delivery: Option<MailboxDeliveryPlan>,
     resource_owner: Option<String>,
+    extension_policy: Option<ExtensionAgentSessionPolicy>,
+    extension_principal: Option<String>,
+    extension_profile: Option<String>,
+    extension_idempotency_key: Option<String>,
+    extension_fingerprint: Option<String>,
+    created_at_ms: u64,
+    started_at_ms: Option<u64>,
+    completed_at_ms: Option<u64>,
+    turn_count: u64,
+    usage: Usage,
+    cost_microdollars: Option<u64>,
+    deadline_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -760,7 +1048,19 @@ struct WaitOutput {
 
 struct SpawnRequest {
     task_name: String,
+    display_task_name: Option<String>,
     message: String,
+    extension_policy: Option<ExtensionAgentSessionPolicy>,
+    extension_provenance: Option<ExtensionSpawnProvenance>,
+}
+
+struct ExtensionSpawnProvenance {
+    parent_session_id: String,
+    principal: String,
+    resource_owner: String,
+    profile: Option<String>,
+    idempotency_key: String,
+    fingerprint: Option<String>,
 }
 
 struct FollowUpRequest {
@@ -770,6 +1070,25 @@ struct FollowUpRequest {
 
 struct WorkerCommand {
     kind: WorkerCommandKind,
+}
+
+struct WorkerStartup {
+    identity: AgentIdentity,
+    session: Session,
+    initial_task: String,
+    commands: mpsc::Receiver<WorkerCommand>,
+    shutdown: crate::CancellationToken,
+    initial_permit: OwnedSemaphorePermit,
+    extension_policy: Option<ExtensionAgentSessionPolicy>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+struct ChildRunContext<'a> {
+    identity: &'a AgentIdentity,
+    commands: &'a mut mpsc::Receiver<WorkerCommand>,
+    shutdown: &'a crate::CancellationToken,
+    extension_policy: Option<&'a ExtensionAgentSessionPolicy>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl WorkerCommand {
@@ -813,8 +1132,26 @@ enum ProvenanceEvent<'a> {
         agent_path: &'a str,
         parent_id: &'a str,
         task_name: &'a str,
-        task: &'a str,
-        session: &'a Path,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display_task_name: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extension_parent_session_id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extension_principal: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extension_resource_owner: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extension_profile: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extension_idempotency_key: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        extension_fingerprint: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session: Option<&'a Path>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_reference: Option<&'a str>,
     },
     AgentStatus {
         timestamp_ms: u128,
@@ -1058,9 +1395,62 @@ impl DelegationManager {
         owner: &AgentIdentity,
         request: SpawnRequest,
     ) -> Result<Value, String> {
-        let SpawnRequest { task_name, message } = request;
+        let SpawnRequest {
+            task_name,
+            display_task_name,
+            message,
+            mut extension_policy,
+            extension_provenance,
+        } = request;
         validate_task_name(&task_name)?;
+        if let Some(display_task_name) = display_task_name.as_deref() {
+            validate_task_name(display_task_name)?;
+        }
         validate_durable_text("spawn task", &message)?;
+        if extension_provenance.is_some() != extension_policy.is_some() {
+            return Err(
+                "extension delegation policy and durable ownership provenance must be paired"
+                    .into(),
+            );
+        }
+        if let Some(provenance) = extension_provenance.as_ref() {
+            if provenance.parent_session_id.trim().is_empty()
+                || provenance.parent_session_id.len() > 256
+                || provenance
+                    .parent_session_id
+                    .chars()
+                    .any(char::is_whitespace)
+            {
+                return Err("invalid extension delegation parent session".into());
+            }
+            if provenance.principal.trim().is_empty() || provenance.principal.len() > 256 {
+                return Err("invalid extension delegation principal".into());
+            }
+            ExtensionDelegationService::validate_resource_owner(&provenance.resource_owner)?;
+        }
+        if let Some(policy) = extension_policy.as_mut() {
+            policy.validate()?;
+            if owner.depth.saturating_add(1) > policy.max_depth {
+                return Err(format!(
+                    "extension child depth limit reached at {} (max depth {})",
+                    owner.path, policy.max_depth
+                ));
+            }
+            let allowed = policy.tools.iter().cloned().collect::<BTreeSet<_>>();
+            let (_, effective_tools) = self.template.extensions.scoped_tool_snapshot(&allowed)?;
+            policy.tools = effective_tools;
+            if let Some(parent_turns) = self.template.max_turns {
+                policy.max_turns = policy.max_turns.min(parent_turns);
+            }
+            let runtime = self
+                .template
+                .runtime
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(parent_cost) = runtime.max_session_cost_microdollars {
+                policy.max_cost_microdollars = policy.max_cost_microdollars.min(parent_cost);
+            }
+        }
         let initial_task = message;
         if owner.depth >= self.config.limits.max_depth {
             return Err(format!(
@@ -1071,6 +1461,14 @@ impl DelegationManager {
         let permit = self.current_permits().try_acquire_owned().map_err(|_| {
             "delegation concurrency limit reached; wait for an active agent".to_owned()
         })?;
+
+        let created_at_ms = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX);
+        let deadline = extension_policy
+            .as_ref()
+            .map(|policy| tokio::time::Instant::now() + Duration::from_millis(policy.timeout_ms));
+        let deadline_at_ms = extension_policy
+            .as_ref()
+            .map(|policy| created_at_ms.saturating_add(policy.timeout_ms));
 
         let (identity, session, command_rx, shutdown, task_name) = {
             let mut state = self
@@ -1118,14 +1516,42 @@ impl DelegationManager {
             };
             let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
             let shutdown = crate::CancellationToken::default();
+            let extension_session_reference = extension_provenance.as_ref().map(|_| {
+                delegated_session_reference(&session_path)
+                    .expect("generated extension child path has a delegated session reference")
+            });
             if let Err(error) = self.journal.append(&ProvenanceEvent::AgentSpawned {
-                timestamp_ms: timestamp_ms(),
+                timestamp_ms: u128::from(created_at_ms),
                 agent_id: &identity.id,
                 agent_path: &identity.path,
                 parent_id: &owner.id,
                 task_name: &task_name,
-                task: &initial_task,
-                session: &session_path,
+                display_task_name: display_task_name.as_deref(),
+                extension_parent_session_id: extension_provenance
+                    .as_ref()
+                    .map(|provenance| provenance.parent_session_id.as_str()),
+                extension_principal: extension_provenance
+                    .as_ref()
+                    .map(|provenance| provenance.principal.as_str()),
+                extension_resource_owner: extension_provenance
+                    .as_ref()
+                    .map(|provenance| provenance.resource_owner.as_str()),
+                extension_profile: extension_provenance
+                    .as_ref()
+                    .and_then(|provenance| provenance.profile.as_deref()),
+                extension_idempotency_key: extension_provenance
+                    .as_ref()
+                    .map(|provenance| provenance.idempotency_key.as_str()),
+                extension_fingerprint: extension_provenance
+                    .as_ref()
+                    .and_then(|provenance| provenance.fingerprint.as_deref()),
+                task: extension_provenance
+                    .is_none()
+                    .then_some(initial_task.as_str()),
+                session: extension_provenance
+                    .is_none()
+                    .then_some(session_path.as_path()),
+                session_reference: extension_session_reference.as_deref(),
             }) {
                 let message = format!("could not persist delegation provenance: {error}");
                 self.fail_persistence_locked(&mut state, &error);
@@ -1140,6 +1566,7 @@ impl DelegationManager {
                 AgentRecord {
                     identity: identity.clone(),
                     task_name: task_name.clone(),
+                    display_task_name: display_task_name.clone(),
                     parent_id: owner.id.clone(),
                     session_path: session_path.clone(),
                     status: DelegatedAgentStatus::Pending,
@@ -1152,24 +1579,47 @@ impl DelegationManager {
                     mailbox: VecDeque::new(),
                     mailbox_delivery: None,
                     resource_owner: None,
+                    extension_policy: extension_policy.clone(),
+                    extension_principal: extension_provenance
+                        .as_ref()
+                        .map(|provenance| provenance.principal.clone()),
+                    extension_profile: extension_provenance
+                        .as_ref()
+                        .and_then(|provenance| provenance.profile.clone()),
+                    extension_idempotency_key: extension_provenance
+                        .as_ref()
+                        .map(|provenance| provenance.idempotency_key.clone()),
+                    extension_fingerprint: extension_provenance
+                        .as_ref()
+                        .and_then(|provenance| provenance.fingerprint.clone()),
+                    created_at_ms,
+                    started_at_ms: None,
+                    completed_at_ms: None,
+                    turn_count: 0,
+                    usage: Usage::default(),
+                    cost_microdollars: None,
+                    deadline_at_ms,
                 },
             );
             state.total_agents += 1;
             (identity, session, command_rx, shutdown, task_name)
         };
 
+        let result_policy = extension_policy.clone();
         let manager = Arc::clone(self);
         let worker_identity = identity.clone();
         tokio::spawn(async move {
             manager
-                .run_worker(
-                    worker_identity,
+                .run_worker(WorkerStartup {
+                    identity: worker_identity,
                     session,
                     initial_task,
-                    command_rx,
+                    commands: command_rx,
                     shutdown,
-                    permit,
-                )
+                    initial_permit: permit,
+                    extension_policy,
+                    deadline,
+                })
                 .await;
         });
         self.changed.notify_waiters();
@@ -1178,19 +1628,35 @@ impl DelegationManager {
             "agent_id": identity.id,
             "agent_path": identity.path,
             "task_name": task_name,
-            "status": "pending"
+            "profile": extension_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.profile.as_deref()),
+            "idempotency_key": extension_provenance
+                .as_ref()
+                .map(|provenance| provenance.idempotency_key.as_str()),
+            "fingerprint": extension_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.fingerprint.as_deref()),
+            "status": "pending",
+            "policy": result_policy,
+            "created_at_ms": created_at_ms,
+            "started_at_ms": Value::Null,
+            "completed_at_ms": Value::Null,
+            "deadline_at_ms": deadline_at_ms,
         }))
     }
 
-    async fn run_worker(
-        self: Arc<Self>,
-        identity: AgentIdentity,
-        session: Session,
-        initial_task: String,
-        mut commands: mpsc::Receiver<WorkerCommand>,
-        shutdown: crate::CancellationToken,
-        initial_permit: OwnedSemaphorePermit,
-    ) {
+    async fn run_worker(self: Arc<Self>, startup: WorkerStartup) {
+        let WorkerStartup {
+            identity,
+            session,
+            initial_task,
+            mut commands,
+            shutdown,
+            initial_permit,
+            extension_policy,
+            deadline,
+        } = startup;
         let session_path = session.path().to_path_buf();
         let mut unopened_session = Some(session);
         let mut agent = None;
@@ -1199,6 +1665,11 @@ impl DelegationManager {
         let mut retry_undelivered_task = false;
         let mut retry_pending_messages = 0;
         loop {
+            if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                self.set_status(&identity.id, DelegatedAgentStatus::TimedOut, true);
+                self.request_shutdown_descendants(&identity.id);
+                return;
+            }
             if shutdown.is_cancelled() {
                 self.set_status(&identity.id, DelegatedAgentStatus::Shutdown, true);
                 self.request_shutdown_descendants(&identity.id);
@@ -1226,8 +1697,9 @@ impl DelegationManager {
                         Some(session) => Ok(session),
                         None => self.reopen_child_session(&session_path),
                     };
-                    let build = child_session
-                        .and_then(|session| self.build_child_agent(session, &identity));
+                    let build = child_session.and_then(|session| {
+                        self.build_child_agent(session, &identity, extension_policy.as_ref())
+                    });
                     match build {
                         Ok(child) => agent = Some(child),
                         Err(error) => {
@@ -1301,10 +1773,14 @@ impl DelegationManager {
                 let execution = self
                     .execute_child_run(
                         agent.as_mut().expect("delegated agent initialized"),
-                        &identity,
                         formatted_task,
-                        &mut commands,
-                        &shutdown,
+                        ChildRunContext {
+                            identity: &identity,
+                            commands: &mut commands,
+                            shutdown: &shutdown,
+                            extension_policy: extension_policy.as_ref(),
+                            deadline,
+                        },
                     )
                     .await;
                 drop(permit);
@@ -1343,6 +1819,11 @@ impl DelegationManager {
                 match outcome {
                     WorkerOutcome::Shutdown => {
                         self.set_status(&identity.id, DelegatedAgentStatus::Shutdown, true);
+                        self.request_shutdown_descendants(&identity.id);
+                        return;
+                    }
+                    WorkerOutcome::TimedOut => {
+                        self.set_status(&identity.id, DelegatedAgentStatus::TimedOut, true);
                         self.request_shutdown_descendants(&identity.id);
                         return;
                     }
@@ -1412,6 +1893,15 @@ impl DelegationManager {
                     self.request_shutdown_descendants(&identity.id);
                     return;
                 }
+                _ = async {
+                    if let Some(deadline) = deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                }, if deadline.is_some() => {
+                    self.set_status(&identity.id, DelegatedAgentStatus::TimedOut, true);
+                    self.request_shutdown_descendants(&identity.id);
+                    return;
+                }
                 _ = &mut notified => {
                     if retry_undelivered_task
                         && self.pending_message_count(&identity.id) > retry_pending_messages
@@ -1452,6 +1942,7 @@ impl DelegationManager {
         self: &Arc<Self>,
         session: Session,
         identity: &AgentIdentity,
+        extension_policy: Option<&ExtensionAgentSessionPolicy>,
     ) -> Result<Agent, DelegationError> {
         let parent_path = identity
             .path
@@ -1470,11 +1961,36 @@ impl DelegationManager {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let system = format!(
-            "{}\n\n{}",
-            base_system,
-            child_instructions(identity, parent_path, &self.config.limits)
-        );
+        let (system, extensions, max_turns) = if let Some(policy) = extension_policy {
+            let allowed = policy.tools.iter().cloned().collect::<BTreeSet<_>>();
+            let (extensions, effective) = self
+                .template
+                .extensions
+                .scoped_tool_snapshot(&allowed)
+                .map_err(DelegationError::InvalidConfig)?;
+            if effective != policy.tools {
+                return Err(DelegationError::InvalidConfig(
+                    "effective extension child tool scope changed after spawn admission".into(),
+                ));
+            }
+            (
+                format!(
+                    "{base_system}\n\nThis is a host-enforced depth-one child session. Only the listed read-only tools are installed; collaboration and mutation tools are unavailable."
+                ),
+                extensions,
+                Some(policy.max_turns),
+            )
+        } else {
+            (
+                format!(
+                    "{}\n\n{}",
+                    base_system,
+                    child_instructions(identity, parent_path, &self.config.limits)
+                ),
+                self.template.extensions.clone(),
+                self.template.max_turns,
+            )
+        };
         let runtime = self
             .template
             .runtime
@@ -1488,8 +2004,8 @@ impl DelegationManager {
             system,
             sandbox: self.template.sandbox.clone(),
             effect_broker: self.template.effect_broker.clone(),
-            extensions: self.template.extensions.clone(),
-            max_turns: self.template.max_turns,
+            extensions,
+            max_turns,
             reasoning: self.template.reasoning.clone(),
             reasoning_mode: self.template.reasoning_mode,
             cache_retention: self.template.cache_retention,
@@ -1512,16 +2028,24 @@ impl DelegationManager {
         )?;
         agent.set_completion_policy(runtime.completion_policy);
         agent.set_output_modalities(runtime.output_modalities);
-        agent.inherit_max_output_tokens(runtime.max_output_tokens);
-        agent.set_max_session_cost_microdollars(runtime.max_session_cost_microdollars);
+        if let Some(policy) = extension_policy {
+            agent.inherit_max_output_tokens(runtime.max_output_tokens.min(policy.max_tokens));
+            agent.set_max_session_tokens(Some(policy.max_tokens));
+            agent.set_max_session_cost_microdollars(Some(policy.max_cost_microdollars));
+        } else {
+            agent.inherit_max_output_tokens(runtime.max_output_tokens);
+            agent.set_max_session_cost_microdollars(runtime.max_session_cost_microdollars);
+        }
         agent.set_provider_retries_enabled(runtime.provider_retries_enabled);
-        let binding = DelegationBinding {
-            manager: Arc::clone(self),
-            identity: identity.clone(),
-            system_instructions: Arc::from(""),
-        };
-        agent.install_delegation_tools(self.tools(identity));
-        agent.set_delegation_binding(binding)?;
+        if extension_policy.is_none() {
+            let binding = DelegationBinding {
+                manager: Arc::clone(self),
+                identity: identity.clone(),
+                system_instructions: Arc::from(""),
+            };
+            agent.install_delegation_tools(self.tools(identity));
+            agent.set_delegation_binding(binding)?;
+        }
         agent.finalize_tool_surface();
         Ok(agent)
     }
@@ -1529,11 +2053,19 @@ impl DelegationManager {
     async fn execute_child_run(
         self: &Arc<Self>,
         agent: &mut Agent,
-        identity: &AgentIdentity,
         task: String,
-        commands: &mut mpsc::Receiver<WorkerCommand>,
-        shutdown: &crate::CancellationToken,
+        context: ChildRunContext<'_>,
     ) -> WorkerExecution {
+        let ChildRunContext {
+            identity,
+            commands,
+            shutdown,
+            extension_policy,
+            deadline,
+        } = context;
+        if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+            return WorkerExecution::new(WorkerOutcome::TimedOut);
+        }
         if shutdown.is_cancelled() {
             return WorkerExecution::new(WorkerOutcome::Shutdown);
         }
@@ -1599,6 +2131,9 @@ impl DelegationManager {
         };
         let control = run.control();
 
+        let output_limit = extension_policy
+            .map(|policy| policy.max_output_bytes)
+            .unwrap_or(MAX_PROVENANCE_TEXT_BYTES);
         let mut output = String::new();
         // A successful nonblocking control enqueue is not delivery: the agent
         // acknowledges only after the input has been appended durably. Keep the
@@ -1613,12 +2148,15 @@ impl DelegationManager {
         let mut acknowledged_follow_ups = QueueUsage::default();
         let mut requested_interrupt = false;
         let mut requested_shutdown = false;
+        let mut requested_timeout = false;
+        let mut requested_token_limit = false;
         let mut commands_open = true;
         enum Next {
             Event(Option<AgentEvent>),
             Command(Option<WorkerCommand>),
             Changed,
             Shutdown,
+            Deadline,
         }
         let outcome = loop {
             let notified = self.changed.notified();
@@ -1631,12 +2169,21 @@ impl DelegationManager {
             let next = tokio::select! {
                 biased;
                 _ = shutdown.cancelled(), if !requested_shutdown => Next::Shutdown,
+                _ = async {
+                    if let Some(deadline) = deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                }, if deadline.is_some() && !requested_timeout => Next::Deadline,
                 _ = &mut notified, if !requested_interrupt => Next::Changed,
                 event = run.next() => Next::Event(event),
                 command = commands.recv(), if commands_open => Next::Command(command),
             };
             match next {
                 Next::Changed => {}
+                Next::Deadline => {
+                    control.abort();
+                    requested_timeout = true;
+                }
                 Next::Shutdown => {
                     control.abort();
                     requested_shutdown = true;
@@ -1691,6 +2238,10 @@ impl DelegationManager {
                 Next::Event(None) => {
                     break if requested_shutdown {
                         WorkerOutcome::Shutdown
+                    } else if requested_timeout {
+                        WorkerOutcome::TimedOut
+                    } else if requested_token_limit {
+                        WorkerOutcome::Failed("maximum delegated token budget reached".into())
                     } else if requested_interrupt {
                         WorkerOutcome::Interrupted
                     } else {
@@ -1715,15 +2266,27 @@ impl DelegationManager {
                         acknowledged_follow_ups.add_usage(follow_up.usage());
                     }
                 }
-                Next::Event(Some(AgentEvent::TurnFinished { message, .. })) => {
+                Next::Event(Some(AgentEvent::TurnFinished {
+                    message,
+                    usage,
+                    session_cost_microdollars,
+                    ..
+                })) => {
+                    self.update_agent_usage(&identity.id, usage, session_cost_microdollars);
+                    if extension_policy
+                        .is_some_and(|policy| delegation_usage_tokens(&usage) > policy.max_tokens)
+                    {
+                        control.abort();
+                        requested_token_limit = true;
+                    }
                     for part in message.content {
                         if let AssistantPart::Text(text) = part {
                             if !output.is_empty() {
                                 output.push('\n');
                             }
                             output.push_str(&text);
-                            if output.len() > MAX_PROVENANCE_TEXT_BYTES {
-                                output = bounded_text(&output);
+                            if output.len() > output_limit {
+                                output = bounded_text_to(&output, output_limit);
                             }
                         }
                     }
@@ -1731,6 +2294,10 @@ impl DelegationManager {
                 Next::Event(Some(AgentEvent::RunFinished { reason, .. })) => {
                     break if requested_shutdown {
                         WorkerOutcome::Shutdown
+                    } else if requested_timeout {
+                        WorkerOutcome::TimedOut
+                    } else if requested_token_limit {
+                        WorkerOutcome::Failed("maximum delegated token budget reached".into())
                     } else if requested_interrupt {
                         WorkerOutcome::Interrupted
                     } else {
@@ -1764,6 +2331,21 @@ impl DelegationManager {
         }
     }
 
+    fn update_agent_usage(&self, id: &str, usage: Usage, cost_microdollars: Option<u64>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = state.records.get_mut(id) else {
+            return;
+        };
+        record.turn_count = record.turn_count.saturating_add(1);
+        record.usage = usage;
+        record.cost_microdollars = cost_microdollars;
+        drop(state);
+        self.changed.notify_waiters();
+    }
+
     fn set_status(&self, id: &str, status: DelegatedAgentStatus, notify_parent: bool) -> bool {
         let mut state = self
             .state
@@ -1791,8 +2373,9 @@ impl DelegationManager {
             }
             return true;
         }
+        let transition_ms = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX);
         if let Err(error) = self.journal.append(&ProvenanceEvent::AgentStatus {
-            timestamp_ms: timestamp_ms(),
+            timestamp_ms: u128::from(transition_ms),
             agent_id: id,
             status: &status,
         }) {
@@ -1802,6 +2385,14 @@ impl DelegationManager {
         let notification = {
             let record = state.records.get_mut(id).expect("checked child exists");
             record.status = status;
+            if matches!(record.status, DelegatedAgentStatus::Running)
+                && record.started_at_ms.is_none()
+            {
+                record.started_at_ms = Some(transition_ms);
+            }
+            if !record.status.is_running() && record.completed_at_ms.is_none() {
+                record.completed_at_ms = Some(transition_ms);
+            }
             if matches!(record.status, DelegatedAgentStatus::Interrupted) {
                 record.interrupt_requested = false;
             }
@@ -2685,7 +3276,7 @@ fn restore_undelivered_task(
 ) -> bool {
     let should_restore = !task_delivered
         && match outcome {
-            WorkerOutcome::Shutdown => false,
+            WorkerOutcome::Shutdown | WorkerOutcome::TimedOut => false,
             WorkerOutcome::Interrupted => matches!(&task, QueuedTask::FollowUp(_)),
             WorkerOutcome::Completed(_) | WorkerOutcome::Failed(_) => true,
         };
@@ -2717,6 +3308,7 @@ impl WorkerExecution {
 enum WorkerOutcome {
     Completed(String),
     Interrupted,
+    TimedOut,
     Failed(String),
     Shutdown,
 }
@@ -2886,7 +3478,10 @@ impl Tool for CollaborationTool {
             CollaborationToolKind::Spawn => {
                 let request = SpawnRequest {
                     task_name: required_string(&args, "task_name")?,
+                    display_task_name: None,
                     message: required_string(&args, "message")?,
+                    extension_policy: None,
+                    extension_provenance: None,
                 };
                 manager.spawn(&self.owner, request)
             }
@@ -3258,6 +3853,7 @@ fn status_message(path: &str, status: &DelegatedAgentStatus) -> String {
         }
         DelegatedAgentStatus::Failed { error } => format!("{path} failed: {error}"),
         DelegatedAgentStatus::Interrupted => format!("{path} was interrupted"),
+        DelegatedAgentStatus::TimedOut => format!("{path} timed out"),
         DelegatedAgentStatus::Shutdown => format!("{path} was shut down"),
         DelegatedAgentStatus::Pending | DelegatedAgentStatus::Running => {
             format!("{path} is {}", status.label())
@@ -3279,10 +3875,21 @@ fn agent_record_value(record: &AgentRecord) -> Value {
         "agent_id": record.identity.id,
         "agent_path": record.identity.path,
         "parent_id": record.parent_id,
-        "task_name": record.task_name,
+        "task_name": record.display_task_name.as_deref().unwrap_or(record.task_name.as_str()),
         "depth": record.identity.depth,
         "session": record.session_path,
-        "status": record.status
+        "status": record.status,
+        "policy": record.extension_policy,
+        "profile": record.extension_profile,
+        "idempotency_key": record.extension_idempotency_key,
+        "fingerprint": record.extension_fingerprint,
+        "created_at_ms": record.created_at_ms,
+        "started_at_ms": record.started_at_ms,
+        "completed_at_ms": record.completed_at_ms,
+        "turn_count": record.turn_count,
+        "usage": record.usage,
+        "cost_microdollars": record.cost_microdollars,
+        "deadline_at_ms": record.deadline_at_ms,
     })
 }
 
@@ -3345,16 +3952,33 @@ fn validate_durable_text(kind: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn bounded_text(text: &str) -> String {
+fn delegation_usage_tokens(usage: &Usage) -> u64 {
+    if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        usage
+            .input_tokens
+            .saturating_add(usage.cache_read_tokens)
+            .saturating_add(usage.cache_write_tokens)
+            .saturating_add(usage.output_tokens)
+    }
+}
+
+fn bounded_text_to(text: &str, limit: usize) -> String {
     const SUFFIX: &str = "\n...[truncated]";
-    if text.len() <= MAX_PROVENANCE_TEXT_BYTES {
+    if text.len() <= limit {
         return text.to_owned();
     }
-    let mut end = MAX_PROVENANCE_TEXT_BYTES.saturating_sub(SUFFIX.len());
-    while !text.is_char_boundary(end) {
+    let suffix = if limit >= SUFFIX.len() { SUFFIX } else { "" };
+    let mut end = limit.saturating_sub(suffix.len()).min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{}", &text[..end], SUFFIX)
+    format!("{}{}", &text[..end], suffix)
+}
+
+fn bounded_text(text: &str) -> String {
+    bounded_text_to(text, MAX_PROVENANCE_TEXT_BYTES)
 }
 
 fn timestamp_ms() -> u128 {
@@ -3394,6 +4018,61 @@ fn cleanup_failed_team_activation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegated_session_references_are_stable_path_free_and_strict() {
+        let first =
+            Path::new("/private/sessions/.delegation/team-0123456789abcdef/0001-review.jsonl");
+        let same_leaf_elsewhere =
+            Path::new("/other/private/team-0123456789abcdef/0001-review.jsonl");
+        let reference = delegated_session_reference(first).unwrap();
+        assert_eq!(reference, delegated_session_reference(first).unwrap());
+        assert_eq!(
+            reference,
+            delegated_session_reference(same_leaf_elsewhere).unwrap()
+        );
+        assert!(reference.starts_with("agent-session:"));
+        assert_eq!(reference.len(), "agent-session:".len() + 64);
+        assert!(!reference.contains("review"));
+        assert!(delegated_session_reference(Path::new(
+            "/private/sessions/.delegation/not-a-team/0001-review.jsonl"
+        ))
+        .is_none());
+        assert!(delegated_session_reference(Path::new(
+            "/private/sessions/.delegation/team-safe/../outside.jsonl"
+        ))
+        .is_none());
+    }
+
+    fn test_extension_policy() -> ExtensionAgentSessionPolicy {
+        ExtensionAgentSessionPolicy {
+            tools: vec!["read".into(), "search".into()],
+            max_depth: 1,
+            max_concurrent_children: 2,
+            max_turns: 4,
+            max_tokens: 32_000,
+            max_cost_microdollars: 200_000,
+            max_output_bytes: 8 * 1024,
+            timeout_ms: 300_000,
+        }
+    }
+
+    fn test_extension_spawn(
+        task_name: &str,
+        profile: Option<&str>,
+        fingerprint: Option<&str>,
+        message: &str,
+        idempotency_key: &str,
+    ) -> ExtensionDelegationSpawnRequest {
+        ExtensionDelegationSpawnRequest {
+            task_name: task_name.into(),
+            profile: profile.map(str::to_owned),
+            fingerprint: fingerprint.map(str::to_owned),
+            message: message.into(),
+            idempotency_key: idempotency_key.into(),
+            policy: test_extension_policy(),
+        }
+    }
 
     fn test_template(directory: &Path) -> DelegationTemplate {
         let model = ygg_ai::ModelCatalog::builtin()
@@ -3467,6 +4146,13 @@ mod tests {
             .open(directory.join("provenance.jsonl"))
             .unwrap();
         manager_with_journal(file, directory)
+    }
+
+    fn writable_manager_with_core_tools(directory: &Path) -> Arc<DelegationManager> {
+        let mut manager = writable_manager(directory);
+        let manager_mut = Arc::get_mut(&mut manager).expect("new manager is uniquely owned");
+        manager_mut.template.extensions.load(&crate::CoreTools);
+        manager
     }
 
     #[cfg(unix)]
@@ -3608,6 +4294,7 @@ mod tests {
                 AgentRecord {
                     identity: grandchild.clone(),
                     task_name: "grandchild".into(),
+                    display_task_name: None,
                     parent_id: child.id.clone(),
                     session_path: manager.team_directory.join("grandchild.jsonl"),
                     status: DelegatedAgentStatus::Running,
@@ -3620,6 +4307,18 @@ mod tests {
                     mailbox: VecDeque::new(),
                     mailbox_delivery: None,
                     resource_owner: None,
+                    extension_policy: None,
+                    extension_principal: None,
+                    extension_profile: None,
+                    extension_idempotency_key: None,
+                    extension_fingerprint: None,
+                    created_at_ms: 1,
+                    started_at_ms: Some(1),
+                    completed_at_ms: None,
+                    turn_count: 0,
+                    usage: Usage::default(),
+                    cost_microdollars: None,
+                    deadline_at_ms: None,
                 },
             );
             state.total_agents += 1;
@@ -3656,7 +4355,7 @@ mod tests {
         let session_path = directory.path().join("prompt-classification.jsonl");
         let session_file = secure_fs::create_regular_file_for_append(&session_path).unwrap();
         let session = Session::create_with_file(&session_path, session_file).unwrap();
-        let mut agent = manager.build_child_agent(session, &child).unwrap();
+        let mut agent = manager.build_child_agent(session, &child, None).unwrap();
         {
             let mut state = manager.state.lock().unwrap();
             state.records.get_mut(&child.id).unwrap().session_path = session_path.clone();
@@ -3668,10 +4367,14 @@ mod tests {
         let execution = manager
             .execute_child_run(
                 &mut agent,
-                &child,
                 "task accepted before startup failed".into(),
-                &mut commands,
-                &shutdown,
+                ChildRunContext {
+                    identity: &child,
+                    commands: &mut commands,
+                    shutdown: &shutdown,
+                    extension_policy: None,
+                    deadline: None,
+                },
             )
             .await;
 
@@ -3712,7 +4415,7 @@ mod tests {
         let session_path = directory.path().join("prompt-replacement.jsonl");
         let session_file = secure_fs::create_regular_file_for_append(&session_path).unwrap();
         let session = Session::create_with_file(&session_path, session_file).unwrap();
-        let mut agent = manager.build_child_agent(session, &child).unwrap();
+        let mut agent = manager.build_child_agent(session, &child, None).unwrap();
         {
             let mut state = manager.state.lock().unwrap();
             state.records.get_mut(&child.id).unwrap().session_path = session_path.clone();
@@ -3724,13 +4427,18 @@ mod tests {
         drop(Session::create(&session_path).unwrap());
 
         let (_command_tx, mut commands) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let shutdown = crate::CancellationToken::default();
         let execution = manager
             .execute_child_run(
                 &mut agent,
-                &child,
                 "task persisted through the original descriptor".into(),
-                &mut commands,
-                &crate::CancellationToken::default(),
+                ChildRunContext {
+                    identity: &child,
+                    commands: &mut commands,
+                    shutdown: &shutdown,
+                    extension_policy: None,
+                    deadline: None,
+                },
             )
             .await;
 
@@ -3768,7 +4476,10 @@ mod tests {
                 &root,
                 SpawnRequest {
                     task_name: "reopen-failure".into(),
+                    display_task_name: None,
                     message: "initial task must remain first".into(),
+                    extension_policy: None,
+                    extension_provenance: None,
                 },
             )
             .unwrap();
@@ -3943,7 +4654,10 @@ mod tests {
                 &root_identity(),
                 SpawnRequest {
                     task_name: "child".into(),
+                    display_task_name: None,
                     message: "do work".into(),
+                    extension_policy: None,
+                    extension_provenance: None,
                 },
             )
             .unwrap_err();
@@ -3978,6 +4692,7 @@ mod tests {
             AgentRecord {
                 identity: identity.clone(),
                 task_name: "child".into(),
+                display_task_name: None,
                 parent_id: ROOT_AGENT_ID.into(),
                 session_path: manager.team_directory.join("child.jsonl"),
                 status,
@@ -3990,6 +4705,18 @@ mod tests {
                 mailbox: VecDeque::new(),
                 mailbox_delivery: None,
                 resource_owner: None,
+                extension_policy: None,
+                extension_principal: None,
+                extension_profile: None,
+                extension_idempotency_key: None,
+                extension_fingerprint: None,
+                created_at_ms: 1,
+                started_at_ms: Some(1),
+                completed_at_ms: None,
+                turn_count: 0,
+                usage: Usage::default(),
+                cost_microdollars: None,
+                deadline_at_ms: None,
             },
         );
         state.total_agents += 1;
@@ -4016,16 +4743,262 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    #[test]
+    fn extension_child_policy_installs_only_detached_read_only_tools_and_lowers_parent_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = writable_manager_with_core_tools(directory.path());
+        {
+            let manager_mut = Arc::get_mut(&mut manager).expect("manager remains unique");
+            manager_mut.template.max_turns = Some(2);
+            manager_mut
+                .template
+                .runtime
+                .get_mut()
+                .unwrap()
+                .max_session_cost_microdollars = Some(50);
+        }
+        let identity = AgentIdentity {
+            id: "agent-policy".into(),
+            path: "/root/policy".into(),
+            depth: 1,
+        };
+        let mut policy = test_extension_policy();
+        policy.max_turns = 8;
+        policy.max_cost_microdollars = 200;
+        let allowed = policy.tools.iter().cloned().collect::<BTreeSet<_>>();
+        let (_, effective) = manager
+            .template
+            .extensions
+            .scoped_tool_snapshot(&allowed)
+            .unwrap();
+        policy.tools = effective;
+        policy.max_turns = policy.max_turns.min(manager.template.max_turns.unwrap());
+        policy.max_cost_microdollars = 50;
+        let session = Session::create(directory.path().join("policy-child.jsonl")).unwrap();
+        let child = manager
+            .build_child_agent(session, &identity, Some(&policy))
+            .unwrap();
+        assert_eq!(
+            child.registered_tool_names(),
+            vec!["read".to_owned(), "search".to_owned()]
+        );
+        assert!(child
+            .registered_tool_names()
+            .iter()
+            .all(|name| !COLLABORATION_TOOL_NAMES.contains(&name.as_str())));
+        assert!(manager
+            .template
+            .extensions
+            .tool_definitions()
+            .iter()
+            .any(|tool| tool.name == "write"));
+    }
+
+    #[test]
+    fn extension_child_rejects_unpriced_model_before_session_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manager = writable_manager_with_core_tools(directory.path());
+        let manager_mut = Arc::get_mut(&mut manager).unwrap();
+        Arc::make_mut(&mut manager_mut.template.model.spec).pricing = None;
+        let binding = manager.root_binding();
+        let service = binding
+            .extension_service("extension-policy", "parent-session", "root-owner")
+            .unwrap();
+
+        let error = service
+            .spawn(
+                "root-owner",
+                test_extension_spawn("unpriced", None, None, "must not run", "unpriced-key"),
+            )
+            .unwrap_err();
+        assert!(error.contains("trusted model pricing"), "{error}");
+        assert!(manager.state.lock().unwrap().records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn extension_service_enforces_concurrency_depth_deadline_and_list_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let team = directory.path().join("team-extension-policy");
+        std::fs::create_dir(&team).unwrap();
+        let manager = writable_manager_with_core_tools(&team);
+        let binding = manager.root_binding();
+        let service = binding
+            .extension_service("extension-policy", "parent-session", "root-owner")
+            .unwrap();
+        let first = service
+            .spawn(
+                "root-owner",
+                test_extension_spawn(
+                    "first",
+                    Some("review"),
+                    Some(&"f".repeat(64)),
+                    "first bounded task",
+                    "first-key",
+                ),
+            )
+            .unwrap();
+        let second = service
+            .spawn(
+                "root-owner",
+                test_extension_spawn("second", None, None, "second bounded task", "second-key"),
+            )
+            .unwrap();
+        let error = service
+            .spawn(
+                "root-owner",
+                test_extension_spawn("third", None, None, "third bounded task", "third-key"),
+            )
+            .unwrap_err();
+        assert!(error.contains("concurrency limit"), "{error}");
+
+        let first_id = first["agent_id"].as_str().unwrap();
+        {
+            let mut state = manager.state.lock().unwrap();
+            let record = state.records.get_mut(first_id).unwrap();
+            record.turn_count = 2;
+            record.usage = Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                ..Usage::default()
+            };
+            record.cost_microdollars = Some(7);
+        }
+        let listed = service.list("root-owner").unwrap();
+        let record = listed["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["agent_id"] == first_id)
+            .unwrap();
+        assert_eq!(record["task_name"], "first");
+        assert_eq!(record["policy"]["tools"], json!(["read", "search"]));
+        assert_eq!(record["turn_count"], 2);
+        assert_eq!(record["usage"]["total_tokens"], 15);
+        assert_eq!(record["cost_microdollars"], 7);
+        assert_eq!(record["profile"], "review");
+        assert_eq!(record["idempotency_key"], "first-key");
+        assert_eq!(record["fingerprint"], "f".repeat(64));
+        assert!(record["created_at_ms"].as_u64().is_some());
+        assert!(record["deadline_at_ms"].as_u64().is_some());
+        assert_eq!(record["provenance"]["principal"], "extension-policy");
+        assert_eq!(record["provenance"]["resource_owner"], "root-owner");
+        let reference = record["session"].as_str().unwrap();
+        let mut inspection = binding
+            .open_session_reference("extension-policy", reference)
+            .unwrap()
+            .unwrap();
+        assert!(inspection
+            .append(crate::EntryValue::Config {
+                model: None,
+                reasoning: None,
+                reasoning_mode: None,
+            })
+            .is_err());
+        assert!(binding
+            .open_session_reference("another-extension", reference)
+            .unwrap()
+            .is_none());
+        assert!(binding
+            .open_session_reference(
+                "extension-policy",
+                &format!("agent-session:{}", "0".repeat(64)),
+            )
+            .unwrap()
+            .is_none());
+
+        let journal =
+            std::fs::read_to_string(manager.team_directory.join("provenance.jsonl")).unwrap();
+        let persisted = journal
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["event"] == "agent_spawned" && event["agent_id"] == first_id)
+            .unwrap();
+        assert_eq!(persisted["extension_parent_session_id"], "parent-session");
+        assert_eq!(persisted["extension_principal"], "extension-policy");
+        assert_eq!(persisted["extension_resource_owner"], "root-owner");
+        assert_eq!(persisted["extension_profile"], "review");
+        assert_eq!(persisted["extension_idempotency_key"], "first-key");
+        assert_eq!(persisted["extension_fingerprint"], "f".repeat(64));
+        assert!(persisted["session_reference"]
+            .as_str()
+            .is_some_and(|reference| reference.starts_with("agent-session:")));
+        assert!(persisted.get("task").is_none());
+        assert!(persisted.get("session").is_none());
+        assert!(!journal.contains("first bounded task"));
+
+        let nested_owner = AgentIdentity {
+            id: first_id.into(),
+            path: first["agent_path"].as_str().unwrap().into(),
+            depth: 1,
+        };
+        let nested_error = manager
+            .spawn(
+                &nested_owner,
+                SpawnRequest {
+                    task_name: "nested".into(),
+                    display_task_name: None,
+                    message: "must not create a session".into(),
+                    extension_policy: Some(test_extension_policy()),
+                    extension_provenance: Some(ExtensionSpawnProvenance {
+                        parent_session_id: "parent-session".into(),
+                        principal: "extension-policy".into(),
+                        resource_owner: "child-owner".into(),
+                        profile: None,
+                        idempotency_key: "nested-key".into(),
+                        fingerprint: None,
+                    }),
+                },
+            )
+            .unwrap_err();
+        assert!(nested_error.contains("depth limit"), "{nested_error}");
+        assert_eq!(second["policy"]["max_concurrent_children"], 2);
+    }
+
+    #[tokio::test]
+    async fn elapsed_extension_deadline_settles_before_provider_or_tool_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = writable_manager(directory.path());
+        let (identity, mut commands) = insert_test_record(&manager, DelegatedAgentStatus::Pending);
+        let session = Session::create(directory.path().join("deadline-child.jsonl")).unwrap();
+        let mut agent = manager.build_child_agent(session, &identity, None).unwrap();
+        let shutdown = crate::CancellationToken::default();
+        let policy = test_extension_policy();
+        let outcome = manager
+            .execute_child_run(
+                &mut agent,
+                "must not execute".into(),
+                ChildRunContext {
+                    identity: &identity,
+                    commands: &mut commands,
+                    shutdown: &shutdown,
+                    extension_policy: Some(&policy),
+                    deadline: Some(tokio::time::Instant::now()),
+                },
+            )
+            .await;
+        assert!(matches!(outcome.outcome, WorkerOutcome::TimedOut));
+        assert!(agent.session().entries().is_empty());
+    }
+
+    #[test]
+    fn extension_output_bound_is_exact_and_utf8_safe() {
+        let output = bounded_text_to(&"é".repeat(10_000), 513);
+        assert!(output.len() <= 513);
+        assert!(output.is_char_boundary(output.len()));
+        assert!(output.ends_with("...[truncated]"));
+    }
+
     #[tokio::test]
     async fn extension_services_are_idempotent_and_isolated_by_principal_and_owner() {
         let directory = tempfile::tempdir().unwrap();
         let manager = writable_manager(directory.path());
         let binding = manager.root_binding();
         let service_a = binding
-            .extension_service("extension-a", "root-owner")
+            .extension_service("extension-a", "parent-session", "root-owner")
             .unwrap();
         let service_b = binding
-            .extension_service("extension-b", "root-owner")
+            .extension_service("extension-b", "parent-session", "root-owner")
             .unwrap();
         let (identity, mut commands) = insert_test_record(&manager, DelegatedAgentStatus::Running);
         {
@@ -4036,7 +5009,10 @@ mod tests {
                 "spawn-1".into(),
                 IdempotentExtensionSpawn {
                     task_name: "research".into(),
+                    profile: None,
+                    fingerprint: None,
                     message_sha256: format!("{:x}", Sha256::digest(b"find it")),
+                    policy: test_extension_policy(),
                     result: json!({"agent_id":identity.id.clone(),"status":"pending"}),
                 },
             );
@@ -4045,18 +5021,14 @@ mod tests {
         let cached = service_a
             .spawn(
                 "root-owner",
-                "research".into(),
-                "find it".into(),
-                "spawn-1".into(),
+                test_extension_spawn("research", None, None, "find it", "spawn-1"),
             )
             .unwrap();
         assert_eq!(cached["agent_id"], "agent-1");
         assert!(service_a
             .spawn(
                 "root-owner",
-                "research".into(),
-                "different".into(),
-                "spawn-1".into(),
+                test_extension_spawn("research", None, None, "different", "spawn-1"),
             )
             .unwrap_err()
             .contains("different input"));
@@ -4317,7 +5289,10 @@ mod tests {
                 &owner,
                 SpawnRequest {
                     task_name: "oversized".into(),
+                    display_task_name: None,
                     message: oversized.clone(),
+                    extension_policy: None,
+                    extension_provenance: None,
                 },
             )
             .unwrap_err();
@@ -4329,7 +5304,10 @@ mod tests {
                 &owner,
                 SpawnRequest {
                     task_name: oversized.clone(),
+                    display_task_name: None,
                     message: "work".into(),
+                    extension_policy: None,
+                    extension_provenance: None,
                 },
             )
             .unwrap_err();
@@ -4726,7 +5704,7 @@ mod tests {
             path: "/root/child".into(),
             depth: 1,
         };
-        let child = manager.build_child_agent(session, &identity).unwrap();
+        let child = manager.build_child_agent(session, &identity, None).unwrap();
 
         assert_eq!(
             child.compaction_model().unwrap().spec.id,
@@ -4803,7 +5781,10 @@ mod tests {
                 &owner,
                 SpawnRequest {
                     task_name: "child".into(),
+                    display_task_name: None,
                     message: "must not launch".into(),
+                    extension_policy: None,
+                    extension_provenance: None,
                 },
             )
             .unwrap_err();
@@ -4821,7 +5802,10 @@ mod tests {
                 &owner,
                 SpawnRequest {
                     task_name: "second".into(),
+                    display_task_name: None,
                     message: "still closed".into(),
+                    extension_policy: None,
+                    extension_provenance: None,
                 },
             )
             .unwrap_err();
@@ -4844,6 +5828,7 @@ mod tests {
                         depth: 1,
                     },
                     task_name: "child".into(),
+                    display_task_name: None,
                     parent_id: ROOT_AGENT_ID.into(),
                     session_path: directory.path().join("child.jsonl"),
                     status: DelegatedAgentStatus::Completed {
@@ -4858,6 +5843,18 @@ mod tests {
                     mailbox: VecDeque::new(),
                     mailbox_delivery: None,
                     resource_owner: None,
+                    extension_policy: None,
+                    extension_principal: None,
+                    extension_profile: None,
+                    extension_idempotency_key: None,
+                    extension_fingerprint: None,
+                    created_at_ms: 1,
+                    started_at_ms: Some(1),
+                    completed_at_ms: None,
+                    turn_count: 0,
+                    usage: Usage::default(),
+                    cost_microdollars: None,
+                    deadline_at_ms: None,
                 },
             );
         }

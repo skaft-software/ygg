@@ -1,0 +1,2 @@
+[hermes_agent.memory_providers]
+entrypoint-memory = offline_entrypoint:register

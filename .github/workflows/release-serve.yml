@@ -269,11 +269,14 @@ jobs:
           archive="$RUNNER_TEMP/ygg-serve-release/ygg-serve-$version-$target.tar.gz"
           test -f "$archive"
           cargo build --locked --target "$target" -p ygg-coding-agent --no-default-features
-          launcher="target/$target/debug/ygg"
+          launcher="$PWD/target/$target/debug/ygg"
           package_home="$RUNNER_TEMP/ygg-package-home"
           mkdir -p "$package_home/.ygg/serve-data"
           printf 'preserve\n' > "$package_home/.ygg/serve-data/sentinel"
-          HOME="$package_home" "$launcher" extension install --path "$archive"
+          (
+            cd "$(dirname "$archive")"
+            HOME="$package_home" "$launcher" extension install --path "./$(basename "$archive")"
+          )
           test -f "$package_home/.ygg/extensions/ygg-serve/package.toml"
           test -x "$package_home/.ygg/extensions/ygg-serve/bin/ygg-serve-runtime"
           test -f "$package_home/.ygg/extensions/ygg-serve/install.json"
@@ -297,9 +300,102 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build-bundles:
+    name: Build executable-extension bundles
+    needs: [resolve, security]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.resolve.outputs.source_commit }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          key: executable-extension-release-smoke
+      - name: Package the official executable-extension catalog reproducibly
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.resolve.outputs.version }}"
+          while IFS= read -r extension; do
+            [[ -n "$extension" ]] || continue
+            scripts/package-ygg-extension-release.sh \
+              "$extension" \
+              "$RUNNER_TEMP/ygg-extension-release" \
+              "${{ needs.resolve.outputs.tag }}"
+            scripts/package-ygg-extension-release.sh \
+              "$extension" \
+              "$RUNNER_TEMP/ygg-extension-release-reproducibility-check" \
+              "${{ needs.resolve.outputs.tag }}"
+            archive="$RUNNER_TEMP/ygg-extension-release/$extension-$version.tar.gz"
+            repeated="$RUNNER_TEMP/ygg-extension-release-reproducibility-check/$extension-$version.tar.gz"
+            test -f "$archive"
+            cmp "$archive" "$repeated"
+          done < <(grep -Ev '^[[:space:]]*(#|$)' extensions/release-catalog.txt)
+      - name: Verify package inclusion, local install, discovery, list, and removal
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.resolve.outputs.version }}"
+          cargo build --locked -p ygg-coding-agent --no-default-features
+          launcher="$PWD/target/debug/ygg"
+          package_home="$RUNNER_TEMP/ygg-bundle-package-home"
+          mkdir -p "$package_home"
+          while IFS= read -r extension; do
+            [[ -n "$extension" ]] || continue
+            archive="$RUNNER_TEMP/ygg-extension-release/$extension-$version.tar.gz"
+            python3 - "$extension" "$archive" <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+          import tarfile
+
+          extension, archive = sys.argv[1:3]
+          prefix = f"extensions/{extension}/"
+          tracked = subprocess.run(
+              ["git", "ls-files", "--", f"extensions/{extension}"],
+              check=True,
+              text=True,
+              stdout=subprocess.PIPE,
+          ).stdout.splitlines()
+          expected = {f"{extension}/{path.removeprefix(prefix)}" for path in tracked}
+          with tarfile.open(archive, "r:gz") as bundle:
+              files = {member.name for member in bundle.getmembers() if member.isfile()}
+              if any(not (member.isfile() or member.isdir()) for member in bundle.getmembers()):
+                  raise SystemExit(f"{extension} bundle contains a link or special file")
+          if files != expected:
+              missing = sorted(expected - files)
+              unexpected = sorted(files - expected)
+              raise SystemExit(
+                  f"{extension} release inclusion mismatch; missing={missing}, unexpected={unexpected}"
+              )
+          PY
+            (
+              cd "$(dirname "$archive")"
+              HOME="$package_home" "$launcher" extension install --path "./$(basename "$archive")"
+            )
+            test -f "$package_home/.ygg/extensions/$extension/extension.toml"
+            test -f "$package_home/.ygg/extensions/$extension/install.json"
+            (
+              cd "$(dirname "$archive")"
+              HOME="$package_home" "$launcher" extension update --path "./$(basename "$archive")"
+            )
+            HOME="$package_home" "$launcher" extension list | grep -F "$extension"
+            test ! -e "$package_home/.ygg/config.toml"
+            HOME="$package_home" "$launcher" extension remove "$extension"
+            test ! -e "$package_home/.ygg/extensions/$extension"
+          done < <(grep -Ev '^[[:space:]]*(#|$)' extensions/release-catalog.txt)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ygg-executable-extension-bundles
+          path: ${{ runner.temp }}/ygg-extension-release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Sign and attach extension artifacts
-    needs: [resolve, build]
+    needs: [resolve, build, build-bundles]
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -315,6 +411,10 @@ jobs:
           pattern: ygg-serve-*
           path: release-assets
           merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ygg-executable-extension-bundles
+          path: release-assets
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
         with:
@@ -414,6 +514,9 @@ jobs:
     needs: [resolve, publish]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.resolve.outputs.source_commit }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: ygg-extension-test-launcher
@@ -449,3 +552,27 @@ jobs:
           HOME="$test_home" "$launcher" extension remove ygg-serve
           test ! -e "$test_home/.ygg/extensions/ygg-serve"
           grep -Fx "preserve" "$test_home/.ygg/serve-data/sentinel"
+
+          while IFS= read -r extension; do
+            [[ -n "$extension" ]] || continue
+            installed=false
+            for attempt in 1 2 3 4 5; do
+              if HOME="$test_home" "$launcher" extension install "$extension"; then
+                installed=true
+                break
+              fi
+              echo "release bundle $extension is not readable yet (attempt $attempt)" >&2
+              sleep $((attempt * 2))
+            done
+            if [[ "$installed" != true ]]; then
+              echo "could not install $extension from $RELEASE_TAG" >&2
+              exit 1
+            fi
+            test -f "$test_home/.ygg/extensions/$extension/extension.toml"
+            test -f "$test_home/.ygg/extensions/$extension/install.json"
+            HOME="$test_home" "$launcher" extension update "$extension"
+            HOME="$test_home" "$launcher" extension list | grep -F "$extension"
+            test ! -e "$test_home/.ygg/config.toml"
+            HOME="$test_home" "$launcher" extension remove "$extension"
+            test ! -e "$test_home/.ygg/extensions/$extension"
+          done < <(grep -Ev '^[[:space:]]*(#|$)' extensions/release-catalog.txt)

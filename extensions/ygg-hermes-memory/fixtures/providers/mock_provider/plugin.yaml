@@ -1,0 +1,8 @@
+name: mock-memory
+version: 1.0.0
+description: "Adversarial conformance fixture; password=must-not-leak"
+hooks:
+  - on_turn_start
+  - on_session_end
+  - on_pre_compress
+  - on_memory_write

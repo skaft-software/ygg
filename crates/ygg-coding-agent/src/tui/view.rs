@@ -363,6 +363,8 @@ pub(crate) struct ShellState {
     pub(crate) extension_header: Option<(String, Option<String>)>,
     pub(crate) extension_status: Option<(String, Option<String>)>,
     pub(crate) extension_footer: Option<(String, Option<String>)>,
+    /// Bounded frontend-neutral activity rows pinned above the composer.
+    pub(crate) extension_activity: Vec<String>,
     pub(crate) error: Option<String>,
     overlay: Option<ShellOverlay>,
     tool_panels: HashMap<ToolCallId, usize>,
@@ -2318,6 +2320,14 @@ impl InteractiveShell {
 
     pub fn set_extension_status(&mut self, text: Option<(String, Option<String>)>) {
         self.state.borrow_mut().extension_status = sanitize_extension_surface(text);
+    }
+
+    pub fn set_extension_activity(&mut self, lines: Vec<String>) {
+        self.state.borrow_mut().extension_activity = lines
+            .into_iter()
+            .take(6)
+            .map(|line| sanitize_for_terminal(&line).replace(['\n', '\r'], " "))
+            .collect();
     }
 
     pub fn set_extension_footer(&mut self, text: Option<(String, Option<String>)>) {

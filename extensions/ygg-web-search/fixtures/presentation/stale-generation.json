@@ -1,0 +1,146 @@
+{
+  "schema": "ygg.web-search.presentation-fixture.v1",
+  "extension": "ygg-web-search",
+  "case": "stale_generation_cleanup",
+  "deliveries": [
+    {
+      "generation": 6,
+      "notification": {
+        "jsonrpc": "2.0",
+        "method": "presentation/update",
+        "params": {
+          "parent_request_id": 2,
+          "snapshot": {
+            "revision": 8,
+            "status": {
+              "state": "active",
+              "label": "web · SearXNG"
+            },
+            "activities": [
+              {
+                "id": "web:web_search:42",
+                "kind": "web_retrieval",
+                "state": "succeeded",
+                "summary": "web_search · SearXNG · 1 result · 900 bytes · cache miss · 75 ms · ok",
+                "provenance": "SearXNG",
+                "started_at_ms": 1000,
+                "completed_at_ms": 1124,
+                "references": []
+              }
+            ],
+            "collection": {
+              "kind": "list",
+              "title": "2 web citations",
+              "nodes": [
+                {
+                  "id": "web-1000000000000001",
+                  "state": "active",
+                  "label": "Example research result",
+                  "secondary": "https://example.com · 2026-08-20",
+                  "action_ids": [],
+                  "references": [
+                    {
+                      "kind": "url",
+                      "id": "https://example.com/research",
+                      "label": "https://example.com"
+                    }
+                  ]
+                },
+                {
+                  "id": "web-2000000000000002",
+                  "state": "active",
+                  "label": "Second source",
+                  "secondary": "https://docs.example.org",
+                  "action_ids": [],
+                  "references": [
+                    {
+                      "kind": "url",
+                      "id": "https://docs.example.org/source",
+                      "label": "https://docs.example.org"
+                    }
+                  ]
+                }
+              ],
+              "selected_node_id": "web-1000000000000001",
+              "detail": {
+                "node_id": "web-1000000000000001",
+                "title": "Example research result",
+                "body": "Citation: web-1000000000000001\nOrigin: https://example.com\nURL: https://example.com/research\nPublished: 2026-08-20",
+                "references": [
+                  {
+                    "kind": "url",
+                    "id": "https://example.com/research",
+                    "label": "https://example.com"
+                  }
+                ]
+              }
+            },
+            "actions": []
+          }
+        }
+      }
+    },
+    {
+      "generation": 7,
+      "notification": {
+        "jsonrpc": "2.0",
+        "method": "presentation/update",
+        "params": {
+          "parent_request_id": 2,
+          "snapshot": {
+            "revision": 1,
+            "status": {
+              "state": "active",
+              "label": "web · SearXNG"
+            },
+            "activities": [],
+            "collection": null,
+            "actions": []
+          }
+        }
+      }
+    },
+    {
+      "generation": 6,
+      "notification": {
+        "jsonrpc": "2.0",
+        "method": "presentation/update",
+        "params": {
+          "parent_request_id": 2,
+          "snapshot": {
+            "revision": 9,
+            "status": {
+              "state": "active",
+              "label": "web · SearXNG"
+            },
+            "activities": [
+              {
+                "id": "web:web_search:42",
+                "kind": "web_retrieval",
+                "state": "running",
+                "summary": "web_search · SearXNG · 0 results · 0 bytes · cache none · 0 ms · running",
+                "provenance": "SearXNG",
+                "started_at_ms": 1000,
+                "references": []
+              }
+            ],
+            "collection": null,
+            "actions": []
+          }
+        }
+      }
+    }
+  ],
+  "expected_generation": 7,
+  "expected_ignored_deliveries": 1,
+  "expected_snapshot": {
+    "revision": 1,
+    "status": {
+      "state": "active",
+      "label": "web · SearXNG"
+    },
+    "activities": [],
+    "collection": null,
+    "actions": []
+  }
+}

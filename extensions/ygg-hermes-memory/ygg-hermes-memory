@@ -1,0 +1,8 @@
+#!/bin/sh
+# The provider environment is an explicit operator decision. This wrapper does
+# no installation or environment mutation; exec keeps one long-lived Python
+# process for the Ygg SDK and the selected Hermes provider.
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHON=${YGG_HERMES_PYTHON:-python3}
+exec "$PYTHON" "$SCRIPT_DIR/extension.py" "$@"
